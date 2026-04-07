@@ -84,9 +84,12 @@ kernel void sdpa(
 
     // ---- Pass 1: Compute attention scores and find max (for numerical stability) ----
 
-    // We apply a causal mask: for query position q_pos, only attend to
-    // key positions k_pos <= q_pos.  Combined with the constraint k_pos < kv_seq_len.
-    const uint max_k = min(q_pos + 1, kv_seq_len);
+    // We apply a causal mask. When seq_len < kv_seq_len (decode mode with
+    // KV cache), the query positions map to the END of the full sequence.
+    // q_pos=0 corresponds to absolute position (kv_seq_len - seq_len).
+    // The causal constraint: attend to k_pos <= abs_pos.
+    const uint abs_pos = kv_seq_len - seq_len + q_pos;
+    const uint max_k = min(abs_pos + 1, kv_seq_len);
 
     float max_score = -INFINITY;
 

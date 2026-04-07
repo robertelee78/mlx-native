@@ -84,13 +84,16 @@ kernel void sdpa_sliding(
     const float scale = rsqrt(float(head_dim));
 
     // Sliding window + causal mask bounds.
-    // Causal: k_pos <= q_pos, so max key is min(q_pos + 1, kv_seq_len).
-    // Sliding: k_pos >= q_pos - window_size (but q_pos - window_size may underflow).
-    const uint causal_max_k = min(q_pos + 1, kv_seq_len);
+    // When seq_len < kv_seq_len (decode mode with KV cache), the query
+    // positions map to the END of the full sequence. q_pos=0 corresponds
+    // to absolute position (kv_seq_len - seq_len).
+    const uint abs_pos = kv_seq_len - seq_len + q_pos;
+    // Causal: k_pos <= abs_pos, so max key is min(abs_pos + 1, kv_seq_len).
+    const uint causal_max_k = min(abs_pos + 1, kv_seq_len);
 
     // Compute the start of the sliding window.
-    // If q_pos < window_size, the window starts at 0 (no underflow with uint).
-    const uint window_start = (q_pos >= window_size) ? (q_pos - window_size) : 0;
+    // If abs_pos < window_size, the window starts at 0 (no underflow with uint).
+    const uint window_start = (abs_pos >= window_size) ? (abs_pos - window_size) : 0;
 
     // Effective range: [window_start, causal_max_k)
     // If window_start >= causal_max_k, there are no valid keys (shouldn't happen
