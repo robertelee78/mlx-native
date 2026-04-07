@@ -30,13 +30,10 @@ struct QuantizedMatmulParams {
     uint bits;        // 4, 6, or 8
 };
 
-// Helper: read bf16 from a half buffer.  Metal's `half` type is IEEE f16, but
-// we store MLX-style bf16 scale/bias as raw uint16 and convert manually.
-// Actually, for simplicity and compatibility with the Rust side which stores
-// scales/biases as f16 (not bf16), we use f16 directly via the `half` type.
-// The story spec says bf16 but the practical implementation stores them as f16
-// since Metal natively supports half (f16) but not bf16 in older MSL versions.
-// We accept half* for scales and biases.
+// Helper: read bf16 scales/biases.  Metal's `half` type is IEEE f16, which is
+// a DIFFERENT format from bf16 (bfloat16).  MLX stores scales and biases as
+// bf16, so we read them as raw uint16_t and reinterpret via as_type<bfloat>,
+// then cast to float for dequantization arithmetic.
 
 // ---- 4-bit dequantization ----
 // Extract the i-th 4-bit value from a packed uint32.
@@ -71,15 +68,15 @@ inline float dequant_8bit(uint packed, uint i, float scale, float bias) {
 // Buffer layout:
 //   buffer(0): input    — float32[M][K] (row-major)
 //   buffer(1): weight   — packed uint32[N][packed_k] (row-major per output column)
-//   buffer(2): scales   — float16[N][num_groups_per_row] (one per group along K)
-//   buffer(3): biases   — float16[N][num_groups_per_row]
+//   buffer(2): scales   — bf16[N][num_groups_per_row] (one per group along K, stored as uint16)
+//   buffer(3): biases   — bf16[N][num_groups_per_row] (stored as uint16)
 //   buffer(4): output   — float32[M][N] (row-major)
 //   buffer(5): params   — QuantizedMatmulParams
 kernel void quantized_matmul(
     device const float*  input   [[buffer(0)]],
     device const uint*   weight  [[buffer(1)]],
-    device const half*   scales  [[buffer(2)]],
-    device const half*   biases  [[buffer(3)]],
+    device const uint16_t* scales  [[buffer(2)]],
+    device const uint16_t* biases  [[buffer(3)]],
     device float*        output  [[buffer(4)]],
     constant QuantizedMatmulParams& params [[buffer(5)]],
     uint2 tid [[thread_position_in_grid]]
@@ -117,8 +114,8 @@ kernel void quantized_matmul(
         uint packed = weight[w_base + pack_idx];
 
         uint g = k / group_size;
-        float scale = float(scales[sb_base + g]);
-        float bias  = float(biases[sb_base + g]);
+        float scale = static_cast<float>(as_type<bfloat>(scales[sb_base + g]));
+        float bias  = static_cast<float>(as_type<bfloat>(biases[sb_base + g]));
 
         float w;
         if (bits == 4) {

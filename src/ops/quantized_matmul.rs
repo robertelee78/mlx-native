@@ -4,7 +4,7 @@
 //!   output[row][col] = sum_k(dequant(weight[col][k]) * input[row][k])
 //!
 //! Weights are stored in packed quantized format (4-bit or 6-bit) with per-group
-//! f16 scales and biases for affine dequantization.
+//! bf16 scales and biases for affine dequantization.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -61,11 +61,11 @@ fn expected_weight_bytes(k: u32, n: u32, bits: u32) -> usize {
 
 /// Compute the expected scales (or biases) buffer size in bytes.
 ///
-/// Each output column has ceil(K / group_size) groups, each with one f16 value.
+/// Each output column has ceil(K / group_size) groups, each with one bf16 value.
 /// Total = N * ceil(K / group_size) * 2 bytes.
 fn expected_scales_bytes(k: u32, n: u32, group_size: u32) -> usize {
     let num_groups = (k + group_size - 1) / group_size;
-    (n as usize) * (num_groups as usize) * 2 // 2 bytes per f16
+    (n as usize) * (num_groups as usize) * 2 // 2 bytes per bf16
 }
 
 /// Encode a quantized matrix multiplication onto the given command encoder.
@@ -80,8 +80,8 @@ fn expected_scales_bytes(k: u32, n: u32, group_size: u32) -> usize {
 /// * `device`   — The Metal device (needed for pipeline compilation and output allocation).
 /// * `input`    — f32 input matrix buffer, shape `[M, K]`.
 /// * `weight`   — Packed quantized weight buffer, shape `[N, packed_k]`.
-/// * `scales`   — f16 scale buffer, shape `[N, num_groups]`.
-/// * `biases`   — f16 bias buffer, shape `[N, num_groups]`.
+/// * `scales`   — bf16 scale buffer, shape `[N, num_groups]`.
+/// * `biases`   — bf16 bias buffer, shape `[N, num_groups]`.
 /// * `params`   — Dimensions and quantization parameters.
 ///
 /// # Returns
@@ -226,7 +226,13 @@ mod tests {
     use super::*;
     use crate::MlxDevice;
 
-    // ---- f16 conversion helpers (no external dependency) ----
+    // ---- f16 / bf16 conversion helpers (no external dependency) ----
+
+    /// Convert an f32 to bfloat16 (bf16) bits.
+    /// bf16 is simply the top 16 bits of the IEEE 754 f32 representation.
+    fn f32_to_bf16_bits(val: f32) -> u16 {
+        (val.to_bits() >> 16) as u16
+    }
 
     /// Convert an f32 to IEEE 754 half-precision (f16) bits.
     /// Uses round-to-nearest-even.
@@ -301,7 +307,8 @@ mod tests {
         f32::from_bits(sign | f32_exp | f32_mantissa)
     }
 
-    // Helper: create an f16 buffer from f32 values (used for scales/biases).
+    // Helper: create an f16 buffer from f32 values.
+    #[allow(dead_code)]
     fn f16_buffer(device: &MlxDevice, shape: Vec<usize>, values: &[f32]) -> MlxBuffer {
         let byte_len = values.len() * 2;
         let mut buf = device.alloc_buffer(byte_len, DType::F16, shape).expect("alloc");
@@ -309,6 +316,19 @@ mod tests {
             let slice: &mut [u16] = buf.as_mut_slice().expect("as_mut_slice");
             for (i, &v) in values.iter().enumerate() {
                 slice[i] = f32_to_f16_bits(v);
+            }
+        }
+        buf
+    }
+
+    // Helper: create a bf16 buffer from f32 values (used for scales/biases).
+    fn bf16_buffer(device: &MlxDevice, shape: Vec<usize>, values: &[f32]) -> MlxBuffer {
+        let byte_len = values.len() * 2;
+        let mut buf = device.alloc_buffer(byte_len, DType::BF16, shape).expect("alloc");
+        {
+            let slice: &mut [u16] = buf.as_mut_slice().expect("as_mut_slice");
+            for (i, &v) in values.iter().enumerate() {
+                slice[i] = f32_to_bf16_bits(v);
             }
         }
         buf
@@ -452,8 +472,8 @@ mod tests {
         let quant_w: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let weight = pack_4bit_buffer(&device, n as usize, k as usize, &quant_w);
 
-        let scales = f16_buffer(&device, vec![n as usize, 1], &[0.1, 0.2]);
-        let biases = f16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
+        let scales = bf16_buffer(&device, vec![n as usize, 1], &[0.1, 0.2]);
+        let biases = bf16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
@@ -467,8 +487,8 @@ mod tests {
         let result = read_f32(&output);
         assert_eq!(result.len(), 2);
 
-        // Tolerance: f16 precision is ~1e-3 for these magnitudes.
-        let tol = 1e-1; // f16 has limited precision, be generous for this test
+        // Tolerance: bf16 precision is ~1e-2 for these magnitudes.
+        let tol = 1e-1; // bf16 has limited precision, be generous for this test
         assert!(
             (result[0] - 3.0).abs() < tol,
             "output[0]={}, expected ~3.0", result[0]
@@ -498,8 +518,8 @@ mod tests {
         let quant_w: Vec<u8> = vec![1, 2, 3, 4, 10, 20, 30, 40];
         let weight = pack_6bit_buffer(&device, n as usize, k as usize, &quant_w);
 
-        let scales = f16_buffer(&device, vec![n as usize, 1], &[0.1, 0.05]);
-        let biases = f16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
+        let scales = bf16_buffer(&device, vec![n as usize, 1], &[0.1, 0.05]);
+        let biases = bf16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
@@ -547,8 +567,8 @@ mod tests {
         let quant_w: Vec<u8> = vec![0, 0, 0, 0];
         let weight = pack_4bit_buffer(&device, 1, 4, &quant_w);
 
-        let scales = f16_buffer(&device, vec![1, 1], &[1.0]);
-        let biases = f16_buffer(&device, vec![1, 1], &[0.5]);
+        let scales = bf16_buffer(&device, vec![1, 1], &[1.0]);
+        let biases = bf16_buffer(&device, vec![1, 1], &[0.5]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
@@ -588,8 +608,8 @@ mod tests {
         let quant_w: Vec<u8> = vec![2, 4, 6, 8];
         let weight = pack_4bit_buffer(&device, 1, 4, &quant_w);
 
-        let scales = f16_buffer(&device, vec![1, 1], &[0.5]);
-        let biases = f16_buffer(&device, vec![1, 1], &[0.0]);
+        let scales = bf16_buffer(&device, vec![1, 1], &[0.5]);
+        let biases = bf16_buffer(&device, vec![1, 1], &[0.0]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
@@ -621,8 +641,8 @@ mod tests {
         let input = f32_buffer(&device, vec![1, 4], &[1.0; 4]);
         // Minimal buffers — validation should fail before size checks matter.
         let weight = device.alloc_buffer(4, DType::U32, vec![1]).expect("alloc");
-        let scales = f16_buffer(&device, vec![1], &[1.0]);
-        let biases = f16_buffer(&device, vec![1], &[0.0]);
+        let scales = bf16_buffer(&device, vec![1], &[1.0]);
+        let biases = bf16_buffer(&device, vec![1], &[0.0]);
 
         let params = QuantizedMatmulParams {
             m: 1, k: 4, n: 1, group_size: 64, bits: 5,
@@ -652,8 +672,8 @@ mod tests {
         // Input is 1x4 but we'll claim K=128 in params.
         let input = f32_buffer(&device, vec![1, 4], &[1.0; 4]);
         let weight = device.alloc_buffer(4, DType::U32, vec![1]).expect("alloc");
-        let scales = f16_buffer(&device, vec![1], &[1.0]);
-        let biases = f16_buffer(&device, vec![1], &[0.0]);
+        let scales = bf16_buffer(&device, vec![1], &[1.0]);
+        let biases = bf16_buffer(&device, vec![1], &[0.0]);
 
         let params = QuantizedMatmulParams {
             m: 1, k: 128, n: 1, group_size: 64, bits: 4,
@@ -703,8 +723,8 @@ mod tests {
         let quant_w: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80];
         let weight = pack_8bit_buffer(&device, n as usize, k as usize, &quant_w);
 
-        let scales = f16_buffer(&device, vec![n as usize, 1], &[0.01, 0.02]);
-        let biases = f16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
+        let scales = bf16_buffer(&device, vec![n as usize, 1], &[0.01, 0.02]);
+        let biases = bf16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
@@ -718,7 +738,7 @@ mod tests {
         let result = read_f32(&output);
         assert_eq!(result.len(), 2);
 
-        // Tolerance: f16 precision is ~1e-3 for these magnitudes.
+        // Tolerance: bf16 precision is ~1e-2 for these magnitudes.
         let tol = 1e-1;
         assert!(
             (result[0] - 3.0).abs() < tol,
@@ -749,8 +769,8 @@ mod tests {
         let quant_w: Vec<u8> = vec![0, 0, 0, 0];
         let weight = pack_8bit_buffer(&device, 1, 4, &quant_w);
 
-        let scales = f16_buffer(&device, vec![1, 1], &[1.0]);
-        let biases = f16_buffer(&device, vec![1, 1], &[0.5]);
+        let scales = bf16_buffer(&device, vec![1, 1], &[1.0]);
+        let biases = bf16_buffer(&device, vec![1, 1], &[0.5]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
@@ -791,8 +811,8 @@ mod tests {
         let weight = pack_4bit_buffer(&device, 1, 8, &quant_w);
 
         // 2 groups: scale=[0.5, 1.0], bias=[0.0, 0.0]
-        let scales = f16_buffer(&device, vec![1, 2], &[0.5, 1.0]);
-        let biases = f16_buffer(&device, vec![1, 2], &[0.0, 0.0]);
+        let scales = bf16_buffer(&device, vec![1, 2], &[0.5, 1.0]);
+        let biases = bf16_buffer(&device, vec![1, 2], &[0.0, 0.0]);
 
         let params = QuantizedMatmulParams { m, k, n, group_size, bits };
 
