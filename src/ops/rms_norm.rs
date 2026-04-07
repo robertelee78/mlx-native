@@ -20,6 +20,7 @@ pub static RMS_NORM_SHADER_SOURCE: &str = include_str!("../shaders/rms_norm.meta
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("rms_norm_f32", RMS_NORM_SHADER_SOURCE);
     registry.register_source("rms_norm_f16", RMS_NORM_SHADER_SOURCE);
+    registry.register_source("rms_norm_bf16", RMS_NORM_SHADER_SOURCE);
 }
 
 /// Dispatch an RMS normalization operation on the GPU.
@@ -29,8 +30,8 @@ pub fn register(registry: &mut KernelRegistry) {
 /// * `encoder`    - Command encoder to record the dispatch into.
 /// * `registry`   - Kernel registry (must have rms_norm sources registered).
 /// * `device`     - Metal device for pipeline compilation.
-/// * `input`      - Input buffer of shape `[rows, dim]` (f32 or f16).
-/// * `weight`     - Weight buffer of shape `[dim]` (f32).
+/// * `input`      - Input buffer of shape `[rows, dim]` (f32, f16, or bf16).
+/// * `weight`     - Weight buffer of shape `[dim]` (same dtype as input; f32 for f32/f16 kernels, bf16 for bf16).
 /// * `output`     - Output buffer (same dtype and shape as input).
 /// * `params_buf` - Params buffer containing `[eps, dim]` as f32.
 /// * `rows`       - Number of rows to normalize.
@@ -39,7 +40,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// # Errors
 ///
 /// Returns `MlxError::InvalidArgument` if:
-/// - Input dtype is not f32 or f16.
+/// - Input dtype is not f32, f16, or bf16.
 /// - Input element count does not match rows * dim.
 pub fn dispatch_rms_norm(
     encoder: &mut CommandEncoder,
@@ -79,6 +80,7 @@ pub fn dispatch_rms_norm(
     let kernel_name = match input.dtype() {
         DType::F32 => "rms_norm_f32",
         DType::F16 => "rms_norm_f16",
+        DType::BF16 => "rms_norm_bf16",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
                 "RMS norm unsupported dtype: {}",

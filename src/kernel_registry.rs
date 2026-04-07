@@ -95,6 +95,7 @@ impl KernelRegistry {
         let rms_norm_src: &'static str = include_str!("shaders/rms_norm.metal");
         sources.insert("rms_norm_f32".into(), rms_norm_src);
         sources.insert("rms_norm_f16".into(), rms_norm_src);
+        sources.insert("rms_norm_bf16".into(), rms_norm_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
