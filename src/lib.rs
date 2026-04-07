@@ -49,6 +49,7 @@ mod dtypes;
 mod encoder;
 mod kernel_registry;
 pub mod ops;
+pub mod weight;
 
 // ---- public re-exports ----
 pub use buffer::MlxBuffer;
@@ -61,6 +62,12 @@ pub use kernel_registry::KernelRegistry;
 
 // Re-export ops.
 pub use ops::quantized_matmul::{quantized_matmul, QuantizedMatmulParams};
+
+// Re-export weight loading utilities.
+pub use weight::{
+    load_quantized_weights, safetensors_to_metal_buffer, QuantizationConfig, QuantizedWeight,
+    SafetensorsFile, TensorQuantConfig,
+};
 
 // Re-export metal types that appear in the public API.
 pub use metal::MTLSize;

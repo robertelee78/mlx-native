@@ -50,6 +50,22 @@ pub enum MlxError {
     /// A kernel function was not found in the compiled library.
     #[error("Kernel not found: {0}")]
     KernelNotFound(String),
+
+    /// An I/O error occurred (e.g. reading a safetensors file).
+    #[error("I/O error: {0}")]
+    IoError(String),
+
+    /// A safetensors file could not be parsed or contains invalid data.
+    #[error("Safetensors error: {0}")]
+    SafetensorsError(String),
+
+    /// A quantization config file could not be parsed.
+    #[error("Quantization config error: {0}")]
+    QuantConfigError(String),
+
+    /// An unsupported data type was encountered.
+    #[error("Unsupported dtype: {0}")]
+    UnsupportedDtype(String),
 }
 
 /// Convenience alias used throughout the crate.
