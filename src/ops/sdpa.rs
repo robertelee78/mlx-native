@@ -40,10 +40,13 @@ pub struct SdpaParams {
     pub seq_len: u32,
     /// Key/value sequence length (may differ from `seq_len` in decode mode).
     pub kv_seq_len: u32,
+    /// Attention score scaling factor. Typically `1.0 / sqrt(head_dim)`, but
+    /// models like Gemma 4 (which use QK norms) require `scale = 1.0`.
+    pub scale: f32,
 }
 
 /// GPU-side parameter struct layout.  Must match the MSL `SdpaParams` struct
-/// exactly (5 consecutive `uint32` values, no padding).
+/// exactly (5 × u32 + 1 × f32 = 24 bytes, no padding).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SdpaParamsGpu {
@@ -52,6 +55,7 @@ struct SdpaParamsGpu {
     head_dim: u32,
     seq_len: u32,
     kv_seq_len: u32,
+    scale: f32,
 }
 
 /// Tile size for query positions per threadgroup.  Must match `TILE_Q` in the
@@ -162,6 +166,7 @@ pub fn sdpa(
         head_dim: params.head_dim,
         seq_len: params.seq_len,
         kv_seq_len: params.kv_seq_len,
+        scale: params.scale,
     };
     let params_bytes = bytemuck::bytes_of(&params_gpu);
     let mut params_buf = device.alloc_buffer(
@@ -219,6 +224,7 @@ mod tests {
             head_dim: 256,
             seq_len: 128,
             kv_seq_len: 128,
+            scale: 1.0 / (256.0_f32).sqrt(),
         };
         assert!(validate_params(&p).is_ok());
     }
@@ -231,6 +237,7 @@ mod tests {
             head_dim: 0,
             seq_len: 128,
             kv_seq_len: 128,
+            scale: 1.0,
         };
         assert!(matches!(
             validate_params(&p),
@@ -246,6 +253,7 @@ mod tests {
             head_dim: 256,
             seq_len: 128,
             kv_seq_len: 128,
+            scale: 1.0,
         };
         assert!(matches!(
             validate_params(&p),
@@ -255,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_gpu_params_layout() {
-        // Ensure SdpaParamsGpu is exactly 20 bytes (5 x u32).
-        assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 20);
+        // Ensure SdpaParamsGpu is exactly 24 bytes (5 x u32 + 1 x f32).
+        assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 24);
     }
 }

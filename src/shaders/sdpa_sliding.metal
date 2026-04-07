@@ -30,6 +30,7 @@ struct SdpaSlidingParams {
     uint seq_len;       // query sequence length
     uint kv_seq_len;    // key/value sequence length
     uint window_size;   // sliding window size
+    float scale;        // attention score scaling factor (e.g. 1/sqrt(head_dim) or 1.0)
 };
 
 // Tile size: number of query positions per threadgroup.
@@ -81,7 +82,7 @@ kernel void sdpa_sliding(
 
     const uint o_base = q_base;
 
-    const float scale = rsqrt(float(head_dim));
+    const float scale = params->scale;
 
     // Sliding window + causal mask bounds.
     // When seq_len < kv_seq_len (decode mode with KV cache), the query
@@ -209,7 +210,7 @@ kernel void sdpa_sliding_bf16(
     const uint v_head_base = k_head_base;
     const uint o_base = q_base;
 
-    const float scale = rsqrt(float(head_dim));
+    const float scale = params->scale;
 
     const uint abs_pos = kv_seq_len - seq_len + q_pos;
     const uint causal_max_k = min(abs_pos + 1, kv_seq_len);

@@ -276,6 +276,7 @@ fn run_sdpa_test(
         head_dim,
         seq_len,
         kv_seq_len,
+        scale: 1.0 / (head_dim as f32).sqrt(),
     };
     sdpa::sdpa(
         &mut encoder,
@@ -360,6 +361,7 @@ fn run_sdpa_sliding_test(
         seq_len,
         kv_seq_len,
         window_size,
+        scale: 1.0 / (head_dim as f32).sqrt(),
     };
     sdpa_sliding::sdpa_sliding(
         &mut encoder,
@@ -497,6 +499,7 @@ fn test_invalid_head_ratio() {
         head_dim: 64,
         seq_len: 32,
         kv_seq_len: 32,
+        scale: 1.0 / (64.0_f32).sqrt(),
     };
 
     // Allocate minimal buffers (they won't actually be used).
@@ -532,6 +535,7 @@ fn test_zero_head_dim() {
         head_dim: 0,
         seq_len: 32,
         kv_seq_len: 32,
+        scale: 1.0,
     };
 
     let buf = device.alloc_buffer(4, DType::F32, vec![1]).expect("buf");
@@ -567,6 +571,7 @@ fn test_sliding_zero_window_size() {
         seq_len: 32,
         kv_seq_len: 32,
         window_size: 0,
+        scale: 1.0 / (64.0_f32).sqrt(),
     };
 
     let buf = device.alloc_buffer(4, DType::F32, vec![1]).expect("buf");

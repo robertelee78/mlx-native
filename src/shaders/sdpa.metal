@@ -25,6 +25,7 @@ struct SdpaParams {
     uint head_dim;      // dimension per head
     uint seq_len;       // query sequence length
     uint kv_seq_len;    // key/value sequence length
+    float scale;        // attention score scaling factor (e.g. 1/sqrt(head_dim) or 1.0)
 };
 
 // Tile size: number of query positions per threadgroup.
@@ -79,8 +80,8 @@ kernel void sdpa(
     // Output offset: same layout as Q.
     const uint o_base = q_base;
 
-    // Scale factor: 1 / sqrt(head_dim).
-    const float scale = rsqrt(float(head_dim));
+    // Attention score scaling factor (caller-provided, e.g. 1/sqrt(head_dim) or 1.0).
+    const float scale = params->scale;
 
     // ---- Pass 1: Compute attention scores and find max (for numerical stability) ----
 
@@ -221,7 +222,7 @@ kernel void sdpa_bf16(
     const uint v_head_base = k_head_base;
     const uint o_base = q_base;
 
-    const float scale = rsqrt(float(head_dim));
+    const float scale = params->scale;
 
     const uint abs_pos = kv_seq_len - seq_len + q_pos;
     const uint max_k = min(abs_pos + 1, kv_seq_len);

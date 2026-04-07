@@ -42,10 +42,13 @@ pub struct SdpaSlidingParams {
     /// Sliding window size.  Attention is restricted to the last `window_size`
     /// key positions relative to each query position.
     pub window_size: u32,
+    /// Attention score scaling factor. Typically `1.0 / sqrt(head_dim)`, but
+    /// models like Gemma 4 (which use QK norms) require `scale = 1.0`.
+    pub scale: f32,
 }
 
 /// GPU-side parameter struct layout.  Must match the MSL `SdpaSlidingParams`
-/// struct exactly (6 consecutive `uint32` values, no padding).
+/// struct exactly (6 × u32 + 1 × f32 = 28 bytes, no padding).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SdpaSlidingParamsGpu {
@@ -55,6 +58,7 @@ struct SdpaSlidingParamsGpu {
     seq_len: u32,
     kv_seq_len: u32,
     window_size: u32,
+    scale: f32,
 }
 
 /// Tile size for query positions per threadgroup.  Must match `TILE_Q` in the
@@ -171,6 +175,7 @@ pub fn sdpa_sliding(
         seq_len: params.seq_len,
         kv_seq_len: params.kv_seq_len,
         window_size: params.window_size,
+        scale: params.scale,
     };
     let params_bytes = bytemuck::bytes_of(&params_gpu);
     let mut params_buf = device.alloc_buffer(
@@ -228,6 +233,7 @@ mod tests {
             seq_len: 2048,
             kv_seq_len: 2048,
             window_size: 1024,
+            scale: 1.0 / (256.0_f32).sqrt(),
         };
         assert!(validate_sliding_params(&p).is_ok());
     }
@@ -241,6 +247,7 @@ mod tests {
             seq_len: 128,
             kv_seq_len: 128,
             window_size: 0,
+            scale: 1.0,
         };
         assert!(matches!(
             validate_sliding_params(&p),
@@ -250,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_gpu_sliding_params_layout() {
-        // Ensure SdpaSlidingParamsGpu is exactly 24 bytes (6 x u32).
-        assert_eq!(std::mem::size_of::<SdpaSlidingParamsGpu>(), 24);
+        // Ensure SdpaSlidingParamsGpu is exactly 28 bytes (6 x u32 + 1 x f32).
+        assert_eq!(std::mem::size_of::<SdpaSlidingParamsGpu>(), 28);
     }
 }
