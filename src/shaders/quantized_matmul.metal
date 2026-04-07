@@ -59,25 +59,28 @@ inline float dequant_8bit(uint packed, uint i, float scale, float bias) {
     return scale * float(val) + bias;
 }
 
-// Main quantized matmul kernel.
+// Main quantized matmul kernel (f32 output).
 //
 // Each thread computes one element of the output: output[row][col].
 // This is a simple, correct baseline — future optimization (tiling, SIMD groups)
 // will come in Epic 6.
 //
+// Accumulation and output are both f32 to avoid f16 overflow (max ~65504) on
+// projections with large intermediate values (e.g. attention output projections).
+//
 // Buffer layout:
-//   buffer(0): input    — float16[M][K] (row-major)
+//   buffer(0): input    — float32[M][K] (row-major)
 //   buffer(1): weight   — packed uint32[N][packed_k] (row-major per output column)
 //   buffer(2): scales   — float16[N][num_groups_per_row] (one per group along K)
 //   buffer(3): biases   — float16[N][num_groups_per_row]
-//   buffer(4): output   — float16[M][N] (row-major)
+//   buffer(4): output   — float32[M][N] (row-major)
 //   buffer(5): params   — QuantizedMatmulParams
 kernel void quantized_matmul(
-    device const half*   input   [[buffer(0)]],
+    device const float*  input   [[buffer(0)]],
     device const uint*   weight  [[buffer(1)]],
     device const half*   scales  [[buffer(2)]],
     device const half*   biases  [[buffer(3)]],
-    device half*         output  [[buffer(4)]],
+    device float*        output  [[buffer(4)]],
     constant QuantizedMatmulParams& params [[buffer(5)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
@@ -126,9 +129,9 @@ kernel void quantized_matmul(
             w = dequant_8bit(packed, in_pack_idx, scale, bias);
         }
 
-        float x = float(input[row * K + k]);
+        float x = input[row * K + k];
         acc += w * x;
     }
 
-    output[row * params.N + col] = half(acc);
+    output[row * params.N + col] = acc;
 }

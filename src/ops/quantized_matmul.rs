@@ -78,7 +78,7 @@ fn expected_scales_bytes(k: u32, n: u32, group_size: u32) -> usize {
 /// * `encoder`  — The command encoder to record the dispatch into.
 /// * `registry` — Kernel registry (compiles the shader on first call).
 /// * `device`   — The Metal device (needed for pipeline compilation and output allocation).
-/// * `input`    — f16 input matrix buffer, shape `[M, K]`.
+/// * `input`    — f32 input matrix buffer, shape `[M, K]`.
 /// * `weight`   — Packed quantized weight buffer, shape `[N, packed_k]`.
 /// * `scales`   — f16 scale buffer, shape `[N, num_groups]`.
 /// * `biases`   — f16 bias buffer, shape `[N, num_groups]`.
@@ -86,7 +86,7 @@ fn expected_scales_bytes(k: u32, n: u32, group_size: u32) -> usize {
 ///
 /// # Returns
 ///
-/// A freshly allocated `MlxBuffer` for the output of shape `[M, N]` with dtype `F16`.
+/// A freshly allocated `MlxBuffer` for the output of shape `[M, N]` with dtype `F32`.
 ///
 /// # Errors
 ///
@@ -123,10 +123,10 @@ pub fn quantized_matmul(
     }
 
     // --- Validate buffer sizes ---
-    let expected_input = (params.m as usize) * (params.k as usize) * DType::F16.size_of();
+    let expected_input = (params.m as usize) * (params.k as usize) * DType::F32.size_of();
     if input.byte_len() < expected_input {
         return Err(MlxError::InvalidArgument(format!(
-            "Input buffer too small: expected at least {} bytes for [{}x{}] f16, got {}",
+            "Input buffer too small: expected at least {} bytes for [{}x{}] f32, got {}",
             expected_input, params.m, params.k, input.byte_len()
         )));
     }
@@ -157,10 +157,12 @@ pub fn quantized_matmul(
     let pipeline = registry.get_pipeline("quantized_matmul", device.metal_device())?;
 
     // --- Allocate output buffer ---
-    let output_bytes = (params.m as usize) * (params.n as usize) * DType::F16.size_of();
+    // Output is f32 to avoid f16 overflow (max ~65504) on projections with large
+    // accumulated values (e.g. attention output projections where K=4096).
+    let output_bytes = (params.m as usize) * (params.n as usize) * DType::F32.size_of();
     let output = device.alloc_buffer(
         output_bytes,
-        DType::F16,
+        DType::F32,
         vec![params.m as usize, params.n as usize],
     )?;
 
@@ -299,7 +301,7 @@ mod tests {
         f32::from_bits(sign | f32_exp | f32_mantissa)
     }
 
-    // Helper: create an f16 buffer from f32 values.
+    // Helper: create an f16 buffer from f32 values (used for scales/biases).
     fn f16_buffer(device: &MlxDevice, shape: Vec<usize>, values: &[f32]) -> MlxBuffer {
         let byte_len = values.len() * 2;
         let mut buf = device.alloc_buffer(byte_len, DType::F16, shape).expect("alloc");
@@ -308,6 +310,17 @@ mod tests {
             for (i, &v) in values.iter().enumerate() {
                 slice[i] = f32_to_f16_bits(v);
             }
+        }
+        buf
+    }
+
+    // Helper: create an f32 buffer from f32 values (used for input).
+    fn f32_buffer(device: &MlxDevice, shape: Vec<usize>, values: &[f32]) -> MlxBuffer {
+        let byte_len = values.len() * 4;
+        let mut buf = device.alloc_buffer(byte_len, DType::F32, shape).expect("alloc");
+        {
+            let slice: &mut [f32] = buf.as_mut_slice().expect("as_mut_slice");
+            slice.copy_from_slice(values);
         }
         buf
     }
@@ -396,10 +409,17 @@ mod tests {
         buf
     }
 
-    // Helper: read f16 output buffer back as f32.
+    // Helper: read f16 buffer back as f32.
+    #[allow(dead_code)]
     fn read_f16(buf: &MlxBuffer) -> Vec<f32> {
         let slice: &[u16] = buf.as_slice().expect("as_slice");
         slice.iter().map(|&bits| f16_bits_to_f32(bits)).collect()
+    }
+
+    // Helper: read f32 output buffer.
+    fn read_f32(buf: &MlxBuffer) -> Vec<f32> {
+        let slice: &[f32] = buf.as_slice().expect("as_slice");
+        slice.to_vec()
     }
 
     /// Test 4-bit quantized matmul with a small known example.
@@ -426,7 +446,7 @@ mod tests {
         let group_size = 64u32;
         let bits = 4u32;
 
-        let input = f16_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
+        let input = f32_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
 
         // Quantized weight values (unsigned): row0=[1,2,3,4], row1=[5,6,7,8]
         let quant_w: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -444,7 +464,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         assert_eq!(result.len(), 2);
 
         // Tolerance: f16 precision is ~1e-3 for these magnitudes.
@@ -472,7 +492,7 @@ mod tests {
         let group_size = 64u32;
         let bits = 6u32;
 
-        let input = f16_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
+        let input = f32_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
 
         // 6-bit quantized weight values (0..63): row0=[1,2,3,4], row1=[10,20,30,40]
         let quant_w: Vec<u8> = vec![1, 2, 3, 4, 10, 20, 30, 40];
@@ -490,7 +510,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         assert_eq!(result.len(), 2);
 
         // dequant row 0: [0.1, 0.2, 0.3, 0.4]
@@ -521,7 +541,7 @@ mod tests {
         let group_size = 64u32;
         let bits = 4u32;
 
-        let input = f16_buffer(&device, vec![1, 4], &[1.0, 1.0, 1.0, 1.0]);
+        let input = f32_buffer(&device, vec![1, 4], &[1.0, 1.0, 1.0, 1.0]);
 
         // quant values all 0 → dequant = scale*0 + bias = bias
         let quant_w: Vec<u8> = vec![0, 0, 0, 0];
@@ -539,7 +559,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         // Each weight dequantized to 0.5, dot with [1,1,1,1] = 2.0
         let tol = 1e-2;
         assert!(
@@ -562,7 +582,7 @@ mod tests {
         let bits = 4u32;
 
         // Two input rows: [1,0,0,0] and [0,1,0,0]
-        let input = f16_buffer(&device, vec![2, 4], &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let input = f32_buffer(&device, vec![2, 4], &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
 
         // quant weight row: [2, 4, 6, 8]
         let quant_w: Vec<u8> = vec![2, 4, 6, 8];
@@ -580,7 +600,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         assert_eq!(result.len(), 2);
 
         // dequant: [1.0, 2.0, 3.0, 4.0]
@@ -598,7 +618,7 @@ mod tests {
         let mut registry = KernelRegistry::new();
         let mut encoder = device.command_encoder().expect("encoder");
 
-        let input = f16_buffer(&device, vec![1, 4], &[1.0; 4]);
+        let input = f32_buffer(&device, vec![1, 4], &[1.0; 4]);
         // Minimal buffers — validation should fail before size checks matter.
         let weight = device.alloc_buffer(4, DType::U32, vec![1]).expect("alloc");
         let scales = f16_buffer(&device, vec![1], &[1.0]);
@@ -630,7 +650,7 @@ mod tests {
         let mut encoder = device.command_encoder().expect("encoder");
 
         // Input is 1x4 but we'll claim K=128 in params.
-        let input = f16_buffer(&device, vec![1, 4], &[1.0; 4]);
+        let input = f32_buffer(&device, vec![1, 4], &[1.0; 4]);
         let weight = device.alloc_buffer(4, DType::U32, vec![1]).expect("alloc");
         let scales = f16_buffer(&device, vec![1], &[1.0]);
         let biases = f16_buffer(&device, vec![1], &[0.0]);
@@ -677,7 +697,7 @@ mod tests {
         let group_size = 64u32;
         let bits = 8u32;
 
-        let input = f16_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
+        let input = f32_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
 
         // 8-bit quantized weight values (0..255): row0=[10,20,30,40], row1=[50,60,70,80]
         let quant_w: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80];
@@ -695,7 +715,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         assert_eq!(result.len(), 2);
 
         // Tolerance: f16 precision is ~1e-3 for these magnitudes.
@@ -723,7 +743,7 @@ mod tests {
         let group_size = 64u32;
         let bits = 8u32;
 
-        let input = f16_buffer(&device, vec![1, 4], &[1.0, 1.0, 1.0, 1.0]);
+        let input = f32_buffer(&device, vec![1, 4], &[1.0, 1.0, 1.0, 1.0]);
 
         // quant values all 0 -> dequant = scale*0 + bias = bias
         let quant_w: Vec<u8> = vec![0, 0, 0, 0];
@@ -741,7 +761,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         // Each weight dequantized to 0.5, dot with [1,1,1,1] = 2.0
         let tol = 1e-2;
         assert!(
@@ -764,7 +784,7 @@ mod tests {
         let group_size = 4u32;
         let bits = 4u32;
 
-        let input = f16_buffer(&device, vec![1, 8], &[1.0; 8]);
+        let input = f32_buffer(&device, vec![1, 8], &[1.0; 8]);
 
         // quant values: [1,1,1,1, 2,2,2,2]
         let quant_w: Vec<u8> = vec![1, 1, 1, 1, 2, 2, 2, 2];
@@ -783,7 +803,7 @@ mod tests {
 
         encoder.commit_and_wait().expect("commit");
 
-        let result = read_f16(&output);
+        let result = read_f32(&output);
         // Group 0: dequant=[0.5,0.5,0.5,0.5], sum = 4*0.5 = 2.0
         // Group 1: dequant=[2.0,2.0,2.0,2.0], sum = 4*2.0 = 8.0
         // Total = 10.0
