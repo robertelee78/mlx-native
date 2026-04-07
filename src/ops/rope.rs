@@ -85,6 +85,7 @@ pub fn dispatch_rope(
     let kernel_name = match input.dtype() {
         DType::F32 => "rope_f32",
         DType::F16 => "rope_f16",
+        DType::BF16 => "rope_bf16",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
                 "RoPE unsupported dtype: {}",

@@ -30,8 +30,10 @@ fn elementwise_kernel_name(op: &str, dtype: DType) -> Result<&'static str> {
     match (op, dtype) {
         ("add", DType::F32) => Ok("elementwise_add_f32"),
         ("add", DType::F16) => Ok("elementwise_add_f16"),
+        ("add", DType::BF16) => Ok("elementwise_add_bf16"),
         ("mul", DType::F32) => Ok("elementwise_mul_f32"),
         ("mul", DType::F16) => Ok("elementwise_mul_f16"),
+        ("mul", DType::BF16) => Ok("elementwise_mul_bf16"),
         _ => Err(MlxError::InvalidArgument(format!(
             "elementwise_{op}: unsupported dtype {dtype}"
         ))),

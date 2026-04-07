@@ -176,3 +176,105 @@ kernel void sdpa(
         O[o_base + d] = acc[d];
     }
 }
+
+// --------------------------------------------------------------------------
+// sdpa_bf16 — Scaled dot-product attention for bfloat16 tensors.
+//
+// Same algorithm as sdpa, but reads/writes bfloat16. All accumulation
+// and intermediate computation stays in float32 for numerical stability.
+// --------------------------------------------------------------------------
+kernel void sdpa_bf16(
+    device const bfloat *Q          [[buffer(0)]],
+    device const bfloat *K          [[buffer(1)]],
+    device const bfloat *V          [[buffer(2)]],
+    device bfloat       *O          [[buffer(3)]],
+    device const SdpaParams *params [[buffer(4)]],
+    uint3 tgid                     [[threadgroup_position_in_grid]],
+    uint  tid                      [[thread_index_in_threadgroup]]
+) {
+    const uint n_heads     = params->n_heads;
+    const uint n_kv_heads  = params->n_kv_heads;
+    const uint head_dim    = params->head_dim;
+    const uint seq_len     = params->seq_len;
+    const uint kv_seq_len  = params->kv_seq_len;
+
+    const uint batch_idx   = tgid.x;
+    const uint head_idx    = tgid.y;
+    const uint tile_idx    = tgid.z;
+
+    const uint q_pos = tile_idx * TILE_Q + tid;
+
+    if (q_pos >= seq_len) {
+        return;
+    }
+
+    const uint heads_per_kv = n_heads / n_kv_heads;
+    const uint kv_head_idx  = head_idx / heads_per_kv;
+
+    const uint q_base = batch_idx * (n_heads * seq_len * head_dim)
+                      + head_idx * (seq_len * head_dim)
+                      + q_pos * head_dim;
+
+    const uint k_head_base = batch_idx * (n_kv_heads * kv_seq_len * head_dim)
+                           + kv_head_idx * (kv_seq_len * head_dim);
+
+    const uint v_head_base = k_head_base;
+    const uint o_base = q_base;
+
+    const float scale = rsqrt(float(head_dim));
+
+    const uint abs_pos = kv_seq_len - seq_len + q_pos;
+    const uint max_k = min(abs_pos + 1, kv_seq_len);
+
+    // Pass 1: find max score.
+    float max_score = -INFINITY;
+    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
+        float dot = 0.0f;
+        const uint k_offset = k_head_base + k_pos * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
+        }
+        float score = dot * scale;
+        max_score = max(max_score, score);
+    }
+
+    // Pass 2a: sum of exp(score - max).
+    float sum_exp = 0.0f;
+    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
+        float dot = 0.0f;
+        const uint k_offset = k_head_base + k_pos * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
+        }
+        float score = dot * scale;
+        sum_exp += exp(score - max_score);
+    }
+
+    // Pass 2b: accumulate weighted V.
+    float acc[512];
+    for (uint d = 0; d < head_dim; d++) {
+        acc[d] = 0.0f;
+    }
+
+    const float inv_sum = 1.0f / sum_exp;
+
+    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
+        float dot = 0.0f;
+        const uint k_offset = k_head_base + k_pos * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
+        }
+        float score = dot * scale;
+        float weight = exp(score - max_score) * inv_sum;
+
+        const uint v_offset = v_head_base + k_pos * head_dim;
+        for (uint d = 0; d < head_dim; d++) {
+            acc[d] += weight * float(V[v_offset + d]);
+        }
+    }
+
+    // Write output as bfloat16.
+    for (uint d = 0; d < head_dim; d++) {
+        O[o_base + d] = bfloat(acc[d]);
+    }
+}

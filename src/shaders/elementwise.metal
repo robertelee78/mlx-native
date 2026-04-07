@@ -93,6 +93,50 @@ kernel void elementwise_mul_f16(
 }
 
 // --------------------------------------------------------------------------
+// elementwise_add_bf16 — out = a + b (bfloat16)
+//
+// Upcasts to f32 for the addition, downcasts result to bfloat16.
+//
+// Buffers:
+//   0: a      — bfloat [n_elements]
+//   1: b      — bfloat [n_elements]
+//   2: output — bfloat [n_elements]
+//   3: params — { n_elements }
+// --------------------------------------------------------------------------
+kernel void elementwise_add_bf16(
+    device const bfloat* a       [[buffer(0)]],
+    device const bfloat* b       [[buffer(1)]],
+    device bfloat*       output  [[buffer(2)]],
+    constant ElementwiseParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    output[gid] = bfloat(float(a[gid]) + float(b[gid]));
+}
+
+// --------------------------------------------------------------------------
+// elementwise_mul_bf16 — out = a * b (bfloat16)
+//
+// Upcasts to f32 for the multiply, downcasts result to bfloat16.
+//
+// Buffers:
+//   0: a      — bfloat [n_elements]
+//   1: b      — bfloat [n_elements]
+//   2: output — bfloat [n_elements]
+//   3: params — { n_elements }
+// --------------------------------------------------------------------------
+kernel void elementwise_mul_bf16(
+    device const bfloat* a       [[buffer(0)]],
+    device const bfloat* b       [[buffer(1)]],
+    device bfloat*       output  [[buffer(2)]],
+    constant ElementwiseParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    output[gid] = bfloat(float(a[gid]) * float(b[gid]));
+}
+
+// --------------------------------------------------------------------------
 // cast_f16_to_f32 — convert half to float
 //
 // Buffers:

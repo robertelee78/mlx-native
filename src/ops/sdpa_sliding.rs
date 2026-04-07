@@ -104,7 +104,7 @@ fn validate_sliding_params(params: &SdpaSlidingParams) -> Result<()> {
 
 /// Validate that a buffer has the expected byte length for the given shape.
 fn validate_buffer(buf: &MlxBuffer, name: &str, expected_elements: usize) -> Result<()> {
-    let expected_bytes = expected_elements * DType::F32.size_of();
+    let expected_bytes = expected_elements * buf.dtype().size_of();
     if buf.byte_len() < expected_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "{name} buffer too small: expected at least {expected_bytes} bytes, got {}",
@@ -184,7 +184,9 @@ pub fn sdpa_sliding(
     }
 
     // Get the compiled pipeline.
-    let pipeline = registry.get_pipeline("sdpa_sliding", device.metal_device())?;
+    // Select kernel based on buffer dtype.
+    let kernel_name = if q.dtype() == DType::BF16 { "sdpa_sliding_bf16" } else { "sdpa_sliding" };
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
     // Calculate dispatch grid.
     let n_tiles = (params.seq_len + TILE_Q - 1) / TILE_Q;

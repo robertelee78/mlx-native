@@ -75,6 +75,8 @@ impl KernelRegistry {
         sources.insert("elementwise_add_f16".into(), elementwise_src);
         sources.insert("elementwise_mul_f32".into(), elementwise_src);
         sources.insert("elementwise_mul_f16".into(), elementwise_src);
+        sources.insert("elementwise_add_bf16".into(), elementwise_src);
+        sources.insert("elementwise_mul_bf16".into(), elementwise_src);
         sources.insert("cast_f16_to_f32".into(), elementwise_src);
         sources.insert("cast_f32_to_f16".into(), elementwise_src);
         sources.insert("cast_bf16_to_f32".into(), elementwise_src);
@@ -85,13 +87,16 @@ impl KernelRegistry {
         // Attention kernels (Story 1.3)
         let sdpa_src: &'static str = include_str!("shaders/sdpa.metal");
         sources.insert("sdpa".into(), sdpa_src);
+        sources.insert("sdpa_bf16".into(), sdpa_src);
         let sdpa_sliding_src: &'static str = include_str!("shaders/sdpa_sliding.metal");
         sources.insert("sdpa_sliding".into(), sdpa_sliding_src);
+        sources.insert("sdpa_sliding_bf16".into(), sdpa_sliding_src);
 
         // RoPE, normalization, activation kernels (Story 1.4)
         let rope_src: &'static str = include_str!("shaders/rope.metal");
         sources.insert("rope_f32".into(), rope_src);
         sources.insert("rope_f16".into(), rope_src);
+        sources.insert("rope_bf16".into(), rope_src);
         let rms_norm_src: &'static str = include_str!("shaders/rms_norm.metal");
         sources.insert("rms_norm_f32".into(), rms_norm_src);
         sources.insert("rms_norm_f16".into(), rms_norm_src);
