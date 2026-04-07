@@ -35,25 +35,28 @@ struct QuantizedMatmulParams {
 // bf16, so we read them as raw uint16_t and reinterpret via as_type<bfloat>,
 // then cast to float for dequantization arithmetic.
 
-// ---- 4-bit dequantization ----
-// Extract the i-th 4-bit value from a packed uint32.
-inline float dequant_4bit(uint packed, uint i, float scale, float bias) {
+// ---- Dequantization helpers ----
+// All dequant functions operate in bf16 arithmetic to match MLX's precision.
+// MLX dequantizes weights to bf16 (the model's native dtype), and multiplies
+// bf16 weights with bf16 inputs, accumulating products in f32.
+// Using bf16 dequant ensures our weight values match MLX's exactly.
+
+// 4-bit: Extract the i-th 4-bit value from a packed uint32.
+inline bfloat dequant_4bit(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (4 * i)) & 0xFu;
-    return scale * float(val) + bias;
+    return bfloat(val) * scale + bias;
 }
 
-// ---- 6-bit dequantization (MLX 3-byte triplet) ----
-// Extract the i-th 6-bit value from a packed uint32 (4 values per uint32).
-inline float dequant_6bit(uint packed, uint i, float scale, float bias) {
+// 6-bit: Extract the i-th 6-bit value from a packed uint32 (4 values per uint32).
+inline bfloat dequant_6bit(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (6 * i)) & 0x3Fu;
-    return scale * float(val) + bias;
+    return bfloat(val) * scale + bias;
 }
 
-// ---- 8-bit dequantization ----
-// Extract the i-th 8-bit value from a packed uint32 (4 values per uint32).
-inline float dequant_8bit(uint packed, uint i, float scale, float bias) {
+// 8-bit: Extract the i-th 8-bit value from a packed uint32 (4 values per uint32).
+inline bfloat dequant_8bit(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (8 * i)) & 0xFFu;
-    return scale * float(val) + bias;
+    return bfloat(val) * scale + bias;
 }
 
 // Main quantized matmul kernel (f32 output).
@@ -114,10 +117,11 @@ kernel void quantized_matmul(
         uint packed = weight[w_base + pack_idx];
 
         uint g = k / group_size;
-        float scale = static_cast<float>(as_type<bfloat>(scales[sb_base + g]));
-        float bias  = static_cast<float>(as_type<bfloat>(biases[sb_base + g]));
+        bfloat scale = as_type<bfloat>(scales[sb_base + g]);
+        bfloat bias  = as_type<bfloat>(biases[sb_base + g]);
 
-        float w;
+        // Dequantize weight to bf16 (matching MLX's native bf16 dequant)
+        bfloat w;
         if (bits == 4) {
             w = dequant_4bit(packed, in_pack_idx, scale, bias);
         } else if (bits == 6) {
@@ -126,8 +130,10 @@ kernel void quantized_matmul(
             w = dequant_8bit(packed, in_pack_idx, scale, bias);
         }
 
-        float x = input[row * K + k];
-        acc += w * x;
+        // Read input and truncate to bf16 to match MLX's bf16 pipeline.
+        // Accumulate bf16*bf16 products in f32 for numerical stability.
+        bfloat x = bfloat(input[row * K + k]);
+        acc += float(w) * float(x);
     }
 
     output[row * params.N + col] = acc;
