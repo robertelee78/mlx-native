@@ -1,0 +1,19 @@
+[package]
+name = "mlx-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81.0"
+description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "mlx_native"
+path = "src/lib.rs"
+
+[dependencies]
+metal = "0.33"
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+static_assertions = "1"
