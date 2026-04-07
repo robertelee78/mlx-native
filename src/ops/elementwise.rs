@@ -152,6 +152,87 @@ pub fn elementwise_mul(
     elementwise_binary(encoder, registry, device, a, b, output, n_elements, "mul", dtype)
 }
 
+/// MSL-compatible params struct for scalar multiplication.
+///
+/// Must match `ScalarMulParams` in `elementwise.metal`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuScalarMulParams {
+    scalar: f32,
+    count: u32,
+}
+
+/// Encode scalar multiplication: `output[i] = input[i] * scalar` (bf16).
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry.
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer (bf16).
+/// * `output`     - Output buffer (bf16, same size as input).
+/// * `n_elements` - Number of elements to process.
+/// * `scalar`     - The f32 scalar to multiply by.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if `n_elements` is zero or buffers are too small.
+pub fn scalar_mul_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: usize,
+    scalar: f32,
+) -> Result<()> {
+    if n_elements == 0 {
+        return Err(MlxError::InvalidArgument(
+            "scalar_mul_bf16: n_elements must be > 0".into(),
+        ));
+    }
+
+    let elem_bytes = n_elements * DType::BF16.size_of();
+    if input.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "scalar_mul_bf16: input buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            input.byte_len()
+        )));
+    }
+    if output.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "scalar_mul_bf16: output buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("scalar_mul_bf16", device)?;
+
+    let gpu_params = GpuScalarMulParams {
+        scalar,
+        count: n_elements as u32,
+    };
+
+    let grid = MTLSize::new(n_elements as u64, 1, 1);
+    let tg = MTLSize::new(std::cmp::min(ELEMENTWISE_TG_SIZE, n_elements as u64), 1, 1);
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
 /// Cast direction for dtype conversion.
 pub enum CastDirection {
     /// f16 -> f32

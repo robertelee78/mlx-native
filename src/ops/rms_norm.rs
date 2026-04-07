@@ -21,6 +21,7 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("rms_norm_f32", RMS_NORM_SHADER_SOURCE);
     registry.register_source("rms_norm_f16", RMS_NORM_SHADER_SOURCE);
     registry.register_source("rms_norm_bf16", RMS_NORM_SHADER_SOURCE);
+    registry.register_source("rms_norm_no_scale_bf16", RMS_NORM_SHADER_SOURCE);
 }
 
 /// Dispatch an RMS normalization operation on the GPU.
@@ -105,6 +106,83 @@ pub fn dispatch_rms_norm(
             (1, weight),
             (2, output),
             (3, params_buf),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Dispatch an RMS normalization without learned scale (bf16 only).
+///
+/// Computes: `output = x * rsqrt(mean(x^2) + eps)` — no weight multiplication.
+/// Used for per-head V normalization in Gemma 4.
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry (must have rms_norm_no_scale_bf16 registered).
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer of shape `[rows, dim]` (bf16).
+/// * `output`     - Output buffer (same dtype and shape as input).
+/// * `params_buf` - Params buffer containing `[eps, dim]` as f32.
+/// * `rows`       - Number of rows to normalize.
+/// * `dim`        - Dimension of the last axis.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if parameters are invalid.
+pub fn dispatch_rms_norm_no_scale_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "RMS norm no_scale: rows and dim must be > 0".into(),
+        ));
+    }
+
+    let expected = (rows as usize) * (dim as usize);
+    if input.element_count() != expected {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm no_scale: input element count {} != rows({}) * dim({})",
+            input.element_count(),
+            rows,
+            dim
+        )));
+    }
+    if output.element_count() != expected {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm no_scale: output element count {} != rows({}) * dim({})",
+            output.element_count(),
+            rows,
+            dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("rms_norm_no_scale_bf16", device)?;
+
+    // One threadgroup per row.  Threadgroup size must be a power of 2
+    // for the tree reduction to work correctly.
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+
+    // Threadgroup shared memory: tg_size floats for the reduction.
+    let shared_mem_bytes = tg_size * 4; // sizeof(float) = 4
+
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[
+            (0, input),
+            (1, output),
+            (2, params_buf),
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new(rows as u64, 1, 1),

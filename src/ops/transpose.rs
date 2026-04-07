@@ -113,3 +113,92 @@ pub fn transpose_2d(
 
     Ok(())
 }
+
+/// MSL-compatible params struct for 3D permute [A, B, C] -> [B, A, C].
+///
+/// Must match `Permute021Params` in `elementwise.metal`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuPermute021Params {
+    dim_a: u32,
+    dim_b: u32,
+    dim_c: u32,
+}
+
+/// Encode a 3D permutation: `[A, B, C] -> [B, A, C]` (bf16).
+///
+/// This is used to convert between `[seq_len, n_heads, head_dim]` and
+/// `[n_heads, seq_len, head_dim]` layouts.
+///
+/// # Buffer expectations
+///
+/// * `input`  — `[dim_a, dim_b, dim_c]` in bf16
+/// * `output` — `[dim_b, dim_a, dim_c]` in bf16 (must be pre-allocated)
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if any dimension is zero or buffers
+/// are too small.
+pub fn permute_021_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    dim_a: usize,
+    dim_b: usize,
+    dim_c: usize,
+) -> Result<()> {
+    if dim_a == 0 || dim_b == 0 || dim_c == 0 {
+        return Err(MlxError::InvalidArgument(
+            "permute_021_bf16: all dimensions must be > 0".into(),
+        ));
+    }
+
+    let total_elements = dim_a * dim_b * dim_c;
+    let elem_bytes = total_elements * 2; // bf16 = 2 bytes
+    if input.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "permute_021_bf16: input buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            input.byte_len()
+        )));
+    }
+    if output.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "permute_021_bf16: output buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("permute_021_bf16", device)?;
+
+    let gpu_params = GpuPermute021Params {
+        dim_a: dim_a as u32,
+        dim_b: dim_b as u32,
+        dim_c: dim_c as u32,
+    };
+
+    // 3D grid: (dim_c, dim_b, dim_a), each thread copies one element
+    let grid = MTLSize::new(dim_c as u64, dim_b as u64, dim_a as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, dim_c as u64),
+        std::cmp::min(4, dim_b as u64),
+        std::cmp::min(4, dim_a as u64),
+    );
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}

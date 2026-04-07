@@ -223,6 +223,69 @@ struct TransposeParams {
     uint cols;
 };
 
+// --------------------------------------------------------------------------
+// scalar_mul_bf16 — out = input * scalar (bfloat16 input/output, f32 scalar)
+//
+// Buffers:
+//   0: input  — bfloat [count]
+//   1: output — bfloat [count]
+//   2: params — { float scalar; uint count; }
+// --------------------------------------------------------------------------
+
+struct ScalarMulParams {
+    float scalar;
+    uint count;
+};
+
+kernel void scalar_mul_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant ScalarMulParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.count) return;
+    output[gid] = bfloat(static_cast<float>(input[gid]) * params.scalar);
+}
+
+// --------------------------------------------------------------------------
+// permute_021_bf16 — Transpose [A, B, C] -> [B, A, C] for bfloat16
+//
+// Used to convert [seq_len, n_heads, head_dim] <-> [n_heads, seq_len, head_dim]
+//
+// Buffers:
+//   0: input  — bfloat [A * B * C]
+//   1: output — bfloat [B * A * C]
+//   2: params — { uint dim_a; uint dim_b; uint dim_c; }
+//
+// Grid: (C, B, A), each thread copies one element
+// --------------------------------------------------------------------------
+
+struct Permute021Params {
+    uint dim_a;
+    uint dim_b;
+    uint dim_c;
+};
+
+kernel void permute_021_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint b = gid.y;
+    const uint a = gid.z;
+
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+
+    // input[a, b, c]  -> offset = a * (B*C) + b * C + c
+    // output[b, a, c] -> offset = b * (A*C) + a * C + c
+    const uint in_idx  = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    const uint out_idx = b * (params.dim_a * params.dim_c) + a * params.dim_c + c;
+
+    output[out_idx] = input[in_idx];
+}
+
 kernel void transpose_2d_f32(
     device const float* input  [[buffer(0)]],
     device float*       output [[buffer(1)]],

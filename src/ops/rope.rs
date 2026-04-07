@@ -19,6 +19,8 @@ pub static ROPE_SHADER_SOURCE: &str = include_str!("../shaders/rope.metal");
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("rope_f32", ROPE_SHADER_SOURCE);
     registry.register_source("rope_f16", ROPE_SHADER_SOURCE);
+    registry.register_source("rope_bf16", ROPE_SHADER_SOURCE);
+    registry.register_source("rope_neox_bf16", ROPE_SHADER_SOURCE);
 }
 
 /// Dispatch a RoPE operation on the GPU.
@@ -111,6 +113,123 @@ pub fn dispatch_rope(
             (3, positions_buf),
         ],
         MTLSize::new(half_dim as u64, seq_len as u64, 1),
+        MTLSize::new(tg_x, tg_y, 1),
+    );
+
+    Ok(())
+}
+
+/// GPU params for the neox RoPE kernel's auxiliary params buffer.
+///
+/// Must match the uint array in `rope_neox_bf16` buffer(4).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuRopeNeoxParams {
+    n_heads: u32,
+    _pad: u32,
+}
+
+/// Dispatch a Neox/split-convention RoPE operation on the GPU (bf16 only).
+///
+/// The Neox convention pairs `(d[i], d[i + half_rope_dim])` instead of
+/// `(d[2i], d[2i+1])`.  Supports partial rotary where only the first
+/// `rope_dim` dimensions are rotated.
+///
+/// # Arguments
+///
+/// * `encoder`       - Command encoder to record the dispatch into.
+/// * `registry`      - Kernel registry (must have rope_neox_bf16 registered).
+/// * `device`        - Metal device for pipeline compilation.
+/// * `input`         - Input buffer of shape `[seq_len * n_heads, head_dim]` (bf16).
+/// * `output`        - Output buffer (same shape and dtype as input).
+/// * `params_buf`    - Params buffer containing `[theta, head_dim, rope_dim, 0]` as f32.
+/// * `positions_buf` - Positions buffer containing `[pos_0, pos_1, ...]` as u32 (length = seq_len).
+/// * `seq_len`       - Number of sequence positions.
+/// * `n_heads`       - Number of attention heads.
+/// * `head_dim`      - Dimension of each head.
+/// * `rope_dim`      - Number of dimensions to rotate (must be even, <= head_dim).
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if parameters are invalid.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rope_neox_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    positions_buf: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    rope_dim: u32,
+) -> Result<()> {
+    use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
+
+    if rope_dim % 2 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "RoPE neox rope_dim must be even, got {}",
+            rope_dim
+        )));
+    }
+    if rope_dim > head_dim {
+        return Err(MlxError::InvalidArgument(format!(
+            "RoPE neox rope_dim ({}) must be <= head_dim ({})",
+            rope_dim, head_dim
+        )));
+    }
+    if head_dim == 0 || seq_len == 0 || n_heads == 0 {
+        return Err(MlxError::InvalidArgument(
+            "RoPE neox head_dim, seq_len, and n_heads must be > 0".into(),
+        ));
+    }
+
+    let n_rows = (seq_len as usize) * (n_heads as usize);
+    let expected_elements = n_rows * (head_dim as usize);
+    if input.element_count() != expected_elements {
+        return Err(MlxError::InvalidArgument(format!(
+            "RoPE neox input element count {} != seq_len({}) * n_heads({}) * head_dim({})",
+            input.element_count(),
+            seq_len,
+            n_heads,
+            head_dim
+        )));
+    }
+    if output.element_count() != expected_elements {
+        return Err(MlxError::InvalidArgument(format!(
+            "RoPE neox output element count {} != seq_len({}) * n_heads({}) * head_dim({})",
+            output.element_count(),
+            seq_len,
+            n_heads,
+            head_dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("rope_neox_bf16", device)?;
+    let half_rope = rope_dim / 2;
+
+    let gpu_rope_params = GpuRopeNeoxParams {
+        n_heads,
+        _pad: 0,
+    };
+
+    // Grid: (half_rope, n_rows) — one thread per pair per row
+    let tg_x = std::cmp::min(64, half_rope as u64);
+    let tg_y = std::cmp::min(4, n_rows as u64);
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(params_buf)),
+            (3, KernelArg::Buffer(positions_buf)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_rope_params))),
+        ],
+        MTLSize::new(half_rope as u64, n_rows as u64, 1),
         MTLSize::new(tg_x, tg_y, 1),
     );
 

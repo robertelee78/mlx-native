@@ -142,3 +142,59 @@ kernel void rms_norm_bf16(
         output[base + i] = bfloat(val * rms_inv * static_cast<float>(weight[i]));
     }
 }
+
+/// RMS Normalization without learned scale (bfloat16).
+///
+/// Computes: output = input / sqrt(mean(input^2) + eps)
+/// No weight multiplication — used for per-head V norm in Gemma 4.
+///
+/// Buffer layout:
+///   buffer(0): input   — bfloat array of shape [rows, dim]
+///   buffer(1): output  — bfloat array of shape [rows, dim]
+///   buffer(2): params  — float2: (eps, dim_f)
+///
+/// Threadgroup: (threadgroup_size, 1, 1) — one threadgroup per row
+/// Grid threadgroups: (rows, 1, 1)
+
+kernel void rms_norm_no_scale_bf16(
+    device const bfloat *input     [[buffer(0)]],
+    device bfloat       *output    [[buffer(1)]],
+    device const float  *params    [[buffer(2)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    threadgroup float *shared      [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+
+    const uint base = row_idx * dim;
+
+    // Phase 1: accumulate sum of squares in f32 for numerical stability
+    float partial_sum_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float val = static_cast<float>(input[base + i]);
+        partial_sum_sq += val * val;
+    }
+
+    // Reduction in threadgroup shared memory (f32 for accuracy)
+    shared[tid] = partial_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Compute the normalization factor: rsqrt(mean(x^2) + eps)
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 2: normalize in f32, store as bf16 — NO weight multiply
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float val = static_cast<float>(input[base + i]);
+        output[base + i] = bfloat(val * rms_inv);
+    }
+}

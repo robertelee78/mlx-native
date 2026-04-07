@@ -85,6 +85,8 @@ impl KernelRegistry {
         sources.insert("cast_f32_to_f16".into(), elementwise_src);
         sources.insert("cast_bf16_to_f32".into(), elementwise_src);
         sources.insert("cast_f32_to_bf16".into(), elementwise_src);
+        sources.insert("scalar_mul_bf16".into(), elementwise_src);
+        sources.insert("permute_021_bf16".into(), elementwise_src);
         sources.insert("transpose_2d_f32".into(), elementwise_src);
         sources.insert("transpose_2d_f16".into(), elementwise_src);
 
@@ -101,10 +103,12 @@ impl KernelRegistry {
         sources.insert("rope_f32".into(), rope_src);
         sources.insert("rope_f16".into(), rope_src);
         sources.insert("rope_bf16".into(), rope_src);
+        sources.insert("rope_neox_bf16".into(), rope_src);
         let rms_norm_src: &'static str = include_str!("shaders/rms_norm.metal");
         sources.insert("rms_norm_f32".into(), rms_norm_src);
         sources.insert("rms_norm_f16".into(), rms_norm_src);
         sources.insert("rms_norm_bf16".into(), rms_norm_src);
+        sources.insert("rms_norm_no_scale_bf16".into(), rms_norm_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
