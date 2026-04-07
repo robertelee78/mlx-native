@@ -61,7 +61,7 @@ pub use error::{MlxError, Result};
 pub use kernel_registry::KernelRegistry;
 
 // Re-export ops.
-pub use ops::quantized_matmul::{quantized_matmul, QuantizedMatmulParams};
+pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 
 // Re-export weight loading utilities.
 pub use weight::{

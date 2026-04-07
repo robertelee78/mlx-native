@@ -52,6 +52,10 @@ impl KernelRegistry {
             "quantized_matmul".into(),
             include_str!("shaders/quantized_matmul.metal"),
         );
+        sources.insert(
+            "quantized_matmul_simd".into(),
+            include_str!("shaders/quantized_matmul.metal"),
+        );
 
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");

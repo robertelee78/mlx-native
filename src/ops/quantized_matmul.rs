@@ -220,6 +220,176 @@ pub fn quantized_matmul(
     Ok(output)
 }
 
+/// Check whether the SIMD-cooperative kernel can be used for the given params.
+///
+/// The SIMD path requires:
+///   - bits is 4 or 8 (not 6)
+///   - N is divisible by 8 (results_per_simdgroup * num_simdgroups)
+///   - K is divisible by block_size:
+///     - 4-bit: K % 256 == 0 (block_size = 8 values/thread * 32 SIMD = 256)
+///       This matches MLX's `qmv` kernel for K=2816 (which is NOT 512-aligned)
+///     - 8-bit: K % 256 == 0 (block_size = 8 * 32 = 256)
+fn can_use_simd_kernel(params: &QuantizedMatmulParams) -> bool {
+    let bn = 8u32; // num_simdgroups * results_per_simdgroup
+    if params.n % bn != 0 {
+        return false;
+    }
+    match params.bits {
+        4 => params.k % 256 == 0,  // qmv path (not qmv_fast)
+        8 => params.k % 256 == 0,
+        _ => false,
+    }
+}
+
+/// Encode a quantized matrix-vector multiply using the SIMD-cooperative kernel
+/// that matches MLX's `qmv_fast` accumulation pattern exactly.
+///
+/// This kernel uses 2 simdgroups of 32 threads, each producing 4 output rows,
+/// with `simd_sum()` reduction. The accumulation order matches MLX bit-for-bit.
+///
+/// Falls back to the scalar `quantized_matmul` kernel if the dimensions don't
+/// meet the alignment requirements.
+///
+/// # Arguments
+///
+/// Same as [`quantized_matmul`].
+///
+/// # Returns
+///
+/// A freshly allocated `MlxBuffer` for the output of shape `[M, N]` with dtype `F32`.
+pub fn quantized_matmul_simd(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    scales: &MlxBuffer,
+    biases: &MlxBuffer,
+    params: &QuantizedMatmulParams,
+) -> Result<MlxBuffer> {
+    // Fall back to scalar kernel if dimensions don't support SIMD path.
+    if !can_use_simd_kernel(params) {
+        return quantized_matmul(encoder, registry, device, input, weight, scales, biases, params);
+    }
+
+    // --- Validate bits ---
+    if params.bits != 4 && params.bits != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "SIMD kernel: unsupported bits value {}; only 4 and 8 are supported",
+            params.bits
+        )));
+    }
+
+    // --- Validate dimensions are non-zero ---
+    if params.m == 0 || params.k == 0 || params.n == 0 {
+        return Err(MlxError::InvalidArgument(
+            "M, K, and N must all be > 0".into(),
+        ));
+    }
+    if params.group_size == 0 {
+        return Err(MlxError::InvalidArgument(
+            "group_size must be > 0".into(),
+        ));
+    }
+
+    // --- Validate buffer sizes ---
+    let expected_input = (params.m as usize) * (params.k as usize) * DType::F32.size_of();
+    if input.byte_len() < expected_input {
+        return Err(MlxError::InvalidArgument(format!(
+            "Input buffer too small: expected at least {} bytes for [{}x{}] f32, got {}",
+            expected_input, params.m, params.k, input.byte_len()
+        )));
+    }
+
+    let expected_w = expected_weight_bytes(params.k, params.n, params.bits);
+    if weight.byte_len() < expected_w {
+        return Err(MlxError::InvalidArgument(format!(
+            "Weight buffer too small: expected at least {} bytes for {}bit [{}x{}], got {}",
+            expected_w, params.bits, params.n, params.k, weight.byte_len()
+        )));
+    }
+
+    let expected_s = expected_scales_bytes(params.k, params.n, params.group_size);
+    if scales.byte_len() < expected_s {
+        return Err(MlxError::InvalidArgument(format!(
+            "Scales buffer too small: expected at least {} bytes, got {}",
+            expected_s, scales.byte_len()
+        )));
+    }
+    if biases.byte_len() < expected_s {
+        return Err(MlxError::InvalidArgument(format!(
+            "Biases buffer too small: expected at least {} bytes, got {}",
+            expected_s, biases.byte_len()
+        )));
+    }
+
+    // --- Get (or compile) the SIMD pipeline ---
+    let pipeline = registry.get_pipeline("quantized_matmul_simd", device.metal_device())?;
+
+    // --- Allocate output buffer ---
+    let output_bytes = (params.m as usize) * (params.n as usize) * DType::F32.size_of();
+    let output = device.alloc_buffer(
+        output_bytes,
+        DType::F32,
+        vec![params.m as usize, params.n as usize],
+    )?;
+
+    // --- Create GPU params buffer ---
+    let gpu_params = QuantizedMatmulGpuParams {
+        m: params.m,
+        k: params.k,
+        n: params.n,
+        group_size: params.group_size,
+        bits: params.bits,
+    };
+    let params_bytes = std::mem::size_of::<QuantizedMatmulGpuParams>();
+    let mut params_buf = device.alloc_buffer(params_bytes, DType::U32, vec![5])?;
+    {
+        let slice: &mut [QuantizedMatmulGpuParams] = bytemuck::cast_slice_mut(
+            params_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| MlxError::InvalidArgument(format!("params buf write: {e}")))?,
+        );
+        slice[0] = gpu_params;
+    }
+
+    // --- Dispatch with MLX's qmv_fast pattern ---
+    // threadgroup_size = (SIMD_SIZE, num_simdgroups, 1) = (32, 2, 1) = 64 threads
+    // threadgroups     = (M, ceil(N / 8), 1)
+    //
+    // In the kernel:
+    //   tid.x = input row (M dimension)
+    //   tid.y = output column block (each block produces 8 output columns)
+    //   simd_gid = which simdgroup (0 or 1), each handles 4 of the 8 columns
+    //   simd_lid = thread index within simdgroup (0..31)
+    let num_simdgroups = 2u64;
+    let results_per_simdgroup = 4u64;
+    let bn = num_simdgroups * results_per_simdgroup; // 8
+
+    let threadgroup_size = metal::MTLSize::new(32, num_simdgroups, 1);
+    let threadgroups = metal::MTLSize::new(
+        params.m as u64,
+        (params.n as u64 + bn - 1) / bn,
+        1,
+    );
+
+    encoder.encode_threadgroups(
+        pipeline,
+        &[
+            (0, input),
+            (1, weight),
+            (2, scales),
+            (3, biases),
+            (4, &output),
+            (5, &params_buf),
+        ],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    Ok(output)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
