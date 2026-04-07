@@ -24,7 +24,7 @@ pub struct QuantizedMatmulParams {
     pub n: u32,
     /// Number of consecutive values sharing one scale/bias pair.
     pub group_size: u32,
-    /// Quantization bit width (4 or 6).
+    /// Quantization bit width (4, 6, or 8).
     pub bits: u32,
 }
 
@@ -47,10 +47,12 @@ struct QuantizedMatmulGpuParams {
 ///   Total = N * ceil(K/8) * 4 bytes.
 /// - 6-bit: 4 values per uint32, so each row needs ceil(K/4) uint32s.
 ///   Total = N * ceil(K/4) * 4 bytes.
+/// - 8-bit: 4 values per uint32, so each row needs ceil(K/4) uint32s.
+///   Total = N * ceil(K/4) * 4 bytes.
 fn expected_weight_bytes(k: u32, n: u32, bits: u32) -> usize {
     let values_per_pack: u32 = match bits {
         4 => 8,
-        6 => 4,
+        6 | 8 => 4,
         _ => return 0,
     };
     let packs_per_row = (k + values_per_pack - 1) / values_per_pack;
@@ -101,9 +103,9 @@ pub fn quantized_matmul(
     params: &QuantizedMatmulParams,
 ) -> Result<MlxBuffer> {
     // --- Validate bits ---
-    if params.bits != 4 && params.bits != 6 {
+    if params.bits != 4 && params.bits != 6 && params.bits != 8 {
         return Err(MlxError::InvalidArgument(format!(
-            "Unsupported bits value {}; only 4 and 6 are supported",
+            "Unsupported bits value {}; only 4, 6, and 8 are supported",
             params.bits
         )));
     }
@@ -357,6 +359,34 @@ mod tests {
                         if k_idx < k {
                             let val = quant_values[col * k + k_idx] as u32 & 0x3F;
                             packed |= val << (6 * i);
+                        }
+                    }
+                    slice[col * packs_per_row + pack] = packed;
+                }
+            }
+        }
+        buf
+    }
+
+    // Helper: pack 8-bit values into uint32 buffer.
+    // 4 values per uint32 (8 bits each).
+    fn pack_8bit_buffer(device: &MlxDevice, n: usize, k: usize, quant_values: &[u8]) -> MlxBuffer {
+        let values_per_pack = 4;
+        let packs_per_row = (k + values_per_pack - 1) / values_per_pack;
+        let total_packs = n * packs_per_row;
+        let byte_len = total_packs * 4;
+
+        let mut buf = device.alloc_buffer(byte_len, DType::U32, vec![n, packs_per_row]).expect("alloc");
+        {
+            let slice: &mut [u32] = buf.as_mut_slice().expect("as_mut_slice");
+            for col in 0..n {
+                for pack in 0..packs_per_row {
+                    let mut packed: u32 = 0;
+                    for i in 0..values_per_pack {
+                        let k_idx = pack * values_per_pack + i;
+                        if k_idx < k {
+                            let val = quant_values[col * k + k_idx] as u32 & 0xFF;
+                            packed |= val << (8 * i);
                         }
                     }
                     slice[col * packs_per_row + pack] = packed;
@@ -621,6 +651,103 @@ mod tests {
             }
             other => panic!("Expected InvalidArgument for input size, got {:?}", other),
         }
+    }
+
+    /// Test 8-bit quantized matmul with a small known example.
+    ///
+    /// input = [[1.0, 2.0, 3.0, 4.0]]  (M=1, K=4)
+    /// weight quantized values (N=2, K=4): [[10, 20, 30, 40], [50, 60, 70, 80]]
+    /// scales = [[0.01], [0.02]]  (1 group per row since group_size=64 > K=4)
+    /// biases = [[0.0], [0.0]]
+    ///
+    /// dequant weight row 0: [0.1, 0.2, 0.3, 0.4]
+    /// dequant weight row 1: [1.0, 1.2, 1.4, 1.6]
+    ///
+    /// output[0][0] = 1.0*0.1 + 2.0*0.2 + 3.0*0.3 + 4.0*0.4 = 3.0
+    /// output[0][1] = 1.0*1.0 + 2.0*1.2 + 3.0*1.4 + 4.0*1.6 = 14.0
+    #[test]
+    fn test_8bit_matmul_small_known() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+
+        let m = 1u32;
+        let k = 4u32;
+        let n = 2u32;
+        let group_size = 64u32;
+        let bits = 8u32;
+
+        let input = f16_buffer(&device, vec![m as usize, k as usize], &[1.0, 2.0, 3.0, 4.0]);
+
+        // 8-bit quantized weight values (0..255): row0=[10,20,30,40], row1=[50,60,70,80]
+        let quant_w: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let weight = pack_8bit_buffer(&device, n as usize, k as usize, &quant_w);
+
+        let scales = f16_buffer(&device, vec![n as usize, 1], &[0.01, 0.02]);
+        let biases = f16_buffer(&device, vec![n as usize, 1], &[0.0, 0.0]);
+
+        let params = QuantizedMatmulParams { m, k, n, group_size, bits };
+
+        let output = quantized_matmul(
+            &mut encoder, &mut registry, &device,
+            &input, &weight, &scales, &biases, &params,
+        ).expect("quantized_matmul");
+
+        encoder.commit_and_wait().expect("commit");
+
+        let result = read_f16(&output);
+        assert_eq!(result.len(), 2);
+
+        // Tolerance: f16 precision is ~1e-3 for these magnitudes.
+        let tol = 1e-1;
+        assert!(
+            (result[0] - 3.0).abs() < tol,
+            "output[0]={}, expected ~3.0", result[0]
+        );
+        assert!(
+            (result[1] - 14.0).abs() < tol,
+            "output[1]={}, expected ~14.0", result[1]
+        );
+    }
+
+    /// Test 8-bit with non-zero biases.
+    #[test]
+    fn test_8bit_matmul_with_bias() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+
+        let m = 1u32;
+        let k = 4u32;
+        let n = 1u32;
+        let group_size = 64u32;
+        let bits = 8u32;
+
+        let input = f16_buffer(&device, vec![1, 4], &[1.0, 1.0, 1.0, 1.0]);
+
+        // quant values all 0 -> dequant = scale*0 + bias = bias
+        let quant_w: Vec<u8> = vec![0, 0, 0, 0];
+        let weight = pack_8bit_buffer(&device, 1, 4, &quant_w);
+
+        let scales = f16_buffer(&device, vec![1, 1], &[1.0]);
+        let biases = f16_buffer(&device, vec![1, 1], &[0.5]);
+
+        let params = QuantizedMatmulParams { m, k, n, group_size, bits };
+
+        let output = quantized_matmul(
+            &mut encoder, &mut registry, &device,
+            &input, &weight, &scales, &biases, &params,
+        ).expect("quantized_matmul");
+
+        encoder.commit_and_wait().expect("commit");
+
+        let result = read_f16(&output);
+        // Each weight dequantized to 0.5, dot with [1,1,1,1] = 2.0
+        let tol = 1e-2;
+        assert!(
+            (result[0] - 2.0).abs() < tol,
+            "output[0]={}, expected ~2.0", result[0]
+        );
     }
 
     /// Test with multiple groups along K (K > group_size).

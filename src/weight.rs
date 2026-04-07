@@ -78,6 +78,17 @@ fn default_group_size() -> usize {
     64
 }
 
+/// Strip `.weight`, `.scales`, or `.biases` suffix from a tensor name to get
+/// the base linear layer name.  Returns the input unchanged if no suffix matches.
+fn strip_tensor_suffix(name: &str) -> &str {
+    for suffix in &[".weight", ".scales", ".biases"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    name
+}
+
 impl QuantizationConfig {
     /// Load and parse a `quantization_config.json` file from disk.
     ///
@@ -103,16 +114,142 @@ impl QuantizationConfig {
         })
     }
 
+    /// Parse per-tensor quantization overrides from the `"quantization"` section
+    /// of an MLX model's `config.json`.
+    ///
+    /// In this format, the quantization section contains flat keys for tensor
+    /// names alongside the default `bits` and `group_size`:
+    ///
+    /// ```json
+    /// {
+    ///   "quantization": {
+    ///     "bits": 4,
+    ///     "group_size": 64,
+    ///     "model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64}
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// This parses the entire `"quantization"` object, extracting `bits` and
+    /// `group_size` as defaults, and any nested objects as per-tensor overrides.
+    pub fn from_model_config_json(json: &str) -> Result<Self> {
+        // Parse the full config.json, extract the "quantization" section.
+        let root: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+            MlxError::QuantConfigError(format!("Failed to parse config.json: {e}"))
+        })?;
+
+        let quant_section = root.get("quantization").ok_or_else(|| {
+            MlxError::QuantConfigError("No \"quantization\" key in config.json".into())
+        })?;
+
+        let quant_obj = quant_section.as_object().ok_or_else(|| {
+            MlxError::QuantConfigError("\"quantization\" is not an object".into())
+        })?;
+
+        let bits = quant_obj
+            .get("bits")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4) as u8;
+
+        let group_size = quant_obj
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64) as usize;
+
+        // Any key whose value is an object with "bits" is a per-tensor override.
+        let mut per_tensor = HashMap::new();
+        for (key, value) in quant_obj {
+            if key == "bits" || key == "group_size" || key == "quant_method" {
+                continue;
+            }
+            if let Some(obj) = value.as_object() {
+                if let Some(tensor_bits) = obj.get("bits").and_then(|v| v.as_u64()) {
+                    let tensor_gs = obj
+                        .get("group_size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(group_size as u64) as usize;
+                    per_tensor.insert(
+                        key.clone(),
+                        TensorQuantConfig {
+                            bits: tensor_bits as u8,
+                            group_size: tensor_gs,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(Self {
+            bits,
+            group_size,
+            per_tensor,
+        })
+    }
+
+    /// Parse per-tensor overrides from a `config.json` file on disk.
+    pub fn from_model_config_file(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path).map_err(|e| {
+            MlxError::IoError(format!(
+                "Failed to read config.json at {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Self::from_model_config_json(&contents)
+    }
+
     /// Look up the quantization parameters for a specific tensor name.
     ///
-    /// First checks for an exact match in `per_tensor`.  If not found, returns
-    /// the default bits and group_size.
+    /// Matching strategy (in order):
+    /// 1. Exact match in `per_tensor`.
+    /// 2. Strip `.weight` / `.scales` / `.biases` suffix, then exact match.
+    /// 3. Strip `language_model.` prefix (with or without suffix), then match.
+    /// 4. Add `language_model.` prefix (with or without suffix), then match.
+    ///
+    /// If no override matches, returns the default bits and group_size.
     pub fn config_for_tensor(&self, tensor_name: &str) -> (u8, usize) {
+        // 1. Exact match.
         if let Some(tc) = self.per_tensor.get(tensor_name) {
-            (tc.bits, tc.group_size)
-        } else {
-            (self.bits, self.group_size)
+            return (tc.bits, tc.group_size);
         }
+
+        // 2. Strip component suffix (.weight, .scales, .biases).
+        let base = strip_tensor_suffix(tensor_name);
+        if base != tensor_name {
+            if let Some(tc) = self.per_tensor.get(base) {
+                return (tc.bits, tc.group_size);
+            }
+        }
+
+        // 3. Strip `language_model.` prefix.
+        let lm_prefix = "language_model.";
+        if let Some(stripped) = tensor_name.strip_prefix(lm_prefix) {
+            if let Some(tc) = self.per_tensor.get(stripped) {
+                return (tc.bits, tc.group_size);
+            }
+            let stripped_base = strip_tensor_suffix(stripped);
+            if stripped_base != stripped {
+                if let Some(tc) = self.per_tensor.get(stripped_base) {
+                    return (tc.bits, tc.group_size);
+                }
+            }
+        }
+
+        // 4. Add `language_model.` prefix.
+        if !tensor_name.starts_with(lm_prefix) {
+            let with_prefix = format!("{lm_prefix}{tensor_name}");
+            if let Some(tc) = self.per_tensor.get(&with_prefix) {
+                return (tc.bits, tc.group_size);
+            }
+            let with_prefix_base = format!("{lm_prefix}{base}");
+            if base != tensor_name {
+                if let Some(tc) = self.per_tensor.get(&with_prefix_base) {
+                    return (tc.bits, tc.group_size);
+                }
+            }
+        }
+
+        (self.bits, self.group_size)
     }
 }
 
@@ -739,6 +876,102 @@ mod tests {
             }
             other => panic!("Expected QuantConfigError, got {:?}", other),
         }
+    }
+
+    // ---- config_for_tensor suffix/prefix stripping ----
+
+    #[test]
+    fn test_config_for_tensor_strips_weight_suffix() {
+        let json = r#"{
+            "bits": 4,
+            "group_size": 64,
+            "per_tensor": {
+                "model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64}
+            }
+        }"#;
+        let config = QuantizationConfig::from_json(json).expect("parse");
+
+        // Querying with .weight suffix should match the override without suffix.
+        let (bits, gs) = config.config_for_tensor("model.layers.0.mlp.down_proj.weight");
+        assert_eq!(bits, 8);
+        assert_eq!(gs, 64);
+
+        // Querying with .scales suffix should also match.
+        let (bits, _) = config.config_for_tensor("model.layers.0.mlp.down_proj.scales");
+        assert_eq!(bits, 8);
+
+        // Querying with .biases suffix should also match.
+        let (bits, _) = config.config_for_tensor("model.layers.0.mlp.down_proj.biases");
+        assert_eq!(bits, 8);
+    }
+
+    #[test]
+    fn test_config_for_tensor_adds_language_model_prefix() {
+        let json = r#"{
+            "bits": 4,
+            "group_size": 64,
+            "per_tensor": {
+                "language_model.model.layers.0.self_attn.v_proj": {"bits": 6, "group_size": 64}
+            }
+        }"#;
+        let config = QuantizationConfig::from_json(json).expect("parse");
+
+        // Query without the language_model. prefix — should still match.
+        let (bits, _) = config.config_for_tensor("model.layers.0.self_attn.v_proj.weight");
+        assert_eq!(bits, 6);
+    }
+
+    #[test]
+    fn test_config_for_tensor_strips_language_model_prefix() {
+        let json = r#"{
+            "bits": 4,
+            "group_size": 64,
+            "per_tensor": {
+                "model.layers.0.self_attn.v_proj": {"bits": 6, "group_size": 64}
+            }
+        }"#;
+        let config = QuantizationConfig::from_json(json).expect("parse");
+
+        // Query with the language_model. prefix — should match by stripping it.
+        let (bits, _) = config.config_for_tensor("language_model.model.layers.0.self_attn.v_proj.weight");
+        assert_eq!(bits, 6);
+    }
+
+    // ---- from_model_config_json ----
+
+    #[test]
+    fn test_from_model_config_json_basic() {
+        let json = r#"{
+            "model_type": "gemma4",
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "language_model.model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64},
+                "language_model.model.layers.0.self_attn.v_proj": {"bits": 6, "group_size": 64}
+            }
+        }"#;
+
+        let config = QuantizationConfig::from_model_config_json(json).expect("parse");
+        assert_eq!(config.bits, 4);
+        assert_eq!(config.group_size, 64);
+        assert_eq!(config.per_tensor.len(), 2);
+
+        let (bits, _) = config.config_for_tensor("language_model.model.layers.0.mlp.down_proj.weight");
+        assert_eq!(bits, 8);
+
+        let (bits, _) = config.config_for_tensor("language_model.model.layers.0.self_attn.v_proj.weight");
+        assert_eq!(bits, 6);
+
+        // Unknown tensor gets default.
+        let (bits, _) = config.config_for_tensor("language_model.model.layers.5.mlp.gate_proj.weight");
+        assert_eq!(bits, 4);
+    }
+
+    #[test]
+    fn test_from_model_config_json_no_quantization_key() {
+        let json = r#"{"model_type": "gemma4"}"#;
+        let result = QuantizationConfig::from_model_config_json(json);
+        assert!(result.is_err());
     }
 
     // ---- DType conversion ----

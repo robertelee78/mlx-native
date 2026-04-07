@@ -1,5 +1,5 @@
-// quantized_matmul.metal — MSL shader for 4-bit and 6-bit affine quantized
-// matrix multiplication with on-the-fly dequantization.
+// quantized_matmul.metal — MSL shader for 4-bit, 6-bit, and 8-bit affine
+// quantized matrix multiplication with on-the-fly dequantization.
 //
 // Computes: output[row][col] = sum_k(dequant(weight[col][k]) * input[row][k])
 //
@@ -11,6 +11,7 @@
 //   4-bit: 8 values per uint32, value i = (packed >> (4*i)) & 0xF
 //   6-bit: 4 values per 3 bytes packed into uint32 (MLX triplet format)
 //          val0 = packed & 0x3F, val1 = (packed>>6) & 0x3F, etc.
+//   8-bit: 4 values per uint32, value i = (packed >> (8*i)) & 0xFF
 //
 // Dequantization: float_val = scale * quant_val + bias
 //   where scale and bias are bf16, one per group of group_size values.
@@ -26,7 +27,7 @@ struct QuantizedMatmulParams {
     uint K;           // inner dimension
     uint N;           // number of output columns
     uint group_size;  // values per scale/bias group
-    uint bits;        // 4 or 6
+    uint bits;        // 4, 6, or 8
 };
 
 // Helper: read bf16 from a half buffer.  Metal's `half` type is IEEE f16, but
@@ -48,6 +49,13 @@ inline float dequant_4bit(uint packed, uint i, float scale, float bias) {
 // Extract the i-th 6-bit value from a packed uint32 (4 values per uint32).
 inline float dequant_6bit(uint packed, uint i, float scale, float bias) {
     uint val = (packed >> (6 * i)) & 0x3Fu;
+    return scale * float(val) + bias;
+}
+
+// ---- 8-bit dequantization ----
+// Extract the i-th 8-bit value from a packed uint32 (4 values per uint32).
+inline float dequant_8bit(uint packed, uint i, float scale, float bias) {
+    uint val = (packed >> (8 * i)) & 0xFFu;
     return scale * float(val) + bias;
 }
 
@@ -92,47 +100,34 @@ kernel void quantized_matmul(
 
     float acc = 0.0f;
 
-    if (bits == 4) {
-        // 4-bit: 8 values per uint32.
-        uint values_per_pack = 8;
-        // Number of uint32 packs per row of weights (one row = K values for one output col).
-        uint packs_per_row = (K + values_per_pack - 1) / values_per_pack;
-        // Weight base for this column.
-        uint w_base = col * packs_per_row;
+    // Determine packing parameters based on bit-width.
+    // 4-bit: 8 values per uint32
+    // 6-bit: 4 values per uint32 (MLX triplet format)
+    // 8-bit: 4 values per uint32
+    uint values_per_pack = (bits == 4) ? 8u : 4u;
+    uint packs_per_row = (K + values_per_pack - 1) / values_per_pack;
+    uint w_base = col * packs_per_row;
 
-        for (uint k = 0; k < K; k++) {
-            uint pack_idx = k / values_per_pack;
-            uint in_pack_idx = k % values_per_pack;
-            uint packed = weight[w_base + pack_idx];
+    for (uint k = 0; k < K; k++) {
+        uint pack_idx = k / values_per_pack;
+        uint in_pack_idx = k % values_per_pack;
+        uint packed = weight[w_base + pack_idx];
 
-            // Determine which group this k belongs to.
-            uint g = k / group_size;
-            float scale = float(scales[sb_base + g]);
-            float bias  = float(biases[sb_base + g]);
+        uint g = k / group_size;
+        float scale = float(scales[sb_base + g]);
+        float bias  = float(biases[sb_base + g]);
 
-            float w = dequant_4bit(packed, in_pack_idx, scale, bias);
-            float x = float(input[row * K + k]);
-            acc += w * x;
+        float w;
+        if (bits == 4) {
+            w = dequant_4bit(packed, in_pack_idx, scale, bias);
+        } else if (bits == 6) {
+            w = dequant_6bit(packed, in_pack_idx, scale, bias);
+        } else {
+            w = dequant_8bit(packed, in_pack_idx, scale, bias);
         }
-    } else {
-        // 6-bit: 4 values per uint32 (3 bytes = 24 bits packed into low 24 bits).
-        uint values_per_pack = 4;
-        uint packs_per_row = (K + values_per_pack - 1) / values_per_pack;
-        uint w_base = col * packs_per_row;
 
-        for (uint k = 0; k < K; k++) {
-            uint pack_idx = k / values_per_pack;
-            uint in_pack_idx = k % values_per_pack;
-            uint packed = weight[w_base + pack_idx];
-
-            uint g = k / group_size;
-            float scale = float(scales[sb_base + g]);
-            float bias  = float(biases[sb_base + g]);
-
-            float w = dequant_6bit(packed, in_pack_idx, scale, bias);
-            float x = float(input[row * K + k]);
-            acc += w * x;
-        }
+        float x = float(input[row * K + k]);
+        acc += w * x;
     }
 
     output[row * params.N + col] = half(acc);
