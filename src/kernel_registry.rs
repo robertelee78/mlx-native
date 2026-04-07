@@ -44,14 +44,43 @@ impl KernelRegistry {
         let mut sources = HashMap::new();
 
         // Register embedded shader sources.
-        // Future stories will add real kernels here, e.g.:
-        //   sources.insert("elementwise_add".into(), include_str!("shaders/elementwise_add.metal"));
-        //
-        // For now, register the placeholder so the embed machinery is exercised.
         sources.insert(
             "placeholder".into(),
             include_str!("shaders/placeholder.metal"),
         );
+        sources.insert(
+            "quantized_matmul".into(),
+            include_str!("shaders/quantized_matmul.metal"),
+        );
+
+        // Embedding kernels (Story 1.5)
+        let embedding_src: &'static str = include_str!("shaders/embedding.metal");
+        sources.insert("embedding_gather_4bit".into(), embedding_src);
+        sources.insert("embedding_gather_6bit".into(), embedding_src);
+
+        // MoE gate kernel (Story 1.5)
+        let moe_gate_src: &'static str = include_str!("shaders/moe_gate.metal");
+        sources.insert("moe_gate".into(), moe_gate_src);
+
+        // MoE dispatch kernels (Story 1.5)
+        let moe_dispatch_src: &'static str = include_str!("shaders/moe_dispatch.metal");
+        sources.insert("fused_gelu_mul".into(), moe_dispatch_src);
+        sources.insert("moe_accumulate".into(), moe_dispatch_src);
+        sources.insert("zero_buffer".into(), moe_dispatch_src);
+        sources.insert("naive_matvec_f32".into(), moe_dispatch_src);
+
+        // Elementwise and transpose kernels (Story 1.5)
+        let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
+        sources.insert("elementwise_add_f32".into(), elementwise_src);
+        sources.insert("elementwise_add_f16".into(), elementwise_src);
+        sources.insert("elementwise_mul_f32".into(), elementwise_src);
+        sources.insert("elementwise_mul_f16".into(), elementwise_src);
+        sources.insert("cast_f16_to_f32".into(), elementwise_src);
+        sources.insert("cast_f32_to_f16".into(), elementwise_src);
+        sources.insert("cast_bf16_to_f32".into(), elementwise_src);
+        sources.insert("cast_f32_to_bf16".into(), elementwise_src);
+        sources.insert("transpose_2d_f32".into(), elementwise_src);
+        sources.insert("transpose_2d_f16".into(), elementwise_src);
 
         Self {
             cache: HashMap::new(),

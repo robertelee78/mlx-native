@@ -151,6 +151,41 @@ impl CommandEncoder {
         self.has_active_encoder = false;
     }
 
+    /// Encode a compute pass using threadgroups with shared threadgroup memory.
+    ///
+    /// Like [`encode_threadgroups`](Self::encode_threadgroups), but additionally
+    /// allocates threadgroup memory at the specified indices.  This is required
+    /// for kernels that use `threadgroup` memory (e.g. reductions in rms_norm
+    /// and softmax).
+    ///
+    /// # Arguments
+    ///
+    /// * `pipeline`         — The compiled compute pipeline to execute.
+    /// * `buffers`          — Slice of `(index, &MlxBuffer)` pairs for buffer bindings.
+    /// * `threadgroup_mem`  — Slice of `(index, byte_length)` pairs for threadgroup memory.
+    /// * `threadgroups`     — Number of threadgroups to dispatch.
+    /// * `threadgroup_size` — Threads per threadgroup.
+    pub fn encode_threadgroups_with_shared(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        buffers: &[(u64, &MlxBuffer)],
+        threadgroup_mem: &[(u64, u64)],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        let encoder = self.cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        for &(index, buf) in buffers {
+            encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+        }
+        for &(index, byte_length) in threadgroup_mem {
+            encoder.set_threadgroup_memory_length(index, byte_length);
+        }
+        encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        encoder.end_encoding();
+        self.has_active_encoder = false;
+    }
+
     /// Commit the command buffer and block until the GPU finishes execution.
     ///
     /// # Errors

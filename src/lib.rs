@@ -59,6 +59,9 @@ pub use encoder::CommandEncoder;
 pub use error::{MlxError, Result};
 pub use kernel_registry::KernelRegistry;
 
+// Re-export ops.
+pub use ops::quantized_matmul::{quantized_matmul, QuantizedMatmulParams};
+
 // Re-export metal types that appear in the public API.
 pub use metal::MTLSize;
 
