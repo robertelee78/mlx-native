@@ -34,10 +34,10 @@ fn test_softcap_f32_basic() {
         .alloc_buffer(byte_len, DType::F32, vec![n])
         .expect("alloc output");
 
-    // Params buffer: [cap]
-    let params_byte_len = std::mem::size_of::<f32>();
+    // Params buffer: [cap, n_elements_as_float_bits]
+    let params_byte_len = 2 * std::mem::size_of::<f32>();
     let mut params_buf = device
-        .alloc_buffer(params_byte_len, DType::F32, vec![1])
+        .alloc_buffer(params_byte_len, DType::F32, vec![2])
         .expect("alloc params");
 
     {
@@ -47,6 +47,7 @@ fn test_softcap_f32_basic() {
     {
         let slice: &mut [f32] = params_buf.as_mut_slice().expect("as_mut_slice");
         slice[0] = cap;
+        slice[1] = f32::from_bits(n as u32);
     }
 
     let mut encoder = device.command_encoder().expect("command_encoder");
@@ -91,7 +92,7 @@ fn test_softcap_f32_output_bounded() {
         .alloc_buffer(byte_len, DType::F32, vec![n])
         .expect("alloc output");
     let mut params_buf = device
-        .alloc_buffer(std::mem::size_of::<f32>(), DType::F32, vec![1])
+        .alloc_buffer(2 * std::mem::size_of::<f32>(), DType::F32, vec![2])
         .expect("alloc params");
 
     {
@@ -101,6 +102,7 @@ fn test_softcap_f32_output_bounded() {
     {
         let slice: &mut [f32] = params_buf.as_mut_slice().expect("as_mut_slice");
         slice[0] = cap;
+        slice[1] = f32::from_bits(n as u32);
     }
 
     let mut encoder = device.command_encoder().expect("command_encoder");
@@ -139,7 +141,7 @@ fn test_softcap_f32_zero_input() {
         .alloc_buffer(4, DType::F32, vec![1])
         .expect("alloc output");
     let mut params_buf = device
-        .alloc_buffer(4, DType::F32, vec![1])
+        .alloc_buffer(8, DType::F32, vec![2])
         .expect("alloc params");
 
     {
@@ -149,6 +151,7 @@ fn test_softcap_f32_zero_input() {
     {
         let slice: &mut [f32] = params_buf.as_mut_slice().expect("as_mut_slice");
         slice[0] = cap;
+        slice[1] = f32::from_bits(1u32);
     }
 
     let mut encoder = device.command_encoder().expect("command_encoder");

@@ -35,7 +35,10 @@ fn cpu_sdpa(
             let kv_h = h / heads_per_kv;
             for q_pos in 0..seq_len {
                 // Compute Q * K^T / sqrt(d) for all valid key positions.
-                let causal_max_k = std::cmp::min(q_pos + 1, kv_seq_len);
+                // In decode mode (seq_len < kv_seq_len), q_pos=0 maps to the
+                // end of the KV sequence: abs_pos = kv_seq_len - seq_len + q_pos.
+                let abs_pos = kv_seq_len - seq_len + q_pos;
+                let causal_max_k = std::cmp::min(abs_pos + 1, kv_seq_len);
                 let mut scores = Vec::with_capacity(causal_max_k);
 
                 let q_offset =
@@ -98,9 +101,10 @@ fn cpu_sdpa_sliding(
         for h in 0..n_heads {
             let kv_h = h / heads_per_kv;
             for q_pos in 0..seq_len {
-                let causal_max_k = std::cmp::min(q_pos + 1, kv_seq_len);
-                let window_start = if q_pos >= window_size {
-                    q_pos - window_size
+                let abs_pos = kv_seq_len - seq_len + q_pos;
+                let causal_max_k = std::cmp::min(abs_pos + 1, kv_seq_len);
+                let window_start = if abs_pos >= window_size {
+                    abs_pos - window_size
                 } else {
                     0
                 };
