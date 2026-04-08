@@ -127,6 +127,20 @@ impl KernelRegistry {
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
 
+        // Fused norm-add kernels — Gemma4 post-attention / post-FFN ordering:
+        //   normed = rms_norm(input, weight, eps);  output = residual + normed
+        let fused_norm_add_src: &'static str =
+            include_str!("shaders/fused_norm_add_bf16.metal");
+        sources.insert("fused_norm_add_bf16".into(), fused_norm_add_src);
+        sources.insert("fused_norm_add_no_weight_bf16".into(), fused_norm_add_src);
+
+        // GPU sampling kernels — eliminate logits readback (Phase 6)
+        let argmax_src: &'static str = include_str!("shaders/argmax.metal");
+        sources.insert("argmax_f32".into(), argmax_src);
+        let softmax_sample_src: &'static str =
+            include_str!("shaders/softmax_sample.metal");
+        sources.insert("softmax_sample_f32".into(), softmax_sample_src);
+
         Self {
             cache: HashMap::new(),
             sources,
