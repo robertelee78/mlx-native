@@ -6,6 +6,7 @@ pub mod elementwise;
 pub mod embedding;
 pub mod encode_helpers;
 pub mod gelu;
+pub mod kv_cache_copy;
 pub mod moe_dispatch;
 pub mod moe_gate;
 pub mod quantized_matmul;

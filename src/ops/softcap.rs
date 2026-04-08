@@ -31,7 +31,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// * `device`     - Metal device for pipeline compilation.
 /// * `input`      - Input buffer (f32 or f16).
 /// * `output`     - Output buffer (same dtype and shape as input).
-/// * `params_buf` - Params buffer containing `[cap]` as f32.
+/// * `params_buf` - Params buffer containing `[cap, n_elements_as_f32_bits]` as two f32 values.
 /// * `cap`        - The capping value (e.g. 30.0).
 ///
 /// # Errors
@@ -84,13 +84,13 @@ pub fn dispatch_softcap(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
-    let thread_count = n as u64;
-    let threadgroup_size = std::cmp::min(256, thread_count);
+    let threadgroup_size: u64 = std::cmp::min(256, n as u64);
+    let threadgroup_count = (n as u64 + threadgroup_size - 1) / threadgroup_size;
 
-    encoder.encode(
+    encoder.encode_threadgroups(
         pipeline,
         &[(0, input), (1, output), (2, params_buf)],
-        MTLSize::new(thread_count, 1, 1),
+        MTLSize::new(threadgroup_count, 1, 1),
         MTLSize::new(threadgroup_size, 1, 1),
     );
 

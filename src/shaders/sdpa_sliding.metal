@@ -4,6 +4,9 @@
 // with a sliding window mask that restricts attention to the last
 // `window_size` key positions relative to each query position.
 //
+// Uses single-pass online softmax (Milakov & Gimelshein 2018) to avoid
+// reading the K cache multiple times.
+//
 // For query position q_pos, keys at positions k_pos where:
 //   k_pos < q_pos - window_size    (outside sliding window)
 //   k_pos > q_pos                  (causal mask)
@@ -107,69 +110,56 @@ kernel void sdpa_sliding(
         return;
     }
 
-    // ---- Pass 1: Find max score for numerical stability ----
+    // ---- Single-pass online softmax (Milakov & Gimelshein 2018) ----
 
-    float max_score = -INFINITY;
-
-    for (uint k_pos = window_start; k_pos < causal_max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        max_score = max(max_score, score);
-    }
-
-    // ---- Pass 2a: Compute sum of exp(score - max) ----
-
-    float sum_exp = 0.0f;
-
-    for (uint k_pos = window_start; k_pos < causal_max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        sum_exp += exp(score - max_score);
-    }
-
-    // ---- Pass 2b: Accumulate weighted V ----
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
 
     float acc[512];
     for (uint d = 0; d < head_dim; d++) {
         acc[d] = 0.0f;
     }
 
-    const float inv_sum = 1.0f / sum_exp;
-
     for (uint k_pos = window_start; k_pos < causal_max_k; k_pos++) {
+        // Compute Q . K^T for this key position.
         float dot = 0.0f;
         const uint k_offset = k_head_base + k_pos * head_dim;
         for (uint d = 0; d < head_dim; d++) {
             dot += float(Q[q_base + d]) * float(K[k_offset + d]);
         }
         float score = dot * scale;
-        float weight = exp(score - max_score) * inv_sum;
 
+        // Online softmax update.
+        float old_max = running_max;
+        running_max = max(running_max, score);
+
+        // Correction factor: rescale previous accumulations.
+        // First iteration: old_max=-inf, correction=exp(-inf - finite)=0.
+        float correction = exp(old_max - running_max);
+
+        running_sum = running_sum * correction + exp(score - running_max);
+
+        float weight = exp(score - running_max);
         const uint v_offset = v_head_base + k_pos * head_dim;
         for (uint d = 0; d < head_dim; d++) {
-            acc[d] += weight * float(V[v_offset + d]);
+            acc[d] = acc[d] * correction + weight * float(V[v_offset + d]);
         }
     }
 
+    // Final normalization.
+    float inv_sum = 1.0f / running_sum;
+
     // Write output.
     for (uint d = 0; d < head_dim; d++) {
-        O[o_base + d] = acc[d];
+        O[o_base + d] = acc[d] * inv_sum;
     }
 }
 
 // --------------------------------------------------------------------------
 // sdpa_sliding_bf16 — Sliding-window attention for bfloat16 tensors.
 //
-// Same algorithm as sdpa_sliding, but reads/writes bfloat16. All
-// accumulation and intermediate computation stays in float32.
+// Same online softmax algorithm as sdpa_sliding, but reads/writes bfloat16.
+// All accumulation and intermediate computation stays in float32.
 // --------------------------------------------------------------------------
 kernel void sdpa_sliding_bf16(
     device const bfloat *Q          [[buffer(0)]],
@@ -223,38 +213,15 @@ kernel void sdpa_sliding_bf16(
         return;
     }
 
-    // Pass 1: find max score.
-    float max_score = -INFINITY;
-    for (uint k_pos = window_start; k_pos < causal_max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        max_score = max(max_score, score);
-    }
+    // Single-pass online softmax.
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
 
-    // Pass 2a: sum of exp(score - max).
-    float sum_exp = 0.0f;
-    for (uint k_pos = window_start; k_pos < causal_max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        sum_exp += exp(score - max_score);
-    }
-
-    // Pass 2b: accumulate weighted V.
     float acc[512];
     for (uint d = 0; d < head_dim; d++) {
         acc[d] = 0.0f;
     }
 
-    const float inv_sum = 1.0f / sum_exp;
-
     for (uint k_pos = window_start; k_pos < causal_max_k; k_pos++) {
         float dot = 0.0f;
         const uint k_offset = k_head_base + k_pos * head_dim;
@@ -262,16 +229,24 @@ kernel void sdpa_sliding_bf16(
             dot += float(Q[q_base + d]) * float(K[k_offset + d]);
         }
         float score = dot * scale;
-        float weight = exp(score - max_score) * inv_sum;
 
+        float old_max = running_max;
+        running_max = max(running_max, score);
+
+        float correction = exp(old_max - running_max);
+        running_sum = running_sum * correction + exp(score - running_max);
+
+        float weight = exp(score - running_max);
         const uint v_offset = v_head_base + k_pos * head_dim;
         for (uint d = 0; d < head_dim; d++) {
-            acc[d] += weight * float(V[v_offset + d]);
+            acc[d] = acc[d] * correction + weight * float(V[v_offset + d]);
         }
     }
 
+    float inv_sum = 1.0f / running_sum;
+
     // Write output as bfloat16.
     for (uint d = 0; d < head_dim; d++) {
-        O[o_base + d] = bfloat(acc[d]);
+        O[o_base + d] = bfloat(acc[d] * inv_sum);
     }
 }

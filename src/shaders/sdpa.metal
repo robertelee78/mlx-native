@@ -2,6 +2,11 @@
 //
 // Computes: softmax(Q * K^T / sqrt(head_dim)) * V
 //
+// Uses single-pass online softmax (Milakov & Gimelshein 2018) to avoid
+// reading the K cache multiple times. The triple-pass algorithm has been
+// replaced with a numerically equivalent single-pass that computes
+// running max, running sum, and weighted V accumulation simultaneously.
+//
 // Supports grouped-query attention (GQA) where n_heads > n_kv_heads.
 // Each KV head serves (n_heads / n_kv_heads) Q heads via broadcast.
 //
@@ -65,12 +70,10 @@ kernel void sdpa(
     const uint kv_head_idx  = head_idx / heads_per_kv;
 
     // Compute base offsets into the contiguous [batch, heads, seq, head_dim] layout.
-    // Q offset: batch_idx * (n_heads * seq_len * head_dim) + head_idx * (seq_len * head_dim) + q_pos * head_dim
     const uint q_base = batch_idx * (n_heads * seq_len * head_dim)
                       + head_idx * (seq_len * head_dim)
                       + q_pos * head_dim;
 
-    // K offset base: batch_idx * (n_kv_heads * kv_seq_len * head_dim) + kv_head_idx * (kv_seq_len * head_dim)
     const uint k_head_base = batch_idx * (n_kv_heads * kv_seq_len * head_dim)
                            + kv_head_idx * (kv_seq_len * head_dim);
 
@@ -83,106 +86,73 @@ kernel void sdpa(
     // Attention score scaling factor (caller-provided, e.g. 1/sqrt(head_dim) or 1.0).
     const float scale = params->scale;
 
-    // ---- Pass 1: Compute attention scores and find max (for numerical stability) ----
-
-    // We apply a causal mask. When seq_len < kv_seq_len (decode mode with
-    // KV cache), the query positions map to the END of the full sequence.
-    // q_pos=0 corresponds to absolute position (kv_seq_len - seq_len).
-    // The causal constraint: attend to k_pos <= abs_pos.
+    // Causal mask bounds.
+    // When seq_len < kv_seq_len (decode mode with KV cache), the query positions
+    // map to the END of the full sequence. q_pos=0 corresponds to absolute
+    // position (kv_seq_len - seq_len). The causal constraint: attend to k_pos <= abs_pos.
     const uint abs_pos = kv_seq_len - seq_len + q_pos;
     const uint max_k = min(abs_pos + 1, kv_seq_len);
 
-    float max_score = -INFINITY;
-
-    // First pass: find the maximum score.
-    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        max_score = max(max_score, score);
-    }
-
-    // ---- Pass 2: Compute exp(score - max) and sum, accumulate weighted V ----
-
-    float sum_exp = 0.0f;
-    // Accumulate output in f32 for numerical stability.
-    // We use a local array for head_dim values. For large head_dim (512),
-    // this fits in thread-local memory.
-    // Metal supports variable-length arrays on stack, but for safety we
-    // accumulate in a streaming fashion: two passes over K.
-
-    // Actually, we need V weighted sum. Let's do it in a single pass after
-    // computing softmax weights. Since kv_seq_len can be large, we do:
-    // Pass 2a: compute sum_exp
-    // Pass 2b: accumulate output
-
-    // Pass 2a: sum of exp(score - max)
-    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        sum_exp += exp(score - max_score);
-    }
-
-    // Pass 2b: accumulate weighted V values.
-    // For each output dimension d, compute sum over k_pos of softmax_weight * V[k_pos, d].
-    // We iterate over output dimensions in the outer loop and key positions in
-    // the inner loop. This is cache-friendly for V access since we walk
-    // contiguously along head_dim for each k_pos.
+    // ---- Single-pass online softmax (Milakov & Gimelshein 2018) ----
     //
-    // However, for large kv_seq_len this means re-computing Q*K^T per output dim.
-    // Instead, iterate key positions in the outer loop and accumulate into the
-    // output dimensions. We store the partial output in thread-local registers.
-    //
-    // Strategy: iterate k_pos once, for each compute the softmax weight,
-    // then scatter-add weight * V[k_pos, :] into a thread-local output accumulator.
-    // We limit head_dim to at most 512 (Gemma 4 max). Metal thread local memory
-    // handles this fine.
+    // Instead of 3 passes over K (find max, compute sum_exp, accumulate V),
+    // we maintain a running max, running sum, and output accumulator in a
+    // single pass. When the running max increases, we rescale the previous
+    // accumulator by exp(old_max - new_max) to maintain correctness.
 
-    // Zero-initialize output accumulator.
-    // Using a fixed-size array that covers the maximum head_dim we support.
-    // The actual loop only iterates up to `head_dim`.
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    // Output accumulator (thread-local). Max head_dim is 512 for Gemma 4.
     float acc[512];
     for (uint d = 0; d < head_dim; d++) {
         acc[d] = 0.0f;
     }
 
-    const float inv_sum = 1.0f / sum_exp;
-
     for (uint k_pos = 0; k_pos < max_k; k_pos++) {
-        // Recompute attention score (avoids storing all scores in memory).
+        // Compute Q . K^T for this key position.
         float dot = 0.0f;
         const uint k_offset = k_head_base + k_pos * head_dim;
         for (uint d = 0; d < head_dim; d++) {
             dot += float(Q[q_base + d]) * float(K[k_offset + d]);
         }
         float score = dot * scale;
-        float weight = exp(score - max_score) * inv_sum;
 
-        // Accumulate weighted V.
+        // Online softmax update.
+        float old_max = running_max;
+        running_max = max(running_max, score);
+
+        // Correction factor to rescale previous accumulations.
+        // When old_max == -INFINITY (first iteration), correction = 0.0
+        // because exp(-inf - finite) = 0.
+        float correction = exp(old_max - running_max);
+
+        // Rescale running sum and add new contribution.
+        running_sum = running_sum * correction + exp(score - running_max);
+
+        // Rescale previous V accumulation and add new weighted V.
+        float weight = exp(score - running_max);
         const uint v_offset = v_head_base + k_pos * head_dim;
         for (uint d = 0; d < head_dim; d++) {
-            acc[d] += weight * float(V[v_offset + d]);
+            acc[d] = acc[d] * correction + weight * float(V[v_offset + d]);
         }
     }
 
+    // Final normalization by the softmax denominator.
+    float inv_sum = 1.0f / running_sum;
+
     // Write output.
     for (uint d = 0; d < head_dim; d++) {
-        O[o_base + d] = acc[d];
+        O[o_base + d] = acc[d] * inv_sum;
     }
 }
 
 // --------------------------------------------------------------------------
 // sdpa_bf16 — Scaled dot-product attention for bfloat16 tensors.
 //
-// Same algorithm as sdpa, but reads/writes bfloat16. All accumulation
-// and intermediate computation stays in float32 for numerical stability.
+// Same online softmax algorithm as sdpa, but reads/writes bfloat16. All
+// accumulation and intermediate computation stays in float32 for numerical
+// stability.
 // --------------------------------------------------------------------------
 kernel void sdpa_bf16(
     device const bfloat *Q          [[buffer(0)]],
@@ -227,38 +197,15 @@ kernel void sdpa_bf16(
     const uint abs_pos = kv_seq_len - seq_len + q_pos;
     const uint max_k = min(abs_pos + 1, kv_seq_len);
 
-    // Pass 1: find max score.
-    float max_score = -INFINITY;
-    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        max_score = max(max_score, score);
-    }
+    // Single-pass online softmax.
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
 
-    // Pass 2a: sum of exp(score - max).
-    float sum_exp = 0.0f;
-    for (uint k_pos = 0; k_pos < max_k; k_pos++) {
-        float dot = 0.0f;
-        const uint k_offset = k_head_base + k_pos * head_dim;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(Q[q_base + d]) * float(K[k_offset + d]);
-        }
-        float score = dot * scale;
-        sum_exp += exp(score - max_score);
-    }
-
-    // Pass 2b: accumulate weighted V.
     float acc[512];
     for (uint d = 0; d < head_dim; d++) {
         acc[d] = 0.0f;
     }
 
-    const float inv_sum = 1.0f / sum_exp;
-
     for (uint k_pos = 0; k_pos < max_k; k_pos++) {
         float dot = 0.0f;
         const uint k_offset = k_head_base + k_pos * head_dim;
@@ -266,16 +213,24 @@ kernel void sdpa_bf16(
             dot += float(Q[q_base + d]) * float(K[k_offset + d]);
         }
         float score = dot * scale;
-        float weight = exp(score - max_score) * inv_sum;
 
+        float old_max = running_max;
+        running_max = max(running_max, score);
+
+        float correction = exp(old_max - running_max);
+        running_sum = running_sum * correction + exp(score - running_max);
+
+        float weight = exp(score - running_max);
         const uint v_offset = v_head_base + k_pos * head_dim;
         for (uint d = 0; d < head_dim; d++) {
-            acc[d] += weight * float(V[v_offset + d]);
+            acc[d] = acc[d] * correction + weight * float(V[v_offset + d]);
         }
     }
 
+    float inv_sum = 1.0f / running_sum;
+
     // Write output as bfloat16.
     for (uint d = 0; d < head_dim; d++) {
-        O[o_base + d] = bfloat(acc[d]);
+        O[o_base + d] = bfloat(acc[d] * inv_sum);
     }
 }
