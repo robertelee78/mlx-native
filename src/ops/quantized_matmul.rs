@@ -226,16 +226,19 @@ pub fn quantized_matmul(
 ///   - bits is 4 or 8 (not 6)
 ///   - N is divisible by 8 (results_per_simdgroup * num_simdgroups)
 ///   - K is divisible by block_size:
-///     - 4-bit: K % 256 == 0 (block_size = 8 values/thread * 32 SIMD = 256)
-///       This matches MLX's `qmv` kernel for K=2816 (which is NOT 512-aligned)
+///     - 4-bit: K % 512 == 0 (block_size = 16 values/thread * 32 SIMD = 512, qmv_fast)
 ///     - 8-bit: K % 256 == 0 (block_size = 8 * 32 = 256)
+///
+/// ADR-002: All SIMD kernels now use qmv_fast params (values_per_thread=16
+/// for 4-bit), so 4-bit block_size is 512.  Dimensions like K=2816 that are
+/// not 512-aligned fall back to the scalar kernel.
 fn can_use_simd_kernel(params: &QuantizedMatmulParams) -> bool {
     let bn = 8u32; // num_simdgroups * results_per_simdgroup
     if params.n % bn != 0 {
         return false;
     }
     match params.bits {
-        4 => params.k % 256 == 0,  // qmv path (not qmv_fast)
+        4 => params.k % 512 == 0,  // qmv_fast: block_size = 16 * 32 = 512
         8 => params.k % 256 == 0,
         _ => false,
     }
@@ -606,7 +609,7 @@ pub fn dispatch_quantized_matmul_simd_bf16_expert(
     if !can_use_simd_kernel(params) {
         return Err(MlxError::InvalidArgument(
             "dispatch_quantized_matmul_simd_bf16_expert: dimensions do not satisfy SIMD \
-             alignment requirements (N%8==0 and K%256==0 required)".into(),
+             alignment requirements (N%8==0 and K%512==0 for 4-bit, K%256==0 for 8-bit)".into(),
         ));
     }
 

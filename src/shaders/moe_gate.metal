@@ -13,7 +13,7 @@ using namespace metal;
 //      Logits are accumulated in threadgroup shared memory (tg_logits).
 //   3. Top-K selection (single thread, K=8 from 128 experts via insertion
 //      sort — 8 × 128 = 1024 comparisons, trivial).
-//   4. Apply per_expert_scale and softmax over the K selected logits.
+//   4. Apply per_expert_scale after softmax, then re-normalize.
 //
 // Buffers:
 //   0: hidden_state      — bfloat [seq_len, hidden_dim]
@@ -136,7 +136,7 @@ kernel void moe_gate(
             sel_logits[k]             = best_val;
         }
 
-        // Softmax over selected logits with per_expert_scale
+        // Standard softmax (no scale)
         float max_logit = sel_logits[0];
         for (uint k = 1; k < top_k; k++) {
             max_logit = max(max_logit, sel_logits[k]);
@@ -145,14 +145,23 @@ kernel void moe_gate(
         float exp_vals[8];
         float sum_exp = 0.0f;
         for (uint k = 0; k < top_k; k++) {
-            float scale = per_expert_scale[expert_ids[out_base + k]];
-            exp_vals[k] = exp(sel_logits[k] - max_logit) * scale;
+            exp_vals[k] = exp(sel_logits[k] - max_logit);
             sum_exp += exp_vals[k];
         }
+        float inv_sum = 1.0f / sum_exp;
 
-        const float inv_sum = 1.0f / sum_exp;
+        // Apply softmax, then scale, then re-normalize
+        float scaled_weights[8];
+        float scale_sum = 0.0f;
         for (uint k = 0; k < top_k; k++) {
-            expert_weights[out_base + k] = exp_vals[k] * inv_sum;
+            float softmax_val = exp_vals[k] * inv_sum;
+            float scale = per_expert_scale[expert_ids[out_base + k]];
+            scaled_weights[k] = softmax_val * scale;
+            scale_sum += scaled_weights[k];
+        }
+        float inv_scale_sum = 1.0f / scale_sum;
+        for (uint k = 0; k < top_k; k++) {
+            expert_weights[out_base + k] = scaled_weights[k] * inv_scale_sum;
         }
     }
 }
