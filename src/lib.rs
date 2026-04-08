@@ -71,6 +71,7 @@ pub use weight::{
 
 // Re-export metal types that appear in the public API.
 pub use metal::MTLSize;
+pub use metal;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
