@@ -404,7 +404,7 @@ inline void load_vector_4bit_bf16(
     const device bfloat* x_bf16,
     thread float* x_thread,
     thread float& sum,
-    int count  // values_per_thread, expected 8
+    int count  // values_per_thread, expected 16 (same as f32 variant)
 ) {
     float s = 0.0f;
     for (int i = 0; i < count; i += 4) {
@@ -474,10 +474,13 @@ kernel void quantized_matmul_simd_bf16(
     uint values_per_thread;
     uint bytes_per_pack;
 
+    // IMPORTANT: values_per_thread and packs_per_thread MUST match the f32
+    // variant exactly.  A previous bug used values_per_thread=8 for 4-bit
+    // which halved the block_size and corrupted all pointer arithmetic.
     if (bits == 4) {
         pack_factor = 8;
-        packs_per_thread = 1;
-        values_per_thread = 8;
+        packs_per_thread = 2;       // was incorrectly 1
+        values_per_thread = 16;     // was incorrectly 8
         bytes_per_pack = 4;
     } else if (bits == 8) {
         pack_factor = 4;
@@ -519,7 +522,7 @@ kernel void quantized_matmul_simd_bf16(
     float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     if (bits == 4) {
-        float x_thread[8];
+        float x_thread[16];  // was incorrectly [8]
         for (uint k = 0; k < K; k += block_size) {
             float x_sum;
             load_vector_4bit_bf16(x_bf16, x_thread, x_sum, values_per_thread);
