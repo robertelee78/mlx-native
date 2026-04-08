@@ -45,18 +45,29 @@ struct QuantizedMatmulGpuParams {
 ///
 /// - 4-bit: 8 values per uint32, so each row of K values needs ceil(K/8) uint32s.
 ///   Total = N * ceil(K/8) * 4 bytes.
-/// - 6-bit: 4 values per uint32, so each row needs ceil(K/4) uint32s.
-///   Total = N * ceil(K/4) * 4 bytes.
+/// - 6-bit: 4 values per 3 bytes (MLX triplet packing), so each row needs
+///   ceil(K/4) * 3 bytes. Total = N * ceil(K/4) * 3 bytes.
 /// - 8-bit: 4 values per uint32, so each row needs ceil(K/4) uint32s.
 ///   Total = N * ceil(K/4) * 4 bytes.
 fn expected_weight_bytes(k: u32, n: u32, bits: u32) -> usize {
-    let values_per_pack: u32 = match bits {
-        4 => 8,
-        6 | 8 => 4,
-        _ => return 0,
-    };
-    let packs_per_row = (k + values_per_pack - 1) / values_per_pack;
-    (n as usize) * (packs_per_row as usize) * 4 // 4 bytes per uint32
+    match bits {
+        4 => {
+            let values_per_pack = 8u32;
+            let packs_per_row = (k + values_per_pack - 1) / values_per_pack;
+            (n as usize) * (packs_per_row as usize) * 4
+        }
+        6 => {
+            // 4 values per 3-byte triplet
+            let triplets_per_row = (k + 3) / 4;
+            (n as usize) * (triplets_per_row as usize) * 3
+        }
+        8 => {
+            let values_per_pack = 4u32;
+            let packs_per_row = (k + values_per_pack - 1) / values_per_pack;
+            (n as usize) * (packs_per_row as usize) * 4
+        }
+        _ => 0,
+    }
 }
 
 /// Compute the expected scales (or biases) buffer size in bytes.
@@ -290,9 +301,13 @@ pub fn quantized_matmul_simd(
     }
 
     // --- Validate bits ---
+    // 6-bit: fall back to scalar GPU kernel (SIMD path only handles 4/8-bit)
+    if params.bits == 6 {
+        return quantized_matmul(encoder, registry, device, input, weight, scales, biases, params);
+    }
     if params.bits != 4 && params.bits != 8 {
         return Err(MlxError::InvalidArgument(format!(
-            "SIMD kernel: unsupported bits value {}; only 4 and 8 are supported",
+            "SIMD kernel: unsupported bits value {}; only 4, 6, and 8 are supported",
             params.bits
         )));
     }
@@ -484,9 +499,37 @@ pub fn dispatch_quantized_matmul_simd_bf16(
         return Ok(bf16_out);
     }
 
+    // 6-bit: already handled by the !can_use_simd_kernel_bf16 fallback above
+    // which routes through quantized_matmul (scalar GPU kernel that supports 6-bit).
+    // But add an explicit check to be safe.
+    if params.bits == 6 {
+        // Route through the same fallback path as non-SIMD-aligned dimensions
+        let n_in = (params.m as usize) * (params.k as usize);
+        let f32_input = if input.dtype() == DType::BF16 {
+            let f32_buf = device.alloc_buffer(n_in * DType::F32.size_of(), DType::F32, vec![params.m as usize, params.k as usize])?;
+            crate::ops::elementwise::cast(
+                encoder, registry, device.metal_device(),
+                input, &f32_buf, n_in,
+                crate::ops::elementwise::CastDirection::BF16ToF32,
+            )?;
+            Some(f32_buf)
+        } else {
+            None
+        };
+        let actual_input = f32_input.as_ref().unwrap_or(input);
+        let f32_result = quantized_matmul(encoder, registry, device, actual_input, packed_weights, scales, biases, params)?;
+        let n_out = (params.m as usize) * (params.n as usize);
+        let bf16_out = device.alloc_buffer(n_out * DType::BF16.size_of(), DType::BF16, vec![params.m as usize, params.n as usize])?;
+        crate::ops::elementwise::cast(
+            encoder, registry, device.metal_device(),
+            &f32_result, &bf16_out, n_out,
+            crate::ops::elementwise::CastDirection::F32ToBF16,
+        )?;
+        return Ok(bf16_out);
+    }
     if params.bits != 4 && params.bits != 8 {
         return Err(MlxError::InvalidArgument(format!(
-            "bf16 SIMD kernel: unsupported bits value {}; only 4 and 8 are supported",
+            "bf16 SIMD kernel: unsupported bits value {}; only 4, 6, and 8 are supported",
             params.bits
         )));
     }

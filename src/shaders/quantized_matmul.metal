@@ -105,35 +105,58 @@ kernel void quantized_matmul(
 
     // Determine packing parameters based on bit-width.
     // 4-bit: 8 values per uint32
-    // 6-bit: 4 values per uint32 (MLX triplet format)
+    // 6-bit: 4 values per 3 bytes (MLX triplet format, read as uint8_t triples)
     // 8-bit: 4 values per uint32
-    uint values_per_pack = (bits == 4) ? 8u : 4u;
-    uint packs_per_row = (K + values_per_pack - 1) / values_per_pack;
-    uint w_base = col * packs_per_row;
+    const device uint8_t* w_bytes = (const device uint8_t*)weight;
 
-    for (uint k = 0; k < K; k++) {
-        uint pack_idx = k / values_per_pack;
-        uint in_pack_idx = k % values_per_pack;
-        uint packed = weight[w_base + pack_idx];
+    if (bits == 6) {
+        // 6-bit: 4 values per 3-byte triplet. Row stride = ceil(K/4) * 3 bytes.
+        uint triplets_per_row = (K + 3) / 4;
+        uint row_bytes = triplets_per_row * 3;
+        const device uint8_t* w_row = w_bytes + col * row_bytes;
 
-        uint g = k / group_size;
-        bfloat scale = as_type<bfloat>(scales[sb_base + g]);
-        bfloat bias  = as_type<bfloat>(biases[sb_base + g]);
+        for (uint k = 0; k < K; k++) {
+            uint triplet_idx = k / 4;
+            uint in_triplet = k % 4;
+            // Read 3 bytes as uint32 (high byte is zero-padded)
+            uint byte_off = triplet_idx * 3;
+            uint packed = uint(w_row[byte_off])
+                        | (uint(w_row[byte_off + 1]) << 8)
+                        | (uint(w_row[byte_off + 2]) << 16);
 
-        // Dequantize weight to bf16 (matching MLX's native bf16 dequant)
-        bfloat w;
-        if (bits == 4) {
-            w = dequant_4bit(packed, in_pack_idx, scale, bias);
-        } else if (bits == 6) {
-            w = dequant_6bit(packed, in_pack_idx, scale, bias);
-        } else {
-            w = dequant_8bit(packed, in_pack_idx, scale, bias);
+            uint g = k / group_size;
+            bfloat scale = as_type<bfloat>(scales[sb_base + g]);
+            bfloat bias  = as_type<bfloat>(biases[sb_base + g]);
+            bfloat w = dequant_6bit(packed, in_triplet, scale, bias);
+
+            bfloat x = bfloat(input[row * K + k]);
+            acc += float(w) * float(x);
         }
+    } else {
+        // 4-bit and 8-bit: uint32 packed
+        uint values_per_pack = (bits == 4) ? 8u : 4u;
+        uint packs_per_row = (K + values_per_pack - 1) / values_per_pack;
+        uint w_base = col * packs_per_row;
 
-        // Read input and truncate to bf16 to match MLX's bf16 pipeline.
-        // Accumulate bf16*bf16 products in f32 for numerical stability.
-        bfloat x = bfloat(input[row * K + k]);
-        acc += float(w) * float(x);
+        for (uint k = 0; k < K; k++) {
+            uint pack_idx = k / values_per_pack;
+            uint in_pack_idx = k % values_per_pack;
+            uint packed = weight[w_base + pack_idx];
+
+            uint g = k / group_size;
+            bfloat scale = as_type<bfloat>(scales[sb_base + g]);
+            bfloat bias  = as_type<bfloat>(biases[sb_base + g]);
+
+            bfloat w;
+            if (bits == 4) {
+                w = dequant_4bit(packed, in_pack_idx, scale, bias);
+            } else {
+                w = dequant_8bit(packed, in_pack_idx, scale, bias);
+            }
+
+            bfloat x = bfloat(input[row * K + k]);
+            acc += float(w) * float(x);
+        }
     }
 
     output[row * params.N + col] = acc;
