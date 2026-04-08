@@ -1,8 +1,8 @@
-//! GPU-accelerated MoE gating: top-K expert selection with softmax routing.
+//! GPU-accelerated MoE gating: parallel top-K expert selection with softmax
+//! routing.
 //!
-//! Given a hidden state and a router weight matrix, computes router logits
-//! for all experts, selects the top-K, and returns softmax-normalized
-//! routing weights.
+//! One threadgroup per token (grid = seq_len × 1 × 1), 128 threads per group.
+//! Supports bf16 hidden state input, f32 router weights, and per-expert scale.
 //!
 //! Designed for Gemma 4: 128 experts, top-8 routing, hidden_dim=2816.
 
@@ -13,8 +13,6 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
-use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
-
 /// Parameters for MoE gate routing.
 pub struct MoeGateParams {
     /// Hidden state dimension (e.g. 2816 for Gemma 4).
@@ -23,43 +21,41 @@ pub struct MoeGateParams {
     pub n_experts: usize,
     /// Number of experts to select (e.g. 8 for Gemma 4).
     pub top_k: usize,
+    /// Number of tokens in the sequence (seq_len >= 1).
+    pub seq_len: usize,
+    /// RMS norm epsilon (e.g. 1e-6).
+    pub rms_eps: f32,
 }
 
-/// MSL-compatible parameter struct for the moe_gate kernel.
+/// Encode a parallel MoE gate operation.
 ///
-/// Must match `MoeGateParams` struct in `moe_gate.metal`.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuMoeGateParams {
-    hidden_dim: u32,
-    n_experts: u32,
-    top_k: u32,
-}
-
-/// Encode a MoE gate operation: compute router logits, select top-K experts,
-/// and softmax-normalize their routing weights.
+/// Launches one threadgroup per token; each threadgroup runs 128 threads that
+/// cooperate on:
+///   1. RMS-Norm of the token's hidden state.
+///   2. Router matmul (each thread handles ⌈n_experts/128⌉ experts).
+///   3. Top-K insertion sort + softmax + per_expert_scale (single thread).
 ///
 /// # Buffer expectations
 ///
-/// * `hidden_state`   — f32, `[hidden_dim]` (single token's hidden state)
-/// * `router_weight`  — f32, `[n_experts, hidden_dim]` (row-major)
-/// * `out_expert_ids` — u32, `[top_k]` (output: selected expert indices)
-/// * `out_weights`    — f32, `[top_k]` (output: softmax routing weights)
+/// * `hidden_state`      — bf16, `[seq_len, hidden_dim]`
+/// * `router_weights`    — f32,  `[n_experts, hidden_dim]` (row-major, pre-cached on GPU)
+/// * `norm_weight`       — f32,  `[hidden_dim]` (RMS norm learned weight)
+/// * `per_expert_scale`  — f32,  `[n_experts]`
+/// * `out_expert_ids`    — u32,  `[seq_len, top_k]`  (output)
+/// * `out_weights`       — f32,  `[seq_len, top_k]`  (output)
 ///
 /// # Errors
 ///
-/// Returns `MlxError::InvalidArgument` if:
-/// * `hidden_dim`, `n_experts`, or `top_k` is zero
-/// * `top_k > n_experts`
-/// * `n_experts > 128` (shader uses fixed-size arrays)
-/// * Buffer sizes are inconsistent
+/// Returns `MlxError::InvalidArgument` if any parameter or buffer is invalid.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gate(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &metal::DeviceRef,
     hidden_state: &MlxBuffer,
-    router_weight: &MlxBuffer,
+    router_weights: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    per_expert_scale: &MlxBuffer,
     out_expert_ids: &MlxBuffer,
     out_weights: &MlxBuffer,
     params: &MoeGateParams,
@@ -80,6 +76,11 @@ pub fn moe_gate(
             "moe_gate: top_k must be > 0".into(),
         ));
     }
+    if params.seq_len == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_gate: seq_len must be > 0".into(),
+        ));
+    }
     if params.top_k > params.n_experts {
         return Err(MlxError::InvalidArgument(format!(
             "moe_gate: top_k ({}) must be <= n_experts ({})",
@@ -93,7 +94,12 @@ pub fn moe_gate(
         )));
     }
 
-    let expected_hidden_bytes = params.hidden_dim * std::mem::size_of::<f32>();
+    // bf16 elements are 2 bytes each
+    let bf16_size = 2usize;
+    let f32_size = std::mem::size_of::<f32>();
+    let u32_size = std::mem::size_of::<u32>();
+
+    let expected_hidden_bytes = params.seq_len * params.hidden_dim * bf16_size;
     if hidden_state.byte_len() < expected_hidden_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "moe_gate: hidden_state buffer too small: need {} bytes, have {}",
@@ -102,17 +108,34 @@ pub fn moe_gate(
         )));
     }
 
-    let expected_router_bytes =
-        params.n_experts * params.hidden_dim * std::mem::size_of::<f32>();
-    if router_weight.byte_len() < expected_router_bytes {
+    let expected_router_bytes = params.n_experts * params.hidden_dim * f32_size;
+    if router_weights.byte_len() < expected_router_bytes {
         return Err(MlxError::InvalidArgument(format!(
-            "moe_gate: router_weight buffer too small: need {} bytes, have {}",
+            "moe_gate: router_weights buffer too small: need {} bytes, have {}",
             expected_router_bytes,
-            router_weight.byte_len()
+            router_weights.byte_len()
         )));
     }
 
-    let expected_ids_bytes = params.top_k * std::mem::size_of::<u32>();
+    let expected_norm_bytes = params.hidden_dim * f32_size;
+    if norm_weight.byte_len() < expected_norm_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_gate: norm_weight buffer too small: need {} bytes, have {}",
+            expected_norm_bytes,
+            norm_weight.byte_len()
+        )));
+    }
+
+    let expected_scale_bytes = params.n_experts * f32_size;
+    if per_expert_scale.byte_len() < expected_scale_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_gate: per_expert_scale buffer too small: need {} bytes, have {}",
+            expected_scale_bytes,
+            per_expert_scale.byte_len()
+        )));
+    }
+
+    let expected_ids_bytes = params.seq_len * params.top_k * u32_size;
     if out_expert_ids.byte_len() < expected_ids_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "moe_gate: out_expert_ids buffer too small: need {} bytes, have {}",
@@ -121,7 +144,7 @@ pub fn moe_gate(
         )));
     }
 
-    let expected_weights_bytes = params.top_k * std::mem::size_of::<f32>();
+    let expected_weights_bytes = params.seq_len * params.top_k * f32_size;
     if out_weights.byte_len() < expected_weights_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "moe_gate: out_weights buffer too small: need {} bytes, have {}",
@@ -130,35 +153,73 @@ pub fn moe_gate(
         )));
     }
 
-    // --- Build GPU params ---
-    let gpu_params = GpuMoeGateParams {
-        hidden_dim: params.hidden_dim as u32,
-        n_experts: params.n_experts as u32,
-        top_k: params.top_k as u32,
-    };
-
+    // --- Kernel dispatch ---
     let pipeline = registry.get_pipeline("moe_gate", device)?;
 
-    // Single-thread dispatch — the kernel does all work in one thread.
-    // This is correct for Stage 1; Epic 6 can parallelize.
-    let grid = MTLSize::new(1, 1, 1);
-    let tg_size = MTLSize::new(1, 1, 1);
+    // 128 threads per threadgroup — one per expert for the matmul phase.
+    // Must be a power of 2 for the tree-reduction in RMS norm.
+    let tg_threads: u64 = 128;
 
-    let params_bytes = as_bytes(&gpu_params);
+    // One threadgroup per token.
+    let threadgroups = MTLSize::new(params.seq_len as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(tg_threads, 1, 1);
 
-    encode_with_args(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(hidden_state)),
-            (1, KernelArg::Buffer(router_weight)),
-            (2, KernelArg::Buffer(out_expert_ids)),
-            (3, KernelArg::Buffer(out_weights)),
-            (5, KernelArg::Bytes(params_bytes)),
-        ],
-        grid,
-        tg_size,
+    // Threadgroup shared memory layout (see moe_gate.metal):
+    //   [0 .. hidden_dim)                   — f32 normed hidden state
+    //   [hidden_dim .. hidden_dim+n_experts) — f32 router logits / reduction scratch
+    //
+    // Both regions are large enough for the RMS reduction (uses logit region as
+    // scratch with tg_size=128 slots, which fits within n_experts=128 floats).
+    let shared_bytes =
+        ((params.hidden_dim + params.n_experts) * std::mem::size_of::<f32>()) as u64;
+
+    // Scalar constants passed as inline bytes via set_bytes.
+    let hidden_dim_u32 = params.hidden_dim as u32;
+    let n_experts_u32  = params.n_experts  as u32;
+    let top_k_u32      = params.top_k      as u32;
+    let rms_eps_f32    = params.rms_eps;
+
+    // Use the raw Metal command buffer to build an encoder that supports both
+    // set_bytes (for scalar constants) and set_threadgroup_memory_length.
+    let cmd_buf = encoder.metal_command_buffer();
+    let ce = cmd_buf.new_compute_command_encoder();
+    ce.set_compute_pipeline_state(pipeline);
+
+    // Buffer bindings (match [[buffer(N)]] in moe_gate.metal)
+    ce.set_buffer(0, Some(hidden_state.metal_buffer()),     0);
+    ce.set_buffer(1, Some(router_weights.metal_buffer()),   0);
+    ce.set_buffer(2, Some(norm_weight.metal_buffer()),      0);
+    ce.set_buffer(3, Some(per_expert_scale.metal_buffer()), 0);
+    ce.set_buffer(4, Some(out_expert_ids.metal_buffer()),   0);
+    ce.set_buffer(5, Some(out_weights.metal_buffer()),      0);
+
+    // Scalar constants via set_bytes
+    ce.set_bytes(
+        6,
+        std::mem::size_of::<u32>() as u64,
+        &hidden_dim_u32 as *const u32 as *const _,
     );
+    ce.set_bytes(
+        7,
+        std::mem::size_of::<u32>() as u64,
+        &n_experts_u32 as *const u32 as *const _,
+    );
+    ce.set_bytes(
+        8,
+        std::mem::size_of::<u32>() as u64,
+        &top_k_u32 as *const u32 as *const _,
+    );
+    ce.set_bytes(
+        9,
+        std::mem::size_of::<f32>() as u64,
+        &rms_eps_f32 as *const f32 as *const _,
+    );
+
+    // Threadgroup (shared) memory
+    ce.set_threadgroup_memory_length(0, shared_bytes);
+
+    ce.dispatch_thread_groups(threadgroups, threadgroup_size);
+    ce.end_encoding();
 
     Ok(())
 }

@@ -4,12 +4,41 @@
 //! then call [`commit_and_wait`](CommandEncoder::commit_and_wait) to submit the
 //! entire batch and block until the GPU finishes.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use metal::{
     CommandBuffer, CommandQueue, ComputePipelineStateRef, MTLCommandBufferStatus, MTLSize,
 };
 
 use crate::buffer::MlxBuffer;
 use crate::error::{MlxError, Result};
+
+/// Number of times `commit_and_wait()` has been called (CPU sync points).
+static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of times an encode method has been called (GPU dispatches).
+static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Reset both `SYNC_COUNT` and `DISPATCH_COUNT` to zero.
+pub fn reset_counters() {
+    SYNC_COUNT.store(0, Ordering::Relaxed);
+    DISPATCH_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Read the current value of `SYNC_COUNT`.
+///
+/// Each call to `commit_and_wait()` increments this counter.
+pub fn sync_count() -> u64 {
+    SYNC_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read the current value of `DISPATCH_COUNT`.
+///
+/// Each call to `encode()`, `encode_threadgroups()`, or
+/// `encode_threadgroups_with_shared()` increments this counter.
+pub fn dispatch_count() -> u64 {
+    DISPATCH_COUNT.load(Ordering::Relaxed)
+}
 
 /// A batched compute command encoder.
 ///
@@ -120,6 +149,7 @@ impl CommandEncoder {
         grid_size: MTLSize,
         threadgroup_size: MTLSize,
     ) {
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         let encoder = self.cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
@@ -141,6 +171,7 @@ impl CommandEncoder {
         threadgroups: MTLSize,
         threadgroup_size: MTLSize,
     ) {
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         let encoder = self.cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
@@ -173,6 +204,7 @@ impl CommandEncoder {
         threadgroups: MTLSize,
         threadgroup_size: MTLSize,
     ) {
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         let encoder = self.cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
@@ -192,6 +224,8 @@ impl CommandEncoder {
     ///
     /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
     pub fn commit_and_wait(&mut self) -> Result<()> {
+        SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+
         // If there is an active encoder that was started via set_pipeline()
         // but not yet ended, we cannot end it here because we don't hold a
         // reference to it.  The `encode()` API handles this properly.
@@ -212,6 +246,39 @@ impl CommandEncoder {
                     "GPU command buffer completed with error status".into(),
                 ))
             }
+            status => Err(MlxError::CommandBufferError(format!(
+                "Unexpected command buffer status after wait: {:?}",
+                status
+            ))),
+        }
+    }
+
+    /// Commit the command buffer WITHOUT blocking.
+    ///
+    /// The GPU begins executing the encoded commands immediately.  Call
+    /// [`wait_until_completed`](Self::wait_until_completed) later to block
+    /// the CPU and check for errors.  This allows the CPU to continue doing
+    /// other work (e.g. preparing the next batch) while the GPU runs.
+    pub fn commit(&mut self) {
+        self.has_active_encoder = false;
+        self.cmd_buf.commit();
+    }
+
+    /// Block until a previously committed command buffer completes.
+    ///
+    /// Must be called after [`commit`](Self::commit).  Do not call after
+    /// [`commit_and_wait`](Self::commit_and_wait) — that method already waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
+    pub fn wait_until_completed(&self) -> Result<()> {
+        self.cmd_buf.wait_until_completed();
+        match self.cmd_buf.status() {
+            MTLCommandBufferStatus::Completed => Ok(()),
+            MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
+                "GPU command buffer completed with error status".into(),
+            )),
             status => Err(MlxError::CommandBufferError(format!(
                 "Unexpected command buffer status after wait: {:?}",
                 status

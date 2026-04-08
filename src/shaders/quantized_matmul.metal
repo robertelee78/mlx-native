@@ -391,3 +391,315 @@ kernel void quantized_matmul_simd(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// load_vector helpers for bf16 input (used by bf16 variants below).
+//
+// These mirror load_vector_4bit / load_vector_8bit but read bfloat instead of
+// float32.  The values are promoted to float for accumulation — identical
+// arithmetic to the f32 path because both paths truncate to bfloat first.
+// ---------------------------------------------------------------------------
+
+inline void load_vector_4bit_bf16(
+    const device bfloat* x_bf16,
+    thread float* x_thread,
+    thread float& sum,
+    int count  // values_per_thread, expected 8
+) {
+    float s = 0.0f;
+    for (int i = 0; i < count; i += 4) {
+        float v0 = float(x_bf16[i]);
+        float v1 = float(x_bf16[i + 1]);
+        float v2 = float(x_bf16[i + 2]);
+        float v3 = float(x_bf16[i + 3]);
+        s += v0 + v1 + v2 + v3;
+        x_thread[i]     = v0;
+        x_thread[i + 1] = v1 / 16.0f;
+        x_thread[i + 2] = v2 / 256.0f;
+        x_thread[i + 3] = v3 / 4096.0f;
+    }
+    sum = s;
+}
+
+inline void load_vector_8bit_bf16(
+    const device bfloat* x_bf16,
+    thread float* x_thread,
+    thread float& sum,
+    int count  // values_per_thread, expected 8
+) {
+    float s = 0.0f;
+    for (int i = 0; i < count; i++) {
+        float v = float(x_bf16[i]);
+        s += v;
+        x_thread[i] = v;
+    }
+    sum = s;
+}
+
+// ---------------------------------------------------------------------------
+// quantized_matmul_simd_bf16
+//
+// Identical computation to quantized_matmul_simd but with bf16 input and
+// bf16 output.  Accumulation remains in f32 for numerical stability.
+//
+// Buffer layout:
+//   buffer(0): input    — bfloat[M][K]
+//   buffer(1): weight   — packed uint32[N][packed_k]
+//   buffer(2): scales   — uint16_t[N][num_groups]  (bf16 bits)
+//   buffer(3): biases   — uint16_t[N][num_groups]  (bf16 bits)
+//   buffer(4): output   — bfloat[M][N]
+//   buffer(5): params   — QuantizedMatmulParams
+// ---------------------------------------------------------------------------
+kernel void quantized_matmul_simd_bf16(
+    device const bfloat*   input   [[buffer(0)]],
+    device const uint*     weight  [[buffer(1)]],
+    device const uint16_t* scales  [[buffer(2)]],
+    device const uint16_t* biases  [[buffer(3)]],
+    device bfloat*         output  [[buffer(4)]],
+    constant QuantizedMatmulParams& params [[buffer(5)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]]
+) {
+    const uint num_simdgroups = 2;
+    const uint results_per_simdgroup = 4;
+
+    const uint K = params.K;
+    const uint N = params.N;
+    const uint bits = params.bits;
+    const uint group_size = params.group_size;
+
+    uint pack_factor;
+    uint packs_per_thread;
+    uint values_per_thread;
+    uint bytes_per_pack;
+
+    if (bits == 4) {
+        pack_factor = 8;
+        packs_per_thread = 1;
+        values_per_thread = 8;
+        bytes_per_pack = 4;
+    } else if (bits == 8) {
+        pack_factor = 4;
+        packs_per_thread = 2;
+        values_per_thread = 8;
+        bytes_per_pack = 4;
+    } else {
+        return;
+    }
+
+    const uint block_size = values_per_thread * SIMD_SIZE_CONST;
+    const uint scale_step_per_thread = group_size / values_per_thread;
+
+    const device uint8_t* ws = (const device uint8_t*)weight;
+
+    const uint row = tid.x;
+    if (row >= params.M) return;
+
+    const uint out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                         simd_gid * results_per_simdgroup;
+    if (out_row >= N) return;
+
+    const uint in_vec_size_w = K * bytes_per_pack / pack_factor;
+    const uint in_vec_size_g = K / group_size;
+
+    const device uint8_t* ws_ptr = ws + out_row * in_vec_size_w +
+                                   simd_lid * packs_per_thread * bytes_per_pack;
+    const device uint16_t* sc_ptr = scales + out_row * in_vec_size_g +
+                                    simd_lid / scale_step_per_thread;
+    const device uint16_t* bi_ptr = biases + out_row * in_vec_size_g +
+                                    simd_lid / scale_step_per_thread;
+
+    // Input is bf16 — read directly without cast.
+    const device bfloat* x_bf16 = input + row * K + simd_lid * values_per_thread;
+
+    // Output is bf16.
+    device bfloat* y_ptr = output + row * N + out_row;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (bits == 4) {
+        float x_thread[8];
+        for (uint k = 0; k < K; k += block_size) {
+            float x_sum;
+            load_vector_4bit_bf16(x_bf16, x_thread, x_sum, values_per_thread);
+
+            for (uint r = 0; r < results_per_simdgroup; r++) {
+                const device uint8_t* wl = ws_ptr + r * in_vec_size_w;
+                float s = float(as_type<bfloat>(sc_ptr[r * in_vec_size_g]));
+                float b = float(as_type<bfloat>(bi_ptr[r * in_vec_size_g]));
+                result[r] += qdot_4bit(wl, x_thread, s, b, x_sum, values_per_thread);
+            }
+
+            ws_ptr += block_size * bytes_per_pack / pack_factor;
+            sc_ptr += block_size / group_size;
+            bi_ptr += block_size / group_size;
+            x_bf16 += block_size;
+        }
+    } else {
+        float x_thread[8];
+        for (uint k = 0; k < K; k += block_size) {
+            float x_sum;
+            load_vector_8bit_bf16(x_bf16, x_thread, x_sum, 8);
+
+            for (uint r = 0; r < results_per_simdgroup; r++) {
+                const device uint8_t* wl = ws_ptr + r * in_vec_size_w;
+                float s = float(as_type<bfloat>(sc_ptr[r * in_vec_size_g]));
+                float b = float(as_type<bfloat>(bi_ptr[r * in_vec_size_g]));
+                result[r] += qdot_8bit(wl, x_thread, s, b, x_sum, 8);
+            }
+
+            ws_ptr += block_size * bytes_per_pack / pack_factor;
+            sc_ptr += block_size / group_size;
+            bi_ptr += block_size / group_size;
+            x_bf16 += block_size;
+        }
+    }
+
+    // Reduce and write bf16 output.
+    for (uint r = 0; r < results_per_simdgroup; r++) {
+        result[r] = simd_sum(result[r]);
+        if (simd_lid == 0) {
+            if (out_row + r < N) {
+                y_ptr[r] = bfloat(result[r]);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// quantized_matmul_simd_bf16_expert
+//
+// Same as quantized_matmul_simd_bf16 but accepts byte-offset parameters that
+// allow indexing into a 3D packed weight tensor [n_experts, rows, packed_cols]
+// without CPU memcpy.  The offsets are in bytes.
+//
+// Buffer layout:
+//   buffer(0): input              — bfloat[M][K]
+//   buffer(1): packed_weights     — packed uint32 for ALL experts (3D layout)
+//   buffer(2): scales             — uint16_t scales for ALL experts
+//   buffer(3): biases             — uint16_t biases for ALL experts
+//   buffer(4): output             — bfloat[M][N]
+//   buffer(5): params             — QuantizedMatmulParams
+//   buffer(6): expert_offset      — byte offset into packed_weights for this expert
+//   buffer(7): scales_offset      — byte offset into scales for this expert
+//   buffer(8): biases_offset      — byte offset into biases for this expert
+// ---------------------------------------------------------------------------
+kernel void quantized_matmul_simd_bf16_expert(
+    device const bfloat*   input             [[buffer(0)]],
+    device const uint8_t*  packed_weights    [[buffer(1)]],
+    device const uint8_t*  scales_raw        [[buffer(2)]],
+    device const uint8_t*  biases_raw        [[buffer(3)]],
+    device bfloat*         output            [[buffer(4)]],
+    constant QuantizedMatmulParams& params   [[buffer(5)]],
+    constant uint& expert_offset             [[buffer(6)]],
+    constant uint& scales_offset             [[buffer(7)]],
+    constant uint& biases_offset             [[buffer(8)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]]
+) {
+    const uint num_simdgroups = 2;
+    const uint results_per_simdgroup = 4;
+
+    const uint K = params.K;
+    const uint N = params.N;
+    const uint bits = params.bits;
+    const uint group_size = params.group_size;
+
+    uint pack_factor;
+    uint packs_per_thread;
+    uint values_per_thread;
+    uint bytes_per_pack;
+
+    if (bits == 4) {
+        pack_factor = 8;
+        packs_per_thread = 1;
+        values_per_thread = 8;
+        bytes_per_pack = 4;
+    } else if (bits == 8) {
+        pack_factor = 4;
+        packs_per_thread = 2;
+        values_per_thread = 8;
+        bytes_per_pack = 4;
+    } else {
+        return;
+    }
+
+    const uint block_size = values_per_thread * SIMD_SIZE_CONST;
+    const uint scale_step_per_thread = group_size / values_per_thread;
+
+    // Apply byte offsets to reach this expert's slice in the 3D buffers.
+    const device uint8_t* ws = packed_weights + expert_offset;
+    const device uint16_t* scales = (const device uint16_t*)(scales_raw + scales_offset);
+    const device uint16_t* biases = (const device uint16_t*)(biases_raw + biases_offset);
+
+    const uint row = tid.x;
+    if (row >= params.M) return;
+
+    const uint out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                         simd_gid * results_per_simdgroup;
+    if (out_row >= N) return;
+
+    const uint in_vec_size_w = K * bytes_per_pack / pack_factor;
+    const uint in_vec_size_g = K / group_size;
+
+    const device uint8_t* ws_ptr = ws + out_row * in_vec_size_w +
+                                   simd_lid * packs_per_thread * bytes_per_pack;
+    const device uint16_t* sc_ptr = scales + out_row * in_vec_size_g +
+                                    simd_lid / scale_step_per_thread;
+    const device uint16_t* bi_ptr = biases + out_row * in_vec_size_g +
+                                    simd_lid / scale_step_per_thread;
+
+    const device bfloat* x_bf16 = input + row * K + simd_lid * values_per_thread;
+    device bfloat* y_ptr = output + row * N + out_row;
+
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (bits == 4) {
+        float x_thread[8];
+        for (uint k = 0; k < K; k += block_size) {
+            float x_sum;
+            load_vector_4bit_bf16(x_bf16, x_thread, x_sum, values_per_thread);
+
+            for (uint r = 0; r < results_per_simdgroup; r++) {
+                const device uint8_t* wl = ws_ptr + r * in_vec_size_w;
+                float s = float(as_type<bfloat>(sc_ptr[r * in_vec_size_g]));
+                float b = float(as_type<bfloat>(bi_ptr[r * in_vec_size_g]));
+                result[r] += qdot_4bit(wl, x_thread, s, b, x_sum, values_per_thread);
+            }
+
+            ws_ptr += block_size * bytes_per_pack / pack_factor;
+            sc_ptr += block_size / group_size;
+            bi_ptr += block_size / group_size;
+            x_bf16 += block_size;
+        }
+    } else {
+        float x_thread[8];
+        for (uint k = 0; k < K; k += block_size) {
+            float x_sum;
+            load_vector_8bit_bf16(x_bf16, x_thread, x_sum, 8);
+
+            for (uint r = 0; r < results_per_simdgroup; r++) {
+                const device uint8_t* wl = ws_ptr + r * in_vec_size_w;
+                float s = float(as_type<bfloat>(sc_ptr[r * in_vec_size_g]));
+                float b = float(as_type<bfloat>(bi_ptr[r * in_vec_size_g]));
+                result[r] += qdot_8bit(wl, x_thread, s, b, x_sum, 8);
+            }
+
+            ws_ptr += block_size * bytes_per_pack / pack_factor;
+            sc_ptr += block_size / group_size;
+            bi_ptr += block_size / group_size;
+            x_bf16 += block_size;
+        }
+    }
+
+    for (uint r = 0; r < results_per_simdgroup; r++) {
+        result[r] = simd_sum(result[r]);
+        if (simd_lid == 0) {
+            if (out_row + r < N) {
+                y_ptr[r] = bfloat(result[r]);
+            }
+        }
+    }
+}

@@ -56,7 +56,7 @@ pub use buffer::MlxBuffer;
 pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
 pub use dtypes::DType;
-pub use encoder::CommandEncoder;
+pub use encoder::{dispatch_count, reset_counters, sync_count, CommandEncoder};
 pub use error::{MlxError, Result};
 pub use kernel_registry::KernelRegistry;
 

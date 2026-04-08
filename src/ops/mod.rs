@@ -5,6 +5,8 @@
 pub mod elementwise;
 pub mod embedding;
 pub mod encode_helpers;
+pub mod fused_head_norm_rope;
+pub mod fused_residual_norm;
 pub mod gelu;
 pub mod kv_cache_copy;
 pub mod moe_dispatch;

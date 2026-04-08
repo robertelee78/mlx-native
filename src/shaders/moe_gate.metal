@@ -2,112 +2,157 @@
 using namespace metal;
 
 // --------------------------------------------------------------------------
-// moe_gate — Top-K expert routing with softmax weights
+// moe_gate — Parallel top-K expert routing with softmax weights.
 //
-// Given a hidden state vector [hidden_dim] and a router weight matrix
-// [hidden_dim x n_experts], compute router logits, select top-K experts,
-// and return softmax-normalized weights over the selected experts.
+// Operates in parallel: one threadgroup per token, 128 threads per group.
 //
-// This kernel operates on a single token at a time. For batch processing,
-// the Rust host dispatches one invocation per token.
-//
-// Stage 1: Compute router logits via dot products (one per expert)
-// Stage 2: Find top-K experts (simple selection sort for K=8 out of 128)
-// Stage 3: Softmax over the K selected logits
+// Algorithm per token:
+//   1. RMS-Norm of hidden state (parallel reduction in threadgroup).
+//   2. Router matmul: each thread handles ceil(n_experts/128) experts.
+//      Normed hidden is stored in threadgroup shared memory (tg_hidden).
+//      Logits are accumulated in threadgroup shared memory (tg_logits).
+//   3. Top-K selection (single thread, K=8 from 128 experts via insertion
+//      sort — 8 × 128 = 1024 comparisons, trivial).
+//   4. Apply per_expert_scale and softmax over the K selected logits.
 //
 // Buffers:
-//   0: hidden_state    — float [hidden_dim]
-//   1: router_weight   — float [n_experts, hidden_dim] (row-major: each expert is one row)
-//   2: out_expert_ids  — uint32 [top_k]  (output: selected expert indices)
-//   3: out_weights     — float  [top_k]  (output: softmax routing weights)
-//   4: params          — { hidden_dim, n_experts, top_k }
+//   0: hidden_state      — bfloat [seq_len, hidden_dim]
+//   1: router_weights    — float  [n_experts, hidden_dim] (row-major)
+//   2: norm_weight       — float  [hidden_dim]
+//   3: per_expert_scale  — float  [n_experts]
+//   4: expert_ids        — uint   [seq_len, top_k]  (output)
+//   5: expert_weights    — float  [seq_len, top_k]  (output)
+//   6: hidden_dim        — constant uint
+//   7: n_experts         — constant uint
+//   8: top_k             — constant uint
+//   9: rms_eps           — constant float
 //
-// Grid: (1, 1, 1)  — single threadgroup, single thread for correctness
-//        (For large n_experts, a parallel reduction would be faster,
-//         but 128 experts with dot products of size 2816 is manageable
-//         for Stage 1. Epic 6 can optimize.)
+// Threadgroup shared memory layout (index 0):
+//   [0 .. hidden_dim)           — float: normed hidden state
+//   [hidden_dim .. hidden_dim+n_experts) — float: router logits
+//
+// Grid:     (seq_len, 1, 1)   — one threadgroup per token
+// Threads:  (128, 1, 1)       — 128 threads per threadgroup
 // --------------------------------------------------------------------------
 
-struct MoeGateParams {
-    uint hidden_dim;
-    uint n_experts;
-    uint top_k;
-};
-
 kernel void moe_gate(
-    device const float*    hidden_state    [[buffer(0)]],
-    device const float*    router_weight   [[buffer(1)]],
-    device uint32_t*       out_expert_ids  [[buffer(2)]],
-    device float*          out_weights     [[buffer(3)]],
-    constant MoeGateParams& params         [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]
+    device const bfloat* hidden_state       [[buffer(0)]],
+    device const float*  router_weights     [[buffer(1)]],
+    device const float*  norm_weight        [[buffer(2)]],
+    device const float*  per_expert_scale   [[buffer(3)]],
+    device uint*         expert_ids         [[buffer(4)]],
+    device float*        expert_weights     [[buffer(5)]],
+    constant uint&       hidden_dim         [[buffer(6)]],
+    constant uint&       n_experts          [[buffer(7)]],
+    constant uint&       top_k              [[buffer(8)]],
+    constant float&      rms_eps            [[buffer(9)]],
+    uint  tid    [[thread_index_in_threadgroup]],
+    uint  token  [[threadgroup_position_in_grid]],
+    uint  tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared               [[threadgroup(0)]]
 ) {
-    // This kernel runs as a single thread for correctness.
-    // It computes: logits[e] = dot(hidden_state, router_weight[e]) for each expert e
-    // Then selects top-K and applies softmax over them.
+    // shared layout:
+    //   shared[0 .. hidden_dim)                — normed hidden (f32)
+    //   shared[hidden_dim .. hidden_dim+n_experts) — logits (f32)
+    threadgroup float* tg_hidden = shared;
+    threadgroup float* tg_logits = shared + hidden_dim;
 
-    uint hidden_dim = params.hidden_dim;
-    uint n_experts  = params.n_experts;
-    uint top_k      = params.top_k;
+    const uint token_base = token * hidden_dim;
 
-    // --- Stage 1: Compute router logits ---
-    // We use threadgroup memory to store all logits.
-    // n_experts is at most 128, so this is fine.
-    // NOTE: threadgroup memory is not available for a single-thread kernel
-    // dispatched with threads=(1,1,1). Use device memory scratch or
-    // local array.  128 floats = 512 bytes, fits in registers/stack.
+    // -----------------------------------------------------------------------
+    // Phase 1: RMS Norm
+    //   Compute rms_inv in parallel, store normed*weight in tg_hidden.
+    // -----------------------------------------------------------------------
 
-    // We cannot use variable-length arrays in MSL, but n_experts <= 128.
-    // Use a fixed-size array.
-    float logits[128];
+    // Step 1a: partial sum of squares
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < hidden_dim; i += tg_size) {
+        float v = static_cast<float>(hidden_state[token_base + i]);
+        partial_sq += v * v;
+    }
 
-    for (uint e = 0; e < n_experts; e++) {
+    // Reuse the logit region as a reduction scratch (n_experts >= tg_size=128).
+    tg_logits[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction over tg_size threads
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            tg_logits[tid] += tg_logits[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms_inv = rsqrt(tg_logits[0] / float(hidden_dim) + rms_eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 1b: normalize and multiply by norm_weight -> store in tg_hidden
+    for (uint i = tid; i < hidden_dim; i += tg_size) {
+        float v = static_cast<float>(hidden_state[token_base + i]);
+        tg_hidden[i] = v * rms_inv * norm_weight[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Router matmul
+    //   Each thread computes dot(tg_hidden, router_weights[e]) for its experts.
+    // -----------------------------------------------------------------------
+    for (uint e = tid; e < n_experts; e += tg_size) {
         float dot = 0.0f;
-        device const float* w_row = router_weight + e * hidden_dim;
+        device const float* w_row = router_weights + e * hidden_dim;
         for (uint d = 0; d < hidden_dim; d++) {
-            dot += hidden_state[d] * w_row[d];
+            dot += tg_hidden[d] * w_row[d];
         }
-        logits[e] = dot;
+        tg_logits[e] = dot;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // --- Stage 2: Top-K selection (selection sort, K iterations) ---
-    // For K=8 out of 128, this is 8*128 = 1024 comparisons — trivial.
-    bool selected[128];
-    for (uint e = 0; e < n_experts; e++) {
-        selected[e] = false;
-    }
+    // -----------------------------------------------------------------------
+    // Phase 3: Top-K + softmax + per_expert_scale (single thread, tid == 0)
+    // -----------------------------------------------------------------------
+    if (tid == 0) {
+        // MSL does not allow variable-length arrays; n_experts <= 128.
+        bool  selected[128];
+        float sel_logits[8];   // top_k <= 8
 
-    float selected_logits[8];  // top_k <= 8
-
-    for (uint k = 0; k < top_k; k++) {
-        float best_val = -INFINITY;
-        uint best_idx = 0;
         for (uint e = 0; e < n_experts; e++) {
-            if (!selected[e] && logits[e] > best_val) {
-                best_val = logits[e];
-                best_idx = e;
-            }
+            selected[e] = false;
         }
-        selected[best_idx] = true;
-        out_expert_ids[k] = best_idx;
-        selected_logits[k] = best_val;
-    }
 
-    // --- Stage 3: Softmax over the K selected logits ---
-    // Find max for numerical stability
-    float max_logit = selected_logits[0];
-    for (uint k = 1; k < top_k; k++) {
-        max_logit = max(max_logit, selected_logits[k]);
-    }
+        const uint out_base = token * top_k;
 
-    float sum_exp = 0.0f;
-    float exp_vals[8];
-    for (uint k = 0; k < top_k; k++) {
-        exp_vals[k] = exp(selected_logits[k] - max_logit);
-        sum_exp += exp_vals[k];
-    }
+        // Insertion sort for top-K
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -INFINITY;
+            uint  best_idx = 0;
+            for (uint e = 0; e < n_experts; e++) {
+                if (!selected[e] && tg_logits[e] > best_val) {
+                    best_val = tg_logits[e];
+                    best_idx = e;
+                }
+            }
+            selected[best_idx] = true;
+            expert_ids[out_base + k]  = best_idx;
+            sel_logits[k]             = best_val;
+        }
 
-    for (uint k = 0; k < top_k; k++) {
-        out_weights[k] = exp_vals[k] / sum_exp;
+        // Softmax over selected logits with per_expert_scale
+        float max_logit = sel_logits[0];
+        for (uint k = 1; k < top_k; k++) {
+            max_logit = max(max_logit, sel_logits[k]);
+        }
+
+        float exp_vals[8];
+        float sum_exp = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            float scale = per_expert_scale[expert_ids[out_base + k]];
+            exp_vals[k] = exp(sel_logits[k] - max_logit) * scale;
+            sum_exp += exp_vals[k];
+        }
+
+        const float inv_sum = 1.0f / sum_exp;
+        for (uint k = 0; k < top_k; k++) {
+            expert_weights[out_base + k] = exp_vals[k] * inv_sum;
+        }
     }
 }

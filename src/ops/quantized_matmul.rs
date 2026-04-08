@@ -390,6 +390,320 @@ pub fn quantized_matmul_simd(
     Ok(output)
 }
 
+// ---------------------------------------------------------------------------
+// bf16 I/O variant — eliminates 2 cast dispatches per projection by accepting
+// bfloat input and producing bfloat output directly.
+// ---------------------------------------------------------------------------
+
+/// GPU-side params for the bf16 kernels.  Identical layout to
+/// `QuantizedMatmulGpuParams`; kept as a separate type for clarity.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QMatmulBf16GpuParams {
+    m: u32,
+    k: u32,
+    n: u32,
+    group_size: u32,
+    bits: u32,
+}
+
+/// Dispatch the bf16 I/O variant of the SIMD quantized matmul kernel.
+///
+/// Input and output are both bf16.  Accumulation happens in f32 inside the
+/// shader for numerical stability, matching the precision of the f32 variant.
+///
+/// Falls back to the scalar `quantized_matmul` kernel (with f32 output) if the
+/// dimensions don't satisfy SIMD alignment requirements.
+///
+/// # Arguments
+///
+/// * `encoder`      — The command encoder to record the dispatch into.
+/// * `registry`     — Kernel registry (compiles the shader on first call).
+/// * `device`       — The Metal device for buffer allocation.
+/// * `input`        — bf16 input matrix buffer, shape `[M, K]`.
+/// * `packed_weights` — Packed quantized weight buffer, shape `[N, packed_k]`.
+/// * `scales`       — bf16 scale buffer, shape `[N, num_groups]`.
+/// * `biases`       — bf16 bias buffer, shape `[N, num_groups]`.
+/// * `params`       — Dimensions and quantization parameters.
+///
+/// # Returns
+///
+/// A freshly allocated `MlxBuffer` for the output of shape `[M, N]` with dtype `BF16`.
+pub fn dispatch_quantized_matmul_simd_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    packed_weights: &MlxBuffer,
+    scales: &MlxBuffer,
+    biases: &MlxBuffer,
+    params: &QuantizedMatmulParams,
+) -> Result<MlxBuffer> {
+    // Fall back to scalar path for unsupported shapes.
+    if !can_use_simd_kernel(params) {
+        return quantized_matmul(encoder, registry, device, input, packed_weights, scales, biases, params);
+    }
+
+    if params.bits != 4 && params.bits != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "bf16 SIMD kernel: unsupported bits value {}; only 4 and 8 are supported",
+            params.bits
+        )));
+    }
+    if params.m == 0 || params.k == 0 || params.n == 0 || params.group_size == 0 {
+        return Err(MlxError::InvalidArgument(
+            "M, K, N, and group_size must all be > 0".into(),
+        ));
+    }
+
+    // Buffer size validation (input is bf16 = 2 bytes per element).
+    let expected_input = (params.m as usize) * (params.k as usize) * DType::BF16.size_of();
+    if input.byte_len() < expected_input {
+        return Err(MlxError::InvalidArgument(format!(
+            "bf16 input buffer too small: expected {} bytes for [{}x{}] bf16, got {}",
+            expected_input, params.m, params.k, input.byte_len()
+        )));
+    }
+
+    let expected_w = expected_weight_bytes(params.k, params.n, params.bits);
+    if packed_weights.byte_len() < expected_w {
+        return Err(MlxError::InvalidArgument(format!(
+            "Weight buffer too small: expected {} bytes, got {}",
+            expected_w, packed_weights.byte_len()
+        )));
+    }
+
+    let expected_s = expected_scales_bytes(params.k, params.n, params.group_size);
+    if scales.byte_len() < expected_s {
+        return Err(MlxError::InvalidArgument(format!(
+            "Scales buffer too small: expected {} bytes, got {}",
+            expected_s, scales.byte_len()
+        )));
+    }
+    if biases.byte_len() < expected_s {
+        return Err(MlxError::InvalidArgument(format!(
+            "Biases buffer too small: expected {} bytes, got {}",
+            expected_s, biases.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("quantized_matmul_simd_bf16", device.metal_device())?;
+
+    // Output is bf16.
+    let output_bytes = (params.m as usize) * (params.n as usize) * DType::BF16.size_of();
+    let output = device.alloc_buffer(
+        output_bytes,
+        DType::BF16,
+        vec![params.m as usize, params.n as usize],
+    )?;
+
+    let gpu_params = QMatmulBf16GpuParams {
+        m: params.m,
+        k: params.k,
+        n: params.n,
+        group_size: params.group_size,
+        bits: params.bits,
+    };
+    let params_bytes = std::mem::size_of::<QMatmulBf16GpuParams>();
+    let mut params_buf = device.alloc_buffer(params_bytes, DType::U32, vec![5])?;
+    {
+        let slice: &mut [QMatmulBf16GpuParams] = bytemuck::cast_slice_mut(
+            params_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| MlxError::InvalidArgument(format!("params buf write: {e}")))?,
+        );
+        slice[0] = gpu_params;
+    }
+
+    let num_simdgroups = 2u64;
+    let results_per_simdgroup = 4u64;
+    let bn = num_simdgroups * results_per_simdgroup; // 8
+
+    let threadgroup_size = metal::MTLSize::new(32, num_simdgroups, 1);
+    let threadgroups = metal::MTLSize::new(
+        params.m as u64,
+        (params.n as u64 + bn - 1) / bn,
+        1,
+    );
+
+    encoder.encode_threadgroups(
+        pipeline,
+        &[
+            (0, input),
+            (1, packed_weights),
+            (2, scales),
+            (3, biases),
+            (4, &output),
+            (5, &params_buf),
+        ],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    Ok(output)
+}
+
+/// Dispatch bf16 quantized matmul with expert offset for MoE inference.
+///
+/// Indexes into a 3D packed weight tensor `[n_experts, rows, packed_cols]` using
+/// byte offsets, eliminating CPU memcpy for expert weight selection.
+///
+/// # Arguments
+///
+/// * `encoder`              — The command encoder to record the dispatch into.
+/// * `registry`             — Kernel registry (compiles the shader on first call).
+/// * `device`               — The Metal device for buffer allocation.
+/// * `input`                — bf16 input matrix buffer, shape `[M, K]`.
+/// * `packed_weights`       — Full 3D packed weight tensor for all experts.
+/// * `scales`               — Full scales buffer for all experts.
+/// * `biases`               — Full biases buffer for all experts.
+/// * `params`               — Dimensions for this expert's projection (M, K, N).
+/// * `expert_offset_bytes`  — Byte offset into `packed_weights` for this expert.
+/// * `scales_offset_bytes`  — Byte offset into `scales` for this expert.
+/// * `biases_offset_bytes`  — Byte offset into `biases` for this expert.
+///
+/// # Returns
+///
+/// A freshly allocated `MlxBuffer` for the output of shape `[M, N]` with dtype `BF16`.
+pub fn dispatch_quantized_matmul_simd_bf16_expert(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    packed_weights: &MlxBuffer,
+    scales: &MlxBuffer,
+    biases: &MlxBuffer,
+    params: &QuantizedMatmulParams,
+    expert_offset_bytes: u32,
+    scales_offset_bytes: u32,
+    biases_offset_bytes: u32,
+) -> Result<MlxBuffer> {
+    // Expert-offset path requires SIMD alignment; no fallback because the
+    // scalar kernel doesn't understand 3D expert packing.
+    if !can_use_simd_kernel(params) {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_quantized_matmul_simd_bf16_expert: dimensions do not satisfy SIMD \
+             alignment requirements (N%8==0 and K%256==0 required)".into(),
+        ));
+    }
+
+    if params.bits != 4 && params.bits != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "bf16 expert kernel: unsupported bits value {}; only 4 and 8 are supported",
+            params.bits
+        )));
+    }
+    if params.m == 0 || params.k == 0 || params.n == 0 || params.group_size == 0 {
+        return Err(MlxError::InvalidArgument(
+            "M, K, N, and group_size must all be > 0".into(),
+        ));
+    }
+
+    // We trust the caller to have sized the 3D buffers correctly.  Validate
+    // that the requested slice (offset + one-expert size) fits.
+    let expert_weight_bytes = expected_weight_bytes(params.k, params.n, params.bits);
+    let expert_scales_bytes = expected_scales_bytes(params.k, params.n, params.group_size);
+
+    if packed_weights.byte_len() < (expert_offset_bytes as usize) + expert_weight_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "packed_weights too small for expert slice: offset={} + size={} > buffer={}",
+            expert_offset_bytes, expert_weight_bytes, packed_weights.byte_len()
+        )));
+    }
+    if scales.byte_len() < (scales_offset_bytes as usize) + expert_scales_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "scales buffer too small for expert slice: offset={} + size={} > buffer={}",
+            scales_offset_bytes, expert_scales_bytes, scales.byte_len()
+        )));
+    }
+    if biases.byte_len() < (biases_offset_bytes as usize) + expert_scales_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "biases buffer too small for expert slice: offset={} + size={} > buffer={}",
+            biases_offset_bytes, expert_scales_bytes, biases.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("quantized_matmul_simd_bf16_expert", device.metal_device())?;
+
+    let output_bytes = (params.m as usize) * (params.n as usize) * DType::BF16.size_of();
+    let output = device.alloc_buffer(
+        output_bytes,
+        DType::BF16,
+        vec![params.m as usize, params.n as usize],
+    )?;
+
+    let gpu_params = QMatmulBf16GpuParams {
+        m: params.m,
+        k: params.k,
+        n: params.n,
+        group_size: params.group_size,
+        bits: params.bits,
+    };
+    let params_bytes = std::mem::size_of::<QMatmulBf16GpuParams>();
+    let mut params_buf = device.alloc_buffer(params_bytes, DType::U32, vec![5])?;
+    {
+        let slice: &mut [QMatmulBf16GpuParams] = bytemuck::cast_slice_mut(
+            params_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| MlxError::InvalidArgument(format!("params buf write: {e}")))?,
+        );
+        slice[0] = gpu_params;
+    }
+
+    // Pack the three byte-offset values into individual u32 buffers.
+    let mut expert_offset_buf = device.alloc_buffer(4, DType::U32, vec![1])?;
+    {
+        let s: &mut [u32] = expert_offset_buf
+            .as_mut_slice()
+            .map_err(|e| MlxError::InvalidArgument(format!("expert_offset buf: {e}")))?;
+        s[0] = expert_offset_bytes;
+    }
+    let mut scales_offset_buf = device.alloc_buffer(4, DType::U32, vec![1])?;
+    {
+        let s: &mut [u32] = scales_offset_buf
+            .as_mut_slice()
+            .map_err(|e| MlxError::InvalidArgument(format!("scales_offset buf: {e}")))?;
+        s[0] = scales_offset_bytes;
+    }
+    let mut biases_offset_buf = device.alloc_buffer(4, DType::U32, vec![1])?;
+    {
+        let s: &mut [u32] = biases_offset_buf
+            .as_mut_slice()
+            .map_err(|e| MlxError::InvalidArgument(format!("biases_offset buf: {e}")))?;
+        s[0] = biases_offset_bytes;
+    }
+
+    let num_simdgroups = 2u64;
+    let results_per_simdgroup = 4u64;
+    let bn = num_simdgroups * results_per_simdgroup;
+
+    let threadgroup_size = metal::MTLSize::new(32, num_simdgroups, 1);
+    let threadgroups = metal::MTLSize::new(
+        params.m as u64,
+        (params.n as u64 + bn - 1) / bn,
+        1,
+    );
+
+    encoder.encode_threadgroups(
+        pipeline,
+        &[
+            (0, input),
+            (1, packed_weights),
+            (2, scales),
+            (3, biases),
+            (4, &output),
+            (5, &params_buf),
+            (6, &expert_offset_buf),
+            (7, &scales_offset_buf),
+            (8, &biases_offset_buf),
+        ],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    Ok(output)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
