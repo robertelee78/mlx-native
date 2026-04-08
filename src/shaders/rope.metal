@@ -150,7 +150,8 @@ kernel void rope_neox_bf16(
     const float theta     = params[0];
     const uint head_dim   = uint(params[1]);
     const uint rope_dim   = uint(params[2]);
-    const uint half_rope  = rope_dim / 2;
+    const uint half_dim   = head_dim / 2;   // MLX pairs (d[i], d[i + head_dim/2])
+    const uint half_rope  = rope_dim / 2;   // number of pairs that get rotation
     const uint n_heads    = rope_params[0];
 
     if (pair_idx >= half_rope) return;
@@ -159,11 +160,9 @@ kernel void rope_neox_bf16(
     const uint seq_idx = row_idx / n_heads;
     const uint pos = positions[seq_idx];
 
-    // Compute the rotation angle
-    // NOTE: denominator is head_dim (not rope_dim) to match mlx-lm's
-    // ProportionalRoPE which computes: exponents = arange(0, rotated_dims, 2) / dims
-    // where dims = full head_dim.  This ensures correct frequency scaling for
-    // partial-rotary global attention layers (e.g., 128 of 512 dims rotated).
+    // Compute the rotation angle.
+    // Denominator is head_dim (not rope_dim) to match mlx-lm's ProportionalRoPE:
+    //   exponents = arange(0, rotated_dims, 2) / dims  (dims = full head_dim)
     const float dim_ratio = float(2 * pair_idx) / float(head_dim);
     const float freq = 1.0f / pow(theta, dim_ratio);
     const float angle = float(pos) * freq;
@@ -171,21 +170,24 @@ kernel void rope_neox_bf16(
     const float cos_a = cos(angle);
     const float sin_a = sin(angle);
 
-    // Neox/split indexing: pair (d[pair_idx], d[pair_idx + half_rope])
+    // Neox/split indexing: pair (d[pair_idx], d[pair_idx + half_dim])
+    // MLX uses half_dim = head_dim/2 as the split point, NOT rope_dim/2.
+    // For partial rotary (rope_dim < head_dim), only the first rope_dim/2
+    // pairs get non-zero rotation; the rest are identity (freq=inf -> angle=0).
     const uint base = row_idx * head_dim;
     const float x0 = static_cast<float>(input[base + pair_idx]);
-    const float x1 = static_cast<float>(input[base + pair_idx + half_rope]);
+    const float x1 = static_cast<float>(input[base + pair_idx + half_dim]);
 
-    output[base + pair_idx]             = bfloat(x0 * cos_a - x1 * sin_a);
-    output[base + pair_idx + half_rope] = bfloat(x1 * cos_a + x0 * sin_a);
+    output[base + pair_idx]              = bfloat(x0 * cos_a - x1 * sin_a);
+    output[base + pair_idx + half_dim]   = bfloat(x1 * cos_a + x0 * sin_a);
 
-    // Pass through non-rotated dimensions (only need one thread to handle this)
-    // Each thread copies its corresponding element beyond rope_dim if it exists
-    // Thread pair_idx handles element rope_dim + pair_idx (and + half_rope if in range)
-    if (pair_idx < (head_dim - rope_dim)) {
-        output[base + rope_dim + pair_idx] = input[base + rope_dim + pair_idx];
-    }
-    if (pair_idx + half_rope < (head_dim - rope_dim)) {
-        output[base + rope_dim + pair_idx + half_rope] = input[base + rope_dim + pair_idx + half_rope];
+    // Pass through non-rotated dimensions.
+    // Elements [half_rope..half_dim) in the first half and
+    // [half_dim+half_rope..head_dim) in the second half are identity.
+    // With half_rope threads available, each thread copies a strided set.
+    for (uint i = pair_idx; i < half_dim - half_rope; i += half_rope) {
+        uint src = half_rope + i;
+        output[base + src]            = input[base + src];
+        output[base + src + half_dim] = input[base + src + half_dim];
     }
 }
