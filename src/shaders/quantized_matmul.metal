@@ -269,8 +269,8 @@ kernel void quantized_matmul_simd(
     const uint bits = params.bits;
     const uint group_size = params.group_size;
 
-    // ADR-002: All kernels use qmv_fast params for consistency.
-    // 4-bit: pack_factor=8, packs_per_thread=2, values_per_thread=16, bytes_per_pack=4
+    // Packing parameters — match MLX's qmv (NOT qmv_fast) for K=2816 compatibility
+    // 4-bit: pack_factor=8, packs_per_thread=1, values_per_thread=8, bytes_per_pack=4
     // 8-bit: pack_factor=4, packs_per_thread=2, values_per_thread=8, bytes_per_pack=4
     uint pack_factor;
     uint packs_per_thread;
@@ -279,8 +279,8 @@ kernel void quantized_matmul_simd(
 
     if (bits == 4) {
         pack_factor = 8;
-        packs_per_thread = 2;       // qmv_fast (was incorrectly 1)
-        values_per_thread = 16;     // 8 * 2 = 16 (was incorrectly 8)
+        packs_per_thread = 1;
+        values_per_thread = 8;     // 8 * 1 = 8, block_size = 256
         bytes_per_pack = 4;
     } else if (bits == 8) {
         pack_factor = 4;
@@ -338,7 +338,7 @@ kernel void quantized_matmul_simd(
 
     // Main loop over K in blocks of block_size
     if (bits == 4) {
-        float x_thread[16];  // ADR-002: qmv_fast uses 16 values per thread
+        float x_thread[8];  // qmv: 8 values per thread (block_size=256)
         for (uint k = 0; k < K; k += block_size) {
             // Load input values with pre-division for packed dot product
             // f32 -> bfloat truncation happens inside load_vector_4bit

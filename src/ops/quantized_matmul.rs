@@ -226,14 +226,28 @@ pub fn quantized_matmul(
 ///   - bits is 4 or 8 (not 6)
 ///   - N is divisible by 8 (results_per_simdgroup * num_simdgroups)
 ///   - K is divisible by block_size:
-///     - 4-bit: K % 512 == 0 (block_size = 16 values/thread * 32 SIMD = 512, qmv_fast)
+///     - 4-bit: K % 256 == 0 (block_size = 8 values/thread * 32 SIMD = 256, qmv)
 ///     - 8-bit: K % 256 == 0 (block_size = 8 * 32 = 256)
 ///
-/// ADR-002: All SIMD kernels now use qmv_fast params (values_per_thread=16
-/// for 4-bit), so 4-bit block_size is 512.  Dimensions like K=2816 that are
-/// not 512-aligned fall back to the scalar kernel.
+/// NOTE: The f32 SIMD kernel uses qmv params (values_per_thread=8) not qmv_fast,
+/// because K=2816 (Gemma 4 hidden_size) is 256-aligned but not 512-aligned.
+/// The bf16 SIMD kernels use qmv_fast (values_per_thread=16, block_size=512).
+/// Check alignment for f32 SIMD kernel (qmv: values_per_thread=8, block_size=256).
 fn can_use_simd_kernel(params: &QuantizedMatmulParams) -> bool {
     let bn = 8u32; // num_simdgroups * results_per_simdgroup
+    if params.n % bn != 0 {
+        return false;
+    }
+    match params.bits {
+        4 => params.k % 256 == 0,  // qmv: block_size = 8 * 32 = 256
+        8 => params.k % 256 == 0,
+        _ => false,
+    }
+}
+
+/// Check alignment for bf16 SIMD kernel (qmv_fast: values_per_thread=16, block_size=512).
+fn can_use_simd_kernel_bf16(params: &QuantizedMatmulParams) -> bool {
+    let bn = 8u32;
     if params.n % bn != 0 {
         return false;
     }
@@ -442,9 +456,9 @@ pub fn dispatch_quantized_matmul_simd_bf16(
     biases: &MlxBuffer,
     params: &QuantizedMatmulParams,
 ) -> Result<MlxBuffer> {
-    // Fall back to scalar path for unsupported shapes.
-    // The scalar kernel expects f32, so cast bf16 input first.
-    if !can_use_simd_kernel(params) {
+    // Fall back to f32 cast+scalar path for shapes where bf16 SIMD (qmv_fast)
+    // alignment is not met (e.g. K=2816 is 256-aligned but not 512-aligned).
+    if !can_use_simd_kernel_bf16(params) {
         let n_in = (params.m as usize) * (params.k as usize);
         let f32_input = if input.dtype() == DType::BF16 {
             let f32_buf = device.alloc_buffer(n_in * DType::F32.size_of(), DType::F32, vec![params.m as usize, params.k as usize])?;
@@ -604,11 +618,11 @@ pub fn dispatch_quantized_matmul_simd_bf16_expert(
     scales_offset_bytes: u32,
     biases_offset_bytes: u32,
 ) -> Result<MlxBuffer> {
-    // Expert-offset path requires SIMD alignment; no fallback because the
-    // scalar kernel doesn't understand 3D expert packing.
-    if !can_use_simd_kernel(params) {
+    // Expert-offset path requires bf16 SIMD (qmv_fast) alignment; no fallback
+    // because the scalar kernel doesn't understand 3D expert packing.
+    if !can_use_simd_kernel_bf16(params) {
         return Err(MlxError::InvalidArgument(
-            "dispatch_quantized_matmul_simd_bf16_expert: dimensions do not satisfy SIMD \
+            "dispatch_quantized_matmul_simd_bf16_expert: dimensions do not satisfy bf16 SIMD \
              alignment requirements (N%8==0 and K%512==0 for 4-bit, K%256==0 for 8-bit)".into(),
         ));
     }
