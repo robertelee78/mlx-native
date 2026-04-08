@@ -160,7 +160,11 @@ kernel void rope_neox_bf16(
     const uint pos = positions[seq_idx];
 
     // Compute the rotation angle
-    const float dim_ratio = float(2 * pair_idx) / float(rope_dim);
+    // NOTE: denominator is head_dim (not rope_dim) to match mlx-lm's
+    // ProportionalRoPE which computes: exponents = arange(0, rotated_dims, 2) / dims
+    // where dims = full head_dim.  This ensures correct frequency scaling for
+    // partial-rotary global attention layers (e.g., 128 of 512 dims rotated).
+    const float dim_ratio = float(2 * pair_idx) / float(head_dim);
     const float freq = 1.0f / pow(theta, dim_ratio);
     const float angle = float(pos) * freq;
 
