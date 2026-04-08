@@ -233,6 +233,122 @@ pub fn scalar_mul_bf16(
     Ok(())
 }
 
+/// Cast f32 to bf16 using an externally-provided encoder (no commit).
+///
+/// Encodes the `cast_f32_to_bf16` kernel into the given encoder without
+/// committing or waiting.  Use this to chain the cast into a mega-encoder
+/// alongside other GPU work, avoiding CPU round-trips.
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry (mutable for lazy pipeline compilation).
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer (f32).
+/// * `output`     - Output buffer (bf16, pre-allocated with `n_elements * 2` bytes).
+/// * `n_elements` - Number of elements to cast.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if `n_elements` is zero or buffers are
+/// too small.
+pub fn dispatch_cast_f32_to_bf16_with_encoder(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: u32,
+) -> Result<()> {
+    cast(
+        encoder,
+        registry,
+        device,
+        input,
+        output,
+        n_elements as usize,
+        CastDirection::F32ToBF16,
+    )
+}
+
+/// Cast bf16 to f32 using an externally-provided encoder (no commit).
+///
+/// Encodes the `cast_bf16_to_f32` kernel into the given encoder without
+/// committing or waiting.  Use this to chain the cast into a mega-encoder
+/// alongside other GPU work, avoiding CPU round-trips.
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry (mutable for lazy pipeline compilation).
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer (bf16).
+/// * `output`     - Output buffer (f32, pre-allocated with `n_elements * 4` bytes).
+/// * `n_elements` - Number of elements to cast.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if `n_elements` is zero or buffers are
+/// too small.
+pub fn dispatch_cast_bf16_to_f32_with_encoder(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: u32,
+) -> Result<()> {
+    cast(
+        encoder,
+        registry,
+        device,
+        input,
+        output,
+        n_elements as usize,
+        CastDirection::BF16ToF32,
+    )
+}
+
+/// Scale bf16 values by a scalar using an externally-provided encoder (no commit).
+///
+/// Encodes `output[i] = input[i] * scalar` (bf16) into the given encoder
+/// without committing or waiting.  Use this to chain the scale into a
+/// mega-encoder alongside other GPU work, avoiding CPU round-trips.
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry (mutable for lazy pipeline compilation).
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer (bf16).
+/// * `output`     - Output buffer (bf16, same size as input).
+/// * `n_elements` - Number of elements to process.
+/// * `scalar`     - The f32 scalar to multiply by (e.g. `sqrt(hidden_size)`).
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if `n_elements` is zero or buffers are
+/// too small.
+pub fn dispatch_scalar_mul_bf16_with_encoder(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: u32,
+    scalar: f32,
+) -> Result<()> {
+    scalar_mul_bf16(
+        encoder,
+        registry,
+        device,
+        input,
+        output,
+        n_elements as usize,
+        scalar,
+    )
+}
+
 /// Cast direction for dtype conversion.
 pub enum CastDirection {
     /// f16 -> f32
