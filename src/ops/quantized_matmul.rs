@@ -440,8 +440,31 @@ pub fn dispatch_quantized_matmul_simd_bf16(
     params: &QuantizedMatmulParams,
 ) -> Result<MlxBuffer> {
     // Fall back to scalar path for unsupported shapes.
+    // The scalar kernel expects f32, so cast bf16 input first.
     if !can_use_simd_kernel(params) {
-        return quantized_matmul(encoder, registry, device, input, packed_weights, scales, biases, params);
+        let n_in = (params.m as usize) * (params.k as usize);
+        let f32_input = if input.dtype() == DType::BF16 {
+            let f32_buf = device.alloc_buffer(n_in * DType::F32.size_of(), DType::F32, vec![params.m as usize, params.k as usize])?;
+            crate::ops::elementwise::cast(
+                encoder, registry, device.metal_device(),
+                input, &f32_buf, n_in,
+                crate::ops::elementwise::CastDirection::BF16ToF32,
+            )?;
+            Some(f32_buf)
+        } else {
+            None
+        };
+        let actual_input = f32_input.as_ref().unwrap_or(input);
+        let f32_result = quantized_matmul(encoder, registry, device, actual_input, packed_weights, scales, biases, params)?;
+        // Cast f32 output back to bf16
+        let n_out = (params.m as usize) * (params.n as usize);
+        let bf16_out = device.alloc_buffer(n_out * DType::BF16.size_of(), DType::BF16, vec![params.m as usize, params.n as usize])?;
+        crate::ops::elementwise::cast(
+            encoder, registry, device.metal_device(),
+            &f32_result, &bf16_out, n_out,
+            crate::ops::elementwise::CastDirection::F32ToBF16,
+        )?;
+        return Ok(bf16_out);
     }
 
     if params.bits != 4 && params.bits != 8 {
