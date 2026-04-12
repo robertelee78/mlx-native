@@ -19,6 +19,7 @@ pub static SOFTMAX_SHADER_SOURCE: &str = include_str!("../shaders/softmax.metal"
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("softmax_f32", SOFTMAX_SHADER_SOURCE);
     registry.register_source("softmax_f16", SOFTMAX_SHADER_SOURCE);
+    registry.register_source("softmax_bf16", SOFTMAX_SHADER_SOURCE);
 }
 
 /// Dispatch a softmax operation on the GPU.
@@ -28,7 +29,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// * `encoder`    - Command encoder to record the dispatch into.
 /// * `registry`   - Kernel registry (must have softmax sources registered).
 /// * `device`     - Metal device for pipeline compilation.
-/// * `input`      - Input buffer of shape `[rows, cols]` (f32 or f16).
+/// * `input`      - Input buffer of shape `[rows, cols]` (f32, f16, or bf16).
 /// * `output`     - Output buffer (same dtype and shape as input).
 /// * `params_buf` - Params buffer containing `[cols, 0]` as f32.
 /// * `rows`       - Number of rows.
@@ -37,7 +38,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// # Errors
 ///
 /// Returns `MlxError::InvalidArgument` if:
-/// - Input dtype is not f32 or f16.
+/// - Input dtype is not f32, f16, or bf16.
 /// - Input element count does not match rows * cols.
 pub fn dispatch_softmax(
     encoder: &mut CommandEncoder,
@@ -76,6 +77,7 @@ pub fn dispatch_softmax(
     let kernel_name = match input.dtype() {
         DType::F32 => "softmax_f32",
         DType::F16 => "softmax_f16",
+        DType::BF16 => "softmax_bf16",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
                 "Softmax unsupported dtype: {}",

@@ -22,6 +22,7 @@ pub static GELU_SHADER_SOURCE: &str = include_str!("../shaders/gelu.metal");
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("gelu_f32", GELU_SHADER_SOURCE);
     registry.register_source("gelu_f16", GELU_SHADER_SOURCE);
+    registry.register_source("gelu_bf16", GELU_SHADER_SOURCE);
 }
 
 /// Dispatch a GELU activation on the GPU.
@@ -31,13 +32,13 @@ pub fn register(registry: &mut KernelRegistry) {
 /// * `encoder`  - Command encoder to record the dispatch into.
 /// * `registry` - Kernel registry (must have GELU sources registered).
 /// * `device`   - Metal device for pipeline compilation.
-/// * `input`    - Input buffer (f32 or f16).
+/// * `input`    - Input buffer (f32, f16, or bf16).
 /// * `output`   - Output buffer (same dtype and shape as input).
 ///
 /// # Errors
 ///
 /// Returns `MlxError::InvalidArgument` if:
-/// - Input dtype is not f32 or f16.
+/// - Input dtype is not f32, f16, or bf16.
 /// - Input and output element counts do not match.
 pub fn dispatch_gelu(
     encoder: &mut CommandEncoder,
@@ -63,6 +64,7 @@ pub fn dispatch_gelu(
     let kernel_name = match input.dtype() {
         DType::F32 => "gelu_f32",
         DType::F16 => "gelu_f16",
+        DType::BF16 => "gelu_bf16",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
                 "GELU unsupported dtype: {}",

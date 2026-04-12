@@ -41,3 +41,17 @@ kernel void softcap_f16(
     const float x = float(input[id]);
     output[id] = half(tanh(x / cap) * cap);
 }
+
+kernel void softcap_bf16(
+    device const bfloat *input  [[buffer(0)]],
+    device bfloat       *output [[buffer(1)]],
+    device const float  *params [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    const uint n_elements = as_type<uint>(params[1]);
+    if (id >= n_elements) return;
+    const float cap = params[0];
+    // Promote to f32 for accurate tanh computation; accumulate in f32
+    const float x = static_cast<float>(input[id]);
+    output[id] = bfloat(tanh(x / cap) * cap);
+}

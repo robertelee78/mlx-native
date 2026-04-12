@@ -48,6 +48,7 @@ mod device;
 mod dtypes;
 mod encoder;
 mod kernel_registry;
+pub mod graph;
 pub mod ops;
 pub mod weight;
 
@@ -58,6 +59,7 @@ pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{dispatch_count, reset_counters, sync_count, CommandEncoder};
 pub use error::{MlxError, Result};
+pub use graph::{GraphExecutor, GraphSession};
 pub use kernel_registry::KernelRegistry;
 
 // Re-export ops.

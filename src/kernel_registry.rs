@@ -126,12 +126,15 @@ impl KernelRegistry {
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
+        sources.insert("gelu_bf16".into(), gelu_src);
         let softmax_src: &'static str = include_str!("shaders/softmax.metal");
         sources.insert("softmax_f32".into(), softmax_src);
         sources.insert("softmax_f16".into(), softmax_src);
+        sources.insert("softmax_bf16".into(), softmax_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
+        sources.insert("softcap_bf16".into(), softcap_src);
 
         // Fused norm-add kernels — Gemma4 post-attention / post-FFN ordering:
         //   normed = rms_norm(input, weight, eps);  output = residual + normed

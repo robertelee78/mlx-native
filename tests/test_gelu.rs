@@ -194,6 +194,106 @@ fn test_gelu_f32_large_negative() {
     }
 }
 
+/// Convert f32 to bf16 raw bits (u16), using round-to-nearest-even.
+fn f32_to_bf16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// Convert bf16 raw bits (u16) back to f32.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+#[test]
+fn test_gelu_bf16_basic() {
+    let (device, mut registry) = setup();
+
+    let input_f32: Vec<f32> = vec![
+        -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, -4.0, 0.1,
+    ];
+    let n = input_f32.len();
+    let byte_len = n * 2; // bf16 = 2 bytes per element
+
+    // Encode input as bf16 (u16 words)
+    let input_bf16: Vec<u16> = input_f32.iter().copied().map(f32_to_bf16).collect();
+    // Decode back to f32 to know the exact bf16-quantized reference values
+    let input_as_f32: Vec<f32> = input_bf16.iter().copied().map(bf16_to_f32).collect();
+
+    let mut input_buf = device
+        .alloc_buffer(byte_len, DType::BF16, vec![n])
+        .expect("alloc input");
+    let output_buf = device
+        .alloc_buffer(byte_len, DType::BF16, vec![n])
+        .expect("alloc output");
+
+    {
+        let slice: &mut [u16] = input_buf.as_mut_slice().expect("as_mut_slice");
+        slice.copy_from_slice(&input_bf16);
+    }
+
+    let mut encoder = device.command_encoder().expect("command_encoder");
+    mlx_native::ops::gelu::dispatch_gelu(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input_buf,
+        &output_buf,
+    )
+    .expect("dispatch_gelu bf16");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let output: &[u16] = output_buf.as_slice().expect("as_slice");
+    for (i, &x) in input_as_f32.iter().enumerate() {
+        let expected = gelu_ref(x);
+        let actual = bf16_to_f32(output[i]);
+        let diff = (actual - expected).abs();
+        // bf16 has ~7.2 bits of mantissa; allow 5e-3 for output quantization error
+        assert!(
+            diff <= 5e-3,
+            "GELU bf16 mismatch at index {}: input={}, expected={}, got={}, diff={}",
+            i, x, expected, actual, diff
+        );
+    }
+}
+
+#[test]
+fn test_gelu_bf16_zero() {
+    let (device, mut registry) = setup();
+
+    let byte_len = 2; // one bf16 element
+    let mut input_buf = device
+        .alloc_buffer(byte_len, DType::BF16, vec![1])
+        .expect("alloc input");
+    let output_buf = device
+        .alloc_buffer(byte_len, DType::BF16, vec![1])
+        .expect("alloc output");
+
+    {
+        let slice: &mut [u16] = input_buf.as_mut_slice().expect("as_mut_slice");
+        slice[0] = f32_to_bf16(0.0);
+    }
+
+    let mut encoder = device.command_encoder().expect("command_encoder");
+    mlx_native::ops::gelu::dispatch_gelu(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input_buf,
+        &output_buf,
+    )
+    .expect("dispatch_gelu bf16 zero");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let output: &[u16] = output_buf.as_slice().expect("as_slice");
+    let result = bf16_to_f32(output[0]);
+    assert!(
+        result.abs() <= 1e-3,
+        "GELU bf16(0) should be 0, got {}",
+        result
+    );
+}
+
 #[test]
 fn test_gelu_invalid_dtype() {
     let (device, mut registry) = setup();

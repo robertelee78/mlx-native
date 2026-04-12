@@ -20,6 +20,7 @@ pub static SOFTCAP_SHADER_SOURCE: &str = include_str!("../shaders/softcap.metal"
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("softcap_f32", SOFTCAP_SHADER_SOURCE);
     registry.register_source("softcap_f16", SOFTCAP_SHADER_SOURCE);
+    registry.register_source("softcap_bf16", SOFTCAP_SHADER_SOURCE);
 }
 
 /// Dispatch a softcap operation on the GPU.
@@ -29,7 +30,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// * `encoder`    - Command encoder to record the dispatch into.
 /// * `registry`   - Kernel registry (must have softcap sources registered).
 /// * `device`     - Metal device for pipeline compilation.
-/// * `input`      - Input buffer (f32 or f16).
+/// * `input`      - Input buffer (f32, f16, or bf16).
 /// * `output`     - Output buffer (same dtype and shape as input).
 /// * `params_buf` - Params buffer containing `[cap, n_elements_as_f32_bits]` as two f32 values.
 /// * `cap`        - The capping value (e.g. 30.0).
@@ -37,7 +38,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// # Errors
 ///
 /// Returns `MlxError::InvalidArgument` if:
-/// - Input dtype is not f32 or f16.
+/// - Input dtype is not f32, f16, or bf16.
 /// - Input and output element counts do not match.
 /// - Cap is not positive.
 pub fn dispatch_softcap(
@@ -75,6 +76,7 @@ pub fn dispatch_softcap(
     let kernel_name = match input.dtype() {
         DType::F32 => "softcap_f32",
         DType::F16 => "softcap_f16",
+        DType::BF16 => "softcap_bf16",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
                 "Softcap unsupported dtype: {}",

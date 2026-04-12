@@ -42,3 +42,16 @@ kernel void gelu_f16(
     const float clamped = clamp(inner, -TANH_CLAMP, TANH_CLAMP);
     output[id] = half(0.5f * x * (1.0f + tanh(clamped)));
 }
+
+kernel void gelu_bf16(
+    device const bfloat *input  [[buffer(0)]],
+    device bfloat       *output [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    // Promote to f32 for accurate computation; accumulate and compute in f32
+    const float x = static_cast<float>(input[id]);
+    const float x_cubed = x * x * x;
+    const float inner = GELU_SQRT_2_OVER_PI * (x + GELU_COEFF * x_cubed);
+    const float clamped = clamp(inner, -TANH_CLAMP, TANH_CLAMP);
+    output[id] = bfloat(0.5f * x * (1.0f + tanh(clamped)));
+}

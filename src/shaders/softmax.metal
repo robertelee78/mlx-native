@@ -137,3 +137,60 @@ kernel void softmax_f16(
         output[base + i] = half(float(output[base + i]) * inv_sum);
     }
 }
+
+kernel void softmax_bf16(
+    device const bfloat *input     [[buffer(0)]],
+    device bfloat       *output    [[buffer(1)]],
+    device const float  *params    [[buffer(2)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    threadgroup float *shared     [[threadgroup(0)]]
+) {
+    const uint cols = uint(params[0]);
+    const uint base = row_idx * cols;
+
+    // Phase 1: find row max (accumulate in f32 for numerical stability)
+    float local_max = -INFINITY;
+    for (uint i = tid; i < cols; i += tg_size) {
+        local_max = max(local_max, static_cast<float>(input[base + i]));
+    }
+
+    shared[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] = max(shared[tid], shared[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float row_max = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: compute exp(x - max) in f32, store intermediate as bf16
+    float local_sum = 0.0f;
+    for (uint i = tid; i < cols; i += tg_size) {
+        const float e = exp(static_cast<float>(input[base + i]) - row_max);
+        output[base + i] = bfloat(e);  // store intermediate
+        local_sum += e;
+    }
+
+    shared[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float row_sum = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: normalize — re-read bf16 intermediate, normalize in f32, store as bf16
+    const float inv_sum = 1.0f / row_sum;
+    for (uint i = tid; i < cols; i += tg_size) {
+        output[base + i] = bfloat(static_cast<float>(output[base + i]) * inv_sum);
+    }
+}
