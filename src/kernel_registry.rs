@@ -143,6 +143,22 @@ impl KernelRegistry {
         sources.insert("fused_norm_add_bf16".into(), fused_norm_add_src);
         sources.insert("fused_norm_add_no_weight_bf16".into(), fused_norm_add_src);
 
+        // Argsort kernel (Story 2.3) — MoE top-K routing
+        let argsort_src: &'static str = include_str!("shaders/argsort.metal");
+        sources.insert("argsort_desc_f32".into(), argsort_src);
+
+        // Gather / index_select kernel (Story 2.4)
+        let gather_src: &'static str = include_str!("shaders/gather.metal");
+        sources.insert("gather_f32".into(), gather_src);
+
+        // Strided copy kernel (Story 2.5)
+        let copy_src: &'static str = include_str!("shaders/copy.metal");
+        sources.insert("strided_copy_f32".into(), copy_src);
+
+        // Dense F16 GEMM kernel (Story 2.6) — lm_head projection
+        let dense_gemm_src: &'static str = include_str!("shaders/dense_gemm.metal");
+        sources.insert("dense_gemm_f16".into(), dense_gemm_src);
+
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);

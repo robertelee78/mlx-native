@@ -3,8 +3,12 @@
 //! Each submodule implements dispatch for a specific kernel family.
 
 pub mod argmax;
+pub mod argsort;
+pub mod copy;
+pub mod dense_gemm;
 pub mod elementwise;
 pub mod embedding;
+pub mod gather;
 pub mod encode_helpers;
 pub mod fused_head_norm_rope;
 pub mod fused_norm_add;
