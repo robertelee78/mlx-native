@@ -540,3 +540,111 @@ pub fn moe_accumulate_encode(
     );
     Ok(())
 }
+
+/// Like [`moe_swiglu_fused_encode`] but reads from `gate_up` at `gu_byte_offset`
+/// and writes to `output` at `out_byte_offset`.
+///
+/// This enables operating on slices within larger buffers (e.g. the _id kernel
+/// output which contains top_k rows of gate_up data).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_swiglu_fused_encode_offset(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    gate_up: &MlxBuffer,
+    gu_byte_offset: usize,
+    output: &MlxBuffer,
+    out_byte_offset: usize,
+    n_elements: usize,
+) -> Result<()> {
+    if n_elements == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_swiglu_fused_encode_offset: n_elements must be > 0".into(),
+        ));
+    }
+    let gu_required = gu_byte_offset + 2 * n_elements * std::mem::size_of::<f32>();
+    if gate_up.byte_len() < gu_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_fused_encode_offset: gate_up buffer too small: need {} bytes (offset {}), have {}",
+            gu_required, gu_byte_offset, gate_up.byte_len()
+        )));
+    }
+    let out_required = out_byte_offset + n_elements * std::mem::size_of::<f32>();
+    if output.byte_len() < out_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_fused_encode_offset: output buffer too small: need {} bytes (offset {}), have {}",
+            out_required, out_byte_offset, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_swiglu_fused", device)?;
+    let params = GpuFusedGeluMulParams {
+        n_elements: n_elements as u32,
+    };
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::BufferWithOffset(gate_up, gu_byte_offset as u64)),
+            (1, KernelArg::BufferWithOffset(output, out_byte_offset as u64)),
+            (2, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(n_elements as u64, 1, 1),
+        MTLSize::new(std::cmp::min(256, n_elements as u64), 1, 1),
+    );
+    Ok(())
+}
+
+/// Like [`moe_accumulate_encode`] but reads `expert_output` from `src_byte_offset`.
+///
+/// This enables reading from a slice within a larger buffer (e.g. the down _id
+/// kernel output which contains top_k rows of hidden data).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_accumulate_encode_offset(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    accumulator: &MlxBuffer,
+    expert_output: &MlxBuffer,
+    src_byte_offset: usize,
+    routing_weight: f32,
+    n_elements: usize,
+) -> Result<()> {
+    if n_elements == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_accumulate_encode_offset: n_elements must be > 0".into(),
+        ));
+    }
+    let required = n_elements * std::mem::size_of::<f32>();
+    if accumulator.byte_len() < required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_accumulate_encode_offset: accumulator too small: need {} bytes, have {}",
+            required, accumulator.byte_len()
+        )));
+    }
+    let src_required = src_byte_offset + required;
+    if expert_output.byte_len() < src_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_accumulate_encode_offset: expert_output too small: need {} bytes (offset {}), have {}",
+            src_required, src_byte_offset, expert_output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_accumulate", device)?;
+    let params = GpuMoeAccumParams {
+        n_elements: n_elements as u32,
+        routing_weight,
+    };
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(accumulator)),
+            (1, KernelArg::BufferWithOffset(expert_output, src_byte_offset as u64)),
+            (2, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(n_elements as u64, 1, 1),
+        MTLSize::new(std::cmp::min(256, n_elements as u64), 1, 1),
+    );
+    Ok(())
+}

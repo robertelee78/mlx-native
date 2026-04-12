@@ -68,6 +68,9 @@ pub use ops::quantized_matmul_ggml::{
     quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
 };
 pub use ops::quantized_matmul_id::{quantized_matmul_id, QuantizedMatmulIdParams};
+pub use ops::quantized_matmul_id_ggml::{
+    quantized_matmul_id_ggml, GgmlQuantizedMatmulIdParams,
+};
 
 // Re-export weight loading utilities.
 pub use weight::{

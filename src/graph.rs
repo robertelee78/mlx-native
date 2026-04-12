@@ -191,6 +191,32 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode an expert-routed GGML block-format quantized mat-vec into this session's encoder.
+    ///
+    /// Delegates to [`ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_id_ggml(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        output: &mut MlxBuffer,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            params,
+        )
+    }
+
     /// Encode scaled dot-product attention into this session's encoder.
     ///
     /// Delegates to [`ops::sdpa::sdpa`].

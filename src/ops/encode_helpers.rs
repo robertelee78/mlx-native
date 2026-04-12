@@ -15,6 +15,8 @@ use crate::encoder::CommandEncoder;
 pub enum KernelArg<'a> {
     /// Bind an existing Metal buffer at the given index.
     Buffer(&'a MlxBuffer),
+    /// Bind an existing Metal buffer at the given index with a byte offset.
+    BufferWithOffset(&'a MlxBuffer, u64),
     /// Bind inline bytes (small constant data) at the given index.
     /// The data must be `Pod` and is copied into the command encoder.
     Bytes(&'a [u8]),
@@ -48,6 +50,9 @@ pub fn encode_with_args(
             KernelArg::Buffer(buf) => {
                 compute_encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
             }
+            KernelArg::BufferWithOffset(buf, offset) => {
+                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
+            }
             KernelArg::Bytes(bytes) => {
                 compute_encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);
             }
@@ -74,6 +79,9 @@ pub fn encode_threadgroups_with_args(
         match arg {
             KernelArg::Buffer(buf) => {
                 compute_encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+            }
+            KernelArg::BufferWithOffset(buf, offset) => {
+                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
             }
             KernelArg::Bytes(bytes) => {
                 compute_encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);
@@ -117,6 +125,9 @@ pub fn encode_threadgroups_with_args_and_shared(
         match arg {
             KernelArg::Buffer(buf) => {
                 compute_encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+            }
+            KernelArg::BufferWithOffset(buf, offset) => {
+                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
             }
             KernelArg::Bytes(bytes) => {
                 compute_encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);

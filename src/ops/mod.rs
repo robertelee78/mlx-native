@@ -20,6 +20,7 @@ pub mod moe_gate;
 pub mod quantized_matmul;
 pub mod quantized_matmul_ggml;
 pub mod quantized_matmul_id;
+pub mod quantized_matmul_id_ggml;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
