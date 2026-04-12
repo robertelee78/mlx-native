@@ -65,6 +65,13 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul.metal"),
         );
 
+        // GGML block-format quantized mat-vec kernels (ADR-006 Phase 3)
+        let ggml_src: &'static str =
+            include_str!("shaders/quantized_matmul_ggml.metal");
+        sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+
         // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
         sources.insert(
             "quantized_matmul_id".into(),

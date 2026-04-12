@@ -168,6 +168,29 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode a GGML block-format quantized mat-vec into this session's encoder.
+    ///
+    /// Delegates to [`ops::quantized_matmul_ggml::quantized_matmul_ggml`].
+    pub fn quantized_matmul_ggml(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &mut MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlQuantizedMatmulParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+        )
+    }
+
     /// Encode scaled dot-product attention into this session's encoder.
     ///
     /// Delegates to [`ops::sdpa::sdpa`].
