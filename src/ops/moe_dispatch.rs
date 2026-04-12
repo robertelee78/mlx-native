@@ -377,6 +377,65 @@ pub fn moe_dispatch(
     Ok(())
 }
 
+/// Encode a fused SwiGLU on a `[2*N]` gate_up buffer, producing `[N]` output.
+///
+/// Computes `output[i] = GELU(gate_up[i]) * gate_up[N + i]` for `i in 0..N`.
+///
+/// Uses the `moe_swiglu_fused` kernel from moe_dispatch.metal.
+///
+/// # Arguments
+/// * `encoder`        -- Command encoder to record into.
+/// * `registry`       -- Kernel registry for pipeline lookup.
+/// * `device`         -- Metal device reference.
+/// * `gate_up`        -- f32 buffer `[2 * n_elements]` (gate || up concatenated).
+/// * `output`         -- f32 buffer `[n_elements]` (output).
+/// * `n_elements`     -- Number of output elements (intermediate_dim).
+pub fn moe_swiglu_fused_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    gate_up: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: usize,
+) -> Result<()> {
+    if n_elements == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_swiglu_fused_encode: n_elements must be > 0".into(),
+        ));
+    }
+    let gu_required = 2 * n_elements * std::mem::size_of::<f32>();
+    if gate_up.byte_len() < gu_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_fused_encode: gate_up buffer too small: need {} bytes, have {}",
+            gu_required, gate_up.byte_len()
+        )));
+    }
+    let out_required = n_elements * std::mem::size_of::<f32>();
+    if output.byte_len() < out_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_fused_encode: output buffer too small: need {} bytes, have {}",
+            out_required, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_swiglu_fused", device)?;
+    let params = GpuFusedGeluMulParams {
+        n_elements: n_elements as u32,
+    };
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(gate_up)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(n_elements as u64, 1, 1),
+        MTLSize::new(std::cmp::min(256, n_elements as u64), 1, 1),
+    );
+    Ok(())
+}
+
 /// Zero-initialize an f32 GPU buffer using the `zero_buffer` kernel.
 ///
 /// This is useful for preparing an accumulator buffer before dispatching

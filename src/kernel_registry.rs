@@ -90,6 +90,7 @@ impl KernelRegistry {
         // MoE dispatch kernels (Story 1.5)
         let moe_dispatch_src: &'static str = include_str!("shaders/moe_dispatch.metal");
         sources.insert("fused_gelu_mul".into(), moe_dispatch_src);
+        sources.insert("moe_swiglu_fused".into(), moe_dispatch_src);
         sources.insert("moe_accumulate".into(), moe_dispatch_src);
         sources.insert("zero_buffer".into(), moe_dispatch_src);
         sources.insert("naive_matvec_f32".into(), moe_dispatch_src);

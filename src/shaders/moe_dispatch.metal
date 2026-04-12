@@ -22,10 +22,14 @@ using namespace metal;
 // --------------------------------------------------------------------------
 
 // GELU approximation matching PyTorch/MLX: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Clamp threshold for tanh argument to prevent NaN from exp() overflow.
+// tanh saturates at +/-1 well before |x| = 10, so clamping at 15 is safe.
 inline float gelu_approx(float x) {
     const float sqrt_2_over_pi = 0.7978845608028654f;
+    const float tanh_clamp = 15.0f;
     float x3 = x * x * x;
     float inner = sqrt_2_over_pi * (x + 0.044715f * x3);
+    inner = clamp(inner, -tanh_clamp, tanh_clamp);
     return 0.5f * x * (1.0f + tanh(inner));
 }
 
@@ -95,6 +99,35 @@ kernel void zero_buffer(
 ) {
     if (gid >= params.n_elements) return;
     buffer[gid] = 0.0f;
+}
+
+// --------------------------------------------------------------------------
+// moe_swiglu_fused — SwiGLU on a fused [gate, up] buffer.
+//
+// Takes a buffer of 2*N elements where:
+//   - First N elements are the gate projection output
+//   - Last N elements are the up projection output
+// Produces N elements: GELU(gate[i]) * up[i]
+//
+// This is the fused variant for models that use a single gate_up projection
+// (e.g., Gemma 4 MoE experts with fused gate/up weights).
+//
+// Buffers:
+//   0: gate_up — float [2 * N] (input: gate || up, concatenated)
+//   1: output  — float [N]     (output: GELU(gate) * up)
+//   2: params  — { n_elements = N }
+// --------------------------------------------------------------------------
+
+kernel void moe_swiglu_fused(
+    device const float* gate_up [[buffer(0)]],
+    device float*       output  [[buffer(1)]],
+    constant FusedGeluMulParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    float gate_val = gate_up[gid];
+    float up_val   = gate_up[params.n_elements + gid];
+    output[gid] = gelu_approx(gate_val) * up_val;
 }
 
 // --------------------------------------------------------------------------
