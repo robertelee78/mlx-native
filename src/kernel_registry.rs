@@ -65,6 +65,12 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul.metal"),
         );
 
+        // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
+        sources.insert(
+            "quantized_matmul_id".into(),
+            include_str!("shaders/quantized_matmul_id.metal"),
+        );
+
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");
         sources.insert("embedding_gather_4bit".into(), embedding_src);

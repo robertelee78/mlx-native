@@ -943,25 +943,29 @@ mod tests {
 
     // Helper: pack 6-bit values into uint32 buffer.
     fn pack_6bit_buffer(device: &MlxDevice, n: usize, k: usize, quant_values: &[u8]) -> MlxBuffer {
-        let values_per_pack = 4;
-        let packs_per_row = (k + values_per_pack - 1) / values_per_pack;
-        let total_packs = n * packs_per_row;
-        let byte_len = total_packs * 4;
+        // 6-bit: 4 values per 3-byte triplet (24 bits). The Metal shader reads
+        // raw bytes as 3-byte triplets, NOT uint32, so we must match that layout.
+        let triplets_per_row = (k + 3) / 4;
+        let row_bytes = triplets_per_row * 3;
+        let total_bytes = n * row_bytes;
 
-        let mut buf = device.alloc_buffer(byte_len, DType::U32, vec![n, packs_per_row]).expect("alloc");
+        let mut buf = device.alloc_buffer(total_bytes, DType::U8, vec![total_bytes]).expect("alloc");
         {
-            let slice: &mut [u32] = buf.as_mut_slice().expect("as_mut_slice");
+            let slice: &mut [u8] = buf.as_mut_slice().expect("as_mut_slice");
             for col in 0..n {
-                for pack in 0..packs_per_row {
+                for t in 0..triplets_per_row {
                     let mut packed: u32 = 0;
-                    for i in 0..values_per_pack {
-                        let k_idx = pack * values_per_pack + i;
+                    for i in 0..4 {
+                        let k_idx = t * 4 + i;
                         if k_idx < k {
                             let val = quant_values[col * k + k_idx] as u32 & 0x3F;
                             packed |= val << (6 * i);
                         }
                     }
-                    slice[col * packs_per_row + pack] = packed;
+                    let base = col * row_bytes + t * 3;
+                    slice[base] = (packed & 0xFF) as u8;
+                    slice[base + 1] = ((packed >> 8) & 0xFF) as u8;
+                    slice[base + 2] = ((packed >> 16) & 0xFF) as u8;
                 }
             }
         }

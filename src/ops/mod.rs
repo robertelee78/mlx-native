@@ -14,6 +14,7 @@ pub mod kv_cache_copy;
 pub mod moe_dispatch;
 pub mod moe_gate;
 pub mod quantized_matmul;
+pub mod quantized_matmul_id;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;

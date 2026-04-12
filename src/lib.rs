@@ -62,6 +62,7 @@ pub use kernel_registry::KernelRegistry;
 
 // Re-export ops.
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
+pub use ops::quantized_matmul_id::{quantized_matmul_id, QuantizedMatmulIdParams};
 
 // Re-export weight loading utilities.
 pub use weight::{
