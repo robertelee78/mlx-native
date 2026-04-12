@@ -34,10 +34,19 @@ crate::static_assertions_send_sync!(MlxBuffer);
 impl MlxBuffer {
     /// Create a new `MlxBuffer` wrapping an already-allocated Metal buffer.
     ///
-    /// This is an internal constructor — callers go through
-    /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer) or
-    /// [`MlxBufferPool::alloc`](crate::MlxBufferPool::alloc).
-    pub(crate) fn from_raw(inner: MetalBuffer, dtype: DType, shape: Vec<usize>) -> Self {
+    /// # When to use
+    ///
+    /// Use this to wrap Metal buffers obtained from external frameworks (e.g.
+    /// candle's `MetalStorage::buffer()`) for zero-copy interop on Apple
+    /// Silicon unified memory.  Both frameworks see the same physical memory.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must ensure that `inner` remains valid for the lifetime of
+    /// the returned `MlxBuffer`.  If the buffer was obtained from another
+    /// framework, the caller must ensure that framework does not deallocate
+    /// the buffer while this `MlxBuffer` exists.
+    pub fn from_raw(inner: MetalBuffer, dtype: DType, shape: Vec<usize>) -> Self {
         Self {
             inner,
             dtype,
