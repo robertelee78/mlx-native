@@ -43,10 +43,17 @@ pub struct SdpaParams {
     /// Attention score scaling factor. Typically `1.0 / sqrt(head_dim)`, but
     /// models like Gemma 4 (which use QK norms) require `scale = 1.0`.
     pub scale: f32,
+    /// KV cache capacity — the stride (in positions) between KV heads in the
+    /// cache buffer.  When the KV cache is pre-allocated to a fixed capacity
+    /// larger than `kv_seq_len`, set this to the capacity so the kernel reads
+    /// the correct memory offsets.  When KV buffers are tightly packed (no
+    /// extra capacity), set equal to `kv_seq_len`.  Default: 0 means "use
+    /// kv_seq_len as capacity" for backwards compatibility.
+    pub kv_capacity: u32,
 }
 
 /// GPU-side parameter struct layout.  Must match the MSL `SdpaParams` struct
-/// exactly (5 × u32 + 1 × f32 = 24 bytes, no padding).
+/// exactly (6 × u32 + 1 × f32 = 28 bytes, no padding).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SdpaParamsGpu {
@@ -56,6 +63,7 @@ struct SdpaParamsGpu {
     seq_len: u32,
     kv_seq_len: u32,
     scale: f32,
+    kv_capacity: u32,
 }
 
 /// Tile size for query positions per threadgroup.  Must match `TILE_Q` in the
@@ -144,14 +152,18 @@ pub fn sdpa(
 ) -> Result<()> {
     validate_params(params)?;
 
+    // Resolve kv_capacity: 0 means "same as kv_seq_len" for backwards compat.
+    let kv_cap = if params.kv_capacity == 0 { params.kv_seq_len } else { params.kv_capacity };
+
     // Validate buffer sizes.
     let q_elements = batch_size as usize
         * params.n_heads as usize
         * params.seq_len as usize
         * params.head_dim as usize;
+    // KV buffers are strided by kv_capacity, not kv_seq_len.
     let kv_elements = batch_size as usize
         * params.n_kv_heads as usize
-        * params.kv_seq_len as usize
+        * kv_cap as usize
         * params.head_dim as usize;
 
     validate_buffer(q, "Q", q_elements)?;
@@ -167,6 +179,7 @@ pub fn sdpa(
         seq_len: params.seq_len,
         kv_seq_len: params.kv_seq_len,
         scale: params.scale,
+        kv_capacity: kv_cap,
     };
     let params_bytes = bytemuck::bytes_of(&params_gpu);
     let mut params_buf = device.alloc_buffer(
@@ -263,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_gpu_params_layout() {
-        // Ensure SdpaParamsGpu is exactly 24 bytes (5 x u32 + 1 x f32).
-        assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 24);
+        // Ensure SdpaParamsGpu is exactly 28 bytes (6 x u32 + 1 x f32).
+        assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 28);
     }
 }

@@ -31,9 +31,10 @@ struct SdpaSlidingParams {
     uint n_kv_heads;    // number of key/value heads
     uint head_dim;      // dimension per head
     uint seq_len;       // query sequence length
-    uint kv_seq_len;    // key/value sequence length
+    uint kv_seq_len;    // key/value sequence length (valid positions)
     uint window_size;   // sliding window size
     float scale;        // attention score scaling factor (e.g. 1/sqrt(head_dim) or 1.0)
+    uint kv_capacity;   // stride between KV heads (in positions); >= kv_seq_len
 };
 
 // Tile size: number of query positions per threadgroup.
@@ -49,12 +50,13 @@ kernel void sdpa_sliding(
     uint  tid                      [[thread_index_in_threadgroup]]
 ) {
     // Unpack parameters.
-    const uint n_heads     = params->n_heads;
-    const uint n_kv_heads  = params->n_kv_heads;
-    const uint head_dim    = params->head_dim;
-    const uint seq_len     = params->seq_len;
-    const uint kv_seq_len  = params->kv_seq_len;
-    const uint window_size = params->window_size;
+    const uint n_heads      = params->n_heads;
+    const uint n_kv_heads   = params->n_kv_heads;
+    const uint head_dim     = params->head_dim;
+    const uint seq_len      = params->seq_len;
+    const uint kv_seq_len   = params->kv_seq_len;
+    const uint window_size  = params->window_size;
+    const uint kv_capacity  = params->kv_capacity;  // stride between KV heads
 
     // Threadgroup grid: (batch, head, query_tile).
     const uint batch_idx   = tgid.x;
@@ -73,13 +75,14 @@ kernel void sdpa_sliding(
     const uint heads_per_kv = n_heads / n_kv_heads;
     const uint kv_head_idx  = head_idx / heads_per_kv;
 
-    // Base offsets.
+    // Base offsets.  Q is packed [batch, heads, seq, head_dim].
+    // KV cache uses kv_capacity as stride between heads (>= kv_seq_len).
     const uint q_base = batch_idx * (n_heads * seq_len * head_dim)
                       + head_idx * (seq_len * head_dim)
                       + q_pos * head_dim;
 
-    const uint k_head_base = batch_idx * (n_kv_heads * kv_seq_len * head_dim)
-                           + kv_head_idx * (kv_seq_len * head_dim);
+    const uint k_head_base = batch_idx * (n_kv_heads * kv_capacity * head_dim)
+                           + kv_head_idx * (kv_capacity * head_dim);
 
     const uint v_head_base = k_head_base;
 
@@ -170,12 +173,13 @@ kernel void sdpa_sliding_bf16(
     uint3 tgid                     [[threadgroup_position_in_grid]],
     uint  tid                      [[thread_index_in_threadgroup]]
 ) {
-    const uint n_heads     = params->n_heads;
-    const uint n_kv_heads  = params->n_kv_heads;
-    const uint head_dim    = params->head_dim;
-    const uint seq_len     = params->seq_len;
-    const uint kv_seq_len  = params->kv_seq_len;
-    const uint window_size = params->window_size;
+    const uint n_heads      = params->n_heads;
+    const uint n_kv_heads   = params->n_kv_heads;
+    const uint head_dim     = params->head_dim;
+    const uint seq_len      = params->seq_len;
+    const uint kv_seq_len   = params->kv_seq_len;
+    const uint window_size  = params->window_size;
+    const uint kv_capacity  = params->kv_capacity;
 
     const uint batch_idx   = tgid.x;
     const uint head_idx    = tgid.y;
@@ -194,8 +198,8 @@ kernel void sdpa_sliding_bf16(
                       + head_idx * (seq_len * head_dim)
                       + q_pos * head_dim;
 
-    const uint k_head_base = batch_idx * (n_kv_heads * kv_seq_len * head_dim)
-                           + kv_head_idx * (kv_seq_len * head_dim);
+    const uint k_head_base = batch_idx * (n_kv_heads * kv_capacity * head_dim)
+                           + kv_head_idx * (kv_capacity * head_dim);
 
     const uint v_head_base = k_head_base;
     const uint o_base = q_base;
