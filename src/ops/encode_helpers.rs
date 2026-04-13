@@ -5,22 +5,16 @@
 //! These helpers extend encoding to support Metal `set_bytes` for small
 //! constant parameter structs, which avoids allocating a full Metal buffer
 //! for a few bytes of configuration data.
+//!
+//! `KernelArg` and `as_bytes` are defined in `crate::encoder` and re-exported
+//! here for backward compatibility.
 
 use metal::{ComputePipelineStateRef, MTLSize};
 
-use crate::buffer::MlxBuffer;
 use crate::encoder::CommandEncoder;
 
-/// A buffer or inline-bytes binding for a compute kernel argument slot.
-pub enum KernelArg<'a> {
-    /// Bind an existing Metal buffer at the given index.
-    Buffer(&'a MlxBuffer),
-    /// Bind an existing Metal buffer at the given index with a byte offset.
-    BufferWithOffset(&'a MlxBuffer, u64),
-    /// Bind inline bytes (small constant data) at the given index.
-    /// The data must be `Pod` and is copied into the command encoder.
-    Bytes(&'a [u8]),
-}
+// Re-export from encoder module where KernelArg now lives.
+pub use crate::encoder::{KernelArg, as_bytes};
 
 /// Encode a compute pass with mixed buffer and bytes bindings.
 ///
@@ -41,26 +35,10 @@ pub fn encode_with_args(
     grid_size: MTLSize,
     threadgroup_size: MTLSize,
 ) {
-    let cmd_buf = encoder.metal_command_buffer();
-    let compute_encoder = cmd_buf.new_compute_command_encoder();
-    compute_encoder.set_compute_pipeline_state(pipeline);
-
-    for &(index, ref arg) in bindings {
-        match arg {
-            KernelArg::Buffer(buf) => {
-                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
-            }
-            KernelArg::BufferWithOffset(buf, offset) => {
-                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
-            }
-            KernelArg::Bytes(bytes) => {
-                compute_encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);
-            }
-        }
-    }
-
-    compute_encoder.dispatch_threads(grid_size, threadgroup_size);
-    compute_encoder.end_encoding();
+    // Use the encoder's persistent compute encoder via encode_with_args_dispatch.
+    // This delegates to CommandEncoder's own dispatch methods that reuse the
+    // same compute encoder across calls.
+    encoder.encode_with_args(pipeline, bindings, grid_size, threadgroup_size);
 }
 
 /// Encode a compute pass with threadgroups and mixed buffer/bytes bindings.
@@ -71,26 +49,7 @@ pub fn encode_threadgroups_with_args(
     threadgroups: MTLSize,
     threadgroup_size: MTLSize,
 ) {
-    let cmd_buf = encoder.metal_command_buffer();
-    let compute_encoder = cmd_buf.new_compute_command_encoder();
-    compute_encoder.set_compute_pipeline_state(pipeline);
-
-    for &(index, ref arg) in bindings {
-        match arg {
-            KernelArg::Buffer(buf) => {
-                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
-            }
-            KernelArg::BufferWithOffset(buf, offset) => {
-                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
-            }
-            KernelArg::Bytes(bytes) => {
-                compute_encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);
-            }
-        }
-    }
-
-    compute_encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
-    compute_encoder.end_encoding();
+    encoder.encode_threadgroups_with_args(pipeline, bindings, threadgroups, threadgroup_size);
 }
 
 /// Encode a compute pass with threadgroups, mixed buffer/bytes bindings, and
@@ -117,38 +76,13 @@ pub fn encode_threadgroups_with_args_and_shared(
     threadgroups: MTLSize,
     threadgroup_size: MTLSize,
 ) {
-    let cmd_buf = encoder.metal_command_buffer();
-    let compute_encoder = cmd_buf.new_compute_command_encoder();
-    compute_encoder.set_compute_pipeline_state(pipeline);
-
-    for &(index, ref arg) in bindings {
-        match arg {
-            KernelArg::Buffer(buf) => {
-                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
-            }
-            KernelArg::BufferWithOffset(buf, offset) => {
-                compute_encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
-            }
-            KernelArg::Bytes(bytes) => {
-                compute_encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);
-            }
-        }
-    }
-
-    for &(index, byte_length) in threadgroup_mem {
-        compute_encoder.set_threadgroup_memory_length(index, byte_length);
-    }
-
-    compute_encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
-    compute_encoder.end_encoding();
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        bindings,
+        threadgroup_mem,
+        threadgroups,
+        threadgroup_size,
+    );
 }
 
-/// Convert a `Pod` value to a byte slice suitable for `KernelArg::Bytes`.
-///
-/// # Safety
-///
-/// The caller must ensure `T` has the same layout as the corresponding
-/// MSL struct in the shader (matching field order, sizes, and alignment).
-pub fn as_bytes<T: bytemuck::Pod>(val: &T) -> &[u8] {
-    bytemuck::bytes_of(val)
-}
+// as_bytes is re-exported from crate::encoder above.

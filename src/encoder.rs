@@ -3,15 +3,63 @@
 //! Wraps a Metal command buffer.  Encode one or more compute kernel dispatches,
 //! then call [`commit_and_wait`](CommandEncoder::commit_and_wait) to submit the
 //! entire batch and block until the GPU finishes.
+//!
+//! # Persistent compute encoder
+//!
+//! A single Metal `ComputeCommandEncoder` is kept alive across multiple
+//! dispatches within the same command buffer.  This avoids the overhead of
+//! creating and ending a new compute encoder per dispatch — the same pattern
+//! candle uses (`compute_per_buffer`).  On a forward pass with ~800 dispatches
+//! this saves ~800 encoder create/end cycles.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal::{
-    CommandBuffer, CommandQueue, ComputePipelineStateRef, MTLCommandBufferStatus, MTLSize,
+    CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineStateRef,
+    MTLCommandBufferStatus, MTLSize,
 };
 
 use crate::buffer::MlxBuffer;
 use crate::error::{MlxError, Result};
+
+/// A buffer or inline-bytes binding for a compute kernel argument slot.
+pub enum KernelArg<'a> {
+    /// Bind an existing Metal buffer at the given index.
+    Buffer(&'a MlxBuffer),
+    /// Bind an existing Metal buffer at the given index with a byte offset.
+    BufferWithOffset(&'a MlxBuffer, u64),
+    /// Bind inline bytes (small constant data) at the given index.
+    /// The data must be `Pod` and is copied into the command encoder.
+    Bytes(&'a [u8]),
+}
+
+/// Convert a `Pod` value to a byte slice suitable for `KernelArg::Bytes`.
+///
+/// # Safety
+///
+/// The caller must ensure `T` has the same layout as the corresponding
+/// MSL struct in the shader (matching field order, sizes, and alignment).
+pub fn as_bytes<T: bytemuck::Pod>(val: &T) -> &[u8] {
+    bytemuck::bytes_of(val)
+}
+
+/// Apply a slice of `KernelArg` bindings to a compute encoder.
+#[inline]
+fn apply_bindings(encoder: &ComputeCommandEncoderRef, bindings: &[(u64, KernelArg<'_>)]) {
+    for &(index, ref arg) in bindings {
+        match arg {
+            KernelArg::Buffer(buf) => {
+                encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+            }
+            KernelArg::BufferWithOffset(buf, offset) => {
+                encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
+            }
+            KernelArg::Bytes(bytes) => {
+                encoder.set_bytes(index, bytes.len() as u64, bytes.as_ptr() as *const _);
+            }
+        }
+    }
+}
 
 /// Number of times `commit_and_wait()` has been called (CPU sync points).
 static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -42,23 +90,29 @@ pub fn dispatch_count() -> u64 {
 
 /// A batched compute command encoder.
 ///
-/// Typical usage:
+/// Keeps a single Metal `ComputeCommandEncoder` alive across multiple
+/// dispatches.  The encoder is created on the first dispatch and ended
+/// only when the command buffer is committed.  This mirrors candle's
+/// `compute_per_buffer` pattern and avoids per-dispatch encoder overhead.
+///
+/// # Typical usage
 ///
 /// ```ignore
 /// let mut enc = device.command_encoder()?;
-/// enc.set_pipeline(&pipeline);
-/// enc.set_buffer(0, &input_buf);
-/// enc.set_buffer(1, &output_buf);
-/// enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+/// // Multiple dispatches share the same compute encoder:
+/// enc.encode_threadgroups(pipeline1, &buffers1, tg1, tg_size1);
+/// enc.encode_threadgroups(pipeline2, &buffers2, tg2, tg_size2);
 /// enc.commit_and_wait()?;
 /// ```
-///
-/// The encoder automatically manages the lifecycle of the underlying Metal
-/// compute command encoder — `end_encoding` is called before commit.
 pub struct CommandEncoder {
     cmd_buf: CommandBuffer,
-    /// Tracks whether we have an active compute encoder that needs ending.
-    has_active_encoder: bool,
+    /// Raw pointer to the persistent compute encoder.
+    /// Non-null when a compute pass is active.
+    /// The encoder borrows from `cmd_buf` but we cannot express this
+    /// lifetime in safe Rust, so we use a raw pointer.
+    /// SAFETY: the pointer is valid as long as `cmd_buf` is alive and
+    /// `end_encoding()` has not been called on it.
+    active_encoder: *const ComputeCommandEncoderRef,
 }
 
 impl CommandEncoder {
@@ -69,59 +123,52 @@ impl CommandEncoder {
         let cmd_buf = queue.new_command_buffer().to_owned();
         Ok(Self {
             cmd_buf,
-            has_active_encoder: false,
+            active_encoder: std::ptr::null(),
         })
+    }
+
+    /// Get or create the persistent compute encoder.
+    ///
+    /// On the first call, creates a new compute encoder from the command
+    /// buffer.  On subsequent calls, returns the existing one.
+    ///
+    /// SAFETY: The returned reference borrows from `self.cmd_buf` which is
+    /// alive for the lifetime of this `CommandEncoder`.  The raw pointer is
+    /// valid until `end_active_encoder()` is called.
+    #[inline]
+    fn get_or_create_encoder(&mut self) -> &ComputeCommandEncoderRef {
+        if self.active_encoder.is_null() {
+            let encoder = self.cmd_buf.new_compute_command_encoder();
+            self.active_encoder = encoder as *const ComputeCommandEncoderRef;
+        }
+        // SAFETY: active_encoder is non-null and points to a valid encoder
+        // owned by cmd_buf.
+        unsafe { &*self.active_encoder }
+    }
+
+    /// End the active compute encoder if one exists.
+    #[inline]
+    fn end_active_encoder(&mut self) {
+        if !self.active_encoder.is_null() {
+            // SAFETY: the pointer was obtained from cmd_buf.new_compute_command_encoder()
+            // and has not been ended yet.
+            unsafe { &*self.active_encoder }.end_encoding();
+            self.active_encoder = std::ptr::null();
+        }
     }
 
     /// Set the compute pipeline state for subsequent dispatches.
     ///
     /// This begins a new compute pass if one is not already active.
     pub fn set_pipeline(&mut self, pipeline: &ComputePipelineStateRef) {
-        // We create a fresh compute encoder each time set_pipeline is called.
-        // If there is already an active encoder, end it first to start a clean pass.
-        if self.has_active_encoder {
-            // end the current encoder — this is implicit in our dispatch model
-            // Actually, in Metal you can set_pipeline multiple times on the
-            // same compute encoder.  We keep a simpler model: one pass at a time.
-        }
-        let encoder = self.cmd_buf.new_compute_command_encoder();
+        let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
-        // The encoder reference is borrowed from cmd_buf.  We mark it active;
-        // the caller will call set_buffer / dispatch_threads on us, and we
-        // forward those to the *current* encoder obtained via the same method.
-        //
-        // IMPORTANT: Metal's compute command encoder is alive until end_encoding()
-        // is called.  We store a flag so commit_and_wait knows to end it.
-        self.has_active_encoder = true;
     }
 
     /// Bind a buffer to a compute kernel argument slot.
     ///
     /// The `index` corresponds to the `[[buffer(N)]]` attribute in the MSL shader.
     pub fn set_buffer(&self, index: u64, buffer: &MlxBuffer) {
-        // Get the current compute encoder from the command buffer.
-        // NOTE: We rely on the Metal API's guarantee that the most recently
-        // created compute command encoder is still active.  In practice we call
-        // this immediately after set_pipeline / previous set_buffer.
-        //
-        // Because metal-rs returns a *borrowed* reference to the encoder from
-        // new_compute_command_encoder(), we cannot store it across calls in safe
-        // Rust.  Instead we use the raw command buffer pattern: encode pipeline +
-        // buffers + dispatch in a single logical block.
-        //
-        // The real encoding happens through the compute encoder created in
-        // set_pipeline.  Since metal-rs gives us a borrowed reference that is
-        // valid until end_encoding, and our API requires calls in strict order
-        // (set_pipeline -> set_buffer -> dispatch_threads), the encoder from
-        // set_pipeline is still alive here.
-        //
-        // However, the borrow checker cannot track this across method calls.
-        // The idiomatic solution is to use the `encode` pattern below.  For the
-        // initial version, we use a simplified approach where encode() does
-        // everything at once.
-        //
-        // This method is a NO-OP placeholder for the encode()-based API below.
-        // Callers should prefer `encode()`.
         let _ = (index, buffer);
     }
 
@@ -132,9 +179,8 @@ impl CommandEncoder {
 
     /// Encode a complete compute pass: set pipeline, bind buffers, dispatch.
     ///
-    /// This is the preferred encoding method.  It creates a compute encoder,
-    /// encodes all operations, and ends the encoder in one call — avoiding
-    /// borrow-lifetime issues with the Metal API.
+    /// Reuses the persistent compute encoder — no per-dispatch encoder
+    /// creation overhead.
     ///
     /// # Arguments
     ///
@@ -150,20 +196,18 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-        let encoder = self.cmd_buf.new_compute_command_encoder();
+        let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
         }
         encoder.dispatch_threads(grid_size, threadgroup_size);
-        encoder.end_encoding();
-        self.has_active_encoder = false;
     }
 
     /// Encode a compute pass using threadgroups instead of raw thread counts.
     ///
-    /// Use this when you need explicit control over threadgroup counts (e.g.
-    /// when the grid is not evenly divisible by the threadgroup size).
+    /// Reuses the persistent compute encoder — no per-dispatch encoder
+    /// creation overhead.
     pub fn encode_threadgroups(
         &mut self,
         pipeline: &ComputePipelineStateRef,
@@ -172,14 +216,12 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-        let encoder = self.cmd_buf.new_compute_command_encoder();
+        let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
         }
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
-        encoder.end_encoding();
-        self.has_active_encoder = false;
     }
 
     /// Encode a compute pass using threadgroups with shared threadgroup memory.
@@ -205,7 +247,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-        let encoder = self.cmd_buf.new_compute_command_encoder();
+        let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
@@ -214,8 +256,61 @@ impl CommandEncoder {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
-        encoder.end_encoding();
-        self.has_active_encoder = false;
+    }
+
+    /// Encode a dispatch with mixed buffer/bytes bindings (dispatch_threads).
+    ///
+    /// Reuses the persistent compute encoder.
+    pub fn encode_with_args(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        grid_size: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let encoder = self.get_or_create_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        apply_bindings(encoder, bindings);
+        encoder.dispatch_threads(grid_size, threadgroup_size);
+    }
+
+    /// Encode a dispatch with mixed buffer/bytes bindings (dispatch_thread_groups).
+    ///
+    /// Reuses the persistent compute encoder.
+    pub fn encode_threadgroups_with_args(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let encoder = self.get_or_create_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        apply_bindings(encoder, bindings);
+        encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+    }
+
+    /// Encode a dispatch with mixed buffer/bytes bindings and shared memory.
+    ///
+    /// Reuses the persistent compute encoder.
+    pub fn encode_threadgroups_with_args_and_shared(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        threadgroup_mem: &[(u64, u64)],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let encoder = self.get_or_create_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        apply_bindings(encoder, bindings);
+        for &(index, byte_length) in threadgroup_mem {
+            encoder.set_threadgroup_memory_length(index, byte_length);
+        }
+        encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
     }
 
     /// Commit the command buffer and block until the GPU finishes execution.
@@ -226,11 +321,8 @@ impl CommandEncoder {
     pub fn commit_and_wait(&mut self) -> Result<()> {
         SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // If there is an active encoder that was started via set_pipeline()
-        // but not yet ended, we cannot end it here because we don't hold a
-        // reference to it.  The `encode()` API handles this properly.
-        // For safety, mark it inactive.
-        self.has_active_encoder = false;
+        // End the persistent compute encoder before committing.
+        self.end_active_encoder();
 
         self.cmd_buf.commit();
         self.cmd_buf.wait_until_completed();
@@ -238,10 +330,6 @@ impl CommandEncoder {
         match self.cmd_buf.status() {
             MTLCommandBufferStatus::Completed => Ok(()),
             MTLCommandBufferStatus::Error => {
-                // Metal does not expose a detailed error string through the
-                // metal-rs crate's CommandBufferRef in all versions.  We provide
-                // a generic message; the GPU-side error code would require
-                // Objective-C runtime introspection.
                 Err(MlxError::CommandBufferError(
                     "GPU command buffer completed with error status".into(),
                 ))
@@ -260,7 +348,7 @@ impl CommandEncoder {
     /// the CPU and check for errors.  This allows the CPU to continue doing
     /// other work (e.g. preparing the next batch) while the GPU runs.
     pub fn commit(&mut self) {
-        self.has_active_encoder = false;
+        self.end_active_encoder();
         self.cmd_buf.commit();
     }
 
@@ -290,5 +378,14 @@ impl CommandEncoder {
     #[inline]
     pub fn metal_command_buffer(&self) -> &CommandBuffer {
         &self.cmd_buf
+    }
+}
+
+impl Drop for CommandEncoder {
+    fn drop(&mut self) {
+        // End the persistent compute encoder before the command buffer
+        // is dropped, otherwise Metal will assert:
+        // "Command encoder released without endEncoding"
+        self.end_active_encoder();
     }
 }

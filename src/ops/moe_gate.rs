@@ -179,47 +179,26 @@ pub fn moe_gate(
     let top_k_u32      = params.top_k      as u32;
     let rms_eps_f32    = params.rms_eps;
 
-    // Use the raw Metal command buffer to build an encoder that supports both
-    // set_bytes (for scalar constants) and set_threadgroup_memory_length.
-    let cmd_buf = encoder.metal_command_buffer();
-    let ce = cmd_buf.new_compute_command_encoder();
-    ce.set_compute_pipeline_state(pipeline);
+    use crate::encoder::{KernelArg, as_bytes};
 
-    // Buffer bindings (match [[buffer(N)]] in moe_gate.metal)
-    ce.set_buffer(0, Some(hidden_state.metal_buffer()),     0);
-    ce.set_buffer(1, Some(router_weights.metal_buffer()),   0);
-    ce.set_buffer(2, Some(norm_weight.metal_buffer()),      0);
-    ce.set_buffer(3, Some(per_expert_scale.metal_buffer()), 0);
-    ce.set_buffer(4, Some(out_expert_ids.metal_buffer()),   0);
-    ce.set_buffer(5, Some(out_weights.metal_buffer()),      0);
-
-    // Scalar constants via set_bytes
-    ce.set_bytes(
-        6,
-        std::mem::size_of::<u32>() as u64,
-        &hidden_dim_u32 as *const u32 as *const _,
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(hidden_state)),
+            (1, KernelArg::Buffer(router_weights)),
+            (2, KernelArg::Buffer(norm_weight)),
+            (3, KernelArg::Buffer(per_expert_scale)),
+            (4, KernelArg::Buffer(out_expert_ids)),
+            (5, KernelArg::Buffer(out_weights)),
+            (6, KernelArg::Bytes(as_bytes(&hidden_dim_u32))),
+            (7, KernelArg::Bytes(as_bytes(&n_experts_u32))),
+            (8, KernelArg::Bytes(as_bytes(&top_k_u32))),
+            (9, KernelArg::Bytes(as_bytes(&rms_eps_f32))),
+        ],
+        &[(0, shared_bytes)],
+        threadgroups,
+        threadgroup_size,
     );
-    ce.set_bytes(
-        7,
-        std::mem::size_of::<u32>() as u64,
-        &n_experts_u32 as *const u32 as *const _,
-    );
-    ce.set_bytes(
-        8,
-        std::mem::size_of::<u32>() as u64,
-        &top_k_u32 as *const u32 as *const _,
-    );
-    ce.set_bytes(
-        9,
-        std::mem::size_of::<f32>() as u64,
-        &rms_eps_f32 as *const f32 as *const _,
-    );
-
-    // Threadgroup (shared) memory
-    ce.set_threadgroup_memory_length(0, shared_bytes);
-
-    ce.dispatch_thread_groups(threadgroups, threadgroup_size);
-    ce.end_encoding();
 
     Ok(())
 }

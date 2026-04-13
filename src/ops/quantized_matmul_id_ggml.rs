@@ -13,7 +13,7 @@
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::quantized_matmul_ggml::GgmlType;
@@ -183,7 +183,7 @@ pub fn quantized_matmul_id_ggml(
     let kernel_name = params.ggml_type.id_kernel_name();
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
-    // --- Build GPU params ---
+    // --- Build GPU params as inline bytes (no buffer allocation) ---
     let gpu_params = GgmlMatvecIdGpuParams {
         ne00: params.k as i64,
         ne01: params.n as i64,
@@ -198,16 +198,6 @@ pub fn quantized_matmul_id_ggml(
         n_tokens: params.n_tokens,
         expert_stride: params.expert_stride as i64,
     };
-    let params_size = std::mem::size_of::<GgmlMatvecIdGpuParams>();
-    let mut params_buf = device.alloc_buffer(params_size, DType::U32, vec![params_size / 4])?;
-    {
-        let slice: &mut [GgmlMatvecIdGpuParams] = bytemuck::cast_slice_mut(
-            params_buf
-                .as_mut_slice::<u8>()
-                .map_err(|e| MlxError::InvalidArgument(format!("params buf write: {e}")))?,
-        );
-        slice[0] = gpu_params;
-    }
 
     // --- Dispatch ---
     // Threadgroup geometry matches the non-id GGML kernels exactly,
@@ -227,14 +217,14 @@ pub fn quantized_matmul_id_ggml(
     );
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
-    encoder.encode_threadgroups(
+    encoder.encode_threadgroups_with_args(
         pipeline,
         &[
-            (0, weight),    // src0 = stacked expert weights (GGML blocks)
-            (1, input),     // src1 = input (f32)
-            (2, output),    // dst  = output (f32)
-            (3, ids),       // ids  = expert indices (u32)
-            (4, &params_buf),
+            (0, KernelArg::Buffer(weight)),    // src0 = stacked expert weights (GGML blocks)
+            (1, KernelArg::Buffer(input)),     // src1 = input (f32)
+            (2, KernelArg::Buffer(output)),    // dst  = output (f32)
+            (3, KernelArg::Buffer(ids)),       // ids  = expert indices (u32)
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
         ],
         threadgroups,
         threads_per_tg,
