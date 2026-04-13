@@ -481,4 +481,22 @@ impl<'a> GraphSession<'a> {
         self.encoder.commit();
         self.encoder
     }
+
+    /// Commit the command buffer and wait, returning split timing.
+    ///
+    /// Returns `(encoding_ns, gpu_wait_ns)` where:
+    /// - `encoding_ns` is the time from session begin to commit (CPU encoding)
+    /// - `gpu_wait_ns` is the time from commit to GPU completion
+    ///
+    /// The `session_begin` instant should be captured right after `exec.begin()`.
+    ///
+    /// Consumes the session.
+    pub fn finish_with_timing(mut self, session_begin: std::time::Instant) -> Result<(u64, u64)> {
+        let commit_start = std::time::Instant::now();
+        let encoding_ns = commit_start.duration_since(session_begin).as_nanos() as u64;
+        self.encoder.commit();
+        self.encoder.wait_until_completed()?;
+        let gpu_wait_ns = commit_start.elapsed().as_nanos() as u64;
+        Ok((encoding_ns, gpu_wait_ns))
+    }
 }

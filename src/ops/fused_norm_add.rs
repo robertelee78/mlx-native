@@ -240,3 +240,325 @@ pub fn dispatch_fused_norm_add_no_weight_bf16(
 
     Ok(())
 }
+
+// =========================================================================
+// F32 variants
+// =========================================================================
+
+/// Dispatch a fused RMS normalization + residual addition (f32).
+///
+/// Computes:
+/// ```text
+/// normed[i] = rms_norm(input[i], weight[i], eps)
+/// output[i] = residual[i] + normed[i]
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_norm_add_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    residual: &MlxBuffer,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    dim: u32,
+    rows: u32,
+    eps: f32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_norm_add_f32: rows and dim must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_norm_add_f32", device)?;
+
+    let tg_size = tg_size_for_dim(dim);
+    let shared_mem_bytes = tg_size * 4;
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(residual)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(weight)),
+            (3, KernelArg::Buffer(output)),
+            (4, KernelArg::Bytes(as_bytes(&dim))),
+            (5, KernelArg::Bytes(as_bytes(&rows))),
+            (6, KernelArg::Bytes(as_bytes(&eps))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// GPU params struct for f32 variant — must match `FusedResidualNormF32Params`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuFusedResidualNormF32Params {
+    dim:       u32,
+    rows:      u32,
+    eps:       f32,
+    write_sum: u32,
+}
+
+/// Dispatch fused residual add + RMS norm (f32).
+///
+/// Computes `normed = rms_norm(residual + input, weight, eps)` in one pass.
+/// Optionally writes the un-normalized sum to `sum_output`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_residual_norm_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    residual: &MlxBuffer,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    normed_output: &MlxBuffer,
+    sum_output: Option<&MlxBuffer>,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_residual_norm_f32: rows and dim must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_residual_norm_f32", device)?;
+
+    let tg_size = tg_size_for_dim(dim);
+    let shared_slots = std::cmp::max(tg_size as u32, dim);
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    let write_sum = sum_output.is_some();
+    let gpu_params = GpuFusedResidualNormF32Params {
+        dim,
+        rows,
+        eps,
+        write_sum: u32::from(write_sum),
+    };
+
+    let sum_buf = sum_output.unwrap_or(normed_output);
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(residual)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(weight)),
+            (3, KernelArg::Buffer(normed_output)),
+            (4, KernelArg::Buffer(sum_buf)),
+            (5, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// GPU params struct — must match `FusedResidualNormScalarF32Params`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuFusedResidualNormScalarF32Params {
+    dim:              u32,
+    rows:             u32,
+    eps:              f32,
+    scalar_is_vector: u32,
+}
+
+/// Dispatch fused residual add + RMS norm + scalar multiply (f32).
+///
+/// Computes: `output = rms_norm(residual + input, weight, eps) * scalar`
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_residual_norm_scalar_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    residual: &MlxBuffer,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    scalar: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    scalar_is_vector: bool,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_residual_norm_scalar_f32: rows and dim must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_residual_norm_scalar_f32", device)?;
+
+    let tg_size = tg_size_for_dim(dim);
+    let shared_slots = std::cmp::max(tg_size as u32, dim);
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    let gpu_params = GpuFusedResidualNormScalarF32Params {
+        dim,
+        rows,
+        eps,
+        scalar_is_vector: u32::from(scalar_is_vector),
+    };
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(residual)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(weight)),
+            (3, KernelArg::Buffer(output)),
+            (4, KernelArg::Buffer(scalar)),
+            (5, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// GPU params struct — must match `FusedMoeRoutingParams`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuFusedMoeRoutingParams {
+    num_experts: u32,
+    top_k:       u32,
+}
+
+/// Dispatch fused MoE routing: softmax + argsort + gather top-K weights (f32).
+///
+/// Replaces 3 separate dispatches (softmax + argsort + gather_topk) with one.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_moe_routing_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    logits: &MlxBuffer,
+    expert_ids: &MlxBuffer,
+    routing_weights: &MlxBuffer,
+    per_expert_scale: &MlxBuffer,
+    num_experts: u32,
+    top_k: u32,
+) -> Result<()> {
+    if num_experts == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_moe_routing_f32: num_experts and top_k must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_moe_routing_f32", device)?;
+
+    let gpu_params = GpuFusedMoeRoutingParams {
+        num_experts,
+        top_k,
+    };
+
+    let tg_size = std::cmp::min(64, num_experts.next_power_of_two()) as u64;
+    let shared_slots = 2 * num_experts + tg_size as u32;
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(logits)),
+            (1, KernelArg::Buffer(expert_ids)),
+            (2, KernelArg::Buffer(routing_weights)),
+            (3, KernelArg::Buffer(per_expert_scale)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// F32 — fused norm(input) + add(residual) + scalar multiply
+// Computes: output = (residual + rms_norm(input, weight)) * scalar
+// This is the CORRECT end-of-layer operation (norm on input alone, not on sum).
+// ---------------------------------------------------------------------------
+
+/// GPU params struct — must match `FusedNormAddScalarF32Params`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuFusedNormAddScalarF32Params {
+    dim:              u32,
+    rows:             u32,
+    eps:              f32,
+    scalar_is_vector: u32,
+}
+
+/// Dispatch fused norm + add + scalar multiply (f32).
+///
+/// Computes: `output = (residual + rms_norm(input, weight, eps)) * scalar`
+///
+/// The norm is applied to `input` ALONE, then the normed result is added to
+/// `residual`, then scaled.  This matches Gemma 4's end-of-layer pattern.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_norm_add_scalar_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    residual: &MlxBuffer,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    scalar: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+    scalar_is_vector: bool,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_norm_add_scalar_f32: rows and dim must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_norm_add_scalar_f32", device)?;
+
+    let tg_size = tg_size_for_dim(dim);
+    let shared_mem_bytes = tg_size * 4;
+
+    let gpu_params = GpuFusedNormAddScalarF32Params {
+        dim,
+        rows,
+        eps,
+        scalar_is_vector: u32::from(scalar_is_vector),
+    };
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(residual)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(weight)),
+            (3, KernelArg::Buffer(output)),
+            (4, KernelArg::Buffer(scalar)),
+            (5, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}

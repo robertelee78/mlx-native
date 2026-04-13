@@ -169,6 +169,20 @@ impl KernelRegistry {
         sources.insert("fused_norm_add_bf16".into(), fused_norm_add_src);
         sources.insert("fused_norm_add_no_weight_bf16".into(), fused_norm_add_src);
 
+        // Fused head-norm + RoPE f32 kernel — replaces separate rms_norm + rope_neox_f32
+        let fused_hnr_f32_src: &'static str =
+            include_str!("shaders/fused_head_norm_rope_f32.metal");
+        sources.insert("fused_head_norm_rope_f32".into(), fused_hnr_f32_src);
+
+        // Fused norm-add f32 kernels — post-attention / post-FFN / end-of-layer
+        let fused_norm_add_f32_src: &'static str =
+            include_str!("shaders/fused_norm_add_f32.metal");
+        sources.insert("fused_norm_add_f32".into(), fused_norm_add_f32_src);
+        sources.insert("fused_residual_norm_f32".into(), fused_norm_add_f32_src);
+        sources.insert("fused_residual_norm_scalar_f32".into(), fused_norm_add_f32_src);
+        sources.insert("fused_moe_routing_f32".into(), fused_norm_add_f32_src);
+        sources.insert("fused_norm_add_scalar_f32".into(), fused_norm_add_f32_src);
+
         // Argsort kernel (Story 2.3) — MoE top-K routing
         let argsort_src: &'static str = include_str!("shaders/argsort.metal");
         sources.insert("argsort_desc_f32".into(), argsort_src);
