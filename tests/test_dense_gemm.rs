@@ -205,3 +205,83 @@ fn test_dense_gemm_decode_shape_argmax() {
         gpu_argmax, cpu_argmax
     );
 }
+
+/// Test at near-realistic lm_head dimensions: [1, 2816] x [4096, 2816]^T.
+/// Using 4096 instead of 262144 to keep test runtime sane while exercising
+/// the vectorized mat-vec kernel with large K and multi-row N.
+#[test]
+fn test_dense_gemm_lm_head_like() {
+    let (device, mut registry) = setup();
+    let m: u32 = 1;
+    let k: u32 = 2816;
+    let n: u32 = 4096;
+
+    let a_f32 = pseudo_random_f32(7, m as usize * k as usize);
+    let b_f32 = pseudo_random_f32(13, n as usize * k as usize);
+
+    let expected = cpu_gemm_abt(&a_f32, &b_f32, m as usize, n as usize, k as usize);
+
+    let cpu_argmax = expected
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+
+    let a_f16: Vec<u16> = a_f32.iter().map(|&v| f32_to_f16(v)).collect();
+    let b_f16: Vec<u16> = b_f32.iter().map(|&v| f32_to_f16(v)).collect();
+
+    let mut a_buf = device
+        .alloc_buffer(m as usize * k as usize * 2, DType::F16, vec![m as usize, k as usize])
+        .expect("alloc A");
+    a_buf.as_mut_slice::<u16>().expect("write A").copy_from_slice(&a_f16);
+
+    let mut b_buf = device
+        .alloc_buffer(n as usize * k as usize * 2, DType::F16, vec![n as usize, k as usize])
+        .expect("alloc B");
+    b_buf.as_mut_slice::<u16>().expect("write B").copy_from_slice(&b_f16);
+
+    let c_buf = device
+        .alloc_buffer(m as usize * n as usize * 2, DType::F16, vec![m as usize, n as usize])
+        .expect("alloc C");
+
+    let params = DenseGemmF16Params { m, n, k };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dense_gemm::dispatch_dense_gemm_f16(
+        &mut encoder, &mut registry, device.metal_device(),
+        &a_buf, &b_buf, &c_buf, &params,
+    ).expect("dispatch");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let output_f16 = c_buf.as_slice::<u16>().expect("read C");
+    let output_f32: Vec<f32> = output_f16.iter().map(|&b| f16_to_f32(b)).collect();
+
+    let gpu_argmax = output_f32
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+
+    assert_eq!(
+        gpu_argmax, cpu_argmax,
+        "lm_head-like argmax mismatch: GPU={}, CPU={}",
+        gpu_argmax, cpu_argmax
+    );
+
+    // Also verify element-wise accuracy (f16 accumulation across 2816 dims
+    // will have some drift vs f32 reference, so use a relaxed tolerance)
+    let max_abs_err: f32 = output_f32
+        .iter()
+        .zip(expected.iter())
+        .map(|(g, c)| (g - c).abs())
+        .fold(0.0f32, f32::max);
+    let max_expected = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let rel_err = max_abs_err / (max_expected + 1e-6);
+    assert!(
+        rel_err < 0.05,
+        "lm_head-like relative error too high: {:.4} (max_abs_err={:.4}, max_expected={:.4})",
+        rel_err, max_abs_err, max_expected
+    );
+}

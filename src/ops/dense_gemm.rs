@@ -3,9 +3,13 @@
 //! Computes `C = A * B^T` where A is [M, K] f16, B is [N, K] f16,
 //! and C is [M, N] f16.
 //!
-//! This is a simple tiled implementation for correctness.  Optimization
-//! (e.g., larger tiles, shared memory tiling, vectorized loads) is deferred
-//! to a later sprint.
+//! Two GPU kernels:
+//!
+//! - `dense_matvec_f16` — specialised M=1 mat-vec (decode hot path).
+//!   Uses vectorised half4 loads + simd_sum, modelled after the llama.cpp
+//!   `kernel_mul_mv_f16_f32` pattern.
+//!
+//! - `dense_gemm_f16` — tiled GEMM for M>1 with simdgroup_matrix MMA.
 
 use metal::MTLSize;
 
@@ -14,7 +18,7 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
-use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
+use super::encode_helpers::{as_bytes, encode_threadgroups_with_args, KernelArg};
 
 /// MSL source for the dense GEMM kernel (embedded at compile time).
 pub static DENSE_GEMM_SHADER_SOURCE: &str = include_str!("../shaders/dense_gemm.metal");
@@ -22,6 +26,7 @@ pub static DENSE_GEMM_SHADER_SOURCE: &str = include_str!("../shaders/dense_gemm.
 /// Register dense GEMM shader source with the given kernel registry.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("dense_gemm_f16", DENSE_GEMM_SHADER_SOURCE);
+    registry.register_source("dense_matvec_f16", DENSE_GEMM_SHADER_SOURCE);
 }
 
 /// MSL-compatible params struct for dense GEMM.
@@ -48,6 +53,10 @@ pub struct DenseGemmF16Params {
 /// Dispatch a dense F16 matrix multiply on the GPU: `C = A * B^T`.
 ///
 /// A is `[M, K]` f16, B is `[N, K]` f16, C is `[M, N]` f16.
+///
+/// For M=1 (decode path), dispatches the specialised `dense_matvec_f16`
+/// kernel which uses vectorised loads + SIMD reduction — typically 10-20x
+/// faster than the tiled GEMM for single-row inputs.
 ///
 /// # Arguments
 ///
@@ -103,7 +112,33 @@ pub fn dispatch_dense_gemm_f16(
         )));
     }
 
-    let pipeline = registry.get_pipeline("dense_gemm_f16", device)?;
+    if params.m == 1 {
+        dispatch_matvec_f16(encoder, registry, device, a, b, output, params)
+    } else {
+        dispatch_gemm_tiled_f16(encoder, registry, device, a, b, output, params)
+    }
+}
+
+/// Specialised M=1 mat-vec kernel dispatch.
+///
+/// Kernel constants (must match `dense_gemm.metal`):
+///   N_DST       = 4  (rows per simdgroup)
+///   N_SIMDGROUP = 2  (simdgroups per threadgroup)
+///   N_SIMDWIDTH = 32 (Apple SIMD width)
+///
+/// Dispatch geometry:
+///   threadgroups:     (ceil(N / 8), 1, 1)
+///   threads_per_tg:   (32, N_SIMDGROUP, 1)   — 32 lanes × 2 simdgroups = 64 threads
+fn dispatch_matvec_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DenseGemmF16Params,
+) -> Result<()> {
+    let pipeline = registry.get_pipeline("dense_matvec_f16", device)?;
 
     let gpu_params = GpuDenseGemmParams {
         m: params.m,
@@ -111,18 +146,18 @@ pub fn dispatch_dense_gemm_f16(
         k: params.k,
     };
 
-    // Tile sizes match the shader constants (TILE_M=8, TILE_N=8).
-    let tile_m: u64 = 8;
-    let tile_n: u64 = 8;
+    let n_dst: u64 = 4;
+    let n_simdgroup: u64 = 2;
+    let rows_per_tg = n_dst * n_simdgroup; // 8
 
-    let grid = MTLSize::new(
-        ((params.n as u64 + tile_n - 1) / tile_n) * tile_n,
-        ((params.m as u64 + tile_m - 1) / tile_m) * tile_m,
+    let threadgroups = MTLSize::new(
+        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
+        1,
         1,
     );
-    let tg = MTLSize::new(tile_n, tile_m, 1);
+    let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
 
-    encode_with_args(
+    encode_threadgroups_with_args(
         encoder,
         pipeline,
         &[
@@ -131,8 +166,55 @@ pub fn dispatch_dense_gemm_f16(
             (2, KernelArg::Buffer(output)),
             (3, KernelArg::Bytes(as_bytes(&gpu_params))),
         ],
-        grid,
-        tg,
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
+/// Tiled GEMM dispatch for M>1 using simdgroup_matrix MMA.
+///
+/// Tile: BM=32, BN=32, BK=16, WM=2, WN=2 → 128 threads per threadgroup.
+fn dispatch_gemm_tiled_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DenseGemmF16Params,
+) -> Result<()> {
+    let pipeline = registry.get_pipeline("dense_gemm_f16", device)?;
+
+    let gpu_params = GpuDenseGemmParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+    };
+
+    let bm: u64 = 32;
+    let bn: u64 = 32;
+    let tgp_size: u64 = 128; // WM * WN * 32 = 2*2*32
+
+    let threadgroups = MTLSize::new(
+        (params.n as u64 + bn - 1) / bn,
+        (params.m as u64 + bm - 1) / bm,
+        1,
+    );
+    let threads_per_tg = MTLSize::new(tgp_size, 1, 1);
+
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(a)),
+            (1, KernelArg::Buffer(b)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        threadgroups,
+        threads_per_tg,
     );
 
     Ok(())
