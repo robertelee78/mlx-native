@@ -98,9 +98,15 @@ impl KernelRegistry {
         let moe_dispatch_src: &'static str = include_str!("shaders/moe_dispatch.metal");
         sources.insert("fused_gelu_mul".into(), moe_dispatch_src);
         sources.insert("moe_swiglu_fused".into(), moe_dispatch_src);
+        sources.insert("moe_swiglu_batch".into(), moe_dispatch_src);
         sources.insert("moe_accumulate".into(), moe_dispatch_src);
+        sources.insert("moe_weighted_sum".into(), moe_dispatch_src);
         sources.insert("zero_buffer".into(), moe_dispatch_src);
         sources.insert("naive_matvec_f32".into(), moe_dispatch_src);
+
+        // Batched KV cache copy kernel
+        let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
+        sources.insert("kv_cache_copy_batch_f32".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");

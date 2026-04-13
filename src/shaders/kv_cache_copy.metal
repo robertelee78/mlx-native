@@ -56,3 +56,28 @@ kernel void kv_cache_copy_f32(
 
     cache[dst_pos * row_size + elem_idx] = src[token_idx * row_size + elem_idx];
 }
+
+/// Batched KV cache copy — copies ALL heads in one dispatch.
+///
+/// Source layout: [n_heads * head_dim] flat (one token, all heads).
+/// Cache layout: [n_heads, capacity, head_dim] head-major.
+///
+/// Grid: 2D — x=element within head (head_dim), y=head index (n_heads).
+/// Replaces n_heads separate kv_cache_copy_f32 dispatches with 1.
+kernel void kv_cache_copy_batch_f32(
+    device const float* src       [[buffer(0)]],   // [n_heads * head_dim] flat
+    device float*       cache     [[buffer(1)]],   // [n_heads, capacity, head_dim]
+    constant uint&     n_heads   [[buffer(2)]],   // number of KV heads
+    constant uint&     head_dim  [[buffer(3)]],   // elements per head
+    constant uint&     capacity  [[buffer(4)]],   // cache capacity (ring buffer size)
+    constant uint&     seq_pos   [[buffer(5)]],   // write position (already wrapped)
+    uint2 tid [[thread_position_in_grid]]          // x=elem, y=head
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    if (head >= n_heads || elem >= head_dim) return;
+
+    uint src_idx = head * head_dim + elem;
+    uint dst_idx = head * capacity * head_dim + seq_pos * head_dim + elem;
+    cache[dst_idx] = src[src_idx];
+}

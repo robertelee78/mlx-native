@@ -131,6 +131,67 @@ kernel void moe_swiglu_fused(
 }
 
 // --------------------------------------------------------------------------
+// moe_swiglu_batch — Batched SwiGLU across all top_k expert slots.
+//
+// Takes a [top_k, 2*intermediate] buffer where for each slot k:
+//   - gate values are at [k, 0..intermediate)
+//   - up values are at [k, intermediate..2*intermediate)
+// Produces [top_k, intermediate] output: GELU(gate[i]) * up[i] per slot.
+//
+// Grid: 2D — x=element within intermediate, y=expert slot.
+// Replaces top_k separate moe_swiglu_fused dispatches with 1.
+// --------------------------------------------------------------------------
+
+kernel void moe_swiglu_batch(
+    device const float* gate_up_buf  [[buffer(0)]],  // [top_k, 2*intermediate]
+    device float*       output_buf   [[buffer(1)]],  // [top_k, intermediate]
+    constant uint&      intermediate [[buffer(2)]],
+    constant uint&      top_k        [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]             // x=element, y=slot
+) {
+    uint i = tid.x;
+    uint slot = tid.y;
+    if (slot >= top_k || i >= intermediate) return;
+
+    uint base = slot * 2 * intermediate;
+    float gate = gate_up_buf[base + i];
+    float up = gate_up_buf[base + intermediate + i];
+    // SwiGLU = GELU(gate) * up
+    float gelu = gate * 0.5f * (1.0f + precise::tanh(
+        0.7978845608f * (gate + 0.044715f * gate * gate * gate)));
+    output_buf[slot * intermediate + i] = gelu * up;
+}
+
+// --------------------------------------------------------------------------
+// moe_weighted_sum — Weighted sum of all top_k expert outputs in one dispatch.
+//
+// Replaces the zero_buffer + top_k * moe_accumulate pattern (9 dispatches)
+// with a single dispatch that reads all expert outputs and routing weights.
+//
+// Grid: 1D — each thread computes one element of the output.
+// --------------------------------------------------------------------------
+
+struct MoeWeightedSumParams {
+    uint hidden_size;
+    uint top_k;
+};
+
+kernel void moe_weighted_sum(
+    device const float*  expert_outputs [[buffer(0)]],  // [top_k, hidden_size]
+    device const float*  weights        [[buffer(1)]],  // [top_k]
+    device float*        output         [[buffer(2)]],  // [hidden_size]
+    constant MoeWeightedSumParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= params.hidden_size) return;
+    float sum = 0.0f;
+    for (uint k = 0; k < params.top_k; k++) {
+        sum += expert_outputs[k * params.hidden_size + tid] * weights[k];
+    }
+    output[tid] = sum;
+}
+
+// --------------------------------------------------------------------------
 // naive_matvec_f32 — Simple matrix-vector multiply for expert projections.
 //
 // Computes: output[row] = dot(weight[row, :], input[:])

@@ -541,6 +541,149 @@ pub fn moe_accumulate_encode(
     Ok(())
 }
 
+/// Encode a batched SwiGLU across all top_k expert slots in one dispatch.
+///
+/// Takes a `[top_k, 2*intermediate]` gate_up buffer and produces
+/// `[top_k, intermediate]` output: `GELU(gate[i]) * up[i]` per slot.
+///
+/// Replaces top_k separate `moe_swiglu_fused_encode_offset` dispatches with 1.
+///
+/// # Arguments
+/// * `encoder`       -- Command encoder to record into.
+/// * `registry`      -- Kernel registry for pipeline lookup.
+/// * `device`        -- Metal device reference.
+/// * `gate_up`       -- f32 buffer `[top_k * 2 * intermediate]`.
+/// * `output`        -- f32 buffer `[top_k * intermediate]`.
+/// * `intermediate`  -- Intermediate dimension per expert.
+/// * `top_k`         -- Number of selected expert slots.
+pub fn moe_swiglu_batch_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    gate_up: &MlxBuffer,
+    output: &MlxBuffer,
+    intermediate: usize,
+    top_k: usize,
+) -> Result<()> {
+    if intermediate == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_swiglu_batch_encode: intermediate and top_k must be > 0".into(),
+        ));
+    }
+    let gu_required = top_k * 2 * intermediate * std::mem::size_of::<f32>();
+    if gate_up.byte_len() < gu_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_batch_encode: gate_up too small: need {} bytes, have {}",
+            gu_required, gate_up.byte_len()
+        )));
+    }
+    let out_required = top_k * intermediate * std::mem::size_of::<f32>();
+    if output.byte_len() < out_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_batch_encode: output too small: need {} bytes, have {}",
+            out_required, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_swiglu_batch", device)?;
+    let intermediate_bytes = (intermediate as u32).to_ne_bytes();
+    let top_k_bytes = (top_k as u32).to_ne_bytes();
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(gate_up)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(&intermediate_bytes)),
+            (3, KernelArg::Bytes(&top_k_bytes)),
+        ],
+        MTLSize::new(intermediate as u64, top_k as u64, 1),
+        MTLSize::new(std::cmp::min(256, intermediate as u64), 1, 1),
+    );
+    Ok(())
+}
+
+/// MSL-compatible struct for moe_weighted_sum kernel.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMoeWeightedSumParams {
+    hidden_size: u32,
+    top_k: u32,
+}
+
+/// Encode a weighted sum of all top_k expert outputs in one dispatch.
+///
+/// Replaces the zero_buffer + top_k * moe_accumulate pattern with 1 dispatch.
+/// The weights buffer must contain pre-scaled routing weights for all top_k
+/// experts (i.e. `routing_weight * per_expert_scale`).
+///
+/// # Arguments
+/// * `encoder`        -- Command encoder to record into.
+/// * `registry`       -- Kernel registry for pipeline lookup.
+/// * `device`         -- Metal device reference.
+/// * `expert_outputs` -- f32 buffer `[top_k * hidden_size]`.
+/// * `weights`        -- f32 buffer `[top_k]` (pre-scaled routing weights).
+/// * `output`         -- f32 buffer `[hidden_size]` (output weighted sum).
+/// * `hidden_size`    -- Hidden dimension.
+/// * `top_k`          -- Number of selected expert slots.
+pub fn moe_weighted_sum_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    expert_outputs: &MlxBuffer,
+    weights: &MlxBuffer,
+    output: &MlxBuffer,
+    hidden_size: usize,
+    top_k: usize,
+) -> Result<()> {
+    if hidden_size == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_weighted_sum_encode: hidden_size and top_k must be > 0".into(),
+        ));
+    }
+    let expert_required = top_k * hidden_size * std::mem::size_of::<f32>();
+    if expert_outputs.byte_len() < expert_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_encode: expert_outputs too small: need {} bytes, have {}",
+            expert_required, expert_outputs.byte_len()
+        )));
+    }
+    let weights_required = top_k * std::mem::size_of::<f32>();
+    if weights.byte_len() < weights_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_encode: weights too small: need {} bytes, have {}",
+            weights_required, weights.byte_len()
+        )));
+    }
+    let out_required = hidden_size * std::mem::size_of::<f32>();
+    if output.byte_len() < out_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_encode: output too small: need {} bytes, have {}",
+            out_required, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_weighted_sum", device)?;
+    let params = GpuMoeWeightedSumParams {
+        hidden_size: hidden_size as u32,
+        top_k: top_k as u32,
+    };
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(expert_outputs)),
+            (1, KernelArg::Buffer(weights)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(hidden_size as u64, 1, 1),
+        MTLSize::new(std::cmp::min(256, hidden_size as u64), 1, 1),
+    );
+    Ok(())
+}
+
 /// Like [`moe_swiglu_fused_encode`] but reads from `gate_up` at `gu_byte_offset`
 /// and writes to `output` at `out_byte_offset`.
 ///
