@@ -402,6 +402,7 @@ dependencies = [
  "half",
  "memmap2",
  "metal",
+ "objc",
  "safetensors",
  "serde",
  "serde_json",

@@ -208,7 +208,11 @@ pub fn flash_attn_vec(
 
     // --- Reduce kernel ---
     // Only needed when NWG > 1.
+    // Barrier: reduce reads `tmp` written by the main dispatch above.
+    // With MTLDispatchTypeConcurrent, both dispatches would run simultaneously
+    // without this barrier, causing the reduce to read stale/partial `tmp` data.
     if nwg > 1 {
+        encoder.memory_barrier();
         let reduce_params = FlashAttnVecReduceParamsGpu {
             nrows: params.num_heads,
         };

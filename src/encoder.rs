@@ -16,8 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal::{
     CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineStateRef,
-    MTLCommandBufferStatus, MTLSize,
+    MTLCommandBufferStatus, MTLDispatchType, MTLSize,
 };
+#[allow(unused_imports)]
+use objc::{msg_send, sel, sel_impl};
 
 use crate::buffer::MlxBuffer;
 use crate::error::{MlxError, Result};
@@ -138,7 +140,12 @@ impl CommandEncoder {
     #[inline]
     fn get_or_create_encoder(&mut self) -> &ComputeCommandEncoderRef {
         if self.active_encoder.is_null() {
-            let encoder = self.cmd_buf.new_compute_command_encoder();
+            // Use MTLDispatchTypeConcurrent to allow independent dispatches
+            // to overlap on the GPU.  Memory barriers are inserted between
+            // dependent dispatches via `memory_barrier()`.
+            let encoder = self
+                .cmd_buf
+                .compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
             self.active_encoder = encoder as *const ComputeCommandEncoderRef;
         }
         // SAFETY: active_encoder is non-null and points to a valid encoder
@@ -154,6 +161,28 @@ impl CommandEncoder {
             // and has not been ended yet.
             unsafe { &*self.active_encoder }.end_encoding();
             self.active_encoder = std::ptr::null();
+        }
+    }
+
+    /// Insert a memory barrier with scope `MTLBarrierScopeBuffers`.
+    ///
+    /// When the encoder uses `MTLDispatchTypeConcurrent`, all dispatches can
+    /// execute concurrently unless separated by a barrier.  Call this between
+    /// dispatches where the later dispatch reads a buffer written by an
+    /// earlier one.
+    ///
+    /// This is the same pattern llama.cpp uses:
+    /// `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
+    pub fn memory_barrier(&mut self) {
+        if self.active_encoder.is_null() {
+            return;
+        }
+        // SAFETY: active_encoder is non-null and valid.
+        let encoder = unsafe { &*self.active_encoder };
+        // MTLBarrierScopeBuffers = 1 << 0 = 1
+        const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
+        unsafe {
+            let _: () = objc::msg_send![encoder, memoryBarrierWithScope: MTL_BARRIER_SCOPE_BUFFERS];
         }
     }
 

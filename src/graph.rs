@@ -474,6 +474,21 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Insert a GPU memory barrier (MTLBarrierScopeBuffers).
+    ///
+    /// Call this between dispatches where the later dispatch reads a buffer
+    /// that an earlier dispatch wrote.  With concurrent dispatch enabled,
+    /// this is required for correctness — without it, the reader may see
+    /// stale data.
+    ///
+    /// Independent dispatches (reading different buffers / writing to
+    /// non-overlapping outputs) do NOT need a barrier and can overlap on
+    /// the GPU for higher throughput.
+    #[inline]
+    pub fn barrier(&mut self) {
+        self.encoder.memory_barrier();
+    }
+
     /// Borrow the underlying command encoder for direct op dispatch.
     ///
     /// Use this when you need to call an op function that is not wrapped by

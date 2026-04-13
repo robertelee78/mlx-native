@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 metal = "0.33"
+objc = "0.2"
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 safetensors = "0.7"
