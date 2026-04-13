@@ -67,6 +67,7 @@ impl GraphExecutor {
             encoder,
             device: &self.device,
             barrier_count: 0,
+            tracker: ConflictTracker::new(),
         })
     }
 
@@ -84,10 +85,84 @@ impl GraphExecutor {
 ///
 /// If an op returns an error, the session can be dropped without committing.
 /// The underlying command buffer is abandoned (never committed to the GPU).
+/// Tracks buffer address ranges for automatic barrier elision.
+///
+/// Mirrors llama.cpp's `ggml_mem_ranges` — accumulates the read and write
+/// ranges of all dispatches in the current concurrent group. When a new
+/// dispatch's reads overlap with an existing write (RAW), or its writes
+/// overlap with an existing read or write (WAR/WAW), a barrier is needed.
+/// Otherwise the dispatch can run concurrently and the barrier is elided.
+///
+/// Uses CPU-visible `contents_ptr()` addresses, which on Apple Silicon
+/// unified memory equal the GPU addresses.
+pub struct ConflictTracker {
+    /// (start, end, is_write) tuples for the current concurrent group.
+    ranges: Vec<(usize, usize, bool)>,
+}
+
+impl ConflictTracker {
+    fn new() -> Self {
+        Self {
+            ranges: Vec::with_capacity(32),
+        }
+    }
+
+    /// Reset the tracker — called after emitting a barrier.
+    fn reset(&mut self) {
+        self.ranges.clear();
+    }
+
+    /// Check if a new dispatch with the given reads and writes conflicts
+    /// with the current concurrent group.
+    ///
+    /// Conflict rules (same as llama.cpp `ggml_mem_ranges_check`):
+    /// - Two SRC (read) ranges in the same buffer: OK (read-read)
+    /// - A new SRC overlapping an existing DST: CONFLICT (RAW)
+    /// - A new DST overlapping an existing SRC or DST: CONFLICT (WAR/WAW)
+    fn conflicts(&self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) -> bool {
+        // Check new reads against existing writes (RAW)
+        for r in reads {
+            let r_start = r.contents_ptr() as usize;
+            let r_end = r_start + r.byte_len();
+            for &(s, e, is_write) in &self.ranges {
+                if is_write && r_start < e && r_end > s {
+                    return true; // RAW conflict
+                }
+            }
+        }
+        // Check new writes against existing reads and writes (WAR/WAW)
+        for w in writes {
+            let w_start = w.contents_ptr() as usize;
+            let w_end = w_start + w.byte_len();
+            for &(s, e, _) in &self.ranges {
+                if w_start < e && w_end > s {
+                    return true; // WAR or WAW conflict
+                }
+            }
+        }
+        false
+    }
+
+    /// Add read and write ranges to the current concurrent group.
+    fn add(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
+        for r in reads {
+            let start = r.contents_ptr() as usize;
+            let end = start + r.byte_len();
+            self.ranges.push((start, end, false));
+        }
+        for w in writes {
+            let start = w.contents_ptr() as usize;
+            let end = start + w.byte_len();
+            self.ranges.push((start, end, true));
+        }
+    }
+}
+
 pub struct GraphSession<'a> {
     encoder: CommandEncoder,
     device: &'a MlxDevice,
     barrier_count: u32,
+    tracker: ConflictTracker,
 }
 
 impl<'a> GraphSession<'a> {
@@ -478,18 +553,44 @@ impl<'a> GraphSession<'a> {
 
     /// Insert a GPU memory barrier (MTLBarrierScopeBuffers).
     ///
-    /// Call this between dispatches where the later dispatch reads a buffer
-    /// that an earlier dispatch wrote.  With concurrent dispatch enabled,
-    /// this is required for correctness — without it, the reader may see
-    /// stale data.
-    ///
-    /// Independent dispatches (reading different buffers / writing to
-    /// non-overlapping outputs) do NOT need a barrier and can overlap on
-    /// the GPU for higher throughput.
+    /// Unconditional barrier — always emits. Use `barrier_between` for
+    /// automatic conflict detection that can elide unnecessary barriers.
     #[inline]
     pub fn barrier(&mut self) {
         self.encoder.memory_barrier();
+        self.tracker.reset();
         self.barrier_count += 1;
+    }
+
+    /// Smart barrier with conflict detection.
+    ///
+    /// Checks if the next dispatch (with the given read and write buffers)
+    /// actually conflicts with any dispatch in the current concurrent group.
+    /// If yes, emits a Metal barrier and resets the tracker. If no, the
+    /// barrier is elided and the dispatch can run concurrently.
+    ///
+    /// After calling this, call `track_dispatch` to register the dispatch's
+    /// buffer ranges for future conflict checks.
+    ///
+    /// This mirrors llama.cpp's `ggml_metal_op_concurrency_check` +
+    /// `ggml_metal_op_concurrency_reset` pattern.
+    #[inline]
+    pub fn barrier_between(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
+        if self.tracker.conflicts(reads, writes) {
+            self.encoder.memory_barrier();
+            self.tracker.reset();
+            self.barrier_count += 1;
+        }
+        self.tracker.add(reads, writes);
+    }
+
+    /// Register a dispatch's buffer ranges without checking for conflicts.
+    ///
+    /// Use after dispatching an op that doesn't need a barrier check (e.g.,
+    /// the first dispatch in a session, or dispatches known to be concurrent).
+    #[inline]
+    pub fn track_dispatch(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
+        self.tracker.add(reads, writes);
     }
 
     /// Return the number of barriers inserted so far in this session.
