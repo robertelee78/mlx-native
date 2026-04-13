@@ -263,3 +263,62 @@ pub fn dispatch_kv_cache_copy_f32(
 
     Ok(())
 }
+
+/// Dispatch a batched F32→F16 copy from a source f32 buffer into an f16 KV cache.
+///
+/// Copies ALL heads in one dispatch, casting float→half on write.
+/// This halves KV cache memory bandwidth for SDPA reads (bandwidth-bound
+/// at batch=1 decode). Reference: llama.cpp stores KV cache in F16.
+///
+/// Source layout: `[n_heads * head_dim]` flat F32 (one token, all heads).
+/// Cache layout: `[n_heads, capacity, head_dim]` head-major F16.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_batch_f32_to_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    cache: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+
+    let total_src = (n_heads as u64) * (head_dim as u64);
+    if (src.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_batch_f32_to_f16: src has {} elements but need {} (n_heads={} * head_dim={})",
+            src.element_count(), total_src, n_heads, head_dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_batch_f32_to_f16", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_bytes = seq_pos.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(cache)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&head_dim_bytes)),
+            (4, KernelArg::Bytes(&capacity_bytes)),
+            (5, KernelArg::Bytes(&seq_pos_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, 1),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}

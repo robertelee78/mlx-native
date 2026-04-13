@@ -105,9 +105,10 @@ impl KernelRegistry {
         sources.insert("naive_matvec_f32".into(), moe_dispatch_src);
         sources.insert("moe_gather_topk_weights".into(), moe_dispatch_src);
 
-        // Batched KV cache copy kernel
+        // Batched KV cache copy kernels
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
         sources.insert("kv_cache_copy_batch_f32".into(), kv_cache_src);
+        sources.insert("kv_cache_copy_batch_f32_to_f16".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
@@ -144,6 +145,9 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_dk512".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_reduce_dk256".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_reduce_dk512".into(), flash_attn_vec_src);
+        // F16 KV variants (Phase 4a)
+        sources.insert("flash_attn_vec_f16kv_dk256".into(), flash_attn_vec_src);
+        sources.insert("flash_attn_vec_f16kv_dk512".into(), flash_attn_vec_src);
 
         // RoPE, normalization, activation kernels (Story 1.4)
         let rope_src: &'static str = include_str!("shaders/rope.metal");

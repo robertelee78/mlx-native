@@ -66,6 +66,7 @@ impl GraphExecutor {
         Ok(GraphSession {
             encoder,
             device: &self.device,
+            barrier_count: 0,
         })
     }
 
@@ -86,6 +87,7 @@ impl GraphExecutor {
 pub struct GraphSession<'a> {
     encoder: CommandEncoder,
     device: &'a MlxDevice,
+    barrier_count: u32,
 }
 
 impl<'a> GraphSession<'a> {
@@ -487,6 +489,13 @@ impl<'a> GraphSession<'a> {
     #[inline]
     pub fn barrier(&mut self) {
         self.encoder.memory_barrier();
+        self.barrier_count += 1;
+    }
+
+    /// Return the number of barriers inserted so far in this session.
+    #[inline]
+    pub fn barrier_count(&self) -> u32 {
+        self.barrier_count
     }
 
     /// Borrow the underlying command encoder for direct op dispatch.

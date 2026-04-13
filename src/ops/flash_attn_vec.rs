@@ -26,6 +26,9 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("flash_attn_vec_dk512", FLASH_ATTN_VEC_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_reduce_dk256", FLASH_ATTN_VEC_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_reduce_dk512", FLASH_ATTN_VEC_SHADER_SOURCE);
+    // F16 KV variants (Phase 4a)
+    registry.register_source("flash_attn_vec_f16kv_dk256", FLASH_ATTN_VEC_SHADER_SOURCE);
+    registry.register_source("flash_attn_vec_f16kv_dk512", FLASH_ATTN_VEC_SHADER_SOURCE);
 }
 
 /// Parameters for the flash attention vector kernel.
@@ -169,10 +172,14 @@ pub fn flash_attn_vec(
         dst[..params_bytes.len()].copy_from_slice(params_bytes);
     }
 
-    // Select kernel by head dimension.
-    let kernel_name = match head_dim {
-        256 => "flash_attn_vec_dk256",
-        512 => "flash_attn_vec_dk512",
+    // Select kernel by head dimension and KV dtype.
+    // F16 KV: K/V buffers are half-precision, halving bandwidth (Phase 4a).
+    let kv_is_f16 = k.dtype() == DType::F16;
+    let kernel_name = match (head_dim, kv_is_f16) {
+        (256, false) => "flash_attn_vec_dk256",
+        (512, false) => "flash_attn_vec_dk512",
+        (256, true)  => "flash_attn_vec_f16kv_dk256",
+        (512, true)  => "flash_attn_vec_f16kv_dk512",
         _ => unreachable!(), // validated above
     };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;

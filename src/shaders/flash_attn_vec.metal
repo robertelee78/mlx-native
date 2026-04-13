@@ -69,12 +69,15 @@ struct FlashAttnVecReduceParams {
 //   [PK + SH, PK + SH + 2*PV)           — output accumulator as float4
 // --------------------------------------------------------------------------
 
-template<short DK, short DV>
-kernel void flash_attn_vec(
+// KV_T = float for F32 KV cache, half for F16 KV cache.
+// When KV_T = half, K/V loads are cast to float for compute (no precision loss
+// in the dot product, only in the stored cache values).
+template<short DK, short DV, typename KV_T>
+kernel void flash_attn_vec_impl(
     device const FlashAttnVecParams *params [[buffer(0)]],
     device const float              *Q      [[buffer(1)]],
-    device const float              *K      [[buffer(2)]],
-    device const float              *V      [[buffer(3)]],
+    device const KV_T               *K      [[buffer(2)]],
+    device const KV_T               *V      [[buffer(3)]],
     device       float              *dst    [[buffer(4)]],
     threadgroup  half               *shmem  [[threadgroup(0)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
@@ -122,10 +125,10 @@ kernel void flash_attn_vec(
     device const float4 *q4 = (device const float4 *)(Q + iq2 * DK);
 
     // K layout: [n_kv_heads, kv_capacity, head_dim]
-    device const float *k_base = K + kv_head * params->kv_capacity * DK;
+    device const KV_T *k_base = K + kv_head * params->kv_capacity * DK;
 
     // V layout: [n_kv_heads, kv_capacity, head_dim]
-    device const float *v_base = V + kv_head * params->kv_capacity * DV;
+    device const KV_T *v_base = V + kv_head * params->kv_capacity * DV;
 
     // Load Q into shared memory as half4.
     for (ushort i = tiisg; i < PK4; i += NW) {
@@ -162,6 +165,9 @@ kernel void flash_attn_vec(
             ? (abs_pos - params->sliding_window + 1) : 0;
     }
 
+    // KV vector type: float4 for F32 cache, half4 for F16 cache.
+    using kv4_t = vec<KV_T, 4>;
+
     // Main loop over KV cache in chunks of C=32.
     // Workgroup iwg handles chunks: iwg, iwg+NWG, iwg+2*NWG, ...
     for (uint ic0 = iwg; ; ic0 += NWG) {
@@ -190,8 +196,9 @@ kernel void flash_attn_vec(
         // cc indexes the KV position within this chunk (0..C-1).
         // Each dot product is reduced via simd_sum across all 32 threads.
         {
-            // pk4 points to K[ic, 0] as float4, then offset by tx.
-            device const float4 *pk4 = (device const float4 *)(k_base + ic * DK) + tx;
+            // pk4 points to K[ic, 0] as vec4, then offset by tx.
+            // KV_T = float → float4 load; KV_T = half → half4 load, cast to float4 for dot.
+            device const kv4_t *pk4 = (device const kv4_t *)(k_base + ic * DK) + tx;
             threadgroup const half4 *pq4 = sq4 + tx;
 
             // mqk[cc] will hold the full dot product for KV position (ic + cc).
@@ -244,8 +251,8 @@ kernel void flash_attn_vec(
                 lo[ii] = float4(0.0f);
             }
 
-            // pv4 points to V[ic, 0] as float4, then offset by tx.
-            device const float4 *pv4 = (device const float4 *)(v_base + ic * DV) + tx;
+            // pv4 points to V[ic, 0] as vec4, then offset by tx.
+            device const kv4_t *pv4 = (device const kv4_t *)(v_base + ic * DV) + tx;
 
             for (short cc = 0; cc < C; ++cc) {
                 float weight = ss[cc];  // softmax weight for KV pos (ic + cc)
@@ -302,16 +309,28 @@ kernel void flash_attn_vec(
 
 
 // --------------------------------------------------------------------------
-// Kernel instantiations
+// Kernel instantiations — F32 KV (backward compatible host names)
 // --------------------------------------------------------------------------
 
-typedef decltype(flash_attn_vec<256, 256>) flash_attn_vec_t;
+typedef decltype(flash_attn_vec_impl<256, 256, float>) flash_attn_vec_f32kv_t;
 
 template [[host_name("flash_attn_vec_dk256")]]
-kernel flash_attn_vec_t flash_attn_vec<256, 256>;
+kernel flash_attn_vec_f32kv_t flash_attn_vec_impl<256, 256, float>;
 
 template [[host_name("flash_attn_vec_dk512")]]
-kernel flash_attn_vec_t flash_attn_vec<512, 512>;
+kernel flash_attn_vec_f32kv_t flash_attn_vec_impl<512, 512, float>;
+
+// --------------------------------------------------------------------------
+// Kernel instantiations — F16 KV (Phase 4a: halves KV cache bandwidth)
+// --------------------------------------------------------------------------
+
+typedef decltype(flash_attn_vec_impl<256, 256, half>) flash_attn_vec_f16kv_t;
+
+template [[host_name("flash_attn_vec_f16kv_dk256")]]
+kernel flash_attn_vec_f16kv_t flash_attn_vec_impl<256, 256, half>;
+
+template [[host_name("flash_attn_vec_f16kv_dk512")]]
+kernel flash_attn_vec_f16kv_t flash_attn_vec_impl<512, 512, half>;
 
 
 // --------------------------------------------------------------------------
