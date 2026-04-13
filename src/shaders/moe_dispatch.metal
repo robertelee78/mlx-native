@@ -231,3 +231,56 @@ kernel void naive_matvec_f32(
     }
     output[gid] = sum;
 }
+
+// --------------------------------------------------------------------------
+// moe_gather_topk_weights — Gather softmax probs at top-K sorted indices,
+// multiply by per_expert_scale, and renormalize.
+//
+// Replaces the CPU softmax+argsort+gather+scale+renorm sequence for MoE
+// routing.  Runs on GPU so the session never needs to break.
+//
+// Inputs:
+//   softmax_probs   — f32 [n_experts]  (softmax output, from dispatch_softmax)
+//   sorted_indices  — u32 [n_experts]  (descending sort, from dispatch_argsort)
+//   per_expert_scale— f32 [n_experts]  (per-expert learned scale)
+//
+// Outputs:
+//   out_expert_ids  — u32 [top_k]  (selected expert indices)
+//   out_weights     — f32 [top_k]  (pre-scaled, renormalized routing weights)
+//
+// Grid: single thread (top_k <= 8, trivial work).
+// --------------------------------------------------------------------------
+
+struct MoeGatherTopkParams {
+    uint n_experts;
+    uint top_k;
+};
+
+kernel void moe_gather_topk_weights(
+    device const float*  softmax_probs    [[buffer(0)]],
+    device const uint*   sorted_indices   [[buffer(1)]],
+    device const float*  per_expert_scale [[buffer(2)]],
+    device uint*         out_expert_ids   [[buffer(3)]],
+    device float*        out_weights      [[buffer(4)]],
+    constant MoeGatherTopkParams& params  [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;
+
+    // 1. Gather top-K expert ids and their softmax probabilities
+    float top_probs[8];   // max top_k = 8
+    float prob_sum = 0.0f;
+    for (uint k = 0; k < params.top_k; k++) {
+        uint eid = sorted_indices[k];
+        out_expert_ids[k] = eid;
+        top_probs[k] = softmax_probs[eid];
+        prob_sum += top_probs[k];
+    }
+
+    // 2. Renormalize and apply per_expert_scale
+    float inv_sum = (prob_sum > 0.0f) ? (1.0f / prob_sum) : 0.0f;
+    for (uint k = 0; k < params.top_k; k++) {
+        uint eid = out_expert_ids[k];
+        out_weights[k] = (top_probs[k] * inv_sum) * per_expert_scale[eid];
+    }
+}

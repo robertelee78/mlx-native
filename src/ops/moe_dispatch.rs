@@ -684,6 +684,102 @@ pub fn moe_weighted_sum_encode(
     Ok(())
 }
 
+/// MSL-compatible struct for moe_gather_topk_weights kernel.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMoeGatherTopkParams {
+    n_experts: u32,
+    top_k: u32,
+}
+
+/// Encode a GPU-side MoE top-K routing gather.
+///
+/// Reads softmax probs and sorted indices (both on GPU from prior dispatches),
+/// gathers the top-K expert IDs and their weights, applies per_expert_scale,
+/// and renormalizes.  This eliminates the CPU readback that previously forced
+/// a session break between S1 and S4.
+///
+/// # Arguments
+/// * `encoder`          -- Command encoder.
+/// * `registry`         -- Kernel registry.
+/// * `device`           -- Metal device.
+/// * `softmax_probs`    -- f32 `[n_experts]` (output of dispatch_softmax).
+/// * `sorted_indices`   -- u32 `[n_experts]` (output of dispatch_argsort_desc_f32).
+/// * `per_expert_scale` -- f32 `[n_experts]` (learned per-expert scale).
+/// * `out_expert_ids`   -- u32 `[top_k]` (output: selected expert indices).
+/// * `out_weights`      -- f32 `[top_k]` (output: pre-scaled routing weights).
+/// * `n_experts`        -- Total number of experts.
+/// * `top_k`            -- Number of experts to select.
+pub fn moe_gather_topk_weights_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    softmax_probs: &MlxBuffer,
+    sorted_indices: &MlxBuffer,
+    per_expert_scale: &MlxBuffer,
+    out_expert_ids: &MlxBuffer,
+    out_weights: &MlxBuffer,
+    n_experts: usize,
+    top_k: usize,
+) -> Result<()> {
+    if n_experts == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_gather_topk_weights: n_experts and top_k must be > 0".into(),
+        ));
+    }
+    if top_k > n_experts {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_gather_topk_weights: top_k ({}) > n_experts ({})",
+            top_k, n_experts,
+        )));
+    }
+    if top_k > 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_gather_topk_weights: top_k ({}) > 8 (shader fixed-size array limit)",
+            top_k,
+        )));
+    }
+
+    let f32_size = std::mem::size_of::<f32>();
+    let u32_size = std::mem::size_of::<u32>();
+    if softmax_probs.byte_len() < n_experts * f32_size {
+        return Err(MlxError::InvalidArgument("softmax_probs too small".into()));
+    }
+    if sorted_indices.byte_len() < n_experts * u32_size {
+        return Err(MlxError::InvalidArgument("sorted_indices too small".into()));
+    }
+    if per_expert_scale.byte_len() < n_experts * f32_size {
+        return Err(MlxError::InvalidArgument("per_expert_scale too small".into()));
+    }
+    if out_expert_ids.byte_len() < top_k * u32_size {
+        return Err(MlxError::InvalidArgument("out_expert_ids too small".into()));
+    }
+    if out_weights.byte_len() < top_k * f32_size {
+        return Err(MlxError::InvalidArgument("out_weights too small".into()));
+    }
+
+    let pipeline = registry.get_pipeline("moe_gather_topk_weights", device)?;
+    let params = GpuMoeGatherTopkParams {
+        n_experts: n_experts as u32,
+        top_k: top_k as u32,
+    };
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(softmax_probs)),
+            (1, KernelArg::Buffer(sorted_indices)),
+            (2, KernelArg::Buffer(per_expert_scale)),
+            (3, KernelArg::Buffer(out_expert_ids)),
+            (4, KernelArg::Buffer(out_weights)),
+            (5, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(1, 1, 1),  // single thread
+        MTLSize::new(1, 1, 1),
+    );
+    Ok(())
+}
+
 /// Like [`moe_swiglu_fused_encode`] but reads from `gate_up` at `gu_byte_offset`
 /// and writes to `output` at `out_byte_offset`.
 ///

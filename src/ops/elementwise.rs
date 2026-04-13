@@ -233,6 +233,147 @@ pub fn scalar_mul_bf16(
     Ok(())
 }
 
+/// Encode scalar multiplication: `output[i] = input[i] * scalar` (f32).
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry.
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer (f32).
+/// * `output`     - Output buffer (f32, same size as input).
+/// * `n_elements` - Number of elements to process.
+/// * `scalar`     - The f32 scalar to multiply by.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if `n_elements` is zero or buffers are too small.
+pub fn scalar_mul_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: usize,
+    scalar: f32,
+) -> Result<()> {
+    if n_elements == 0 {
+        return Err(MlxError::InvalidArgument(
+            "scalar_mul_f32: n_elements must be > 0".into(),
+        ));
+    }
+
+    let elem_bytes = n_elements * DType::F32.size_of();
+    if input.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "scalar_mul_f32: input buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            input.byte_len()
+        )));
+    }
+    if output.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "scalar_mul_f32: output buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("scalar_mul_f32", device)?;
+
+    let gpu_params = GpuScalarMulParams {
+        scalar,
+        count: n_elements as u32,
+    };
+
+    let grid = MTLSize::new(n_elements as u64, 1, 1);
+    let tg = MTLSize::new(std::cmp::min(ELEMENTWISE_TG_SIZE, n_elements as u64), 1, 1);
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
+/// MSL-compatible params struct for embedding_gather_scale_f32 kernel.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuEmbedGatherScaleParams {
+    scale: f32,
+    hidden_size: u32,
+    token_id: u32,
+}
+
+/// Encode an embedding gather + scale: `output[i] = embed[token_id * hs + i] * scale`.
+///
+/// # Arguments
+///
+/// * `encoder`     - Command encoder.
+/// * `registry`    - Kernel registry.
+/// * `device`      - Metal device.
+/// * `embed_table` - f32 `[vocab_size * hidden_size]`.
+/// * `output`      - f32 `[hidden_size]`.
+/// * `token_id`    - Token index into the embedding table.
+/// * `hidden_size` - Embedding dimension.
+/// * `scale`       - Scale factor (e.g. sqrt(hidden_size)).
+pub fn embedding_gather_scale_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    embed_table: &MlxBuffer,
+    output: &MlxBuffer,
+    token_id: u32,
+    hidden_size: usize,
+    scale: f32,
+) -> Result<()> {
+    if hidden_size == 0 {
+        return Err(MlxError::InvalidArgument(
+            "embedding_gather_scale_f32: hidden_size must be > 0".into(),
+        ));
+    }
+    let out_bytes = hidden_size * std::mem::size_of::<f32>();
+    if output.byte_len() < out_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_gather_scale_f32: output too small: need {} bytes, have {}",
+            out_bytes, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("embedding_gather_scale_f32", device)?;
+
+    let gpu_params = GpuEmbedGatherScaleParams {
+        scale,
+        hidden_size: hidden_size as u32,
+        token_id,
+    };
+
+    let grid = MTLSize::new(hidden_size as u64, 1, 1);
+    let tg = MTLSize::new(std::cmp::min(ELEMENTWISE_TG_SIZE, hidden_size as u64), 1, 1);
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(embed_table)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
 /// Cast f32 to bf16 using an externally-provided encoder (no commit).
 ///
 /// Encodes the `cast_f32_to_bf16` kernel into the given encoder without

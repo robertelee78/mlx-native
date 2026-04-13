@@ -103,6 +103,7 @@ impl KernelRegistry {
         sources.insert("moe_weighted_sum".into(), moe_dispatch_src);
         sources.insert("zero_buffer".into(), moe_dispatch_src);
         sources.insert("naive_matvec_f32".into(), moe_dispatch_src);
+        sources.insert("moe_gather_topk_weights".into(), moe_dispatch_src);
 
         // Batched KV cache copy kernel
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
@@ -121,6 +122,8 @@ impl KernelRegistry {
         sources.insert("cast_bf16_to_f32".into(), elementwise_src);
         sources.insert("cast_f32_to_bf16".into(), elementwise_src);
         sources.insert("scalar_mul_bf16".into(), elementwise_src);
+        sources.insert("scalar_mul_f32".into(), elementwise_src);
+        sources.insert("embedding_gather_scale_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16".into(), elementwise_src);
         sources.insert("transpose_2d_f32".into(), elementwise_src);
         sources.insert("transpose_2d_f16".into(), elementwise_src);

@@ -248,6 +248,53 @@ kernel void scalar_mul_bf16(
 }
 
 // --------------------------------------------------------------------------
+// scalar_mul_f32 — out = input * scalar (float32 input/output, f32 scalar)
+//
+// Buffers:
+//   0: input  — float [count]
+//   1: output — float [count]
+//   2: params — { float scalar; uint count; }
+// --------------------------------------------------------------------------
+
+kernel void scalar_mul_f32(
+    device const float* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant ScalarMulParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.count) return;
+    output[gid] = input[gid] * params.scalar;
+}
+
+// --------------------------------------------------------------------------
+// embedding_gather_scale_f32 — Gather one embedding row and scale it.
+//
+// out[i] = embed_table[token_id * hidden_size + i] * scale
+//
+// Buffers:
+//   0: embed_table — float [vocab_size * hidden_size]
+//   1: output      — float [hidden_size]
+//   2: params      — { float scale; uint hidden_size; uint token_id; }
+// --------------------------------------------------------------------------
+
+struct EmbedGatherScaleParams {
+    float scale;
+    uint hidden_size;
+    uint token_id;
+};
+
+kernel void embedding_gather_scale_f32(
+    device const float* embed_table [[buffer(0)]],
+    device float*       output      [[buffer(1)]],
+    constant EmbedGatherScaleParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.hidden_size) return;
+    uint offset = params.token_id * params.hidden_size + gid;
+    output[gid] = embed_table[offset] * params.scale;
+}
+
+// --------------------------------------------------------------------------
 // permute_021_bf16 — Transpose [A, B, C] -> [B, A, C] for bfloat16
 //
 // Used to convert [seq_len, n_heads, head_dim] <-> [n_heads, seq_len, head_dim]
