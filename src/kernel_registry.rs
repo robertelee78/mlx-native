@@ -136,6 +136,15 @@ impl KernelRegistry {
         sources.insert("sdpa_sliding".into(), sdpa_sliding_src);
         sources.insert("sdpa_sliding_bf16".into(), sdpa_sliding_src);
 
+        // Flash attention vector kernels — SIMD-vectorized decode-path SDPA
+        // (ported from llama.cpp flash_attn_ext_vec)
+        let flash_attn_vec_src: &'static str =
+            include_str!("shaders/flash_attn_vec.metal");
+        sources.insert("flash_attn_vec_dk256".into(), flash_attn_vec_src);
+        sources.insert("flash_attn_vec_dk512".into(), flash_attn_vec_src);
+        sources.insert("flash_attn_vec_reduce_dk256".into(), flash_attn_vec_src);
+        sources.insert("flash_attn_vec_reduce_dk512".into(), flash_attn_vec_src);
+
         // RoPE, normalization, activation kernels (Story 1.4)
         let rope_src: &'static str = include_str!("shaders/rope.metal");
         sources.insert("rope_f32".into(), rope_src);

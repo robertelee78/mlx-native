@@ -244,6 +244,33 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode flash attention vector (SIMD-vectorized decode-path SDPA).
+    ///
+    /// Delegates to [`ops::flash_attn_vec::flash_attn_vec`].
+    pub fn flash_attn_vec(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        q: &MlxBuffer,
+        k: &MlxBuffer,
+        v: &MlxBuffer,
+        output: &MlxBuffer,
+        tmp: &MlxBuffer,
+        params: &ops::flash_attn_vec::FlashAttnVecParams,
+    ) -> Result<()> {
+        ops::flash_attn_vec::flash_attn_vec(
+            &mut self.encoder,
+            registry,
+            device,
+            q,
+            k,
+            v,
+            output,
+            tmp,
+            params,
+        )
+    }
+
     /// Encode an elementwise add into this session's encoder.
     ///
     /// Delegates to [`ops::elementwise::elementwise_add`].
