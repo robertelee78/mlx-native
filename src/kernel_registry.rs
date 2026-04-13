@@ -133,11 +133,13 @@ impl KernelRegistry {
         sources.insert("rope_f16".into(), rope_src);
         sources.insert("rope_bf16".into(), rope_src);
         sources.insert("rope_neox_bf16".into(), rope_src);
+        sources.insert("rope_neox_f32".into(), rope_src);
         let rms_norm_src: &'static str = include_str!("shaders/rms_norm.metal");
         sources.insert("rms_norm_f32".into(), rms_norm_src);
         sources.insert("rms_norm_f16".into(), rms_norm_src);
         sources.insert("rms_norm_bf16".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_bf16".into(), rms_norm_src);
+        sources.insert("rms_norm_no_scale_f32".into(), rms_norm_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
@@ -165,6 +167,12 @@ impl KernelRegistry {
         // Gather / index_select kernel (Story 2.4)
         let gather_src: &'static str = include_str!("shaders/gather.metal");
         sources.insert("gather_f32".into(), gather_src);
+
+        // F32 KV cache copy kernel (Session merge S1+S2)
+        let kv_cache_copy_src: &'static str =
+            include_str!("shaders/kv_cache_copy.metal");
+        sources.insert("kv_cache_copy".into(), kv_cache_copy_src);
+        sources.insert("kv_cache_copy_f32".into(), kv_cache_copy_src);
 
         // Strided copy kernel (Story 2.5)
         let copy_src: &'static str = include_str!("shaders/copy.metal");

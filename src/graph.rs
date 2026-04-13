@@ -388,6 +388,65 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode an RMS norm without learned scale (f32) into this session's encoder.
+    ///
+    /// Delegates to [`ops::rms_norm::dispatch_rms_norm_no_scale_f32`].
+    pub fn rms_norm_no_scale_f32(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &metal::DeviceRef,
+        input: &MlxBuffer,
+        output: &MlxBuffer,
+        params_buf: &MlxBuffer,
+        rows: u32,
+        dim: u32,
+    ) -> Result<()> {
+        ops::rms_norm::dispatch_rms_norm_no_scale_f32(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            output,
+            params_buf,
+            rows,
+            dim,
+        )
+    }
+
+    /// Encode a NeoX RoPE (f32) with optional freq_factors into this session's encoder.
+    ///
+    /// Delegates to [`ops::rope::dispatch_rope_neox_f32`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_f32(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &metal::DeviceRef,
+        input: &MlxBuffer,
+        output: &MlxBuffer,
+        params_buf: &MlxBuffer,
+        positions_buf: &MlxBuffer,
+        freq_factors: Option<&MlxBuffer>,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+    ) -> Result<()> {
+        ops::rope::dispatch_rope_neox_f32(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            output,
+            params_buf,
+            positions_buf,
+            freq_factors,
+            seq_len,
+            n_heads,
+            head_dim,
+            rope_dim,
+        )
+    }
+
     /// Borrow the underlying command encoder for direct op dispatch.
     ///
     /// Use this when you need to call an op function that is not wrapped by
