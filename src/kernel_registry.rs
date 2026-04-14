@@ -222,6 +222,7 @@ impl KernelRegistry {
         let dense_gemm_src: &'static str = include_str!("shaders/dense_gemm.metal");
         sources.insert("dense_gemm_f16".into(), dense_gemm_src);
         sources.insert("dense_matvec_f16".into(), dense_gemm_src);
+        sources.insert("dense_matvec_f16w_f32io".into(), dense_gemm_src);
 
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
