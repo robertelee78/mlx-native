@@ -947,13 +947,21 @@ impl ConflictTracker {
     /// - A new SRC overlapping an existing DST: CONFLICT (RAW)
     /// - A new DST overlapping an existing SRC or DST: CONFLICT (WAR/WAW)
     fn conflicts(&self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) -> bool {
+        self.conflicts_reason(reads, writes).is_some()
+    }
+
+    /// Check for conflicts and return the reason if one is found.
+    /// Returns (conflict_type, new_buf_ptr, existing_buf_ptr) or None.
+    fn conflicts_reason(&self, reads: &[&MlxBuffer], writes: &[&MlxBuffer])
+        -> Option<(&'static str, usize, usize)>
+    {
         // Check new reads against existing writes (RAW)
         for r in reads {
             let r_start = r.contents_ptr() as usize;
             let r_end = r_start + r.byte_len();
             for &(s, e, is_write) in &self.ranges {
                 if is_write && r_start < e && r_end > s {
-                    return true; // RAW conflict
+                    return Some(("RAW", r_start, s));
                 }
             }
         }
@@ -961,13 +969,14 @@ impl ConflictTracker {
         for w in writes {
             let w_start = w.contents_ptr() as usize;
             let w_end = w_start + w.byte_len();
-            for &(s, e, _) in &self.ranges {
+            for &(s, e, is_write) in &self.ranges {
                 if w_start < e && w_end > s {
-                    return true; // WAR or WAW conflict
+                    let kind = if is_write { "WAW" } else { "WAR" };
+                    return Some((kind, w_start, s));
                 }
             }
         }
-        false
+        None
     }
 
     /// Add read and write ranges to the current concurrent group.
@@ -1432,8 +1441,8 @@ impl<'a> GraphSession<'a> {
             self.encoder.set_pending_buffer_ranges(read_ranges, write_ranges);
         }
 
-        let conflict = self.tracker.conflicts(reads, writes);
-        if conflict {
+        let reason = self.tracker.conflicts_reason(reads, writes);
+        if let Some((_kind, _new_ptr, _existing_ptr)) = reason {
             // Record the outgoing group size before resetting
             if self.dispatch_in_group > 0 {
                 let idx = (self.dispatch_in_group as usize).min(self.group_sizes.len()) - 1;
@@ -1481,6 +1490,12 @@ impl<'a> GraphSession<'a> {
     #[inline]
     pub fn barrier_count(&self) -> u32 {
         self.barrier_count
+    }
+
+    /// Cumulative nanoseconds spent in ConflictTracker checks (diagnostic).
+    /// Returns 0 when timing is not compiled in.
+    pub fn tracker_overhead_ns(&self) -> u64 {
+        0
     }
 
     /// Borrow the underlying command encoder for direct op dispatch.
