@@ -167,6 +167,18 @@ impl ComputeGraph {
         &self.nodes
     }
 
+    /// Count dispatch nodes that have empty read/write range annotations.
+    ///
+    /// Used for diagnostics: if >0, the reorder pass cannot guarantee
+    /// correctness because it relies on complete annotations.
+    pub fn unannotated_dispatch_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| matches!(n, CapturedNode::Dispatch { reads, writes, .. }
+                if reads.is_empty() || writes.is_empty()))
+            .count()
+    }
+
     /// Take ownership of the node list, consuming the graph.
     pub fn into_nodes(self) -> Vec<CapturedNode> {
         self.nodes
@@ -1741,7 +1753,18 @@ impl<'a> GraphSession<'a> {
             if let Some(nodes) = self.encoder.take_capture() {
                 let mut graph = ComputeGraph::from_nodes(nodes);
                 fusions = graph.fuse(registry, device)?;
-                reordered = graph.reorder();
+
+                // Safety: only reorder when ALL dispatch nodes have buffer
+                // range annotations.  Without complete annotations the
+                // conflict tracker cannot detect RAW/WAR/WAW hazards and
+                // the reorder may break data dependencies.
+                let unannotated = graph.unannotated_dispatch_count();
+                if unannotated == 0 {
+                    reordered = graph.reorder();
+                } else if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                    eprintln!("  [GRAPH_OPT] WARN: skipping reorder — {} of {} dispatches lack range annotations",
+                        unannotated, graph.dispatch_count());
+                }
 
                 let mut enc0 = self.device.command_encoder()?;
                 let mut enc1 = self.device.command_encoder()?;

@@ -265,6 +265,24 @@ pub fn flash_attn_vec(
         let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
         let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
 
+        // Annotate reads/writes for the capture graph so the reorder pass
+        // (Phase 4e.3) can track data dependencies on the reduce kernel.
+        {
+            let read_ranges = vec![
+                {
+                    let s = tmp.contents_ptr() as usize;
+                    (s, s + tmp.byte_len())
+                },
+            ];
+            let write_ranges = vec![
+                {
+                    let s = output.contents_ptr() as usize;
+                    (s, s + output.byte_len())
+                },
+            ];
+            encoder.set_pending_buffer_ranges(read_ranges, write_ranges);
+        }
+
         encoder.encode_threadgroups(
             reduce_pipeline,
             &[
