@@ -11,12 +11,19 @@
 //! creating and ending a new compute encoder per dispatch — the same pattern
 //! candle uses (`compute_per_buffer`).  On a forward pass with ~800 dispatches
 //! this saves ~800 encoder create/end cycles.
+//!
+//! # Capture mode (Phase 4e.1)
+//!
+//! When `start_capture()` is called, subsequent dispatches are recorded into a
+//! `Vec<CapturedNode>` instead of being encoded into Metal.  `memory_barrier()`
+//! records a barrier sentinel.  Call `take_capture()` to extract the recorded
+//! graph for later replay via `ComputeGraph::encode_sequential()`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal::{
-    CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineStateRef,
-    MTLCommandBufferStatus, MTLDispatchType, MTLSize,
+    CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
+    ComputePipelineStateRef, MTLCommandBufferStatus, MTLDispatchType, MTLSize,
 };
 #[allow(unused_imports)]
 use objc::{msg_send, sel, sel_impl};
@@ -43,6 +50,111 @@ pub enum KernelArg<'a> {
 /// MSL struct in the shader (matching field order, sizes, and alignment).
 pub fn as_bytes<T: bytemuck::Pod>(val: &T) -> &[u8] {
     bytemuck::bytes_of(val)
+}
+
+// ---------------------------------------------------------------------------
+// Capture-mode types (Phase 4e.1 — Graph IR)
+// ---------------------------------------------------------------------------
+
+/// A recorded kernel argument binding.
+///
+/// When the encoder is in capture mode, each `set_buffer` / `set_bytes` call
+/// is stored as a `RecordedBinding` instead of being applied to Metal.
+#[derive(Clone)]
+pub enum RecordedBinding {
+    /// A Metal buffer at the given offset.
+    Buffer {
+        metal_buffer: metal::Buffer,
+        offset: u64,
+    },
+    /// Inline bytes (small constant data, copied).
+    Bytes(Vec<u8>),
+}
+
+/// How to dispatch the recorded kernel.
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchKind {
+    /// `dispatch_threads(grid_size, threadgroup_size)` — Metal picks threadgroup count.
+    Threads,
+    /// `dispatch_thread_groups(threadgroups, threadgroup_size)` — caller specifies threadgroup count.
+    ThreadGroups,
+}
+
+/// Operation kind tag for captured nodes, used by the fusion pass (4e.2).
+///
+/// When the encoder is in capture mode, each dispatch can be tagged with an
+/// `OpKind` so the fusion pass can identify fuseable sequences without
+/// inspecting pipeline names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturedOpKind {
+    /// RMS normalization (with learned scale).
+    RmsNorm,
+    /// Elementwise multiply.
+    ElemMul,
+    /// Elementwise add.
+    ElemAdd,
+    /// Scaled dot-product attention (NOT reorderable — breaks lookahead).
+    Sdpa,
+    /// Softmax (NOT reorderable — breaks lookahead).
+    Softmax,
+    /// Any other operation — treated as reorderable by the graph optimizer.
+    Other,
+}
+
+impl CapturedOpKind {
+    /// Whether this captured op kind is safe to reorder past in the graph
+    /// optimizer (Phase 4e.3).
+    ///
+    /// Mirrors the `h_safe` whitelist from llama.cpp's
+    /// `ggml_metal_graph_optimize_reorder`.  Non-safe ops break the 64-node
+    /// lookahead — the reorder pass cannot look past them.
+    pub fn is_reorderable(&self) -> bool {
+        match self {
+            Self::Sdpa | Self::Softmax => false,
+            Self::RmsNorm | Self::ElemMul | Self::ElemAdd | Self::Other => true,
+        }
+    }
+}
+
+/// A memory range annotation: (start_address, end_address).
+///
+/// Represents a contiguous GPU buffer region for conflict detection in the
+/// reorder pass (Phase 4e.3).  Addresses are CPU-visible `contents_ptr()`
+/// values, which on Apple Silicon unified memory equal the GPU addresses.
+pub type MemRange = (usize, usize);
+
+/// A single captured compute dispatch or barrier sentinel.
+///
+/// Created when the encoder is in capture mode.  Replayed later by
+/// `ComputeGraph::encode_sequential()`.
+#[derive(Clone)]
+pub enum CapturedNode {
+    /// A compute dispatch to replay.
+    Dispatch {
+        /// Pipeline state object to bind.
+        pipeline: ComputePipelineState,
+        /// Kernel argument bindings: (slot_index, binding).
+        bindings: Vec<(u64, RecordedBinding)>,
+        /// Grid or threadgroup count (interpretation depends on `dispatch_kind`).
+        threads_per_grid: MTLSize,
+        /// Threads per threadgroup.
+        threads_per_threadgroup: MTLSize,
+        /// Optional threadgroup memory allocations: (index, byte_length).
+        threadgroup_memory: Vec<(u64, u64)>,
+        /// Whether this is a dispatch_threads or dispatch_thread_groups call.
+        dispatch_kind: DispatchKind,
+        /// Operation kind tag for the fusion pass (4e.2).
+        /// Defaults to `Other` if not explicitly set via `set_op_kind()`.
+        op_kind: CapturedOpKind,
+        /// Read buffer ranges for reorder conflict detection (4e.3).
+        /// Populated from `barrier_between` calls in capture mode.
+        reads: Vec<MemRange>,
+        /// Write buffer ranges for reorder conflict detection (4e.3).
+        /// Populated from `barrier_between` calls in capture mode.
+        writes: Vec<MemRange>,
+    },
+    /// A memory barrier sentinel — forces a barrier at replay time.
+    Barrier,
 }
 
 /// Apply a slice of `KernelArg` bindings to a compute encoder.
@@ -115,6 +227,18 @@ pub struct CommandEncoder {
     /// SAFETY: the pointer is valid as long as `cmd_buf` is alive and
     /// `end_encoding()` has not been called on it.
     active_encoder: *const ComputeCommandEncoderRef,
+    /// When `Some`, dispatches are recorded here instead of being encoded
+    /// into Metal.  Set via `start_capture()`, extracted via `take_capture()`.
+    capture: Option<Vec<CapturedNode>>,
+    /// Op kind tag for the NEXT captured dispatch.  Set via `set_op_kind()`,
+    /// consumed (reset to `Other`) when a dispatch is captured.
+    pending_op_kind: CapturedOpKind,
+    /// Pending read buffer ranges for the NEXT captured dispatch.
+    /// Set via `set_pending_buffer_ranges()`, consumed when the next dispatch
+    /// is captured.  Used by the reorder pass (Phase 4e.3).
+    pending_reads: Vec<MemRange>,
+    /// Pending write buffer ranges for the NEXT captured dispatch.
+    pending_writes: Vec<MemRange>,
 }
 
 impl CommandEncoder {
@@ -126,7 +250,108 @@ impl CommandEncoder {
         Ok(Self {
             cmd_buf,
             active_encoder: std::ptr::null(),
+            capture: None,
+            pending_op_kind: CapturedOpKind::Other,
+            pending_reads: Vec::new(),
+            pending_writes: Vec::new(),
         })
+    }
+
+    /// Enable capture mode.
+    ///
+    /// All subsequent dispatch and barrier calls will be recorded into a
+    /// `Vec<CapturedNode>` instead of being encoded into Metal.
+    /// Call `take_capture()` to extract the recorded nodes.
+    pub fn start_capture(&mut self) {
+        self.capture = Some(Vec::with_capacity(128));
+    }
+
+    /// Whether the encoder is currently in capture mode.
+    pub fn is_capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Extract the captured nodes, ending capture mode.
+    ///
+    /// Returns `None` if capture mode was not active.
+    pub fn take_capture(&mut self) -> Option<Vec<CapturedNode>> {
+        self.capture.take()
+    }
+
+    /// Tag the NEXT captured dispatch with the given operation kind.
+    ///
+    /// The tag is consumed (reset to `Other`) after the next dispatch is
+    /// captured.  Only meaningful in capture mode — has no effect on
+    /// direct-dispatch encoding.
+    ///
+    /// Used by op dispatch functions to annotate captures for the fusion
+    /// pass (Phase 4e.2).
+    pub fn set_op_kind(&mut self, kind: CapturedOpKind) {
+        self.pending_op_kind = kind;
+    }
+
+    /// Consume and return the pending op kind, resetting it to `Other`.
+    fn take_pending_op_kind(&mut self) -> CapturedOpKind {
+        let kind = self.pending_op_kind;
+        self.pending_op_kind = CapturedOpKind::Other;
+        kind
+    }
+
+    /// Stash buffer range annotations for the NEXT captured dispatch.
+    ///
+    /// Called by `GraphSession::barrier_between()` in capture mode to record
+    /// which buffers the next dispatch reads from and writes to.  The ranges
+    /// are consumed by the next `encode_*` call and attached to the captured
+    /// `CapturedNode::Dispatch`.
+    ///
+    /// Only meaningful in capture mode — has no effect on direct-dispatch.
+    pub fn set_pending_buffer_ranges(&mut self, reads: Vec<MemRange>, writes: Vec<MemRange>) {
+        self.pending_reads = reads;
+        self.pending_writes = writes;
+    }
+
+    /// Consume and return the pending buffer range annotations.
+    fn take_pending_buffer_ranges(&mut self) -> (Vec<MemRange>, Vec<MemRange>) {
+        let reads = std::mem::take(&mut self.pending_reads);
+        let writes = std::mem::take(&mut self.pending_writes);
+        (reads, writes)
+    }
+
+    /// Record buffer bindings into `RecordedBinding` form.
+    fn record_buffer_bindings(buffers: &[(u64, &MlxBuffer)]) -> Vec<(u64, RecordedBinding)> {
+        buffers
+            .iter()
+            .map(|&(index, buf)| {
+                (
+                    index,
+                    RecordedBinding::Buffer {
+                        metal_buffer: buf.metal_buffer().clone(),
+                        offset: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Record `KernelArg` bindings into `RecordedBinding` form.
+    fn record_arg_bindings(bindings: &[(u64, KernelArg<'_>)]) -> Vec<(u64, RecordedBinding)> {
+        bindings
+            .iter()
+            .map(|(index, arg)| {
+                let recorded = match arg {
+                    KernelArg::Buffer(buf) => RecordedBinding::Buffer {
+                        metal_buffer: buf.metal_buffer().clone(),
+                        offset: 0,
+                    },
+                    KernelArg::BufferWithOffset(buf, offset) => RecordedBinding::Buffer {
+                        metal_buffer: buf.metal_buffer().clone(),
+                        offset: *offset,
+                    },
+                    KernelArg::Bytes(bytes) => RecordedBinding::Bytes(bytes.to_vec()),
+                };
+                (*index, recorded)
+            })
+            .collect()
     }
 
     /// Get or create the persistent compute encoder.
@@ -174,6 +399,10 @@ impl CommandEncoder {
     /// This is the same pattern llama.cpp uses:
     /// `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
     pub fn memory_barrier(&mut self) {
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Barrier);
+            return;
+        }
         if self.active_encoder.is_null() {
             return;
         }
@@ -225,6 +454,22 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let op_kind = self.take_pending_op_kind();
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: pipeline.to_owned(),
+                bindings: Self::record_buffer_bindings(buffers),
+                threads_per_grid: grid_size,
+                threads_per_threadgroup: threadgroup_size,
+                threadgroup_memory: Vec::new(),
+                dispatch_kind: DispatchKind::Threads,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
@@ -245,6 +490,22 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let op_kind = self.take_pending_op_kind();
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: pipeline.to_owned(),
+                bindings: Self::record_buffer_bindings(buffers),
+                threads_per_grid: threadgroups,
+                threads_per_threadgroup: threadgroup_size,
+                threadgroup_memory: Vec::new(),
+                dispatch_kind: DispatchKind::ThreadGroups,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
@@ -276,6 +537,22 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let op_kind = self.take_pending_op_kind();
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: pipeline.to_owned(),
+                bindings: Self::record_buffer_bindings(buffers),
+                threads_per_grid: threadgroups,
+                threads_per_threadgroup: threadgroup_size,
+                threadgroup_memory: threadgroup_mem.to_vec(),
+                dispatch_kind: DispatchKind::ThreadGroups,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
@@ -298,6 +575,22 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let op_kind = self.take_pending_op_kind();
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: pipeline.to_owned(),
+                bindings: Self::record_arg_bindings(bindings),
+                threads_per_grid: grid_size,
+                threads_per_threadgroup: threadgroup_size,
+                threadgroup_memory: Vec::new(),
+                dispatch_kind: DispatchKind::Threads,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
@@ -315,6 +608,22 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let op_kind = self.take_pending_op_kind();
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: pipeline.to_owned(),
+                bindings: Self::record_arg_bindings(bindings),
+                threads_per_grid: threadgroups,
+                threads_per_threadgroup: threadgroup_size,
+                threadgroup_memory: Vec::new(),
+                dispatch_kind: DispatchKind::ThreadGroups,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
@@ -333,6 +642,22 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        let op_kind = self.take_pending_op_kind();
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+        if let Some(ref mut nodes) = self.capture {
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: pipeline.to_owned(),
+                bindings: Self::record_arg_bindings(bindings),
+                threads_per_grid: threadgroups,
+                threads_per_threadgroup: threadgroup_size,
+                threadgroup_memory: threadgroup_mem.to_vec(),
+                dispatch_kind: DispatchKind::ThreadGroups,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
@@ -340,6 +665,52 @@ impl CommandEncoder {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+    }
+
+    /// Replay a single captured dispatch node into this encoder.
+    ///
+    /// This is the inverse of capture: it takes a previously recorded
+    /// `CapturedNode::Dispatch` and encodes it into the live Metal encoder.
+    /// Barrier nodes are handled by the caller (ComputeGraph::encode_sequential).
+    ///
+    /// Does NOT increment `DISPATCH_COUNT` — that was already counted at
+    /// capture time.
+    pub fn replay_dispatch(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, RecordedBinding)],
+        threadgroup_memory: &[(u64, u64)],
+        threads_per_grid: MTLSize,
+        threads_per_threadgroup: MTLSize,
+        dispatch_kind: DispatchKind,
+    ) {
+        let encoder = self.get_or_create_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        for (index, binding) in bindings {
+            match binding {
+                RecordedBinding::Buffer { metal_buffer, offset } => {
+                    encoder.set_buffer(*index, Some(metal_buffer), *offset);
+                }
+                RecordedBinding::Bytes(bytes) => {
+                    encoder.set_bytes(
+                        *index,
+                        bytes.len() as u64,
+                        bytes.as_ptr() as *const _,
+                    );
+                }
+            }
+        }
+        for &(index, byte_length) in threadgroup_memory {
+            encoder.set_threadgroup_memory_length(index, byte_length);
+        }
+        match dispatch_kind {
+            DispatchKind::Threads => {
+                encoder.dispatch_threads(threads_per_grid, threads_per_threadgroup);
+            }
+            DispatchKind::ThreadGroups => {
+                encoder.dispatch_thread_groups(threads_per_grid, threads_per_threadgroup);
+            }
+        }
     }
 
     /// Commit the command buffer and block until the GPU finishes execution.

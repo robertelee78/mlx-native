@@ -162,6 +162,10 @@ impl KernelRegistry {
         sources.insert("rms_norm_bf16".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_bf16".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_f32".into(), rms_norm_src);
+        // Fused RMS norm + elementwise multiply kernels (Phase 4e.2)
+        sources.insert("rms_norm_mul_f32".into(), rms_norm_src);
+        sources.insert("rms_norm_mul_f16".into(), rms_norm_src);
+        sources.insert("rms_norm_mul_bf16".into(), rms_norm_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);

@@ -11,7 +11,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CapturedOpKind, CommandEncoder};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::DType;
@@ -193,6 +193,9 @@ pub fn flash_attn_vec(
     let sh = 4 * 32; // 4 * C = 128 halfs
     let shmem_halfs = pk + sh + 2 * pv;
     let shmem_bytes = shmem_halfs * 2; // 2 bytes per half
+
+    // Tag for the reorder pass (Phase 4e.3): SDPA is NOT reorderable.
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
 
     // Dispatch main kernel.
     // Grid: (1 query, num_heads, nwg)

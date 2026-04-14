@@ -7,7 +7,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CapturedOpKind, CommandEncoder};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -101,6 +101,15 @@ fn elementwise_binary(
 
     let grid = MTLSize::new(n_elements as u64, 1, 1);
     let tg = MTLSize::new(std::cmp::min(ELEMENTWISE_TG_SIZE, n_elements as u64), 1, 1);
+
+    // Tag for the fusion pass (Phase 4e.2): elementwise mul/add can fuse
+    // with a preceding RMS norm.
+    let op_tag = match op {
+        "mul" => CapturedOpKind::ElemMul,
+        "add" => CapturedOpKind::ElemAdd,
+        _ => CapturedOpKind::Other,
+    };
+    encoder.set_op_kind(op_tag);
 
     encode_with_args(
         encoder,

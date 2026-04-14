@@ -11,7 +11,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CapturedOpKind, CommandEncoder};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::DType;
@@ -211,6 +211,9 @@ pub fn sdpa_sliding(
         n_tiles as u64,
     );
     let threadgroup_size = MTLSize::new(TILE_Q as u64, 1, 1);
+
+    // Tag for the reorder pass (Phase 4e.3): SDPA is NOT reorderable.
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
 
     // Encode the dispatch.
     encoder.encode_threadgroups(

@@ -57,9 +57,12 @@ pub use buffer::MlxBuffer;
 pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
 pub use dtypes::DType;
-pub use encoder::{dispatch_count, reset_counters, sync_count, CommandEncoder};
+pub use encoder::{
+    dispatch_count, reset_counters, sync_count, CapturedNode, CommandEncoder, DispatchKind,
+    RecordedBinding,
+};
 pub use error::{MlxError, Result};
-pub use graph::{GraphExecutor, GraphSession};
+pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
 pub use kernel_registry::KernelRegistry;
 
 // Re-export ops.

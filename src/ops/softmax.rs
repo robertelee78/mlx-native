@@ -8,7 +8,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CapturedOpKind, CommandEncoder};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -94,6 +94,9 @@ pub fn dispatch_softmax(
 
     // Threadgroup shared memory: tg_size floats for the reduction.
     let shared_mem_bytes = tg_size * 4; // sizeof(float) = 4
+
+    // Tag for the reorder pass (Phase 4e.3): Softmax is NOT reorderable.
+    encoder.set_op_kind(CapturedOpKind::Softmax);
 
     encoder.encode_threadgroups_with_shared(
         pipeline,
