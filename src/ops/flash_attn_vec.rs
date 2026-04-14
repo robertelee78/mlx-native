@@ -11,7 +11,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::{CapturedOpKind, CommandEncoder};
+use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::DType;
@@ -161,17 +161,6 @@ pub fn flash_attn_vec(
         softcap: params.softcap,
         nwg,
     };
-    let params_bytes = bytemuck::bytes_of(&gpu_params);
-    let mut params_buf = device.alloc_buffer(
-        params_bytes.len(),
-        DType::U8,
-        vec![params_bytes.len()],
-    )?;
-    {
-        let dst: &mut [u8] = params_buf.as_mut_slice()?;
-        dst[..params_bytes.len()].copy_from_slice(params_bytes);
-    }
-
     // Select kernel by head dimension and KV dtype.
     // F16 KV: K/V buffers are half-precision, halving bandwidth (Phase 4a).
     let kv_is_f16 = k.dtype() == DType::F16;
@@ -202,14 +191,16 @@ pub fn flash_attn_vec(
     let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
     let threadgroup_size = MTLSize::new(32, 1, 1); // 1 simdgroup of 32 threads
 
-    encoder.encode_threadgroups_with_shared(
+    // Pass params as inline bytes — no Metal buffer allocation.
+    // This eliminates 1 [MTLDevice newBufferWithLength:] per SDPA call (30/token).
+    encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
         &[
-            (0, &params_buf),
-            (1, q),
-            (2, k),
-            (3, v),
-            (4, tmp),
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(q)),
+            (2, KernelArg::Buffer(k)),
+            (3, KernelArg::Buffer(v)),
+            (4, KernelArg::Buffer(tmp)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,
@@ -226,29 +217,6 @@ pub fn flash_attn_vec(
         let reduce_params = FlashAttnVecReduceParamsGpu {
             nrows: params.num_heads,
         };
-        let reduce_bytes = bytemuck::bytes_of(&reduce_params);
-        let mut reduce_buf = device.alloc_buffer(
-            reduce_bytes.len(),
-            DType::U8,
-            vec![reduce_bytes.len()],
-        )?;
-        {
-            let dst: &mut [u8] = reduce_buf.as_mut_slice()?;
-            dst[..reduce_bytes.len()].copy_from_slice(reduce_bytes);
-        }
-
-        // NWG param buffer (u32).
-        let nwg_val = nwg;
-        let nwg_bytes = bytemuck::bytes_of(&nwg_val);
-        let mut nwg_buf = device.alloc_buffer(
-            nwg_bytes.len(),
-            DType::U8,
-            vec![nwg_bytes.len()],
-        )?;
-        {
-            let dst: &mut [u8] = nwg_buf.as_mut_slice()?;
-            dst[..nwg_bytes.len()].copy_from_slice(nwg_bytes);
-        }
 
         let reduce_kernel = match head_dim {
             256 => "flash_attn_vec_reduce_dk256",
@@ -259,9 +227,6 @@ pub fn flash_attn_vec(
             registry.get_pipeline(reduce_kernel, device.metal_device())?;
 
         // Grid: (num_heads, 1, 1), Threadgroup: (32*NWG, 1, 1)
-        // Each threadgroup has NWG simdgroups. Within each simdgroup, 32 threads
-        // handle the 32 workgroups via simd_sum. sgitg distributes dimension
-        // chunks across simdgroups: each handles DV4/NWG chunks.
         let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
         let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
 
@@ -283,13 +248,15 @@ pub fn flash_attn_vec(
             encoder.set_pending_buffer_ranges(read_ranges, write_ranges);
         }
 
-        encoder.encode_threadgroups(
+        // Pass params as inline bytes — no Metal buffer allocation.
+        // This eliminates 2 [MTLDevice newBufferWithLength:] per SDPA call (60/token).
+        encoder.encode_threadgroups_with_args(
             reduce_pipeline,
             &[
-                (0, &reduce_buf),
-                (1, tmp),
-                (2, output),
-                (3, &nwg_buf),
+                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                (1, KernelArg::Buffer(tmp)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&nwg))),
             ],
             reduce_tg,
             reduce_tg_size,
