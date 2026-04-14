@@ -74,7 +74,7 @@ struct FlashAttnVecReduceParams {
 // in the dot product, only in the stored cache values).
 template<short DK, short DV, typename KV_T>
 kernel void flash_attn_vec_impl(
-    device const FlashAttnVecParams *params [[buffer(0)]],
+    constant FlashAttnVecParams     &params [[buffer(0)]],
     device const float              *Q      [[buffer(1)]],
     device const KV_T               *K      [[buffer(2)]],
     device const KV_T               *V      [[buffer(3)]],
@@ -100,7 +100,7 @@ kernel void flash_attn_vec_impl(
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
-    const uint NWG = params->nwg;
+    const uint NWG = params.nwg;
 
     // Threadgroup grid: (n_queries, n_heads, n_batches * NWG)
     const ushort iwg = tgpig[2] % NWG;    // workgroup index within this head
@@ -108,7 +108,7 @@ kernel void flash_attn_vec_impl(
     const ushort iq1 = tgpig[0];           // query index (0 for decode)
 
     // GQA: map query head to KV head.
-    const uint heads_per_kv = params->n_heads / params->n_kv_heads;
+    const uint heads_per_kv = params.n_heads / params.n_kv_heads;
     const uint kv_head = iq2 / heads_per_kv;
 
     // Shared memory pointers.
@@ -125,10 +125,10 @@ kernel void flash_attn_vec_impl(
     device const float4 *q4 = (device const float4 *)(Q + iq2 * DK);
 
     // K layout: [n_kv_heads, kv_capacity, head_dim]
-    device const KV_T *k_base = K + kv_head * params->kv_capacity * DK;
+    device const KV_T *k_base = K + kv_head * params.kv_capacity * DK;
 
     // V layout: [n_kv_heads, kv_capacity, head_dim]
-    device const KV_T *v_base = V + kv_head * params->kv_capacity * DV;
+    device const KV_T *v_base = V + kv_head * params.kv_capacity * DV;
 
     // Load Q into shared memory as half4.
     for (ushort i = tiisg; i < PK4; i += NW) {
@@ -154,15 +154,15 @@ kernel void flash_attn_vec_impl(
     const ushort tx = tiisg;
 
     // Compute masking bounds.
-    const uint kv_seq_len = params->kv_seq_len;
+    const uint kv_seq_len = params.kv_seq_len;
     // For decode: single query at position (kv_seq_len - 1).
     const uint abs_pos = kv_seq_len - 1;
     const uint causal_max_k = min(abs_pos + 1, kv_seq_len); // = kv_seq_len
 
     uint window_start = 0;
-    if (params->mask_type == 2 && params->sliding_window > 0) {
-        window_start = (abs_pos >= params->sliding_window)
-            ? (abs_pos - params->sliding_window + 1) : 0;
+    if (params.mask_type == 2 && params.sliding_window > 0) {
+        window_start = (abs_pos >= params.sliding_window)
+            ? (abs_pos - params.sliding_window + 1) : 0;
     }
 
     // KV vector type: float4 for F32 cache, half4 for F16 cache.
@@ -215,7 +215,7 @@ kernel void flash_attn_vec_impl(
 
             // Combine with mask and scale, store to scratch.
             // ss[tx] already contains the mask value for position (ic + tx).
-            ss[tx] = fma(mqk[tx], params->scale, ss[tx]);
+            ss[tx] = fma(mqk[tx], params.scale, ss[tx]);
         }
 
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -286,8 +286,8 @@ kernel void flash_attn_vec_impl(
     //   dst[rid * DV4 * NWG + NWG * i + iwg] = output float4 at dim chunk i
     //   After the DV data: S and M values for each (row, workgroup).
     if (sgitg == 0) {
-        const int64_t nrows = params->n_heads;  // For batch=1
-        const int64_t rid = iq2 + (int64_t)iq1 * params->n_heads;
+        const int64_t nrows = params.n_heads;  // For batch=1
+        const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
 
         device float4 *dst4 = (device float4 *)dst;
         device float  *dst1 = (device float *)dst + nrows * DV * NWG;
@@ -345,7 +345,7 @@ kernel flash_attn_vec_f16kv_t flash_attn_vec_impl<512, 512, half>;
 
 template<short DV>
 kernel void flash_attn_vec_reduce(
-    device const FlashAttnVecReduceParams *params [[buffer(0)]],
+    constant FlashAttnVecReduceParams     &params [[buffer(0)]],
     device const float                    *htmp   [[buffer(1)]],
     device       float                    *dst    [[buffer(2)]],
     constant     uint                     &nwg_param [[buffer(3)]],
@@ -360,7 +360,7 @@ kernel void flash_attn_vec_reduce(
     const ushort iwg = tiisg;    // each thread handles one workgroup
 
     // S and M values are stored after all DV data.
-    device const float *sm = htmp + (uint64_t)params->nrows * DV * NWG;
+    device const float *sm = htmp + (uint64_t)params.nrows * DV * NWG;
 
     // Load this workgroup's S and M.
     float S_wg = (iwg < NWG) ? sm[rid * (2 * NWG) + 2 * iwg + 0] : 0.0f;
