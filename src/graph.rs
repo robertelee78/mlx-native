@@ -1695,13 +1695,14 @@ impl<'a> GraphSession<'a> {
 
         if self.recording {
             if let Some(nodes) = self.encoder.take_capture() {
+                // Commit the capture encoder's empty command buffer so its
+                // MTLCommandQueue pool slot is freed (same fix as timing variant).
+                self.encoder.commit();
+
                 let mut graph = ComputeGraph::from_nodes(nodes);
                 fusions = graph.fuse(registry, device)?;
                 reordered = graph.reorder();
 
-                // Need two fresh encoders for dual-buffer encode.
-                // The original self.encoder's command buffer was used for capture
-                // and is now drained — create two new ones from the device.
                 let mut enc0 = self.device.command_encoder()?;
                 let mut enc1 = self.device.command_encoder()?;
 
@@ -1751,13 +1752,19 @@ impl<'a> GraphSession<'a> {
 
         if self.recording {
             if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
-                fusions = graph.fuse(registry, device)?;
+                // Commit the capture encoder's empty command buffer so its
+                // MTLCommandQueue pool slot is freed.  Without this, each
+                // token leaks one uncommitted buffer and the queue exhausts
+                // its ~64-slot pool after ~64 tokens, causing a deadlock.
+                self.encoder.commit();
 
-                // Safety: only reorder when ALL dispatch nodes have buffer
-                // range annotations.  Without complete annotations the
-                // conflict tracker cannot detect RAW/WAR/WAW hazards and
-                // the reorder may break data dependencies.
+                let opt_t0 = std::time::Instant::now();
+                let mut graph = ComputeGraph::from_nodes(nodes);
+                let fuse_t0 = std::time::Instant::now();
+                fusions = graph.fuse(registry, device)?;
+                let fuse_us = fuse_t0.elapsed().as_micros();
+
+                let reorder_t0 = std::time::Instant::now();
                 let unannotated = graph.unannotated_dispatch_count();
                 if unannotated == 0 {
                     reordered = graph.reorder();
@@ -1765,22 +1772,33 @@ impl<'a> GraphSession<'a> {
                     eprintln!("  [GRAPH_OPT] WARN: skipping reorder — {} of {} dispatches lack range annotations",
                         unannotated, graph.dispatch_count());
                 }
+                let reorder_us = reorder_t0.elapsed().as_micros();
+                let opt_us = opt_t0.elapsed().as_micros();
 
+                let diag = std::env::var("HF2Q_GRAPH_DIAG").is_ok();
+                let t0 = std::time::Instant::now();
                 let mut enc0 = self.device.command_encoder()?;
                 let mut enc1 = self.device.command_encoder()?;
+                let enc_create_us = t0.elapsed().as_micros();
 
-                // encode_dual_buffer encodes both chunks and commits enc0.
-                // Measure total CPU time from session begin through all encoding.
+                let t1 = std::time::Instant::now();
                 let (b0, b1) = graph.encode_dual_buffer(&mut enc0, &mut enc1);
                 barriers0 = b0;
                 barriers1 = b1;
+                let encode_us = t1.elapsed().as_micros();
 
                 let encoding_ns = session_begin.elapsed().as_nanos() as u64;
 
-                // Now commit enc1 and wait for GPU to finish both buffers.
                 let wait_start = std::time::Instant::now();
                 enc1.commit_and_wait()?;
                 let gpu_wait_ns = wait_start.elapsed().as_nanos() as u64;
+
+                if diag {
+                    eprintln!("  [DIAG] fuse={:.1}ms reorder={:.1}ms opt_total={:.1}ms enc_create={:.1}ms encode={:.1}ms gpu_wait={:.1}ms barriers={}+{}",
+                        fuse_us as f64 / 1e3, reorder_us as f64 / 1e3, opt_us as f64 / 1e3,
+                        enc_create_us as f64 / 1e3, encode_us as f64 / 1e3,
+                        gpu_wait_ns as f64 / 1e6, b0, b1);
+                }
 
                 return Ok((encoding_ns, gpu_wait_ns, fusions, reordered, barriers0, barriers1));
             }
