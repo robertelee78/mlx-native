@@ -50,6 +50,7 @@ mod encoder;
 mod kernel_registry;
 pub mod graph;
 pub mod ops;
+pub mod turboquant;
 pub mod weight;
 
 // ---- public re-exports ----

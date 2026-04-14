@@ -9,6 +9,8 @@ pub mod dense_gemm;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
+pub mod gather_bench;
+pub mod hadamard;
 pub mod encode_helpers;
 pub mod fused_head_norm_rope;
 pub mod fused_norm_add;

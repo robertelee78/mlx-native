@@ -36,3 +36,11 @@ harness = false
 [[bench]]
 name = "bench_moe_dispatch"
 harness = false
+
+[[bench]]
+name = "bench_gather"
+harness = false
+
+[[bench]]
+name = "bench_hadamard"
+harness = false
