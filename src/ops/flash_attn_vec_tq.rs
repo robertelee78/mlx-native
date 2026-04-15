@@ -115,24 +115,20 @@ const NWG: u32 = 32;
 
 /// Dispatch TQ flash attention vector kernel on the GPU.
 ///
-/// Dispatches NWG=32 workgroups per head (same as F16 SDPA), then a reduce
-/// kernel to combine partial results. FWHT is applied per-workgroup before
-/// writing partials; since FWHT is linear, the reduce output is already in
-/// the original (un-rotated) domain.
+/// Dispatches NWG=32 workgroups per head, then a reduce kernel.
+///
+/// **FWHT is NOT done inside this kernel.** The caller must:
+/// 1. Pre-rotate Q via `dispatch_fwht_f32` before calling this function
+/// 2. Apply inverse FWHT to the output after this function returns
+///
+/// With NWG=32, doing FWHT per-workgroup would repeat it 32× per head.
+/// Keeping FWHT outside means it's done once per head regardless of NWG.
 ///
 /// # Arguments
 ///
-/// * `encoder`      — Command encoder to record dispatches into.
-/// * `registry`     — Kernel registry for pipeline lookup/compilation.
-/// * `device`       — Metal device.
-/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32.
-/// * `k_packed`     — Nibble-packed K indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
-/// * `k_norms`      — Per-position K norms `[num_kv_heads, kv_capacity]`, F32.
-/// * `v_packed`     — Nibble-packed V indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
-/// * `v_norms`      — Per-position V norms `[num_kv_heads, kv_capacity]`, F32.
-/// * `output`       — Output buffer `[num_heads, 1, head_dim]`, F32, pre-allocated.
-/// * `tmp`          — Temporary buffer for NWG partial results. Size from `tmp_buffer_bytes()`.
-/// * `params`       — TQ flash attention parameters.
+/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32, **pre-rotated via FWHT**.
+/// * `output`       — Output buffer `[num_heads, 1, head_dim]`, F32, **in rotated domain**.
+/// * `tmp`          — Temporary buffer for NWG partial results.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_vec_tq(
     encoder: &mut CommandEncoder,

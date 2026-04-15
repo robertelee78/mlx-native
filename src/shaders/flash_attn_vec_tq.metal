@@ -185,47 +185,26 @@ kernel void flash_attn_vec_tq_impl(
     const uint kv_head = iq2 / heads_per_kv;
 
     // Shared memory layout:
-    //   [0, PK)                     — Q as half4 (FWHT-rotated in-kernel)
+    //   [0, PK)                     — Q as half4 (pre-rotated by caller)
     //   [PK, PK + SH)               — scratch for attention scores
-    //   [PK + SH, PK + SH + 2*PV)   — output accumulator as float4 / FWHT scratch
+    //   [PK + SH, PK + SH + 2*PV)   — output accumulator as float4
     //
-    // FWHT is fused into this kernel:
-    //   1. Q is loaded as float into so4 area, FWHT'd in-place, then cast to half4 into sq4
-    //   2. After SDPA, output in so4 is FWHT'd in-place (inverse rotation) then written
+    // FWHT is NOT done in this kernel. With NWG=32, doing FWHT per-workgroup
+    // would repeat it 32× per head. Instead:
+    //   - Caller pre-rotates Q via a standalone FWHT dispatch (1× per head)
+    //   - Partials are written in the rotated domain
+    //   - Caller applies inverse FWHT after the reduce kernel (1× per head)
 
     // Pointers.
     threadgroup half4  *sq4 = (threadgroup half4  *)(shmem);
     threadgroup float  *ss  = (threadgroup float  *)(shmem + PK);
     threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + SH);
 
-    // ---- In-kernel FWHT on Q ----
-    // Use so4 area as float scratch (PV floats >= DK floats).
-    // Load Q as float → FWHT in-place → cast to half4 into sq4.
+    // Load PRE-ROTATED Q directly into shared memory as half4.
     {
-        threadgroup float *q_scratch = (threadgroup float *)(shmem + PK + SH);
-
-        // Load Q into float scratch.
-        for (ushort i = tiisg; i < DK; i += NW) {
-            q_scratch[i] = Q[iq2 * DK + i];
-        }
-        // Zero padding beyond DK (needed for FWHT if DK < PV).
-        for (ushort i = DK + tiisg; i < PV; i += NW) {
-            q_scratch[i] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // FWHT in shared memory.
-        fwht_shared<DK>(q_scratch, tiisg, NW);
-
-        // Cast rotated Q from float to half4 into sq4.
         for (ushort i = tiisg; i < PK4; i += NW) {
             if (i < DK4) {
-                float4 qval = float4(
-                    q_scratch[i * 4 + 0],
-                    q_scratch[i * 4 + 1],
-                    q_scratch[i * 4 + 2],
-                    q_scratch[i * 4 + 3]
-                );
+                float4 qval = *((device const float4 *)(Q + iq2 * DK + i * 4));
                 sq4[i] = half4(qval);
             } else {
                 sq4[i] = half4(0.0h);
@@ -390,31 +369,18 @@ kernel void flash_attn_vec_tq_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Inverse FWHT + normalize + write output ----
+    // ---- Write output (rotated domain — caller handles inverse FWHT) ----
     //
-    // so4[0..DV4) holds the accumulated output in the rotated domain.
+    // so4[0..DV4) holds the accumulated partial in the rotated domain.
+    // NO in-kernel FWHT — with NWG=32 that would repeat it 32× per head.
+    // The caller applies inverse FWHT once after the reduce kernel.
     //
-    // Apply inverse FWHT BEFORE normalization so that both NWG=1 and NWG>1
-    // produce output in the original (un-rotated) domain:
-    //
-    // NWG=1: FWHT(partial) / S → final answer, written directly to dst.
-    // NWG>1: FWHT(partial) written raw to tmp (no /S). The reduce kernel
-    //        combines FWHT'd partials. Since FWHT is linear:
-    //        reduce(FWHT(p_i)) = FWHT(reduce(p_i)) = FWHT(final)
-    //        → reduce output is already in original domain. No post-reduce
-    //        FWHT dispatch needed.
+    // NWG==1: normalize by 1/S and write directly to dst.
+    // NWG>1:  write raw (unnormalized) partials to tmp for the reduce kernel.
     if (sgitg == 0) {
         const int64_t nrows = params.n_heads;
         const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
         const uint NWG_val = params.nwg;
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Inverse FWHT on accumulated output (rotate back to original domain).
-        // Applied to the RAW partial (not normalized by S) so the reduce
-        // kernel's weighted sum preserves correctness via linearity.
-        threadgroup float *out_floats = (threadgroup float *)so4;
-        fwht_shared<DV>(out_floats, tiisg, NW);
 
         // When NWG==1: normalize by 1/S directly. Otherwise write raw for reduce.
         const float inv_S = (NWG_val == 1) ? ((S == 0.0f) ? 0.0f : 1.0f / S) : 1.0f;
