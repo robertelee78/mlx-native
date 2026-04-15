@@ -7,6 +7,10 @@
 //! GGUF mmap. No intermediate conversion.
 //!
 //! Supported formats: Q4_0 (4-bit), Q8_0 (8-bit), Q6_K (6-bit super-block).
+//!
+//! Portions derived from candle-metal-kernels v0.10.2 (Apache-2.0) and
+//! llama.cpp (MIT). See src/shaders/quantized_matmul_ggml.metal for full
+//! attribution.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;

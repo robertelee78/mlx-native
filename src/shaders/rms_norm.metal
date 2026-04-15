@@ -210,7 +210,8 @@ kernel void rms_norm_no_scale_bf16(
 /// round-trip.
 ///
 /// Inspired by llama.cpp's kernel_rms_norm_mul_f32 (ggml-metal.metal),
-/// Apache-2.0 licensed.  Adapted for mlx-native's dispatch conventions.
+/// MIT licensed.  Copyright the llama.cpp Authors. See LICENSE-MIT-llamacpp.
+/// Adapted for mlx-native's dispatch conventions.
 ///
 /// Buffer layout:
 ///   buffer(0): input   — float array of shape [rows, dim]

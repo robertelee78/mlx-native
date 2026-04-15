@@ -1,5 +1,8 @@
 // dense_gemm.metal — Dense F16 matrix multiply: C = A * B^T
 //
+// Portions of this file are modeled after llama.cpp's kernel_mul_mv_f16_f32
+// (MIT licensed). Copyright the llama.cpp Authors. See LICENSE-MIT-llamacpp.
+//
 // Two kernels:
 //
 // 1. `dense_matvec_f16`  — Specialized M=1 mat-vec (decode path).
