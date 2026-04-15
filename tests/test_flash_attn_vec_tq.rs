@@ -277,22 +277,17 @@ fn run_sdpa_tq_test(
 
     // ---- GPU path ----
 
-    // The GPU kernel operates in the Hadamard-rotated domain:
-    // Q must be pre-rotated (FWHT per head), and the output is in the rotated
-    // domain (caller applies inverse FWHT).  Simulate the standalone FWHT
-    // dispatches that forward_mlx.rs issues around the kernel.
-    let mut q_rotated = q_data.clone();
-    for h in 0..nh {
-        let start = h * hd;
-        fwht_inplace(&mut q_rotated[start..start + hd]).unwrap();
-    }
+    // The GPU kernel fuses FWHT into the kernel:
+    //   - Q is loaded as float, FWHT'd in shared memory, then used for dot products
+    //   - Output accumulator is inverse-FWHT'd in shared memory before writing
+    // So Q goes in unrotated and output comes out unrotated — no external FWHT needed.
 
     // Allocate GPU buffers
     let mut q_buf = device
         .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
         .expect("alloc Q");
     q_buf.as_mut_slice::<f32>().expect("write Q")[..nh * hd]
-        .copy_from_slice(&q_rotated);
+        .copy_from_slice(&q_data);
 
     let mut k_packed_buf = device
         .alloc_buffer(k_packed_all.len(), DType::U8, vec![nkv, kvl, hd / 2])
@@ -353,13 +348,8 @@ fn run_sdpa_tq_test(
 
     encoder.commit_and_wait().expect("commit");
 
-    // Read GPU output (in Hadamard-rotated domain) and inverse-rotate back.
-    // FWHT is self-inverse: H^{-1} = H for the normalized form.
-    let mut gpu_output: Vec<f32> = output_buf.as_slice::<f32>().expect("read output").to_vec();
-    for h in 0..nh {
-        let start = h * hd;
-        fwht_inplace(&mut gpu_output[start..start + hd]).unwrap();
-    }
+    // Read GPU output — FWHT is fused into the kernel, output is in original domain.
+    let gpu_output: Vec<f32> = output_buf.as_slice::<f32>().expect("read output").to_vec();
 
     // Compare CPU vs GPU
     let mut max_abs_diff = 0.0f32;

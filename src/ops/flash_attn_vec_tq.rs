@@ -7,8 +7,8 @@
 //! Key differences from `flash_attn_vec`:
 //! - NWG=1: no reduce kernel needed (TQ's 4× smaller KV reads mean one
 //!   workgroup per head is sufficient)
-//! - Q arrives pre-rotated via standalone FWHT dispatch
-//! - Output stays rotated; caller applies inverse FWHT via standalone dispatch
+//! - FWHT rotation of Q and inverse-FWHT of output are FUSED into the kernel
+//!   (no standalone FWHT dispatches or barriers needed by the caller)
 //! - Dequant is inline: codebook[nibble] * inv_sqrt(head_dim) * norm
 //! - Zero scattered memory access — codebook fits in registers
 
@@ -113,7 +113,7 @@ fn validate_params(params: &FlashAttnVecTqParams) -> Result<()> {
 /// * `encoder`      — Command encoder to record dispatches into.
 /// * `registry`     — Kernel registry for pipeline lookup/compilation.
 /// * `device`       — Metal device.
-/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32 (pre-rotated via FWHT).
+/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32 (FWHT applied in-kernel).
 /// * `k_packed`     — Nibble-packed K indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
 /// * `k_norms`      — Per-position K norms `[num_kv_heads, kv_capacity]`, F32.
 /// * `v_packed`     — Nibble-packed V indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.

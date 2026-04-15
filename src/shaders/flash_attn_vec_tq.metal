@@ -139,9 +139,10 @@ inline float4 dequant_tq_float4(
 // Main TQ flash attention vector kernel.
 //
 // Same structure as flash_attn_vec_impl but:
-//   - Q is FWHT-rotated in shared memory before dot products
-//   - K/V are gathered from nibble-packed buffers + centroid table
-//   - Accumulated output is inverse-FWHT-rotated before writing
+//   - Q is FWHT-rotated IN-KERNEL in shared memory before dot products
+//   - K/V dequant is inline from nibble-packed buffers + register codebook
+//   - Accumulated output is inverse-FWHT-rotated IN-KERNEL before writing
+//   - Both FWHT transforms fused to eliminate 2 extra dispatches + barriers
 // ---------------------------------------------------------------------------
 template<short DK, short DV>
 kernel void flash_attn_vec_tq_impl(
@@ -184,25 +185,47 @@ kernel void flash_attn_vec_tq_impl(
     const uint kv_head = iq2 / heads_per_kv;
 
     // Shared memory layout:
-    //   [0, PK)                     — Q as half4 (pre-rotated, loaded directly)
+    //   [0, PK)                     — Q as half4 (FWHT-rotated in-kernel)
     //   [PK, PK + SH)               — scratch for attention scores
-    //   [PK + SH, PK + SH + 2*PV)   — output accumulator as float4
+    //   [PK + SH, PK + SH + 2*PV)   — output accumulator as float4 / FWHT scratch
     //
-    // No FWHT scratch needed — Q arrives pre-rotated from a standalone dispatch,
-    // and the output is written in the rotated domain for a standalone inverse FWHT.
+    // FWHT is fused into this kernel:
+    //   1. Q is loaded as float into so4 area, FWHT'd in-place, then cast to half4 into sq4
+    //   2. After SDPA, output in so4 is FWHT'd in-place (inverse rotation) then written
 
     // Pointers.
     threadgroup half4  *sq4 = (threadgroup half4  *)(shmem);
     threadgroup float  *ss  = (threadgroup float  *)(shmem + PK);
     threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + SH);
 
-    // Load PRE-ROTATED Q directly into shared memory as half4.
-    // The caller has already applied FWHT to Q via a standalone dispatch.
-    // No in-kernel rotation needed — just load and cast F32 → half4.
+    // ---- In-kernel FWHT on Q ----
+    // Use so4 area as float scratch (PV floats >= DK floats).
+    // Load Q as float → FWHT in-place → cast to half4 into sq4.
     {
+        threadgroup float *q_scratch = (threadgroup float *)(shmem + PK + SH);
+
+        // Load Q into float scratch.
+        for (ushort i = tiisg; i < DK; i += NW) {
+            q_scratch[i] = Q[iq2 * DK + i];
+        }
+        // Zero padding beyond DK (needed for FWHT if DK < PV).
+        for (ushort i = DK + tiisg; i < PV; i += NW) {
+            q_scratch[i] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // FWHT in shared memory.
+        fwht_shared<DK>(q_scratch, tiisg, NW);
+
+        // Cast rotated Q from float to half4 into sq4.
         for (ushort i = tiisg; i < PK4; i += NW) {
             if (i < DK4) {
-                float4 qval = *((device const float4 *)(Q + iq2 * DK + i * 4));
+                float4 qval = float4(
+                    q_scratch[i * 4 + 0],
+                    q_scratch[i * 4 + 1],
+                    q_scratch[i * 4 + 2],
+                    q_scratch[i * 4 + 3]
+                );
                 sq4[i] = half4(qval);
             } else {
                 sq4[i] = half4(0.0h);
@@ -367,20 +390,9 @@ kernel void flash_attn_vec_tq_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Inverse FWHT on accumulated output ----
-    // The output is in the rotated domain. Apply FWHT to rotate back.
-    // (Since H^{-1} = H for normalized Hadamard, inverse = forward.)
-    //
-    // The output is stored as float4 in so4[0..DV4).
-    // We need to copy it to a contiguous float array, apply FWHT, then write out.
-    //
-    // Reuse fwht_scratch = (float*)(shmem + PK + SH) which overlaps so4.
-    // So first copy so4 to a temporary location... but we don't have one.
-    //
-    // Actually, so4 IS fwht_scratch (same memory). The float4 layout in so4
-    // Output stays in rotated domain — the caller applies inverse FWHT
-    // via a standalone dispatch after this kernel completes.
-    // No in-kernel FWHT on the output.
+    // ---- Normalize + inverse FWHT + write output ----
+    // so4[0..DV4) holds the accumulated output in the rotated domain.
+    // float4 layout IS contiguous floats, so we can run fwht_shared on it.
     if (sgitg == 0) {
         const int64_t nrows = params.n_heads;
         const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
@@ -392,7 +404,15 @@ kernel void flash_attn_vec_tq_impl(
             so4[i] *= inv_S;
         }
 
-        // Write to destination (still in rotated domain).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inverse FWHT on accumulated output (rotate back to original domain).
+        // H^{-1} = H for the normalized Hadamard — same fwht_shared function.
+        // so4 as float4* overlays contiguous floats: reinterpret for FWHT.
+        threadgroup float *out_floats = (threadgroup float *)so4;
+        fwht_shared<DV>(out_floats, tiisg, NW);
+
+        // Write FWHT'd output to destination.
         device float4 *dst4 = (device float4 *)dst;
         const uint NWG_val = params.nwg;
 
