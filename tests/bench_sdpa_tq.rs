@@ -10,6 +10,8 @@
 
 use std::time::Instant;
 
+use metal::MTLSize;
+use mlx_native::ops::encode_helpers::{as_bytes, KernelArg};
 use mlx_native::ops::flash_attn_vec::{self, FlashAttnVecParams};
 use mlx_native::ops::flash_attn_vec_tq::{self, FlashAttnVecTqParams};
 use mlx_native::turboquant::{fwht_inplace, CODEBOOK_4BIT};
@@ -88,6 +90,10 @@ fn setup() -> (MlxDevice, KernelRegistry) {
     let mut registry = KernelRegistry::new();
     flash_attn_vec_tq::register(&mut registry);
     mlx_native::ops::flash_attn_vec::register(&mut registry);
+    // Register v2 tiled kernel for benchmarking.
+    let v2_src = include_str!("../src/shaders/flash_attn_vec_tq_v2.metal");
+    registry.register_source("flash_attn_vec_tq_v2_dk256", v2_src);
+    registry.register_source("flash_attn_vec_tq_v2_dk512", v2_src);
     (device, registry)
 }
 
@@ -373,5 +379,206 @@ fn bench_tq_nwg_sweep() {
     for &nwg in &[1u32, 2, 4, 8, 16, 32] {
         let us = bench_tq_sdpa(&device, &mut registry, nh, nkv, hd, kvl, Some(nwg), warmup, iters);
         eprintln!("{:>6} {:>12.1}", nwg, us);
+    }
+}
+
+// ---- TQ v2 (tiled dequant) bench ----
+
+/// GPU params — must match FlashAttnVecTqParams in the shader.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TqParamsGpu {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    scale: f32,
+    mask_type: u32,
+    sliding_window: u32,
+    softcap: f32,
+    nwg: u32,
+}
+
+fn bench_tq_v2_sdpa(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    kv_seq_len: u32,
+    nwg: u32,
+    warmup: usize,
+    iters: usize,
+) -> f64 {
+    let mut rng = Xoshiro256::new(42);
+    let nh = num_heads as usize;
+    let nkv = num_kv_heads as usize;
+    let hd = head_dim as usize;
+    let kvl = kv_seq_len as usize;
+
+    // Same data setup as v1 bench
+    let q_data = random_f32_vec(&mut rng, nh * hd);
+    let mut k_packed = vec![0u8; nkv * kvl * (hd / 2)];
+    let mut k_norms = vec![0.0f32; nkv * kvl];
+    let mut v_packed = vec![0u8; nkv * kvl * (hd / 2)];
+    let mut v_norms = vec![0.0f32; nkv * kvl];
+
+    for kv_h in 0..nkv {
+        for p in 0..kvl {
+            let k_vec = random_f32_vec(&mut rng, hd);
+            let mut rotated = k_vec.clone();
+            fwht_inplace(&mut rotated).unwrap();
+            let norm: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
+            k_norms[kv_h * kvl + p] = norm;
+            if norm > 1e-30 {
+                let inv_norm = 1.0 / norm;
+                let scale = (hd as f32).sqrt();
+                let offset = (kv_h * kvl + p) * (hd / 2);
+                for c in 0..hd {
+                    let scaled = rotated[c] * inv_norm * scale;
+                    let idx = nearest_centroid_4bit(scaled);
+                    if c % 2 == 0 { k_packed[offset + c / 2] = idx & 0xF; }
+                    else { k_packed[offset + c / 2] |= (idx & 0xF) << 4; }
+                }
+            }
+            let v_vec = random_f32_vec(&mut rng, hd);
+            let mut v_rot = v_vec.clone();
+            fwht_inplace(&mut v_rot).unwrap();
+            let v_norm: f32 = v_rot.iter().map(|v| v * v).sum::<f32>().sqrt();
+            v_norms[kv_h * kvl + p] = v_norm;
+            if v_norm > 1e-30 {
+                let inv_norm = 1.0 / v_norm;
+                let scale = (hd as f32).sqrt();
+                let offset = (kv_h * kvl + p) * (hd / 2);
+                for c in 0..hd {
+                    let scaled = v_rot[c] * inv_norm * scale;
+                    let idx = nearest_centroid_4bit(scaled);
+                    if c % 2 == 0 { v_packed[offset + c / 2] = idx & 0xF; }
+                    else { v_packed[offset + c / 2] |= (idx & 0xF) << 4; }
+                }
+            }
+        }
+    }
+
+    let mut q_rotated = q_data.clone();
+    for h in 0..nh {
+        fwht_inplace(&mut q_rotated[h * hd..(h + 1) * hd]).unwrap();
+    }
+
+    let mut q_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    q_buf.as_mut_slice::<f32>().unwrap()[..nh * hd].copy_from_slice(&q_rotated);
+    let mut k_packed_buf = device.alloc_buffer(k_packed.len(), DType::U8, vec![nkv, kvl, hd / 2]).unwrap();
+    k_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&k_packed);
+    let mut k_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv, kvl]).unwrap();
+    k_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_norms);
+    let mut v_packed_buf = device.alloc_buffer(v_packed.len(), DType::U8, vec![nkv, kvl, hd / 2]).unwrap();
+    v_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&v_packed);
+    let mut v_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv, kvl]).unwrap();
+    v_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_norms);
+
+    let output_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+
+    let kernel_name = match head_dim {
+        256 => "flash_attn_vec_tq_v2_dk256",
+        512 => "flash_attn_vec_tq_v2_dk512",
+        _ => panic!("unsupported head_dim"),
+    };
+
+    let gpu_params = TqParamsGpu {
+        n_heads: num_heads, n_kv_heads: num_kv_heads,
+        head_dim, kv_seq_len, kv_capacity: kv_seq_len,
+        scale: 1.0, mask_type: 1, sliding_window: 0, softcap: 0.0,
+        nwg,
+    };
+
+    // CT (chunk tile size) determines shared memory:
+    let ct: usize = if head_dim == 512 { 16 } else { 32 };
+    let dk4 = head_dim as usize / 4;
+    let dv4 = dk4; // DK == DV for Gemma
+    let pk = ((head_dim as usize) + 127) & !127; // PAD2(hd, 128)
+    let pv = pk;
+    let sh = 4 * ct; // CT * 4 halfs for scores
+    let tile_size = ct * dk4.max(dv4); // tile_buf in half4
+    let shmem_halfs = pk + sh + 2 * pv + tile_size * 4; // tile_buf is half4 = 4 halfs each
+    let shmem_bytes = shmem_halfs * 2;
+
+    // Warmup
+    for _ in 0..warmup {
+        let mut encoder = device.command_encoder().unwrap();
+        let pipeline = registry.get_pipeline(kernel_name, device.metal_device()).unwrap();
+        let threadgroups = MTLSize::new(1, num_heads as u64, nwg as u64);
+        let threadgroup_size = MTLSize::new(32, 1, 1);
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+                (1, KernelArg::Buffer(&q_buf)),
+                (2, KernelArg::Buffer(&k_packed_buf)),
+                (3, KernelArg::Buffer(&k_norms_buf)),
+                (4, KernelArg::Buffer(&v_packed_buf)),
+                (5, KernelArg::Buffer(&v_norms_buf)),
+                (6, KernelArg::Buffer(&output_buf)),
+            ],
+            &[(0, shmem_bytes as u64)],
+            threadgroups,
+            threadgroup_size,
+        );
+        encoder.commit_and_wait().unwrap();
+    }
+
+    // Timed
+    let start = Instant::now();
+    for _ in 0..iters {
+        let mut encoder = device.command_encoder().unwrap();
+        let pipeline = registry.get_pipeline(kernel_name, device.metal_device()).unwrap();
+        let threadgroups = MTLSize::new(1, num_heads as u64, nwg as u64);
+        let threadgroup_size = MTLSize::new(32, 1, 1);
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+                (1, KernelArg::Buffer(&q_buf)),
+                (2, KernelArg::Buffer(&k_packed_buf)),
+                (3, KernelArg::Buffer(&k_norms_buf)),
+                (4, KernelArg::Buffer(&v_packed_buf)),
+                (5, KernelArg::Buffer(&v_norms_buf)),
+                (6, KernelArg::Buffer(&output_buf)),
+            ],
+            &[(0, shmem_bytes as u64)],
+            threadgroups,
+            threadgroup_size,
+        );
+        encoder.commit_and_wait().unwrap();
+    }
+    let elapsed = start.elapsed();
+    elapsed.as_secs_f64() * 1e6 / iters as f64
+}
+
+#[test]
+fn bench_tq_v1_vs_v2() {
+    let (device, mut registry) = setup();
+
+    let warmup = 5;
+    let iters = 30;
+
+    eprintln!("\n=== TQ SDPA v1 vs v2: Sliding (nh=16, nkv=8, hd=256) ===");
+    eprintln!("{:>8} {:>12} {:>12} {:>12} {:>8}", "kv_len", "v1 (μs)", "v2 (μs)", "F16 (μs)", "v2/F16");
+
+    for &kvl in &[32u32, 128, 512, 1024] {
+        let v1 = bench_tq_sdpa(&device, &mut registry, 16, 8, 256, kvl, Some(16), warmup, iters);
+        let v2 = bench_tq_v2_sdpa(&device, &mut registry, 16, 8, 256, kvl, 16, warmup, iters);
+        let f16 = bench_f16_sdpa(&device, &mut registry, 16, 8, 256, kvl, warmup, iters);
+        eprintln!("{:>8} {:>12.1} {:>12.1} {:>12.1} {:>8.2}x", kvl, v1, v2, f16, v2 / f16);
+    }
+
+    eprintln!("\n=== TQ SDPA v1 vs v2: Global (nh=16, nkv=2, hd=512) ===");
+    eprintln!("{:>8} {:>12} {:>12} {:>12} {:>8}", "kv_len", "v1 (μs)", "v2 (μs)", "F16 (μs)", "v2/F16");
+
+    for &kvl in &[32u32, 128, 512, 1024] {
+        let v1 = bench_tq_sdpa(&device, &mut registry, 16, 2, 512, kvl, Some(16), warmup, iters);
+        let v2 = bench_tq_v2_sdpa(&device, &mut registry, 16, 2, 512, kvl, 16, warmup, iters);
+        let f16 = bench_f16_sdpa(&device, &mut registry, 16, 2, 512, kvl, warmup, iters);
+        eprintln!("{:>8} {:>12.1} {:>12.1} {:>12.1} {:>8.2}x", kvl, v1, v2, f16, v2 / f16);
     }
 }
