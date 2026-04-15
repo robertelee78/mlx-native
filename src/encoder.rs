@@ -220,6 +220,7 @@ pub fn dispatch_count() -> u64 {
 /// ```
 pub struct CommandEncoder {
     cmd_buf: CommandBuffer,
+    // SAFETY marker: see unsafe Send impl below.
     /// Raw pointer to the persistent compute encoder.
     /// Non-null when a compute pass is active.
     /// The encoder borrows from `cmd_buf` but we cannot express this
@@ -240,6 +241,22 @@ pub struct CommandEncoder {
     /// Pending write buffer ranges for the NEXT captured dispatch.
     pending_writes: Vec<MemRange>,
 }
+
+/// SAFETY: CommandEncoder is safe to Send across threads provided that:
+/// 1. Only one thread accesses the encoder at a time (exclusive ownership).
+/// 2. The encoder is not used concurrently from multiple threads.
+///
+/// Metal command buffers and compute encoders are thread-safe for exclusive
+/// access (Apple documentation: "You can create command buffers, encode
+/// commands, and submit them from any thread"). The raw pointer
+/// `active_encoder` borrows from `cmd_buf` and is valid as long as
+/// `cmd_buf` is alive — this invariant holds across thread boundaries
+/// because both fields move together.
+///
+/// This matches llama.cpp's pattern of encoding command buffers on GCD
+/// worker threads via `dispatch_apply`, and is used for the dual-buffer
+/// pipeline where buf1 is encoded on a worker thread while buf0 executes.
+unsafe impl Send for CommandEncoder {}
 
 impl CommandEncoder {
     /// Create a new command encoder from the given command queue.

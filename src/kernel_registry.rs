@@ -224,6 +224,16 @@ impl KernelRegistry {
         sources.insert("dense_matvec_f16".into(), dense_gemm_src);
         sources.insert("dense_matvec_f16w_f32io".into(), dense_gemm_src);
 
+        // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
+        let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
+        sources.insert("fwht_standalone_f32_d256".into(), fwht_src);
+        sources.insert("fwht_standalone_f32_d512".into(), fwht_src);
+
+        // Fast Hadamard quantize (SIMD shuffle, zero barriers)
+        let hq_fast_src: &'static str = include_str!("shaders/hadamard_quantize_kv_fast.metal");
+        sources.insert("hadamard_quantize_kv_fast_d256".into(), hq_fast_src);
+        sources.insert("hadamard_quantize_kv_fast_d512".into(), hq_fast_src);
+
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);

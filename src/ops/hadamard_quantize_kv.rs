@@ -168,7 +168,14 @@ pub fn dispatch_hadamard_quantize_kv(
         )));
     }
 
-    let pipeline = registry.get_pipeline("hadamard_quantize_kv", device)?;
+    // Use the fast SIMD-shuffle kernel (zero threadgroup barriers).
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_fast_d256",
+        512 => "hadamard_quantize_kv_fast_d512",
+        _ => "hadamard_quantize_kv", // fallback to shared-memory version
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let params = HadamardQuantizeParams {
         head_dim,
@@ -179,23 +186,38 @@ pub fn dispatch_hadamard_quantize_kv(
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
-    // Shared memory: 2 * head_dim * sizeof(float) bytes.
-    let shared_mem_bytes = 2u64 * (head_dim as u64) * 4;
-
-    // Dispatch: one threadgroup per KV head, head_dim threads per threadgroup.
-    encode_threadgroups_with_args_and_shared(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(src)),
-            (1, KernelArg::Buffer(packed)),
-            (2, KernelArg::Buffer(norms)),
-            (3, KernelArg::Bytes(params_bytes)),
-        ],
-        &[(0, shared_mem_bytes)],
-        MTLSize::new(num_kv_heads as u64, 1, 1),
-        MTLSize::new(head_dim as u64, 1, 1),
-    );
+    if kernel_name.starts_with("hadamard_quantize_kv_fast") {
+        // Fast kernel: 1 simdgroup (32 threads) per head, no shared memory.
+        use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+        encode_threadgroups_with_args(
+            encoder,
+            pipeline,
+            &[
+                (0, KA::Buffer(src)),
+                (1, KA::Buffer(packed)),
+                (2, KA::Buffer(norms)),
+                (3, KA::Bytes(params_bytes)),
+            ],
+            MTLSize::new(num_kv_heads as u64, 1, 1),
+            MTLSize::new(32, 1, 1), // 1 simdgroup
+        );
+    } else {
+        // Fallback: shared-memory version for non-256/512 head_dim.
+        let shared_mem_bytes = 2u64 * (head_dim as u64) * 4;
+        encode_threadgroups_with_args_and_shared(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(src)),
+                (1, KernelArg::Buffer(packed)),
+                (2, KernelArg::Buffer(norms)),
+                (3, KernelArg::Bytes(params_bytes)),
+            ],
+            &[(0, shared_mem_bytes)],
+            MTLSize::new(num_kv_heads as u64, 1, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+    }
 
     Ok(())
 }

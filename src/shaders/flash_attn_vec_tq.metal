@@ -177,66 +177,25 @@ kernel void flash_attn_vec_tq_impl(
     const uint kv_head = iq2 / heads_per_kv;
 
     // Shared memory layout:
-    //   [0, PK)                     — Q as half4 (after FWHT, stored as half for compute)
+    //   [0, PK)                     — Q as half4 (pre-rotated, loaded directly)
     //   [PK, PK + SH)               — scratch for attention scores
     //   [PK + SH, PK + SH + 2*PV)   — output accumulator as float4
     //
-    // Additional scratch for FWHT: we need DK floats for Q rotation and
-    // DV floats for output rotation. We reuse the Q region (PK halfs = PK/2 floats)
-    // for FWHT since PK >= DK. For output rotation, we reuse the output accumulator
-    // region (2*PV halfs = PV floats >= DV).
-    //
-    // FWHT scratch for Q: use a separate region after the main layout.
-    // Actually, we can do FWHT in the Q half4 region if we temporarily use it as float.
-    // PK halfs = PK*2 bytes. PK floats would need PK*4 bytes = 2*PK halfs.
-    // That doesn't fit. Instead, use the region after the output accumulator.
-    //
-    // Extended shared memory layout:
-    //   [0, PK)                           — Q as half4
-    //   [PK, PK + SH)                     — scratch
-    //   [PK + SH, PK + SH + 2*PV)         — output accumulator (float4)
-    //   [PK + SH + 2*PV, PK + SH + 2*PV + 2*DK)  — FWHT scratch for Q (DK floats)
-    //
-    // Wait, we need the FWHT scratch only temporarily during Q load.
-    // After FWHT, Q is stored as half4 in the first PK region.
-    // So we can overlay the FWHT scratch with the output accumulator region
-    // since it hasn't been used yet. DK floats = 2*DK halfs.
-    // Output region is 2*PV halfs >= 2*DV halfs = 2*DK halfs (since DK=DV). OK!
+    // No FWHT scratch needed — Q arrives pre-rotated from a standalone dispatch,
+    // and the output is written in the rotated domain for a standalone inverse FWHT.
 
     // Pointers.
     threadgroup half4  *sq4 = (threadgroup half4  *)(shmem);
     threadgroup float  *ss  = (threadgroup float  *)(shmem + PK);
     threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + SH);
 
-    // FWHT scratch: reuse output accumulator region as float array.
-    // This is safe because we do FWHT before the main loop starts accumulating.
-    threadgroup float *fwht_scratch = (threadgroup float *)(shmem + PK + SH);
-
-    // Load Q into FWHT scratch as float for rotation.
+    // Load PRE-ROTATED Q directly into shared memory as half4.
+    // The caller has already applied FWHT to Q via a standalone dispatch.
+    // No in-kernel rotation needed — just load and cast F32 → half4.
     {
-        device const float4 *q4 = (device const float4 *)(Q + iq2 * DK);
-        // Load Q into fwht_scratch as individual floats.
-        for (ushort i = tiisg; i < DK; i += NW) {
-            // Access Q as float array.
-            fwht_scratch[i] = Q[iq2 * DK + i];
-        }
-        // Pad remaining to zero if PV > DK (shouldn't happen for DK=DV but be safe).
-        // Actually fwht_scratch is PV floats = DV floats = DK floats. Exact match.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Apply FWHT to Q in shared memory.
-        fwht_shared<DK>(fwht_scratch, tiisg, NW);
-        // fwht_shared ends with a barrier.
-
-        // Copy rotated Q from fwht_scratch (float) to sq4 (half4).
         for (ushort i = tiisg; i < PK4; i += NW) {
             if (i < DK4) {
-                float4 qval = float4(
-                    fwht_scratch[i * 4 + 0],
-                    fwht_scratch[i * 4 + 1],
-                    fwht_scratch[i * 4 + 2],
-                    fwht_scratch[i * 4 + 3]
-                );
+                float4 qval = *((device const float4 *)(Q + iq2 * DK + i * 4));
                 sq4[i] = half4(qval);
             } else {
                 sq4[i] = half4(0.0h);
@@ -408,49 +367,21 @@ kernel void flash_attn_vec_tq_impl(
     // So first copy so4 to a temporary location... but we don't have one.
     //
     // Actually, so4 IS fwht_scratch (same memory). The float4 layout in so4
-    // is contiguous: so4[0].x = fwht_scratch[0], so4[0].y = fwht_scratch[1], etc.
-    // So the data is already in the right format for FWHT.
-    //
-    // But before FWHT, we need to normalize by 1/S. Actually, the original kernel
-    // normalizes by 1/S when NWG==1, or leaves raw for the reduce kernel.
-    // We should do the same: apply FWHT only when NWG==1, otherwise the reduce
-    // kernel will handle normalization, and we apply FWHT there... but the reduce
-    // kernel is shared and doesn't know about TQ.
-    //
-    // SOLUTION: When NWG==1, apply FWHT before writing to dst.
-    // When NWG>1, store raw rotated output to tmp (same as original kernel).
-    // The reduce kernel combines partial results (which are all in rotated domain).
-    // After reduce, a separate FWHT pass is needed on the final output.
-    //
-    // For now: implement FWHT in the NWG==1 path. For NWG>1, the dispatch wrapper
-    // will need to handle the post-reduce FWHT. We can either:
-    //   a) Add a separate FWHT kernel dispatch after reduce, or
-    //   b) Force NWG=1 for TQ (simpler, and TQ already saves bandwidth so the
-    //      benefit of NWG>1 is less critical).
-    //
-    // Let's implement option (b) for now: the dispatch wrapper will set NWG=1.
-    // This simplifies the kernel — we always apply FWHT and normalize here.
-
+    // Output stays in rotated domain — the caller applies inverse FWHT
+    // via a standalone dispatch after this kernel completes.
+    // No in-kernel FWHT on the output.
     if (sgitg == 0) {
         const int64_t nrows = params.n_heads;
         const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
 
         const float inv_S = (S == 0.0f) ? 0.0f : 1.0f / S;
 
-        // Normalize the output.
+        // Normalize the output by 1/S.
         for (ushort i = tiisg; i < DV4; i += NW) {
             so4[i] *= inv_S;
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Apply inverse FWHT to the normalized output.
-        // so4 overlaps fwht_scratch. Data is contiguous float layout.
-        threadgroup float *out_fwht = (threadgroup float *)(shmem + PK + SH);
-        fwht_shared<DV>(out_fwht, tiisg, NW);
-        // fwht_shared ends with a barrier.
-
-        // Write to destination.
+        // Write to destination (still in rotated domain).
         device float4 *dst4 = (device float4 *)dst;
         const uint NWG_val = params.nwg;
 
