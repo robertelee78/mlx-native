@@ -109,22 +109,25 @@ constant float CODEBOOK_4BIT[16] = {
 // coord_offset: starting coordinate index (must be multiple of 4)
 // scale_norm: pre-multiplied (1/sqrt(head_dim)) * norm
 // ---------------------------------------------------------------------------
+// Reconstruct float4 from 2 adjacent packed bytes (4 nibble indices).
+//
+// packed_base: pointer to position's packed data [head_dim/2 bytes]
+// byte_offset: byte offset into packed_base (= coord_offset / 2, always even)
+// scale_norm: pre-multiplied (1/sqrt(head_dim)) * norm
 inline float4 dequant_tq_float4(
     device const uint8_t *packed_base,
-    uint coord_offset,
+    uint byte_offset,
     float scale_norm
 ) {
-    // Read 2 bytes = 4 nibble indices
-    // Layout: low nibble = even coord, high nibble = odd coord
-    uint byte0_idx = coord_offset / 2;
-    uint byte1_idx = (coord_offset + 2) / 2;
-    uint8_t byte0 = packed_base[byte0_idx];
-    uint8_t byte1 = packed_base[byte1_idx];
+    // Single 16-bit load for 2 adjacent bytes = 4 nibbles.
+    // This is cheaper than two separate byte loads.
+    ushort packed = *((device const ushort *)(packed_base + byte_offset));
 
-    uint idx0 = byte0 & 0xFu;          // coord_offset + 0 (even -> low nibble)
-    uint idx1 = (byte0 >> 4u) & 0xFu;  // coord_offset + 1 (odd -> high nibble)
-    uint idx2 = byte1 & 0xFu;          // coord_offset + 2 (even -> low nibble)
-    uint idx3 = (byte1 >> 4u) & 0xFu;  // coord_offset + 3 (odd -> high nibble)
+    // Extract 4 nibble indices from the 16-bit value.
+    uint idx0 = packed & 0xFu;
+    uint idx1 = (packed >> 4u) & 0xFu;
+    uint idx2 = (packed >> 8u) & 0xFu;
+    uint idx3 = (packed >> 12u) & 0xFu;
 
     return float4(
         CODEBOOK_4BIT[idx0] * scale_norm,
@@ -282,17 +285,16 @@ kernel void flash_attn_vec_tq_impl(
                     continue;
                 }
 
-                // Pre-multiply norm * inv_sqrt_dk for register-only dequant.
-                float k_scale_norm = K_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dk;
+                float k_sn = K_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dk;
 
-                // Pointer to packed K data for this position.
-                device const uint8_t *k_packed_pos =
-                    K_packed + (kv_head * params.kv_capacity + kv_pos) * (DK / 2);
+                // Base pointer to packed K for this position.
+                // Precompute the position offset once, then stride by 2 bytes per ii.
+                device const uint8_t *k_base =
+                    K_packed + (kv_head * params.kv_capacity + kv_pos) * (DK / 2) + tx * 2u;
 
                 float partial = 0.0f;
                 for (short ii = 0; ii < DK4 / NL; ++ii) {
-                    uint coord = (uint)(ii * NL + tx) * 4u;
-                    float4 k_val = dequant_tq_float4(k_packed_pos, coord, k_scale_norm);
+                    float4 k_val = dequant_tq_float4(k_base, (uint)(ii * NL) * 2u, k_sn);
                     partial += dot(k_val, float4(pq4[ii * NL]));
                 }
                 mqk[cc] = simd_sum(partial);
@@ -340,15 +342,13 @@ kernel void flash_attn_vec_tq_impl(
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) continue;
 
-                float v_scale_norm = V_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dv;
-                device const uint8_t *v_packed_pos =
-                    V_packed + (kv_head * params.kv_capacity + kv_pos) * (DV / 2);
+                // Fold weight into scale_norm: dequant returns pre-weighted values.
+                float v_sw = V_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dv * ss[cc];
+                device const uint8_t *v_base =
+                    V_packed + (kv_head * params.kv_capacity + kv_pos) * (DV / 2) + tx * 2u;
 
-                float weight = ss[cc];
                 for (short ii = 0; ii < DV4 / NL; ++ii) {
-                    uint coord = (uint)(ii * NL + tx) * 4u;
-                    float4 v_val = dequant_tq_float4(v_packed_pos, coord, v_scale_norm);
-                    lo[ii] += v_val * weight;
+                    lo[ii] += dequant_tq_float4(v_base, (uint)(ii * NL) * 2u, v_sw);
                 }
             }
 
