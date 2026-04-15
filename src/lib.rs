@@ -52,6 +52,7 @@ mod device;
 mod dtypes;
 mod encoder;
 mod kernel_registry;
+pub mod gguf;
 pub mod graph;
 pub mod ops;
 pub mod turboquant;
@@ -69,6 +70,9 @@ pub use encoder::{
 pub use error::{MlxError, Result};
 pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
 pub use kernel_registry::KernelRegistry;
+
+// Re-export GGUF parser.
+pub use gguf::{GgufFile, MetadataValue, TensorInfo};
 
 // Re-export ops.
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};

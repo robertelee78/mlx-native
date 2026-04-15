@@ -53,6 +53,13 @@ pub struct FlashAttnVecTqParams {
     pub softcap: f32,
 }
 
+/// GPU-side reduce params. Must match `FlashAttnVecReduceParams` in the MSL.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlashAttnVecReduceParamsGpu {
+    nrows: u32,
+}
+
 /// GPU-side parameter struct. Must match the MSL `FlashAttnVecTqParams` exactly.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -102,23 +109,29 @@ fn validate_params(params: &FlashAttnVecTqParams) -> Result<()> {
     Ok(())
 }
 
+/// Number of workgroups per head for TQ SDPA. Must match the F16 SDPA's NWG
+/// for similar parallelism. Each workgroup processes kv_seq_len/NWG chunks.
+const NWG: u32 = 32;
+
 /// Dispatch TQ flash attention vector kernel on the GPU.
 ///
-/// This dispatches a single Metal compute pass (NWG=1, no reduce kernel).
-/// The kernel dequants K/V inline from nibble-packed indices + scalar codebook
-/// (register-resident, no centroid table buffer needed).
+/// Dispatches NWG=32 workgroups per head (same as F16 SDPA), then a reduce
+/// kernel to combine partial results. FWHT is applied per-workgroup before
+/// writing partials; since FWHT is linear, the reduce output is already in
+/// the original (un-rotated) domain.
 ///
 /// # Arguments
 ///
 /// * `encoder`      — Command encoder to record dispatches into.
 /// * `registry`     — Kernel registry for pipeline lookup/compilation.
 /// * `device`       — Metal device.
-/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32 (FWHT applied in-kernel).
+/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32.
 /// * `k_packed`     — Nibble-packed K indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
 /// * `k_norms`      — Per-position K norms `[num_kv_heads, kv_capacity]`, F32.
 /// * `v_packed`     — Nibble-packed V indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
 /// * `v_norms`      — Per-position V norms `[num_kv_heads, kv_capacity]`, F32.
 /// * `output`       — Output buffer `[num_heads, 1, head_dim]`, F32, pre-allocated.
+/// * `tmp`          — Temporary buffer for NWG partial results. Size from `tmp_buffer_bytes()`.
 /// * `params`       — TQ flash attention parameters.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_vec_tq(
@@ -131,15 +144,13 @@ pub fn flash_attn_vec_tq(
     v_packed: &MlxBuffer,
     v_norms: &MlxBuffer,
     output: &MlxBuffer,
+    tmp: &MlxBuffer,
     params: &FlashAttnVecTqParams,
 ) -> Result<()> {
     validate_params(params)?;
 
     let head_dim = params.head_dim;
-
-    // NWG=1: single workgroup per head. No reduce kernel needed.
-    // TQ's 4× bandwidth reduction means one workgroup is sufficient.
-    let nwg: u32 = 1;
+    let nwg = NWG;
 
     let gpu_params = FlashAttnVecTqParamsGpu {
         n_heads: params.num_heads,
@@ -174,8 +185,7 @@ pub fn flash_attn_vec_tq(
     // Tag for the reorder pass: SDPA is NOT reorderable.
     encoder.set_op_kind(CapturedOpKind::Sdpa);
 
-    // Dispatch: (1 query, num_heads, 1 workgroup).
-    // NWG=1: output goes directly to dst, no reduce kernel.
+    // Dispatch main kernel: (1 query, num_heads, NWG workgroups).
     let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
     let threadgroup_size = MTLSize::new(32, 1, 1); // 1 simdgroup of 32 threads
 
@@ -188,16 +198,53 @@ pub fn flash_attn_vec_tq(
             (3, KernelArg::Buffer(k_norms)),
             (4, KernelArg::Buffer(v_packed)),
             (5, KernelArg::Buffer(v_norms)),
-            (6, KernelArg::Buffer(output)),
+            (6, KernelArg::Buffer(tmp)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,
         threadgroup_size,
     );
 
-    // No reduce kernel: NWG=1 writes directly to output with FWHT applied.
+    // --- Reduce kernel ---
+    // Barrier: reduce reads `tmp` written by the main dispatch above.
+    encoder.memory_barrier();
+
+    let reduce_params = FlashAttnVecReduceParamsGpu { nrows: params.num_heads };
+
+    let reduce_kernel = match head_dim {
+        256 => "flash_attn_vec_reduce_dk256",
+        512 => "flash_attn_vec_reduce_dk512",
+        _ => unreachable!(),
+    };
+    let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
+
+    // Grid: (num_heads, 1, 1), Threadgroup: (32*NWG, 1, 1)
+    let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
+    let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
+
+    encoder.encode_threadgroups_with_args(
+        reduce_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+            (1, KernelArg::Buffer(tmp)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&nwg))),
+        ],
+        reduce_tg,
+        reduce_tg_size,
+    );
 
     Ok(())
+}
+
+/// Compute the size in bytes of the temporary buffer needed for TQ SDPA.
+///
+/// Same formula as F16 SDPA: stores NWG partial output vectors + S/M values.
+pub fn tmp_buffer_bytes(num_heads: u32, head_dim: u32) -> usize {
+    let nrows = num_heads as usize;
+    let nwg = NWG as usize;
+    let dv = head_dim as usize;
+    (nrows * nwg * (dv + 2)) * std::mem::size_of::<f32>()
 }
 
 /// Pad x up to next multiple of n (n must be power of 2).

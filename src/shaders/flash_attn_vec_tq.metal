@@ -390,37 +390,41 @@ kernel void flash_attn_vec_tq_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Normalize + inverse FWHT + write output ----
+    // ---- Inverse FWHT + normalize + write output ----
+    //
     // so4[0..DV4) holds the accumulated output in the rotated domain.
-    // float4 layout IS contiguous floats, so we can run fwht_shared on it.
+    //
+    // Apply inverse FWHT BEFORE normalization so that both NWG=1 and NWG>1
+    // produce output in the original (un-rotated) domain:
+    //
+    // NWG=1: FWHT(partial) / S → final answer, written directly to dst.
+    // NWG>1: FWHT(partial) written raw to tmp (no /S). The reduce kernel
+    //        combines FWHT'd partials. Since FWHT is linear:
+    //        reduce(FWHT(p_i)) = FWHT(reduce(p_i)) = FWHT(final)
+    //        → reduce output is already in original domain. No post-reduce
+    //        FWHT dispatch needed.
     if (sgitg == 0) {
         const int64_t nrows = params.n_heads;
         const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
-
-        const float inv_S = (S == 0.0f) ? 0.0f : 1.0f / S;
-
-        // Normalize the output by 1/S.
-        for (ushort i = tiisg; i < DV4; i += NW) {
-            so4[i] *= inv_S;
-        }
+        const uint NWG_val = params.nwg;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Inverse FWHT on accumulated output (rotate back to original domain).
-        // H^{-1} = H for the normalized Hadamard — same fwht_shared function.
-        // so4 as float4* overlays contiguous floats: reinterpret for FWHT.
+        // Applied to the RAW partial (not normalized by S) so the reduce
+        // kernel's weighted sum preserves correctness via linearity.
         threadgroup float *out_floats = (threadgroup float *)so4;
         fwht_shared<DV>(out_floats, tiisg, NW);
 
-        // Write FWHT'd output to destination.
-        device float4 *dst4 = (device float4 *)dst;
-        const uint NWG_val = params.nwg;
+        // When NWG==1: normalize by 1/S directly. Otherwise write raw for reduce.
+        const float inv_S = (NWG_val == 1) ? ((S == 0.0f) ? 0.0f : 1.0f / S) : 1.0f;
 
+        device float4 *dst4 = (device float4 *)dst;
         for (ushort i = tiisg; i < DV4; i += NW) {
-            dst4[rid * DV4 * NWG_val + NWG_val * i + iwg] = so4[i];
+            dst4[rid * DV4 * NWG_val + NWG_val * i + iwg] = so4[i] * inv_S;
         }
 
-        // Store S and M for the reduce kernel (in case NWG > 1).
+        // Store S and M for the reduce kernel (NWG > 1 only).
         if (NWG_val > 1 && tiisg == 0) {
             device float *dst1 = (device float *)dst + nrows * DV * NWG_val;
             dst1[rid * (2 * NWG_val) + 2 * iwg + 0] = S;

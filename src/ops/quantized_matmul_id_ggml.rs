@@ -67,6 +67,7 @@ impl GgmlType {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
         }
     }
 }
@@ -205,6 +206,12 @@ pub fn quantized_matmul_id_ggml(
     let (nth0, nth1, align) = match params.ggml_type {
         GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
         GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml does not support {:?}",
+                params.ggml_type
+            )));
+        }
     };
 
     let n = params.n as usize;

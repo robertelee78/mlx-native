@@ -205,6 +205,8 @@ fn setup() -> (MlxDevice, KernelRegistry) {
     let device = MlxDevice::new().expect("MlxDevice::new");
     let mut registry = KernelRegistry::new();
     flash_attn_vec_tq::register(&mut registry);
+    // Register the reduce kernel (shared with F16 SDPA).
+    mlx_native::ops::flash_attn_vec::register(&mut registry);
     (device, registry)
 }
 
@@ -317,6 +319,11 @@ fn run_sdpa_tq_test(
         .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
         .expect("alloc output");
 
+    let tmp_bytes = flash_attn_vec_tq::tmp_buffer_bytes(num_heads, head_dim);
+    let tmp_buf = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .expect("alloc tmp");
+
     // Dispatch GPU kernel
     let mut encoder = device.command_encoder().expect("encoder");
 
@@ -342,6 +349,7 @@ fn run_sdpa_tq_test(
         &v_packed_buf,
         &v_norms_buf,
         &output_buf,
+        &tmp_buf,
         &params,
     )
     .expect("flash_attn_vec_tq dispatch");

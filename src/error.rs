@@ -66,6 +66,10 @@ pub enum MlxError {
     /// An unsupported data type was encountered.
     #[error("Unsupported dtype: {0}")]
     UnsupportedDtype(String),
+
+    /// A GGUF file could not be parsed or contains invalid data.
+    #[error("GGUF parse error: {0}")]
+    GgufParseError(String),
 }
 
 /// Convenience alias used throughout the crate.

@@ -25,6 +25,10 @@ const BLOCK_Q4_0_BYTES: u32 = 18;
 const QK8_0: u32 = 32;
 const BLOCK_Q8_0_BYTES: u32 = 34;
 
+/// Q4_K: 256 values per block, 144 bytes per block.
+const QK4_K: u32 = 256;
+const BLOCK_Q4_K_BYTES: u32 = 144;
+
 /// Q6_K: 256 values per block, 210 bytes per block.
 const QK6_K: u32 = 256;
 const BLOCK_Q6_K_BYTES: u32 = 210;
@@ -32,13 +36,19 @@ const BLOCK_Q6_K_BYTES: u32 = 210;
 // ---- Public types ----
 
 /// GGML quantization type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum GgmlType {
+    /// 32-bit float (unquantized). 1 element per block, 4 bytes per block.
+    F32,
+    /// 16-bit float (unquantized). 1 element per block, 2 bytes per block.
+    F16,
     /// 4-bit quantization. 32 values per block, 18 bytes per block.
     Q4_0,
     /// 8-bit quantization. 32 values per block, 34 bytes per block.
     Q8_0,
+    /// 4-bit super-block quantization. 256 values per block, 144 bytes per block.
+    Q4_K,
     /// 6-bit super-block quantization. 256 values per block, 210 bytes per block.
     Q6_K,
 }
@@ -47,8 +57,11 @@ impl GgmlType {
     /// Number of dequantized values per GGML block.
     pub fn block_values(self) -> u32 {
         match self {
+            GgmlType::F32 => 1,
+            GgmlType::F16 => 1,
             GgmlType::Q4_0 => QK4_0,
             GgmlType::Q8_0 => QK8_0,
+            GgmlType::Q4_K => QK4_K,
             GgmlType::Q6_K => QK6_K,
         }
     }
@@ -56,8 +69,11 @@ impl GgmlType {
     /// Number of bytes per GGML block.
     pub fn block_bytes(self) -> u32 {
         match self {
+            GgmlType::F32 => 4,
+            GgmlType::F16 => 2,
             GgmlType::Q4_0 => BLOCK_Q4_0_BYTES,
             GgmlType::Q8_0 => BLOCK_Q8_0_BYTES,
+            GgmlType::Q4_K => BLOCK_Q4_K_BYTES,
             GgmlType::Q6_K => BLOCK_Q6_K_BYTES,
         }
     }
@@ -65,6 +81,11 @@ impl GgmlType {
     /// Metal kernel function name.
     fn kernel_name(self) -> &'static str {
         match self {
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => {
+                // These types do not have a direct mat-vec kernel in this module.
+                // Q4_K support for mat-vec will be added separately.
+                "unsupported"
+            }
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q6_K => "kernel_mul_mv_q6_K_f32",
@@ -127,6 +148,15 @@ pub fn quantized_matmul_ggml(
     let block_bytes = params.ggml_type.block_bytes();
 
     // --- Validate ---
+    match params.ggml_type {
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K => {}
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_ggml does not support {:?} — use a different dispatch path",
+                other
+            )));
+        }
+    }
     if params.m == 0 || params.k == 0 || params.n == 0 {
         return Err(MlxError::InvalidArgument(
             "M, K, and N must all be > 0".into(),
