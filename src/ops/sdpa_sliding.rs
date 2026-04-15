@@ -247,6 +247,7 @@ mod tests {
             kv_seq_len: 2048,
             window_size: 1024,
             scale: 1.0 / (256.0_f32).sqrt(),
+            kv_capacity: 2048,
         };
         assert!(validate_sliding_params(&p).is_ok());
     }
@@ -261,6 +262,7 @@ mod tests {
             kv_seq_len: 128,
             window_size: 0,
             scale: 1.0,
+            kv_capacity: 128,
         };
         assert!(matches!(
             validate_sliding_params(&p),
@@ -270,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_gpu_sliding_params_layout() {
-        // Ensure SdpaSlidingParamsGpu is exactly 32 bytes (7 x u32 + 1 x f32).
+        // Ensure SdpaSlidingParamsGpu is exactly 32 bytes (7 x u32 + 1 x f32 = 8 fields x 4).
         assert_eq!(std::mem::size_of::<SdpaSlidingParamsGpu>(), 32);
     }
 }

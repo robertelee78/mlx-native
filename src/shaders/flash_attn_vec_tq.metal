@@ -1,16 +1,16 @@
 // Flash attention vector kernel for TurboQuant-compressed KV cache (ADR-007 Phase 1.3).
 //
 // Fork of flash_attn_vec.metal that reads K and V from nibble-packed indices
-// + per-position norms + pre-rotated centroid table, instead of F16/F32 buffers.
+// + per-position norms, instead of F16/F32 buffers.
 //
 // The kernel operates in the Hadamard-rotated domain:
-//   1. Q is rotated (FWHT) in shared memory at load time
-//   2. K/V are gathered from the centroid table (already in rotated domain)
+//   1. Q is rotated (FWHT) via standalone dispatch before this kernel
+//   2. K/V are dequantized inline from nibble indices + scalar codebook
 //   3. Dot products are computed in the rotated domain (orthogonal invariance)
-//   4. Accumulated output is rotated back (inverse FWHT) before writing to dst
+//   4. Output stays rotated; caller applies inverse FWHT via standalone dispatch
 //
-// Pre-rotated centroid table layout: [16, head_dim] F32
-//   table[idx * head_dim + c] = codebook[idx] / sqrt(head_dim)
+// Dequant: value = CODEBOOK_4BIT[nibble_idx] * inv_sqrt(head_dim) * norm
+//   The 16-element codebook fits in registers — zero main-memory bandwidth for dequant.
 //
 // Packed KV layout: [num_kv_heads, capacity, head_dim/2] u8
 //   Low nibble = even coordinate index, high nibble = odd coordinate index
@@ -90,20 +90,29 @@ inline void fwht_shared(threadgroup float *x, ushort tx, ushort NW) {
 
 
 // ---------------------------------------------------------------------------
-// Reconstruct float4 from 2 packed bytes (4 nibble indices) using centroid table.
+// 4-bit Lloyd-Max codebook for N(0,1): 16 reconstruction levels.
+// Matches CODEBOOK_4BIT in turboquant.rs exactly.
+// Fits in registers — zero main-memory bandwidth for dequant.
+// ---------------------------------------------------------------------------
+constant float CODEBOOK_4BIT[16] = {
+    -2.7325896f, -2.0690172f, -1.6180464f, -1.2562312f,
+    -0.9423405f, -0.6567591f, -0.3880483f, -0.1283950f,
+     0.1283950f,  0.3880483f,  0.6567591f,  0.9423405f,
+     1.2562312f,  1.6180464f,  2.0690172f,  2.7325896f,
+};
+
+// ---------------------------------------------------------------------------
+// Reconstruct float4 from 2 packed bytes (4 nibble indices) using inline
+// scalar dequant. No centroid table lookup — just register-resident codebook.
 //
 // packed_base: pointer to start of this position's packed data [head_dim/2 bytes]
 // coord_offset: starting coordinate index (must be multiple of 4)
-// head_dim: head dimension
-// centroids: pre-rotated centroid table [16, head_dim]
-// norm: per-position norm scalar
+// scale_norm: pre-multiplied (1/sqrt(head_dim)) * norm
 // ---------------------------------------------------------------------------
-inline float4 gather_tq_float4(
+inline float4 dequant_tq_float4(
     device const uint8_t *packed_base,
     uint coord_offset,
-    uint head_dim,
-    constant float *centroids,
-    float norm
+    float scale_norm
 ) {
     // Read 2 bytes = 4 nibble indices
     // Layout: low nibble = even coord, high nibble = odd coord
@@ -117,12 +126,12 @@ inline float4 gather_tq_float4(
     uint idx2 = byte1 & 0xFu;          // coord_offset + 2 (even -> low nibble)
     uint idx3 = (byte1 >> 4u) & 0xFu;  // coord_offset + 3 (odd -> high nibble)
 
-    float4 result;
-    result.x = centroids[idx0 * head_dim + coord_offset + 0] * norm;
-    result.y = centroids[idx1 * head_dim + coord_offset + 1] * norm;
-    result.z = centroids[idx2 * head_dim + coord_offset + 2] * norm;
-    result.w = centroids[idx3 * head_dim + coord_offset + 3] * norm;
-    return result;
+    return float4(
+        CODEBOOK_4BIT[idx0] * scale_norm,
+        CODEBOOK_4BIT[idx1] * scale_norm,
+        CODEBOOK_4BIT[idx2] * scale_norm,
+        CODEBOOK_4BIT[idx3] * scale_norm
+    );
 }
 
 
@@ -140,11 +149,9 @@ kernel void flash_attn_vec_tq_impl(
     device const float              *Q           [[buffer(1)]],
     device const uint8_t            *K_packed    [[buffer(2)]],
     device const float              *K_norms     [[buffer(3)]],
-    constant float                  *K_centroids [[buffer(4)]],
-    device const uint8_t            *V_packed    [[buffer(5)]],
-    device const float              *V_norms     [[buffer(6)]],
-    constant float                  *V_centroids [[buffer(7)]],
-    device       float              *dst         [[buffer(8)]],
+    device const uint8_t            *V_packed    [[buffer(4)]],
+    device const float              *V_norms     [[buffer(5)]],
+    device       float              *dst         [[buffer(6)]],
     threadgroup  half               *shmem       [[threadgroup(0)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
@@ -263,6 +270,9 @@ kernel void flash_attn_vec_tq_impl(
         {
             float mqk[C];
 
+            // Pre-compute inv_sqrt(DK) once — used for all K dequant in this chunk.
+            const float inv_sqrt_dk = rsqrt(float(DK));
+
             for (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) {
@@ -270,8 +280,8 @@ kernel void flash_attn_vec_tq_impl(
                     continue;
                 }
 
-                // Get norm for this K position.
-                float k_norm = K_norms[kv_head * params.kv_capacity + kv_pos];
+                // Pre-multiply norm * inv_sqrt_dk for register-only dequant.
+                float k_scale_norm = K_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dk;
 
                 // Pointer to packed K data for this position.
                 device const uint8_t *k_packed_pos =
@@ -280,8 +290,7 @@ kernel void flash_attn_vec_tq_impl(
                 float partial = 0.0f;
                 for (short ii = 0; ii < DK4 / NL; ++ii) {
                     uint coord = (uint)(ii * NL + tx) * 4u;
-                    float4 k_val = gather_tq_float4(
-                        k_packed_pos, coord, (uint)DK, K_centroids, k_norm);
+                    float4 k_val = dequant_tq_float4(k_packed_pos, coord, k_scale_norm);
                     partial += dot(k_val, float4(pq4[ii * NL]));
                 }
                 mqk[cc] = simd_sum(partial);
@@ -322,19 +331,21 @@ kernel void flash_attn_vec_tq_impl(
                 lo[ii] = float4(0.0f);
             }
 
+            // Pre-compute inv_sqrt(DV) once — used for all V dequant in this chunk.
+            const float inv_sqrt_dv = rsqrt(float(DV));
+
             for (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) continue;
 
-                float v_norm = V_norms[kv_head * params.kv_capacity + kv_pos];
+                float v_scale_norm = V_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dv;
                 device const uint8_t *v_packed_pos =
                     V_packed + (kv_head * params.kv_capacity + kv_pos) * (DV / 2);
 
                 float weight = ss[cc];
                 for (short ii = 0; ii < DV4 / NL; ++ii) {
                     uint coord = (uint)(ii * NL + tx) * 4u;
-                    float4 v_val = gather_tq_float4(
-                        v_packed_pos, coord, (uint)DV, V_centroids, v_norm);
+                    float4 v_val = dequant_tq_float4(v_packed_pos, coord, v_scale_norm);
                     lo[ii] += v_val * weight;
                 }
             }

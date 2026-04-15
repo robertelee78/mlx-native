@@ -1,14 +1,16 @@
 //! Flash attention vector kernel dispatch for TurboQuant-compressed KV cache.
 //!
 //! Fork of `flash_attn_vec` that reads K and V from nibble-packed indices
-//! + per-position norms + pre-rotated centroid table, instead of F16/F32 buffers.
+//! + per-position norms, with inline scalar dequant from a register-resident
+//! 16-element codebook. No centroid table buffer needed.
 //!
 //! Key differences from `flash_attn_vec`:
 //! - NWG=1: no reduce kernel needed (TQ's 4× smaller KV reads mean one
 //!   workgroup per head is sufficient)
-//! - Q is FWHT-rotated inside the kernel (shared memory)
-//! - Accumulated output is inverse-FWHT-rotated before writing to dst
-//! - Output goes directly to the destination buffer (no tmp buffer)
+//! - Q arrives pre-rotated via standalone FWHT dispatch
+//! - Output stays rotated; caller applies inverse FWHT via standalone dispatch
+//! - Dequant is inline: codebook[nibble] * inv_sqrt(head_dim) * norm
+//! - Zero scattered memory access — codebook fits in registers
 
 use metal::MTLSize;
 
@@ -103,21 +105,19 @@ fn validate_params(params: &FlashAttnVecTqParams) -> Result<()> {
 /// Dispatch TQ flash attention vector kernel on the GPU.
 ///
 /// This dispatches a single Metal compute pass (NWG=1, no reduce kernel).
-/// The kernel applies FWHT to Q, gathers K/V from centroid tables, and
-/// applies inverse FWHT to the output.
+/// The kernel dequants K/V inline from nibble-packed indices + scalar codebook
+/// (register-resident, no centroid table buffer needed).
 ///
 /// # Arguments
 ///
 /// * `encoder`      — Command encoder to record dispatches into.
 /// * `registry`     — Kernel registry for pipeline lookup/compilation.
 /// * `device`       — Metal device.
-/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32.
+/// * `q`            — Query buffer `[num_heads, 1, head_dim]`, F32 (pre-rotated via FWHT).
 /// * `k_packed`     — Nibble-packed K indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
 /// * `k_norms`      — Per-position K norms `[num_kv_heads, kv_capacity]`, F32.
-/// * `k_centroids`  — Pre-rotated K centroid table `[16, head_dim]`, F32.
 /// * `v_packed`     — Nibble-packed V indices `[num_kv_heads, kv_capacity, head_dim/2]`, U8.
 /// * `v_norms`      — Per-position V norms `[num_kv_heads, kv_capacity]`, F32.
-/// * `v_centroids`  — Pre-rotated V centroid table `[16, head_dim]`, F32.
 /// * `output`       — Output buffer `[num_heads, 1, head_dim]`, F32, pre-allocated.
 /// * `params`       — TQ flash attention parameters.
 #[allow(clippy::too_many_arguments)]
@@ -128,10 +128,8 @@ pub fn flash_attn_vec_tq(
     q: &MlxBuffer,
     k_packed: &MlxBuffer,
     k_norms: &MlxBuffer,
-    k_centroids: &MlxBuffer,
     v_packed: &MlxBuffer,
     v_norms: &MlxBuffer,
-    v_centroids: &MlxBuffer,
     output: &MlxBuffer,
     params: &FlashAttnVecTqParams,
 ) -> Result<()> {
@@ -188,11 +186,9 @@ pub fn flash_attn_vec_tq(
             (1, KernelArg::Buffer(q)),
             (2, KernelArg::Buffer(k_packed)),
             (3, KernelArg::Buffer(k_norms)),
-            (4, KernelArg::Buffer(k_centroids)),
-            (5, KernelArg::Buffer(v_packed)),
-            (6, KernelArg::Buffer(v_norms)),
-            (7, KernelArg::Buffer(v_centroids)),
-            (8, KernelArg::Buffer(output)),
+            (4, KernelArg::Buffer(v_packed)),
+            (5, KernelArg::Buffer(v_norms)),
+            (6, KernelArg::Buffer(output)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,

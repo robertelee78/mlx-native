@@ -142,18 +142,6 @@ fn nibble_dequantize(packed: &[u8], norm: f32, head_dim: usize) -> Vec<f32> {
     rotated
 }
 
-/// Build pre-rotated centroid table: table[idx * d + c] = CODEBOOK_4BIT[idx] / sqrt(d)
-fn build_centroid_table(head_dim: usize) -> Vec<f32> {
-    let inv_scale = 1.0 / (head_dim as f32).sqrt();
-    let mut table = vec![0.0f32; 16 * head_dim];
-    for idx in 0..16 {
-        for c in 0..head_dim {
-            table[idx * head_dim + c] = CODEBOOK_4BIT[idx] * inv_scale;
-        }
-    }
-    table
-}
-
 // ---- CPU naive SDPA reference ----
 
 /// Compute naive SDPA on CPU with dequantized KV cache.
@@ -276,8 +264,7 @@ fn run_sdpa_tq_test(
         }
     }
 
-    // Build centroid table
-    let centroid_table = build_centroid_table(hd);
+    // Centroid table no longer needed — codebook is embedded in the Metal kernel.
 
     // CPU reference SDPA
     let cpu_output = cpu_sdpa(
@@ -290,12 +277,22 @@ fn run_sdpa_tq_test(
 
     // ---- GPU path ----
 
+    // The GPU kernel operates in the Hadamard-rotated domain:
+    // Q must be pre-rotated (FWHT per head), and the output is in the rotated
+    // domain (caller applies inverse FWHT).  Simulate the standalone FWHT
+    // dispatches that forward_mlx.rs issues around the kernel.
+    let mut q_rotated = q_data.clone();
+    for h in 0..nh {
+        let start = h * hd;
+        fwht_inplace(&mut q_rotated[start..start + hd]).unwrap();
+    }
+
     // Allocate GPU buffers
     let mut q_buf = device
         .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
         .expect("alloc Q");
     q_buf.as_mut_slice::<f32>().expect("write Q")[..nh * hd]
-        .copy_from_slice(&q_data);
+        .copy_from_slice(&q_rotated);
 
     let mut k_packed_buf = device
         .alloc_buffer(k_packed_all.len(), DType::U8, vec![nkv, kvl, hd / 2])
@@ -309,12 +306,6 @@ fn run_sdpa_tq_test(
     k_norms_buf.as_mut_slice::<f32>().expect("write K norms")
         .copy_from_slice(&k_norms_all);
 
-    let mut k_centroids_buf = device
-        .alloc_buffer(centroid_table.len() * 4, DType::F32, vec![16, hd])
-        .expect("alloc K centroids");
-    k_centroids_buf.as_mut_slice::<f32>().expect("write K centroids")
-        .copy_from_slice(&centroid_table);
-
     let mut v_packed_buf = device
         .alloc_buffer(v_packed_all.len(), DType::U8, vec![nkv, kvl, hd / 2])
         .expect("alloc V packed");
@@ -326,12 +317,6 @@ fn run_sdpa_tq_test(
         .expect("alloc V norms");
     v_norms_buf.as_mut_slice::<f32>().expect("write V norms")
         .copy_from_slice(&v_norms_all);
-
-    let mut v_centroids_buf = device
-        .alloc_buffer(centroid_table.len() * 4, DType::F32, vec![16, hd])
-        .expect("alloc V centroids");
-    v_centroids_buf.as_mut_slice::<f32>().expect("write V centroids")
-        .copy_from_slice(&centroid_table);
 
     let output_buf = device
         .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
@@ -359,10 +344,8 @@ fn run_sdpa_tq_test(
         &q_buf,
         &k_packed_buf,
         &k_norms_buf,
-        &k_centroids_buf,
         &v_packed_buf,
         &v_norms_buf,
-        &v_centroids_buf,
         &output_buf,
         &params,
     )
@@ -370,8 +353,13 @@ fn run_sdpa_tq_test(
 
     encoder.commit_and_wait().expect("commit");
 
-    // Read GPU output
-    let gpu_output: Vec<f32> = output_buf.as_slice::<f32>().expect("read output").to_vec();
+    // Read GPU output (in Hadamard-rotated domain) and inverse-rotate back.
+    // FWHT is self-inverse: H^{-1} = H for the normalized form.
+    let mut gpu_output: Vec<f32> = output_buf.as_slice::<f32>().expect("read output").to_vec();
+    for h in 0..nh {
+        let start = h * hd;
+        fwht_inplace(&mut gpu_output[start..start + hd]).unwrap();
+    }
 
     // Compare CPU vs GPU
     let mut max_abs_diff = 0.0f32;

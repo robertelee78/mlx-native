@@ -241,6 +241,7 @@ mod tests {
             seq_len: 128,
             kv_seq_len: 128,
             scale: 1.0 / (256.0_f32).sqrt(),
+            kv_capacity: 128,
         };
         assert!(validate_params(&p).is_ok());
     }
@@ -254,6 +255,7 @@ mod tests {
             seq_len: 128,
             kv_seq_len: 128,
             scale: 1.0,
+            kv_capacity: 128,
         };
         assert!(matches!(
             validate_params(&p),
@@ -270,6 +272,7 @@ mod tests {
             seq_len: 128,
             kv_seq_len: 128,
             scale: 1.0,
+            kv_capacity: 128,
         };
         assert!(matches!(
             validate_params(&p),
@@ -279,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_gpu_params_layout() {
-        // Ensure SdpaParamsGpu is exactly 28 bytes (6 x u32 + 1 x f32).
+        // Ensure SdpaParamsGpu is exactly 28 bytes (6 x u32 + 1 x f32 + kv_capacity u32 = 28).
         assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 28);
     }
 }
