@@ -5,10 +5,9 @@
 //! 16-element codebook. No centroid table buffer needed.
 //!
 //! Key differences from `flash_attn_vec`:
-//! - NWG=1: no reduce kernel needed (TQ's 4× smaller KV reads mean one
-//!   workgroup per head is sufficient)
-//! - FWHT rotation of Q and inverse-FWHT of output are FUSED into the kernel
-//!   (no standalone FWHT dispatches or barriers needed by the caller)
+//! - Adaptive NWG (1-32) based on kv_seq_len. At short context NWG=1
+//!   avoids the reduce kernel. At long context NWG scales up for parallelism.
+//! - Caller handles FWHT: pre-rotates Q, post-rotates output (1× per head).
 //! - Dequant is inline: codebook[nibble] * inv_sqrt(head_dim) * norm
 //! - Zero scattered memory access — codebook fits in registers
 
@@ -109,9 +108,24 @@ fn validate_params(params: &FlashAttnVecTqParams) -> Result<()> {
     Ok(())
 }
 
-/// Number of workgroups per head for TQ SDPA. Must match the F16 SDPA's NWG
-/// for similar parallelism. Each workgroup processes kv_seq_len/NWG chunks.
-const NWG: u32 = 32;
+/// Compute NWG for TQ SDPA.
+///
+/// NWG=16 is optimal across both short and long context on M5 Max
+/// (measured: outperforms both NWG=1 and NWG=32 at all tested lengths).
+/// NWG=32 adds reduce kernel overhead that outweighs its parallelism gain.
+/// NWG<16 starves the GPU at long context.
+///
+/// Override: set HF2Q_TQ_NWG=N to force a specific value (for benchmarking).
+fn compute_nwg(_kv_seq_len: u32) -> u32 {
+    if let Ok(v) = std::env::var("HF2Q_TQ_NWG") {
+        if let Ok(n) = v.parse::<u32>() {
+            if n >= 1 && n <= 32 {
+                return n;
+            }
+        }
+    }
+    16
+}
 
 /// Dispatch TQ flash attention vector kernel on the GPU.
 ///
@@ -146,7 +160,7 @@ pub fn flash_attn_vec_tq(
     validate_params(params)?;
 
     let head_dim = params.head_dim;
-    let nwg = NWG;
+    let nwg = compute_nwg(params.kv_seq_len);
 
     let gpu_params = FlashAttnVecTqParamsGpu {
         n_heads: params.num_heads,
@@ -185,6 +199,10 @@ pub fn flash_attn_vec_tq(
     let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
     let threadgroup_size = MTLSize::new(32, 1, 1); // 1 simdgroup of 32 threads
 
+    // NWG=1: write directly to output (no reduce needed).
+    // NWG>1: write to tmp, then reduce into output.
+    let dst_buf = if nwg == 1 { output } else { tmp };
+
     encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
         &[
@@ -194,53 +212,54 @@ pub fn flash_attn_vec_tq(
             (3, KernelArg::Buffer(k_norms)),
             (4, KernelArg::Buffer(v_packed)),
             (5, KernelArg::Buffer(v_norms)),
-            (6, KernelArg::Buffer(tmp)),
+            (6, KernelArg::Buffer(dst_buf)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,
         threadgroup_size,
     );
 
-    // --- Reduce kernel ---
-    // Barrier: reduce reads `tmp` written by the main dispatch above.
-    encoder.memory_barrier();
+    // --- Reduce kernel (NWG > 1 only) ---
+    if nwg > 1 {
+        encoder.memory_barrier();
 
-    let reduce_params = FlashAttnVecReduceParamsGpu { nrows: params.num_heads };
+        let reduce_params = FlashAttnVecReduceParamsGpu { nrows: params.num_heads };
 
-    let reduce_kernel = match head_dim {
-        256 => "flash_attn_vec_reduce_dk256",
-        512 => "flash_attn_vec_reduce_dk512",
-        _ => unreachable!(),
-    };
-    let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
+        let reduce_kernel = match head_dim {
+            256 => "flash_attn_vec_reduce_dk256",
+            512 => "flash_attn_vec_reduce_dk512",
+            _ => unreachable!(),
+        };
+        let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
 
-    // Grid: (num_heads, 1, 1), Threadgroup: (32*NWG, 1, 1)
-    let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
-    let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
+        let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
+        let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
 
-    encoder.encode_threadgroups_with_args(
-        reduce_pipeline,
-        &[
-            (0, KernelArg::Bytes(as_bytes(&reduce_params))),
-            (1, KernelArg::Buffer(tmp)),
-            (2, KernelArg::Buffer(output)),
-            (3, KernelArg::Bytes(as_bytes(&nwg))),
-        ],
-        reduce_tg,
-        reduce_tg_size,
-    );
+        encoder.encode_threadgroups_with_args(
+            reduce_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                (1, KernelArg::Buffer(tmp)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&nwg))),
+            ],
+            reduce_tg,
+            reduce_tg_size,
+        );
+    }
 
     Ok(())
 }
 
 /// Compute the size in bytes of the temporary buffer needed for TQ SDPA.
 ///
-/// Same formula as F16 SDPA: stores NWG partial output vectors + S/M values.
+/// Sized for max NWG=32 regardless of actual adaptive NWG — the buffer is
+/// allocated once at model load time and reused for all context lengths.
 pub fn tmp_buffer_bytes(num_heads: u32, head_dim: u32) -> usize {
     let nrows = num_heads as usize;
-    let nwg = NWG as usize;
+    let max_nwg = 32usize;
     let dv = head_dim as usize;
-    (nrows * nwg * (dv + 2)) * std::mem::size_of::<f32>()
+    (nrows * max_nwg * (dv + 2)) * std::mem::size_of::<f32>()
 }
 
 /// Pad x up to next multiple of n (n must be power of 2).
