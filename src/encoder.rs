@@ -415,6 +415,7 @@ impl CommandEncoder {
     ///
     /// This is the same pattern llama.cpp uses:
     /// `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
+    #[allow(unexpected_cfgs)]
     pub fn memory_barrier(&mut self) {
         if let Some(ref mut nodes) = self.capture {
             nodes.push(CapturedNode::Barrier);

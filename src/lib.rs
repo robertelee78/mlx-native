@@ -38,6 +38,10 @@
 
 // Enforce the no-panic policy at compile time.
 #![deny(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+// The `objc` crate's `msg_send!` macro internally checks `cfg(feature = "cargo-clippy")`
+// which triggers unexpected_cfgs warnings. Suppress at crate level since we can't
+// control the macro expansion site.
+#![allow(unexpected_cfgs)]
 
 // ---- internal modules ----
 #[macro_use]

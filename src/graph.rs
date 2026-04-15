@@ -946,10 +946,6 @@ impl ConflictTracker {
     /// - Two SRC (read) ranges in the same buffer: OK (read-read)
     /// - A new SRC overlapping an existing DST: CONFLICT (RAW)
     /// - A new DST overlapping an existing SRC or DST: CONFLICT (WAR/WAW)
-    fn conflicts(&self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) -> bool {
-        self.conflicts_reason(reads, writes).is_some()
-    }
-
     /// Check for conflicts and return the reason if one is found.
     /// Returns (conflict_type, new_buf_ptr, existing_buf_ptr) or None.
     fn conflicts_reason(&self, reads: &[&MlxBuffer], writes: &[&MlxBuffer])
