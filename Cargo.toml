@@ -38,6 +38,15 @@ half = { version = "2", features = ["bytemuck"] }
 static_assertions = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[package.metadata.release]
+# Run semver checks before publishing to catch accidental breaking changes.
+pre-release-hook = ["cargo", "semver-checks"]
+# Tag format: v0.1.0, v0.2.0, etc.
+tag-prefix = "v"
+tag-name = "{{prefix}}{{version}}"
+# Push tag and commits to remote after publish.
+push-remote = "origin"
+
 [[bench]]
 name = "bench_quantized_matmul"
 harness = false
