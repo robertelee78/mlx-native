@@ -4,7 +4,20 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
-license = "MIT OR Apache-2.0"
+license = "MIT"
+authors = ["mlx-native contributors"]
+repository = "https://github.com/robertelee78/mlx-native"
+homepage = "https://github.com/robertelee78/mlx-native"
+documentation = "https://docs.rs/mlx-native"
+readme = "README.md"
+keywords = ["metal", "gpu", "mlx", "inference", "apple-silicon"]
+categories = ["os::macos-apis", "science"]
+exclude = [".claude/", "_bmad/", "_bmad-output/", "docs/", ".github/"]
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+all-features = true
 
 [lib]
 name = "mlx_native"

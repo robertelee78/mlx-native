@@ -188,6 +188,9 @@ fn test_graph_multi_op_sequence() {
             )
             .expect("graph add");
 
+        // Barrier: tmp_graph was written by add, will be read by mul.
+        session.barrier();
+
         // Step 2: out = tmp * c (same encoder, NO intermediate commit_and_wait)
         session
             .elementwise_mul(

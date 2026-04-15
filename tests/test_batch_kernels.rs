@@ -113,7 +113,7 @@ fn test_moe_swiglu_batch() {
     // gate_up: [top_k, 2*intermediate]
     let gu_len = top_k * 2 * intermediate;
     let gu_data: Vec<f32> = (0..gu_len)
-        .map(|i| ((i as f32) * 0.05 - 1.5))
+        .map(|i| (i as f32) * 0.05 - 1.5)
         .collect();
     let mut gu_buf = device
         .alloc_buffer(gu_len * 4, DType::F32, vec![gu_len])

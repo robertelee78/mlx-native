@@ -45,6 +45,7 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     x.iter().zip(weight).map(|(&xi, &wi)| (xi / rms) * wi).collect()
 }
 
+#[allow(dead_code)]
 fn softmax(values: &[f32]) -> Vec<f32> {
     let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = values.iter().map(|&v| (v - max_val).exp()).collect();

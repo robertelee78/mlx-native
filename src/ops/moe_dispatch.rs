@@ -282,6 +282,10 @@ pub fn moe_dispatch(
             continue;
         }
 
+        // Barrier after zero_buffer (first iteration) or after previous
+        // accumulate (subsequent iterations) — the output buffer was just written.
+        encoder.memory_barrier();
+
         // gate_out = gate_proj @ input  (matvec: [intermediate_dim, input_dim] @ [input_dim] -> [intermediate_dim])
         let gate_params = GpuMatmulParams {
             m: 1,
@@ -320,6 +324,9 @@ pub fn moe_dispatch(
             MTLSize::new(std::cmp::min(256, params.intermediate_dim as u64), 1, 1),
         );
 
+        // Barrier: gate_out and up_out must complete before gelu_mul reads them.
+        encoder.memory_barrier();
+
         // hidden = GELU(gate_out) * up_out
         let gelu_params = GpuFusedGeluMulParams {
             n_elements: params.intermediate_dim as u32,
@@ -336,6 +343,9 @@ pub fn moe_dispatch(
             MTLSize::new(params.intermediate_dim as u64, 1, 1),
             MTLSize::new(std::cmp::min(256, params.intermediate_dim as u64), 1, 1),
         );
+
+        // Barrier: hidden must complete before down_proj reads it.
+        encoder.memory_barrier();
 
         // expert_out = down_proj @ hidden  (matvec: [input_dim, intermediate_dim] @ [intermediate_dim] -> [input_dim])
         let down_params = GpuMatmulParams {
@@ -355,6 +365,9 @@ pub fn moe_dispatch(
             MTLSize::new(params.input_dim as u64, 1, 1),
             MTLSize::new(std::cmp::min(256, params.input_dim as u64), 1, 1),
         );
+
+        // Barrier: expert_out must complete before accumulate reads it.
+        encoder.memory_barrier();
 
         // result += w * expert_out
         let accum_params = GpuMoeAccumParams {
