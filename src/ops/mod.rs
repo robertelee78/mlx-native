@@ -27,6 +27,7 @@ pub mod quantized_matmul_id_ggml;
 pub mod rms_norm;
 pub mod rope;
 pub mod flash_attn_vec;
+pub mod flash_attn_vec_tq;
 pub mod sdpa;
 pub mod sdpa_sliding;
 pub mod softcap;
