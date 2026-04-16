@@ -191,6 +191,63 @@ kernel void moe_weighted_sum(
     output[tid] = sum;
 }
 
+/// Multi-token SwiGLU for batched prefill.
+/// Input:  [n_tokens, top_k, 2*intermediate]
+/// Output: [n_tokens, top_k, intermediate]
+/// Grid:   3D (intermediate, top_k, n_tokens)
+struct MoeSwigluSeqParams {
+    uint intermediate;
+    uint top_k;
+    uint n_tokens;
+};
+kernel void moe_swiglu_seq(
+    device const float* gate_up_buf  [[buffer(0)]],
+    device float*       output_buf   [[buffer(1)]],
+    constant MoeSwigluSeqParams& params [[buffer(2)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint i = tid.x;
+    uint slot = tid.y;
+    uint tok = tid.z;
+    if (tok >= params.n_tokens || slot >= params.top_k || i >= params.intermediate) return;
+
+    uint slot_base = (tok * params.top_k + slot) * 2 * params.intermediate;
+    float gate = gate_up_buf[slot_base + i];
+    float up   = gate_up_buf[slot_base + params.intermediate + i];
+    float gelu = gate * 0.5f * (1.0f + precise::tanh(
+        0.7978845608f * (gate + 0.044715f * gate * gate * gate)));
+    output_buf[(tok * params.top_k + slot) * params.intermediate + i] = gelu * up;
+}
+
+/// Multi-token weighted sum of expert outputs.
+/// Input:  expert_outputs [n_tokens, top_k, hidden_size]
+///         weights        [n_tokens, top_k]
+/// Output: [n_tokens, hidden_size]
+struct MoeWeightedSumSeqParams {
+    uint hidden_size;
+    uint top_k;
+    uint n_tokens;
+};
+kernel void moe_weighted_sum_seq(
+    device const float*  expert_outputs [[buffer(0)]],
+    device const float*  weights        [[buffer(1)]],
+    device float*        output         [[buffer(2)]],
+    constant MoeWeightedSumSeqParams& params [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    uint d = tid.x;
+    uint tok = tid.y;
+    if (tok >= params.n_tokens || d >= params.hidden_size) return;
+
+    float sum = 0.0f;
+    for (uint k = 0; k < params.top_k; k++) {
+        const uint in_idx = (tok * params.top_k + k) * params.hidden_size + d;
+        const uint w_idx = tok * params.top_k + k;
+        sum += expert_outputs[in_idx] * weights[w_idx];
+    }
+    output[tok * params.hidden_size + d] = sum;
+}
+
 // --------------------------------------------------------------------------
 // naive_matvec_f32 — Simple matrix-vector multiply for expert projections.
 //

@@ -295,6 +295,42 @@ kernel void embedding_gather_scale_f32(
 }
 
 // --------------------------------------------------------------------------
+// embedding_gather_scale_batch_f32 — Gather N embedding rows and scale them.
+//
+// output[tok * hidden_size + i] = embed_table[token_ids[tok] * hidden_size + i] * scale
+//
+// Buffers:
+//   0: embed_table — float [vocab_size * hidden_size]
+//   1: token_ids   — uint  [n_tokens]
+//   2: output      — float [n_tokens * hidden_size]
+//   3: params      — { float scale; uint hidden_size; uint n_tokens; }
+//
+// Grid: 2D (hidden_size, n_tokens) — one thread per element.
+// --------------------------------------------------------------------------
+
+struct EmbedGatherScaleBatchParams {
+    float scale;
+    uint hidden_size;
+    uint n_tokens;
+};
+
+kernel void embedding_gather_scale_batch_f32(
+    device const float* embed_table [[buffer(0)]],
+    device const uint*  token_ids   [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
+    constant EmbedGatherScaleBatchParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint i = gid.x;
+    const uint tok = gid.y;
+    if (i >= params.hidden_size || tok >= params.n_tokens) return;
+    const uint token_id = token_ids[tok];
+    const uint src = token_id * params.hidden_size + i;
+    const uint dst = tok * params.hidden_size + i;
+    output[dst] = embed_table[src] * params.scale;
+}
+
+// --------------------------------------------------------------------------
 // permute_021_bf16 — Transpose [A, B, C] -> [B, A, C] for bfloat16
 //
 // Used to convert [seq_len, n_heads, head_dim] <-> [n_heads, seq_len, head_dim]

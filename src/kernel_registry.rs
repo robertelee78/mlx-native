@@ -99,8 +99,10 @@ impl KernelRegistry {
         sources.insert("fused_gelu_mul".into(), moe_dispatch_src);
         sources.insert("moe_swiglu_fused".into(), moe_dispatch_src);
         sources.insert("moe_swiglu_batch".into(), moe_dispatch_src);
+        sources.insert("moe_swiglu_seq".into(), moe_dispatch_src);
         sources.insert("moe_accumulate".into(), moe_dispatch_src);
         sources.insert("moe_weighted_sum".into(), moe_dispatch_src);
+        sources.insert("moe_weighted_sum_seq".into(), moe_dispatch_src);
         sources.insert("zero_buffer".into(), moe_dispatch_src);
         sources.insert("naive_matvec_f32".into(), moe_dispatch_src);
         sources.insert("moe_gather_topk_weights".into(), moe_dispatch_src);
@@ -109,6 +111,8 @@ impl KernelRegistry {
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
         sources.insert("kv_cache_copy_batch_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_batch_f32_to_f16".into(), kv_cache_src);
+        sources.insert("kv_cache_copy_seq_f32".into(), kv_cache_src);
+        sources.insert("kv_cache_copy_seq_f32_to_f16".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
@@ -125,6 +129,7 @@ impl KernelRegistry {
         sources.insert("scalar_mul_bf16".into(), elementwise_src);
         sources.insert("scalar_mul_f32".into(), elementwise_src);
         sources.insert("embedding_gather_scale_f32".into(), elementwise_src);
+        sources.insert("embedding_gather_scale_batch_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16".into(), elementwise_src);
         sources.insert("permute_021_f32".into(), elementwise_src);
         sources.insert("transpose_2d_f32".into(), elementwise_src);
@@ -199,6 +204,7 @@ impl KernelRegistry {
         sources.insert("fused_residual_norm_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_residual_norm_scalar_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_routing_f32".into(), fused_norm_add_f32_src);
+        sources.insert("fused_moe_routing_batch_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_norm_add_scalar_f32".into(), fused_norm_add_f32_src);
 
         // Argsort kernel (Story 2.3) — MoE top-K routing

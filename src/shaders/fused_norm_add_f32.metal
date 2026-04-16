@@ -344,6 +344,105 @@ kernel void fused_moe_routing_f32(
     }
 }
 
+/// Batched fused MoE routing for prefill (float32).
+///
+/// Same semantics as fused_moe_routing_f32, but processes n_tokens at once.
+/// Grid: (n_tokens, 1, 1). Each threadgroup handles one token's routing.
+///
+/// Buffer layout:
+///   buffer(0): logits          — float [n_tokens, num_experts]
+///   buffer(1): expert_ids      — uint  [n_tokens, top_k]
+///   buffer(2): routing_weights — float [n_tokens, top_k]
+///   buffer(3): per_expert_scale — float [num_experts]
+///   buffer(4): params          — { num_experts, top_k }
+///
+/// Shared memory: (2 * num_experts + tg_size) floats.
+kernel void fused_moe_routing_batch_f32(
+    device const float*               logits_all      [[buffer(0)]],
+    device uint*                      expert_ids_all  [[buffer(1)]],
+    device float*                     routing_weights_all [[buffer(2)]],
+    device const float*               per_expert_scale [[buffer(3)]],
+    constant FusedMoeRoutingParams&   params          [[buffer(4)]],
+    uint tok_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const uint num_experts = params.num_experts;
+    const uint top_k       = params.top_k;
+
+    device const float* logits          = logits_all       + tok_id * num_experts;
+    device uint*        expert_ids      = expert_ids_all   + tok_id * top_k;
+    device float*       routing_weights = routing_weights_all + tok_id * top_k;
+
+    // Step 1: find max for numerical stability (softmax)
+    float local_max = -INFINITY;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        local_max = max(local_max, logits[i]);
+    }
+    shared[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] = max(shared[tid], shared[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_val = shared[0];
+
+    // Step 2: compute exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        const float e = exp(logits[i] - max_val);
+        shared[num_experts + i] = e;
+        local_sum += e;
+    }
+    shared[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float sum_exp = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: compute softmax probabilities in shared[0..num_experts)
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        shared[i] = shared[num_experts + i] / sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: find top-K (serial, only thread 0 — K is tiny, typically 2)
+    if (tid == 0) {
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint i = 0; i < num_experts; i++) {
+                if (shared[i] > best_val) {
+                    best_val = shared[i];
+                    best_idx = i;
+                }
+            }
+            expert_ids[k] = best_idx;
+            routing_weights[k] = best_val;
+            shared[best_idx] = -1.0f;
+        }
+
+        float topk_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            topk_sum += routing_weights[k];
+        }
+        if (topk_sum > 0.0f) {
+            for (uint k = 0; k < top_k; k++) {
+                const uint eid = expert_ids[k];
+                routing_weights[k] = (routing_weights[k] / topk_sum) * per_expert_scale[eid];
+            }
+        } else {
+            for (uint k = 0; k < top_k; k++) {
+                routing_weights[k] = 0.0f;
+            }
+        }
+    }
+}
+
 /// Fused RMS normalization + residual addition + scalar multiply (float32).
 ///
 /// Computes:

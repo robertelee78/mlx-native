@@ -296,3 +296,83 @@ pub fn dispatch_fused_head_norm_rope_f32(
 
     Ok(())
 }
+
+/// Batched fused head norm + RoPE for prefill (f32).
+///
+/// Processes `seq_len` tokens at once. Input/output buffers have shape
+/// `[seq_len, n_heads, head_dim]` (token-major). Launches
+/// `seq_len * n_heads` threadgroups; the kernel's `seq_idx = head_id / n_heads`
+/// formula picks the correct position from `positions_buf[seq_idx]`.
+///
+/// * `input`/`output`: f32 buffers of shape `[seq_len * n_heads * head_dim]`.
+/// * `positions_buf`: u32 buffer of shape `[seq_len]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_head_norm_rope_batch_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    norm_weight: Option<&MlxBuffer>,
+    positions_buf: &MlxBuffer,
+    freq_factors: Option<&MlxBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    half_rope_dim: u32,
+    seq_len: u32,
+    eps: f32,
+    theta: f32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || seq_len == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_head_norm_rope_batch_f32: n_heads, head_dim, seq_len must be > 0".into(),
+        ));
+    }
+    if half_rope_dim > head_dim / 2 {
+        return Err(MlxError::InvalidArgument(format!(
+            "fused_head_norm_rope_batch_f32: half_rope_dim ({}) must be <= head_dim/2 ({})",
+            half_rope_dim,
+            head_dim / 2,
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("fused_head_norm_rope_f32", device)?;
+
+    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
+    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    let has_weight = norm_weight.is_some();
+    let has_ff = freq_factors.is_some();
+    let gpu_params = GpuFusedHeadNormRopeF32Params {
+        head_dim,
+        n_heads,
+        half_rope_dim,
+        eps,
+        has_weight: u32::from(has_weight),
+        theta,
+        has_freq_factors: u32::from(has_ff),
+        _pad: 0,
+    };
+
+    let weight_buf = norm_weight.unwrap_or(input);
+    let ff_buf = freq_factors.unwrap_or(input);
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(weight_buf)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (4, KernelArg::Buffer(positions_buf)),
+            (5, KernelArg::Buffer(ff_buf)),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}

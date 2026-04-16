@@ -489,6 +489,64 @@ pub fn dispatch_fused_moe_routing_f32(
     Ok(())
 }
 
+/// Batched fused MoE routing for prefill.
+///
+/// Processes `n_tokens` routings in one dispatch. Same semantics as
+/// `dispatch_fused_moe_routing_f32` but with batched buffers.
+///
+/// Buffer shapes:
+/// - `logits`          `[n_tokens, num_experts]`
+/// - `expert_ids`      `[n_tokens, top_k]`
+/// - `routing_weights` `[n_tokens, top_k]`
+/// - `per_expert_scale` `[num_experts]`
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_moe_routing_batch_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    logits: &MlxBuffer,
+    expert_ids: &MlxBuffer,
+    routing_weights: &MlxBuffer,
+    per_expert_scale: &MlxBuffer,
+    num_experts: u32,
+    top_k: u32,
+    n_tokens: u32,
+) -> Result<()> {
+    if num_experts == 0 || top_k == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_moe_routing_batch_f32: num_experts, top_k, n_tokens must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_moe_routing_batch_f32", device)?;
+
+    let gpu_params = GpuFusedMoeRoutingParams {
+        num_experts,
+        top_k,
+    };
+
+    let tg_size = std::cmp::min(64, num_experts.next_power_of_two()) as u64;
+    let shared_slots = 2 * num_experts + tg_size as u32;
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(logits)),
+            (1, KernelArg::Buffer(expert_ids)),
+            (2, KernelArg::Buffer(routing_weights)),
+            (3, KernelArg::Buffer(per_expert_scale)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(n_tokens as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // F32 — fused norm(input) + add(residual) + scalar multiply
 // Computes: output = (residual + rms_norm(input, weight)) * scalar

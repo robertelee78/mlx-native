@@ -322,3 +322,115 @@ pub fn dispatch_kv_cache_copy_batch_f32_to_f16(
 
     Ok(())
 }
+
+/// Multi-position, all-heads KV cache copy (F32 → F32 cache, batched prefill).
+///
+/// Source layout: `[n_tokens, n_heads, head_dim]` (token-major).
+/// Cache layout:  `[n_heads, capacity, head_dim]` (head-major).
+/// Writes positions `[seq_pos_start, seq_pos_start + n_tokens)` linearly.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_seq_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    cache: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos_start: u32,
+    n_tokens: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
+        return Ok(());
+    }
+    let total_src = (n_tokens as u64) * (n_heads as u64) * (head_dim as u64);
+    if (src.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_seq_f32: src has {} elements, need {} (n_tokens={} * n_heads={} * head_dim={})",
+            src.element_count(), total_src, n_tokens, n_heads, head_dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_seq_f32", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
+    let n_tokens_bytes = n_tokens.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(cache)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&head_dim_bytes)),
+            (4, KernelArg::Bytes(&capacity_bytes)),
+            (5, KernelArg::Bytes(&seq_pos_start_bytes)),
+            (6, KernelArg::Bytes(&n_tokens_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Multi-position, all-heads KV cache copy (F32 source → F16 cache, batched prefill).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_seq_f32_to_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    cache: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos_start: u32,
+    n_tokens: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
+        return Ok(());
+    }
+    let total_src = (n_tokens as u64) * (n_heads as u64) * (head_dim as u64);
+    if (src.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_seq_f32_to_f16: src has {} elements, need {}",
+            src.element_count(), total_src
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_seq_f32_to_f16", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
+    let n_tokens_bytes = n_tokens.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(cache)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&head_dim_bytes)),
+            (4, KernelArg::Bytes(&capacity_bytes)),
+            (5, KernelArg::Bytes(&seq_pos_start_bytes)),
+            (6, KernelArg::Bytes(&n_tokens_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}

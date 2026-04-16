@@ -900,3 +900,143 @@ pub fn moe_accumulate_encode_offset(
     );
     Ok(())
 }
+
+/// GPU params for batched SwiGLU over multiple tokens.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMoeSwigluSeqParams {
+    intermediate: u32,
+    top_k: u32,
+    n_tokens: u32,
+}
+
+/// Multi-token SwiGLU for batched prefill.
+///
+/// Input:  `[n_tokens, top_k, 2*intermediate]`
+/// Output: `[n_tokens, top_k, intermediate]`
+#[allow(clippy::too_many_arguments)]
+pub fn moe_swiglu_seq_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    gate_up: &MlxBuffer,
+    output: &MlxBuffer,
+    intermediate: usize,
+    top_k: usize,
+    n_tokens: usize,
+) -> Result<()> {
+    if intermediate == 0 || top_k == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_swiglu_seq_encode: all dims must be > 0".into(),
+        ));
+    }
+    let gu_required = n_tokens * top_k * 2 * intermediate * std::mem::size_of::<f32>();
+    if gate_up.byte_len() < gu_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_seq_encode: gate_up too small: need {} bytes, have {}",
+            gu_required, gate_up.byte_len()
+        )));
+    }
+    let out_required = n_tokens * top_k * intermediate * std::mem::size_of::<f32>();
+    if output.byte_len() < out_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_seq_encode: output too small: need {} bytes, have {}",
+            out_required, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_swiglu_seq", device)?;
+    let gpu_params = GpuMoeSwigluSeqParams {
+        intermediate: intermediate as u32,
+        top_k: top_k as u32,
+        n_tokens: n_tokens as u32,
+    };
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(gate_up)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        MTLSize::new(intermediate as u64, top_k as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, intermediate as u64), 1, 1),
+    );
+    Ok(())
+}
+
+/// GPU params for batched weighted-sum over multiple tokens.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMoeWeightedSumSeqParams {
+    hidden_size: u32,
+    top_k: u32,
+    n_tokens: u32,
+}
+
+/// Multi-token weighted sum of expert outputs for batched prefill.
+///
+/// * `expert_outputs` — `[n_tokens, top_k, hidden_size]`
+/// * `weights`        — `[n_tokens, top_k]`
+/// * `output`         — `[n_tokens, hidden_size]`
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_seq_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    expert_outputs: &MlxBuffer,
+    weights: &MlxBuffer,
+    output: &MlxBuffer,
+    hidden_size: usize,
+    top_k: usize,
+    n_tokens: usize,
+) -> Result<()> {
+    if hidden_size == 0 || top_k == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_weighted_sum_seq_encode: all dims must be > 0".into(),
+        ));
+    }
+    let expert_required = n_tokens * top_k * hidden_size * std::mem::size_of::<f32>();
+    if expert_outputs.byte_len() < expert_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_encode: expert_outputs too small: need {} bytes, have {}",
+            expert_required, expert_outputs.byte_len()
+        )));
+    }
+    let weights_required = n_tokens * top_k * std::mem::size_of::<f32>();
+    if weights.byte_len() < weights_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_encode: weights too small: need {} bytes, have {}",
+            weights_required, weights.byte_len()
+        )));
+    }
+    let out_required = n_tokens * hidden_size * std::mem::size_of::<f32>();
+    if output.byte_len() < out_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_encode: output too small: need {} bytes, have {}",
+            out_required, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_weighted_sum_seq", device)?;
+    let gpu_params = GpuMoeWeightedSumSeqParams {
+        hidden_size: hidden_size as u32,
+        top_k: top_k as u32,
+        n_tokens: n_tokens as u32,
+    };
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(expert_outputs)),
+            (1, KernelArg::Buffer(weights)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        MTLSize::new(hidden_size as u64, n_tokens as u64, 1),
+        MTLSize::new(std::cmp::min(256, hidden_size as u64), 1, 1),
+    );
+    Ok(())
+}

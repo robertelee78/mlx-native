@@ -383,6 +383,87 @@ pub fn embedding_gather_scale_f32(
     Ok(())
 }
 
+/// GPU params struct for batched embedding gather + scale.
+/// Must match `EmbedGatherScaleBatchParams` in the MSL shader.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuEmbedGatherScaleBatchParams {
+    scale: f32,
+    hidden_size: u32,
+    n_tokens: u32,
+}
+
+/// Batched embedding gather + scale for prefill (f32).
+///
+/// Reads `token_ids[tok]` for each `tok in 0..n_tokens`, gathers the
+/// embedding row from `embed_table`, multiplies by `scale`, and writes to
+/// `output[tok * hidden_size + i]`.
+///
+/// * `embed_table` — f32 `[vocab_size * hidden_size]`
+/// * `token_ids`   — u32 `[n_tokens]`
+/// * `output`      — f32 `[n_tokens * hidden_size]`
+#[allow(clippy::too_many_arguments)]
+pub fn embedding_gather_scale_batch_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    embed_table: &MlxBuffer,
+    token_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    hidden_size: usize,
+    n_tokens: usize,
+    scale: f32,
+) -> Result<()> {
+    if hidden_size == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "embedding_gather_scale_batch_f32: hidden_size and n_tokens must be > 0".into(),
+        ));
+    }
+    let out_bytes = n_tokens * hidden_size * std::mem::size_of::<f32>();
+    if output.byte_len() < out_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_gather_scale_batch_f32: output too small: need {} bytes, have {}",
+            out_bytes, output.byte_len()
+        )));
+    }
+    let ids_bytes = n_tokens * std::mem::size_of::<u32>();
+    if token_ids.byte_len() < ids_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_gather_scale_batch_f32: token_ids too small: need {} bytes, have {}",
+            ids_bytes, token_ids.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("embedding_gather_scale_batch_f32", device)?;
+
+    let gpu_params = GpuEmbedGatherScaleBatchParams {
+        scale,
+        hidden_size: hidden_size as u32,
+        n_tokens: n_tokens as u32,
+    };
+
+    let grid = MTLSize::new(hidden_size as u64, n_tokens as u64, 1);
+    let tg = MTLSize::new(
+        std::cmp::min(ELEMENTWISE_TG_SIZE, hidden_size as u64),
+        1, 1,
+    );
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(embed_table)),
+            (1, KernelArg::Buffer(token_ids)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
 /// Cast f32 to bf16 using an externally-provided encoder (no commit).
 ///
 /// Encodes the `cast_f32_to_bf16` kernel into the given encoder without
