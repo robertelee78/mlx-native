@@ -242,7 +242,10 @@ kernel void fused_residual_norm_scalar_f32(
 /// Buffer layout:
 ///   buffer(0): logits         — float [num_experts]  (input)
 ///   buffer(1): expert_ids     — uint  [top_k]        (output: sorted expert indices)
-///   buffer(2): routing_weights— float [top_k]        (output: normalized top-K weights)
+///   buffer(2): routing_weights— float [top_k]        (output: top-K softmax weights
+///                                                    renormalized over the selected
+///                                                    experts, then scaled by
+///                                                    per_expert_scale)
 ///   buffer(3): per_expert_scale — float [num_experts] (input: per-expert scale factors)
 ///   buffer(4): params         — { num_experts, top_k }
 ///
@@ -314,19 +317,28 @@ kernel void fused_moe_routing_f32(
                 }
             }
             expert_ids[k] = best_idx;
-            // Apply per_expert_scale
-            routing_weights[k] = best_val * per_expert_scale[best_idx];
+            // Match the old passing candle path:
+            //   1. softmax over all experts
+            //   2. renormalize the selected top-K slice
+            //   3. apply per_expert_scale
+            // Critically, do NOT renormalize after applying per_expert_scale.
+            routing_weights[k] = best_val;
             shared[best_idx] = -1.0f;  // mark as used
         }
 
-        // Renormalize the top-K weights
-        float weight_sum = 0.0f;
+        // Renormalize the top-K weights before applying per_expert_scale.
+        float topk_sum = 0.0f;
         for (uint k = 0; k < top_k; k++) {
-            weight_sum += routing_weights[k];
+            topk_sum += routing_weights[k];
         }
-        if (weight_sum > 0.0f) {
+        if (topk_sum > 0.0f) {
             for (uint k = 0; k < top_k; k++) {
-                routing_weights[k] /= weight_sum;
+                const uint eid = expert_ids[k];
+                routing_weights[k] = (routing_weights[k] / topk_sum) * per_expert_scale[eid];
+            }
+        } else {
+            for (uint k = 0; k < top_k; k++) {
+                routing_weights[k] = 0.0f;
             }
         }
     }
