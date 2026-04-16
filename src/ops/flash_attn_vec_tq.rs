@@ -50,6 +50,15 @@ pub struct FlashAttnVecTqParams {
     pub sliding_window: u32,
     /// Logit softcapping (0 = disabled).
     pub softcap: f32,
+    /// Ring buffer start slot for sliding-window after wrap (ADR-009 Track 2).
+    ///
+    /// Physical slot index of the chronologically OLDEST entry in the ring
+    /// buffer. Before wrap (`kv_seq_len < kv_capacity`): set to 0.
+    /// After wrap: set to `write_pos % capacity`.
+    ///
+    /// The shader uses this to map physical slots to logical positions
+    /// for correct causal/sliding-window masking after wrap.
+    pub ring_start: u32,
 }
 
 /// GPU-side reduce params. Must match `FlashAttnVecReduceParams` in the MSL.
@@ -73,6 +82,7 @@ struct FlashAttnVecTqParamsGpu {
     sliding_window: u32,
     softcap: f32,
     nwg: u32,
+    ring_start: u32,
 }
 
 /// Validate TQ flash attention parameters.
@@ -173,6 +183,7 @@ pub fn flash_attn_vec_tq(
         sliding_window: params.sliding_window,
         softcap: params.softcap,
         nwg,
+        ring_start: params.ring_start,
     };
 
     let kernel_name = match head_dim {
@@ -284,6 +295,7 @@ mod tests {
             mask_type: 1,
             sliding_window: 0,
             softcap: 0.0,
+            ring_start: 0,
         };
         assert!(validate_params(&p).is_ok());
     }
@@ -300,6 +312,7 @@ mod tests {
             mask_type: 0,
             sliding_window: 0,
             softcap: 0.0,
+            ring_start: 0,
         };
         assert!(validate_params(&p).is_err());
     }
@@ -308,7 +321,7 @@ mod tests {
     fn test_gpu_params_layout() {
         assert_eq!(
             std::mem::size_of::<FlashAttnVecTqParamsGpu>(),
-            40, // 10 x u32/f32 = 40 bytes
+            44, // 11 x u32/f32 = 44 bytes
         );
     }
 }

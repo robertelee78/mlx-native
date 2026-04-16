@@ -30,6 +30,7 @@ struct FlashAttnVecTqParams {
     uint  sliding_window;
     float softcap;
     uint  nwg;
+    uint  ring_start;
 };
 
 struct FlashAttnVecReduceParams {

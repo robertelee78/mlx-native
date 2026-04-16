@@ -38,6 +38,7 @@ struct FlashAttnVecTqParams {
     uint  sliding_window;
     float softcap;
     uint  nwg;
+    uint  ring_start;  // ADR-009 Track 2: physical slot of oldest entry in ring buffer
 };
 
 // Reduce params — shared with flash_attn_vec.
@@ -235,33 +236,48 @@ kernel void flash_attn_vec_tq_impl(
 
     const ushort tx = tiisg;
 
-    // Masking bounds.
+    // Masking bounds (ADR-009 Track 2: ring-buffer-aware chronology).
+    //
+    // ring_start = physical slot of the oldest entry in the ring buffer.
+    // Before wrap: ring_start = 0 (physical == logical).
+    // After wrap: ring_start = write_pos % capacity.
+    //
+    // logical_idx(physical_slot) = (physical_slot - ring_start + capacity) % capacity
+    // This maps physical slots to chronological order: 0 = oldest, kv_seq_len-1 = newest.
     const uint kv_seq_len = params.kv_seq_len;
-    const uint abs_pos = kv_seq_len - 1;
-    const uint causal_max_k = min(abs_pos + 1, kv_seq_len);
+    const uint kv_capacity = params.kv_capacity;
+    const uint ring_start = params.ring_start;
 
-    uint window_start = 0;
-    if (params.mask_type == 2 && params.sliding_window > 0) {
-        window_start = (abs_pos >= params.sliding_window)
-            ? (abs_pos - params.sliding_window + 1) : 0;
+    // For sliding window: oldest visible logical index.
+    uint window_start_logical = 0;
+    if (params.mask_type == 2 && params.sliding_window > 0 && kv_seq_len > params.sliding_window) {
+        window_start_logical = kv_seq_len - params.sliding_window;
     }
 
     // Reference to Q in shared memory for dot products.
     threadgroup const half4 *pq4 = sq4 + tx;
 
     // Main loop over KV cache in chunks of C=32.
+    // Iterate over all physical slots (up to kv_seq_len).
     for (uint ic0 = iwg; ; ic0 += NWG) {
         uint ic = ic0 * C;
-        if (ic >= causal_max_k) {
+        if (ic >= kv_seq_len) {
             break;
         }
 
-        // Compute implicit mask for this chunk.
+        // Compute implicit mask for this chunk using ring-buffer chronology.
         {
-            uint k_pos = ic + tx;
+            uint k_pos = ic + tx;  // physical slot index
             float mask_val = 0.0f;
-            if (k_pos >= causal_max_k || k_pos < window_start) {
+            if (k_pos >= kv_seq_len) {
+                // Beyond valid range
                 mask_val = -65504.0f;
+            } else {
+                // Map physical slot to logical (chronological) index
+                uint logical_idx = (k_pos - ring_start + kv_capacity) % kv_capacity;
+                if (logical_idx >= kv_seq_len || logical_idx < window_start_logical) {
+                    mask_val = -65504.0f;
+                }
             }
             ss[tx] = mask_val;
         }
