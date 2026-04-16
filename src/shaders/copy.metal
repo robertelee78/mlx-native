@@ -36,3 +36,33 @@ kernel void strided_copy_f32(
     uint dst_idx = row * params.cols + col;
     dst[dst_idx] = src[src_idx];
 }
+
+// --------------------------------------------------------------------------
+// offset_copy_f32 — Copy `count` f32 elements with src/dst offsets.
+//
+// dst[dst_offset + i] = src[src_offset + i]  for i in 0..count
+//
+// Buffer layout:
+//   buffer(0): src    — float (source buffer)
+//   buffer(1): dst    — float (destination buffer)
+//   buffer(2): params — uint [3] — {src_offset, dst_offset, count}
+//
+// Grid:        (count, 1, 1)
+// Threadgroup: (min(256, count), 1, 1)
+// --------------------------------------------------------------------------
+
+struct OffsetCopyParams {
+    uint src_offset;
+    uint dst_offset;
+    uint count;
+};
+
+kernel void offset_copy_f32(
+    device const float*       src    [[buffer(0)]],
+    device float*             dst    [[buffer(1)]],
+    constant OffsetCopyParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= params.count) return;
+    dst[params.dst_offset + tid] = src[params.src_offset + tid];
+}

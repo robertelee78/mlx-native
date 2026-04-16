@@ -218,6 +218,7 @@ impl KernelRegistry {
         // Strided copy kernel (Story 2.5)
         let copy_src: &'static str = include_str!("shaders/copy.metal");
         sources.insert("strided_copy_f32".into(), copy_src);
+        sources.insert("offset_copy_f32".into(), copy_src);
 
         // Dense F16 GEMM kernel (Story 2.6) — lm_head projection
         let dense_gemm_src: &'static str = include_str!("shaders/dense_gemm.metal");

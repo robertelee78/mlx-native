@@ -20,6 +20,7 @@ pub static COPY_SHADER_SOURCE: &str = include_str!("../shaders/copy.metal");
 /// Register strided copy shader source with the given kernel registry.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("strided_copy_f32", COPY_SHADER_SOURCE);
+    registry.register_source("offset_copy_f32", COPY_SHADER_SOURCE);
 }
 
 /// MSL-compatible params struct for strided copy.
@@ -112,6 +113,73 @@ pub fn dispatch_strided_copy_f32(
 
     let grid = MTLSize::new(params.cols as u64, params.rows as u64, 1);
     let tg = MTLSize::new(std::cmp::min(256, params.cols as u64), 1, 1);
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(dst)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
+/// GPU-side params for offset copy.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuOffsetCopyParams {
+    src_offset: u32,
+    dst_offset: u32,
+    count: u32,
+}
+
+/// Copy `count` f32 elements from `src[src_offset..]` to `dst[dst_offset..]`.
+///
+/// Used during prefill to scatter/gather rows between large prefill buffers
+/// and single-token activation buffers.
+pub fn dispatch_copy_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    dst: &MlxBuffer,
+    src_offset: usize,
+    dst_offset: usize,
+    count: usize,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(()); // no-op
+    }
+    let src_end_bytes = (src_offset + count) * 4;
+    let dst_end_bytes = (dst_offset + count) * 4;
+    if src.byte_len() < src_end_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "offset_copy_f32: src too small: need {} bytes (offset {} + count {}), have {}",
+            src_end_bytes, src_offset, count, src.byte_len()
+        )));
+    }
+    if dst.byte_len() < dst_end_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "offset_copy_f32: dst too small: need {} bytes (offset {} + count {}), have {}",
+            dst_end_bytes, dst_offset, count, dst.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("offset_copy_f32", device)?;
+
+    let gpu_params = GpuOffsetCopyParams {
+        src_offset: src_offset as u32,
+        dst_offset: dst_offset as u32,
+        count: count as u32,
+    };
+
+    let grid = MTLSize::new(count as u64, 1, 1);
+    let tg = MTLSize::new(std::cmp::min(256, count as u64), 1, 1);
 
     encode_with_args(
         encoder,
