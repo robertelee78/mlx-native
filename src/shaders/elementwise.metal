@@ -361,3 +361,32 @@ kernel void transpose_2d_f16(
 
     output[col * params.rows + row] = input[row * params.cols + col];
 }
+
+// --------------------------------------------------------------------------
+// permute_021_f32 — Transpose [A, B, C] -> [B, A, C] for float32
+//
+// Same operation as permute_021_bf16 but for F32 buffers.
+// Used for prefill Q/K/V layout conversion:
+//   [seq_len, n_heads, head_dim] <-> [n_heads, seq_len, head_dim]
+//
+// Reuses Permute021Params (defined above permute_021_bf16).
+//
+// Grid: (C, B, A), each thread copies one element
+// --------------------------------------------------------------------------
+
+kernel void permute_021_f32(
+    device const float* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint b = gid.y;
+    const uint a = gid.z;
+
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+
+    const uint in_idx  = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    const uint out_idx = b * (params.dim_a * params.dim_c) + a * params.dim_c + c;
+    output[out_idx] = input[in_idx];
+}

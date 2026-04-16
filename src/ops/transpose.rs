@@ -139,6 +139,69 @@ struct GpuPermute021Params {
 ///
 /// Returns `MlxError::InvalidArgument` if any dimension is zero or buffers
 /// are too small.
+pub fn permute_021_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    dim_a: usize,
+    dim_b: usize,
+    dim_c: usize,
+) -> Result<()> {
+    if dim_a == 0 || dim_b == 0 || dim_c == 0 {
+        return Err(MlxError::InvalidArgument(
+            "permute_021_f32: all dimensions must be > 0".into(),
+        ));
+    }
+
+    let total_elements = dim_a * dim_b * dim_c;
+    let elem_bytes = total_elements * 4; // f32 = 4 bytes
+    if input.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "permute_021_f32: input buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            input.byte_len()
+        )));
+    }
+    if output.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "permute_021_f32: output buffer too small: need {} bytes, have {}",
+            elem_bytes,
+            output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("permute_021_f32", device)?;
+
+    let gpu_params = GpuPermute021Params {
+        dim_a: dim_a as u32,
+        dim_b: dim_b as u32,
+        dim_c: dim_c as u32,
+    };
+
+    let grid = MTLSize::new(dim_c as u64, dim_b as u64, dim_a as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, dim_c as u64),
+        std::cmp::min(4, dim_b as u64),
+        std::cmp::min(4, dim_a as u64),
+    );
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
 pub fn permute_021_bf16(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
