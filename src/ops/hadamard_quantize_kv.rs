@@ -169,10 +169,16 @@ pub fn dispatch_hadamard_quantize_kv(
     }
 
     // Use the fast SIMD-shuffle kernel (zero threadgroup barriers).
-    let kernel_name = match head_dim {
-        256 => "hadamard_quantize_kv_fast_d256",
-        512 => "hadamard_quantize_kv_fast_d512",
-        _ => "hadamard_quantize_kv", // fallback to shared-memory version
+    // HF2Q_TQ_ENCODE_LEGACY=1: force the old shared-memory kernel for coherence testing.
+    let use_legacy = std::env::var("HF2Q_TQ_ENCODE_LEGACY").map_or(false, |v| v == "1");
+    let kernel_name = if use_legacy {
+        "hadamard_quantize_kv"
+    } else {
+        match head_dim {
+            256 => "hadamard_quantize_kv_fast_d256",
+            512 => "hadamard_quantize_kv_fast_d512",
+            _ => "hadamard_quantize_kv", // fallback to shared-memory version
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;

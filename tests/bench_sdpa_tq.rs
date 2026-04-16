@@ -94,6 +94,10 @@ fn setup() -> (MlxDevice, KernelRegistry) {
     let v2_src = include_str!("../src/shaders/flash_attn_vec_tq_v2.metal");
     registry.register_source("flash_attn_vec_tq_v2_dk256", v2_src);
     registry.register_source("flash_attn_vec_tq_v2_dk512", v2_src);
+    // Register affine4 kernel for representation A/B testing.
+    let affine4_src = include_str!("../src/shaders/flash_attn_vec_affine4.metal");
+    registry.register_source("flash_attn_vec_affine4_dk256", affine4_src);
+    registry.register_source("flash_attn_vec_affine4_dk512", affine4_src);
     (device, registry)
 }
 
@@ -384,6 +388,13 @@ fn bench_tq_nwg_sweep() {
 
 // ---- TQ v2 (tiled dequant) bench ----
 
+/// GPU reduce params — must match FlashAttnVecReduceParams in the shader.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlashAttnVecReduceParamsGpu {
+    nrows: u32,
+}
+
 /// GPU params — must match FlashAttnVecTqParams in the shader.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -580,5 +591,269 @@ fn bench_tq_v1_vs_v2() {
         let v2 = bench_tq_v2_sdpa(&device, &mut registry, 16, 2, 512, kvl, 16, warmup, iters);
         let f16 = bench_f16_sdpa(&device, &mut registry, 16, 2, 512, kvl, warmup, iters);
         eprintln!("{:>8} {:>12.1} {:>12.1} {:>12.1} {:>8.2}x", kvl, v1, v2, f16, v2 / f16);
+    }
+}
+
+// ---- Affine INT4 bench (representation A/B) ----
+
+fn bench_affine4_sdpa(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    kv_seq_len: u32,
+    nwg: u32,
+    warmup: usize,
+    iters: usize,
+) -> f64 {
+    let mut rng = Xoshiro256::new(42);
+    let nh = num_heads as usize;
+    let nkv = num_kv_heads as usize;
+    let hd = head_dim as usize;
+    let kvl = kv_seq_len as usize;
+
+    // Same data setup as TQ bench — packed nibbles + norms.
+    // The affine kernel interprets norms as scales (same buffer, different math).
+    let q_data = random_f32_vec(&mut rng, nh * hd);
+    let mut k_packed = vec![0u8; nkv * kvl * (hd / 2)];
+    let mut k_norms = vec![0.0f32; nkv * kvl];
+    let mut v_packed = vec![0u8; nkv * kvl * (hd / 2)];
+    let mut v_norms = vec![0.0f32; nkv * kvl];
+
+    for kv_h in 0..nkv {
+        for p in 0..kvl {
+            let k_vec = random_f32_vec(&mut rng, hd);
+            let mut rotated = k_vec.clone();
+            fwht_inplace(&mut rotated).unwrap();
+            let norm: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
+            k_norms[kv_h * kvl + p] = norm;
+            if norm > 1e-30 {
+                let inv_norm = 1.0 / norm;
+                let scale = (hd as f32).sqrt();
+                let offset = (kv_h * kvl + p) * (hd / 2);
+                for c in 0..hd {
+                    let scaled = rotated[c] * inv_norm * scale;
+                    let idx = nearest_centroid_4bit(scaled);
+                    if c % 2 == 0 { k_packed[offset + c / 2] = idx & 0xF; }
+                    else { k_packed[offset + c / 2] |= (idx & 0xF) << 4; }
+                }
+            }
+            let v_vec = random_f32_vec(&mut rng, hd);
+            let mut v_rot = v_vec.clone();
+            fwht_inplace(&mut v_rot).unwrap();
+            let v_norm: f32 = v_rot.iter().map(|v| v * v).sum::<f32>().sqrt();
+            v_norms[kv_h * kvl + p] = v_norm;
+            if v_norm > 1e-30 {
+                let inv_norm = 1.0 / v_norm;
+                let scale = (hd as f32).sqrt();
+                let offset = (kv_h * kvl + p) * (hd / 2);
+                for c in 0..hd {
+                    let scaled = v_rot[c] * inv_norm * scale;
+                    let idx = nearest_centroid_4bit(scaled);
+                    if c % 2 == 0 { v_packed[offset + c / 2] = idx & 0xF; }
+                    else { v_packed[offset + c / 2] |= (idx & 0xF) << 4; }
+                }
+            }
+        }
+    }
+
+    let mut q_rotated = q_data.clone();
+    for h in 0..nh {
+        fwht_inplace(&mut q_rotated[h * hd..(h + 1) * hd]).unwrap();
+    }
+
+    let mut q_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    q_buf.as_mut_slice::<f32>().unwrap()[..nh * hd].copy_from_slice(&q_rotated);
+    let mut k_packed_buf = device.alloc_buffer(k_packed.len(), DType::U8, vec![nkv, kvl, hd / 2]).unwrap();
+    k_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&k_packed);
+    let mut k_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv, kvl]).unwrap();
+    k_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_norms);
+    let mut v_packed_buf = device.alloc_buffer(v_packed.len(), DType::U8, vec![nkv, kvl, hd / 2]).unwrap();
+    v_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&v_packed);
+    let mut v_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv, kvl]).unwrap();
+    v_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_norms);
+
+    // Output buffer: NWG=1 writes directly, NWG>1 needs tmp + reduce.
+    // Size tmp for max NWG to avoid OOB writes.
+    let tmp_bytes = flash_attn_vec_tq::tmp_buffer_bytes(num_heads, head_dim);
+    let output_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    let tmp_buf = device.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4]).unwrap();
+
+    let kernel_name = match head_dim {
+        256 => "flash_attn_vec_affine4_dk256",
+        512 => "flash_attn_vec_affine4_dk512",
+        _ => panic!("unsupported head_dim"),
+    };
+
+    let reduce_kernel_name = match head_dim {
+        256 => "flash_attn_vec_reduce_dk256",
+        512 => "flash_attn_vec_reduce_dk512",
+        _ => panic!("unsupported head_dim"),
+    };
+
+    let gpu_params = TqParamsGpu {
+        n_heads: num_heads, n_kv_heads: num_kv_heads,
+        head_dim, kv_seq_len, kv_capacity: kv_seq_len,
+        scale: 1.0, mask_type: 1, sliding_window: 0, softcap: 0.0,
+        nwg,
+    };
+
+    let pk = ((head_dim as usize) + 127) & !127;
+    let pv = pk;
+    let sh = 4 * 32;
+    let shmem_halfs = pk + sh + 2 * pv;
+    let shmem_bytes = shmem_halfs * 2;
+
+    let reduce_params = FlashAttnVecReduceParamsGpu { nrows: num_heads };
+
+    // Warmup
+    for _ in 0..warmup {
+        let mut encoder = device.command_encoder().unwrap();
+        let pipeline = registry.get_pipeline(kernel_name, device.metal_device()).unwrap();
+        let threadgroups = MTLSize::new(1, num_heads as u64, nwg as u64);
+        let threadgroup_size = MTLSize::new(32, 1, 1);
+        let dst_buf = if nwg == 1 { &output_buf } else { &tmp_buf };
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+                (1, KernelArg::Buffer(&q_buf)),
+                (2, KernelArg::Buffer(&k_packed_buf)),
+                (3, KernelArg::Buffer(&k_norms_buf)),
+                (4, KernelArg::Buffer(&v_packed_buf)),
+                (5, KernelArg::Buffer(&v_norms_buf)),
+                (6, KernelArg::Buffer(dst_buf)),
+            ],
+            &[(0, shmem_bytes as u64)],
+            threadgroups,
+            threadgroup_size,
+        );
+        if nwg > 1 {
+            encoder.memory_barrier();
+            let reduce_pipeline = registry.get_pipeline(reduce_kernel_name, device.metal_device()).unwrap();
+            let reduce_tg = MTLSize::new(num_heads as u64, 1, 1);
+            let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
+            encoder.encode_threadgroups_with_args(
+                reduce_pipeline,
+                &[
+                    (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                    (1, KernelArg::Buffer(&tmp_buf)),
+                    (2, KernelArg::Buffer(&output_buf)),
+                    (3, KernelArg::Bytes(as_bytes(&nwg))),
+                ],
+                reduce_tg,
+                reduce_tg_size,
+            );
+        }
+        encoder.commit_and_wait().unwrap();
+    }
+
+    // Timed
+    let start = Instant::now();
+    for _ in 0..iters {
+        let mut encoder = device.command_encoder().unwrap();
+        let pipeline = registry.get_pipeline(kernel_name, device.metal_device()).unwrap();
+        let threadgroups = MTLSize::new(1, num_heads as u64, nwg as u64);
+        let threadgroup_size = MTLSize::new(32, 1, 1);
+        let dst_buf = if nwg == 1 { &output_buf } else { &tmp_buf };
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+                (1, KernelArg::Buffer(&q_buf)),
+                (2, KernelArg::Buffer(&k_packed_buf)),
+                (3, KernelArg::Buffer(&k_norms_buf)),
+                (4, KernelArg::Buffer(&v_packed_buf)),
+                (5, KernelArg::Buffer(&v_norms_buf)),
+                (6, KernelArg::Buffer(dst_buf)),
+            ],
+            &[(0, shmem_bytes as u64)],
+            threadgroups,
+            threadgroup_size,
+        );
+        if nwg > 1 {
+            encoder.memory_barrier();
+            let reduce_pipeline = registry.get_pipeline(reduce_kernel_name, device.metal_device()).unwrap();
+            let reduce_tg = MTLSize::new(num_heads as u64, 1, 1);
+            let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
+            encoder.encode_threadgroups_with_args(
+                reduce_pipeline,
+                &[
+                    (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                    (1, KernelArg::Buffer(&tmp_buf)),
+                    (2, KernelArg::Buffer(&output_buf)),
+                    (3, KernelArg::Bytes(as_bytes(&nwg))),
+                ],
+                reduce_tg,
+                reduce_tg_size,
+            );
+        }
+        encoder.commit_and_wait().unwrap();
+    }
+    let elapsed = start.elapsed();
+    elapsed.as_secs_f64() * 1e6 / iters as f64
+}
+
+/// A/B test: TQ codebook vs affine INT4 vs F16 SDPA.
+///
+/// If affine4 ≈ TQ → codebook lookup is NOT the issue, total ALU is.
+/// If affine4 << TQ → codebook lookup IS the bottleneck, representation change wins.
+/// If affine4 ≈ F16 → affine decode is nearly free, full representation swap justified.
+#[test]
+fn bench_tq_vs_affine4() {
+    let (device, mut registry) = setup();
+
+    let warmup = 5;
+    let iters = 30;
+
+    // --- NWG=16: Production config (with reduce kernel) ---
+    eprintln!("\n=== Representation A/B: NWG=16 (production, + reduce) ===");
+
+    eprintln!("\n  Sliding Layer (nh=16, nkv=8, hd=256):");
+    eprintln!("  {:>8} {:>10} {:>10} {:>10} {:>9} {:>9}",
+        "kv_len", "TQ(μs)", "Aff(μs)", "F16(μs)", "Aff/F16", "TQ/Aff");
+
+    for &kvl in &[128u32, 512, 1024] {
+        let tq = bench_tq_sdpa(&device, &mut registry, 16, 8, 256, kvl, Some(16), warmup, iters);
+        let aff = bench_affine4_sdpa(&device, &mut registry, 16, 8, 256, kvl, 16, warmup, iters);
+        let f16 = bench_f16_sdpa(&device, &mut registry, 16, 8, 256, kvl, warmup, iters);
+        eprintln!("  {:>8} {:>10.1} {:>10.1} {:>10.1} {:>9.2}x {:>9.2}x",
+            kvl, tq, aff, f16, aff / f16, tq / aff);
+    }
+
+    eprintln!("\n  Global Layer (nh=16, nkv=2, hd=512):");
+    eprintln!("  {:>8} {:>10} {:>10} {:>10} {:>9} {:>9}",
+        "kv_len", "TQ(μs)", "Aff(μs)", "F16(μs)", "Aff/F16", "TQ/Aff");
+
+    for &kvl in &[128u32, 512, 1024] {
+        let tq = bench_tq_sdpa(&device, &mut registry, 16, 2, 512, kvl, Some(16), warmup, iters);
+        let aff = bench_affine4_sdpa(&device, &mut registry, 16, 2, 512, kvl, 16, warmup, iters);
+        let f16 = bench_f16_sdpa(&device, &mut registry, 16, 2, 512, kvl, warmup, iters);
+        eprintln!("  {:>8} {:>10.1} {:>10.1} {:>10.1} {:>9.2}x {:>9.2}x",
+            kvl, tq, aff, f16, aff / f16, tq / aff);
+    }
+
+    // --- Summary: NWG=16, kv=1024 (typical decode) ---
+    eprintln!("\n=== Key metric: NWG=16, kv=1024 (typical decode) ===");
+    let tq_s = bench_tq_sdpa(&device, &mut registry, 16, 8, 256, 1024, Some(16), warmup, iters);
+    let aff_s = bench_affine4_sdpa(&device, &mut registry, 16, 8, 256, 1024, 16, warmup, iters);
+    let f16_s = bench_f16_sdpa(&device, &mut registry, 16, 8, 256, 1024, warmup, iters);
+    let tq_g = bench_tq_sdpa(&device, &mut registry, 16, 2, 512, 1024, Some(16), warmup, iters);
+    let aff_g = bench_affine4_sdpa(&device, &mut registry, 16, 2, 512, 1024, 16, warmup, iters);
+    let f16_g = bench_f16_sdpa(&device, &mut registry, 16, 2, 512, 1024, warmup, iters);
+
+    let tq_saving_s = tq_s - aff_s;
+    let tq_saving_g = tq_g - aff_g;
+    // Gemma-4-27B: 24 sliding + 6 global layers
+    let total_saving_us = 24.0 * tq_saving_s + 6.0 * tq_saving_g;
+    eprintln!("  Sliding:  TQ={:.0}μs  Aff={:.0}μs  F16={:.0}μs  (save {:.0}μs/layer)",
+        tq_s, aff_s, f16_s, tq_saving_s);
+    eprintln!("  Global:   TQ={:.0}μs  Aff={:.0}μs  F16={:.0}μs  (save {:.0}μs/layer)",
+        tq_g, aff_g, f16_g, tq_saving_g);
+    eprintln!("  Projected 30-layer saving: {:.0}μs = {:.2}ms/token", total_saving_us, total_saving_us / 1000.0);
+    if total_saving_us > 0.0 {
+        eprintln!("  At ~11ms/token (90 tok/s): affine would give ~{:.0} tok/s",
+            1e6 / (11000.0 - total_saving_us));
     }
 }
