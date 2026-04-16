@@ -74,6 +74,10 @@ static_assert(sizeof(block_q6_K) == sizeof(half) + QK_K/16 + 3*QK_K/4, "wrong q6
 //
 // Dispatch: threadgroups=(ceil(N/8), M, B), threads_per_tg=(8, 8, 1)
 
+// ADR-009 Phase 3A: match llama.cpp's 4-accumulator layout exactly.
+// Using 4 separate accumulators (one per nibble position) instead of 2
+// paired accumulators ensures identical floating-point rounding to
+// llama.cpp's block_q_n_dot_y for block_q4_0.
 inline float block_q4_0_dot_y(
     device const block_q4_0 * qb,
     float sumy,
@@ -81,15 +85,15 @@ inline float block_q4_0_dot_y(
     int il
 ) {
     float d = qb->d;
-    float2 acc = 0.f;
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     device const uint16_t * qs = ((device const uint16_t *)qb + 1 + il/2);
     for (int i = 0; i < 8; i += 2) {
-        acc[0] += yl[i + 0] * (qs[i / 2] & 0x000F)
-                + yl[i + 1] * (qs[i / 2] & 0x0F00);
-        acc[1] += yl[i + 8] * (qs[i / 2] & 0x00F0)
-                + yl[i + 9] * (qs[i / 2] & 0xF000);
+        acc[0] += yl[i + 0] * (qs[i / 2] & 0x000F);
+        acc[1] += yl[i + 1] * (qs[i / 2] & 0x0F00);
+        acc[2] += yl[i + 8] * (qs[i / 2] & 0x00F0);
+        acc[3] += yl[i + 9] * (qs[i / 2] & 0xF000);
     }
-    return d * (sumy * -8.f + acc[0] + acc[1]);
+    return d * (sumy * -8.f + acc[0] + acc[1] + acc[2] + acc[3]);
 }
 
 kernel void kernel_mul_mv_q4_0_f32(
@@ -128,19 +132,22 @@ kernel void kernel_mul_mv_q4_0_f32(
 
     device const float * yb = y + ix * QK4_0 + il;
 
+    // ADR-009 Phase 3A: match llama.cpp's two-accumulator sumy pattern.
+    // llama.cpp accumulates sumy[0] (first half) and sumy[1] (second half)
+    // separately, then combines. This ensures identical FP rounding.
     for (int ib = ix; ib < nb; ib += nw/2) {
-        float sumy = 0;
+        float sumy[2] = { 0.f, 0.f };
         for (int i = 0; i < 8; i += 2) {
-            sumy += yb[i] + yb[i+1];
+            sumy[0] += yb[i] + yb[i+1];
             yl[i+0] = yb[i+0];
             yl[i+1] = yb[i+1] / 256.f;
-            sumy += yb[i+16] + yb[i+17];
+            sumy[1] += yb[i+16] + yb[i+17];
             yl[i+8] = yb[i+16] / 16.f;
             yl[i+9] = yb[i+17] / 4096.f;
         }
 
         for (int row = 0; row < nr; row++) {
-            sumf[row] += block_q4_0_dot_y(x + ib + row*nb, sumy, yl, il);
+            sumf[row] += block_q4_0_dot_y(x + ib + row*nb, sumy[0] + sumy[1], yl, il);
         }
 
         yb += QK4_0 * 16;
