@@ -4,6 +4,10 @@
 //
 // Copyright the llama.cpp Authors. See LICENSE-MIT-llamacpp.
 //
+// ADR-009 Phase 3A: match llama.cpp's FOR_UNROLL to ensure identical
+// compiler optimization and FMA generation for the d=256 path.
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+//
 // Simplified for F32 Q/K/V with NE=1 (Gemma 4 head dims 256 and 512).
 // No quantized KV, no ALiBi, no attention sinks, no logit softcapping.
 // Supports causal masking and sliding window via implicit mask computation.
@@ -136,7 +140,7 @@ kernel void flash_attn_vec_impl(
     }
 
     // Zero the output accumulator.
-    for (short i = 0; i < DV4 / NL; ++i) {
+    FOR_UNROLL (short i = 0; i < DV4 / NL; ++i) {
         so4[i * NL] = float4(0.0f);
     }
 
@@ -204,9 +208,9 @@ kernel void flash_attn_vec_impl(
             // mqk[cc] will hold the full dot product for KV position (ic + cc).
             float mqk[C];
 
-            for (short cc = 0; cc < C; ++cc) {
+            FOR_UNROLL (short cc = 0; cc < C; ++cc) {
                 float partial = 0.0f;
-                for (short ii = 0; ii < DK4 / NL; ++ii) {
+                FOR_UNROLL (short ii = 0; ii < DK4 / NL; ++ii) {
                     partial += dot(float4(pk4[cc * DK4 + ii * NL]),
                                    float4(pq4[ii * NL]));
                 }
@@ -236,7 +240,7 @@ kernel void flash_attn_vec_impl(
             ss[tiisg] = vs;
 
             // Rescale previous output accumulation.
-            for (short ii = 0; ii < DV4 / NL; ++ii) {
+            FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                 so4[ii * NL] *= ms;
             }
         }
@@ -254,16 +258,16 @@ kernel void flash_attn_vec_impl(
             // pv4 points to V[ic, 0] as vec4, then offset by tx.
             device const kv4_t *pv4 = (device const kv4_t *)(v_base + ic * DV) + tx;
 
-            for (short cc = 0; cc < C; ++cc) {
+            FOR_UNROLL (short cc = 0; cc < C; ++cc) {
                 float weight = ss[cc];  // softmax weight for KV pos (ic + cc)
-                for (short ii = 0; ii < DV4 / NL; ++ii) {
+                FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                     lo[ii] += float4(pv4[cc * DV4 + ii * NL]) * weight;
                 }
             }
 
             // No SIMD reduction needed for NE=1 — each thread owns distinct
             // output dimensions. Accumulate directly.
-            for (short ii = 0; ii < DV4 / NL; ++ii) {
+            FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                 so4[ii * NL] += lo[ii];
             }
         }
