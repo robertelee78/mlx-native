@@ -226,64 +226,30 @@ pub fn quantized_matmul_ggml(
     let n = params.n as usize;
     let m = params.m as usize;
 
-    match params.ggml_type {
-        GgmlType::Q8_0 => {
-            // Phase 4b: Q8_0 uses NSG=4 (128 threads), NR0=2 rows/simdgroup.
-            // Requires threadgroup shared memory for cross-simdgroup reduction.
-            // Matches llama.cpp N_SG_Q8_0=4, N_R0_Q8_0=2.
-            let nsg: usize = 4;
-            let nr0: usize = 2;
-            let align = nr0; // tgpig.x covers nr0 rows (no *nsg in kernel)
-            let smem_bytes = nr0 * 32 * std::mem::size_of::<f32>(); // NR0 * NW * 4
+    let (nth0, nth1, align) = match params.ggml_type {
+        GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
+        GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        _ => unreachable!(),
+    };
 
-            let threadgroups = metal::MTLSize::new(
-                div_ceil(n, align) as u64,
-                m as u64,
-                1,
-            );
-            let threads_per_tg = metal::MTLSize::new(32, nsg as u64, 1);
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(n, align) as u64,
+        m as u64,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
-            encoder.encode_threadgroups_with_args_and_shared(
-                pipeline,
-                &[
-                    (0, KernelArg::Buffer(weight)),
-                    (1, KernelArg::Buffer(input)),
-                    (2, KernelArg::Buffer(output)),
-                    (3, KernelArg::Bytes(as_bytes(&gpu_params))),
-                ],
-                &[(0, smem_bytes as u64)],
-                threadgroups,
-                threads_per_tg,
-            );
-        }
-        _ => {
-            // Q4_0, Q6_K: original dispatch geometry.
-            let (nth0, nth1, align) = match params.ggml_type {
-                GgmlType::Q4_0 => (8u64, 8u64, 8usize),
-                GgmlType::Q6_K => (2u64, 32u64, 2usize),
-                _ => unreachable!(),
-            };
-
-            let threadgroups = metal::MTLSize::new(
-                div_ceil(n, align) as u64,
-                m as u64,
-                1,
-            );
-            let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
-
-            encoder.encode_threadgroups_with_args(
-                pipeline,
-                &[
-                    (0, KernelArg::Buffer(weight)),
-                    (1, KernelArg::Buffer(input)),
-                    (2, KernelArg::Buffer(output)),
-                    (3, KernelArg::Bytes(as_bytes(&gpu_params))),
-                ],
-                threadgroups,
-                threads_per_tg,
-            );
-        }
-    }
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        threadgroups,
+        threads_per_tg,
+    );
 
     Ok(())
 }

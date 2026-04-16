@@ -156,103 +156,69 @@ kernel void kernel_mul_mv_q4_0_f32(
 
 // ---- Q8_0 mat-vec kernel ----
 //
-// Phase 4b: NSG=4 (128 threads) matching llama.cpp N_SG_Q8_0=4, N_R0_Q8_0=2.
-// Each simdgroup handles different blocks of the input, then results are
-// reduced across simdgroups via threadgroup memory.
-//
-// Dispatch: threadgroups=(ceil(N/8), M, B), threads_per_tg=(32, 4, 1)
-// Shared memory: N_DST_Q8 * N_SIMDWIDTH * sizeof(float) = 2 * 32 * 4 = 256 bytes
-//
-// Ported from llama.cpp kernel_mul_mv_q8_0_f32_impl (MIT licensed).
-// Source: /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:3563-3635
+// This is the stock candle kernel geometry and reduction path used by the
+// old passing TQ stack. Dispatch: threadgroups=(ceil(N/8), M, B),
+// threads_per_tg=(8, 8, 1). No threadgroup shared memory.
 
-#define NQ_Q8 8  // quants per thread per iteration
+#define NB_Q8_0 8
 
 kernel void kernel_mul_mv_q8_0_f32(
     device const  void  * src0   [[buffer(0)]],
     device const float  * src1   [[buffer(1)]],
     device       float  * dst    [[buffer(2)]],
     constant GgmlMatvecParams & p [[buffer(3)]],
-    threadgroup float   * shmem  [[threadgroup(0)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]],
     uint  sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    const int nr  = N_DST_Q8;       // 2 rows per simdgroup
-    const int nsg = N_SIMDGROUP_Q8; // 4 simdgroups
-    const int nw  = N_SIMDWIDTH;    // 32
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
 
     const int nb = p.ne00 / QK8_0;
-    const int r0 = tgpig.x * nr;   // NOTE: no *nsg here — tgpig.x already covers nsg*nr rows
+    const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
 
     const uint i12 = im % p.ne12;
     const uint i13 = im / p.ne12;
 
-    // Pre-compute row pointers (matches llama.cpp pattern)
-    device const block_q8_0 * ax[N_DST_Q8];
-    for (int row = 0; row < nr; ++row) {
-        const uint offset0 = (r0 + row) * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
-        ax[row] = (device const block_q8_0 *) src0 + offset0;
-    }
+    const uint offset0 = first_row * nb + (i12 / p.r2) * (nb * p.ne01) + (i13 / p.r3) * (nb * p.ne01 * p.ne02);
 
-    device const float * y = (device const float *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+    device const block_q8_0 * x = (device const block_q8_0 *) src0 + offset0;
+    device const float      * y = (device const float      *) src1 + r1 * p.ne10 + im * p.ne00 * p.ne1;
 
-    float sumf[N_DST_Q8] = {0.f};
+    float yl[NB_Q8_0];
+    float sumf[nr] = {0.f};
 
-    const int ix = tiisg / (nw / NQ_Q8);  // = tiisg / 4
-    const int il = tiisg % (nw / NQ_Q8);  // = tiisg % 4
+    const int ix = tiisg / 4;
+    const int il = tiisg % 4;
 
-    const int ib0 = sgitg * NQ_Q8 + ix;
+    device const float * yb = y + ix * QK8_0 + NB_Q8_0 * il;
 
-    float yl[NQ_Q8];
-    device const float * yb = y + ib0 * QK8_0 + il * NQ_Q8;
-
-    // Each thread processes NQ_Q8 quants at a time.
-    // Simdgroups are interleaved: stride = NSG * NQ_Q8 blocks.
-    for (int ib = ib0; ib < nb; ib += nsg * NQ_Q8) {
-        for (int i = 0; i < NQ_Q8; ++i) {
+    for (int ib = ix; ib < nb; ib += nw / 4) {
+        for (int i = 0; i < NB_Q8_0; ++i) {
             yl[i] = yb[i];
         }
 
-        for (int row = 0; row < nr; ++row) {
-            device const int8_t * qs = ax[row][ib].qs + il * NQ_Q8;
+        for (int row = 0; row < nr; row++) {
+            device const int8_t * qs = x[ib + row * nb].qs + NB_Q8_0 * il;
             float sumq = 0.f;
-            for (int iq = 0; iq < NQ_Q8; ++iq) {
+            for (int iq = 0; iq < NB_Q8_0; ++iq) {
                 sumq += qs[iq] * yl[iq];
             }
-            sumf[row] += sumq * ax[row][ib].d;
+            sumf[row] += sumq * x[ib + row * nb].d;
         }
 
-        yb += nsg * NQ_Q8 * QK8_0;
+        yb += NB_Q8_0 * nw;
     }
-
-    // Cross-simdgroup reduction via threadgroup memory.
-    // Pattern from llama.cpp helper_mv_reduce_and_write.
-    threadgroup float * shmem_rows[N_DST_Q8];
-    for (int row = 0; row < nr; ++row) {
-        shmem_rows[row] = shmem + nw * row;
-        if (sgitg == 0) {
-            shmem_rows[row][tiisg] = 0.0f;
-        }
-        sumf[row] = simd_sum(sumf[row]);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int row = 0; row < nr; ++row) {
-        if (tiisg == 0) {
-            shmem_rows[row][sgitg] = sumf[row];
-        }
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int row = 0; row < nr && r0 + row < p.ne01; ++row) {
-        float tot = simd_sum(shmem_rows[row][tiisg]);
-        if (tiisg == 0 && sgitg == 0) {
-            dst[r1*p.ne0 + im*p.ne0*p.ne1 + r0 + row] = tot;
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[r1 * p.ne0 + im * p.ne0 * p.ne1 + first_row + row] = tot;
         }
     }
 }
