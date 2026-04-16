@@ -4,6 +4,7 @@
 
 pub mod argmax;
 pub mod argsort;
+pub mod top_k;
 pub mod copy;
 pub mod dense_gemm;
 pub mod elementwise;

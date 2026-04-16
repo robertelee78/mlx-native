@@ -248,6 +248,9 @@ impl KernelRegistry {
         let softmax_sample_src: &'static str =
             include_str!("shaders/softmax_sample.metal");
         sources.insert("softmax_sample_f32".into(), softmax_sample_src);
+        // Top-K kernel for Q8 rerank: avoids full-logits readback.
+        let top_k_src: &'static str = include_str!("shaders/top_k.metal");
+        sources.insert("top_k_f32".into(), top_k_src);
 
         Self {
             cache: HashMap::new(),
