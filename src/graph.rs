@@ -1477,8 +1477,31 @@ impl<'a> GraphSession<'a> {
     ///
     /// Use after dispatching an op that doesn't need a barrier check (e.g.,
     /// the first dispatch in a session, or dispatches known to be concurrent).
+    ///
+    /// In recording mode, also retroactively annotates the most recently
+    /// captured dispatch node with these ranges if it was missing them.
+    /// That keeps the reorder pass able to reason about dispatches that
+    /// were preceded by `track_dispatch` rather than `barrier_between`.
     #[inline]
     pub fn track_dispatch(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
+        if self.recording {
+            let read_ranges: Vec<MemRange> = reads
+                .iter()
+                .map(|b| {
+                    let start = b.contents_ptr() as usize;
+                    (start, start + b.byte_len())
+                })
+                .collect();
+            let write_ranges: Vec<MemRange> = writes
+                .iter()
+                .map(|b| {
+                    let start = b.contents_ptr() as usize;
+                    (start, start + b.byte_len())
+                })
+                .collect();
+            self.encoder
+                .annotate_last_dispatch_if_missing(read_ranges, write_ranges);
+        }
         self.tracker.add(reads, writes);
     }
 

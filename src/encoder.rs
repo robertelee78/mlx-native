@@ -327,6 +327,25 @@ impl CommandEncoder {
         self.pending_writes = writes;
     }
 
+    /// Patch the last captured dispatch node's empty reads/writes with the
+    /// given ranges. No-op if not capturing, or if the last node isn't a
+    /// Dispatch, or if its ranges are already populated.
+    ///
+    /// Used by `GraphSession::track_dispatch` in recording mode to annotate
+    /// dispatches that were called without a preceding `barrier_between`.
+    pub fn annotate_last_dispatch_if_missing(&mut self, reads: Vec<MemRange>, writes: Vec<MemRange>) {
+        if let Some(ref mut nodes) = self.capture {
+            if let Some(CapturedNode::Dispatch { reads: r, writes: w, .. }) = nodes.last_mut() {
+                if r.is_empty() && !reads.is_empty() {
+                    *r = reads;
+                }
+                if w.is_empty() && !writes.is_empty() {
+                    *w = writes;
+                }
+            }
+        }
+    }
+
     /// Consume and return the pending buffer range annotations.
     fn take_pending_buffer_ranges(&mut self) -> (Vec<MemRange>, Vec<MemRange>) {
         let reads = std::mem::take(&mut self.pending_reads);
