@@ -388,6 +388,15 @@ kernel void fused_moe_routing_batch_f32(
     }
     const float max_val = shared[0];
 
+    // All threads must complete the broadcast-read of shared[0] for max_val
+    // BEFORE any thread (notably tid==0) overwrites shared[0] with its
+    // local_sum. Same race class as the fused_head_norm_rope Phase-1→Phase-2
+    // boundary (see b31505d / hf2q docs/spike-batched-prefill-race-rootcause.md).
+    // Without this barrier, simdgroups that race ahead of simdgroup 0 read a
+    // clobbered shared[0] and compute a corrupt max_val — produces
+    // nondeterministic routing decisions at scale.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // Step 2: compute exp(x - max) and sum
     float local_sum = 0.0f;
     for (uint i = tid; i < num_experts; i += tg_size) {
