@@ -77,6 +77,13 @@ kernel void fused_head_norm_rope_bf16(
 
     const float rms_inv = rsqrt(shared[0] / float(head_dim) + eps);
 
+    // All threads must complete the broadcast-read of shared[0] for rms_inv
+    // BEFORE any thread (notably tid==0) overwrites shared[0] as part of
+    // Phase 2's shared[i] = val write. See the matching comment in the f32
+    // sibling; same race, same fix. Ref: docs/spike-batched-prefill-race-
+    // rootcause.md (hf2q, 2026-04-16).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // -------------------------------------------------------------------------
     // Phase 2: normalize (optionally scale with weight), then apply NeoX RoPE
     //

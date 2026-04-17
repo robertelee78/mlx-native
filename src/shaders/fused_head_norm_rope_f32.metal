@@ -94,6 +94,21 @@ kernel void fused_head_norm_rope_f32(
 
     const float rms_inv = rsqrt(shared[0] / float(head_dim) + eps);
 
+    // All threads must complete the broadcast-read of shared[0] for rms_inv
+    // BEFORE any thread (notably tid==0) overwrites shared[0] as part of
+    // Phase 2's shared[i] = val write. Without this barrier, simdgroups that
+    // race ahead of simdgroup 0 read a clobbered shared[0] at line above and
+    // compute a corrupt rms_inv, producing nondeterministic output at scale
+    // (observed ~80% broken at head_dim=256, n_tokens*n_heads >= 2000
+    // threadgroups on Apple Silicon).
+    //
+    // Matches candle's pattern at reduce.metal:1099 (dedicated threadgroup
+    // scalar under a full barrier) and llama.cpp's architectural choice of
+    // writing Phase-2 results to device memory (never reusing shared scratch).
+    //
+    // Ref: docs/spike-batched-prefill-race-rootcause.md (hf2q, 2026-04-16).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // -------------------------------------------------------------------------
     // Phase 2: normalize (optionally scale with weight), store in shared
     // -------------------------------------------------------------------------
