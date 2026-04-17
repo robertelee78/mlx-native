@@ -252,3 +252,194 @@ fn test_kv_cache_copy_global_overflow_error() {
 
     assert!(result.is_err(), "Should error on global cache overflow");
 }
+
+/// Ring-wrap behaviour of the multi-position seq prefill kernel
+/// (`kv_cache_copy_seq_f32`). Exercises hf2q Gate A: batched prefill on a
+/// prompt longer than a sliding-window layer's capacity must ring-wrap
+/// writes so the last `capacity` source tokens survive in modular-slot
+/// order, matching the layout equivalent sequential decode appends would
+/// produce.
+#[test]
+fn test_kv_cache_copy_seq_f32_sliding_ring_wrap() {
+    let (device, mut registry) = setup();
+
+    let n_heads: u32 = 2;
+    let head_dim: u32 = 4;
+    let capacity: u32 = 4; // small: forces wrap when n_tokens > 4
+    let n_tokens: u32 = 8; // two full rings
+
+    let src_elems = n_tokens as usize * n_heads as usize * head_dim as usize;
+    let cache_elems = n_heads as usize * capacity as usize * head_dim as usize;
+
+    // Encode (tok, head, elem) into the source value so we can tell which
+    // token survived at which slot after ring-wrap.
+    let mut src_f32 = vec![0f32; src_elems];
+    for t in 0..n_tokens as usize {
+        for h in 0..n_heads as usize {
+            for e in 0..head_dim as usize {
+                let idx = t * (n_heads as usize * head_dim as usize)
+                    + h * head_dim as usize + e;
+                // Token 0 => 1000.0, token 1 => 1001.0, etc., offset by head+elem
+                src_f32[idx] = 1000.0 + t as f32 + 0.1 * h as f32 + 0.01 * e as f32;
+            }
+        }
+    }
+    let src_bytes: Vec<u8> = src_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let mut src_buf = device
+        .alloc_buffer(src_elems * 4, DType::F32, vec![src_elems])
+        .expect("alloc src");
+    src_buf
+        .as_mut_slice::<u8>()
+        .expect("write src")
+        .copy_from_slice(&src_bytes);
+
+    let mut cache_buf = device
+        .alloc_buffer(cache_elems * 4, DType::F32, vec![cache_elems])
+        .expect("alloc cache");
+    for b in cache_buf.as_mut_slice::<u8>().expect("zero cache").iter_mut() {
+        *b = 0;
+    }
+
+    // Sliding-window contract: host passes the last `capacity` source tokens
+    // via `src_tok_offset`, eliminating the intra-dispatch race that naive
+    // modular writes would have.
+    let src_tok_offset = n_tokens - capacity; // 8 - 4 = 4
+    let dispatch_n_tokens = capacity;
+    let dispatch_seq_pos_start = src_tok_offset;
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &src_buf,
+        &cache_buf,
+        n_heads,
+        head_dim,
+        capacity,
+        dispatch_seq_pos_start,
+        dispatch_n_tokens,
+        src_tok_offset,
+    )
+    .expect("dispatch_kv_cache_copy_seq_f32");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let cache_slice: &[f32] = cache_buf.as_slice::<f32>().expect("read cache");
+
+    // For each slot s in [0..capacity), the surviving source token is the
+    // one at absolute position `src_tok_offset + t` where
+    // `(dispatch_seq_pos_start + t) % capacity == s`. With our inputs this
+    // resolves uniquely: slot s holds source token (src_tok_offset + s).
+    for h in 0..n_heads as usize {
+        for s in 0..capacity as usize {
+            let t = src_tok_offset as usize + s; // unique surviving source token
+            for e in 0..head_dim as usize {
+                let cache_idx = h * capacity as usize * head_dim as usize
+                    + s * head_dim as usize + e;
+                let expected = 1000.0 + t as f32 + 0.1 * h as f32 + 0.01 * e as f32;
+                let got = cache_slice[cache_idx];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "ring-wrap mismatch: head={} slot={} elem={} \
+                     expected token {} value {}, got {}",
+                    h, s, e, t, expected, got,
+                );
+            }
+        }
+    }
+}
+
+/// Non-wrap behaviour: when `seq_pos_start + n_tokens <= capacity` the
+/// seq kernel must behave linearly (mod is identity). Global (non-sliding)
+/// layers rely on this — their capacity is always `>= prompt + decode`.
+#[test]
+fn test_kv_cache_copy_seq_f32_no_wrap() {
+    let (device, mut registry) = setup();
+
+    let n_heads: u32 = 2;
+    let head_dim: u32 = 4;
+    let capacity: u32 = 8;
+    let n_tokens: u32 = 3; // well below capacity
+    let seq_pos_start: u32 = 0;
+
+    let src_elems = n_tokens as usize * n_heads as usize * head_dim as usize;
+    let cache_elems = n_heads as usize * capacity as usize * head_dim as usize;
+
+    let mut src_f32 = vec![0f32; src_elems];
+    for t in 0..n_tokens as usize {
+        for h in 0..n_heads as usize {
+            for e in 0..head_dim as usize {
+                let idx = t * (n_heads as usize * head_dim as usize)
+                    + h * head_dim as usize + e;
+                src_f32[idx] = 2000.0 + t as f32 + 0.1 * h as f32 + 0.01 * e as f32;
+            }
+        }
+    }
+    let src_bytes: Vec<u8> = src_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let mut src_buf = device
+        .alloc_buffer(src_elems * 4, DType::F32, vec![src_elems])
+        .expect("alloc src");
+    src_buf
+        .as_mut_slice::<u8>()
+        .expect("write src")
+        .copy_from_slice(&src_bytes);
+
+    // Pre-fill cache with a sentinel so we can verify untouched slots stay untouched.
+    let sentinel = -9999.0f32;
+    let mut cache_buf = device
+        .alloc_buffer(cache_elems * 4, DType::F32, vec![cache_elems])
+        .expect("alloc cache");
+    {
+        let dst: &mut [f32] = cache_buf
+            .as_mut_slice::<f32>()
+            .expect("prefill cache");
+        for v in dst.iter_mut() { *v = sentinel; }
+    }
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &src_buf,
+        &cache_buf,
+        n_heads,
+        head_dim,
+        capacity,
+        seq_pos_start,
+        n_tokens,
+        0, // src_tok_offset: no skipping for the linear no-wrap case
+    )
+    .expect("dispatch_kv_cache_copy_seq_f32");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let cache_slice: &[f32] = cache_buf.as_slice::<f32>().expect("read cache");
+
+    // Slots 0..n_tokens should hold the corresponding source token;
+    // slots n_tokens..capacity should still be the sentinel.
+    for h in 0..n_heads as usize {
+        for s in 0..capacity as usize {
+            for e in 0..head_dim as usize {
+                let cache_idx = h * capacity as usize * head_dim as usize
+                    + s * head_dim as usize + e;
+                let got = cache_slice[cache_idx];
+                if s < n_tokens as usize {
+                    let expected = 2000.0 + s as f32 + 0.1 * h as f32 + 0.01 * e as f32;
+                    assert!(
+                        (got - expected).abs() < 1e-4,
+                        "no-wrap: head={} slot={} elem={} expected {}, got {}",
+                        h, s, e, expected, got,
+                    );
+                } else {
+                    assert!(
+                        (got - sentinel).abs() < 1e-4,
+                        "no-wrap: head={} slot={} elem={} should be sentinel, got {}",
+                        h, s, e, got,
+                    );
+                }
+            }
+        }
+    }
+}

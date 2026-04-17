@@ -325,9 +325,21 @@ pub fn dispatch_kv_cache_copy_batch_f32_to_f16(
 
 /// Multi-position, all-heads KV cache copy (F32 → F32 cache, batched prefill).
 ///
-/// Source layout: `[n_tokens, n_heads, head_dim]` (token-major).
+/// Source layout: `[n_src_tokens, n_heads, head_dim]` (token-major). The
+/// kernel reads `[src_tok_offset, src_tok_offset + n_tokens)` from it.
 /// Cache layout:  `[n_heads, capacity, head_dim]` (head-major).
-/// Writes positions `[seq_pos_start, seq_pos_start + n_tokens)` linearly.
+/// Writes absolute positions `[seq_pos_start, seq_pos_start + n_tokens)` into
+/// cache slots `dst_pos % capacity`.
+///
+/// Global-layer contract: caller sets `seq_pos_start + n_tokens <= capacity`
+/// so `dst_pos % capacity == dst_pos` and writes are linear. Typical call:
+/// `src_tok_offset = 0`, `n_tokens = seq_len`, `seq_pos_start = 0`.
+///
+/// Sliding-window contract: caller sets `capacity = sliding_window`,
+/// `n_tokens = min(seq_len, capacity)`, `src_tok_offset = seq_len - n_tokens`,
+/// `seq_pos_start = seq_len - n_tokens`. This writes the last `n_tokens`
+/// source tokens into modular slots exactly once — no intra-dispatch race.
+/// Decode side reads via `ring_start = write_pos % capacity`.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_kv_cache_copy_seq_f32(
     encoder: &mut CommandEncoder,
@@ -340,15 +352,17 @@ pub fn dispatch_kv_cache_copy_seq_f32(
     capacity: u32,
     seq_pos_start: u32,
     n_tokens: u32,
+    src_tok_offset: u32,
 ) -> Result<()> {
     if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
         return Ok(());
     }
-    let total_src = (n_tokens as u64) * (n_heads as u64) * (head_dim as u64);
+    let total_src = ((src_tok_offset as u64) + (n_tokens as u64))
+        * (n_heads as u64) * (head_dim as u64);
     if (src.element_count() as u64) < total_src {
         return Err(MlxError::InvalidArgument(format!(
-            "kv_cache_copy_seq_f32: src has {} elements, need {} (n_tokens={} * n_heads={} * head_dim={})",
-            src.element_count(), total_src, n_tokens, n_heads, head_dim
+            "kv_cache_copy_seq_f32: src has {} elements, need {} ((src_tok_offset={} + n_tokens={}) * n_heads={} * head_dim={})",
+            src.element_count(), total_src, src_tok_offset, n_tokens, n_heads, head_dim
         )));
     }
 
@@ -359,6 +373,7 @@ pub fn dispatch_kv_cache_copy_seq_f32(
     let capacity_bytes = capacity.to_ne_bytes();
     let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
     let n_tokens_bytes = n_tokens.to_ne_bytes();
+    let src_tok_offset_bytes = src_tok_offset.to_ne_bytes();
 
     use super::encode_helpers::{encode_with_args, KernelArg};
 
@@ -373,6 +388,7 @@ pub fn dispatch_kv_cache_copy_seq_f32(
             (4, KernelArg::Bytes(&capacity_bytes)),
             (5, KernelArg::Bytes(&seq_pos_start_bytes)),
             (6, KernelArg::Bytes(&n_tokens_bytes)),
+            (7, KernelArg::Bytes(&src_tok_offset_bytes)),
         ],
         MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
         MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
@@ -382,6 +398,10 @@ pub fn dispatch_kv_cache_copy_seq_f32(
 }
 
 /// Multi-position, all-heads KV cache copy (F32 source → F16 cache, batched prefill).
+///
+/// Same semantics as [`dispatch_kv_cache_copy_seq_f32`] (including
+/// `src_tok_offset` source slicing and `dst_pos % capacity` ring-wrap for
+/// sliding-window layers) but writes half-precision values in the cache.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_kv_cache_copy_seq_f32_to_f16(
     encoder: &mut CommandEncoder,
@@ -394,11 +414,13 @@ pub fn dispatch_kv_cache_copy_seq_f32_to_f16(
     capacity: u32,
     seq_pos_start: u32,
     n_tokens: u32,
+    src_tok_offset: u32,
 ) -> Result<()> {
     if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
         return Ok(());
     }
-    let total_src = (n_tokens as u64) * (n_heads as u64) * (head_dim as u64);
+    let total_src = ((src_tok_offset as u64) + (n_tokens as u64))
+        * (n_heads as u64) * (head_dim as u64);
     if (src.element_count() as u64) < total_src {
         return Err(MlxError::InvalidArgument(format!(
             "kv_cache_copy_seq_f32_to_f16: src has {} elements, need {}",
@@ -413,6 +435,7 @@ pub fn dispatch_kv_cache_copy_seq_f32_to_f16(
     let capacity_bytes = capacity.to_ne_bytes();
     let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
     let n_tokens_bytes = n_tokens.to_ne_bytes();
+    let src_tok_offset_bytes = src_tok_offset.to_ne_bytes();
 
     use super::encode_helpers::{encode_with_args, KernelArg};
 
@@ -427,6 +450,7 @@ pub fn dispatch_kv_cache_copy_seq_f32_to_f16(
             (4, KernelArg::Bytes(&capacity_bytes)),
             (5, KernelArg::Bytes(&seq_pos_start_bytes)),
             (6, KernelArg::Bytes(&n_tokens_bytes)),
+            (7, KernelArg::Bytes(&src_tok_offset_bytes)),
         ],
         MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
         MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),

@@ -111,21 +111,35 @@ kernel void kv_cache_copy_batch_f32_to_f16(
 
 /// Multi-position, all-heads KV cache copy (F32 source → F32 cache).
 ///
-/// Source layout: [n_tokens, n_heads, head_dim] — token-major, from head_norm+RoPE.
+/// Source layout: [n_src_tokens, n_heads, head_dim] — token-major, from
+/// head_norm+RoPE. The caller selects the surviving slice of the source
+/// via `src_tok_offset`; only tokens
+/// `[src_tok_offset, src_tok_offset + n_tokens)` are read.
 /// Cache layout:  [n_heads, capacity, head_dim] — head-major dense_kvs.
-/// Writes positions [seq_pos_start, seq_pos_start + n_tokens) linearly
-/// (no ring-buffer wrap — only used in prefill where seq_pos_start=0 and
-/// n_tokens <= capacity).
+/// Writes absolute positions `[seq_pos_start, seq_pos_start + n_tokens)`
+/// into cache slots `dst_pos % capacity`.
+///
+/// Global (non-sliding) layer contract: caller ensures
+/// `seq_pos_start + n_tokens <= capacity` so `dst_pos % capacity == dst_pos`
+/// and behaviour is linear/no-wrap.
+///
+/// Sliding-window contract: caller sets `capacity = sliding_window`,
+/// `n_tokens = min(seq_len, capacity)`, `src_tok_offset = seq_len - n_tokens`,
+/// `seq_pos_start = seq_len - n_tokens`. This writes the last `n_tokens`
+/// source tokens into modular slots, each exactly once — no intra-dispatch
+/// race. Decode side reads via `ring_start = write_pos % capacity`
+/// (`hf2q:src/serve/forward_mlx.rs`), consistent with this layout.
 ///
 /// Grid: 3D — x=elem within head, y=head, z=token.
 kernel void kv_cache_copy_seq_f32(
-    device const float* src       [[buffer(0)]],   // [n_tokens, n_heads, head_dim] F32
+    device const float* src       [[buffer(0)]],   // [n_src_tokens, n_heads, head_dim] F32
     device float*       cache     [[buffer(1)]],   // [n_heads, capacity, head_dim] F32
     constant uint&     n_heads   [[buffer(2)]],
     constant uint&     head_dim  [[buffer(3)]],
     constant uint&     capacity  [[buffer(4)]],
     constant uint&     seq_pos_start [[buffer(5)]],
     constant uint&     n_tokens  [[buffer(6)]],
+    constant uint&     src_tok_offset [[buffer(7)]],
     uint3 tid [[thread_position_in_grid]]
 ) {
     uint elem = tid.x;
@@ -133,23 +147,28 @@ kernel void kv_cache_copy_seq_f32(
     uint tok  = tid.z;
     if (head >= n_heads || elem >= head_dim || tok >= n_tokens) return;
 
-    uint src_idx = tok * (n_heads * head_dim) + head * head_dim + elem;
+    uint src_tok = src_tok_offset + tok;
+    uint src_idx = src_tok * (n_heads * head_dim) + head * head_dim + elem;
     uint dst_pos = seq_pos_start + tok;
-    uint dst_idx = head * capacity * head_dim + dst_pos * head_dim + elem;
+    uint slot    = dst_pos % capacity;
+    uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
     cache[dst_idx] = src[src_idx];
 }
 
 /// Multi-position, all-heads KV cache copy (F32 source → F16 cache).
 ///
-/// Same layout/semantics as kv_cache_copy_seq_f32 but casts to half on write.
+/// Same layout/semantics as kv_cache_copy_seq_f32 (including `src_tok_offset`
+/// source slicing and `dst_pos % capacity` ring-wrap for sliding layers)
+/// but casts to half on write.
 kernel void kv_cache_copy_seq_f32_to_f16(
-    device const float* src       [[buffer(0)]],   // [n_tokens, n_heads, head_dim] F32
+    device const float* src       [[buffer(0)]],   // [n_src_tokens, n_heads, head_dim] F32
     device half*        cache     [[buffer(1)]],   // [n_heads, capacity, head_dim] F16
     constant uint&     n_heads   [[buffer(2)]],
     constant uint&     head_dim  [[buffer(3)]],
     constant uint&     capacity  [[buffer(4)]],
     constant uint&     seq_pos_start [[buffer(5)]],
     constant uint&     n_tokens  [[buffer(6)]],
+    constant uint&     src_tok_offset [[buffer(7)]],
     uint3 tid [[thread_position_in_grid]]
 ) {
     uint elem = tid.x;
@@ -157,8 +176,10 @@ kernel void kv_cache_copy_seq_f32_to_f16(
     uint tok  = tid.z;
     if (head >= n_heads || elem >= head_dim || tok >= n_tokens) return;
 
-    uint src_idx = tok * (n_heads * head_dim) + head * head_dim + elem;
+    uint src_tok = src_tok_offset + tok;
+    uint src_idx = src_tok * (n_heads * head_dim) + head * head_dim + elem;
     uint dst_pos = seq_pos_start + tok;
-    uint dst_idx = head * capacity * head_dim + dst_pos * head_dim + elem;
+    uint slot    = dst_pos % capacity;
+    uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
     cache[dst_idx] = half(src[src_idx]);
 }
