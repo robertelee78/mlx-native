@@ -726,17 +726,36 @@ void flash_attn_prefill_d512_impl(
 
       M[jj] = new_max;
 
-      // exp2(score - new_max) — base-2 because Q was pre-scaled by log2(e).
+      // exp2(score - new_max) — base-2 because Q was pre-scaled by log2(e),
+      // so `s2` and `new_max` are ALREADY in base-2 score space.  There is
+      // NO additional log2(e) factor: multiplying by log2(e) here would
+      // convert `exp2(x*log2(e))` = `e^x`, which is natural-exp over a
+      // base-2 argument and effectively re-scales scores by log2(e)≈1.4427,
+      // producing a sharper-than-correct softmax.  Matches the D=256
+      // kernel's `ExpSubOp::apply` at
+      // /opt/mlx-native/src/shaders/flash_attn_prefill.metal:1123
+      //   (`fast::exp2(x - y)`, no log2(e) factor) and llama.cpp's
+      // `const float2 vs2 = exp(s2 - M[jj])` at
+      // /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6156
+      // (both sides in natural-log space there; we're in base-2 with the
+      // same net result because `exp2(base2) = exp(natural)` when the
+      // pre-scale moves the Q·K^T into base-2 space).
+      //
       // Unguarded: new_max is always finite under the sentinel regime
       // (simd_max of -FLT_MAX/2 and real scores), so exp2(-inf - finite)
       // = exp2(-inf) = +0.0 IEEE-754.
       float2 vs2;
-      vs2.x = fast::exp2((s2.x - new_max) * 1.44269504089f);
-      vs2.y = fast::exp2((s2.y - new_max) * 1.44269504089f);
+      vs2.x = fast::exp2(s2.x - new_max);
+      vs2.y = fast::exp2(s2.y - new_max);
 
-      // Rescale factor exp2((M_old - M_new) * log2(e)).  Finite by
-      // construction.
-      const float ms = fast::exp2((m_old - new_max) * 1.44269504089f);
+      // Rescale factor exp2(M_old - M_new) — both in base-2 score space,
+      // no additional log2(e) factor.  Matches the D=256 kernel's
+      // `factor[i] = fast::exp2(max_score[i] - new_max[i])` at
+      // /opt/mlx-native/src/shaders/flash_attn_prefill.metal:1546 and
+      // llama.cpp's `const float ms = exp(m - M[jj])` at
+      // /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6155.
+      // Finite by construction.
+      const float ms = fast::exp2(m_old - new_max);
 
       // Update S.
       S[jj] = S[jj] * ms + simd_sum(vs2.x + vs2.y);
