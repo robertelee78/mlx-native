@@ -413,8 +413,16 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     validate_buffer_size(k, "K", batch * h_kv * kl * d)?;
     validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
     validate_buffer_size(out, "out", batch * h * ql * d)?;
+    // A rank-2 mask `[qL, kL]` is the Wave 2D broadcast layout: one plane is
+    // shared across all batches and heads (stride-0 in batch and head dims).
+    // A rank-4 mask `[B, H, qL, kL]` is the per-head layout (back-compat).
+    let mask_is_rank2_broadcast = mask.is_some_and(|m| m.shape().len() == 2);
     if let Some(m) = mask {
-        validate_buffer_size(m, "mask", batch * h * ql * kl)?;
+        if mask_is_rank2_broadcast {
+            validate_buffer_size(m, "mask", ql * kl)?;
+        } else {
+            validate_buffer_size(m, "mask", batch * h * ql * kl)?;
+        }
     }
 
     // ── Tile geometry ─────────────────────────────────────────────────────
@@ -566,10 +574,16 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
             )
         })?;
 
-        // Mask strides for layout [B, H, qL, kL] (inner dim = 1).
-        let m_ql_stride = kl as i64;
-        let m_head_stride = (ql * kl) as i64;
-        let m_batch_stride = (h * ql * kl) as i64;
+        // Strides depend on mask rank:
+        //   rank-2 `[qL, kL]` — broadcast across batch + heads: set batch_stride
+        //   and head_stride to 0 so the shader re-reads the same plane for every
+        //   (batch, head) pair.  The Metal shader already handles stride-0 correctly.
+        //   rank-4 `[B, H, qL, kL]` — per-head layout (back-compat path).
+        let (m_batch_stride, m_head_stride, m_ql_stride) = if mask_is_rank2_broadcast {
+            (0_i64, 0_i64, kl as i64)
+        } else {
+            ((h * ql * kl) as i64, (ql * kl) as i64, kl as i64)
+        };
 
         let mask_params = AttnMaskParamsGpu {
             m_strides: [m_batch_stride, m_head_stride, m_ql_stride],

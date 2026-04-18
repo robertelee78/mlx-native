@@ -2823,6 +2823,330 @@ fn test_blk_gemma4_sliding_prefill() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// § 9  WAVE 4.1 — RANK-2 BROADCAST MASK TESTS (ADR-011 Phase 2, Wave 4.1)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests verify that `dispatch_flash_attn_prefill_bf16_d{256,512}` accept
+// a rank-2 `[qL, kL]` mask produced by `build_sdpa_mask_bf16` and broadcast
+// it correctly across all (batch, head) pairs via stride-0 in the batch and
+// head dimensions.
+//
+// The key property: for multi-head (n_heads > 1) attention with a single shared
+// mask, every head must attend to exactly the same (q, k) positions — the GPU
+// output must match a CPU reference that replicates the mask across all heads.
+//
+// Back-compat test: a rank-4 `[1, H, qL, kL]` mask (per-head layout) must
+// still work via the old code path and produce the same result.
+
+/// CPU reference helper for rank-2 broadcast mask: replicate `[ql, kl]` mask
+/// across all batch items and heads to produce the `[B, H, qL, kL]` layout
+/// that `sdpa_reference_f32` / `reference_for_bf16` expects.
+fn broadcast_mask_to_rank4(
+    mask_rank2: &[f32],
+    batch: usize,
+    n_heads: usize,
+    ql: usize,
+    kl: usize,
+) -> Vec<f32> {
+    assert_eq!(mask_rank2.len(), ql * kl, "broadcast_mask_to_rank4: mask must be [qL, kL]");
+    let mut out = vec![0.0f32; batch * n_heads * ql * kl];
+    for b in 0..batch {
+        for h in 0..n_heads {
+            let dst_base = b * n_heads * ql * kl + h * ql * kl;
+            out[dst_base..dst_base + ql * kl].copy_from_slice(mask_rank2);
+        }
+    }
+    out
+}
+
+/// Wave 4.1 / Test 1: rank-2 broadcast mask with multi-head D=256.
+///
+/// batch=1, n_heads=8 (multi-head), ql=kl=128, D=256.  Builds a causal+SWA
+/// mask via `build_sdpa_mask_bf16` (which produces rank-2 `[128, 128]`).
+/// Dispatches `dispatch_flash_attn_prefill_bf16_d256` and verifies GPU output
+/// against a CPU reference that replicates the same mask across all 8 heads.
+///
+/// Critical: this test catches incorrect stride calculations that would cause
+/// per-head indexing to walk off the single-plane buffer.
+#[test]
+fn test_mask_rank2_broadcast_d256_multihead() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let batch = 1;
+    let h = 8;
+    let kv_h = 8; // MHA (no GQA) to keep the reference simple.
+    let ql = 128usize;
+    let kl = 128usize;
+    let d = 256usize;
+    let window = 64_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // Build the rank-2 `[ql, kl]` causal+SWA mask.
+    let mask_params = SdpaMaskParams {
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        window_size: Some(window),
+        causal: true,
+        q_abs_offset: 0,
+    };
+    let mut mask_enc = device.command_encoder().expect("mask encoder");
+    let mask_buf = build_sdpa_mask_bf16(&device, &mut registry, &mut mask_enc, &mask_params)
+        .expect("build_sdpa_mask_bf16");
+    mask_enc.commit_and_wait().expect("mask commit");
+
+    // Verify the mask shape is rank-2 (confirms Wave 2D contract).
+    assert_eq!(mask_buf.shape(), &[ql, kl], "mask must be rank-2 [qL, kL]");
+
+    // Random Q/K/V.
+    let q = pseudo_random_f32(SEED + 900, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 901, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 902, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // GPU dispatch — rank-2 mask, multi-head.
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let attn_params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false, // causal baked into mask
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut enc, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, Some(&mask_buf), &mut out_buf, &attn_params,
+    ).expect("dispatch bf16 d256 rank-2 broadcast");
+    enc.commit_and_wait().expect("commit");
+
+    let gpu_out_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&gpu_out_bf);
+
+    // CPU reference: broadcast the rank-2 mask across all heads.
+    let mask_f32: Vec<f32> = read_bf16_buffer(&mask_buf, ql * kl)
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    let mask_rank4_f32 = broadcast_mask_to_rank4(&mask_f32, batch, h, ql, kl);
+    let mask_rank4_bf = f32_to_bf16(&mask_rank4_f32);
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&mask_rank4_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_all_finite(&gpu_out, "rank2_broadcast_d256_multihead");
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "rank2_broadcast_d256_multihead",
+    );
+}
+
+/// Wave 4.1 / Test 2: rank-2 broadcast mask with multi-head D=512.
+///
+/// Same as Test 1 but routes through `dispatch_flash_attn_prefill_bf16_d512`.
+/// batch=1, n_heads=8, ql=kl=128, D=512.
+#[test]
+fn test_mask_rank2_broadcast_d512_multihead() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let batch = 1;
+    let h = 8;
+    let kv_h = 8;
+    let ql = 128usize;
+    let kl = 128usize;
+    let d = 512usize;
+    let window = 64_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // Build the rank-2 `[ql, kl]` causal+SWA mask.
+    let mask_params = SdpaMaskParams {
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        window_size: Some(window),
+        causal: true,
+        q_abs_offset: 0,
+    };
+    let mut mask_enc = device.command_encoder().expect("mask encoder");
+    let mask_buf = build_sdpa_mask_bf16(&device, &mut registry, &mut mask_enc, &mask_params)
+        .expect("build_sdpa_mask_bf16");
+    mask_enc.commit_and_wait().expect("mask commit");
+
+    assert_eq!(mask_buf.shape(), &[ql, kl], "mask must be rank-2 [qL, kL]");
+
+    let q = pseudo_random_f32(SEED + 910, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 911, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 912, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // GPU dispatch — rank-2 mask, multi-head, D=512.
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let attn_params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d512(
+        &mut enc, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, Some(&mask_buf), &mut out_buf, &attn_params,
+    ).expect("dispatch bf16 d512 rank-2 broadcast");
+    enc.commit_and_wait().expect("commit");
+
+    let gpu_out_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&gpu_out_bf);
+
+    // CPU reference: broadcast the rank-2 mask across all heads.
+    let mask_f32: Vec<f32> = read_bf16_buffer(&mask_buf, ql * kl)
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    let mask_rank4_f32 = broadcast_mask_to_rank4(&mask_f32, batch, h, ql, kl);
+    let mask_rank4_bf = f32_to_bf16(&mask_rank4_f32);
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&mask_rank4_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_all_finite(&gpu_out, "rank2_broadcast_d512_multihead");
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "rank2_broadcast_d512_multihead",
+    );
+}
+
+/// Wave 4.1 / Test 3: rank-4 per-head mask is still accepted and honoured
+/// (back-compat regression gate).
+///
+/// Manually allocates a rank-4 `[1, H, qL, kL]` mask buffer with a
+/// checkerboard bias pattern, dispatches `dispatch_flash_attn_prefill_bf16_d256`,
+/// and verifies the output matches the CPU reference.  Any regression in the
+/// rank-4 code path will be caught here.
+#[test]
+fn test_mask_rank4_preserved_regression() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let batch = 1;
+    let h = 4;
+    let kv_h = 4;
+    let ql = 128usize;
+    let kl = 128usize;
+    let d = 256usize;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 920, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 921, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 922, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // Build a rank-4 [B, H, qL, kL] checkerboard mask directly.
+    // Odd positions get -1e4 (effectively masked), even get 0.0.
+    let mask_elems = batch * h * ql * kl;
+    let mask_f32: Vec<f32> = (0..mask_elems)
+        .map(|i| if i % 2 == 0 { 0.0_f32 } else { -1.0e4_f32 })
+        .collect();
+    let mask_bf = f32_to_bf16(&mask_f32);
+
+    // Allocate with a rank-4 shape so the dispatcher takes the per-head path.
+    let mask_buf = device
+        .alloc_buffer(
+            mask_elems * 2,
+            DType::BF16,
+            vec![batch, h, ql, kl],
+        )
+        .expect("alloc rank-4 mask buffer");
+    fill_bf16_buffer(&mask_buf, &mask_bf);
+
+    // Verify the buffer was allocated with rank-4 shape.
+    assert_eq!(mask_buf.shape(), &[batch, h, ql, kl], "mask shape must be rank-4");
+    assert_eq!(mask_buf.shape().len(), 4, "mask must have 4 dimensions");
+
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let attn_params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut enc, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, Some(&mask_buf), &mut out_buf, &attn_params,
+    ).expect("dispatch bf16 d256 rank-4 back-compat");
+    enc.commit_and_wait().expect("commit");
+
+    let gpu_out_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&gpu_out_bf);
+
+    // CPU reference uses the same rank-4 mask directly (already [B*H*qL*kL]).
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&mask_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_all_finite(&gpu_out, "rank4_preserved_regression");
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "rank4_preserved_regression",
+    );
+}
+
 } // mod flash_attn_prefill_tests
 
 // ─── Non-macOS stub ───────────────────────────────────────────────────────────
