@@ -268,24 +268,35 @@ pub fn quantized_matmul_ggml(
         )));
     }
 
-    // ADR-011 Phase 3 Wave P3a — the matrix-matrix (mm) kernel is ported
-    // and available (see `dispatch_mm` below) but the public dispatcher
-    // keeps routing every call to the mv path until the follow-up commit
-    // wires the m>8 threshold in.  This preserves bit-identical prefill
-    // output byte-for-byte with pre-port behaviour.  Tests call
-    // `dispatch_mm_for_test` directly to exercise the mm kernel.
-    dispatch_mv(encoder, registry, device, input, weight, output, params)
+    // ADR-011 Phase 3 Wave P3a — route on m threshold.
+    //
+    // The mm kernel stages a 64x32 weight tile into threadgroup shared
+    // memory and reuses it across a 32-row block of M.  This cuts DRAM
+    // weight-read bandwidth by ~32x at prefill m=2455 and delivers a
+    // 5-30x per-kernel speedup over the mv path (which re-reads every
+    // weight block once per M row).  The mv path is still preferable at
+    // low M (decode m=1, short-prompt prefill m<=8) where launch overhead
+    // dominates tile reuse savings.
+    //
+    // Threshold matches llama.cpp's `ne11_mm_min = 8`
+    // (ggml-metal-ops.cpp:2046).  The mm kernel also requires K >= NK=32,
+    // which every projection in our Gemma 4 DWQ model satisfies — guard
+    // kept so any future shape smaller than 32 falls back to mv.
+    if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 {
+        dispatch_mm(encoder, registry, device, input, weight, output, params)
+    } else {
+        dispatch_mv(encoder, registry, device, input, weight, output, params)
+    }
 }
 
 /// Test-only helper: force the mm dispatch path.  Used by the mm parity
 /// tests (`tests/test_quantized_matmul_mm.rs`).  This entry point
 /// intentionally bypasses the public dispatcher's routing decision so
-/// that tests can verify mm vs mv parity without depending on the
-/// routing threshold.
+/// that tests can verify mm vs mv parity at every M (including the
+/// m <= 8 range where the production dispatcher normally picks mv).
 ///
-/// Not intended for production callers — the public `quantized_matmul_ggml`
-/// entry point will start routing to mm in a follow-up commit (once the
-/// `_id` MoE variant is ported and tested).
+/// Not intended for production callers — use `quantized_matmul_ggml`
+/// above, which routes by m.
 #[doc(hidden)]
 pub fn dispatch_mm_for_test(
     encoder: &mut CommandEncoder,

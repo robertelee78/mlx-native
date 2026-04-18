@@ -191,11 +191,51 @@ pub fn quantized_matmul_id_ggml(
         )));
     }
 
-    // --- Get pipeline ---
+    // ADR-011 Phase 3 Wave P3a — route on n_tokens threshold.
+    //
+    // At prefill with n_tokens > 8 and top_k=8, dispatch the two-stage
+    // mm_id kernels (map0 + mm).  Each expert's weight tile is staged
+    // once to threadgroup shmem per 32-row block of that expert's routed
+    // tokens — identical to the dense mm dispatcher's win but per-expert.
+    //
+    // Falls back to the mv_id path for:
+    //   * decode (n_tokens <= 8)
+    //   * top_k values other than 8 (only ne20_8 is instantiated today)
+    //   * K < 32 (mm tile requires NK=32)
+    if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
+        && params.top_k == 8
+        && params.k >= 32
+    {
+        return dispatch_id_mm(
+            encoder, registry, device, input, weight, ids, output, params,
+        );
+    }
+
+    dispatch_id_mv(encoder, registry, device, input, weight, ids, output, params)
+}
+
+/// The n_tokens threshold at which `quantized_matmul_id_ggml` switches
+/// from the mv_id kernel to the mm_id kernel.  Matches llama.cpp's
+/// `ne11_mm_min = 8` (ggml-metal-ops.cpp:2046).
+pub const MM_ID_ROUTING_THRESHOLD: u32 = 8;
+
+/// Matrix-vector `_id` dispatch (decode path, unchanged from pre-Phase-3).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_id_mv(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &mut MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
+
     let kernel_name = params.ggml_type.id_kernel_name();
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
-    // --- Build GPU params as inline bytes (no buffer allocation) ---
     let gpu_params = GgmlMatvecIdGpuParams {
         ne00: params.k as i64,
         ne01: params.n as i64,
@@ -211,9 +251,6 @@ pub fn quantized_matmul_id_ggml(
         expert_stride: params.expert_stride as i64,
     };
 
-    // --- Dispatch ---
-    // Threadgroup geometry matches the non-id GGML kernels exactly,
-    // but with the Y (row) dimension expanded to total_rows = n_tokens * top_k.
     let (nth0, nth1, align) = match params.ggml_type {
         GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
         GgmlType::Q6_K => (2u64, 32u64, 2usize),
@@ -238,10 +275,10 @@ pub fn quantized_matmul_id_ggml(
     encoder.encode_threadgroups_with_args(
         pipeline,
         &[
-            (0, KernelArg::Buffer(weight)),    // src0 = stacked expert weights (GGML blocks)
-            (1, KernelArg::Buffer(input)),     // src1 = input (f32)
-            (2, KernelArg::Buffer(output)),    // dst  = output (f32)
-            (3, KernelArg::Buffer(ids)),       // ids  = expert indices (u32)
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
             (4, KernelArg::Bytes(as_bytes(&gpu_params))),
         ],
         threadgroups,
@@ -249,6 +286,52 @@ pub fn quantized_matmul_id_ggml(
     );
 
     Ok(())
+}
+
+/// Matrix-matrix `_id` dispatch (ADR-011 Phase 3 Wave P3a).
+///
+/// Allocates two small scratch buffers (htpe + hids) per call to hold
+/// map0's per-expert routed-token lists.  On Apple Silicon's unified
+/// memory these allocations are just Metal `newBufferWithLength:` calls
+/// — fast and page-aligned.  Upcoming work (Phase 3b) will pool these
+/// so prefills amortise the cost across layers.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_id_mm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &mut MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    // Translate the dispatcher-facing params to the mm_id internal dispatch
+    // shape.  Same fields; different type keeps the public mv params from
+    // becoming mm-specific.
+    let dispatch = GgmlIdMmDispatchParams {
+        n_tokens: params.n_tokens,
+        top_k: params.top_k,
+        n: params.n,
+        k: params.k,
+        n_experts: params.n_experts,
+        expert_stride: params.expert_stride,
+        ggml_type: params.ggml_type,
+    };
+
+    let mut htpe = device.alloc_buffer(
+        dispatch.htpe_bytes(), DType::U32, vec![params.n_experts as usize]
+    )?;
+    let mut hids = device.alloc_buffer(
+        dispatch.hids_bytes(), DType::U32,
+        vec![params.n_experts as usize, params.n_tokens as usize],
+    )?;
+
+    dispatch_id_mm_for_test(
+        encoder, registry, device,
+        input, weight, ids,
+        &mut htpe, &mut hids, output, &dispatch,
+    )
 }
 
 fn div_ceil(a: usize, b: usize) -> usize {

@@ -83,7 +83,7 @@ pub use ops::quantized_matmul_ggml::{
 pub use ops::quantized_matmul_id::{quantized_matmul_id, QuantizedMatmulIdParams};
 pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, quantized_matmul_id_ggml, GgmlIdMmDispatchParams,
-    GgmlQuantizedMatmulIdParams,
+    GgmlQuantizedMatmulIdParams, MM_ID_ROUTING_THRESHOLD,
 };
 
 // Re-export weight loading utilities.
