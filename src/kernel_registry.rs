@@ -102,6 +102,20 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
 
+        // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
+        // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's
+        // `kernel_mul_mm_id_map0_ne20_N` + `kernel_mul_mm_id_<q>_f32`).
+        // Two-stage dispatch: map0 regroups the token-to-expert table into
+        // per-expert routed-token lists, then mm_id stages a 64x32 expert
+        // weight tile into threadgroup shmem and reuses it across a 32-row
+        // block of that expert's routed tokens.
+        let ggml_id_mm_src: &'static str =
+            include_str!("shaders/quantized_matmul_id_mm.metal");
+        sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
+
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");
         sources.insert("embedding_gather_4bit".into(), embedding_src);

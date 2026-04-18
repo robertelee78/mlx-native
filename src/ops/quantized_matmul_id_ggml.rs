@@ -61,12 +61,23 @@ pub struct GgmlQuantizedMatmulIdParams {
 }
 
 impl GgmlType {
-    /// Metal kernel function name for the _id variant.
+    /// Metal kernel function name for the mat-vec `_id` variant.
     fn id_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
+        }
+    }
+
+    /// Metal kernel function name for the mat-mat `_id` variant (ADR-011
+    /// Phase 3 Wave P3a port of llama.cpp's `kernel_mul_mm_id_<q>_f32`).
+    fn id_mm_kernel_name(self) -> &'static str {
+        match self {
+            GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
+            GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
+            GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
         }
     }
@@ -242,4 +253,326 @@ pub fn quantized_matmul_id_ggml(
 
 fn div_ceil(a: usize, b: usize) -> usize {
     (a + b - 1) / b
+}
+
+// ============================================================================
+// ADR-011 Phase 3 Wave P3a: `_id` matrix-matrix (mm) path.
+//
+// Ports llama.cpp's `kernel_mul_mm_id_map0_ne20_<N>` + `kernel_mul_mm_id_<q>_f32`
+// two-stage dispatch.  Used for MoE projections at prefill — instead of
+// re-reading each expert's weight blocks once per routed (token, slot) pair,
+// the mm kernel stages a 64x32 expert weight tile into threadgroup shared
+// memory and reuses it across a 32-row block of the expert's routed tokens.
+//
+// The preprocessing step (`map0`) is what lets mm work for MoE: it
+// regroups the flat `[n_tokens, top_k]` ids table into per-expert routed
+// token lists so each mm tile is homogeneous in its choice of expert
+// weight slab.  Without map0, consecutive M-rows in a tile could route to
+// different experts, defeating weight reuse.
+//
+// Same staging strategy as Wave P3a Commit 1 (non-id): the kernel exists,
+// tests verify correctness, but the public `quantized_matmul_id_ggml`
+// dispatcher is NOT rerouted yet — tests call `dispatch_id_mm_for_test`.
+// ============================================================================
+
+/// Host-side params for the `_id` mm path's `map0` preprocessor.
+///
+/// Matches `GgmlMatmulIdMm_Map0Params` in
+/// `/opt/mlx-native/src/shaders/quantized_matmul_id_mm.metal`.  Explicit
+/// 4-byte trailing padding so the struct aligns to 8 (u64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GgmlIdMmMap0GpuParams {
+    ne10: i32,       // unused, kept for struct symmetry
+    ne11: i32,       // n_expert_used (bcast, == ne20)
+    nb11: u64,       // unused
+    nb12: u64,       // unused
+    ne21: i32,       // n_tokens
+    ne20: i32,       // n_expert_used (top_k)
+    nb21: u64,       // bytes per token in the ids table (= ne20 * sizeof(i32))
+}
+
+/// Host-side params for the `_id` mm kernel.
+///
+/// Matches `GgmlMatmulIdMm_MmParams` in
+/// `/opt/mlx-native/src/shaders/quantized_matmul_id_mm.metal`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GgmlIdMmMmGpuParams {
+    ne00: i32,   // K
+    ne02: i32,   // n_experts
+    nb01: u64,   // bytes per weight row (within one expert's slab)
+    nb02: u64,   // bytes per expert weight slab (= nb01 * N)
+    nb03: u64,
+    ne11: i32,   // n_expert_used (bcast)
+    _pad0: u32,
+    nb10: u64,   // = sizeof(float)
+    nb11: u64,   // bytes per input row (= K * 4)
+    nb12: u64,   // bytes per input batch (= n_tokens * nb11)
+    nb13: u64,
+    ne20: i32,   // n_expert_used (top_k)
+    ne21: i32,   // n_tokens
+    ne0: i32,    // N (per-expert output rows)
+    ne1: i32,    // batch stride (== ne20 for our packed layout)
+    r2: i16,
+    r3: i16,
+    _pad1: u32,
+}
+
+/// Parameters for the `_id` mm dispatch (scratch-buffer sized view).
+#[derive(Debug, Clone, Copy)]
+pub struct GgmlIdMmDispatchParams {
+    /// Number of input tokens.
+    pub n_tokens: u32,
+    /// Number of experts each token is routed to (top-k).
+    pub top_k: u32,
+    /// Number of output columns per expert (weight rows).
+    pub n: u32,
+    /// Input dimension (weight cols before quantization).
+    pub k: u32,
+    /// Total experts in the stacked weight buffer.
+    pub n_experts: u32,
+    /// Byte stride between expert weight slices in the stacked buffer.
+    pub expert_stride: u64,
+    /// GGML quantization type.
+    pub ggml_type: GgmlType,
+}
+
+impl GgmlIdMmDispatchParams {
+    /// Bytes required for the `htpe` scratch buffer (per-expert routed count).
+    pub fn htpe_bytes(&self) -> usize {
+        (self.n_experts as usize) * DType::U32.size_of()
+    }
+
+    /// Bytes required for the `hids` scratch buffer (per-expert routed-token list).
+    /// Layout: `[n_experts, n_tokens]` int32 row-major.
+    pub fn hids_bytes(&self) -> usize {
+        (self.n_experts as usize) * (self.n_tokens as usize) * DType::U32.size_of()
+    }
+}
+
+/// Test-only helper: force the `_id` mm two-stage dispatch path.
+///
+/// Runs `kernel_mul_mm_id_map0_ne20_<top_k>` followed by
+/// `kernel_mul_mm_id_<qtype>_f32`.
+///
+/// Input:
+///   * `input`   — f32 input rows `[n_tokens, K]`.
+///   * `weight`  — stacked expert weights `[n_experts, N, packed_K]`.
+///   * `ids`     — flat expert-id table `[n_tokens, top_k]` viewed as
+///                 i32 (u32 is byte-equivalent in this range).
+///   * `output`  — f32 output `[n_tokens, top_k, N]` row-major.
+///
+/// Scratch (caller-allocated, zero-init not required):
+///   * `htpe`    — `[n_experts]` u32 (per-expert count).
+///   * `hids`    — `[n_experts, n_tokens]` i32 (per-expert routed list).
+///
+/// Not intended for production callers — the public `quantized_matmul_id_ggml`
+/// entry point stays on the mv path until the follow-up commit wires the
+/// m > 8 threshold.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_id_mm_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    htpe: &mut MlxBuffer,
+    hids: &mut MlxBuffer,
+    output: &mut MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+) -> Result<()> {
+    let qk = params.ggml_type.block_values();
+
+    // ---- Validate common shapes ----
+    match params.ggml_type {
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K => {}
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_id_mm_for_test does not support {:?}", other
+            )));
+        }
+    }
+    if params.n_tokens == 0 || params.k == 0 || params.n == 0
+        || params.top_k == 0 || params.n_experts == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "n_tokens, K, N, top_k, n_experts must all be > 0".into(),
+        ));
+    }
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "K ({}) must be divisible by block QK ({})", params.k, qk
+        )));
+    }
+
+    // Match the top_k template instantiation available in the shader.
+    if params.top_k != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_id_mm_for_test: only top_k=8 is instantiated (got {})",
+            params.top_k
+        )));
+    }
+
+    let blocks_per_row = params.k / qk;
+    let block_bytes = params.ggml_type.block_bytes();
+    let per_expert_bytes =
+        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
+
+    if (params.expert_stride as usize) < per_expert_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "expert_stride ({}) < per_expert_bytes ({})",
+            params.expert_stride, per_expert_bytes
+        )));
+    }
+
+    if weight.byte_len() < per_expert_bytes * params.n_experts as usize {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_for_test: weight buffer too small".into(),
+        ));
+    }
+    if input.byte_len()
+        < (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of()
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_for_test: input buffer too small".into(),
+        ));
+    }
+    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
+    if ids.byte_len() < total_rows * DType::U32.size_of() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_for_test: ids buffer too small".into(),
+        ));
+    }
+    if output.byte_len() < total_rows * (params.n as usize) * DType::F32.size_of() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_for_test: output buffer too small".into(),
+        ));
+    }
+    if htpe.byte_len() < params.htpe_bytes() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_for_test: htpe buffer too small".into(),
+        ));
+    }
+    if hids.byte_len() < params.hids_bytes() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_for_test: hids buffer too small".into(),
+        ));
+    }
+
+    // ---- Stage 1: map0 — build per-expert routed-token lists ----
+    //
+    // Dispatch: 1 threadgroup of `n_experts` threads.  Shared memory:
+    // `n_experts * top_k * sizeof(uint16)` staging area.
+    let map0_pipeline = registry.get_pipeline(
+        "kernel_mul_mm_id_map0_ne20_8", device.metal_device()
+    )?;
+
+    let map0_params = GgmlIdMmMap0GpuParams {
+        ne10: params.n.try_into().map_err(|_| {
+            MlxError::InvalidArgument("N out of i32 range".into())
+        })?,
+        ne11: params.top_k as i32,
+        nb11: 0,
+        nb12: 0,
+        ne21: params.n_tokens as i32,
+        ne20: params.top_k as i32,
+        nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
+    };
+
+    let map0_shmem =
+        (params.n_experts as u64) * (params.top_k as u64) * std::mem::size_of::<u16>() as u64;
+    let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
+    let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        map0_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&map0_params))),
+            (1, KernelArg::Buffer(ids)),
+            (2, KernelArg::Buffer(htpe)),
+            (3, KernelArg::Buffer(hids)),
+        ],
+        &[(0, map0_shmem)],
+        map0_threadgroups,
+        map0_threads,
+    );
+
+    // Memory barrier: the mm kernel reads htpe + hids, map0 wrote them.
+    // Without this, Metal's concurrent-dispatch compute encoder lets the
+    // two dispatches overlap — mm would read zeros (all-expert early-exit).
+    // llama.cpp does the same via `ggml_metal_op_concurrency_reset`
+    // (ggml-metal-ops.cpp:2353).
+    encoder.memory_barrier();
+
+    // ---- Stage 2: mm_id — matmul with the per-expert lists ----
+    let mm_pipeline = registry.get_pipeline(
+        params.ggml_type.id_mm_kernel_name(), device.metal_device()
+    )?;
+
+    let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
+    let row_bytes = (params.k as u64) * (DType::F32.size_of() as u64);
+
+    // Input layout: `[n_tokens, K]` f32 flat.  There is ONE input row per
+    // token (shared across all top_k slots), so:
+    //   * nb11 (slot stride) = 0 — the kernel advances by `i11 * nb11`
+    //     inside the K loop; zero means every slot reads the same token row.
+    //   * nb12 (token stride) = K * 4.
+    //
+    // This differs from llama.cpp's upstream MUL_MAT_ID where `src1` has
+    // shape `[K, n_expert_used, n_tokens]` (pre-replicated per slot),
+    // making `nb11 = K * 4` and `nb12 = top_k * K * 4` there.  Our mv_id
+    // port uses the flat `[n_tokens, K]` layout and so does mm_id.
+    let mm_params = GgmlIdMmMmGpuParams {
+        ne00: params.k as i32,
+        ne02: params.n_experts as i32,
+        nb01,
+        nb02: params.expert_stride,
+        nb03: 0,
+        ne11: params.top_k as i32,
+        _pad0: 0,
+        nb10: DType::F32.size_of() as u64,
+        nb11: 0,             // no slot dim in our input
+        nb12: row_bytes,     // per-token stride
+        nb13: 0,
+        ne20: params.top_k as i32,
+        ne21: params.n_tokens as i32,
+        ne0: params.n as i32,
+        ne1: params.top_k as i32,
+        r2: 1,
+        r3: 1,
+        _pad1: 0,
+    };
+
+    const NR0: u64 = 64;
+    const NR1: u64 = 32;
+    const THREADS_PER_TG: u64 = 128;
+
+    let mm_threadgroups = metal::MTLSize::new(
+        (params.n_tokens as u64 + NR1 - 1) / NR1,
+        (params.n as u64 + NR0 - 1) / NR0,
+        params.n_experts as u64,
+    );
+    let mm_threads = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+
+    const MM_SHMEM_BYTES: u64 = 8192;
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        mm_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&mm_params))),
+            (1, KernelArg::Buffer(weight)),
+            (2, KernelArg::Buffer(input)),
+            (3, KernelArg::Buffer(htpe)),
+            (4, KernelArg::Buffer(hids)),
+            (5, KernelArg::Buffer(output)),
+        ],
+        &[(0, MM_SHMEM_BYTES)],
+        mm_threadgroups,
+        mm_threads,
+    );
+
+    Ok(())
 }
