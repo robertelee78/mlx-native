@@ -948,6 +948,27 @@ fn test_cpu_ref_custom_scale() {
 const BF16_GPU_ATOL: f32 = 5e-3;
 const BF16_GPU_RTOL: f32 = 2e-2;
 
+// Tightened D=512 tolerance — exercised only by the D=512 llama.cpp-derived
+// kernel (`flash_attn_prefill_d512.metal`, NSG=8).
+//
+// Why tighter than D=256?  The original D=512 tests inherited the D=256
+// tolerance (5e-3 / 2e-2), which turned out to be too loose to catch a
+// real bug: a double-application of `log2(e)` inside the softmax (see
+// /opt/hf2q/docs/ADR-011-phase2-wave2c-d512-bug-fix.md).  The defect
+// effectively produced a sharper-than-correct softmax, which the loose
+// tolerance absorbed on (ql=kl=32/128) random inputs but which compounded
+// across Gemma 4's 5 global layers enough to flip sourdough_gate argmaxes.
+//
+// Under the corrected kernel (single log2(e) application — Q pre-scaled
+// once on load, `exp2(s - M)` with no additional factor) the residual
+// per-element error is dominated by bf16 I/O rounding (~4e-3 on magnitudes
+// near 1) and f32 MMA accumulation (~1 ULP per frag).  The 1e-3 / 5e-3
+// budget is tight enough to catch any future softmax / accumulator
+// regression while still absorbing legitimate bf16 rounding.  Mirrors the
+// tolerance bar the user directive asked for in the fix brief.
+const BF16_GPU_ATOL_D512: f32 = 1e-3;
+const BF16_GPU_RTOL_D512: f32 = 5e-3;
+
 /// Cast an f32 slice to bf16 using round-to-nearest-even (the default for
 /// `bf16::from_f32`).
 fn f32_to_bf16(xs: &[f32]) -> Vec<bf16> {
@@ -1673,7 +1694,7 @@ fn test_gpu_bf16_d512_unmasked() {
         );
 
         assert_close_gpu(
-            &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+            &gpu_out, &ref_out, BF16_GPU_ATOL_D512, BF16_GPU_RTOL_D512,
             &format!("gpu_bf16_d512_unmasked_ql{ql}_kl{kl}"),
         );
     }
@@ -1707,7 +1728,7 @@ fn test_gpu_bf16_d512_causal() {
         );
 
         assert_close_gpu(
-            &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+            &gpu_out, &ref_out, BF16_GPU_ATOL_D512, BF16_GPU_RTOL_D512,
             &format!("gpu_bf16_d512_causal_ql{ql}_kl{kl}"),
         );
     }
@@ -1795,6 +1816,69 @@ fn test_gpu_bf16_d512_determinism() {
         );
     }
     eprintln!("test_gpu_bf16_d512_determinism: PASS — two runs byte-identical");
+}
+
+/// Regression gate for the "double log2(e)" softmax bug fixed in
+/// `/opt/hf2q/docs/ADR-011-phase2-wave2c-d512-bug-fix.md`.
+///
+/// The bug — multiplying `(s2 - new_max)` by `log2(e)` inside `exp2` after
+/// Q had already been pre-scaled by `scale * log2(e)` — produced a softmax
+/// effectively scaled by `log2(e)^2 ≈ 2.08` rather than `log2(e)` once.
+/// On low-variance inputs (the original `(ql=32, kl=32)` random PRNG test)
+/// the score range is small enough that the sharpened distribution stays
+/// inside the `5e-3 / 2e-2` tolerance.  But on HIGH-variance inputs — the
+/// regime real attention sees, with `score = Q·K^T / sqrt(d)` ranging over
+/// several units of magnitude — the bug shifts the softmax output by tens
+/// of percent at the top-attended positions.
+///
+/// This test constructs an input with deliberately high score variance:
+/// Q and K from `pseudo_random_f32 ∈ [-1, 1]`, scaled by `2/sqrt(d)` (4×
+/// the standard `1/sqrt(d)`).  The pre-softmax scores are O(2-4) range,
+/// so a single softmax-sharpness factor of `log2(e)` distorts the top
+/// score's weight by `e^(2 * (log2(e) - 1)) ≈ e^0.885 ≈ 2.42`.  This
+/// shows up as multi-percent output shifts that violate the tightened
+/// `1e-3 / 5e-3` budget, ensuring the bug class can't recur silently.
+///
+/// Tolerance: same `BF16_GPU_ATOL_D512 / BF16_GPU_RTOL_D512` budget as
+/// the standard D=512 tests — these ARE the bf16 round-off floor; any
+/// extra softmax-shape error is a kernel bug.
+#[test]
+fn test_gpu_bf16_d512_high_variance_softmax() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    // Larger ql, kl + two heads to exercise the per-head softmax more
+    // thoroughly.  Includes a partial trailing KV chunk (kl=72 → one full
+    // chunk of C=64 + 8 leftover) to also exercise the align_K=false guard.
+    for &(ql, kl) in &[(64usize, 72usize), (128, 192)] {
+        let batch = 1; let h = 2; let kv_h = 2; let d = 512;
+        // 4× the standard scale → score variance ≈ 16× wider, exercising
+        // the regime where the double-log2(e) bug produces the largest
+        // softmax-shape distortion.
+        let scale = 4.0 / (d as f32).sqrt();
+
+        let q = pseudo_random_f32(SEED + 200, batch * h * ql * d);
+        let k = pseudo_random_f32(SEED + 201, batch * kv_h * kl * d);
+        let v = pseudo_random_f32(SEED + 202, batch * kv_h * kl * d);
+        let q_bf = f32_to_bf16(&q);
+        let k_bf = f32_to_bf16(&k);
+        let v_bf = f32_to_bf16(&v);
+
+        let gpu_out = run_bf16_gpu_d512(
+            &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+        let ref_out = reference_for_bf16(
+            &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+
+        assert_close_gpu(
+            &gpu_out, &ref_out, BF16_GPU_ATOL_D512, BF16_GPU_RTOL_D512,
+            &format!("gpu_bf16_d512_high_variance_softmax_ql{ql}_kl{kl}"),
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3048,7 +3132,7 @@ fn test_mask_rank2_broadcast_d512_multihead() {
 
     assert_all_finite(&gpu_out, "rank2_broadcast_d512_multihead");
     assert_close_gpu(
-        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        &gpu_out, &ref_out, BF16_GPU_ATOL_D512, BF16_GPU_RTOL_D512,
         "rank2_broadcast_d512_multihead",
     );
 }
