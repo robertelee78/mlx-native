@@ -78,6 +78,17 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
 
+        // GGML block-format quantized matrix-matrix kernels
+        // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's kernel_mul_mm_<q>_f32).
+        // Used at prefill m > 8 to reuse each weight tile across a 32-row
+        // block via threadgroup-staged simdgroup MMA, instead of re-reading
+        // every block per prompt-token as the mv kernel does.
+        let ggml_mm_src: &'static str =
+            include_str!("shaders/quantized_matmul_mm.metal");
+        sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_q6_K_f32".into(), ggml_mm_src);
+
         // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
         sources.insert(
             "quantized_matmul_id".into(),

@@ -77,7 +77,8 @@ pub use gguf::{GgufFile, MetadataValue, TensorInfo};
 // Re-export ops.
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
+    dispatch_mm_for_test, quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
+    MM_ROUTING_THRESHOLD,
 };
 pub use ops::quantized_matmul_id::{quantized_matmul_id, QuantizedMatmulIdParams};
 pub use ops::quantized_matmul_id_ggml::{
