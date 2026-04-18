@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use metal::ComputePipelineState;
+use metal::{ComputePipelineState, FunctionConstantValues, MTLDataType};
 
 use crate::error::{MlxError, Result};
 
@@ -142,6 +142,57 @@ impl KernelRegistry {
         let sdpa_sliding_src: &'static str = include_str!("shaders/sdpa_sliding.metal");
         sources.insert("sdpa_sliding".into(), sdpa_sliding_src);
         sources.insert("sdpa_sliding_bf16".into(), sdpa_sliding_src);
+
+        // Flash-attention tiled prefill kernel (ADR-011 Phase 1).
+        // Ten entry points; all backed by the same shader source.
+        // Pipelines are compiled with function constants via
+        // `get_pipeline_with_bool_constants` — not `get_pipeline`.
+        let flash_attn_prefill_src: &'static str =
+            include_str!("shaders/flash_attn_prefill.metal");
+        // D=256 variants (BQ=32, BK=16, WM=4, WN=1 — 128 threads/threadgroup)
+        sources.insert(
+            "steel_attention_float32_bq32_bk16_bd256_wm4_wn1_maskfloat32".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_float32_bq32_bk16_bd256_wm4_wn1_maskbool_".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_bfloat16_bq32_bk16_bd256_wm4_wn1_maskbfloat16".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_bfloat16_bq32_bk16_bd256_wm4_wn1_maskbool_".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_float16_bq32_bk16_bd256_wm4_wn1_maskfloat16".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_float16_bq32_bk16_bd256_wm4_wn1_maskbool_".into(),
+            flash_attn_prefill_src,
+        );
+        // D=512 variants (BQ=8, BK=8, WM=1, WN=1 — 32 threads/threadgroup)
+        // NOTE: f32 at D=512 is NOT instantiated — threadgroup memory exceeds
+        // the 32 KB Metal limit (candle sdpa.rs:86-94).
+        sources.insert(
+            "steel_attention_bfloat16_bq8_bk8_bd512_wm1_wn1_maskbfloat16".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_bfloat16_bq8_bk8_bd512_wm1_wn1_maskbool_".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_float16_bq8_bk8_bd512_wm1_wn1_maskfloat16".into(),
+            flash_attn_prefill_src,
+        );
+        sources.insert(
+            "steel_attention_float16_bq8_bk8_bd512_wm1_wn1_maskbool_".into(),
+            flash_attn_prefill_src,
+        );
 
         // Flash attention vector kernels — SIMD-vectorized decode-path SDPA
         // (ported from llama.cpp flash_attn_ext_vec)
@@ -317,6 +368,88 @@ impl KernelRegistry {
         // At this point the pipeline is guaranteed to be in the cache.
         // We use `ok_or_else` instead of `expect` to satisfy the no-panic policy.
         self.cache.get(name).ok_or_else(|| {
+            MlxError::KernelNotFound(name.to_string())
+        })
+    }
+
+    /// Get a compiled compute pipeline for the named kernel, specialized with
+    /// Metal function constants.
+    ///
+    /// The `bool_constants` slice contains `(index, value)` pairs.  Each pair
+    /// maps to a `[[function_constant(index)]]` declaration in the MSL shader.
+    ///
+    /// Pipelines are cached by a composite key:
+    /// `"<name>|<index>:<0|1>|..."` so that distinct constant combinations each
+    /// produce a separately compiled pipeline.  The slow compilation path runs at
+    /// most once per unique `(name, constants)` combination.
+    ///
+    /// # Errors
+    ///
+    /// * `MlxError::KernelNotFound` — no source registered for this name.
+    /// * `MlxError::ShaderCompilationError` — MSL compilation, function
+    ///   specialisation, or pipeline creation failed.
+    pub fn get_pipeline_with_bool_constants(
+        &mut self,
+        name: &str,
+        device: &metal::DeviceRef,
+        bool_constants: &[(usize, bool)],
+    ) -> Result<&ComputePipelineState> {
+        // Build a composite cache key so distinct constant combinations each
+        // compile to their own pipeline.
+        let mut cache_key = name.to_string();
+        for &(index, value) in bool_constants {
+            cache_key.push('|');
+            cache_key.push_str(&index.to_string());
+            cache_key.push(':');
+            cache_key.push(if value { '1' } else { '0' });
+        }
+
+        if !self.cache.contains_key(&cache_key) {
+            // Slow path: compile the shader with function constant specialisation.
+            let source = self.sources.get(name).ok_or_else(|| {
+                MlxError::KernelNotFound(name.to_string())
+            })?;
+
+            let compile_opts = metal::CompileOptions::new();
+            let library = device
+                .new_library_with_source(source, &compile_opts)
+                .map_err(|msg| MlxError::ShaderCompilationError {
+                    name: name.to_string(),
+                    message: msg,
+                })?;
+
+            // Build the FunctionConstantValues object.
+            let fcv = FunctionConstantValues::new();
+            for &(index, value) in bool_constants {
+                // MTLDataType::Bool = 53 (from metal-rs argument.rs).
+                // The value must be passed as a pointer to a Rust bool (1 byte).
+                // The Metal runtime reads it as an Objective-C BOOL (uint8_t).
+                let v: u8 = if value { 1 } else { 0 };
+                fcv.set_constant_value_at_index(
+                    (&v as *const u8).cast::<std::ffi::c_void>(),
+                    MTLDataType::Bool,
+                    index as u64,
+                );
+            }
+
+            let function = library
+                .get_function(name, Some(fcv))
+                .map_err(|msg| MlxError::ShaderCompilationError {
+                    name: name.to_string(),
+                    message: msg,
+                })?;
+
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|msg| MlxError::ShaderCompilationError {
+                    name: name.to_string(),
+                    message: msg,
+                })?;
+
+            self.cache.insert(cache_key.clone(), pipeline);
+        }
+
+        self.cache.get(&cache_key).ok_or_else(|| {
             MlxError::KernelNotFound(name.to_string())
         })
     }
