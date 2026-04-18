@@ -3,7 +3,9 @@
 //! Tests the `attention<BQ, BK, BD, WM, WN>` kernel in
 //! `src/shaders/flash_attn_prefill.metal` against a CPU reference that
 //! mirrors the exact mathematical idioms used in the GPU shader (base-2
-//! softmax, three NaN guards documented in the kernel preamble).
+//! softmax, llama.cpp finite-M-sentinel convention with ONE output-side
+//! guard at the final normalisation — see kernel preamble and
+//! ADR-011-phase2-port-sentinel.md).
 //!
 //! # Test coverage
 //!
@@ -43,12 +45,20 @@
 //! - Q is pre-scaled by `scale * log2(e)` before QK^T (matches the kernel's
 //!   `TransformScale` applied to Q on load).
 //! - Softmax uses `f32::exp2(x - max)` (matches `ExpSubOp::apply`).
-//! - NaN guard #1 on exp: if `max_new == -inf` (row fully masked), exp = 0.
-//! - NaN guard #2 on rescale factor: if `max_old == -inf`, factor = 0.
+//! - Row max `max_score` initialised to `f32::MIN / 2.0` = `-FLT_MAX/2`,
+//!   the llama.cpp finite sentinel (ggml-metal.metal:5891).  This lets
+//!   `exp2(score - max_score)` evaluate cleanly for any masked score
+//!   (`exp2(-inf - finite) = 0.0`, IEEE-754 exact) without an intermediate
+//!   NaN guard.
+//! - ONE output-side guard at the final normalisation:
+//!   `safe_sum = sum_exp == 0 ? 1 : sum_exp` — mirrors llama.cpp's
+//!   `scale = S == 0 ? 0 : 1/S` at ggml-metal.metal:6358, which handles
+//!   fully-masked rows where every exp is bit-exact 0.
 //! - Additive (float) mask is multiplied by `log2(e)` before being added to
 //!   the score, matching the kernel's mask-addition step.
 //! - Causal masking: positions with `k_pos > q_abs_pos` get scores set to
-//!   -inf before exp.
+//!   -inf before exp (the mask sentinel; absorbed by the finite
+//!   `max_score` via the max() reduction).
 //!
 //! # Tolerance
 //!
@@ -74,6 +84,20 @@ use mlx_native::ops::flash_attn_prefill::{
     self, AttnParamsGpu, AttnMaskParamsGpu, FlashAttnPrefillParams,
     dispatch_flash_attn_prefill_bf16_d256,
 };
+use mlx_native::ops::flash_attn_prefill_d512::{
+    self as flash_attn_prefill_d512,
+    dispatch_flash_attn_prefill_bf16_d512,
+};
+use mlx_native::ops::flash_attn_prefill_mask::{
+    self as flash_attn_prefill_mask,
+    build_sdpa_mask_bf16, SdpaMaskParams,
+};
+use mlx_native::ops::flash_attn_prefill_blk::{
+    self as flash_attn_prefill_blk,
+    dispatch_flash_attn_prefill_blk, alloc_blk_buffer, BlkParams,
+};
+use mlx_native::ops::flash_attn_prefill::dispatch_flash_attn_prefill_bf16_d256_with_blk;
+use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_bf16_d512_with_blk;
 use mlx_native::{DType, KernelRegistry, MlxDevice, MlxError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -505,13 +529,27 @@ fn sdpa_naive_scalar_f32(
                     }
                 }
 
-                // Standard numerically-stable softmax using exp().
-                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // Standard numerically-stable softmax using exp() — updated
+                // to the llama.cpp finite-sentinel convention for parity with
+                // the kernel-equivalent reference.  For any non-fully-masked
+                // input, `max_s` is the real row-max (identical to the
+                // previous NEG_INFINITY init, which would have been overwritten
+                // by the first score).  For a fully-masked row, max_s stays
+                // at -FLT_MAX/2, `exp(-inf - -FLT_MAX/2) = exp(-inf) = 0.0`
+                // (IEEE-754 exact), sum = 0, safe_sum = 1, output = 0 — same
+                // final answer as the previous branch-guarded form.
+                let mut max_s = f32::MIN / 2.0; // = -FLT_MAX/2 sentinel (llama.cpp ggml-metal.metal:5891)
+                for &s in &scores {
+                    if s > max_s {
+                        max_s = s;
+                    }
+                }
                 let exp_scores: Vec<f32> = scores
                     .iter()
-                    .map(|&s| if max_s == f32::NEG_INFINITY { 0.0 } else { (s - max_s).exp() })
+                    .map(|&s| (s - max_s).exp())
                     .collect();
                 let sum_exp: f32 = exp_scores.iter().sum();
+                // Mirror of llama.cpp's `S == 0 ? 0 : 1/S` at ggml-metal.metal:6358.
                 let safe_sum = if sum_exp == 0.0 { 1.0 } else { sum_exp };
 
                 let o_base = b * n_heads * ql * head_dim + h * ql * head_dim + q_pos * head_dim;
@@ -603,35 +641,44 @@ fn sdpa_reference_f32(
                     }
                 }
 
-                // ── Online softmax (base-2, with NaN guards) ──────────────
+                // ── Online softmax (base-2, llama.cpp finite-M regime) ────
                 // Row max reduction:
-                // flash_attn_prefill.metal:1393 — row_reduce<MaxOp>(new_max)
-                let mut max_score = f32::NEG_INFINITY; // init: Limits<float>::min = -inf (:1060)
+                // flash_attn_prefill.metal — row_reduce<MaxOp>(new_max) with
+                // max_score init = -FLT_MAX/2 (llama.cpp convention,
+                // ggml-metal.metal:5891).  A finite sentinel absorbs -inf
+                // scores via max() without ever letting max_score become
+                // -inf, so the subsequent exp2(score - max) path never sees
+                // exp2(-inf - -inf) = exp2(NaN).  See
+                // ADR-011-phase2-port-sentinel.md §1.3.
+                let mut max_score = f32::MIN / 2.0; // = -FLT_MAX/2, matches llama.cpp + our kernel
                 for &s in &scores {
                     if s > max_score {
                         max_score = s;
                     }
                 }
 
-                // exp2(score - max) with NaN guard:
-                // flash_attn_prefill.metal:1064-1072 — ExpSubOp::apply
-                //   if (y == -inf) return T(0); else return fast::exp2(x - y);
+                // exp2(score - max) unguarded: max_score is finite by
+                // construction (simd_max of -FLT_MAX/2 floor and real
+                // scores), so exp2(-inf - finite) = exp2(-inf) = +0.0
+                // (IEEE-754 exact) for any masked position, never NaN.
+                // Matches llama.cpp's unguarded `exp(s2 - M[jj])` at
+                // ggml-metal.metal:6156.
                 let exp_scores: Vec<f32> = scores
                     .iter()
-                    .map(|&s| {
-                        if max_score == f32::NEG_INFINITY {
-                            // NaN guard: all scores are -inf (fully masked row).
-                            // flash_attn_prefill.metal:1067-1069
-                            0.0_f32
-                        } else {
-                            // flash_attn_prefill.metal:1070 — fast::exp2(x - y)
-                            f32::exp2(s - max_score)
-                        }
-                    })
+                    .map(|&s| f32::exp2(s - max_score))
                     .collect();
 
-                // Sum: flash_attn_prefill.metal:1415-1416 — row_reduce<SumOp>
+                // Sum: flash_attn_prefill.metal — row_reduce<SumOp>
                 let sum_exp: f32 = exp_scores.iter().sum();
+                // THE single surviving guard — mirrors llama.cpp's
+                // `scale = S == 0 ? 0 : 1/S` at ggml-metal.metal:6358.
+                // For a fully-masked row every exp is 0 so sum_exp = 0;
+                // downstream the weighted sum becomes (exp / safe_sum) = 0
+                // and `* 0` when sum_exp was 0, i.e. 0 output.  We keep
+                // the `safe_sum = 1` form here because the weighted loop
+                // below does `(exp / safe_sum) * v`: when sum_exp == 0
+                // every `exp` is also 0, so `0 / 1 * v = 0` — same final
+                // behaviour as llama.cpp's `reciprocal-then-multiply`.
                 let safe_sum = if sum_exp == 0.0 { 1.0 } else { sum_exp };
 
                 // ── Weighted sum of V ─────────────────────────────────────
@@ -788,15 +835,22 @@ fn test_cpu_ref_self_consistency_additive_mask() {
     eprintln!("test_cpu_ref_self_consistency_additive_mask: PASS (both refs produce finite output)");
 }
 
-/// CPU NaN guard test: fully-masked input must produce finite output.
+/// CPU fully-masked input must produce zero output (llama.cpp sentinel regime).
 ///
-/// When ALL K positions are masked to -infinity, the CPU reference's NaN guards
-/// must prevent NaN propagation (output should be 0 — no valid keys attended):
+/// Under the llama.cpp finite-M convention (ADR-011-phase2-port-sentinel.md),
+/// when ALL K positions are masked to -infinity the fully-masked-row path is:
 ///
-/// 1. `ExpSubOp` guard: max_new == -inf → return 0 (not exp2(NaN)).
-///    flash_attn_prefill.metal:1067-1069
-/// 2. Factor guard: max_old == -inf → factor = 0 (not exp2(-inf - new_max)).
-///    flash_attn_prefill.metal:1401-1405
+/// 1. Row max `max_score` initialised to `-FLT_MAX/2` (finite).  Every score
+///    is `-inf` from the mask, so `max(-FLT_MAX/2, -inf) = -FLT_MAX/2`:
+///    max_score stays finite.  No NaN.
+/// 2. `exp2(score - max_score) = exp2(-inf - -FLT_MAX/2) = exp2(-inf) = 0.0`
+///    (IEEE-754 exact).  No NaN.
+/// 3. `sum_exp = sum of zeros = 0`.  Output-side guard
+///    (`safe_sum = sum_exp == 0 ? 1 : sum_exp`) sets divisor to 1.
+/// 4. `(0 / 1) * v = 0` per output component → output = all 0.0.
+///
+/// Mirrors llama.cpp's end-to-end trace at ggml-metal.metal:5888-6374 for a
+/// fully-masked row (final `scale = S == 0 ? 0 : 1/S` at :6358 yields 0).
 #[test]
 fn test_cpu_ref_nan_guard_fully_masked() {
     let batch = 1; let h = 2; let kv_h = 2;
@@ -1180,16 +1234,21 @@ fn test_gpu_bf16_d256_additive_mask() {
     );
 }
 
-/// GPU correctness: fully-masked KV tile exercises all three NaN-guard paths.
+/// GPU correctness: fully-masked KV tile under the llama.cpp sentinel regime.
 ///
-/// The kernel uses true -infinity as the masked-position sentinel, so the
-/// fully-masked-row case requires three guards (per the kernel's preamble):
-/// (1) `ExpSubOp` for `max == -inf`, (2) the rescale factor for
-/// `old_max == -inf`, and (3) `DivOp` for `sum_score == 0`.  Without all
-/// three, fully-masked rows propagate NaN.
+/// The kernel uses llama.cpp's finite-M convention (ADR-011-phase2-port-sentinel.md):
+/// the running row-max `M` is initialised to `-FLT_MAX/2` (finite), so
+/// `simd_max(-FLT_MAX/2, -inf) = -FLT_MAX/2` keeps `M` finite throughout
+/// the K-sweep, which in turn makes `exp2(-inf - M) = exp2(-inf) = +0.0`
+/// (IEEE-754 exact) — never `exp2(NaN)`.  The K-sweep accumulates
+/// `sum_score = bit-exact 0` with no intermediate NaN.  The ONE remaining
+/// guard is the final output normalisation (`DivOp`: `sum_score == 0 ?
+/// 0 : x/sum_score`), mirroring llama.cpp's
+/// `scale = S == 0 ? 0 : 1/S` at ggml-metal.metal:6358.
 ///
 /// This test sets the entire mask to -inf; the expected output is all zeros
-///   (no valid keys attended).  Any NaN or Inf in the output = guard bug.
+///   (no valid keys attended).  Any NaN or Inf in the output = the sentinel
+///   chain is broken somewhere.
 #[test]
 fn test_gpu_bf16_d256_fully_masked_nan_guard() {
     let device = MlxDevice::new().expect("Metal device");
@@ -1409,6 +1468,1359 @@ fn test_gpu_bf16_d256_determinism() {
         );
     }
     eprintln!("test_gpu_bf16_d256_determinism: PASS — two runs byte-identical");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 6  GPU CORRECTNESS — BF16 D=512 (NSG=8, llama.cpp-derived kernel)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests exercise `dispatch_flash_attn_prefill_bf16_d512` — the
+// llama.cpp-derived NSG=8 kernel at `shaders/flash_attn_prefill_d512.metal`.
+// The tolerance budget is the same as D=256 (BF16_GPU_ATOL=5e-3, _RTOL=2e-2)
+// because the kernel body is a direct port of llama.cpp's proven math and
+// uses the same bf16 I/O + f32 accumulation pipeline.
+//
+// Unlike the D=256 kernel, D=512 ships with only ONE entry point per dtype
+// (additive-mask; the boolean variant is separate) with NSG selected via an
+// int function constant at pipeline-creation time.  These tests dispatch
+// at the default NSG=8.
+
+/// Run the bf16 D=512 kernel once and return the bf16 output as f32.
+///
+/// Mirrors `run_bf16_gpu` but routes through the D=512 dispatcher.
+#[allow(clippy::too_many_arguments)]
+fn run_bf16_gpu_d512(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_bf16: &[bf16],
+    k_bf16: &[bf16],
+    v_bf16: &[bf16],
+    mask_bf16: Option<&[bf16]>,
+    batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    ql: usize,
+    kl: usize,
+    head_dim: usize,
+    scale: f32,
+    do_causal: bool,
+) -> Vec<f32> {
+    assert_eq!(head_dim, 512, "run_bf16_gpu_d512 is D=512 only");
+
+    let q_elems = batch * n_heads * ql * head_dim;
+    let kv_elems = batch * n_kv_heads * kl * head_dim;
+
+    let q_buf = alloc_bf16(device, q_elems, "Q");
+    let k_buf = alloc_bf16(device, kv_elems, "K");
+    let v_buf = alloc_bf16(device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(device, q_elems, "out");
+
+    fill_bf16_buffer(&q_buf, q_bf16);
+    fill_bf16_buffer(&k_buf, k_bf16);
+    fill_bf16_buffer(&v_buf, v_bf16);
+
+    let mask_buf = mask_bf16.map(|m| {
+        let mask_elems = batch * n_heads * ql * kl;
+        assert_eq!(m.len(), mask_elems, "mask length mismatch");
+        let buf = alloc_bf16(device, mask_elems, "mask");
+        fill_bf16_buffer(&buf, m);
+        buf
+    });
+
+    let params = FlashAttnPrefillParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d512(
+        &mut encoder, device, registry,
+        &q_buf, &k_buf, &v_buf, mask_buf.as_ref(), &mut out_buf, &params,
+    ).expect("bf16 D=512 dispatch");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let out_bf16 = read_bf16_buffer(&out_buf, q_elems);
+    bf16_to_f32(&out_bf16)
+}
+
+/// Measure the compiled pipeline's static threadgroup memory footprint and
+/// max threads/TG.  This is the regression gate for the TG-memory claim:
+/// llama.cpp reports 28,672 B for (DK=DV=512, Q=8, C=64, NSG=8, bf16,
+/// is_q=0); if this measurement is larger, the kernel is allocating
+/// statically-sized threadgroup arrays that don't exist in llama.cpp's
+/// kernel (or our shmem aliasing has drifted).
+#[test]
+fn test_d512_pipeline_tg_memory_and_threads() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            "flash_attn_prefill_llamacpp_bf16_d512",
+            device.metal_device(),
+            &[(200, true), (201, true), (300, false), (301, false)],
+            &[(322, 8_i32)],
+        )
+        .expect("bf16 d512 nsg=8 pipeline compiles");
+
+    // NOTE: `static_threadgroup_memory_length` reports threadgroup memory
+    // declared STATICALLY inside the shader (via `threadgroup T arr[N]`
+    // declarations).  Our kernel declares its buffers DYNAMICALLY
+    // (`threadgroup half* shmem_f16 [[threadgroup(0)]]`) and sizes them at
+    // encode time via `setThreadgroupMemoryLength` — so this value is
+    // expected to be 0, and the real allocation (28,672 B) is done at the
+    // dispatcher level.  We still assert the pipeline compiled.
+    let static_tg = pipeline.static_threadgroup_memory_length();
+    let max_total = pipeline.max_total_threads_per_threadgroup();
+    let exec_width = pipeline.thread_execution_width();
+
+    eprintln!(
+        "D=512 NSG=8 pipeline: static_tg={} bytes, max_total_threads_per_tg={}, \
+         thread_execution_width={}",
+        static_tg, max_total, exec_width
+    );
+
+    // Apple GPU simdgroup width is always 32.
+    assert_eq!(exec_width, 32, "simdgroup width must be 32");
+
+    // Our shader annotated `max_total_threads_per_threadgroup(32 * 8) = 256`
+    // on the kernel.  Metal compiler may report a smaller value if it can
+    // prove register pressure forces occupancy-down, but 256 is the upper
+    // bound we declared.
+    assert!(
+        max_total >= 256,
+        "max_total_threads_per_threadgroup >= 256 required for NSG=8 × 32 lanes"
+    );
+
+    // Dynamic allocation is used (matches llama.cpp), so static size should
+    // be small or zero.
+    assert!(
+        static_tg < 1024,
+        "static threadgroup memory should be near-zero (we allocate dynamically); \
+         got {static_tg} bytes"
+    );
+}
+
+/// Verify the llama.cpp-derived D=512 shader library compiles and the
+/// bf16 NSG=8 pipeline is obtainable at the canonical function-constant
+/// combination.
+///
+/// Acts as the regression gate for shader-source errors — if the kernel
+/// template has an MSL syntax bug, this test fails before any of the
+/// correctness tests have a chance to run.
+#[test]
+fn test_bf16_d512_llamacpp_library_compiles() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    // Canonical FC combo: align_Q=true, align_K=true, has_mask=false,
+    // do_causal=false, nsg=8.
+    let result = registry.get_pipeline_with_constants(
+        "flash_attn_prefill_llamacpp_bf16_d512",
+        device.metal_device(),
+        &[(200, true), (201, true), (300, false), (301, false)],
+        &[(322, 8_i32)],
+    );
+    match result {
+        Ok(_) => eprintln!("test_bf16_d512_llamacpp_library_compiles: OK"),
+        Err(MlxError::ShaderCompilationError { name, message }) => {
+            panic!(
+                "bf16 D=512 NSG=8 pipeline compilation failed: name={name}, \
+                 message={message}"
+            );
+        }
+        Err(other) => panic!("Unexpected error: {other:?}"),
+    }
+}
+
+/// GPU correctness: unmasked, non-causal, at D=512 with (ql, kl) ∈
+/// {(32, 32), (128, 128)}.
+///
+/// Small head count keeps CPU reference reasonable while exercising the
+/// 8 simdgroups × 8 Q-rows × 64 KV-cols tile geometry.
+#[test]
+fn test_gpu_bf16_d512_unmasked() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    for &(ql, kl) in &[(32usize, 32usize), (128, 128)] {
+        let batch = 1; let h = 2; let kv_h = 2; let d = 512;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let q = pseudo_random_f32(SEED + 100, batch * h * ql * d);
+        let k = pseudo_random_f32(SEED + 101, batch * kv_h * kl * d);
+        let v = pseudo_random_f32(SEED + 102, batch * kv_h * kl * d);
+        let q_bf = f32_to_bf16(&q);
+        let k_bf = f32_to_bf16(&k);
+        let v_bf = f32_to_bf16(&v);
+
+        let gpu_out = run_bf16_gpu_d512(
+            &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+        let ref_out = reference_for_bf16(
+            &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+
+        assert_close_gpu(
+            &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+            &format!("gpu_bf16_d512_unmasked_ql{ql}_kl{kl}"),
+        );
+    }
+}
+
+/// GPU correctness: in-kernel causal masking at D=512.
+#[test]
+fn test_gpu_bf16_d512_causal() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    for &(ql, kl) in &[(32usize, 32usize), (128, 128)] {
+        let batch = 1; let h = 2; let kv_h = 2; let d = 512;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let q = pseudo_random_f32(SEED + 110, batch * h * ql * d);
+        let k = pseudo_random_f32(SEED + 111, batch * kv_h * kl * d);
+        let v = pseudo_random_f32(SEED + 112, batch * kv_h * kl * d);
+        let q_bf = f32_to_bf16(&q);
+        let k_bf = f32_to_bf16(&k);
+        let v_bf = f32_to_bf16(&v);
+
+        let gpu_out = run_bf16_gpu_d512(
+            &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, true,
+        );
+        let ref_out = reference_for_bf16(
+            &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, true,
+        );
+
+        assert_close_gpu(
+            &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+            &format!("gpu_bf16_d512_causal_ql{ql}_kl{kl}"),
+        );
+    }
+}
+
+/// GPU correctness: fully-masked KV tile at D=512 — exercises the sentinel
+/// DivOp guard (`S == 0 ? 0 : 1/S`).
+///
+/// Under the finite-M regime, the entire score row degenerates to `-inf`
+/// (from the mask), exp2(-inf - -FLT_MAX/2) = 0 (IEEE-754 exact), sum = 0.
+/// The final `output / sum` guard returns 0 — output row must be all zeros
+/// with no NaN / Inf leakage.
+#[test]
+fn test_gpu_bf16_d512_fully_masked_sentinel() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    let batch = 1; let h = 2; let kv_h = 2; let ql = 32; let kl = 32; let d = 512;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 130, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 131, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 132, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // Fully -inf additive mask.
+    let mask_f32 = vec![f32::NEG_INFINITY; batch * h * ql * kl];
+    let mask_bf = f32_to_bf16(&mask_f32);
+
+    let gpu_out = run_bf16_gpu_d512(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, Some(&mask_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    // No NaN, no Inf.
+    assert_all_finite(&gpu_out, "gpu_bf16_d512_fully_masked_sentinel");
+
+    // All outputs must be exactly 0.0.
+    for (i, &val) in gpu_out.iter().enumerate() {
+        assert_eq!(
+            val, 0.0,
+            "gpu_bf16_d512_fully_masked_sentinel: element {i} expected 0.0, got {val} \
+             (DivOp sentinel may be broken)"
+        );
+    }
+    eprintln!("test_gpu_bf16_d512_fully_masked_sentinel: PASS — all zeros, DivOp guard intact");
+}
+
+/// GPU determinism: two dispatches with identical inputs produce identical
+/// output at D=512 NSG=8.  Any divergence = non-deterministic reduction
+/// order (e.g. unordered atomics) — would be a correctness regression.
+#[test]
+fn test_gpu_bf16_d512_determinism() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+
+    let batch = 1; let h = 2; let kv_h = 2; let ql = 128; let kl = 128; let d = 512;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 160, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 161, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 162, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    let run1 = run_bf16_gpu_d512(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+    let run2 = run_bf16_gpu_d512(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_eq!(run1.len(), run2.len());
+    for (i, (a, b)) in run1.iter().zip(run2.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(), b.to_bits(),
+            "determinism violated at index {i}: run1={a} run2={b}"
+        );
+    }
+    eprintln!("test_gpu_bf16_d512_determinism: PASS — two runs byte-identical");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 7  SWA / CAUSAL MASK BUILDER (Wave 2D, ADR-011 Phase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Verifies the port of llama.cpp's `llm_graph_input_attn_no_cache::set_input`
+// mask-fill algorithm (llama-graph.cpp:380-444) and the `is_masked_swa`
+// predicate (llama-hparams.h:316-328) into a bf16 GPU-fill kernel.
+//
+// The builder produces a `[seq_len_q, seq_len_k]` bf16 mask with discrete
+// cell values: 0.0 for attended, -inf for masked.  Correctness is EXACT
+// (no floating-point tolerance) — any cell that disagrees with the CPU
+// predicate is a bug.  The integration test then runs the mask through
+// `dispatch_flash_attn_prefill_bf16_d256` with `do_causal=false` to confirm
+// the mask-carried causal + SWA gating produces the same attention output
+// as the CPU reference with the same semantics, within bf16 tolerance.
+//
+// Sentinel verification: bf16(-INFINITY) must encode as bit pattern 0xFF80
+// and bf16(0.0) as 0x0000.  Any drift here is a silent correctness bug
+// because the flash_attn_prefill kernel relies on the finite-M-sentinel
+// regime's handling of exact bf16 -inf in mask cells.
+
+/// bf16(-INFINITY) must encode as 0xFF80 (sign=1, exponent=0xFF, mantissa=0).
+/// bf16(0.0) must encode as 0x0000.
+///
+/// Both half (F16) and bfloat16 have real `-inf` representations; verifies
+/// that the `half::bf16::from_f32` path preserves the infinity through the
+/// cast.  If this ever changes the mask would silently start producing a
+/// finite sentinel (e.g. -FLT_MAX saturation), breaking the kernel's
+/// finite-M design and causing NaN propagation on fully-masked rows.
+///
+/// Cross-checks our Rust-side cast against the Metal-side cast at
+/// `flash_attn_prefill_mask.metal:bfloat16_t(-INFINITY)`: both must produce
+/// 0xFF80.
+#[test]
+fn test_mask_sentinel_bit_patterns() {
+    let ninf = bf16::from_f32(f32::NEG_INFINITY);
+    assert_eq!(
+        ninf.to_bits(),
+        0xFF80,
+        "bf16(-INFINITY) must be 0xFF80 (sign=1, exp=0xFF, mantissa=0)"
+    );
+    assert!(ninf.is_infinite(), "bf16(-INFINITY) must be infinite");
+    assert!(ninf.is_sign_negative(), "bf16(-INFINITY) must be negative");
+
+    let zero = bf16::from_f32(0.0);
+    assert_eq!(zero.to_bits(), 0x0000, "bf16(0.0) must be 0x0000");
+
+    eprintln!("test_mask_sentinel_bit_patterns: PASS — bf16 sentinels are correct (0xFF80 / 0x0000)");
+}
+
+/// Read a mask buffer and assert elementwise that the semantics match the
+/// expected (causal + SWA) predicate.  0.0 cells must compare exactly zero;
+/// -inf cells must compare as negative infinity.  No tolerance — these
+/// are discrete values.
+fn assert_mask_matches_predicate(
+    buf: &mlx_native::MlxBuffer,
+    seq_len_q: usize,
+    seq_len_k: usize,
+    window_size: Option<u32>,
+    causal: bool,
+    q_abs_offset: u32,
+    test_name: &str,
+) {
+    let data = read_bf16_buffer(buf, seq_len_q * seq_len_k);
+    let mut first_mismatch: Option<(usize, usize, f32, bool)> = None;
+    for q in 0..seq_len_q {
+        for k in 0..seq_len_k {
+            let cell = data[q * seq_len_k + k];
+            let q_abs = q as i64 + q_abs_offset as i64;
+            let k_pos = k as i64;
+
+            // Mirror is_masked_swa + causal.
+            let mut expected_masked = false;
+            if causal && k_pos > q_abs {
+                expected_masked = true;
+            }
+            if let Some(w) = window_size {
+                if (q_abs - k_pos) >= w as i64 {
+                    expected_masked = true;
+                }
+            }
+
+            let actual_masked = cell.is_infinite() && cell.is_sign_negative();
+            let actual_attended = cell.to_f32() == 0.0;
+
+            let ok = if expected_masked {
+                actual_masked
+            } else {
+                actual_attended
+            };
+
+            if !ok && first_mismatch.is_none() {
+                first_mismatch = Some((q, k, cell.to_f32(), expected_masked));
+            }
+        }
+    }
+    if let Some((q, k, got, expected_masked)) = first_mismatch {
+        panic!(
+            "{test_name}: mismatch at (q={q}, k={k}): got={got} \
+             (bits=0x{:04X}), expected {} (causal={causal}, \
+             window_size={:?}, q_abs_offset={q_abs_offset})",
+            data[q * seq_len_k + k].to_bits(),
+            if expected_masked { "-inf" } else { "0.0" },
+            window_size,
+        );
+    }
+    eprintln!(
+        "{test_name}: PASS — all {} cells match predicate",
+        seq_len_q * seq_len_k
+    );
+}
+
+/// 2D mask layout: seq_len=8, causal-only, no window.
+/// Expected: lower-triangle (inclusive diag) = 0.0, upper-triangle = -inf.
+#[test]
+fn test_mask_global_causal() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let params = SdpaMaskParams {
+        seq_len_q: 8,
+        seq_len_k: 8,
+        window_size: None,
+        causal: true,
+        q_abs_offset: 0,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let mask = build_sdpa_mask_bf16(&device, &mut registry, &mut encoder, &params)
+        .expect("build_sdpa_mask_bf16");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    assert_eq!(mask.dtype(), DType::BF16);
+    assert_eq!(mask.shape(), &[8, 8]);
+    assert_eq!(mask.byte_len(), 8 * 8 * 2);
+
+    assert_mask_matches_predicate(&mask, 8, 8, None, true, 0, "mask_global_causal");
+
+    // Spot-check a few specific cells for the triangle pattern.
+    let data = read_bf16_buffer(&mask, 64);
+    // (0, 0): attended (k=0 <= q=0).
+    assert_eq!(data[0 * 8 + 0].to_f32(), 0.0);
+    // (0, 7): masked (k=7 > q=0).
+    assert!(data[0 * 8 + 7].is_infinite() && data[0 * 8 + 7].is_sign_negative());
+    // (7, 0): attended (k=0 <= q=7).
+    assert_eq!(data[7 * 8 + 0].to_f32(), 0.0);
+    // (7, 7): attended (k=7 <= q=7, diagonal).
+    assert_eq!(data[7 * 8 + 7].to_f32(), 0.0);
+    // (3, 5): masked (k=5 > q=3).
+    assert!(data[3 * 8 + 5].is_infinite());
+}
+
+/// 2D mask layout: seq_len=16, window=4, causal.
+/// Expected: for each q, attended iff (k <= q) AND (q - k < 4).
+/// So row q=10 has attended cells k ∈ {7, 8, 9, 10}; k ≤ 6 is masked (outside
+/// window) and k ≥ 11 is masked (future, causal).
+#[test]
+fn test_mask_sliding_window_4() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let params = SdpaMaskParams {
+        seq_len_q: 16,
+        seq_len_k: 16,
+        window_size: Some(4),
+        causal: true,
+        q_abs_offset: 0,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let mask = build_sdpa_mask_bf16(&device, &mut registry, &mut encoder, &params)
+        .expect("build_sdpa_mask_bf16");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    assert_mask_matches_predicate(
+        &mask, 16, 16, Some(4), true, 0, "mask_sliding_window_4",
+    );
+
+    // Spot checks on the window boundary (the exclusive upper bound is the
+    // primary failure mode for off-by-one bugs).
+    let data = read_bf16_buffer(&mask, 16 * 16);
+    // Row q=10:
+    //   k=6 → distance 4 → masked (EXCLUSIVE upper bound).
+    //   k=7 → distance 3 → attended.
+    //   k=10 → distance 0 → attended.
+    //   k=11 → future → masked.
+    assert!(
+        data[10 * 16 + 6].is_infinite(),
+        "(q=10, k=6) distance=4 must be masked (exclusive upper bound)"
+    );
+    assert_eq!(
+        data[10 * 16 + 7].to_f32(), 0.0,
+        "(q=10, k=7) distance=3 must be attended (within window)"
+    );
+    assert_eq!(
+        data[10 * 16 + 10].to_f32(), 0.0,
+        "(q=10, k=10) diagonal must be attended"
+    );
+    assert!(
+        data[10 * 16 + 11].is_infinite(),
+        "(q=10, k=11) future must be masked"
+    );
+}
+
+/// Integration: build a mask, feed it to `dispatch_flash_attn_prefill_bf16_d256`
+/// with `do_causal=false` (the causal+window constraints are baked into the
+/// mask).  Compare GPU output against the CPU reference with the same
+/// semantics applied via the `mask` argument.  Must agree at bf16 tolerance.
+///
+/// The mask builder produces a `[qL, kL]` layout.  For the integration we
+/// set `n_heads = n_kv_heads = batch = 1` so the flash_attn_prefill
+/// dispatcher's internal stride calculation
+/// (`m_batch_stride = h * qL * kL = qL * kL`, `m_head_stride = qL * kL`) is
+/// degenerate: (batch=0, head=0) always indexes the same `[qL, kL]` plane.
+/// This is the simplest integration that exercises the full mask → kernel
+/// path without requiring the broadcast-stride plumbing that Wave 2E/3
+/// will add at the hf2q call-site.
+#[test]
+fn test_mask_integrates_with_flash_attn_prefill() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1;
+    let ql = 128; let kl = 128; let d = 256;
+    let window = 64_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // Random Q/K/V.
+    let q = pseudo_random_f32(SEED + 300, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 301, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 302, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // ── Build the mask ────────────────────────────────────────────────────
+    let mask_params = SdpaMaskParams {
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        window_size: Some(window),
+        causal: true,
+        q_abs_offset: 0,
+    };
+    let mut mask_enc = device.command_encoder().expect("mask encoder");
+    let mask_buf = build_sdpa_mask_bf16(&device, &mut registry, &mut mask_enc, &mask_params)
+        .expect("build_sdpa_mask_bf16");
+    mask_enc.commit_and_wait().expect("mask commit");
+
+    // Verify mask correctness before using it (cheap; localises failures).
+    assert_mask_matches_predicate(
+        &mask_buf, ql, kl, Some(window), true, 0, "integration_mask_precheck",
+    );
+
+    // ── GPU flash_attn_prefill with the external mask, do_causal=false ────
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut enc, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, Some(&mask_buf), &mut out_buf, &params,
+    ).expect("dispatch bf16 d256");
+    enc.commit_and_wait().expect("commit");
+
+    let gpu_out_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&gpu_out_bf);
+
+    // ── CPU reference: apply the same mask as an additive term ────────────
+    //
+    // sdpa_reference_f32 takes a [batch, h, qL, kL] mask; our mask is
+    // [qL, kL].  Since batch=h=1 the layouts are byte-identical — pass the
+    // mask f32 directly.
+    let mask_f32: Vec<f32> = read_bf16_buffer(&mask_buf, ql * kl)
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&f32_to_bf16(&mask_f32)),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "mask_integrates_with_flash_attn_prefill",
+    );
+}
+
+/// Gemma 4 sliding-prefill shape: seq_len=2455, window=1024 (per ADR-011
+/// Phase 2 §3.2).  Head count is minimised (h=1, kv_h=1, d=256) because
+/// correctness scales with sequence length, not head count; adding heads
+/// would pad the runtime with no additional mask coverage.
+///
+/// This is the largest shape we exercise in this test file and validates
+/// that the mask-fill kernel + the flash_attn_prefill consumer both behave
+/// correctly at realistic Gemma 4 prompt lengths, at the seq_len > n_swa
+/// boundary where the SWA mask actually differs from plain causal.
+#[test]
+fn test_mask_gemma4_sliding_prefill() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1;
+    let ql = 2455; let kl = 2455; let d = 256;
+    let window = 1024_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // Random Q/K/V — pseudo_random is deterministic under a fixed seed.
+    let q = pseudo_random_f32(SEED + 400, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 401, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 402, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // Build the mask.
+    let mask_params = SdpaMaskParams {
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        window_size: Some(window),
+        causal: true,
+        q_abs_offset: 0,
+    };
+    let mut mask_enc = device.command_encoder().expect("mask encoder");
+    let mask_buf = build_sdpa_mask_bf16(&device, &mut registry, &mut mask_enc, &mask_params)
+        .expect("build_sdpa_mask_bf16");
+    mask_enc.commit_and_wait().expect("mask commit");
+
+    // Predicate cross-check on a coarse sample — full-pass predicate test is
+    // O(ql*kl) = 6 M cells and would dwarf the actual GPU runtime; the
+    // smaller test_mask_sliding_window_4 already validates the predicate
+    // at every cell for a small shape.  For this large-shape test we sample
+    // the seq_len > n_swa boundary, where the SWA mask actually differs
+    // from plain causal (cells (q, q-window) and (q, q-window-1) flip
+    // across the SWA boundary).
+    let mask_data = read_bf16_buffer(&mask_buf, ql * kl);
+    for q_row in [1024usize, 1500, 2000, 2454].iter() {
+        let q_row = *q_row;
+        // (q, q - window): distance = window → EXCLUSIVE upper bound → masked.
+        let k_pos = q_row - window as usize;
+        assert!(
+            mask_data[q_row * kl + k_pos].is_infinite(),
+            "(q={q_row}, k={k_pos}) distance={window} must be masked (exclusive)"
+        );
+        // (q, q - window + 1): distance = window - 1 → attended.
+        let k_pos = q_row - window as usize + 1;
+        assert_eq!(
+            mask_data[q_row * kl + k_pos].to_f32(), 0.0,
+            "(q={q_row}, k={k_pos}) distance={}  must be attended (within window)",
+            window - 1
+        );
+        // (q, q + 1): future → masked.
+        if q_row + 1 < kl {
+            let k_pos = q_row + 1;
+            assert!(
+                mask_data[q_row * kl + k_pos].is_infinite(),
+                "(q={q_row}, k={k_pos}) future must be masked"
+            );
+        }
+    }
+
+    // ── Run flash_attn_prefill with the mask ──────────────────────────────
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut enc, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, Some(&mask_buf), &mut out_buf, &params,
+    ).expect("dispatch bf16 d256");
+    enc.commit_and_wait().expect("commit");
+
+    let gpu_out_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&gpu_out_bf);
+
+    // CPU reference.
+    let mask_f32: Vec<f32> = mask_data.iter().map(|x| x.to_f32()).collect();
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&f32_to_bf16(&mask_f32)),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "mask_gemma4_sliding_prefill",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 8  WAVE 2E — TILE-SKIP PRE-PASS TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Helper: read the entire blk byte buffer as a Vec<u8>.
+fn read_u8_buffer(buf: &mlx_native::MlxBuffer, elems: usize) -> Vec<u8> {
+    let ptr = buf.contents_ptr() as *const u8;
+    assert!(!ptr.is_null(), "buffer contents pointer is null");
+    // SAFETY: buffer is shared-storage and covers at least `elems` bytes.
+    let slice = unsafe { std::slice::from_raw_parts(ptr, elems) };
+    slice.to_vec()
+}
+
+/// Helper: build the Wave 2D mask + Wave 2E blk buffer and return both.
+fn build_mask_and_blk(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    ql: u32,
+    kl: u32,
+    window_size: Option<u32>,
+    causal: bool,
+    bq: u32,
+    bk: u32,
+) -> (mlx_native::MlxBuffer, mlx_native::MlxBuffer) {
+    // Build the bf16 mask.
+    let mask_params = SdpaMaskParams {
+        seq_len_q: ql,
+        seq_len_k: kl,
+        window_size,
+        causal,
+        q_abs_offset: 0,
+    };
+    let mut mask_enc = device.command_encoder().expect("mask encoder");
+    let mask = build_sdpa_mask_bf16(device, registry, &mut mask_enc, &mask_params)
+        .expect("build_sdpa_mask_bf16");
+    mask_enc.commit_and_wait().expect("mask commit");
+
+    // Allocate and fill the blk classification buffer.
+    let blk_params = BlkParams {
+        seq_len_q: ql,
+        seq_len_k: kl,
+        bq,
+        bk,
+    };
+    let blk = alloc_blk_buffer(device, &blk_params).expect("alloc_blk_buffer");
+    let mut blk_enc = device.command_encoder().expect("blk encoder");
+    dispatch_flash_attn_prefill_blk(
+        &mut blk_enc,
+        device,
+        registry,
+        &mask,
+        &blk,
+        &blk_params,
+    ).expect("dispatch_flash_attn_prefill_blk");
+    blk_enc.commit_and_wait().expect("blk commit");
+
+    (mask, blk)
+}
+
+/// Reference classifier: given a bf16 mask + tile shape, compute the
+/// per-tile byte on the CPU.  Byte values match the GPU pre-pass:
+///   0 — every cell is -inf (or < -1e30f).
+///   1 — mixed (at least one finite, at least one non-zero).
+///   2 — every cell is exactly 0.0.
+/// Partial right-edge tiles (tile_k_end > kL) default to 1.
+fn cpu_classify_blk(
+    mask: &[bf16],
+    ql: usize,
+    kl: usize,
+    bq: usize,
+    bk: usize,
+) -> Vec<u8> {
+    let nq = (ql + bq - 1) / bq;
+    let nk = (kl + bk - 1) / bk;
+    let mut out = vec![0u8; nq * nk];
+    for qt in 0..nq {
+        for kt in 0..nk {
+            let tile_k_start = kt * bk;
+            let tile_k_end = tile_k_start + bk;
+            let res;
+            if tile_k_start >= kl {
+                res = 0;
+            } else if tile_k_end > kl {
+                res = 1;
+            } else {
+                let q_rows = bq.min(ql.saturating_sub(qt * bq));
+                let mut mmin = f32::INFINITY;
+                let mut mmax = f32::NEG_INFINITY;
+                for j in 0..q_rows {
+                    for i in 0..bk {
+                        let row = qt * bq + j;
+                        let col = tile_k_start + i;
+                        let v = mask[row * kl + col].to_f32();
+                        mmin = mmin.min(v);
+                        mmax = mmax.max(v);
+                    }
+                }
+                res = if mmax <= -1.0e30f32 {
+                    0
+                } else if mmin == 0.0 && mmax == 0.0 {
+                    2
+                } else {
+                    1
+                };
+            }
+            out[qt * nk + kt] = res;
+        }
+    }
+    out
+}
+
+/// Test: global causal mask at seq_len=64 D=256 — verify classification.
+/// Expected: upper-triangle tiles = 0, lower-triangle full tiles = 2,
+/// diagonal tiles = 1.  Tile shape (BQ=32, BK=16) gives NQ=2, NK=4.
+#[test]
+fn test_blk_global_causal_d256() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_mask::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let ql = 64_u32;
+    let kl = 64_u32;
+    let bq = 32_u32;
+    let bk = 16_u32;
+
+    let (mask, blk) = build_mask_and_blk(&device, &mut registry, ql, kl, None, true, bq, bk);
+
+    // Read and classify on CPU for cross-check.
+    let mask_data = read_bf16_buffer(&mask, (ql * kl) as usize);
+    let cpu_blk = cpu_classify_blk(&mask_data, ql as usize, kl as usize,
+                                    bq as usize, bk as usize);
+
+    let nq_tiles = ((ql + bq - 1) / bq) as usize;
+    let nk_tiles = ((kl + bk - 1) / bk) as usize;
+    let gpu_blk = read_u8_buffer(&blk, nq_tiles * nk_tiles);
+
+    // Verify GPU matches CPU classifier byte-for-byte.
+    for qt in 0..nq_tiles {
+        for kt in 0..nk_tiles {
+            let i = qt * nk_tiles + kt;
+            assert_eq!(
+                gpu_blk[i], cpu_blk[i],
+                "blk[{qt}][{kt}] mismatch: GPU={}, CPU={}",
+                gpu_blk[i], cpu_blk[i]
+            );
+        }
+    }
+
+    // Spot-check the expected structural pattern.  At ql=kl=64, bq=32, bk=16:
+    //   Q-tile 0 (rows 0-31):  above-diagonal K-tiles (kt >= 2) fully masked;
+    //                          diagonal K-tile (kt=1) mixed (kt*bk=16 ≤ row 31 < 32);
+    //                          kt=0 (rows 0-31, cols 0-15) — mixed because rows 0-15
+    //                          have some masked cells (causal: col > row).
+    //                          Actually kt=0 has causal triangle: every row has
+    //                          attended cols [0..=row], masked cols [row+1..16].
+    //                          For row 15 all cols 0-15 are attended → last row.
+    //                          For row 0 only col 0 attended, rest masked → mixed.
+    //   Q-tile 1 (rows 32-63): kt=0, kt=1 fully-attended (row ≥ 32 always > col ≤ 31);
+    //                          kt=2 mixed (diagonal spans rows 32-63 × cols 32-47);
+    //                          kt=3 fully masked (cols 48-63, rows 32-47 have col>row).
+
+    // qt=0, kt=2 (cols 32-47, rows 0-31): all col > row → fully masked.
+    assert_eq!(gpu_blk[0 * nk_tiles + 2], 0);
+    // qt=0, kt=3 (cols 48-63, rows 0-31): all col > row → fully masked.
+    assert_eq!(gpu_blk[0 * nk_tiles + 3], 0);
+    // qt=1, kt=0 (cols 0-15, rows 32-63): all col <= row → all attended.
+    assert_eq!(gpu_blk[1 * nk_tiles + 0], 2);
+    // qt=1, kt=1 (cols 16-31, rows 32-63): all col <= row → all attended.
+    assert_eq!(gpu_blk[1 * nk_tiles + 1], 2);
+    // qt=1, kt=2 (cols 32-47, rows 32-63): diagonal tile → mixed.
+    assert_eq!(gpu_blk[1 * nk_tiles + 2], 1);
+    // qt=1, kt=3 (cols 48-63, rows 32-47 masked, 48-63 mixed) → mixed.
+    assert_eq!(gpu_blk[1 * nk_tiles + 3], 1);
+}
+
+/// Test: sliding window mask at seq_len=256, window=64 D=256 — verify
+/// sliding pattern.  Tile shape (32, 16) gives NQ=8, NK=16.
+#[test]
+fn test_blk_sliding_window_d256() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_mask::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let ql = 256_u32;
+    let kl = 256_u32;
+    let bq = 32_u32;
+    let bk = 16_u32;
+    let window = 64_u32;
+
+    let (mask, blk) =
+        build_mask_and_blk(&device, &mut registry, ql, kl, Some(window), true, bq, bk);
+
+    let mask_data = read_bf16_buffer(&mask, (ql * kl) as usize);
+    let cpu_blk = cpu_classify_blk(&mask_data, ql as usize, kl as usize,
+                                    bq as usize, bk as usize);
+
+    let nq_tiles = ((ql + bq - 1) / bq) as usize;
+    let nk_tiles = ((kl + bk - 1) / bk) as usize;
+    let gpu_blk = read_u8_buffer(&blk, nq_tiles * nk_tiles);
+
+    for qt in 0..nq_tiles {
+        for kt in 0..nk_tiles {
+            let i = qt * nk_tiles + kt;
+            assert_eq!(
+                gpu_blk[i], cpu_blk[i],
+                "blk[{qt}][{kt}] mismatch: GPU={}, CPU={}",
+                gpu_blk[i], cpu_blk[i]
+            );
+        }
+    }
+
+    // Count class-0 (skip) tiles: must be > 0 (tiles far above diagonal
+    // AND tiles outside the SWA window below the diagonal).
+    let zero_count = gpu_blk.iter().filter(|&&b| b == 0).count();
+    let two_count  = gpu_blk.iter().filter(|&&b| b == 2).count();
+    let one_count  = gpu_blk.iter().filter(|&&b| b == 1).count();
+
+    eprintln!(
+        "test_blk_sliding_window_d256: class counts — 0(skip)={zero_count} \
+         1(mixed)={one_count} 2(all_attended)={two_count} \
+         total={} (NQ*NK={})",
+        zero_count + one_count + two_count,
+        nq_tiles * nk_tiles
+    );
+
+    assert!(zero_count > 0, "SWA mask must produce some fully-masked tiles");
+    assert!(two_count > 0,
+            "SWA mask must produce some all-attended tiles (interior of window)");
+    assert!(one_count > 0, "SWA mask must produce some mixed tiles (diagonal)");
+    assert_eq!(zero_count + one_count + two_count, nq_tiles * nk_tiles);
+}
+
+/// Correctness gate: D=256 main kernel output MUST be bit-identical with
+/// blk=None vs blk=Some(built_blk).  The blk path is a skip optimisation,
+/// NEVER a correctness change.
+///
+/// Uses a modest shape (qL=kL=128, d=256) so bit-exact comparison is fast.
+#[test]
+fn test_gpu_bf16_d256_with_blk_matches_no_blk() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1;
+    let ql = 128usize; let kl = 128usize; let d = 256;
+    let window = 48_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 600, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 601, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 602, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // Build mask + blk once.
+    let (mask_buf, blk_buf) = build_mask_and_blk(
+        &device, &mut registry,
+        ql as u32, kl as u32,
+        Some(window), true,
+        32, 16,
+    );
+
+    // Pre-fill two separate output buffers so they don't interfere.
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+
+    let q_buf_a = alloc_bf16(&device, q_elems, "Q_a");
+    let k_buf_a = alloc_bf16(&device, kv_elems, "K_a");
+    let v_buf_a = alloc_bf16(&device, kv_elems, "V_a");
+    let mut out_a = alloc_bf16(&device, q_elems, "out_a");
+    fill_bf16_buffer(&q_buf_a, &q_bf);
+    fill_bf16_buffer(&k_buf_a, &k_bf);
+    fill_bf16_buffer(&v_buf_a, &v_bf);
+
+    let q_buf_b = alloc_bf16(&device, q_elems, "Q_b");
+    let k_buf_b = alloc_bf16(&device, kv_elems, "K_b");
+    let v_buf_b = alloc_bf16(&device, kv_elems, "V_b");
+    let mut out_b = alloc_bf16(&device, q_elems, "out_b");
+    fill_bf16_buffer(&q_buf_b, &q_bf);
+    fill_bf16_buffer(&k_buf_b, &k_bf);
+    fill_bf16_buffer(&v_buf_b, &v_bf);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    // Run A — blk = None (pre-Wave-2E path).
+    let mut enc_a = device.command_encoder().expect("encoder_a");
+    dispatch_flash_attn_prefill_bf16_d256_with_blk(
+        &mut enc_a, &device, &mut registry,
+        &q_buf_a, &k_buf_a, &v_buf_a,
+        Some(&mask_buf), None,
+        &mut out_a, &params,
+    ).expect("dispatch without blk");
+    enc_a.commit_and_wait().expect("commit_a");
+
+    // Run B — blk = Some(built_blk).
+    let mut enc_b = device.command_encoder().expect("encoder_b");
+    dispatch_flash_attn_prefill_bf16_d256_with_blk(
+        &mut enc_b, &device, &mut registry,
+        &q_buf_b, &k_buf_b, &v_buf_b,
+        Some(&mask_buf), Some(&blk_buf),
+        &mut out_b, &params,
+    ).expect("dispatch with blk");
+    enc_b.commit_and_wait().expect("commit_b");
+
+    // BIT-EXACT comparison — the blk path must not change any output bit.
+    let out_a_data = read_bf16_buffer(&out_a, q_elems);
+    let out_b_data = read_bf16_buffer(&out_b, q_elems);
+
+    let mut mismatches = 0usize;
+    let mut first_bad = None;
+    for i in 0..q_elems {
+        if out_a_data[i].to_bits() != out_b_data[i].to_bits() {
+            if first_bad.is_none() {
+                first_bad = Some((i, out_a_data[i], out_b_data[i]));
+            }
+            mismatches += 1;
+        }
+    }
+    if mismatches > 0 {
+        if let Some((idx, a, b)) = first_bad {
+            panic!(
+                "test_gpu_bf16_d256_with_blk_matches_no_blk: \
+                 {mismatches}/{q_elems} elements differ (blk=None vs \
+                 blk=Some). first mismatch at idx={idx}: \
+                 no_blk=0x{:04X} ({}) vs with_blk=0x{:04X} ({})",
+                a.to_bits(), a.to_f32(),
+                b.to_bits(), b.to_f32()
+            );
+        }
+    }
+    eprintln!(
+        "test_gpu_bf16_d256_with_blk_matches_no_blk: PASS — all {q_elems} \
+         bf16 elements bit-identical"
+    );
+}
+
+/// Correctness gate: D=512 main kernel output MUST be bit-identical with
+/// blk=None vs blk=Some(built_blk).  The D=512 analogue of the D=256 test.
+///
+/// Uses a modest shape (qL=kL=64, d=512) so bit-exact comparison is fast.
+/// Tile shape for D=512 pre-pass: (BQ=8, BK=64) — matches the main kernel's
+/// NQPSG=8 Q-tile and NCPSG=64 KV-chunk size.
+#[test]
+fn test_gpu_bf16_d512_with_blk_matches_no_blk() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_d512::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1;
+    // D=512 main kernel's NQPSG=8 and NCPSG=64 — size ql so the trailing
+    // Q-chunk is exact (ql % 8 == 0) and kl so the trailing KV-chunk is
+    // partial (kl=64 → exactly one full chunk, no partial).
+    let ql = 64usize; let kl = 64usize; let d = 512;
+    let window = 32_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 700, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 701, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 702, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // Build mask + blk for D=512 geometry: BQ=8, BK=64 (one per KV-chunk).
+    let (mask_buf, blk_buf) = build_mask_and_blk(
+        &device, &mut registry,
+        ql as u32, kl as u32,
+        Some(window), true,
+        8, 64,
+    );
+
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+
+    let q_buf_a = alloc_bf16(&device, q_elems, "Q_a");
+    let k_buf_a = alloc_bf16(&device, kv_elems, "K_a");
+    let v_buf_a = alloc_bf16(&device, kv_elems, "V_a");
+    let mut out_a = alloc_bf16(&device, q_elems, "out_a");
+    fill_bf16_buffer(&q_buf_a, &q_bf);
+    fill_bf16_buffer(&k_buf_a, &k_bf);
+    fill_bf16_buffer(&v_buf_a, &v_bf);
+
+    let q_buf_b = alloc_bf16(&device, q_elems, "Q_b");
+    let k_buf_b = alloc_bf16(&device, kv_elems, "K_b");
+    let v_buf_b = alloc_bf16(&device, kv_elems, "V_b");
+    let mut out_b = alloc_bf16(&device, q_elems, "out_b");
+    fill_bf16_buffer(&q_buf_b, &q_bf);
+    fill_bf16_buffer(&k_buf_b, &k_bf);
+    fill_bf16_buffer(&v_buf_b, &v_bf);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    let mut enc_a = device.command_encoder().expect("encoder_a");
+    dispatch_flash_attn_prefill_bf16_d512_with_blk(
+        &mut enc_a, &device, &mut registry,
+        &q_buf_a, &k_buf_a, &v_buf_a,
+        Some(&mask_buf), None,
+        &mut out_a, &params,
+    ).expect("dispatch D512 without blk");
+    enc_a.commit_and_wait().expect("commit_a");
+
+    let mut enc_b = device.command_encoder().expect("encoder_b");
+    dispatch_flash_attn_prefill_bf16_d512_with_blk(
+        &mut enc_b, &device, &mut registry,
+        &q_buf_b, &k_buf_b, &v_buf_b,
+        Some(&mask_buf), Some(&blk_buf),
+        &mut out_b, &params,
+    ).expect("dispatch D512 with blk");
+    enc_b.commit_and_wait().expect("commit_b");
+
+    let out_a_data = read_bf16_buffer(&out_a, q_elems);
+    let out_b_data = read_bf16_buffer(&out_b, q_elems);
+
+    let mut mismatches = 0usize;
+    let mut first_bad = None;
+    for i in 0..q_elems {
+        if out_a_data[i].to_bits() != out_b_data[i].to_bits() {
+            if first_bad.is_none() {
+                first_bad = Some((i, out_a_data[i], out_b_data[i]));
+            }
+            mismatches += 1;
+        }
+    }
+    if mismatches > 0 {
+        if let Some((idx, a, b)) = first_bad {
+            panic!(
+                "test_gpu_bf16_d512_with_blk_matches_no_blk: \
+                 {mismatches}/{q_elems} elements differ (blk=None vs \
+                 blk=Some).  first mismatch at idx={idx}: \
+                 no_blk=0x{:04X} ({}) vs with_blk=0x{:04X} ({})",
+                a.to_bits(), a.to_f32(),
+                b.to_bits(), b.to_f32()
+            );
+        }
+    }
+    eprintln!(
+        "test_gpu_bf16_d512_with_blk_matches_no_blk: PASS — all {q_elems} \
+         bf16 elements bit-identical"
+    );
+}
+
+/// Gemma 4 sliding-prefill shape: seq_len=2455, window=1024 at D=256.
+/// Build mask + blk + dispatch flash_attn_prefill.  Verify:
+///   1. Pre-pass classification matches CPU reference (spot-checked rows).
+///   2. Tile-skip rate is ≥ 55% (ADR-011 predicts ~58.5%).
+///   3. GPU output with blk enabled matches the bf16 tolerance reference.
+#[test]
+fn test_blk_gemma4_sliding_prefill() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1;
+    let ql = 2455usize; let kl = 2455usize; let d = 256;
+    let window = 1024_u32;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // Build mask + blk.
+    let (mask_buf, blk_buf) = build_mask_and_blk(
+        &device, &mut registry,
+        ql as u32, kl as u32,
+        Some(window), true,
+        32, 16,
+    );
+
+    // Measure tile-skip rate.
+    let nq_tiles = (ql + 31) / 32;
+    let nk_tiles = (kl + 15) / 16;
+    let blk_data = read_u8_buffer(&blk_buf, nq_tiles * nk_tiles);
+    let zero_count = blk_data.iter().filter(|&&b| b == 0).count();
+    let two_count  = blk_data.iter().filter(|&&b| b == 2).count();
+    let one_count  = blk_data.iter().filter(|&&b| b == 1).count();
+    let total = nq_tiles * nk_tiles;
+    let skip_pct = (zero_count as f64 / total as f64) * 100.0;
+    let attn_pct = (two_count  as f64 / total as f64) * 100.0;
+    let mix_pct  = (one_count  as f64 / total as f64) * 100.0;
+
+    eprintln!(
+        "test_blk_gemma4_sliding_prefill: ql={ql} kl={kl} window={window} \
+         nq={nq_tiles} nk={nk_tiles} total={total}\n\
+         classification — skip(0): {zero_count} ({:.1}%), \
+         mixed(1): {one_count} ({:.1}%), \
+         all_attended(2): {two_count} ({:.1}%)",
+        skip_pct, mix_pct, attn_pct
+    );
+
+    // ADR-011 predicts ~58.5% skip for Gemma 4 at ql=2455, window=1024.
+    // Require ≥55% as a practical floor (slight variation from boundary
+    // rounding at tile edges).
+    assert!(
+        skip_pct >= 55.0,
+        "Gemma 4 sliding mask tile-skip rate too low: {skip_pct:.1}% \
+         (ADR-011 predicts ~58.5%)"
+    );
+
+    // Cross-check a few tiles with CPU classifier (not all 11858 — that
+    // would dwarf the actual GPU dispatch cost).
+    let mask_data = read_bf16_buffer(&mask_buf, ql * kl);
+    let cpu_blk = cpu_classify_blk(&mask_data, ql, kl, 32, 16);
+    for &(qt, kt) in &[
+        (0usize, 0usize),
+        (0, nk_tiles - 1),
+        (nq_tiles / 2, 0),
+        (nq_tiles / 2, nk_tiles / 2),
+        (nq_tiles - 1, nk_tiles - 1),
+        (10, 5),
+        (50, 80),
+    ] {
+        let i = qt * nk_tiles + kt;
+        assert_eq!(
+            blk_data[i], cpu_blk[i],
+            "spot-check mismatch at (qt={qt}, kt={kt}): GPU={}, CPU={}",
+            blk_data[i], cpu_blk[i]
+        );
+    }
+
+    // ── End-to-end GPU dispatch with blk enabled ──────────────────────────
+    let q = pseudo_random_f32(SEED + 800, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 801, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 802, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false,
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256_with_blk(
+        &mut enc, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf,
+        Some(&mask_buf), Some(&blk_buf),
+        &mut out_buf, &params,
+    ).expect("gemma4 dispatch with blk");
+    enc.commit_and_wait().expect("commit");
+
+    let gpu_out_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&gpu_out_bf);
+
+    // CPU reference: apply the same mask as an additive term.
+    let mask_f32: Vec<f32> = mask_data.iter().map(|x| x.to_f32()).collect();
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&f32_to_bf16(&mask_f32)),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "blk_gemma4_sliding_prefill",
+    );
 }
 
 } // mod flash_attn_prefill_tests

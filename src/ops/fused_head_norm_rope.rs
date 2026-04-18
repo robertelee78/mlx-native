@@ -58,7 +58,7 @@ struct GpuFusedHeadNormRopeParams {
 /// * `input`         - bf16 buffer of shape `[n_heads * head_dim]` (one token's Q or K).
 /// * `output`        - bf16 output buffer, same shape as `input`.
 /// * `norm_weight`   - bf16 weight buffer of shape `[head_dim]`.  Pass `None` for the
-///                     no-scale variant (e.g. V-head normalization in Gemma 4).
+///   no-scale variant (e.g. V-head normalization in Gemma 4).
 /// * `cos_cache`     - f32 buffer of shape `[half_rope_dim]` with precomputed cosines.
 /// * `sin_cache`     - f32 buffer of shape `[half_rope_dim]` with precomputed sines.
 /// * `n_heads`       - Number of attention heads.
@@ -206,10 +206,10 @@ struct GpuFusedHeadNormRopeF32Params {
 /// * `input`         - f32 buffer of shape `[n_heads * head_dim]` (one token's Q or K).
 /// * `output`        - f32 output buffer, same shape as `input`.
 /// * `norm_weight`   - f32 weight buffer of shape `[head_dim]`.  Pass `None` for the
-///                     no-scale variant (e.g. V-head unit normalization).
+///   no-scale variant (e.g. V-head unit normalization).
 /// * `positions_buf` - u32 buffer of shape `[seq_len]` with position values.
 /// * `freq_factors`  - Optional f32 buffer of shape `[half_rope_dim]` with per-pair
-///                     frequency divisors.  `None` for standard RoPE.
+///   frequency divisors.  `None` for standard RoPE.
 /// * `n_heads`       - Number of attention heads.
 /// * `head_dim`      - Dimension of each head.
 /// * `half_rope_dim` - Half the rotary dimension (may be < head_dim/2 for partial rotary).
@@ -291,6 +291,107 @@ pub fn dispatch_fused_head_norm_rope_f32(
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new(n_heads as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Batched fused head norm + RoPE for prefill (bf16).
+///
+/// Processes `seq_len` tokens at once. Input/output buffers have shape
+/// `[seq_len, n_heads, head_dim]` (token-major, bf16). Launches
+/// `seq_len * n_heads` threadgroups.
+///
+/// The kernel computes RoPE sin/cos on-the-fly from `positions_buf` and
+/// `theta` (same as the f32 batch variant), so no precomputed cache buffers
+/// are required.  Optionally accepts `freq_factors` for Gemma 4 global
+/// attention layers.
+///
+/// * `input`/`output`: bf16 buffers of shape `[seq_len * n_heads * head_dim]`.
+/// * `positions_buf`: u32 buffer of shape `[seq_len]`.
+/// * `freq_factors`: optional f32 buffer of shape `[half_rope_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_head_norm_rope_batch_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    norm_weight: Option<&MlxBuffer>,
+    positions_buf: &MlxBuffer,
+    freq_factors: Option<&MlxBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    half_rope_dim: u32,
+    seq_len: u32,
+    eps: f32,
+    theta: f32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || seq_len == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_head_norm_rope_batch_bf16: n_heads, head_dim, seq_len must be > 0".into(),
+        ));
+    }
+    if half_rope_dim > head_dim / 2 {
+        return Err(MlxError::InvalidArgument(format!(
+            "fused_head_norm_rope_batch_bf16: half_rope_dim ({}) must be <= head_dim/2 ({})",
+            half_rope_dim,
+            head_dim / 2,
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("fused_head_norm_rope_batch_bf16", device)?;
+
+    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
+    // Shared memory: max(tg_size, head_dim) f32 values for reduction + normalization.
+    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    let has_weight = norm_weight.is_some();
+    let has_ff = freq_factors.is_some();
+
+    // GPU params struct mirrors FusedHeadNormRopeBatchBf16Params in the shader.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct GpuBatchBf16Params {
+        head_dim:         u32,
+        n_heads:          u32,
+        half_rope_dim:    u32,
+        eps:              f32,
+        has_weight:       u32,
+        theta:            f32,
+        has_freq_factors: u32,
+        _pad:             u32,
+    }
+
+    let gpu_params = GpuBatchBf16Params {
+        head_dim,
+        n_heads,
+        half_rope_dim,
+        eps,
+        has_weight: u32::from(has_weight),
+        theta,
+        has_freq_factors: u32::from(has_ff),
+        _pad: 0,
+    };
+
+    let weight_buf = norm_weight.unwrap_or(input);
+    let ff_buf = freq_factors.unwrap_or(input);
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(weight_buf)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (4, KernelArg::Buffer(positions_buf)),
+            (5, KernelArg::Buffer(ff_buf)),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),
         MTLSize::new(tg_size, 1, 1),
     );
 

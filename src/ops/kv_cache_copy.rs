@@ -397,6 +397,77 @@ pub fn dispatch_kv_cache_copy_seq_f32(
     Ok(())
 }
 
+/// Multi-position, all-heads KV cache copy (BF16 source → F32 cache, batched prefill).
+///
+/// Same layout and semantics as [`dispatch_kv_cache_copy_seq_f32`] — including
+/// `src_tok_offset` source slicing and `dst_pos % capacity` ring-wrap for
+/// sliding-window layers — but reads bfloat16 from the source and promotes to
+/// float32 on write.
+///
+/// Used in the Phase 2 bf16 activation path where `pf_k_normed` / `pf_v_normed`
+/// become bf16, but the KV cache (used by decode SDPA) stays f32.
+///
+/// Source layout: `[n_src_tokens, n_heads, head_dim]` bf16.
+/// Cache layout:  `[n_heads, capacity, head_dim]`     f32.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_seq_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    cache: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
+        return Ok(());
+    }
+    // src is bf16 (2 bytes per element)
+    let total_src = ((src_tok_offset as u64) + (n_tokens as u64))
+        * (n_heads as u64) * (head_dim as u64);
+    let src_bytes_needed = total_src * 2; // bf16 = 2 bytes
+    if (src.byte_len() as u64) < src_bytes_needed {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_seq_bf16: src has {} bytes, need {} ((src_tok_offset={} + n_tokens={}) * n_heads={} * head_dim={} * 2)",
+            src.byte_len(), src_bytes_needed, src_tok_offset, n_tokens, n_heads, head_dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_seq_bf16", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
+    let n_tokens_bytes = n_tokens.to_ne_bytes();
+    let src_tok_offset_bytes = src_tok_offset.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(cache)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&head_dim_bytes)),
+            (4, KernelArg::Bytes(&capacity_bytes)),
+            (5, KernelArg::Bytes(&seq_pos_start_bytes)),
+            (6, KernelArg::Bytes(&n_tokens_bytes)),
+            (7, KernelArg::Bytes(&src_tok_offset_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Multi-position, all-heads KV cache copy (F32 source → F16 cache, batched prefill).
 ///
 /// Same semantics as [`dispatch_kv_cache_copy_seq_f32`] (including

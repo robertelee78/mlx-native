@@ -127,3 +127,124 @@ kernel void fused_head_norm_rope_bf16(
         output[base + i] = bfloat(shared[i]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Batched variant: processes seq_len tokens in one dispatch.
+//
+// Grid: (seq_len * n_heads, 1, 1) — each threadgroup handles one head of
+// one token.  seq_idx = tg_id / n_heads; head_within_tok = tg_id % n_heads.
+//
+// Input/output layout: [seq_len, n_heads, head_dim] (token-major) bf16.
+// positions_buf: uint [seq_len] — absolute token positions for RoPE.
+// freq_factors: float [half_rope_dim] — per-pair divisors (Gemma4 global
+//   attention). Ignored when has_freq_factors == 0.
+//
+// Shared memory: max(tg_size, head_dim) * sizeof(float) at threadgroup(0).
+// ---------------------------------------------------------------------------
+
+struct FusedHeadNormRopeBatchBf16Params {
+    uint  head_dim;
+    uint  n_heads;
+    uint  half_rope_dim;   // may be < head_dim/2 for partial rotary
+    float eps;
+    uint  has_weight;      // 0 = no weight scale, nonzero = apply weight
+    float theta;           // RoPE base frequency (e.g. 1000000 for Gemma4)
+    uint  has_freq_factors;
+    uint  _pad;
+};
+
+kernel void fused_head_norm_rope_batch_bf16(
+    device const bfloat*                            input        [[buffer(0)]],
+    device bfloat*                                  output       [[buffer(1)]],
+    device const bfloat*                            norm_weight  [[buffer(2)]],
+    constant FusedHeadNormRopeBatchBf16Params&      params       [[buffer(3)]],
+    device const uint*                              positions    [[buffer(4)]],
+    device const float*                             freq_factors [[buffer(5)]],
+    uint tg_id    [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    threadgroup float* shared                                    [[threadgroup(0)]]
+) {
+    const uint head_dim   = params.head_dim;
+    const uint n_heads    = params.n_heads;
+    const uint half_rope  = params.half_rope_dim;
+    const uint half_dim   = head_dim / 2u;
+    const float eps       = params.eps;
+    const bool has_weight = (params.has_weight != 0u);
+    const float theta     = params.theta;
+    const bool has_ff     = (params.has_freq_factors != 0u);
+
+    // Decode token index and head index from the flat threadgroup id.
+    const uint seq_idx = tg_id / n_heads;
+    const uint pos     = positions[seq_idx];
+
+    // Base element index: layout is [seq_len, n_heads, head_dim].
+    const uint base = tg_id * head_dim;
+
+    // -------------------------------------------------------------------------
+    // Phase 1: parallel sum-of-squares reduction (accumulate in f32)
+    // -------------------------------------------------------------------------
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        const float val = static_cast<float>(input[base + i]);
+        partial_sq += val * val;
+    }
+
+    shared[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms_inv = rsqrt(shared[0] / float(head_dim) + eps);
+
+    // Barrier: every thread must read rms_inv from shared[0] before any thread
+    // overwrites shared[i] in Phase 2. Same race as in the f32 sibling.
+    // Ref: docs/spike-batched-prefill-race-rootcause.md (hf2q, 2026-04-16).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Phase 2: normalize + store normalized f32 values in shared memory
+    // -------------------------------------------------------------------------
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = static_cast<float>(input[base + i]) * rms_inv;
+        if (has_weight) {
+            val *= static_cast<float>(norm_weight[i]);
+        }
+        shared[i] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Phase 3: NeoX rotation on first 2*half_rope dimensions.
+    // Uses head_dim as the denominator (ProportionalRoPE, matching mlx-lm).
+    // Accumulate trig in f32; cast result to bf16 on store.
+    // -------------------------------------------------------------------------
+    for (uint i = tid; i < half_rope; i += tg_size) {
+        const float x0 = shared[i];
+        const float x1 = shared[i + half_dim];
+
+        const float dim_ratio = float(2u * i) / float(head_dim);
+        float freq = float(pos) / pow(theta, dim_ratio);
+        if (has_ff) {
+            freq /= freq_factors[i];
+        }
+
+        const float cos_a = cos(freq);
+        const float sin_a = sin(freq);
+
+        output[base + i]            = bfloat(x0 * cos_a - x1 * sin_a);
+        output[base + i + half_dim] = bfloat(x1 * cos_a + x0 * sin_a);
+    }
+
+    // Pass through non-rotated dimensions
+    for (uint i = tid; i < half_dim - half_rope; i += tg_size) {
+        uint src = half_rope + i;
+        output[base + src]            = bfloat(shared[src]);
+        output[base + src + half_dim] = bfloat(shared[src + half_dim]);
+    }
+}

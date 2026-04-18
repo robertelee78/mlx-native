@@ -191,6 +191,33 @@ kernel void moe_weighted_sum(
     output[tid] = sum;
 }
 
+// --------------------------------------------------------------------------
+// fused_gelu_mul_bf16 — bf16 variant of fused_gelu_mul.
+//
+// Inputs gate_out and up_out are bfloat16; output is bfloat16.
+// All arithmetic is promoted to f32 (accumulate in f32, store in bf16).
+//
+// Buffers:
+//   0: gate_out  — bfloat [n_elements]
+//   1: up_out    — bfloat [n_elements]
+//   2: output    — bfloat [n_elements]  (GELU(gate_out) * up_out)
+//   3: params    — { n_elements }
+// --------------------------------------------------------------------------
+
+kernel void fused_gelu_mul_bf16(
+    device const bfloat* gate_out [[buffer(0)]],
+    device const bfloat* up_out   [[buffer(1)]],
+    device bfloat*       output   [[buffer(2)]],
+    constant FusedGeluMulParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    // Promote to f32 for accurate GELU; store result as bf16.
+    const float g = static_cast<float>(gate_out[gid]);
+    const float u = static_cast<float>(up_out[gid]);
+    output[gid] = bfloat(gelu_approx(g) * u);
+}
+
 /// Multi-token SwiGLU for batched prefill.
 /// Input:  [n_tokens, top_k, 2*intermediate]
 /// Output: [n_tokens, top_k, intermediate]
@@ -244,6 +271,68 @@ kernel void moe_weighted_sum_seq(
         const uint in_idx = (tok * params.top_k + k) * params.hidden_size + d;
         const uint w_idx = tok * params.top_k + k;
         sum += expert_outputs[in_idx] * weights[w_idx];
+    }
+    output[tok * params.hidden_size + d] = sum;
+}
+
+// --------------------------------------------------------------------------
+// moe_swiglu_seq_bf16 — bf16 variant of moe_swiglu_seq.
+//
+// Input:  [n_tokens, top_k, 2*intermediate] bfloat16
+// Output: [n_tokens, top_k, intermediate]   bfloat16
+// Grid:   3D (intermediate, top_k, n_tokens)
+//
+// All arithmetic in f32; inputs read as bf16, output stored as bf16.
+// --------------------------------------------------------------------------
+
+kernel void moe_swiglu_seq_bf16(
+    device const bfloat* gate_up_buf  [[buffer(0)]],
+    device bfloat*       output_buf   [[buffer(1)]],
+    constant MoeSwigluSeqParams& params [[buffer(2)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint i    = tid.x;
+    uint slot = tid.y;
+    uint tok  = tid.z;
+    if (tok >= params.n_tokens || slot >= params.top_k || i >= params.intermediate) return;
+
+    uint slot_base = (tok * params.top_k + slot) * 2u * params.intermediate;
+    const float gate = static_cast<float>(gate_up_buf[slot_base + i]);
+    const float up   = static_cast<float>(gate_up_buf[slot_base + params.intermediate + i]);
+    // SwiGLU = GELU(gate) * up; compute in f32, store as bf16
+    const float gelu = gate * 0.5f * (1.0f + precise::tanh(
+        0.7978845608f * (gate + 0.044715f * gate * gate * gate)));
+    output_buf[(tok * params.top_k + slot) * params.intermediate + i] = bfloat(gelu * up);
+}
+
+// --------------------------------------------------------------------------
+// moe_weighted_sum_seq_bf16_input — bf16 expert_outputs, f32 weights/output.
+//
+// Matches the MoE convention: expert intermediates are bf16, but the
+// weighted accumulator (pf_moe_accum) stays f32 for residual precision.
+//
+// Input:  expert_outputs [n_tokens, top_k, hidden_size] bfloat16
+//         weights        [n_tokens, top_k]              float32
+// Output: [n_tokens, hidden_size]                       float32
+// --------------------------------------------------------------------------
+
+kernel void moe_weighted_sum_seq_bf16_input(
+    device const bfloat* expert_outputs [[buffer(0)]],
+    device const float*  weights        [[buffer(1)]],
+    device float*        output         [[buffer(2)]],
+    constant MoeWeightedSumSeqParams& params [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    uint d   = tid.x;
+    uint tok = tid.y;
+    if (tok >= params.n_tokens || d >= params.hidden_size) return;
+
+    float sum = 0.0f;
+    for (uint k = 0u; k < params.top_k; k++) {
+        const uint in_idx = (tok * params.top_k + k) * params.hidden_size + d;
+        const uint w_idx  = tok * params.top_k + k;
+        // Promote bf16 expert output to f32 before multiply-accumulate
+        sum += static_cast<float>(expert_outputs[in_idx]) * weights[w_idx];
     }
     output[tok * params.hidden_size + d] = sum;
 }

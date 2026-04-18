@@ -29,33 +29,43 @@
 //   tests/test_flash_attn_prefill.rs.  See ADR-011-phase1-port-source-decision.md
 //   §3 for the full threadgroup-memory analysis.
 //
-// Numerical guards (three of them):
-//   This kernel uses true -infinity as the masked-position sentinel rather
-//   than -FLT_MAX/2.  Sentinel arithmetic (-inf - -inf, exp(-inf - -inf),
-//   0/0) is undefined or NaN-producing, so three guard sites convert each
-//   undefined operation to its correctness-preserving value:
+// Numerical guard (output normalisation — ONE guard, matches llama.cpp):
+//   This kernel follows llama.cpp's non-vec flash-attention design: the
+//   per-row running max `M` is initialised to a FINITE sentinel `-FLT_MAX/2`
+//   (~-1.7e38) rather than true `-infinity`.  Masked positions in the input
+//   mask buffer still arrive as `-inf` (consistent with llama.cpp's CPU
+//   convention at `llama-graph.cpp:421,436,1572`), so scores `s2` CAN become
+//   `-inf` mid-flight.  But because `M` is kept finite by the `simd_max`
+//   floor of `-FLT_MAX/2`, every `exp(score - M)` evaluates as
+//   `exp(-inf - finite) = exp(-inf) = +0.0` (IEEE-754 exact) rather than
+//   `exp(-inf - -inf) = exp(NaN) = NaN`.  No intermediate guard needed.
 //
-//     1. ExpSubOp  : if max == -inf, exp(score - max) = 0     (not NaN)
-//     2. Rescale   : if old_max == -inf, factor = 0           (not NaN)
-//     3. DivOp     : if sum_score == 0, output = 0            (not NaN)
+//   The ONE surviving guard is the final output normalisation: for a row
+//   where every K position was masked, `sum_score` stays at bit-exact 0
+//   across the K-sweep, and the final `output / sum_score = 0/0 = NaN`
+//   without a guard.  `DivOp` returns 0 in that case, mirroring llama.cpp's
+//   `const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];` at
+//   `ggml-metal.metal:6358`.
 //
-//   #1 and #2 cover the fully-masked-row case during the K-sweep; #3
-//   covers the same case at the final output normalization, since a row
-//   whose every score was masked accumulates sum_score = 0 across every
-//   KV iteration.  Verified end-to-end by the
-//   `test_gpu_bf16_d256_fully_masked_nan_guard` integration test.
+//   Fully-masked-row output is exact 0.0 in every component under this
+//   regime — verified end-to-end by the
+//   `test_gpu_bf16_d256_fully_masked_nan_guard` integration test, and
+//   line-by-line traced in ADR-011-phase2-port-sentinel.md §3.3.
 //
 // References (algorithmic, not source dependencies):
 //   - Dao et al., "FlashAttention: Fast and Memory-Efficient Exact
 //     Attention with IO-Awareness" (2022).
 //   - MLX backend/metal/kernels/steel/attn — Apple Inc.'s reference Metal
 //     implementation; provided the simdgroup MMA tile structure we use.
+//   - llama.cpp ggml/src/ggml-metal — Apple-Silicon flash-attention.  We
+//     port llama.cpp's numerical convention directly: M-init = -FLT_MAX/2
+//     (non-vec: `:5891`, vec: `:6725`), unguarded exp in the K-sweep
+//     (`:6155-6156`), and a single `S == 0 ? 0 : 1/S` guard at the output
+//     normalisation (`:6358`).  See ADR-011-phase2-port-sentinel.md.
 //   - candle-metal-kernels/src/metal_src/scaled_dot_product_attention.metal
-//     — Hugging Face's Apache-2.0/MIT port of MLX with NaN guards (#1, #2);
-//     informed our guard design.
-//   - llama.cpp ggml/src/ggml-metal — Apple-Silicon flash-attention with
-//     a separate threadgroup-memory accumulator, threadgroup-half typing,
-//     and the `flash_attn_ext_blk` SWA tile-skip pre-pass (Phase 4/5 work).
+//     — Hugging Face's Apache-2.0/MIT port of MLX with NaN guards; the MMA
+//     tile structure we retain is from candle's port, but the numerical
+//     design (finite M-init, single output-side guard) is llama.cpp's.
 //
 // SPDX-License-Identifier: MIT
 
@@ -1054,6 +1064,16 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 
+// Wave 2E tile-skip pre-pass: when true, the kernel reads a per-(qtile, ktile)
+// classification byte from buffer(7) and uses it to skip fully-masked tiles
+// and the mask-add on all-attended tiles.  See
+// /opt/mlx-native/src/shaders/flash_attn_prefill_blk.metal and
+// /opt/hf2q/docs/ADR-011-phase2-port-tile-skip.md for the port spec.  When
+// has_blk is false the function_constant-gated buffer(7) is NOT bound and
+// the Metal compiler dead-codes every blk reference below — so enabling the
+// pre-pass is a strict zero-cost add for callers that don't need it.
+constant bool has_blk [[function_constant(303)]];
+
 template <typename T>
 struct TransformScale {
   T scale;
@@ -1093,25 +1113,33 @@ struct SubOp {
 };
 
 struct ExpSubOp {
-  // Guard: when y (row max) is -inf, all scores in the row are -inf (entirely masked). Return 0 instead of exp2(-inf - (-inf)) = exp2(NaN).
+  // Unguarded under the finite-M regime: M is initialised to -FLT_MAX/2
+  // and floor-capped by simd_max, so y is ALWAYS finite.  When a score
+  // x is -inf (from a masked position), exp2(-inf - finite) = exp2(-inf)
+  // = +0.0 (IEEE-754 exact), never NaN.  Matches llama.cpp's
+  // `const float2 vs2 = exp(s2 - M[jj]);` at ggml-metal.metal:6156.
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
-    return (y == -metal::numeric_limits<T>::infinity())
-        ? T(0)
-        : fast::exp2(x - y);
+    return fast::exp2(x - y);
   }
 };
 
 struct DivOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
-    // Guard #3 of the three NaN guards documented in this kernel's preamble.
-    // For a row where every KV position was masked to -inf, the K-sweep
-    // accumulates sum_score = 0 (because Guard #1 turns every exp into 0).
-    // The final output normalization is then `output / sum_score = 0/0 = NaN`
-    // without this guard.  Returning 0 in that case preserves the
-    // correctness-preserving "no valid keys attended → no contribution"
-    // semantics; it is a no-op for any non-degenerate row where sum_score > 0.
+    // THE SOLE remaining numerical guard under the llama.cpp-derived
+    // finite-M regime.  Mirrors llama.cpp's output-normalisation guard at
+    // `ggml-metal.metal:6358`:
+    //     const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
+    //
+    // For a row where every KV position was masked to -inf, scores are
+    // -inf, exp2(-inf - -FLT_MAX/2) = 0 (IEEE-754 exact, NOT NaN), so the
+    // K-sweep accumulates sum_score = bit-exact 0 with no intermediate
+    // NaN.  The final output normalisation is then `output / sum_score
+    // = 0/0 = NaN` without this guard.  Returning 0 in that case
+    // preserves the "no valid keys attended → no contribution"
+    // semantics; it is a no-op for any non-degenerate row where
+    // sum_score > 0.  See ADR-011-phase2-port-sentinel.md §2.3.
     return (y == T(0)) ? T(0) : x / y;
   }
 };
@@ -1134,6 +1162,7 @@ template <
     const constant AttnParams* params [[buffer(4)]],
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
+    const device char* blk [[buffer(7), function_constant(has_blk)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1278,10 +1307,16 @@ template <
   AccumType max_score[kRowsPT];
   AccumType sum_score[kRowsPT] = {0};
 
-  // Init to -Inf
+  // Init max_score to finite sentinel -FLT_MAX/2 per llama.cpp's convention
+  // at ggml-metal.metal:5891 (non-vec prefill) and :6725 (vec decode).
+  // A finite sentinel absorbs -inf scores (from masked positions) via
+  // simd_max without ever letting M become -inf itself, so exp(score - M)
+  // evaluates cleanly as exp(-inf) = 0 rather than exp(NaN) = NaN.  This
+  // is the whole reason the three candle-style NaN guards are not needed.
+  // See ADR-011-phase2-port-sentinel.md §1.3.
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    max_score[i] = Limits<AccumType>::min;
+    max_score[i] = -FLT_MAX / AccumType(2);
   }
 
   int kb_lim = params->NK;
@@ -1291,8 +1326,65 @@ template <
     kb_lim = (q_max + BK - 1) / BK;
   }
 
+  // ── Wave 2E tile-skip pre-pass row base ─────────────────────────────────
+  //
+  // When has_blk is true the dispatcher has bound the per-(qtile, ktile)
+  // classification byte buffer at buffer(7).  The mask (and therefore the
+  // blk) produced by Wave 2D is a single [qL, kL] plane that is broadcast
+  // across batch and heads via m_strides = (0, 0, kL).  So the blk buffer
+  // is shape [NQ, NK] (no batch / head axis) and each main-kernel
+  // threadgroup reads its row at `blk + tid.x * NK`.
+  //
+  // Port of llama.cpp ggml-metal.metal:5841-5846, adapted to our 2D mask
+  // layout.  See /opt/hf2q/docs/ADR-011-phase2-port-tile-skip.md §6.
+  const device char* blk_row = nullptr;
+  if (has_blk) {
+    const int NK_blk = (params->kL + BK - 1) / BK;
+    blk_row = blk + int(tid.x) * NK_blk;
+  }
+
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
+    // ── Wave 2E tile-skip branch ─────────────────────────────────────────
+    //
+    // blk_cur:
+    //   0 → skip entire tile (port of ggml-metal.metal:5956-5962)
+    //   1 → standard mask-add + softmax (default; matches pre-Wave-2E behaviour)
+    //   2 → skip mask-add, compute Q·K^T + softmax normally (port of :6145)
+    //
+    // When has_blk is false blk_cur is forced to 1 below, and the compiler
+    // dead-codes both the byte load and the skip branch (blk_cur == 0 can
+    // never be true).  The subsequent `blk_cur != 2` gate on mask-add also
+    // becomes a constant-true under `has_blk=false && has_mask=true`, so
+    // the mask-add code path is unchanged from pre-Wave-2E in that case.
+    char blk_cur = 1;
+    if (has_blk) {
+      blk_cur = blk_row[kb];
+      if (blk_cur == 0) {
+        // Fully-masked KV tile — skip the entire iteration.  The running
+        // per-row (max, sum, O) accumulators are unchanged because this
+        // tile contributes no finite scores: equivalent to the standard
+        // path with mqk=-inf, which under the finite-M-sentinel regime
+        // yields exp2(-inf - finite) = 0 contribution and `factor = 1`
+        // rescale (M unchanged, S unchanged, O unchanged).  Matches
+        // llama.cpp's `continue` at ggml-metal.metal:5961.
+        //
+        // IMPORTANT: K/V block loaders advance via loader_k.next() /
+        // loader_v.next() at the END of every iteration.  A `continue`
+        // that skips the end-of-iter `next()` calls would leave the
+        // loaders pointing at the same KV tile on the NEXT iteration —
+        // the subsequent `load_unsafe()` would read the wrong data.
+        // Advance the loaders before `continue` so the next iteration
+        // sees the correct KV tile.  llama.cpp handles this equivalently
+        // via its `pm2[jj] += NW` per-row mask pointer advance at
+        // ggml-metal.metal:5958-5960 (there the K/V stream is per-chunk
+        // and the advance happens implicitly via ic0++ in the for-head).
+        loader_k.next();
+        loader_v.next();
+        continue;
+      }
+    }
+
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!align_K && kb == (params->NK_aligned)) {
@@ -1364,8 +1456,15 @@ template <
       }
     }
 
-    // Other masking as needed
-    if (has_mask) {
+    // Other masking as needed.
+    //
+    // Wave 2E: when has_blk && blk_cur == 2 the entire mask tile is
+    // bit-exact 0.0, so adding it is a no-op — skip the load+add.  Port
+    // of llama.cpp's `if (blk_cur != 2)` guard at
+    // ggml-metal.metal:6145.  The gate is constant-false when has_blk is
+    // false (blk_cur always == 1 in that case), so the compiler treats
+    // this identically to pre-Wave-2E code.
+    if (has_mask && blk_cur != 2) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
       constexpr auto neg_inf = -metal::numeric_limits<selem_t>::infinity();
@@ -1434,13 +1533,17 @@ template <
     Stile.template row_bin_op<ExpSubOp>(new_max);
 
     // Factor exp(rowmax(Si) - rowmax(Si-1))
-    // Guard: when max_score == -inf (no valid K seen yet), the previous accumulation is all zeros so the correct rescaling factor is 0.
-    // Without this, -inf - (-inf) = NaN which poisons the output.
+    // Unguarded under the finite-M regime: max_score is -FLT_MAX/2 initially
+    // and simd_max-floor-capped at -FLT_MAX/2 thereafter, so the difference
+    // max_score - new_max is ALWAYS finite (in [-FLT_MAX, 0]).  On the first
+    // K-tile iteration of a fully-masked row the difference is exactly 0
+    // and factor = exp2(0) = 1, which is correct: sum_score starts at 0,
+    // stays at sum_score*1 + 0 = 0; Otile starts at 0, stays at 0*1 = 0.
+    // Matches llama.cpp's unguarded `const float ms = exp(m - M[jj]);`
+    // at ggml-metal.metal:6155.
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
-      factor[i] = (max_score[i] == -metal::numeric_limits<AccumType>::infinity())
-          ? AccumType(0)
-          : fast::exp2(max_score[i] - new_max[i]);
+      factor[i] = fast::exp2(max_score[i] - new_max[i]);
     }
 
     // Save max for next iteration

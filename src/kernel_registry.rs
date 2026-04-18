@@ -11,6 +11,12 @@ use metal::{ComputePipelineState, FunctionConstantValues, MTLDataType};
 
 use crate::error::{MlxError, Result};
 
+// MTLDataType numeric values (from metal-rs argument.rs, confirmed in Apple Metal spec):
+//   Int  = 29
+//   Bool = 53
+// These are used when calling set_constant_value_at_index so the Metal runtime
+// knows how wide each constant value is.
+
 /// Registry that lazily compiles and caches Metal compute pipelines from
 /// embedded MSL source.
 ///
@@ -106,6 +112,10 @@ impl KernelRegistry {
         sources.insert("zero_buffer".into(), moe_dispatch_src);
         sources.insert("naive_matvec_f32".into(), moe_dispatch_src);
         sources.insert("moe_gather_topk_weights".into(), moe_dispatch_src);
+        // bf16 variants (Phase 2 bf16 activation path)
+        sources.insert("fused_gelu_mul_bf16".into(), moe_dispatch_src);
+        sources.insert("moe_swiglu_seq_bf16".into(), moe_dispatch_src);
+        sources.insert("moe_weighted_sum_seq_bf16_input".into(), moe_dispatch_src);
 
         // Batched KV cache copy kernels
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
@@ -113,6 +123,8 @@ impl KernelRegistry {
         sources.insert("kv_cache_copy_batch_f32_to_f16".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32_to_f16".into(), kv_cache_src);
+        // bf16-source KV cache copy (Phase 2 bf16 activation path)
+        sources.insert("kv_cache_copy_seq_bf16".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
@@ -248,6 +260,13 @@ impl KernelRegistry {
             include_str!("shaders/fused_head_norm_rope_f32.metal");
         sources.insert("fused_head_norm_rope_f32".into(), fused_hnr_f32_src);
 
+        // Fused head-norm + RoPE bf16 kernels (single-token + batch prefill)
+        // Both entry points live in the same .metal file.
+        let fused_hnr_bf16_src: &'static str =
+            include_str!("shaders/fused_head_norm_rope_bf16.metal");
+        sources.insert("fused_head_norm_rope_bf16".into(), fused_hnr_bf16_src);
+        sources.insert("fused_head_norm_rope_batch_bf16".into(), fused_hnr_bf16_src);
+
         // Fused norm-add f32 kernels — post-attention / post-FFN / end-of-layer
         let fused_norm_add_f32_src: &'static str =
             include_str!("shaders/fused_norm_add_f32.metal");
@@ -373,35 +392,49 @@ impl KernelRegistry {
     }
 
     /// Get a compiled compute pipeline for the named kernel, specialized with
-    /// Metal function constants.
+    /// Metal function constants (both bool and i32 in one call).
     ///
-    /// The `bool_constants` slice contains `(index, value)` pairs.  Each pair
-    /// maps to a `[[function_constant(index)]]` declaration in the MSL shader.
+    /// `bool_constants` contains `(index, value)` pairs mapping to
+    /// `[[function_constant(index)]]` bool declarations in the MSL shader.
+    /// `int_constants` contains `(index, value)` pairs mapping to
+    /// `[[function_constant(index)]]` int (int32_t) declarations in the MSL
+    /// shader.
     ///
     /// Pipelines are cached by a composite key:
-    /// `"<name>|<index>:<0|1>|..."` so that distinct constant combinations each
-    /// produce a separately compiled pipeline.  The slow compilation path runs at
-    /// most once per unique `(name, constants)` combination.
+    /// `"<name>|<index>:b<0|1>|...|<index>:i<value>|..."`.  The 'b' prefix
+    /// marks bool entries and the 'i' prefix marks i32 entries, making the
+    /// format unambiguous regardless of constant ordering.  Distinct
+    /// `(name, constants)` combinations each compile to a separate pipeline;
+    /// the slow compilation path runs at most once per unique combination.
     ///
     /// # Errors
     ///
     /// * `MlxError::KernelNotFound` — no source registered for this name.
     /// * `MlxError::ShaderCompilationError` — MSL compilation, function
     ///   specialisation, or pipeline creation failed.
-    pub fn get_pipeline_with_bool_constants(
+    pub fn get_pipeline_with_constants(
         &mut self,
         name: &str,
         device: &metal::DeviceRef,
         bool_constants: &[(usize, bool)],
+        int_constants: &[(usize, i32)],
     ) -> Result<&ComputePipelineState> {
         // Build a composite cache key so distinct constant combinations each
-        // compile to their own pipeline.
+        // compile to their own pipeline.  Bool entries use the 'b' type marker
+        // and i32 entries use 'i'; this prevents a collision between, e.g.,
+        // bool index 5 value 1 and int index 5 value 1.
         let mut cache_key = name.to_string();
         for &(index, value) in bool_constants {
             cache_key.push('|');
             cache_key.push_str(&index.to_string());
+            cache_key.push_str(if value { ":b1" } else { ":b0" });
+        }
+        for &(index, value) in int_constants {
+            cache_key.push('|');
+            cache_key.push_str(&index.to_string());
             cache_key.push(':');
-            cache_key.push(if value { '1' } else { '0' });
+            cache_key.push('i');
+            cache_key.push_str(&value.to_string());
         }
 
         if !self.cache.contains_key(&cache_key) {
@@ -418,16 +451,30 @@ impl KernelRegistry {
                     message: msg,
                 })?;
 
-            // Build the FunctionConstantValues object.
+            // Build the FunctionConstantValues object with all bool and i32
+            // constants.  Metal's set_constant_value_at_index reads the value
+            // through a raw pointer; the pointed-to bytes must match the size
+            // declared in the MSL shader (1 byte for bool, 4 bytes for int).
             let fcv = FunctionConstantValues::new();
+
             for &(index, value) in bool_constants {
-                // MTLDataType::Bool = 53 (from metal-rs argument.rs).
-                // The value must be passed as a pointer to a Rust bool (1 byte).
+                // MTLDataType::Bool = 53 (metal-rs argument.rs).
                 // The Metal runtime reads it as an Objective-C BOOL (uint8_t).
                 let v: u8 = if value { 1 } else { 0 };
                 fcv.set_constant_value_at_index(
                     (&v as *const u8).cast::<std::ffi::c_void>(),
                     MTLDataType::Bool,
+                    index as u64,
+                );
+            }
+
+            for &(index, value) in int_constants {
+                // MTLDataType::Int = 29 (metal-rs argument.rs).
+                // The Metal runtime reads 4 bytes as a signed 32-bit integer,
+                // matching the Metal shader type `constant int`.
+                fcv.set_constant_value_at_index(
+                    (&value as *const i32).cast::<std::ffi::c_void>(),
+                    MTLDataType::Int,
                     index as u64,
                 );
             }
@@ -454,6 +501,32 @@ impl KernelRegistry {
         })
     }
 
+    /// Get a compiled compute pipeline for the named kernel, specialized with
+    /// Metal bool function constants.
+    ///
+    /// The `bool_constants` slice contains `(index, value)` pairs.  Each pair
+    /// maps to a `[[function_constant(index)]]` declaration in the MSL shader.
+    ///
+    /// This is a thin wrapper around [`get_pipeline_with_constants`] that
+    /// passes an empty `int_constants` slice.  Existing callers continue to
+    /// work without modification; the cache-key format for pure-bool pipelines
+    /// is compatible (bool entries carry the 'b' type marker, which is the
+    /// only format ever written by this wrapper).
+    ///
+    /// # Errors
+    ///
+    /// * `MlxError::KernelNotFound` — no source registered for this name.
+    /// * `MlxError::ShaderCompilationError` — MSL compilation, function
+    ///   specialisation, or pipeline creation failed.
+    pub fn get_pipeline_with_bool_constants(
+        &mut self,
+        name: &str,
+        device: &metal::DeviceRef,
+        bool_constants: &[(usize, bool)],
+    ) -> Result<&ComputePipelineState> {
+        self.get_pipeline_with_constants(name, device, bool_constants, &[])
+    }
+
     /// Check if a pipeline for the given name is already compiled and cached.
     pub fn is_cached(&self, name: &str) -> bool {
         self.cache.contains_key(name)
@@ -473,5 +546,146 @@ impl KernelRegistry {
 impl Default for KernelRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal Metal shader that uses a single int function constant.
+    ///
+    /// The kernel writes the constant value N into the first element of the
+    /// output buffer, allowing the test to verify that the Metal compiler
+    /// actually sees distinct specialisations for N=4 and N=8.
+    ///
+    /// The shader is intentionally trivial — we only need it to *compile* with
+    /// an int function constant; correctness of the kernel logic is not under
+    /// test here.
+    const INT_FC_TEST_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant int test_N [[function_constant(100)]];
+
+kernel void int_fc_test_kernel(
+    device int* out [[buffer(0)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid == 0) {
+        out[0] = test_N;
+    }
+}
+"#;
+
+    /// Verify that `get_pipeline_with_constants` produces distinct cached
+    /// pipelines for different i32 function-constant values, and that
+    /// `get_pipeline_with_bool_constants` (the backward-compat wrapper) still
+    /// works correctly with the new 'b'-prefixed cache-key format.
+    ///
+    /// This test requires a real Metal device and is therefore marked
+    /// `#[ignore]` on non-Apple platforms, but runs unconditionally on macOS.
+    #[test]
+    fn test_int_fc_distinct_pipelines_and_bool_compat() {
+        let device = metal::Device::system_default()
+            .expect("no Metal device — run on Apple Silicon or x86 Mac with Metal support");
+
+        let mut registry = KernelRegistry::new();
+
+        // Register the inline test shader under a name that cannot collide with
+        // any production kernel.
+        registry.register_source("int_fc_test_kernel", INT_FC_TEST_SHADER);
+
+        // Compile with N=4.
+        let p4_ptr = registry
+            .get_pipeline_with_constants(
+                "int_fc_test_kernel",
+                &device,
+                &[],                  // no bool constants
+                &[(100, 4_i32)],      // int constant index 100 = 4
+            )
+            .expect("pipeline N=4 should compile") as *const _;
+
+        // Cache must now have exactly 1 entry for this kernel.
+        // (Other production kernels may already be in cache from new(); here
+        // we check that the N=4 key was inserted.)
+        let count_after_n4 = registry.cached_count();
+
+        // Compile with N=8 — must produce a SEPARATE pipeline.
+        let p8_ptr = registry
+            .get_pipeline_with_constants(
+                "int_fc_test_kernel",
+                &device,
+                &[],
+                &[(100, 8_i32)],
+            )
+            .expect("pipeline N=8 should compile") as *const _;
+
+        // Cache must have grown by exactly 1.
+        assert_eq!(
+            registry.cached_count(),
+            count_after_n4 + 1,
+            "N=8 must produce a new cache entry"
+        );
+
+        // The two pipelines must be distinct objects in the cache.
+        assert_ne!(
+            p4_ptr, p8_ptr,
+            "N=4 and N=8 specialisations must be separate ComputePipelineState objects"
+        );
+
+        // A second call with N=4 must return the SAME pipeline (cache hit, no
+        // new compilation).
+        let p4_again_ptr = registry
+            .get_pipeline_with_constants(
+                "int_fc_test_kernel",
+                &device,
+                &[],
+                &[(100, 4_i32)],
+            )
+            .expect("pipeline N=4 cache hit should succeed") as *const _;
+
+        assert_eq!(
+            registry.cached_count(),
+            count_after_n4 + 1,
+            "repeated N=4 call must be a cache hit, not a new entry"
+        );
+        assert_eq!(
+            p4_ptr, p4_again_ptr,
+            "repeated N=4 call must return the same pipeline pointer"
+        );
+
+        // Verify backward compatibility: get_pipeline_with_bool_constants must
+        // still route through get_pipeline_with_constants and produce a cached
+        // pipeline without panicking.
+        //
+        // We register a separate bool-constant shader that does NOT use a bool
+        // function constant (so the Metal compiler ignores missing FCs for
+        // this trivial case) — but the call path and cache-key format are what
+        // matter here.  We reuse the int_fc_test_kernel source; the bool FC is
+        // simply unused by the shader (Metal allows unused FCs when the shader
+        // declares them with `function_constant` but the value is never read).
+        //
+        // To avoid a Metal compiler error for an undeclared function constant,
+        // we register a separate bare-kernel shader for the bool wrapper test.
+        const BARE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void bare_kernel(device int* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid == 0) { out[0] = 42; }
+}
+"#;
+        registry.register_source("bare_kernel", BARE_SHADER);
+
+        let count_before_bool = registry.cached_count();
+        let _bool_pipeline = registry
+            .get_pipeline_with_bool_constants("bare_kernel", &device, &[])
+            .expect("bool-constants wrapper with empty slice must succeed");
+
+        assert_eq!(
+            registry.cached_count(),
+            count_before_bool + 1,
+            "bool-constants wrapper must insert one new cache entry"
+        );
     }
 }

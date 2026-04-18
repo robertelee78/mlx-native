@@ -155,6 +155,41 @@ kernel void kv_cache_copy_seq_f32(
     cache[dst_idx] = src[src_idx];
 }
 
+/// Multi-position, all-heads KV cache copy (BF16 source → F32 cache).
+///
+/// Same layout/semantics as kv_cache_copy_seq_f32 — including `src_tok_offset`
+/// source slicing and `dst_pos % capacity` ring-wrap for sliding-window layers
+/// — but reads bfloat16 from the source and promotes to float32 on write.
+///
+/// Used in the Phase 2 bf16 activation path where pf_k_normed and pf_v_normed
+/// are bf16 but the KV cache (dense_kvs) remains f32 for decode SDPA precision.
+///
+/// Grid: 3D — x=elem within head, y=head, z=token.
+kernel void kv_cache_copy_seq_bf16(
+    device const bfloat* src              [[buffer(0)]],   // [n_src_tokens, n_heads, head_dim] BF16
+    device float*        cache            [[buffer(1)]],   // [n_heads, capacity, head_dim] F32
+    constant uint&       n_heads          [[buffer(2)]],
+    constant uint&       head_dim         [[buffer(3)]],
+    constant uint&       capacity         [[buffer(4)]],
+    constant uint&       seq_pos_start    [[buffer(5)]],
+    constant uint&       n_tokens         [[buffer(6)]],
+    constant uint&       src_tok_offset   [[buffer(7)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    uint tok  = tid.z;
+    if (head >= n_heads || elem >= head_dim || tok >= n_tokens) return;
+
+    uint src_tok = src_tok_offset + tok;
+    uint src_idx = src_tok * (n_heads * head_dim) + head * head_dim + elem;
+    uint dst_pos = seq_pos_start + tok;
+    uint slot    = dst_pos % capacity;
+    uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
+    // Promote bf16 → f32 on write to keep cache precision.
+    cache[dst_idx] = static_cast<float>(src[src_idx]);
+}
+
 /// Multi-position, all-heads KV cache copy (F32 source → F16 cache).
 ///
 /// Same layout/semantics as kv_cache_copy_seq_f32 (including `src_tok_offset`

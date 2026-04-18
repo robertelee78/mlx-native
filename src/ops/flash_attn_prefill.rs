@@ -77,10 +77,36 @@
 //! `log2(e) ≈ 1.44269504` and uses `fast::exp2` throughout — so the host
 //! MUST NOT pre-multiply by `log2(e)`.
 //!
+//! ## Mask-sentinel contract (llama.cpp convention)
+//!
+//! The additive mask buffer (bf16/f16 for the additive dispatchers) uses
+//! the llama.cpp CPU-side convention: **masked positions = `-INFINITY`**
+//! (IEEE-754 f32 `0xFF800000`, cast to the I/O dtype — both `half(-inf)`
+//! and `bfloat16(-inf)` have a real `-inf` encoding that the kernel
+//! consumes correctly).  Attended positions = `0.0`.
+//!
+//! This matches llama.cpp's mask-authoring sites at
+//! `llama-graph.cpp:421, 436, 557` and `llama-kv-cache.cpp:1572`, where
+//! the CPU writes raw `-INFINITY` and the flash-attn cast to f16 saturates
+//! to f16-`-INFINITY`.
+//!
+//! The kernel does NOT require masks to use `-FLT_MAX/2` or any other
+//! finite "large negative" sentinel.  The `-FLT_MAX/2` value is the
+//! kernel-internal `M` (running row-max) initialiser — a finite sentinel
+//! that absorbs `-inf` scores via `simd_max` without ever letting `M`
+//! become `-inf`, which in turn lets every `exp(score - M)` evaluate as
+//! `exp(-inf) = 0.0` (IEEE-754 exact) rather than `exp(-inf - -inf) =
+//! exp(NaN) = NaN`.  See ADR-011-phase2-port-sentinel.md §1.
+//!
+//! Callers may pass arbitrary finite additive biases in the mask for
+//! non-masked positions (e.g. ALiBi, relative-position biases); only
+//! "fully block this K position" requires `-inf`.
+//!
 //! ## See also
 //!
 //! - Kernel: `/opt/mlx-native/src/shaders/flash_attn_prefill.metal`
 //! - ADR-011: `/opt/hf2q/docs/ADR-011-flash-attn-prefill.md`
+//! - ADR-011 phase 2 sentinel port: `/opt/hf2q/docs/ADR-011-phase2-port-sentinel.md`
 
 use metal::MTLSize;
 
@@ -381,7 +407,8 @@ fn validate_buffer_size(buf: &MlxBuffer, name: &str, expected_elements: usize) -
 /// - `k`    — `[batch, n_kv_heads, seq_len_k, 256]`, dtype BF16
 /// - `v`    — `[batch, n_kv_heads, seq_len_k, 256]`, dtype BF16
 /// - `mask` — `[batch, n_heads, seq_len_q, seq_len_k]`, dtype BF16
-///   (additive, log-scale: 0.0 = attend, -inf = mask out), or `None`
+///   (additive, log-scale: 0.0 = attend, -inf = mask out — llama.cpp
+///   convention, see module doc "Mask-sentinel contract"), or `None`
 /// - `out`  — `[batch, n_heads,    seq_len_q, 256]`, dtype BF16 (output)
 ///
 /// # Function constants
@@ -416,12 +443,87 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
     out: &mut MlxBuffer,
     params: &FlashAttnPrefillParams,
 ) -> Result<()> {
+    // Delegate to the blk-aware dispatcher with blk=None.  Because
+    // `has_blk` is a function constant (index 303), the compiled pipeline
+    // with has_blk=false dead-codes every blk reference — this call has
+    // zero runtime overhead compared with the pre-Wave-2E code path.
+    dispatch_flash_attn_prefill_bf16_d256_with_blk(
+        encoder, device, registry, q, k, v, mask, None, out, params,
+    )
+}
+
+/// Dispatch flash-attention prefill for bf16 Q/K/V/O, head_dim=256, with an
+/// optional Wave 2E tile-skip pre-pass byte buffer.
+///
+/// This is the blk-aware sibling of [`dispatch_flash_attn_prefill_bf16_d256`].
+/// When `blk` is `Some(buf)`, the kernel reads a classification byte per
+/// `(qtile, ktile)` and:
+///
+/// - On `blk[qt][kt] == 0`, skips the entire KV tile (no K/V load, no
+///   Q·K^T, no mask-add, no softmax update).
+/// - On `blk[qt][kt] == 2`, skips the mask-add (but still computes Q·K^T
+///   and softmax normally).
+/// - On `blk[qt][kt] == 1`, runs the standard path.
+///
+/// The `blk` buffer must be produced by
+/// [`crate::ops::flash_attn_prefill_blk::dispatch_flash_attn_prefill_blk`]
+/// with the SAME `(BQ=32, BK=16)` tile shape as this dispatcher, and the
+/// caller MUST sequence the pre-pass dispatch BEFORE this one on the same
+/// command encoder (or commit the pre-pass first).
+///
+/// # Correctness invariant
+///
+/// For any valid (mask, built blk), calling this function with `blk=None`
+/// vs `blk=Some(built_blk)` MUST produce bit-exact identical output.  The
+/// blk path is a pure skip optimisation.  Exercised by
+/// `test_gpu_bf16_d256_with_blk_matches_no_blk` in
+/// `tests/test_flash_attn_prefill.rs`.
+///
+/// # Buffer layout
+///
+/// All buffers as in [`dispatch_flash_attn_prefill_bf16_d256`], plus:
+///
+/// - `blk` — `[ceil(seq_len_q / 32), ceil(seq_len_k / 16)]`, dtype U8.
+///   Required iff `Some(_)`; must have at least
+///   `ceil(qL/32) * ceil(kL/16)` bytes.  When `None`, the dispatcher
+///   compiles with `has_blk=false` and does not bind buffer index 7.
+///
+/// # Errors
+///
+/// Same as [`dispatch_flash_attn_prefill_bf16_d256`], plus:
+/// - `blk` is `Some(b)` with `mask = None` (a blk without a mask is
+///   meaningless — rejected to catch caller bugs).
+/// - `blk` buffer undersized.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d256_with_blk(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    blk: Option<&MlxBuffer>,
+    out: &mut MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
     if params.head_dim != 256 {
         return Err(MlxError::InvalidArgument(format!(
             "dispatch_flash_attn_prefill_bf16_d256: head_dim must be 256, got {}",
             params.head_dim
         )));
+    }
+    // Reject the meaningless has_blk=true, has_mask=false case: a blk
+    // buffer classifies the contents of the mask; without a mask the blk
+    // bytes are computed against undefined data.  This is a caller-bug
+    // defence, not a shader limitation.
+    if blk.is_some() && mask.is_none() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_bf16_d256_with_blk: \
+             blk requires mask (a blk without a mask is meaningless)"
+                .into(),
+        ));
     }
     validate_params(params)?;
 
@@ -478,7 +580,24 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
     let align_q = ql_rem == 0;
     let align_k = kl_rem == 0;
     let has_mask = mask.is_some();
+    let has_blk = blk.is_some();
     let do_causal = params.do_causal;
+
+    // Validate blk buffer size when present.  Tile shape is fixed for D=256:
+    // BQ=32, BK=16 — see ADR-011-phase2-port-tile-skip.md §5.1.
+    if let Some(b) = blk {
+        let nq_tiles = ql.div_ceil(BQ_D256 as usize);
+        let nk_tiles = kl.div_ceil(BK_D256 as usize);
+        let expected = nq_tiles * nk_tiles;
+        if b.byte_len() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_bf16_d256_with_blk: blk buffer \
+                 too small: expected at least {expected} bytes (NQ={nq_tiles}, \
+                 NK={nk_tiles}), got {}",
+                b.byte_len()
+            )));
+        }
+    }
 
     // ── Kernel name ───────────────────────────────────────────────────────
     // bf16 I/O, bf16 additive mask (or no mask — uses same pipeline since
@@ -486,6 +605,13 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
     let kernel_name = K_BF16_D256;
 
     // ── Pipeline lookup (with function constants) ─────────────────────────
+    //
+    // Wave 2E adds function constant 303 (has_blk).  When has_blk=false
+    // every blk reference in the shader is dead-coded, so pipelines with
+    // the pre-Wave-2E constants {200, 201, 300, 301} + {303: false}
+    // generate the same machine code as the pre-Wave-2E pipelines.  The
+    // only cache-key overhead is one extra "b0" suffix, which is paid
+    // once per (aligned, causal, masked) combo at compile time.
     let pipeline = registry.get_pipeline_with_bool_constants(
         kernel_name,
         device.metal_device(),
@@ -494,6 +620,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
             (201, align_k),
             (300, has_mask),
             (301, do_causal),
+            (303, has_blk),
         ],
     )?;
 
@@ -569,20 +696,47 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
             m_strides: [m_batch_stride, m_head_stride, m_ql_stride],
         };
 
-        encoder.encode_threadgroups_with_args(
-            pipeline,
-            &[
-                (0, KernelArg::Buffer(q)),
-                (1, KernelArg::Buffer(k)),
-                (2, KernelArg::Buffer(v)),
-                (3, KernelArg::Buffer(out)),
-                (4, KernelArg::Bytes(as_bytes(&attn_params))),
-                (5, KernelArg::Bytes(as_bytes(&mask_params))),
-                (6, KernelArg::Buffer(mask_buf)),
-            ],
-            grid,
-            tg_size,
-        );
+        if has_blk {
+            // SAFETY: has_blk is true iff blk.is_some() and the earlier
+            // has_blk validation rejects blk.is_some() && mask.is_none().
+            let blk_buf = blk.ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "flash_attn_prefill: internal error — has_blk=true but blk is None".into(),
+                )
+            })?;
+
+            encoder.encode_threadgroups_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(q)),
+                    (1, KernelArg::Buffer(k)),
+                    (2, KernelArg::Buffer(v)),
+                    (3, KernelArg::Buffer(out)),
+                    (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                    (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                    (6, KernelArg::Buffer(mask_buf)),
+                    (7, KernelArg::Buffer(blk_buf)),
+                ],
+                grid,
+                tg_size,
+            );
+        } else {
+            encoder.encode_threadgroups_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(q)),
+                    (1, KernelArg::Buffer(k)),
+                    (2, KernelArg::Buffer(v)),
+                    (3, KernelArg::Buffer(out)),
+                    (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                    (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                    (6, KernelArg::Buffer(mask_buf)),
+                    // buffer 7 absent — has_blk=false constant dead-codes blk refs.
+                ],
+                grid,
+                tg_size,
+            );
+        }
     } else {
         encoder.encode_threadgroups_with_args(
             pipeline,
@@ -592,8 +746,8 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
                 (2, KernelArg::Buffer(v)),
                 (3, KernelArg::Buffer(out)),
                 (4, KernelArg::Bytes(as_bytes(&attn_params))),
-                // buffers 5 and 6 intentionally absent — has_mask=false constant
-                // causes the Metal compiler to dead-code-eliminate mask loads.
+                // buffers 5, 6, 7 intentionally absent — has_mask=false +
+                // has_blk=false constants dead-code-eliminate mask + blk loads.
             ],
             grid,
             tg_size,
