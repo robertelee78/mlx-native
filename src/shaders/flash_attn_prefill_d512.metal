@@ -298,15 +298,37 @@ void flash_attn_prefill_d512_impl(
 
   // ── Threadgroup memory regions ─────────────────────────────────────────
   //
-  // Layout mirrors ggml-metal.metal:5816-5828.  For (DK=DV=512, Q=8, C=64,
-  // NSG=8, bf16):
-  //   sq offset  0 bytes ,  size 8×512×2 =  8192 bytes
-  //   so offset 8192       size 8×512×2 =  8192 bytes  (always half)
-  //   ss offset 16384      size 8×128×2 =  2048 bytes
-  //   Total:    26624 B
-  //   Dispatcher requests 28672 B (matches llama.cpp FATTN_SMEM padding).
-  threadgroup T*    sq  = (threadgroup T*)    (shmem_f16 + 0 * T_STRIDE);
-  threadgroup half* so  = (threadgroup half*) (shmem_f16 + 0 * T_STRIDE + Q * DK);
+  // Layout mirrors ggml-metal.metal:5816-5828 STRUCTURALLY, but the `so`
+  // accumulator here is stored in f32 (NOT half as llama.cpp's bf16-I/O
+  // specialisation at FA_TYPES_BF).  Rationale: at runtime llama.cpp's
+  // default KV-cache dtype is f16 (common/common.h:344), which dispatches
+  // its *f16* FA_TYPES instantiation — and FA_TYPES uses `float` for o_t
+  // (see ggml-metal.metal:6441, last line of FA_TYPES macro).  FA_TYPES_BF
+  // is the bf16 I/O variant which llama.cpp defines for bf16 K/V caches
+  // but its default cache types route Gemma 4 inference through the F16
+  // kernel at runtime.  Matching llama.cpp's *actual inference behaviour*
+  // (f32 O accumulator) — not its literal bf16 template instantiation —
+  // gives byte-identical output; the half-O variant loses ~10 bits of
+  // accumulator precision per KV chunk which compounds across Gemma 4's
+  // 5 global layers (observed pre-fix: 1026-byte common prefix with
+  // half O; post-fix: full 3094+ with f32 O).
+  //
+  // For (DK=DV=512, Q=8, C=64, NSG=8, bf16 I/O, f32 so, f32 ss):
+  //   sq offset  0 bytes , size 8×512×2 =  8192 bytes
+  //   so offset  8192     , size 8×512×4 = 16384 bytes (f32)
+  //   ss offset  24576    , size 8×128×4 =  4096 bytes (f32)
+  //   Total:    28672 B
+  //   Exactly equals the dispatcher's 28672 B budget — we've re-used the
+  //   is_q=1 dequant scratch reservation (which llama.cpp paid for but
+  //   we don't need since is_q=0) for the widened O accumulator.
+  //
+  // Shared-memory offsets in halves (base ptr is `shmem_f16 + half index`):
+  //   sq: [0, Q*DK)               = [0, 4096)
+  //   so: [Q*DK, Q*DK + Q*PV*2)   = [4096, 12288)   — so floats live at
+  //                                  half-index 4096..12287 as pairs
+  //   ss: [Q*T_STRIDE, ...)       = [12288, 14336)  — same as before
+  threadgroup T*     sq  = (threadgroup T*)     (shmem_f16 + 0 * T_STRIDE);
+  threadgroup float* so  = (threadgroup float*) (shmem_f16 + 0 * T_STRIDE + Q * DK);
   // Note: ss is float-typed (s_t == float in llama.cpp FA_TYPES_BF).  Row j
   // starts at `Q*T_STRIDE halves + 2*j*SH halves` = `Q*T_STRIDE halves +
   // j*(2*SH) halves`; in float units (ss's native) row j starts at
@@ -398,16 +420,19 @@ void flash_attn_prefill_d512_impl(
   // NQ owned rows of the Q tile from device memory into `sq`, then zeros
   // its owned slots in `so` and `ss`.
   //
-  // Scale Q here, not per-KV-iteration, so `scale * log2(e)` is paid once
-  // per token rather than once per chunk.  This matches our D=256 kernel's
-  // `TransformScale` model (flash_attn_prefill.metal:1242, 1291) and makes
-  // the per-row `exp2(score - max)` idiom unchanged from D=256.
+  // Q is stored UNSCALED, mirroring llama.cpp's ggml-metal.metal:5862-5870
+  // (`sq4[…] = (q4_t) q4[i]` — pure type cast, no scale).  Scale is applied
+  // AFTER the Q·K^T matmul, inside the online softmax step
+  // (`float2 s2 = ss2[…] * args.scale` at :6138).  Keeping scale out of the
+  // Q-tile preserves llama.cpp's bf16 rounding behaviour bit-for-bit:
+  // pre-scaling Q by `scale * log2(e)` on load would round `Q*α` to bf16
+  // once per element, introducing systematic per-element bias that
+  // accumulates across the 512-wide dot product into measurable drift on
+  // Gemma 4 global-layer outputs (observed: byte-1026 divergence from
+  // llama.cpp on sourdough_gate).  Doing the multiply post-matmul keeps
+  // the bf16 round on Q identical to llama.cpp's.
   //
   // sq uses element layout [Q][DK]; each row is DK elements of dtype T.
-  // We write in 4-wide groups using float4 reads from device memory
-  // (matches llama.cpp's q4 device-load at :5862).
-  const T q_scale = (T)(args.scale * 1.44269504089f);  // scale * log2(e)
-
   FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
     const short j = jj * NSG + sgitg;
     const bool j_in_range = (int)(iq1 + j) < args.qL;
@@ -416,20 +441,19 @@ void flash_attn_prefill_d512_impl(
         q_head + (ulong)(iq1 + j) * (ulong)args.Q_strides[2];
 
     // Each lane loads ceil(DK / NW) elements; DK=512 / 32 = 16 per lane.
-    // Write into `sq[j*DK + i]` where i ∈ [0, DK).  Pre-scale on load so
-    // the subsequent Q·K^T matmul is already in base-2 score space.
     for (short i = tiisg; i < DK; i += NW) {
       T val = j_in_range ? q_row[i] : T(0);
-      sq[j * DK + i] = val * q_scale;
+      sq[j * DK + i] = val;
     }
   }
 
   FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
     const short j = jj * NSG + sgitg;
 
-    // Zero per-row O (in half, regardless of T — matches ggml-metal.metal:5818).
+    // Zero per-row O.  so is f32 here (see threadgroup-region comment above
+    // for why we widen the llama.cpp FA_TYPES_BF half accumulator to f32).
     for (short i = tiisg; i < DV; i += NW) {
-      so[j * PV + i] = (half)0.0h;
+      so[j * PV + i] = 0.0f;
     }
 
     // Zero per-row SS (softmax / mask scratch).
@@ -669,34 +693,39 @@ void flash_attn_prefill_d512_impl(
     // but each simdgroup owns a different NC slice of the KV columns.
     // At this barrier, ss holds scores for all 8 Q rows × full C columns.
     //
-    // Our softmax uses exp2 + base-2 scores (matches D=256 kernel;
-    // `flash_attn_prefill.metal:1458`); llama.cpp uses natural exp
-    // (ggml-metal.metal:6155-6156).  Because Q was pre-scaled by
-    // `scale * log2(e)`, the score space is base-2, and exp2 is the
-    // correct inverse.
+    // Softmax idiom: line-by-line port of llama.cpp ggml-metal.metal:6131-
+    // 6174, including the scale-after-matmul step at :6138.  The scale is
+    // applied HERE (f32 multiply on the MMA output), not baked into Q on
+    // load — this keeps the Q bf16 rounding behaviour bit-identical to
+    // llama.cpp's.  We use `exp` (natural) like llama.cpp rather than
+    // `exp2`: the score space is natural-log because Q was stored
+    // unscaled, so natural exp is the correct inverse.  Metal's `exp`
+    // compiles to a single instruction on Apple Silicon (same latency as
+    // `exp2`); choosing natural exp here means the sourdough_gate's bf16
+    // output stream can match llama.cpp's flash_attn_ext output byte-for-
+    // byte.
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
       const short j = jj * NSG + sgitg;
 
       const float m_old = M[jj];
 
       // Read 2 floats (one float2) from ss2 covering columns
-      // [2*tiisg, 2*tiisg+1].  Full row read = NW lanes × float2 = 64 cols.
-      float2 s2 = ss2[j * (SH / 2) + tiisg];
+      // [2*tiisg, 2*tiisg+1].  Apply `args.scale` post-matmul, matching
+      // llama.cpp :6138.
+      float2 s2 = ss2[j * (SH / 2) + tiisg] * args.scale;
 
-      // Apply additive mask — the mask in sm2 is already in base-2 scale
-      // when it came in as additive T, because our dispatcher writes bf16/f16
-      // masks in natural-log scale; we multiply by log2(e) here to bring
-      // it into the base-2 score space.  This mirrors our D=256 kernel's
-      // `Stile[jj] += 1.44269504089 * mfrag[jj]` at
-      // flash_attn_prefill.metal:1428.
+      // Apply additive mask in NATURAL units — matches llama.cpp
+      // ggml-metal.metal:6149 `s2 += s2_t(sm2[j*SH + tiisg])` (no
+      // log2(e) factor because natural-exp is used below).  Mask cells
+      // are already in natural-log space (bf16 -inf for masked,
+      // bf16 0.0 for attended).
       //
       // Under the finite-sentinel regime, masked positions come in as
-      // bf16::NEG_INFINITY, which in float promotion is -inf.  `-inf *
-      // log2(e) = -inf` (IEEE-754), so s2 component becomes -inf — the
-      // finite M absorbs it via simd_max without producing NaN.
+      // bf16::NEG_INFINITY, which in float promotion is -inf.  `s2 +=
+      // -inf` → -inf; finite M absorbs it via simd_max without NaN.
       if (has_mask_def && blk_cur != 2) {
         half2 m2 = sm2[j * SH + C + tiisg];
-        s2 = s2 + float2((float)m2.x, (float)m2.y) * 1.44269504089f;
+        s2 = s2 + float2((float)m2.x, (float)m2.y);
       }
 
       // Causal masking — the qL-relative absolute position of row
@@ -712,7 +741,6 @@ void flash_attn_prefill_d512_impl(
       }
 
       // Align_K=false trailing-chunk guard — mask out columns beyond kL.
-      // Matches our D=256 kernel's `align_K && kb == NK_aligned` branch.
       if (!align_K_def && ic + C > args.kL) {
         int c0 = ic + 2 * (int)tiisg;
         int c1 = c0 + 1;
@@ -721,41 +749,22 @@ void flash_attn_prefill_d512_impl(
       }
 
       // Row max over this simdgroup's lanes covering all C columns.
+      // Matches llama.cpp :6153.
       float my_max = max(s2.x, s2.y);
       float new_max = simd_max(max(m_old, my_max));
 
       M[jj] = new_max;
 
-      // exp2(score - new_max) — base-2 because Q was pre-scaled by log2(e),
-      // so `s2` and `new_max` are ALREADY in base-2 score space.  There is
-      // NO additional log2(e) factor: multiplying by log2(e) here would
-      // convert `exp2(x*log2(e))` = `e^x`, which is natural-exp over a
-      // base-2 argument and effectively re-scales scores by log2(e)≈1.4427,
-      // producing a sharper-than-correct softmax.  Matches the D=256
-      // kernel's `ExpSubOp::apply` at
-      // /opt/mlx-native/src/shaders/flash_attn_prefill.metal:1123
-      //   (`fast::exp2(x - y)`, no log2(e) factor) and llama.cpp's
-      // `const float2 vs2 = exp(s2 - M[jj])` at
-      // /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6156
-      // (both sides in natural-log space there; we're in base-2 with the
-      // same net result because `exp2(base2) = exp(natural)` when the
-      // pre-scale moves the Q·K^T into base-2 space).
-      //
-      // Unguarded: new_max is always finite under the sentinel regime
-      // (simd_max of -FLT_MAX/2 and real scores), so exp2(-inf - finite)
-      // = exp2(-inf) = +0.0 IEEE-754.
+      // Natural exp — direct port of llama.cpp :6155-6156.  Unguarded:
+      // new_max is always finite under the sentinel regime, so
+      // exp(-inf - finite) = exp(-inf) = +0.0 (IEEE-754 exact).
       float2 vs2;
-      vs2.x = fast::exp2(s2.x - new_max);
-      vs2.y = fast::exp2(s2.y - new_max);
+      vs2.x = exp(s2.x - new_max);
+      vs2.y = exp(s2.y - new_max);
 
-      // Rescale factor exp2(M_old - M_new) — both in base-2 score space,
-      // no additional log2(e) factor.  Matches the D=256 kernel's
-      // `factor[i] = fast::exp2(max_score[i] - new_max[i])` at
-      // /opt/mlx-native/src/shaders/flash_attn_prefill.metal:1546 and
-      // llama.cpp's `const float ms = exp(m - M[jj])` at
-      // /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6155.
-      // Finite by construction.
-      const float ms = fast::exp2(m_old - new_max);
+      // Rescale factor — matches llama.cpp :6155
+      // `const float ms = exp(m - M[jj]);`.  Finite by construction.
+      const float ms = exp(m_old - new_max);
 
       // Update S.
       S[jj] = S[jj] * ms + simd_sum(vs2.x + vs2.y);
@@ -766,10 +775,12 @@ void flash_attn_prefill_d512_impl(
       // Rescale O for this row by `ms`.  Only this simdgroup touches its
       // owned Q row, so no cross-simdgroup synchronisation needed here
       // (barrier at end of outer loop covers the so write-back).
-      // DV4 = 128; 128 / NW = 4 iterations per lane.
+      // DV = 512; 512 / NW = 16 iterations per lane.  so is f32, so no
+      // precision loss on rescale (unlike llama.cpp's half so4[i] *= ms
+      // which rounds through half at every chunk).
       FOR_UNROLL (short ii = 0; ii < DV / NW; ++ii) {
         const short i = ii * NW + tiisg;
-        so[j * PV + i] = (half)((float)so[j * PV + i] * ms);
+        so[j * PV + i] = so[j * PV + i] * ms;
       }
     }
 
@@ -795,20 +806,24 @@ void flash_attn_prefill_d512_impl(
     {
       constexpr short NO = PV8 / NSG;
 
-      // Per-llama.cpp FA_TYPES_BF (ggml-metal.metal:6444-6451):
-      //   o_t        = half              (storage)
-      //   o8x8_t     = simdgroup_half8x8 (MMA accumulator type)
-      //   s_t        = float, s8x8_t = simdgroup_float8x8
-      //   v_t        = bfloat (== T in our bf16 path)
+      // We use f32 O accumulator (simdgroup_float8x8) rather than the
+      // llama.cpp FA_TYPES_BF half (simdgroup_half8x8) design.  See the
+      // threadgroup-region comment at the top of the kernel for the
+      // rationale — llama.cpp's runtime F16-KV-cache path uses FA_TYPES
+      // which has `float` for o_t, and matching THAT behaviour (not the
+      // bf16 FA_TYPES_BF variant's half o_t) gives byte-identical output
+      // to llama.cpp at runtime.  The cost is 8 KB more threadgroup
+      // memory for so (still within the 28 KB budget because we've
+      // re-used the is_q=1 dequant scratch reservation).
       //
-      // Metal 3's `simdgroup_multiply_accumulate` supports mixed types for
-      // A, B, C, D where the compiler chooses the widest accumulation path.
-      // Using `simdgroup_half8x8` for lo mirrors llama.cpp's o_t choice.
-      simdgroup_matrix<half, 8, 8> lo[NO];
+      // Matches D=256 kernel's `MMATile<AccumType, TQ, TD, MMAFrag_acc_t>
+      // Otile` at /opt/mlx-native/src/shaders/flash_attn_prefill.metal:1277
+      // where `AccumType = float`.
+      simdgroup_matrix<float, 8, 8> lo[NO];
 
-      // Load this simdgroup's NO output frags from `so`.
+      // Load this simdgroup's NO output frags from `so` (f32).
       {
-        threadgroup half* sot = so + 8 * sgitg;
+        threadgroup float* sot = so + 8 * sgitg;
         FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
           simdgroup_load(lo[ii], sot, PV, 0, false);
           sot += 8 * NSG;
@@ -850,9 +865,9 @@ void flash_attn_prefill_d512_impl(
         }
       }
 
-      // Store this simdgroup's output frags back to `so`.
+      // Store this simdgroup's output frags back to `so` (f32).
       {
-        threadgroup half* sot = so + 8 * sgitg;
+        threadgroup float* sot = so + 8 * sgitg;
         FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
           simdgroup_store(lo[ii], sot, PV, 0, false);
           sot += 8 * NSG;
@@ -880,10 +895,14 @@ void flash_attn_prefill_d512_impl(
 
     const float scale = (S[jj] == 0.0f) ? 0.0f : 1.0f / S[jj];
 
-    // DV4 = 128.  Each lane writes DV4 / NW = 4 elements.
+    // so is f32 — no pre-promotion needed.  Cast to T at the final store
+    // is the ONLY bf16 round per element (llama.cpp writes f32 out here
+    // but our dispatcher contract is bf16; this matches sdpa_bf16's
+    // single-bf16-round output convention).  DV = 512; 512 / NW = 16
+    // writes per lane.
     FOR_UNROLL (short ii = 0; ii < DV / NW; ++ii) {
       const short i = ii * NW + tiisg;
-      o_row[i] = (T)((float)so[j * PV + i] * scale);
+      o_row[i] = (T)(so[j * PV + i] * scale);
     }
   }
 }
