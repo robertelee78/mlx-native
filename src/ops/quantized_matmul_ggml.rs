@@ -108,6 +108,41 @@ impl GgmlType {
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_f32",
         }
     }
+
+    /// Metal kernel function name for the tensor-API matrix-matrix
+    /// variant (ADR-011 Phase 3 Wave P3b-tensor).  On M3+ this path uses
+    /// `mpp::tensor_ops::matmul2d<>` which hits the hardware tensor cores
+    /// for 2-3× the FLOP throughput of the simdgroup MMA variant.  The
+    /// dispatcher falls back to `mm_kernel_name()` when the tensor
+    /// pipeline fails to compile (pre-M3 hardware).
+    fn mm_tensor_kernel_name(self) -> &'static str {
+        match self {
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
+            GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
+            GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
+            GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_f32",
+        }
+    }
+}
+
+/// Cached tensor-API availability — `None` until the first mm dispatch,
+/// then `Some(true)` if the tensor mm kernels compile on this device,
+/// `Some(false)` if they don't (we transparently fall back to the
+/// simdgroup MMA variants).  One-shot probe keeps the hot path
+/// branch-free after the first layer.
+static TENSOR_MM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
+    *TENSOR_MM_AVAILABLE.get_or_init(|| {
+        // Attempt to compile one tensor-mm pipeline; success means the
+        // Metal runtime has `<metal_tensor>` +
+        // `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>`
+        // available on this device (M3+).  Probing via Q4_0 is sufficient
+        // — all three qtype variants share the same tensor_ops surface.
+        registry
+            .get_pipeline("kernel_mul_mm_q4_0_tensor_f32", device.metal_device())
+            .is_ok()
+    })
 }
 
 /// llama.cpp's `ne11_mm_min` threshold for routing between mat-vec and
@@ -400,7 +435,16 @@ fn dispatch_mm(
     output: &mut MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    let kernel_name = params.ggml_type.mm_kernel_name();
+    // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
+    // variant on M3+ (hardware tensor cores); fall back to the simdgroup
+    // MMA kernel if the probe fails or the tensor kernel can't compile
+    // on this device.
+    let use_tensor = probe_tensor_mm(registry, device);
+    let kernel_name = if use_tensor {
+        params.ggml_type.mm_tensor_kernel_name()
+    } else {
+        params.ggml_type.mm_kernel_name()
+    };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
     let qk = params.ggml_type.block_values();

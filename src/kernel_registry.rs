@@ -89,6 +89,22 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q6_K_f32".into(), ggml_mm_src);
 
+        // GGML block-format quantized matrix-matrix kernels — tensor API
+        // variant (ADR-011 Phase 3 Wave P3b-tensor: port of llama.cpp's
+        // kernel_mul_mm_impl `#ifdef GGML_METAL_HAS_TENSOR` branch).
+        // Uses Apple's MetalPerformancePrimitives `tensor_ops::matmul2d`
+        // primitive which on M3+ dispatches to hardware tensor cores for
+        // 2-3x the effective FLOP throughput vs the simdgroup MMA path.
+        // Only compiled on devices where the tensor API is available; the
+        // kernel_registry's runtime-probe (see MlxDevice::has_tensor) gates
+        // compilation so non-tensor devices transparently fall back to the
+        // non-tensor `kernel_mul_mm_<q>_f32` kernels.
+        let ggml_mm_tensor_src: &'static str =
+            include_str!("shaders/quantized_matmul_mm_tensor.metal");
+        sources.insert("kernel_mul_mm_q4_0_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
+
         // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
         sources.insert(
             "quantized_matmul_id".into(),
