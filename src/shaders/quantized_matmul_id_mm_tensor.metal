@@ -215,14 +215,18 @@ kernel void hf2q_mul_mm_id_tensor_impl(
             }
         }
 
-        // Stage B (f32 → half)
-        for (short i = 0; i < 8; ++i) {
+        // Stage B (f32 → half, 8-wide vector store).  See the dense
+        // tensor kernel's equivalent staging for the rationale:
+        // K is always a multiple of NK=32 on our projections, so the
+        // per-element K-tail bounds check that the scalar path needs is
+        // never triggered — drop it and issue a single half2x4 store
+        // per thread.  Matches llama.cpp's FC_mul_mm_bc_inp=false path.
+        {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-            const short lx = i;
             const short ly = (tiitg/NL1)%8;
-            *(sb + NK*(8*sy + ly) + 8*sx + lx) =
-                (loop_k + iy + i < args.ne00) ? (half)*((device float *) y + i) : 0.h;
+            *(threadgroup half2x4 *)(sb + NK*(8*sy + ly) + 8*sx) =
+                (half2x4)(*((device float2x4 *) y));
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
