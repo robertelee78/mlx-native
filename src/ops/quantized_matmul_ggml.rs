@@ -139,9 +139,13 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
         // `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>`
         // available on this device (M3+).  Probing via Q4_0 is sufficient
         // — all three qtype variants share the same tensor_ops surface.
-        registry
+        let ok = registry
             .get_pipeline("kernel_mul_mm_q4_0_tensor_f32", device.metal_device())
-            .is_ok()
+            .is_ok();
+        if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+            eprintln!("[mlx-native] tensor_mm probe: {}", if ok { "OK (using tensor variant)" } else { "FAILED (falling back to simdgroup MMA)" });
+        }
+        ok
     })
 }
 
