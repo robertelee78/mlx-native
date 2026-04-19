@@ -435,3 +435,53 @@ kernel void rms_norm_no_scale_f32(
         output[base + i] = input[base + i] * rms_inv;
     }
 }
+
+// ---------------------------------------------------------------------------
+// rms_norm_no_scale_f32_dual — co-writes bf16 output alongside the f32
+// output (ADR-011 Phase 3 Wave P3b-tensor.3).
+//
+// Used by batched prefill's V-norm path to fuse the f32→bf16 cast that
+// previously ran as a separate dispatch.  Same compute as
+// rms_norm_no_scale_f32; one extra device write per element.  Memory
+// traffic on Apple Silicon's unified memory is bandwidth-bound; the
+// extra write is ~free since the f32 result is already in registers.
+// ---------------------------------------------------------------------------
+kernel void rms_norm_no_scale_f32_dual(
+    device const float *input       [[buffer(0)]],
+    device float       *output      [[buffer(1)]],
+    device const float *params      [[buffer(2)]],
+    device bfloat      *output_bf16 [[buffer(3)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    threadgroup float *shared       [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+
+    const uint base = row_idx * dim;
+
+    float partial_sum_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float val = input[base + i];
+        partial_sum_sq += val * val;
+    }
+
+    shared[tid] = partial_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float v = input[base + i] * rms_inv;
+        output[base + i]      = v;
+        output_bf16[base + i] = bfloat(v);
+    }
+}
