@@ -179,6 +179,11 @@ pub fn dispatch_fused_head_norm_rope_bf16(
 
 /// GPU params struct for f32 variant — must match `FusedHeadNormRopeF32Params`
 /// in the MSL shader exactly.
+///
+/// `has_bf16_output` (ADR-011 Phase 3 Wave P3b.4) — when set, the kernel
+/// co-writes every output element to an additional bf16 buffer at
+/// buffer(6).  Used by batched prefill to fuse the f32→bf16 cast that
+/// would otherwise run as a separate dispatch.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuFusedHeadNormRopeF32Params {
@@ -189,7 +194,7 @@ struct GpuFusedHeadNormRopeF32Params {
     has_weight:       u32,
     theta:            f32,
     has_freq_factors: u32,
-    _pad:             u32,
+    has_bf16_output:  u32,
 }
 
 /// Dispatch a fused per-head RMS norm + NeoX RoPE operation (f32).
@@ -271,7 +276,7 @@ pub fn dispatch_fused_head_norm_rope_f32(
         has_weight: u32::from(has_weight),
         theta,
         has_freq_factors: u32::from(has_ff),
-        _pad: 0,
+        has_bf16_output: 0,
     };
 
     // Bind dummies for optional buffers
@@ -288,6 +293,8 @@ pub fn dispatch_fused_head_norm_rope_f32(
             (3, KernelArg::Bytes(as_bytes(&gpu_params))),
             (4, KernelArg::Buffer(positions_buf)),
             (5, KernelArg::Buffer(ff_buf)),
+            // buffer(6) unused when has_bf16_output=0 — bind `input` as harmless dummy.
+            (6, KernelArg::Buffer(input)),
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new(n_heads as u64, 1, 1),
@@ -453,7 +460,7 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
         has_weight: u32::from(has_weight),
         theta,
         has_freq_factors: u32::from(has_ff),
-        _pad: 0,
+        has_bf16_output: 0,
     };
 
     let weight_buf = norm_weight.unwrap_or(input);
@@ -469,6 +476,104 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
             (3, KernelArg::Bytes(as_bytes(&gpu_params))),
             (4, KernelArg::Buffer(positions_buf)),
             (5, KernelArg::Buffer(ff_buf)),
+            // buffer(6) unused when has_bf16_output=0 — bind `input` as harmless dummy.
+            (6, KernelArg::Buffer(input)),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Batched fused head norm + RoPE for prefill (f32) with optional bf16
+/// co-write — ADR-011 Phase 3 Wave P3b.4.
+///
+/// Same contract as `dispatch_fused_head_norm_rope_batch_f32`, plus an
+/// optional `output_bf16` buffer.  When `Some(buf)`, the kernel writes
+/// every output element also to `buf` at the same logical index, in
+/// bf16.  This fuses the otherwise-separate `elementwise::cast_f32_to_bf16`
+/// dispatch that turns pf_q_normed / pf_k_normed into their bf16
+/// counterparts fed into the permute→SDPA stage.
+///
+/// * `output_bf16`: bf16 buffer of shape `[seq_len * n_heads * head_dim]`
+///   (or `None` to match the original f32-only contract).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    output_bf16: Option<&MlxBuffer>,
+    norm_weight: Option<&MlxBuffer>,
+    positions_buf: &MlxBuffer,
+    freq_factors: Option<&MlxBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    half_rope_dim: u32,
+    seq_len: u32,
+    eps: f32,
+    theta: f32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || seq_len == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_head_norm_rope_batch_f32_with_bf16: n_heads, head_dim, seq_len must be > 0".into(),
+        ));
+    }
+    if half_rope_dim > head_dim / 2 {
+        return Err(MlxError::InvalidArgument(format!(
+            "fused_head_norm_rope_batch_f32_with_bf16: half_rope_dim ({}) must be <= head_dim/2 ({})",
+            half_rope_dim,
+            head_dim / 2,
+        )));
+    }
+    if let Some(buf) = output_bf16 {
+        let expected = (seq_len as usize) * (n_heads as usize) * (head_dim as usize);
+        if buf.element_count() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_head_norm_rope_batch_f32_with_bf16: output_bf16 element count {} < expected {}",
+                buf.element_count(), expected
+            )));
+        }
+    }
+
+    let pipeline = registry.get_pipeline("fused_head_norm_rope_f32", device)?;
+
+    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
+    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
+    let shared_mem_bytes = (shared_slots as u64) * 4;
+
+    let has_weight = norm_weight.is_some();
+    let has_ff = freq_factors.is_some();
+    let has_bf16 = output_bf16.is_some();
+    let gpu_params = GpuFusedHeadNormRopeF32Params {
+        head_dim,
+        n_heads,
+        half_rope_dim,
+        eps,
+        has_weight: u32::from(has_weight),
+        theta,
+        has_freq_factors: u32::from(has_ff),
+        has_bf16_output: u32::from(has_bf16),
+    };
+
+    let weight_buf = norm_weight.unwrap_or(input);
+    let ff_buf = freq_factors.unwrap_or(input);
+    let bf16_buf = output_bf16.unwrap_or(input);
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(weight_buf)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (4, KernelArg::Buffer(positions_buf)),
+            (5, KernelArg::Buffer(ff_buf)),
+            (6, KernelArg::Buffer(bf16_buf)),
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),

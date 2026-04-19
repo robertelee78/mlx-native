@@ -26,6 +26,17 @@ using namespace metal;
 ///   buffer(3): params        — FusedHeadNormRopeF32Params struct
 ///   buffer(4): positions     — uint [seq_len]
 ///   buffer(5): freq_factors  — float [half_rope_dim] (ignored when has_freq_factors=0)
+///   buffer(6): output_bf16   — bfloat [n_heads * head_dim] (ignored when has_bf16_output=0)
+///
+/// ADR-011 Phase 3 Wave P3b.4 — optional bf16 co-write.  When the
+/// `has_bf16_output` params flag is set, the kernel writes every f32
+/// output element also to a bf16 buffer at the same logical offset.
+/// Callers use this to fuse the f32→bf16 cast that would otherwise run
+/// as a separate dispatch (saving 60 casts / prefill on Gemma 4: 2× per
+/// layer × 30 layers for Q and K).  The pf_q_normed_bf16 /
+/// pf_k_normed_bf16 buffers fed into the permute→SDPA stage are filled
+/// directly here, removing the need for an `elementwise::cast_f32_to_bf16`
+/// dispatch.
 ///
 /// Threadgroup: (min(256, next_pow2(head_dim)), 1, 1)
 /// Grid       : (n_heads, 1, 1)
@@ -36,12 +47,12 @@ using namespace metal;
 struct FusedHeadNormRopeF32Params {
     uint  head_dim;
     uint  n_heads;
-    uint  half_rope_dim;   // may be < head_dim/2 for partial rotary
+    uint  half_rope_dim;    // may be < head_dim/2 for partial rotary
     float eps;
-    uint  has_weight;      // 0 = no weight scale (V-norm variant), nonzero = apply weight
-    float theta;           // RoPE base frequency (e.g. 10000 or 1000000)
+    uint  has_weight;       // 0 = no weight scale (V-norm variant), nonzero = apply weight
+    float theta;            // RoPE base frequency (e.g. 10000 or 1000000)
     uint  has_freq_factors; // nonzero if freq_factors buffer is valid
-    uint  _pad;            // alignment padding
+    uint  has_bf16_output;  // ADR-011 P3b.4 — nonzero to co-write bf16 output
 };
 
 kernel void fused_head_norm_rope_f32(
@@ -51,11 +62,13 @@ kernel void fused_head_norm_rope_f32(
     constant FusedHeadNormRopeF32Params&     params       [[buffer(3)]],
     device const uint*                       positions    [[buffer(4)]],
     device const float*                      freq_factors [[buffer(5)]],
+    device bfloat*                           output_bf16  [[buffer(6)]],
     uint head_id  [[threadgroup_position_in_grid]],
     uint tid      [[thread_index_in_threadgroup]],
     uint tg_size  [[threads_per_threadgroup]],
     threadgroup float* shared             [[threadgroup(0)]]
 ) {
+    const bool has_bf16 = (params.has_bf16_output != 0u);
     const uint head_dim     = params.head_dim;
     const uint half_rope    = params.half_rope_dim;
     const uint half_dim     = head_dim / 2;
@@ -141,15 +154,27 @@ kernel void fused_head_norm_rope_f32(
         const float cos_a = cos(freq);
         const float sin_a = sin(freq);
 
-        output[base + i]            = x0 * cos_a - x1 * sin_a;
-        output[base + i + half_dim] = x1 * cos_a + x0 * sin_a;
+        const float o0 = x0 * cos_a - x1 * sin_a;
+        const float o1 = x1 * cos_a + x0 * sin_a;
+        output[base + i]            = o0;
+        output[base + i + half_dim] = o1;
+        if (has_bf16) {
+            output_bf16[base + i]            = bfloat(o0);
+            output_bf16[base + i + half_dim] = bfloat(o1);
+        }
     }
 
     // Pass through non-rotated dimensions:
     // [half_rope..half_dim) in first half and [half_dim+half_rope..head_dim) in second half
     for (uint i = tid; i < half_dim - half_rope; i += tg_size) {
         uint src = half_rope + i;
-        output[base + src]            = shared[src];
-        output[base + src + half_dim] = shared[src + half_dim];
+        const float o0 = shared[src];
+        const float o1 = shared[src + half_dim];
+        output[base + src]            = o0;
+        output[base + src + half_dim] = o1;
+        if (has_bf16) {
+            output_bf16[base + src]            = bfloat(o0);
+            output_bf16[base + src + half_dim] = bfloat(o1);
+        }
     }
 }
