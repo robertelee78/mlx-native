@@ -1132,6 +1132,35 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Pooled-scratch variant of [`Self::quantized_matmul_id_ggml`] — the
+    /// `IdMmScratch` is caller-owned so batched prefill amortises the
+    /// per-call allocations that the auto entry point incurs (ADR-011
+    /// Phase 3 Wave P3b).
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_id_ggml_pooled(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        output: &mut MlxBuffer,
+        scratch: &mut ops::quantized_matmul_id_ggml::IdMmScratch,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            scratch,
+            params,
+        )
+    }
+
     /// Encode scaled dot-product attention into this session's encoder.
     ///
     /// Delegates to [`ops::sdpa::sdpa`].

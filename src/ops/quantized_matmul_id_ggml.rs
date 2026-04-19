@@ -214,6 +214,115 @@ pub fn quantized_matmul_id_ggml(
     dispatch_id_mv(encoder, registry, device, input, weight, ids, output, params)
 }
 
+/// Same contract as `quantized_matmul_id_ggml`, but takes caller-owned
+/// `IdMmScratch` so batched-prefill dispatches avoid the per-call
+/// `MTLDevice.newBufferWithLength:` allocations the auto entry point
+/// incurs (ADR-011 Phase 3 Wave P3b — "scratch pooling").
+///
+/// When the dispatch routes to the mv_id path (decode / top_k != 8 /
+/// K < 32), the scratch is not touched — it is only used on the mm_id
+/// path.  Callers may over-size the scratch once per prefill and share
+/// it across every mm_id call in the forward pass.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &mut MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    // Mirror the validation + routing logic from `quantized_matmul_id_ggml`
+    // so the pooled path has identical correctness invariants.  (We keep
+    // the two entry points separate rather than extracting a shared inner
+    // because the scratch is only relevant on the mm_id branch — lifting
+    // scratch into the mv branch would add unused parameters.)
+    let qk = params.ggml_type.block_values();
+    let block_bytes = params.ggml_type.block_bytes();
+
+    if params.n_tokens == 0 || params.k == 0 || params.n == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled: n_tokens, K, and N must all be > 0".into(),
+        ));
+    }
+    if params.top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled: top_k must be > 0".into(),
+        ));
+    }
+    if params.n_experts == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled: n_experts must be > 0".into(),
+        ));
+    }
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled: K ({}) must be divisible by block QK ({})",
+            params.k, qk
+        )));
+    }
+
+    let expected_input_bytes =
+        (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of();
+    if input.byte_len() < expected_input_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled: input buffer too small: expected {} bytes for [{} x {}] f32, got {}",
+            expected_input_bytes, params.n_tokens, params.k, input.byte_len()
+        )));
+    }
+
+    let blocks_per_row = params.k / qk;
+    let per_expert_bytes =
+        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
+
+    if params.expert_stride < per_expert_bytes as u64 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled: expert_stride ({}) < per_expert_bytes ({})",
+            params.expert_stride, per_expert_bytes
+        )));
+    }
+
+    let total_weight_bytes = per_expert_bytes * (params.n_experts as usize);
+    if weight.byte_len() < total_weight_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled: weight buffer too small: expected {} bytes for {} experts, got {}",
+            total_weight_bytes, params.n_experts, weight.byte_len()
+        )));
+    }
+
+    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
+    let expected_ids_bytes = total_rows * DType::U32.size_of();
+    if ids.byte_len() < expected_ids_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled: ids buffer too small: expected {} bytes for [{} * {}] u32, got {}",
+            expected_ids_bytes, params.n_tokens, params.top_k, ids.byte_len()
+        )));
+    }
+
+    let expected_output_bytes = total_rows * (params.n as usize) * DType::F32.size_of();
+    if output.byte_len() < expected_output_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled: output buffer too small: expected {} bytes for [{} x {}] f32, got {}",
+            expected_output_bytes, total_rows, params.n, output.byte_len()
+        )));
+    }
+
+    if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
+        && params.top_k == 8
+        && params.k >= 32
+    {
+        return dispatch_id_mm_pooled(
+            encoder, registry, device, input, weight, ids, output,
+            scratch, params,
+        );
+    }
+
+    dispatch_id_mv(encoder, registry, device, input, weight, ids, output, params)
+}
+
 /// The n_tokens threshold at which `quantized_matmul_id_ggml` switches
 /// from the mv_id kernel to the mm_id kernel.  Matches llama.cpp's
 /// `ne11_mm_min = 8` (ggml-metal-ops.cpp:2046).
@@ -288,15 +397,73 @@ fn dispatch_id_mv(
     Ok(())
 }
 
-/// Matrix-matrix `_id` dispatch (ADR-011 Phase 3 Wave P3a).
+/// Caller-owned scratch for the `_id` mm path's map0 stage.
 ///
-/// Allocates two small scratch buffers (htpe + hids) per call to hold
-/// map0's per-expert routed-token lists.  On Apple Silicon's unified
-/// memory these allocations are just Metal `newBufferWithLength:` calls
-/// — fast and page-aligned.  Upcoming work (Phase 3b) will pool these
-/// so prefills amortise the cost across layers.
+/// Holds the two small buffers map0 writes and mm_id reads
+/// (`htpe`: `[n_experts]` per-expert routed-token count, `hids`:
+/// `[n_experts, n_tokens]` per-expert routed-token list).  Passing one
+/// instance through every mm_id call in a prefill amortises what would
+/// otherwise be two Metal allocations per MoE layer — ~60 allocations
+/// per Gemma 4 prefill.
+///
+/// Size the scratch for the largest `(n_experts, n_tokens)` pair the
+/// session will dispatch; callers use `IdMmScratch::alloc(dev, n_experts,
+/// max_n_tokens)` once at prefill start.  Smaller subsequent dispatches
+/// reuse the same buffers (kernel only touches the first
+/// `n_experts * n_tokens` u32s).
+pub struct IdMmScratch {
+    pub htpe: MlxBuffer,
+    pub hids: MlxBuffer,
+    n_experts_cap: u32,
+    n_tokens_cap: u32,
+}
+
+impl IdMmScratch {
+    /// Allocate scratch sized to `n_experts * max_n_tokens` u32s.
+    pub fn alloc(
+        device: &MlxDevice,
+        n_experts: u32,
+        max_n_tokens: u32,
+    ) -> Result<Self> {
+        let htpe = device.alloc_buffer(
+            (n_experts as usize) * DType::U32.size_of(),
+            DType::U32,
+            vec![n_experts as usize],
+        )?;
+        let hids = device.alloc_buffer(
+            (n_experts as usize) * (max_n_tokens as usize) * DType::U32.size_of(),
+            DType::U32,
+            vec![n_experts as usize, max_n_tokens as usize],
+        )?;
+        Ok(Self {
+            htpe,
+            hids,
+            n_experts_cap: n_experts,
+            n_tokens_cap: max_n_tokens,
+        })
+    }
+
+    fn check_capacity(&self, n_experts: u32, n_tokens: u32) -> Result<()> {
+        if n_experts > self.n_experts_cap {
+            return Err(MlxError::InvalidArgument(format!(
+                "IdMmScratch: n_experts ({}) > cap ({})",
+                n_experts, self.n_experts_cap,
+            )));
+        }
+        if n_tokens > self.n_tokens_cap {
+            return Err(MlxError::InvalidArgument(format!(
+                "IdMmScratch: n_tokens ({}) > cap ({})",
+                n_tokens, self.n_tokens_cap,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Matrix-matrix `_id` dispatch using caller-owned scratch (ADR-011 Phase
+/// 3 Wave P3b).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_id_mm(
+fn dispatch_id_mm_pooled(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -304,8 +471,11 @@ fn dispatch_id_mm(
     weight: &MlxBuffer,
     ids: &MlxBuffer,
     output: &mut MlxBuffer,
+    scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    scratch.check_capacity(params.n_experts, params.n_tokens)?;
+
     // Translate the dispatcher-facing params to the mm_id internal dispatch
     // shape.  Same fields; different type keeps the public mv params from
     // becoming mm-specific.
@@ -319,18 +489,34 @@ fn dispatch_id_mm(
         ggml_type: params.ggml_type,
     };
 
-    let mut htpe = device.alloc_buffer(
-        dispatch.htpe_bytes(), DType::U32, vec![params.n_experts as usize]
-    )?;
-    let mut hids = device.alloc_buffer(
-        dispatch.hids_bytes(), DType::U32,
-        vec![params.n_experts as usize, params.n_tokens as usize],
-    )?;
-
     dispatch_id_mm_for_test(
         encoder, registry, device,
         input, weight, ids,
-        &mut htpe, &mut hids, output, &dispatch,
+        &mut scratch.htpe, &mut scratch.hids, output, &dispatch,
+    )
+}
+
+/// Matrix-matrix `_id` dispatch that allocates scratch on every call.
+///
+/// Retained for the auto-allocating `quantized_matmul_id_ggml` entry
+/// point (tests, non-prefill callers); the pooled entry point
+/// `quantized_matmul_id_ggml_pooled` is preferred for batched prefill.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_id_mm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &mut MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    let mut scratch = IdMmScratch::alloc(device, params.n_experts, params.n_tokens)?;
+    dispatch_id_mm_pooled(
+        encoder, registry, device,
+        input, weight, ids, output,
+        &mut scratch, params,
     )
 }
 
