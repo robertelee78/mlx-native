@@ -132,6 +132,17 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
 
+        // MoE-routed quantized matrix-matrix kernels — tensor API variant
+        // (ADR-011 Phase 3 Wave P3b-tensor).  Uses the MPP tensor_ops
+        // matmul2d primitive for hardware-tensor-core MMA on M3+.  Only
+        // the mm_id kernel is ported — map0 is a short pre-pass (not
+        // matmul) and continues to use the simdgroup version.
+        let ggml_id_mm_tensor_src: &'static str =
+            include_str!("shaders/quantized_matmul_id_mm_tensor.metal");
+        sources.insert("kernel_mul_mm_id_q4_0_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert("kernel_mul_mm_id_q8_0_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert("kernel_mul_mm_id_q6_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");
         sources.insert("embedding_gather_4bit".into(), embedding_src);

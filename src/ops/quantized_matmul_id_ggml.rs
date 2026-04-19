@@ -81,6 +81,31 @@ impl GgmlType {
             GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
         }
     }
+
+    /// Tensor-API variant of the mm_id kernel (ADR-011 Phase 3 Wave
+    /// P3b-tensor).  Dispatcher falls back to `id_mm_kernel_name()` when
+    /// the tensor pipeline probe fails on pre-M3 hardware.
+    fn id_mm_tensor_kernel_name(self) -> &'static str {
+        match self {
+            GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
+            GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
+            GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
+        }
+    }
+}
+
+/// One-shot probe for mm_id tensor-API availability.  Cached separately
+/// from the dense-mm probe in quantized_matmul_ggml.rs because these are
+/// distinct shader files; whichever runs first pays its own compile cost.
+static TENSOR_MM_ID_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
+    *TENSOR_MM_ID_AVAILABLE.get_or_init(|| {
+        registry
+            .get_pipeline("kernel_mul_mm_id_q4_0_tensor_f32", device.metal_device())
+            .is_ok()
+    })
 }
 
 /// Encode an expert-routed GGML quantized matrix-vector multiply.
@@ -777,9 +802,17 @@ pub fn dispatch_id_mm_for_test(
     encoder.memory_barrier();
 
     // ---- Stage 2: mm_id — matmul with the per-expert lists ----
-    let mm_pipeline = registry.get_pipeline(
-        params.ggml_type.id_mm_kernel_name(), device.metal_device()
-    )?;
+    //
+    // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
+    // mm_id variant on M3+.  The probe caches the decision after the
+    // first dispatch; subsequent calls are branch-free.
+    let use_tensor = probe_tensor_mm_id(registry, device);
+    let mm_kernel_name = if use_tensor {
+        params.ggml_type.id_mm_tensor_kernel_name()
+    } else {
+        params.ggml_type.id_mm_kernel_name()
+    };
+    let mm_pipeline = registry.get_pipeline(mm_kernel_name, device.metal_device())?;
 
     let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
     let row_bytes = (params.k as u64) * (DType::F32.size_of() as u64);
