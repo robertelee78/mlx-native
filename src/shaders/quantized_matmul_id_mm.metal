@@ -239,8 +239,18 @@ kernel void hf2q_mul_mm_id_map0_impl(
     tpe_u32[ide] = n_all;
 }
 
-// Gemma 4 uses top_k = 8.  We only instantiate that value today; other
-// values can be added when needed.
+// Gemma 4 uses top_k = 8 for the MoE gate_up call and top_k = 1 for the
+// MoE down call (where the gate_up output is flattened to
+// [seq_len*top_k] rows, each one routed to a single expert via the
+// expert-id table).  Both must hit the mm_id path — without ne20_1, the
+// down call falls back to mv_id and re-reads each expert's weights once
+// per (seq_len * top_k) row, defeating the whole point of mm.
+template [[host_name("kernel_mul_mm_id_map0_ne20_1")]]
+kernel void hf2q_mul_mm_id_map0_impl<1>(
+    constant GgmlMatmulIdMm_Map0Params &,
+    device const char *, device char *, device char *,
+    threadgroup char *, ushort, ushort);
+
 template [[host_name("kernel_mul_mm_id_map0_ne20_8")]]
 kernel void hf2q_mul_mm_id_map0_impl<8>(
     constant GgmlMatmulIdMm_Map0Params &,

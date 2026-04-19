@@ -216,19 +216,25 @@ pub fn quantized_matmul_id_ggml(
         )));
     }
 
-    // ADR-011 Phase 3 Wave P3a — route on n_tokens threshold.
+    // ADR-011 Phase 3 — route on n_tokens threshold.
     //
-    // At prefill with n_tokens > 8 and top_k=8, dispatch the two-stage
-    // mm_id kernels (map0 + mm).  Each expert's weight tile is staged
-    // once to threadgroup shmem per 32-row block of that expert's routed
-    // tokens — identical to the dense mm dispatcher's win but per-expert.
+    // At prefill with n_tokens > 8, dispatch the two-stage mm_id kernels
+    // (map0 + mm).  Each expert's weight tile is staged once to
+    // threadgroup shmem per 32-row block of that expert's routed tokens
+    // — identical to the dense mm dispatcher's win but per-expert.
+    //
+    // P3b-tensor.2 — extended to top_k=1 (Gemma 4's MoE down call).
+    // Without this the down call's 19,640-row matmul falls back to mv_id
+    // and re-reads each expert's weights once per row — ~50% of prefill
+    // wall time burnt on weight re-reads.  Today we have ne20_1 and
+    // ne20_8 instantiations; other top_k values still fall back to mv_id.
     //
     // Falls back to the mv_id path for:
     //   * decode (n_tokens <= 8)
-    //   * top_k values other than 8 (only ne20_8 is instantiated today)
+    //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
-        && params.top_k == 8
+        && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
     {
         return dispatch_id_mm(
@@ -335,8 +341,9 @@ pub fn quantized_matmul_id_ggml_pooled(
         )));
     }
 
+    // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
-        && params.top_k == 8
+        && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
     {
         return dispatch_id_mm_pooled(
@@ -702,10 +709,11 @@ pub fn dispatch_id_mm_for_test(
         )));
     }
 
-    // Match the top_k template instantiation available in the shader.
-    if params.top_k != 8 {
+    // Match the top_k template instantiations available in the shader.
+    // P3b-tensor.2 — added ne20_1 alongside ne20_8 (Gemma 4 MoE down).
+    if params.top_k != 1 && params.top_k != 8 {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_id_mm_for_test: only top_k=8 is instantiated (got {})",
+            "dispatch_id_mm_for_test: top_k {} has no map0 instantiation (need 1 or 8)",
             params.top_k
         )));
     }
@@ -760,9 +768,23 @@ pub fn dispatch_id_mm_for_test(
     //
     // Dispatch: 1 threadgroup of `n_experts` threads.  Shared memory:
     // `n_experts * top_k * sizeof(uint16)` staging area.
-    let map0_pipeline = registry.get_pipeline(
-        "kernel_mul_mm_id_map0_ne20_8", device.metal_device()
-    )?;
+    //
+    // ADR-011 Phase 3 Wave P3b-tensor.2 — pick the map0 instantiation
+    // whose `ne20` template arg matches our top_k.  Gemma 4 needs both:
+    // `ne20_8` for the gate_up call (top_k=8) and `ne20_1` for the
+    // down call (top_k=1, where each output row routes to a single
+    // expert).  Without ne20_1 the top_k=1 caller falls back to mv_id
+    // and re-reads each expert's weights once per (seq_len*top_k) row —
+    // ~50% of prefill time wasted on weight re-reads.
+    let map0_kernel_name = match params.top_k {
+        1 => "kernel_mul_mm_id_map0_ne20_1",
+        8 => "kernel_mul_mm_id_map0_ne20_8",
+        other => return Err(MlxError::InvalidArgument(format!(
+            "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
+            other
+        ))),
+    };
+    let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
 
     let map0_params = GgmlIdMmMap0GpuParams {
         ne10: params.n.try_into().map_err(|_| {

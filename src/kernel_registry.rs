@@ -127,6 +127,7 @@ impl KernelRegistry {
         // block of that expert's routed tokens.
         let ggml_id_mm_src: &'static str =
             include_str!("shaders/quantized_matmul_id_mm.metal");
+        sources.insert("kernel_mul_mm_id_map0_ne20_1".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
