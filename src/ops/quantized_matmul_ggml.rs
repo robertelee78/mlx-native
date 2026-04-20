@@ -514,3 +514,194 @@ fn dispatch_mm(
 fn div_ceil(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
+
+// ===========================================================================
+// Wave P4.19 — bf16-input perm021 entry point for tensor-mm
+//
+// Used by the hf2q batched prefill's O-projection to consume the flash-
+// attention output buffer (bf16 at [n_heads, seq_len, head_dim] physical
+// layout) directly, eliminating the dedicated `permute_021_bf16_to_f32`
+// dispatch that otherwise runs every layer.
+//
+// Semantics:
+//   output[t, c] = sum_{i=0..K-1} weight[c, i] * src1_logical[t, i]
+// where src1_logical[t, i] is obtained from the physical bf16 buffer at
+//   src1_bf16[h * seq_len * head_dim + t * head_dim + f],  h = i / head_dim,
+//                                                          f = i mod head_dim.
+// K must equal n_heads * head_dim, and head_dim must be a multiple of NK=32
+// (Gemma 4: head_dim ∈ {256 sliding, 512 global} — both satisfy).
+//
+// See /opt/mlx-native/src/shaders/quantized_matmul_mm_tensor.metal kernel
+// `hf2q_mul_mm_tensor_perm021_impl` for the byte-exact equivalence proof.
+// ===========================================================================
+
+/// GPU-side params for the perm021 tensor-mm kernel — must match the
+/// shader's `GgmlMatmulMmTensorPerm021Params`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GgmlMatmulMmTensorPerm021GpuParams {
+    ne00: i32,   // K = n_heads * head_dim
+    ne02: i32,
+    nb01: u64,   // bytes per weight row
+    nb02: u64,
+    nb03: u64,
+    ne12: i32,
+    _pad0: u32,
+    nb10: u64,   // = sizeof(bfloat) = 2
+    nb11: u64,   // unused (kept for struct symmetry)
+    nb12: u64,
+    nb13: u64,
+    ne0: i32,    // N = hidden_size
+    ne1: i32,    // M = seq_len
+    r2: i16,
+    r3: i16,
+    // NO _pad between r3 and head_dim: Metal auto-aligns int32_t after
+    // two int16_t at 2-byte boundary; the next int32_t naturally lands
+    // at offset 84 (= 80 + 2 + 2).  Adding a u32 pad here would slide
+    // head_dim to byte 88, mismatching the Metal struct layout and
+    // causing the GPU to read head_dim = 0 (verified empirically
+    // 2026-04-20: an earlier version with _pad1 produced first_token
+    // 236772 instead of the expected 29294; removing the pad restored
+    // byte-identity).
+    head_dim: i32,
+    seq_len: i32,
+    // Trailing pad to bring struct size to a multiple of 8 (largest
+    // member alignment = u64).  Rust's repr(C) auto-inserts this to 96
+    // bytes anyway, but bytemuck::Pod rejects implicit trailing padding;
+    // an explicit pad makes the derive compile and matches Metal's
+    // struct size exactly.
+    _pad_trailing: u32,
+}
+
+/// Params for the perm021 tensor-mm dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct GgmlQuantizedMatmulPerm021Params {
+    /// M — number of rows / tokens.
+    pub m: u32,
+    /// N — number of output cols (= hidden_size).
+    pub n: u32,
+    /// K — hidden_size (= n_heads * head_dim).  Must be divisible by
+    /// the block's QK and by `head_dim`.
+    pub k: u32,
+    /// Head dimension.  Must be a multiple of NK=32.
+    pub head_dim: u32,
+    /// GGML quantization type of the weight (Q4_0 or Q6_K).
+    pub ggml_type: GgmlType,
+}
+
+/// Dispatch the bf16-input permuted-021 variant of the tensor-mm kernel.
+///
+/// `weight` is the quantized O-projection weight `[n, k]`.
+/// `input_bf16` is the flash-attention output at physical layout
+///   `[n_heads, seq_len, head_dim]` bf16.
+/// `output` is the standard `[m, n]` f32 O-proj result.
+///
+/// # Errors
+/// Returns `InvalidArgument` if:
+/// - `ggml_type` is not Q4_0 or Q6_K
+/// - `head_dim` is not a positive multiple of 32
+/// - `k != n_heads * head_dim`  (we infer n_heads = k / head_dim)
+/// - buffer sizes don't match the declared shapes
+pub fn quantized_matmul_mm_tensor_perm021(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &mut MlxBuffer,
+    params: &GgmlQuantizedMatmulPerm021Params,
+) -> Result<()> {
+    let kernel_name = match params.ggml_type {
+        GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_bf16_perm021",
+        GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_bf16_perm021",
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_mm_tensor_perm021: unsupported ggml_type {:?} \
+                 (only Q4_0 and Q6_K are instantiated)",
+                other
+            )));
+        }
+    };
+
+    if params.head_dim == 0 || params.head_dim % 32 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: head_dim {} must be a positive \
+             multiple of 32 (NK tile width)",
+            params.head_dim
+        )));
+    }
+    if params.k % params.head_dim != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: k ({}) must be divisible by \
+             head_dim ({})",
+            params.k, params.head_dim
+        )));
+    }
+
+    // Input-buffer size check: n_heads * seq_len * head_dim * sizeof(bfloat).
+    let n_heads = params.k / params.head_dim;
+    let expected_input_bytes = (n_heads as usize) * (params.m as usize)
+        * (params.head_dim as usize) * 2;
+    if input_bf16.byte_len() < expected_input_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: input_bf16 buffer too small \
+             (have {}, need {})",
+            input_bf16.byte_len(), expected_input_bytes
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+
+    let qk = params.ggml_type.block_values();
+    let block_bytes = params.ggml_type.block_bytes();
+    let blocks_per_row = params.k / qk;
+    let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
+
+    let gpu_params = GgmlMatmulMmTensorPerm021GpuParams {
+        ne00: params.k as i32,
+        ne02: 1,
+        nb01,
+        nb02: nb01 * (params.n as u64),
+        nb03: 0,
+        ne12: 1,
+        _pad0: 0,
+        nb10: 2, // sizeof(bfloat)
+        nb11: 0, // unused; B-stage computes addresses directly
+        nb12: 0,
+        nb13: 0,
+        ne0: params.n as i32,
+        ne1: params.m as i32,
+        r2: 1,
+        r3: 1,
+        head_dim: params.head_dim as i32,
+        seq_len: params.m as i32,
+        _pad_trailing: 0,
+    };
+
+    const NR0: u64 = 64;
+    const NR1: u64 = 32;
+    const THREADS_PER_TG: u64 = 128;
+    const SHMEM_BYTES: u64 = 8192;
+
+    let threadgroups = metal::MTLSize::new(
+        (params.m as u64 + NR1 - 1) / NR1,
+        (params.n as u64 + NR0 - 1) / NR0,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(weight)),
+            (2, KernelArg::Buffer(input_bf16)),
+            (3, KernelArg::Buffer(output)),
+        ],
+        &[(0, SHMEM_BYTES)],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
