@@ -199,7 +199,9 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        // Stage A
+        // Stage A.  See dense mm_tensor kernel preamble for the
+        // explanation of why we DO NOT add llama.cpp's FOR_UNROLL pragma
+        // here on M5 — null measured effect, P4.8 attempt 2026-04-19.
         {
             half4x4 temp_a;
             dequantize_func(x, il, temp_a);

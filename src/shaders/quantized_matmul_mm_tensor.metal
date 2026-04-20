@@ -238,6 +238,15 @@ kernel void hf2q_mul_mm_tensor_impl(
         // element to `sa + NK*(8*sy + ly) + 8*sx + lx`.  Matches
         // llama.cpp ggml-metal.metal:9446-9456 (GGML_METAL_HAS_TENSOR
         // branch).
+        //
+        // NOTE: We DO NOT add llama.cpp's FOR_UNROLL pragma here.
+        // Tested 2026-04-19 (P4.8): no measurable prefill delta on M5
+        // Max (5-run median 2710 tok/s with vs 2710 without).  The
+        // Metal compiler unrolls 16-iter constant-bound loops on its
+        // own; the explicit pragma adds no value on this gen.  Per
+        // project memory entry "Metal compiler auto-optimizes static
+        // levers", we leave the source minimal rather than carrying a
+        // null-effect annotation that suggests the compiler doesn't.
         {
             half4x4 temp_a;
             dequantize_func(x, il, temp_a);
