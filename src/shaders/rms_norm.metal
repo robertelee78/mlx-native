@@ -487,6 +487,78 @@ kernel void rms_norm_no_scale_f32_dual(
 }
 
 // ---------------------------------------------------------------------------
+// rms_norm_no_scale_f32_dual_perm — V-norm that writes bf16 output at the
+// permuted [n_heads, seq_len, head_dim] layout instead of the natural
+// [seq_len, n_heads, head_dim] layout.  Wave P4.16.
+//
+// Replaces the V-permute_021_bf16 dispatch (~30/prefill on Gemma 4) by
+// having the V-norm itself write directly into the FA-expected head-major
+// layout.  Same compute as rms_norm_no_scale_f32_dual; only the bf16
+// output index changes.  f32 output (used by KV cache copy downstream)
+// remains at natural layout — KV cache copy expects [seq_len, n_heads,
+// head_dim] source.
+//
+// Buffers:
+//   0: input        — float [rows * dim]   (rows = seq_len * n_heads)
+//   1: output       — float [rows * dim]   (natural layout — KV cache src)
+//   2: params       — float [eps, dim]
+//   3: output_bf16  — bfloat [rows * dim]  (permuted layout — FA src)
+//   4: aux_params   — uint  [n_heads, seq_len]  (permuted-index calc)
+//
+// Threadgroup: (min(256, next_pow2(dim)), 1, 1) — one threadgroup per row
+// Grid       : (rows, 1, 1)
+// ---------------------------------------------------------------------------
+kernel void rms_norm_no_scale_f32_dual_perm(
+    device const float *input       [[buffer(0)]],
+    device float       *output      [[buffer(1)]],
+    device const float *params      [[buffer(2)]],
+    device bfloat      *output_bf16 [[buffer(3)]],
+    constant uint2&     aux_params  [[buffer(4)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    threadgroup float *shared       [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+    const uint n_heads = aux_params.x;
+    const uint seq_len = aux_params.y;
+
+    const uint base = row_idx * dim;
+    // Permuted bf16 base: rows are laid out [seq_len, n_heads, dim] in
+    // input/output, so row_idx = token * n_heads + head.  The permuted
+    // bf16 layout is [n_heads, seq_len, dim], so the bf16 base is
+    //   head * (seq_len * dim) + token * dim.
+    const uint head    = row_idx % n_heads;
+    const uint token   = row_idx / n_heads;
+    const uint base_bf = head * (seq_len * dim) + token * dim;
+
+    float partial_sum_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float val = input[base + i];
+        partial_sum_sq += val * val;
+    }
+
+    shared[tid] = partial_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float v = input[base + i] * rms_inv;
+        output[base + i]         = v;
+        output_bf16[base_bf + i] = bfloat(v);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // rms_norm_f32_triple — fused 3-output RMS norm with shared compute.
 //
 // Computes RMS(input) ONCE, then applies three different per-element
