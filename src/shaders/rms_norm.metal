@@ -485,3 +485,82 @@ kernel void rms_norm_no_scale_f32_dual(
         output_bf16[base + i] = bfloat(v);
     }
 }
+
+// ---------------------------------------------------------------------------
+// rms_norm_f32_triple — fused 3-output RMS norm with shared compute.
+//
+// Computes RMS(input) ONCE, then applies three different per-element
+// weight vectors to produce three outputs.  Used by hf2q's batched
+// prefill at the pre-FF point where the residual stream is normed three
+// separate ways (pre_feedforward_layernorm for MLP, pre_feedforward_
+// layernorm_2 for MoE input, router_combined_weight for MoE routing).
+//
+// Wave P4.9 — replaces three separate `rms_norm_f32` dispatches per
+// layer (60 dispatches/prefill on Gemma 4) with one shared-compute
+// dispatch.  Bandwidth: input is read once instead of three times,
+// saving ~40 MB of read traffic per layer at pp2455 (input is
+// 2455×2048×4 = 20 MB).
+//
+// Buffers:
+//   0: input    — float [rows * dim]
+//   1: weight_a — float [dim]
+//   2: weight_b — float [dim]
+//   3: weight_c — float [dim]
+//   4: output_a — float [rows * dim]
+//   5: output_b — float [rows * dim]
+//   6: output_c — float [rows * dim]
+//   7: params   — float [eps, dim]
+//
+// Same compute structure as rms_norm_f32 (Phase 1: sum of squares + tree
+// reduce; Phase 2: rsqrt + 3 weight multiplies).  The Phase 2 loop
+// reads input[i] once, multiplies by rms_inv and three different
+// weight[i] values to produce three outputs.
+// ---------------------------------------------------------------------------
+kernel void rms_norm_f32_triple(
+    device const float *input    [[buffer(0)]],
+    device const float *weight_a [[buffer(1)]],
+    device const float *weight_b [[buffer(2)]],
+    device const float *weight_c [[buffer(3)]],
+    device float       *output_a [[buffer(4)]],
+    device float       *output_b [[buffer(5)]],
+    device float       *output_c [[buffer(6)]],
+    device const float *params   [[buffer(7)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    threadgroup float *shared    [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+
+    const uint base = row_idx * dim;
+
+    // Phase 1: sum of squares — read input once.
+    float partial_sum_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float val = input[base + i];
+        partial_sum_sq += val * val;
+    }
+
+    shared[tid] = partial_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 2: read input again, multiply by rms_inv * weight, write
+    // three outputs.  Compiler hoists the input load and rms_inv*input
+    // factor across the three multiplies.
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float vn = input[base + i] * rms_inv;
+        output_a[base + i] = vn * weight_a[i];
+        output_b[base + i] = vn * weight_b[i];
+        output_c[base + i] = vn * weight_c[i];
+    }
+}

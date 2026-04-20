@@ -137,6 +137,122 @@ pub fn dispatch_rms_norm(
     Ok(())
 }
 
+/// Dispatch a fused 3-output RMS normalization (f32 only).
+///
+/// Computes RMS(input) ONCE, then applies three different per-element
+/// weight vectors to produce three outputs:
+///   output_a = input * rsqrt(mean(input^2) + eps) * weight_a
+///   output_b = input * rsqrt(mean(input^2) + eps) * weight_b
+///   output_c = input * rsqrt(mean(input^2) + eps) * weight_c
+///
+/// Replaces three separate `dispatch_rms_norm` calls when the input is
+/// the same.  Saves 2 dispatches and reads `input` once instead of
+/// three times.  Wave P4.9.
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry (must have rms_norm_f32_triple registered).
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Shared input buffer of shape `[rows, dim]` (f32).
+/// * `weight_a`   - First weight vector `[dim]` (f32).
+/// * `weight_b`   - Second weight vector `[dim]` (f32).
+/// * `weight_c`   - Third weight vector `[dim]` (f32).
+/// * `output_a`   - First output buffer `[rows, dim]` (f32).
+/// * `output_b`   - Second output buffer `[rows, dim]` (f32).
+/// * `output_c`   - Third output buffer `[rows, dim]` (f32).
+/// * `params_buf` - Params buffer containing `[eps, dim]` as f32.
+/// * `rows`       - Number of rows to normalize.
+/// * `dim`        - Dimension of the last axis.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if parameters are invalid.
+pub fn dispatch_rms_norm_f32_triple(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    weight_a: &MlxBuffer,
+    weight_b: &MlxBuffer,
+    weight_c: &MlxBuffer,
+    output_a: &MlxBuffer,
+    output_b: &MlxBuffer,
+    output_c: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "RMS norm triple: rows and dim must be > 0".into(),
+        ));
+    }
+
+    let expected = (rows as usize) * (dim as usize);
+    for (name, buf) in [
+        ("input", input),
+        ("output_a", output_a),
+        ("output_b", output_b),
+        ("output_c", output_c),
+    ] {
+        if buf.element_count() != expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "RMS norm triple: {} element count {} != rows({}) * dim({})",
+                name, buf.element_count(), rows, dim
+            )));
+        }
+        if buf.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "RMS norm triple: {} must be f32, got {}",
+                name, buf.dtype()
+            )));
+        }
+    }
+    for (name, buf) in [
+        ("weight_a", weight_a),
+        ("weight_b", weight_b),
+        ("weight_c", weight_c),
+    ] {
+        if buf.element_count() != dim as usize {
+            return Err(MlxError::InvalidArgument(format!(
+                "RMS norm triple: {} element count {} != dim({})",
+                name, buf.element_count(), dim
+            )));
+        }
+        if buf.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "RMS norm triple: {} must be f32, got {}",
+                name, buf.dtype()
+            )));
+        }
+    }
+
+    let pipeline = registry.get_pipeline("rms_norm_f32_triple", device)?;
+
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4;
+
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[
+            (0, input),
+            (1, weight_a),
+            (2, weight_b),
+            (3, weight_c),
+            (4, output_a),
+            (5, output_b),
+            (6, output_c),
+            (7, params_buf),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Dispatch an RMS normalization without learned scale (bf16 only).
 ///
 /// Computes: `output = x * rsqrt(mean(x^2) + eps)` — no weight multiplication.
