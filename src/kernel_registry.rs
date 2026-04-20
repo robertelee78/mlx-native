@@ -105,6 +105,16 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
 
+        // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
+        // prefill Q@K^T and scores@V, modeled on llama.cpp's
+        // kernel_mul_mm_bf16_f32 with the GGML_METAL_HAS_TENSOR branch
+        // active).  Tile geometry and write-back identical to the
+        // quantized tensor kernel; only the A-stage copy (bfloat →
+        // bfloat, no dequantize) differs.
+        let dense_mm_bf16_tensor_src: &'static str =
+            include_str!("shaders/dense_mm_bf16_tensor.metal");
+        sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
+
         // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
         sources.insert(
             "quantized_matmul_id".into(),

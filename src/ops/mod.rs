@@ -7,6 +7,7 @@ pub mod argsort;
 pub mod top_k;
 pub mod copy;
 pub mod dense_gemm;
+pub mod dense_mm_bf16;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
