@@ -155,6 +155,76 @@ kernel void kv_cache_copy_seq_f32(
     cache[dst_idx] = src[src_idx];
 }
 
+/// Fused K + V multi-position cache copy (F32 source → F32 cache).
+///
+/// Combines two kv_cache_copy_seq_f32 dispatches (one for K, one for V)
+/// into a single kernel.  The two streams have identical shape, identical
+/// dst layout (n_heads × capacity × head_dim), and shared metadata
+/// (capacity, seq_pos_start, n_tokens, src_tok_offset) — so we can merge
+/// them with no extra register pressure.  Each thread copies one (K, V)
+/// element pair at the same coordinates.
+///
+/// Wave P4.11 — saves one dispatch per layer (30/prefill on Gemma 4).
+///
+/// Grid: same as kv_cache_copy_seq_f32 (3D — x=elem, y=head, z=token).
+kernel void kv_cache_copy_seq_f32_kv_dual(
+    device const float* src_k         [[buffer(0)]],
+    device const float* src_v         [[buffer(1)]],
+    device float*       cache_k       [[buffer(2)]],
+    device float*       cache_v       [[buffer(3)]],
+    constant uint&     n_heads        [[buffer(4)]],
+    constant uint&     head_dim       [[buffer(5)]],
+    constant uint&     capacity       [[buffer(6)]],
+    constant uint&     seq_pos_start  [[buffer(7)]],
+    constant uint&     n_tokens       [[buffer(8)]],
+    constant uint&     src_tok_offset [[buffer(9)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    uint tok  = tid.z;
+    if (head >= n_heads || elem >= head_dim || tok >= n_tokens) return;
+
+    uint src_tok = src_tok_offset + tok;
+    uint src_idx = src_tok * (n_heads * head_dim) + head * head_dim + elem;
+    uint dst_pos = seq_pos_start + tok;
+    uint slot    = dst_pos % capacity;
+    uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
+    cache_k[dst_idx] = src_k[src_idx];
+    cache_v[dst_idx] = src_v[src_idx];
+}
+
+/// Fused K + V multi-position cache copy (F32 source → F16 cache).
+///
+/// Same as kv_cache_copy_seq_f32_kv_dual but casts to half on write —
+/// for the use_f16_kv branch.  Wave P4.11.
+kernel void kv_cache_copy_seq_f32_to_f16_kv_dual(
+    device const float* src_k         [[buffer(0)]],
+    device const float* src_v         [[buffer(1)]],
+    device half*        cache_k       [[buffer(2)]],
+    device half*        cache_v       [[buffer(3)]],
+    constant uint&     n_heads        [[buffer(4)]],
+    constant uint&     head_dim       [[buffer(5)]],
+    constant uint&     capacity       [[buffer(6)]],
+    constant uint&     seq_pos_start  [[buffer(7)]],
+    constant uint&     n_tokens       [[buffer(8)]],
+    constant uint&     src_tok_offset [[buffer(9)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    uint tok  = tid.z;
+    if (head >= n_heads || elem >= head_dim || tok >= n_tokens) return;
+
+    uint src_tok = src_tok_offset + tok;
+    uint src_idx = src_tok * (n_heads * head_dim) + head * head_dim + elem;
+    uint dst_pos = seq_pos_start + tok;
+    uint slot    = dst_pos % capacity;
+    uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
+    cache_k[dst_idx] = half(src_k[src_idx]);
+    cache_v[dst_idx] = half(src_v[src_idx]);
+}
+
 /// Multi-position, all-heads KV cache copy (BF16 source → F32 cache).
 ///
 /// Same layout/semantics as kv_cache_copy_seq_f32 — including `src_tok_offset`

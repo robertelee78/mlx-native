@@ -397,6 +397,142 @@ pub fn dispatch_kv_cache_copy_seq_f32(
     Ok(())
 }
 
+/// Fused K + V cache copy (F32 source → F32 cache).  Wave P4.11.
+///
+/// Combines two `dispatch_kv_cache_copy_seq_f32` calls (one for K, one
+/// for V) into one dispatch.  Both streams share identical metadata
+/// (n_heads, head_dim, capacity, seq_pos_start, n_tokens,
+/// src_tok_offset) and are independently addressed in src/cache, so a
+/// single thread can copy one (K, V) element pair at the same
+/// coordinates.  Saves 1 dispatch per layer (30/prefill on Gemma 4).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_seq_f32_dual(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    cache_k: &MlxBuffer,
+    cache_v: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
+        return Ok(());
+    }
+    let total_src = ((src_tok_offset as u64) + (n_tokens as u64))
+        * (n_heads as u64) * (head_dim as u64);
+    for (name, b) in [("src_k", src_k), ("src_v", src_v)] {
+        if (b.element_count() as u64) < total_src {
+            return Err(MlxError::InvalidArgument(format!(
+                "kv_cache_copy_seq_f32_dual: {} has {} elements, need {}",
+                name, b.element_count(), total_src
+            )));
+        }
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_seq_f32_kv_dual", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
+    let n_tokens_bytes = n_tokens.to_ne_bytes();
+    let src_tok_offset_bytes = src_tok_offset.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src_k)),
+            (1, KernelArg::Buffer(src_v)),
+            (2, KernelArg::Buffer(cache_k)),
+            (3, KernelArg::Buffer(cache_v)),
+            (4, KernelArg::Bytes(&n_heads_bytes)),
+            (5, KernelArg::Bytes(&head_dim_bytes)),
+            (6, KernelArg::Bytes(&capacity_bytes)),
+            (7, KernelArg::Bytes(&seq_pos_start_bytes)),
+            (8, KernelArg::Bytes(&n_tokens_bytes)),
+            (9, KernelArg::Bytes(&src_tok_offset_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Fused K + V cache copy (F32 source → F16 cache).  Wave P4.11
+/// f16-cache variant of `dispatch_kv_cache_copy_seq_f32_dual`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_seq_f32_to_f16_dual(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    cache_k: &MlxBuffer,
+    cache_v: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
+        return Ok(());
+    }
+    let total_src = ((src_tok_offset as u64) + (n_tokens as u64))
+        * (n_heads as u64) * (head_dim as u64);
+    for (name, b) in [("src_k", src_k), ("src_v", src_v)] {
+        if (b.element_count() as u64) < total_src {
+            return Err(MlxError::InvalidArgument(format!(
+                "kv_cache_copy_seq_f32_to_f16_dual: {} has {} elements, need {}",
+                name, b.element_count(), total_src
+            )));
+        }
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_seq_f32_to_f16_kv_dual", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
+    let n_tokens_bytes = n_tokens.to_ne_bytes();
+    let src_tok_offset_bytes = src_tok_offset.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src_k)),
+            (1, KernelArg::Buffer(src_v)),
+            (2, KernelArg::Buffer(cache_k)),
+            (3, KernelArg::Buffer(cache_v)),
+            (4, KernelArg::Bytes(&n_heads_bytes)),
+            (5, KernelArg::Bytes(&head_dim_bytes)),
+            (6, KernelArg::Bytes(&capacity_bytes)),
+            (7, KernelArg::Bytes(&seq_pos_start_bytes)),
+            (8, KernelArg::Bytes(&n_tokens_bytes)),
+            (9, KernelArg::Bytes(&src_tok_offset_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Multi-position, all-heads KV cache copy (BF16 source → F32 cache, batched prefill).
 ///
 /// Same layout and semantics as [`dispatch_kv_cache_copy_seq_f32`] — including

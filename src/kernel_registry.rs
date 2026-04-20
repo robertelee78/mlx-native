@@ -176,6 +176,9 @@ impl KernelRegistry {
         sources.insert("kv_cache_copy_batch_f32_to_f16".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32_to_f16".into(), kv_cache_src);
+        // Wave P4.11 — fused K+V copy variants
+        sources.insert("kv_cache_copy_seq_f32_kv_dual".into(), kv_cache_src);
+        sources.insert("kv_cache_copy_seq_f32_to_f16_kv_dual".into(), kv_cache_src);
         // bf16-source KV cache copy (Phase 2 bf16 activation path)
         sources.insert("kv_cache_copy_seq_bf16".into(), kv_cache_src);
 
