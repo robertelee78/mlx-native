@@ -368,6 +368,66 @@ pub fn dispatch_fused_moe_wsum_norm_add_f32(
     Ok(())
 }
 
+/// Dispatch fused MoE-weighted-sum + DOUBLE RMS norm + add (f32).  Wave P4.14.
+///
+/// Replaces a three-dispatch sequence (norm of pf_mlp_down +
+/// moe_weighted_sum + fused_norm_add of weighted into normed mlp_down) with
+/// one kernel.  See shader comment for the algorithm; saves 2 dispatches
+/// per layer (60/prefill on Gemma 4) and eliminates two intermediate
+/// buffer write+read cycles (~10 MB at pp2455 × 30 = 300 MB of memory
+/// traffic).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_moe_wsum_dnorm_add_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    expert_outputs: &MlxBuffer,
+    weights: &MlxBuffer,
+    residual: &MlxBuffer,
+    res_norm_weight: &MlxBuffer,
+    moe_norm_weight: &MlxBuffer,
+    output: &MlxBuffer,
+    dim: u32,
+    top_k: u32,
+    rows: u32,
+    eps: f32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_moe_wsum_dnorm_add_f32: rows, dim, top_k must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_moe_wsum_dnorm_add_f32", device)?;
+
+    // Threadgroup memory: 2 * tg_size (two reduction scratch arrays) + dim
+    // (per-row sum_buf for the weighted-sum carryover).
+    let tg_size = tg_size_for_dim(dim);
+    let shared_mem_bytes = ((2u64 * tg_size as u64) + (dim as u64)) * 4;
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(expert_outputs)),
+            (1, KernelArg::Buffer(weights)),
+            (2, KernelArg::Buffer(residual)),
+            (3, KernelArg::Buffer(res_norm_weight)),
+            (4, KernelArg::Buffer(moe_norm_weight)),
+            (5, KernelArg::Buffer(output)),
+            (6, KernelArg::Bytes(as_bytes(&dim))),
+            (7, KernelArg::Bytes(as_bytes(&top_k))),
+            (8, KernelArg::Bytes(as_bytes(&rows))),
+            (9, KernelArg::Bytes(as_bytes(&eps))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// GPU params struct for f32 variant — must match `FusedResidualNormF32Params`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
