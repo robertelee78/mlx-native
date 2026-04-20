@@ -195,6 +195,8 @@ struct GpuFusedHeadNormRopeF32Params {
     theta:            f32,
     has_freq_factors: u32,
     has_bf16_output:  u32,
+    bf16_permuted:    u32, // P4.15: write bf16 at permuted layout
+    seq_len:          u32, // P4.15: needed for permuted-index calc
 }
 
 /// Dispatch a fused per-head RMS norm + NeoX RoPE operation (f32).
@@ -277,6 +279,8 @@ pub fn dispatch_fused_head_norm_rope_f32(
         theta,
         has_freq_factors: u32::from(has_ff),
         has_bf16_output: 0,
+        bf16_permuted: 0,
+        seq_len: 1, // single-token decode variant
     };
 
     // Bind dummies for optional buffers
@@ -461,6 +465,8 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
         theta,
         has_freq_factors: u32::from(has_ff),
         has_bf16_output: 0,
+        bf16_permuted: 0,
+        seq_len,
     };
 
     let weight_buf = norm_weight.unwrap_or(input);
@@ -499,6 +505,12 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
 ///
 /// * `output_bf16`: bf16 buffer of shape `[seq_len * n_heads * head_dim]`
 ///   (or `None` to match the original f32-only contract).
+/// * `bf16_permuted`: P4.15 — when true, the bf16 output is written at
+///   permuted layout `[n_heads, seq_len, head_dim]` (head-major) instead of
+///   the natural `[seq_len, n_heads, head_dim]` (token-major).  Used to
+///   absorb the post-norm `permute_021_bf16` dispatch when feeding FA's
+///   head-major contract.  `output_bf16` must be sized `[seq_len * n_heads
+///   * head_dim]` either way (same total element count).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
     encoder: &mut CommandEncoder,
@@ -516,6 +528,7 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
     seq_len: u32,
     eps: f32,
     theta: f32,
+    bf16_permuted: bool,
 ) -> Result<()> {
     if n_heads == 0 || head_dim == 0 || seq_len == 0 {
         return Err(MlxError::InvalidArgument(
@@ -557,6 +570,8 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
         theta,
         has_freq_factors: u32::from(has_ff),
         has_bf16_output: u32::from(has_bf16),
+        bf16_permuted: u32::from(bf16_permuted && has_bf16),
+        seq_len,
     };
 
     let weight_buf = norm_weight.unwrap_or(input);

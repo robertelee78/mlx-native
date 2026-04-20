@@ -53,6 +53,11 @@ struct FusedHeadNormRopeF32Params {
     float theta;            // RoPE base frequency (e.g. 10000 or 1000000)
     uint  has_freq_factors; // nonzero if freq_factors buffer is valid
     uint  has_bf16_output;  // ADR-011 P3b.4 — nonzero to co-write bf16 output
+    uint  bf16_permuted;    // P4.15 — if 1, bf16 output written at permuted
+                            // [head, token, i] index instead of natural
+                            // [token, head, i] index, fusing the
+                            // permute_021_bf16 pre-FA dispatch.
+    uint  seq_len;          // P4.15 — needed to compute permuted index
 };
 
 kernel void fused_head_norm_rope_f32(
@@ -77,6 +82,8 @@ kernel void fused_head_norm_rope_f32(
     const float theta       = params.theta;
     const bool has_ff       = (params.has_freq_factors != 0u);
     const uint n_heads      = params.n_heads;
+    const bool bf16_perm    = (params.bf16_permuted != 0u);
+    const uint seq_len_v    = params.seq_len;
 
     // For single-token decode, seq_idx is always 0; head_id is which head.
     // The position comes from positions[seq_idx] where seq_idx = head_id / n_heads
@@ -85,6 +92,16 @@ kernel void fused_head_norm_rope_f32(
     const uint pos = positions[seq_idx];
 
     const uint base = head_id * head_dim;
+    // P4.15 — when bf16 output is written at permuted layout [head, token, i],
+    // the base for bf16 writes is different from the natural [token, head, i]
+    // base used for the f32 output.  permute_021_bf16 turns
+    // [seq_len, n_heads, head_dim] into [n_heads, seq_len, head_dim] so the
+    // permuted index for (token=seq_idx, head=head_within_token, i) is
+    //   head * seq_len * head_dim + token * head_dim + i.
+    const uint head_within_token = head_id % n_heads;
+    const uint base_bf16 = bf16_perm
+        ? (head_within_token * seq_len_v * head_dim + seq_idx * head_dim)
+        : base;
 
     // -------------------------------------------------------------------------
     // Phase 1: parallel sum-of-squares reduction
@@ -159,8 +176,8 @@ kernel void fused_head_norm_rope_f32(
         output[base + i]            = o0;
         output[base + i + half_dim] = o1;
         if (has_bf16) {
-            output_bf16[base + i]            = bfloat(o0);
-            output_bf16[base + i + half_dim] = bfloat(o1);
+            output_bf16[base_bf16 + i]            = bfloat(o0);
+            output_bf16[base_bf16 + i + half_dim] = bfloat(o1);
         }
     }
 
@@ -173,8 +190,8 @@ kernel void fused_head_norm_rope_f32(
         output[base + src]            = o0;
         output[base + src + half_dim] = o1;
         if (has_bf16) {
-            output_bf16[base + src]            = bfloat(o0);
-            output_bf16[base + src + half_dim] = bfloat(o1);
+            output_bf16[base_bf16 + src]            = bfloat(o0);
+            output_bf16[base_bf16 + src + half_dim] = bfloat(o1);
         }
     }
 }
