@@ -460,3 +460,40 @@ kernel void permute_021_bf16_to_f32(
 
     output[out_idx] = static_cast<float>(input[in_idx]);
 }
+
+// --------------------------------------------------------------------------
+// transpose_last2_bf16 — swap the last two axes of a 3D bf16 tensor.
+//
+//   input:  bfloat [A, B, C] row-major
+//   output: bfloat [A, C, B] row-major
+//
+// Used by hf2q's non-flash-attention prefill path to materialise V_t
+// (V transposed over seq↔hd) so the scores@V matmul can consume it at
+// the tile geometry the dense_mm_bf16_tensor kernel expects.
+//
+// Grid: (B, C, A) — each thread copies one element.  Threadgroup shape
+// is a divisor of (B, C); typical dispatch uses (16, 16, 1) threadgroups.
+//
+// Buffers:
+//   0: input  — bfloat [A * B * C]
+//   1: output — bfloat [A * C * B]
+//   2: params — Permute021Params { dim_a, dim_b, dim_c } (shared struct)
+// --------------------------------------------------------------------------
+kernel void transpose_last2_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint b = gid.x;
+    const uint c = gid.y;
+    const uint a = gid.z;
+
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+
+    const uint in_idx  = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    // output layout: [A, C, B].  dim_c rows of length dim_b per slice.
+    const uint out_idx = a * (params.dim_c * params.dim_b) + c * params.dim_b + b;
+
+    output[out_idx] = input[in_idx];
+}

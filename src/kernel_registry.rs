@@ -115,6 +115,15 @@ impl KernelRegistry {
             include_str!("shaders/dense_mm_bf16_tensor.metal");
         sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
 
+        // Fused scale-mask-softmax for the non-flash-attention prefill
+        // path.  One row-local threadgroup per (head, query) pair
+        // replaces three separate dispatches (scale, mask-add, softmax);
+        // reads a bf16 mask (-INF at masked positions, matching
+        // flash_attn_prefill_mask.metal) that is shared across heads.
+        let scale_mask_softmax_src: &'static str =
+            include_str!("shaders/scale_mask_softmax.metal");
+        sources.insert("scale_mask_softmax_f32".into(), scale_mask_softmax_src);
+
         // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
         sources.insert(
             "quantized_matmul_id".into(),
@@ -209,6 +218,7 @@ impl KernelRegistry {
         sources.insert("embedding_gather_scale_f32".into(), elementwise_src);
         sources.insert("embedding_gather_scale_batch_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16".into(), elementwise_src);
+        sources.insert("transpose_last2_bf16".into(), elementwise_src);
         sources.insert("permute_021_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16_to_f32".into(), elementwise_src);
         sources.insert("transpose_2d_f32".into(), elementwise_src);
