@@ -58,22 +58,30 @@ struct FusedHeadNormRopeF32Params {
                             // [token, head, i] index, fusing the
                             // permute_021_bf16 pre-FA dispatch.
     uint  seq_len;          // P4.15 — needed to compute permuted index
+    uint  has_f32_perm_output; // D.1 — nonzero to co-write f32 output at the
+                               // permuted [head, token, i] layout (same
+                               // index math as bf16_permuted).  Used by
+                               // HF2Q_NO_FA so the tensor-mm Q@K^T can
+                               // consume Q directly without an intermediate
+                               // bf16→f32 cast dispatch.
 };
 
 kernel void fused_head_norm_rope_f32(
-    device const float*                      input        [[buffer(0)]],
-    device float*                            output       [[buffer(1)]],
-    device const float*                      norm_weight  [[buffer(2)]],
-    constant FusedHeadNormRopeF32Params&     params       [[buffer(3)]],
-    device const uint*                       positions    [[buffer(4)]],
-    device const float*                      freq_factors [[buffer(5)]],
-    device bfloat*                           output_bf16  [[buffer(6)]],
+    device const float*                      input            [[buffer(0)]],
+    device float*                            output           [[buffer(1)]],
+    device const float*                      norm_weight      [[buffer(2)]],
+    constant FusedHeadNormRopeF32Params&     params           [[buffer(3)]],
+    device const uint*                       positions        [[buffer(4)]],
+    device const float*                      freq_factors     [[buffer(5)]],
+    device bfloat*                           output_bf16      [[buffer(6)]],
+    device float*                            output_f32_perm  [[buffer(7)]],
     uint head_id  [[threadgroup_position_in_grid]],
     uint tid      [[thread_index_in_threadgroup]],
     uint tg_size  [[threads_per_threadgroup]],
     threadgroup float* shared             [[threadgroup(0)]]
 ) {
     const bool has_bf16 = (params.has_bf16_output != 0u);
+    const bool has_f32_perm = (params.has_f32_perm_output != 0u);
     const uint head_dim     = params.head_dim;
     const uint half_rope    = params.half_rope_dim;
     const uint half_dim     = head_dim / 2;
@@ -179,6 +187,10 @@ kernel void fused_head_norm_rope_f32(
             output_bf16[base_bf16 + i]            = bfloat(o0);
             output_bf16[base_bf16 + i + half_dim] = bfloat(o1);
         }
+        if (has_f32_perm) {
+            output_f32_perm[base_bf16 + i]            = o0;
+            output_f32_perm[base_bf16 + i + half_dim] = o1;
+        }
     }
 
     // Pass through non-rotated dimensions:
@@ -192,6 +204,10 @@ kernel void fused_head_norm_rope_f32(
         if (has_bf16) {
             output_bf16[base_bf16 + src]            = bfloat(o0);
             output_bf16[base_bf16 + src + half_dim] = bfloat(o1);
+        }
+        if (has_f32_perm) {
+            output_f32_perm[base_bf16 + src]            = o0;
+            output_f32_perm[base_bf16 + src + half_dim] = o1;
         }
     }
 }

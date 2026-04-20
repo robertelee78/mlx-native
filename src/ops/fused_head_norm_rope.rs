@@ -197,6 +197,7 @@ struct GpuFusedHeadNormRopeF32Params {
     has_bf16_output:  u32,
     bf16_permuted:    u32, // P4.15: write bf16 at permuted layout
     seq_len:          u32, // P4.15: needed for permuted-index calc
+    has_f32_perm_output: u32, // D.1: co-write f32 at permuted layout
 }
 
 /// Dispatch a fused per-head RMS norm + NeoX RoPE operation (f32).
@@ -281,6 +282,7 @@ pub fn dispatch_fused_head_norm_rope_f32(
         has_bf16_output: 0,
         bf16_permuted: 0,
         seq_len: 1, // single-token decode variant
+        has_f32_perm_output: 0,
     };
 
     // Bind dummies for optional buffers
@@ -299,6 +301,8 @@ pub fn dispatch_fused_head_norm_rope_f32(
             (5, KernelArg::Buffer(ff_buf)),
             // buffer(6) unused when has_bf16_output=0 — bind `input` as harmless dummy.
             (6, KernelArg::Buffer(input)),
+            // buffer(7) unused when has_f32_perm_output=0 — same dummy pattern.
+            (7, KernelArg::Buffer(input)),
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new(n_heads as u64, 1, 1),
@@ -467,6 +471,7 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
         has_bf16_output: 0,
         bf16_permuted: 0,
         seq_len,
+        has_f32_perm_output: 0,
     };
 
     let weight_buf = norm_weight.unwrap_or(input);
@@ -484,6 +489,7 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
             (5, KernelArg::Buffer(ff_buf)),
             // buffer(6) unused when has_bf16_output=0 — bind `input` as harmless dummy.
             (6, KernelArg::Buffer(input)),
+            (7, KernelArg::Buffer(input)),
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),
@@ -530,6 +536,40 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
     theta: f32,
     bf16_permuted: bool,
 ) -> Result<()> {
+    dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
+        encoder, registry, device, input, output, output_bf16, None,
+        norm_weight, positions_buf, freq_factors,
+        n_heads, head_dim, half_rope_dim, seq_len, eps, theta,
+        bf16_permuted,
+    )
+}
+
+/// Extended variant that additionally accepts an optional `output_f32_perm`
+/// buffer.  When `Some(buf)`, the kernel writes every f32 result element
+/// also to `buf` at the permuted `[n_heads, seq_len, head_dim]` layout
+/// (same index math as `bf16_permuted=true`).  Used by hf2q's HF2Q_NO_FA
+/// path to skip the post-norm bf16→f32 Q cast that would otherwise run
+/// as a separate `permute_021_bf16_to_f32([1,N,1])` dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    output_bf16: Option<&MlxBuffer>,
+    output_f32_perm: Option<&MlxBuffer>,
+    norm_weight: Option<&MlxBuffer>,
+    positions_buf: &MlxBuffer,
+    freq_factors: Option<&MlxBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    half_rope_dim: u32,
+    seq_len: u32,
+    eps: f32,
+    theta: f32,
+    bf16_permuted: bool,
+) -> Result<()> {
     if n_heads == 0 || head_dim == 0 || seq_len == 0 {
         return Err(MlxError::InvalidArgument(
             "fused_head_norm_rope_batch_f32_with_bf16: n_heads, head_dim, seq_len must be > 0".into(),
@@ -551,6 +591,15 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
             )));
         }
     }
+    if let Some(buf) = output_f32_perm {
+        let expected = (seq_len as usize) * (n_heads as usize) * (head_dim as usize);
+        if buf.element_count() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_head_norm_rope_batch_f32_with_bf16_f32_perm: output_f32_perm element count {} < expected {}",
+                buf.element_count(), expected
+            )));
+        }
+    }
 
     let pipeline = registry.get_pipeline("fused_head_norm_rope_f32", device)?;
 
@@ -561,6 +610,7 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
     let has_weight = norm_weight.is_some();
     let has_ff = freq_factors.is_some();
     let has_bf16 = output_bf16.is_some();
+    let has_f32_perm = output_f32_perm.is_some();
     let gpu_params = GpuFusedHeadNormRopeF32Params {
         head_dim,
         n_heads,
@@ -570,13 +620,15 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
         theta,
         has_freq_factors: u32::from(has_ff),
         has_bf16_output: u32::from(has_bf16),
-        bf16_permuted: u32::from(bf16_permuted && has_bf16),
+        bf16_permuted: u32::from(bf16_permuted && (has_bf16 || has_f32_perm)),
         seq_len,
+        has_f32_perm_output: u32::from(has_f32_perm),
     };
 
     let weight_buf = norm_weight.unwrap_or(input);
     let ff_buf = freq_factors.unwrap_or(input);
     let bf16_buf = output_bf16.unwrap_or(input);
+    let f32_perm_buf = output_f32_perm.unwrap_or(input);
 
     encode_threadgroups_with_args_and_shared(
         encoder,
@@ -589,6 +641,7 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16(
             (4, KernelArg::Buffer(positions_buf)),
             (5, KernelArg::Buffer(ff_buf)),
             (6, KernelArg::Buffer(bf16_buf)),
+            (7, KernelArg::Buffer(f32_perm_buf)),
         ],
         &[(0, shared_mem_bytes)],
         MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),

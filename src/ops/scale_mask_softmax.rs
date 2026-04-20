@@ -53,7 +53,7 @@ pub fn dispatch_scale_mask_softmax_f32(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     mask_bf16: &MlxBuffer,
     params: &ScaleMaskSoftmaxParams,
 ) -> Result<()> {
