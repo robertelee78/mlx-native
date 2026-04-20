@@ -102,9 +102,13 @@ static TENSOR_MM_ID_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::
 
 fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     *TENSOR_MM_ID_AVAILABLE.get_or_init(|| {
-        registry
+        let ok = registry
             .get_pipeline("kernel_mul_mm_id_q4_0_tensor_f32", device.metal_device())
-            .is_ok()
+            .is_ok();
+        if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+            eprintln!("[mlx-native] tensor_mm_id probe: {}", if ok { "OK (using tensor variant for MoE)" } else { "FAILED (falling back to simdgroup MMA)" });
+        }
+        ok
     })
 }
 

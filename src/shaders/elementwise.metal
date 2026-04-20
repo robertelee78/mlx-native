@@ -426,3 +426,37 @@ kernel void permute_021_f32(
     const uint out_idx = b * (params.dim_a * params.dim_c) + a * params.dim_c + c;
     output[out_idx] = input[in_idx];
 }
+
+// --------------------------------------------------------------------------
+// permute_021_bf16_to_f32 — fused permute + dtype cast.
+//
+// Combines the two post-FA SDPA-output passes (permute_021_bf16 then
+// cast_bf16_to_f32) into one global-memory pass, halving bandwidth on the
+// [n_heads, seq_len, head_dim] tensor and removing one dispatch per layer.
+// Wave P4.10.
+//
+// Buffers:
+//   0: input  — bfloat [A * B * C]
+//   1: output — float  [B * A * C]
+//   2: params — { uint dim_a; uint dim_b; uint dim_c; }
+//
+// Grid: (C, B, A) — same as permute_021_bf16; each thread reads one bf16
+// element and writes one f32 element at the permuted position.
+// --------------------------------------------------------------------------
+kernel void permute_021_bf16_to_f32(
+    device const bfloat* input  [[buffer(0)]],
+    device float*        output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint b = gid.y;
+    const uint a = gid.z;
+
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+
+    const uint in_idx  = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    const uint out_idx = b * (params.dim_a * params.dim_c) + a * params.dim_c + c;
+
+    output[out_idx] = static_cast<float>(input[in_idx]);
+}
