@@ -335,6 +335,7 @@ impl KernelRegistry {
         sources.insert("fused_moe_routing_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_routing_batch_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_norm_add_scalar_f32".into(), fused_norm_add_f32_src);
+        sources.insert("fused_moe_wsum_norm_add_f32".into(), fused_norm_add_f32_src);
 
         // Argsort kernel (Story 2.3) — MoE top-K routing
         let argsort_src: &'static str = include_str!("shaders/argsort.metal");

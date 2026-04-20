@@ -296,6 +296,78 @@ pub fn dispatch_fused_norm_add_f32(
     Ok(())
 }
 
+/// Dispatch fused MoE-weighted-sum + residual + RMS norm (f32).  Wave P4.13.
+///
+/// Replaces two dispatches (moe_weighted_sum_seq + fused_norm_add_f32) with
+/// one kernel that:
+///   1. Computes weighted_sum[i] = sum_k expert_outputs[i, k] * weights[k]
+///   2. Computes RMS over the weighted sum
+///   3. Writes output[i] = residual[i] + weighted_sum[i] * rms_inv * norm_weight[i]
+///
+/// Eliminates one global write+read of the [rows * dim] intermediate sum
+/// buffer (~5 MB at pp2455 × 30 = 150 MB of read+write traffic).
+///
+/// # Arguments
+///
+/// * `expert_outputs` - MoE down outputs `[rows * top_k * dim]` (f32).
+/// * `weights`        - Routing weights `[rows * top_k]` (f32).
+/// * `residual`       - Residual stream `[rows * dim]` (f32).
+/// * `norm_weight`    - RMS norm scale `[dim]` (f32).
+/// * `output`         - Output buffer `[rows * dim]` (f32).
+/// * `dim`            - Hidden dim.
+/// * `top_k`          - Number of experts per token.
+/// * `rows`           - Number of tokens.
+/// * `eps`            - RMS norm epsilon.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_moe_wsum_norm_add_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    expert_outputs: &MlxBuffer,
+    weights: &MlxBuffer,
+    residual: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    output: &MlxBuffer,
+    dim: u32,
+    top_k: u32,
+    rows: u32,
+    eps: f32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_moe_wsum_norm_add_f32: rows, dim, top_k must be > 0".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("fused_moe_wsum_norm_add_f32", device)?;
+
+    // Threadgroup memory: tg_size floats for sum-of-squares reduction
+    // scratch + dim floats for the per-row weighted_sum result buffer.
+    let tg_size = tg_size_for_dim(dim);
+    let shared_mem_bytes = ((tg_size as u64) + (dim as u64)) * 4;
+
+    encode_threadgroups_with_args_and_shared(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(expert_outputs)),
+            (1, KernelArg::Buffer(weights)),
+            (2, KernelArg::Buffer(residual)),
+            (3, KernelArg::Buffer(norm_weight)),
+            (4, KernelArg::Buffer(output)),
+            (5, KernelArg::Bytes(as_bytes(&dim))),
+            (6, KernelArg::Bytes(as_bytes(&top_k))),
+            (7, KernelArg::Bytes(as_bytes(&rows))),
+            (8, KernelArg::Bytes(as_bytes(&eps))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// GPU params struct for f32 variant — must match `FusedResidualNormF32Params`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

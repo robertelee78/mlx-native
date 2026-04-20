@@ -23,6 +23,95 @@ using namespace metal;
 /// Grid       : (rows, 1, 1)
 /// Shared mem : tg_size * sizeof(float) for the sum-of-squares reduction
 
+/// Fused MoE-weighted-sum + RMS norm + residual add (float32).
+///
+/// Replaces the three-dispatch sequence in batched prefill:
+///   1. moe_weighted_sum_seq:    sum[tok,d] = sum_k expert_outputs[tok,k,d] * weights[tok,k]
+///   2. fused_norm_add_f32:      output[tok,d] = residual[tok,d] + rms_norm(sum, weight, eps)
+///
+/// (Steps 1+2 combined; the kernel reads expert_outputs+weights, accumulates
+/// the weighted sum into a threadgroup-local buffer in phase 1, computes
+/// RMS over that buffer, and writes residual + norm(sum)*weight in phase 2.)
+///
+/// Wave P4.13 — saves 1 dispatch per layer (30/prefill on Gemma 4) and one
+/// global write+read of the [rows * dim] intermediate sum buffer (~5 MB at
+/// pp2455 × 30 = 150 MB of read+write traffic eliminated).
+///
+/// Buffer layout:
+///   buffer(0): expert_outputs — float [rows * top_k * dim]   MoE down outputs
+///   buffer(1): weights        — float [rows * top_k]         MoE routing weights
+///   buffer(2): residual       — float [rows * dim]           residual stream
+///   buffer(3): norm_weight    — float [dim]                  RMS norm scale
+///   buffer(4): output         — float [rows * dim]           residual + norm(sum)
+///   buffer(5): dim            — uint
+///   buffer(6): top_k          — uint
+///   buffer(7): rows           — uint
+///   buffer(8): eps            — float
+///
+/// Threadgroup: (min(256, next_pow2(dim)), 1, 1) — one threadgroup per row
+/// Grid       : (rows, 1, 1)
+/// Shared mem : tg_size + dim floats (reduction scratch + weighted_sum buffer)
+kernel void fused_moe_wsum_norm_add_f32(
+    device const float* expert_outputs [[buffer(0)]],
+    device const float* weights        [[buffer(1)]],
+    device const float* residual       [[buffer(2)]],
+    device const float* norm_weight    [[buffer(3)]],
+    device float*       output         [[buffer(4)]],
+    constant uint&      dim            [[buffer(5)]],
+    constant uint&      top_k          [[buffer(6)]],
+    constant uint&      rows           [[buffer(7)]],
+    constant float&     eps            [[buffer(8)]],
+    uint row_id  [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    threadgroup float* shared          [[threadgroup(0)]]
+) {
+    if (row_id >= rows) { return; }
+
+    // Threadgroup shmem layout: first `tg_size` floats are the
+    // sum-of-squares reduction scratch (reused for tree-reduce), then
+    // `dim` floats for the weighted-sum result buffer.  Both regions are
+    // only valid within Phase 1/2 of THIS row's computation; nothing
+    // crosses threadgroup boundaries.
+    threadgroup float* sum_scratch = shared;
+    threadgroup float* sum_buf     = shared + tg_size;
+
+    const uint base_w  = row_id * top_k;
+    const uint base_eo = row_id * top_k * dim;
+    const uint base_d  = row_id * dim;
+
+    // Phase 1: each thread computes sum[i] = sum_k expert_outputs[i,k] *
+    // weights[k] for its strided i, accumulates v*v for RMS, and stashes
+    // v in sum_buf for phase 2 reuse.
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = 0.0f;
+        for (uint k = 0; k < top_k; ++k) {
+            v += expert_outputs[base_eo + k * dim + i] * weights[base_w + k];
+        }
+        sum_buf[i] = v;
+        partial_sq += v * v;
+    }
+
+    sum_scratch[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum_scratch[tid] += sum_scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms_inv = rsqrt(sum_scratch[0] / float(dim) + eps);
+
+    // Phase 2: residual + rms_norm(sum) * weight, no re-compute of sum.
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float normed = sum_buf[i] * rms_inv * norm_weight[i];
+        output[base_d + i] = residual[base_d + i] + normed;
+    }
+}
+
 kernel void fused_norm_add_f32(
     device const float* residual [[buffer(0)]],
     device const float* input    [[buffer(1)]],
