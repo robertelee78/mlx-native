@@ -66,3 +66,7 @@ harness = false
 [[bench]]
 name = "bench_hadamard"
 harness = false
+
+[[bench]]
+name = "bench_prefill_qmatmul_shapes"
+harness = false

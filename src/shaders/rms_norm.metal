@@ -636,3 +636,113 @@ kernel void rms_norm_f32_triple(
         output_c[base + i] = vn * weight_c[i];
     }
 }
+
+// ---------------------------------------------------------------------------
+// fused_post_attn_triple_norm_f32 — fuses POST_ATTN_NORM_ADD + TRIPLE_RMS_NORM
+// into one dispatch.  Replaces the pair:
+//   residual = hidden + norm(attn_out, post_attn_w)           [fused_norm_add_f32]
+//   [norm_a, norm_b, norm_c] = triple_norm(residual, w_a/b/c) [rms_norm_f32_triple]
+// with one kernel that:
+//   1. computes sum(attn_out^2)          — for attn_out rms
+//   2. accumulates residual_new = hidden + attn_out*rms_attn*post_attn_w
+//      AND sum(residual_new^2) in the same pass
+//   3. writes residual_output            — for end-of-layer consumer
+//   4. applies three weight vectors to residual * rms_res -> 3 outputs
+//
+// Eliminates:
+//   - One dispatch per layer (30/prefill)
+//   - One write+read of pf_residual (~60 MB/layer, 1.8 GB total @ pp2455)
+//   - The serialization barrier between the two dispatches
+//
+// Buffers:
+//   0: hidden         — float [rows * dim]  (pre-attention residual stream)
+//   1: attn_out       — float [rows * dim]  (attention O-proj output)
+//   2: post_attn_w    — float [dim]         (post-attention layernorm weight)
+//   3: weight_a       — float [dim]         (pre-FF layernorm 1)
+//   4: weight_b       — float [dim]         (pre-FF layernorm 2)
+//   5: weight_c       — float [dim]         (router combined weight)
+//   6: residual_out   — float [rows * dim]  (hidden + normed_attn, written)
+//   7: output_a       — float [rows * dim]
+//   8: output_b       — float [rows * dim]
+//   9: output_c       — float [rows * dim]
+//  10: params         — { float eps; uint dim; }
+//
+// Grid: (rows, 1, 1). Threadgroup: (min(tg_size, next_pow2(dim)), 1, 1).
+// Shared memory: 2 × tg_size × sizeof(float) for two staggered reductions.
+// ---------------------------------------------------------------------------
+
+struct FusedPostAttnTripleNormParams {
+    float eps;
+    uint  dim;
+};
+
+kernel void fused_post_attn_triple_norm_f32(
+    device const float* hidden       [[buffer(0)]],
+    device const float* attn_out     [[buffer(1)]],
+    device const float* post_attn_w  [[buffer(2)]],
+    device const float* weight_a     [[buffer(3)]],
+    device const float* weight_b     [[buffer(4)]],
+    device const float* weight_c     [[buffer(5)]],
+    device float*       residual_out [[buffer(6)]],
+    device float*       output_a     [[buffer(7)]],
+    device float*       output_b     [[buffer(8)]],
+    device float*       output_c     [[buffer(9)]],
+    constant FusedPostAttnTripleNormParams& params [[buffer(10)]],
+    uint row_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const float eps = params.eps;
+    const uint  dim = params.dim;
+    const uint  base = row_id * dim;
+
+    // Phase 1: sum of squares over attn_out (for the first rms norm).
+    float partial_attn_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float v = attn_out[base + i];
+        partial_attn_sq += v * v;
+    }
+    shared[tid] = partial_attn_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float rms_inv_attn = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 2: compute residual_new[i] = hidden[i] + normed_attn[i], write
+    // it to residual_out, AND accumulate sum(residual_new^2) for the pre-FF
+    // rms normalization.  We re-compute the residual in Phase 4 from
+    // residual_out (device-memory re-read, hardware-cached) to avoid
+    // needing shared memory for the full row.
+    float partial_res_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float a = attn_out[base + i];
+        const float normed_attn = a * rms_inv_attn * post_attn_w[i];
+        const float r = hidden[base + i] + normed_attn;
+        residual_out[base + i] = r;
+        partial_res_sq += r * r;
+    }
+    shared[tid] = partial_res_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float rms_inv_res = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 3: read residual_out back, apply three weight vectors, write
+    // three outputs.  Compiler hoists the shared (r * rms_inv_res) factor.
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float r = residual_out[base + i];
+        const float vn = r * rms_inv_res;
+        output_a[base + i] = vn * weight_a[i];
+        output_b[base + i] = vn * weight_b[i];
+        output_c[base + i] = vn * weight_c[i];
+    }
+}

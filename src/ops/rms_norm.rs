@@ -253,6 +253,131 @@ pub fn dispatch_rms_norm_f32_triple(
     Ok(())
 }
 
+/// Dispatch the Wave P4.18 fused post-attention norm+add + triple pre-FF norm.
+///
+/// Replaces the two dispatches
+///   (a) `fused_norm_add_f32(hidden, attn_out, post_attn_w -> pf_residual)`
+///   (b) `rms_norm_f32_triple(pf_residual, w_a/b/c -> out_a/b/c)`
+/// with one kernel that:
+///   1. computes rms_inv over attn_out
+///   2. writes `residual_out = hidden + attn_out * rms_inv * post_attn_w` AND
+///      accumulates sum(residual_out^2) in the same pass
+///   3. computes rms_inv over the residual stream
+///   4. reads `residual_out` back, applies three weight vectors, writes 3 outputs
+///
+/// Eliminates one write+read of the residual buffer (~60 MB / layer @ pp2455
+/// x 30 layers = ~1.8 GB of memory traffic) and one dispatch per layer.
+///
+/// # Arguments
+/// * `encoder`      - Command encoder to record the dispatch into.
+/// * `registry`     - Kernel registry (must have fused_post_attn_triple_norm_f32).
+/// * `device`       - Metal device for pipeline compilation.
+/// * `hidden`       - Pre-attention residual stream, f32 `[rows, dim]`.
+/// * `attn_out`     - Attention O-proj output, f32 `[rows, dim]`.
+/// * `post_attn_w`  - Post-attention layernorm weight, f32 `[dim]`.
+/// * `weight_a`     - First pre-FF weight (e.g. MLP norm), f32 `[dim]`.
+/// * `weight_b`     - Second pre-FF weight (e.g. MoE input norm), f32 `[dim]`.
+/// * `weight_c`     - Third pre-FF weight (e.g. router norm), f32 `[dim]`.
+/// * `residual_out` - Output: residual stream (hidden + normed_attn), f32 `[rows, dim]`.
+/// * `output_a/b/c` - Triple-normed outputs, f32 `[rows, dim]`.
+/// * `eps`          - RMS epsilon.
+/// * `rows`         - Number of rows (= seq_len).
+/// * `dim`          - Model hidden size.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_post_attn_triple_norm_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    hidden:       &MlxBuffer,
+    attn_out:     &MlxBuffer,
+    post_attn_w:  &MlxBuffer,
+    weight_a:     &MlxBuffer,
+    weight_b:     &MlxBuffer,
+    weight_c:     &MlxBuffer,
+    residual_out: &MlxBuffer,
+    output_a:     &MlxBuffer,
+    output_b:     &MlxBuffer,
+    output_c:     &MlxBuffer,
+    eps:          f32,
+    rows:         u32,
+    dim:          u32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_post_attn_triple_norm_f32: rows and dim must be > 0".into(),
+        ));
+    }
+    let expected = (rows as usize) * (dim as usize);
+    for (name, buf) in [
+        ("hidden",       hidden),
+        ("attn_out",     attn_out),
+        ("residual_out", residual_out),
+        ("output_a",     output_a),
+        ("output_b",     output_b),
+        ("output_c",     output_c),
+    ] {
+        if buf.element_count() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_post_attn_triple_norm_f32: {} size {} < rows({}) * dim({})",
+                name, buf.element_count(), rows, dim
+            )));
+        }
+        if buf.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_post_attn_triple_norm_f32: {} must be f32, got {}",
+                name, buf.dtype()
+            )));
+        }
+    }
+    for (name, buf) in [
+        ("post_attn_w", post_attn_w),
+        ("weight_a",    weight_a),
+        ("weight_b",    weight_b),
+        ("weight_c",    weight_c),
+    ] {
+        if buf.element_count() != dim as usize {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_post_attn_triple_norm_f32: {} size {} != dim({})",
+                name, buf.element_count(), dim
+            )));
+        }
+    }
+
+    let pipeline = registry.get_pipeline("fused_post_attn_triple_norm_f32", device)?;
+
+    let tg_size = std::cmp::min(256u32, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Params { eps: f32, dim: u32 }
+    let params = Params { eps, dim };
+
+    use super::encode_helpers::{as_bytes, KernelArg};
+    encoder.set_op_kind(CapturedOpKind::Other);
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0,  KernelArg::Buffer(hidden)),
+            (1,  KernelArg::Buffer(attn_out)),
+            (2,  KernelArg::Buffer(post_attn_w)),
+            (3,  KernelArg::Buffer(weight_a)),
+            (4,  KernelArg::Buffer(weight_b)),
+            (5,  KernelArg::Buffer(weight_c)),
+            (6,  KernelArg::Buffer(residual_out)),
+            (7,  KernelArg::Buffer(output_a)),
+            (8,  KernelArg::Buffer(output_b)),
+            (9,  KernelArg::Buffer(output_c)),
+            (10, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Dispatch an RMS normalization without learned scale (bf16 only).
 ///
 /// Computes: `output = x * rsqrt(mean(x^2) + eps)` — no weight multiplication.
