@@ -778,6 +778,33 @@ impl CommandEncoder {
         }
     }
 
+    /// Commit + wait, returning `(gpu_start_s, gpu_end_s)` CFTimeInterval
+    /// timestamps from `MTLCommandBuffer`'s `GPUStartTime`/`GPUEndTime`
+    /// properties.  Both are mach-absolute CFTimeInterval seconds (double).
+    ///
+    /// Intended for `HF2Q_PROFILE_GPU_TS=1` per-bucket GPU wall-clock
+    /// attribution.  Adds exactly two ObjC property reads per call on top
+    /// of the regular `commit_and_wait` — measured well under 1 μs on
+    /// M5 Max.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
+    pub fn commit_wait_with_gpu_time(&mut self) -> Result<(f64, f64)> {
+        self.commit_and_wait()?;
+        // SAFETY: cmd_buf is a valid MTLCommandBuffer that has been
+        // committed and awaited.  GPUStartTime / GPUEndTime return
+        // CFTimeInterval (double precision seconds).  See
+        // https://developer.apple.com/documentation/metal/mtlcommandbuffer/1639925-gpustarttime
+        let (gpu_start, gpu_end): (f64, f64) = unsafe {
+            let cb = &*self.cmd_buf;
+            let s: f64 = msg_send![cb, GPUStartTime];
+            let e: f64 = msg_send![cb, GPUEndTime];
+            (s, e)
+        };
+        Ok((gpu_start, gpu_end))
+    }
+
     /// Commit the command buffer WITHOUT blocking.
     ///
     /// The GPU begins executing the encoded commands immediately.  Call

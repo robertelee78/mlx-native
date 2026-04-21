@@ -1630,6 +1630,35 @@ impl<'a> GraphSession<'a> {
         Ok((encoding_ns, gpu_wait_ns))
     }
 
+    /// Finish this session and return the GPU wall-clock interval in ns.
+    ///
+    /// Returns `(gpu_interval_ns,)` where `gpu_interval_ns` is the CFTimeInterval
+    /// difference between `MTLCommandBuffer.GPUEndTime` and
+    /// `MTLCommandBuffer.GPUStartTime`, converted to ns.  Excludes CPU
+    /// commit+wait overhead — that appears in the residual when bucket
+    /// sums are compared to the outer wall-clock.
+    ///
+    /// Used by `HF2Q_PROFILE_GPU_TS=1` to accumulate pure GPU time per
+    /// op bucket.  In recording mode: replays the captured graph before
+    /// committing.
+    ///
+    /// Consumes the session.
+    pub fn finish_with_gpu_time(mut self) -> Result<u64> {
+        if self.recording {
+            if let Some(nodes) = self.encoder.take_capture() {
+                let graph = ComputeGraph::from_nodes(nodes);
+                graph.encode_sequential(&mut self.encoder);
+            }
+        }
+        let (gs, ge) = self.encoder.commit_wait_with_gpu_time()?;
+        // GPUStartTime/GPUEndTime are CFTimeInterval (seconds, double).
+        // Guard against negative deltas (can happen on the first CB of
+        // a run if the kernel driver lazily initialises the timeline;
+        // clamp to zero in that case).
+        let delta = (ge - gs).max(0.0);
+        Ok((delta * 1.0e9) as u64)
+    }
+
     /// Finish with fusion: run the RMS norm + MUL fusion pass before
     /// replaying the graph.
     ///
