@@ -221,3 +221,164 @@ pub fn dispatch_hadamard_quantize_kv(
 
     Ok(())
 }
+
+/// Dispatch the Hadamard-quantize KV kernel over a sequence of tokens.
+///
+/// Wraps the single-token [`dispatch_hadamard_quantize_kv`] to populate
+/// the TQ-packed cache for `n_tokens` consecutive positions from a batched
+/// source buffer. The source buffer is laid out as
+/// `[total_src_tokens, num_kv_heads, head_dim]` F32; this function iterates
+/// the leading dimension starting at `src_tok_offset` and re-dispatches
+/// the single-token kernel with a buffer byte offset, so the cleared kernel
+/// source is untouched.
+///
+/// Cache positions written: `[write_pos_start, write_pos_start + n_tokens)`
+/// (wrapped modulo `cache_capacity` when `is_sliding` is true).
+///
+/// # Arguments
+///
+/// * `src`             — F32 buffer `[total_src_tokens, num_kv_heads, head_dim]`.
+/// * `packed`          — Output packed buffer (same layout as single-token).
+/// * `norms`           — Output norms buffer (same layout as single-token).
+/// * `write_pos_start` — First cache position to write.
+/// * `n_tokens`        — How many consecutive positions to write.
+/// * `src_tok_offset`  — Starting token index in `src` (matches the
+///   batched dense-copy semantics; use `seq_len - n_tokens` when
+///   sliding and the prefill has already exceeded the window).
+///
+/// # Performance notes
+///
+/// Correctness-first implementation: at pp2455 with 30 layers and the
+/// Gemma-4 sliding/global layer split this issues on the order of
+/// 147k kernel launches per prefill. If that is ever measured to be
+/// the bottleneck, promote to a dedicated bulk shader with a 2-D
+/// dispatch grid — this wrapper intentionally does not modify the
+/// cleared single-token kernel source, so both variants remain
+/// byte-identical in their math.
+///
+/// # Errors
+///
+/// Propagates any [`dispatch_hadamard_quantize_kv`] error encountered
+/// on the per-position dispatches and adds one extra validation:
+/// `src` must have at least `n_tokens * num_kv_heads * head_dim`
+/// F32 elements.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_seq(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,
+    norms: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+    is_sliding: bool,
+) -> Result<()> {
+    if n_tokens == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+
+    // Src must cover [src_tok_offset, src_tok_offset + n_tokens) slices.
+    let required_src =
+        (src_tok_offset as u64 + n_tokens as u64) * (num_kv_heads as u64) * (head_dim as u64);
+    if (src.element_count() as u64) < required_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_seq: src has {} elements but need {} \
+             (src_tok_offset={} + n_tokens={} * num_kv_heads={} * head_dim={})",
+            src.element_count(),
+            required_src,
+            src_tok_offset,
+            n_tokens,
+            num_kv_heads,
+            head_dim,
+        )));
+    }
+
+    // Pre-shared setup for the per-position dispatches. The kernel name
+    // and pipeline only depend on `head_dim`, so resolve once.
+    if !head_dim.is_power_of_two() {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_seq: head_dim must be a power of two, got {}",
+            head_dim
+        )));
+    }
+    if head_dim > 4096 {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_seq: head_dim {} exceeds Metal 32 KB threadgroup limit",
+            head_dim
+        )));
+    }
+    if head_dim % 2 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_seq: head_dim must be even for nibble packing, got {}",
+            head_dim
+        )));
+    }
+
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_fast_d256",
+        512 => "hadamard_quantize_kv_fast_d512",
+        _ => "hadamard_quantize_kv",
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let bytes_per_token = (num_kv_heads as u64) * (head_dim as u64) * 4; // f32
+
+    for i in 0..n_tokens {
+        let write_pos = write_pos_start + i;
+
+        if !is_sliding && write_pos >= cache_capacity {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_seq: global cache write_pos({}) >= cache_capacity({}) at seq idx {}",
+                write_pos, cache_capacity, i
+            )));
+        }
+
+        let params = HadamardQuantizeParams {
+            head_dim,
+            num_kv_heads,
+            write_pos,
+            cache_capacity,
+            is_sliding: if is_sliding { 1 } else { 0 },
+        };
+        let params_bytes = bytemuck::bytes_of(&params);
+        let src_offset = ((src_tok_offset + i) as u64) * bytes_per_token;
+
+        if kernel_name.starts_with("hadamard_quantize_kv_fast") {
+            use super::encode_helpers::encode_threadgroups_with_args;
+            encode_threadgroups_with_args(
+                encoder,
+                pipeline,
+                &[
+                    (0, KernelArg::BufferWithOffset(src, src_offset)),
+                    (1, KernelArg::Buffer(packed)),
+                    (2, KernelArg::Buffer(norms)),
+                    (3, KernelArg::Bytes(params_bytes)),
+                ],
+                MTLSize::new(num_kv_heads as u64, 1, 1),
+                MTLSize::new(32, 1, 1),
+            );
+        } else {
+            let shared_mem_bytes = 2u64 * (head_dim as u64) * 4;
+            encode_threadgroups_with_args_and_shared(
+                encoder,
+                pipeline,
+                &[
+                    (0, KernelArg::BufferWithOffset(src, src_offset)),
+                    (1, KernelArg::Buffer(packed)),
+                    (2, KernelArg::Buffer(norms)),
+                    (3, KernelArg::Bytes(params_bytes)),
+                ],
+                &[(0, shared_mem_bytes)],
+                MTLSize::new(num_kv_heads as u64, 1, 1),
+                MTLSize::new(head_dim as u64, 1, 1),
+            );
+        }
+    }
+
+    Ok(())
+}
