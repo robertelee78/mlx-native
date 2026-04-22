@@ -612,7 +612,7 @@ fn bitwidth_ab() {
         let diffs: Vec<f32> = codebook_4bit_f32
             .iter()
             .zip(CODEBOOK_4BIT.iter())
-            .map(|(gen, prod)| (gen - prod).abs())
+            .map(|(generated, prod)| (generated - prod).abs())
             .collect();
         let max_diff = diffs.iter().copied().fold(0.0f32, f32::max);
         if max_diff >= 1e-4 {
@@ -687,7 +687,7 @@ fn bitwidth_ab() {
     let codebook_4bit_max_diff: f64 = codebook_4bit_f32
         .iter()
         .zip(CODEBOOK_4BIT.iter())
-        .map(|(gen, prod)| (gen - prod).abs() as f64)
+        .map(|(generated, prod)| (generated - prod).abs() as f64)
         .fold(0.0f64, f64::max);
 
     // -----------------------------------------------------------------------
