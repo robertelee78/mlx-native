@@ -261,16 +261,30 @@ fn decide_verdict(cells: &[Cell]) -> &'static str {
         .map(|c| c.nrmse_mean)
         .fold(f64::NEG_INFINITY, f64::max);
 
+    // Band around the first-principles Lloyd-Max 4-bit N(0,1) floor.
+    // Analytic derivation using CODEBOOK_4BIT: MSE = 0.009501008, RMSE = 0.097473.
+    // Codex read-only review independently re-derived the same value (cfa-20260422-C3).
+    // Band [0.085, 0.11] = analytic floor +/- ~12%, tight enough to detect
+    // codebook drift or scale-pairing regressions, loose enough for finite-N jitter.
+    const FLOOR_LO: f64 = 0.085;
+    const FLOOR_HI: f64 = 0.11;
+    const RATIO_LO: f64 = 0.90;
+    const RATIO_HI: f64 = 1.10;
+
     if case_c_nrmse_max > 1e-5 {
         return "FWHT_non_reversible";
     }
-    if case_b_nrmse_max > 0.15 {
+    if case_b_nrmse_max > FLOOR_HI {
         return "CODEBOOK_bug";
     }
-    if case_a_over_b_ratio_max > 1.5 {
+    if case_a_over_b_ratio_max > RATIO_HI {
         return "FWHT_normalization_bug";
     }
-    if case_a_nrmse_max <= 0.15 && case_a_over_b_ratio_max <= 1.5 {
+    let in_floor_band = case_a_nrmse_max >= FLOOR_LO
+        && case_a_nrmse_max <= FLOOR_HI
+        && case_a_over_b_ratio_max >= RATIO_LO
+        && case_a_over_b_ratio_max <= RATIO_HI;
+    if in_floor_band {
         return "representation_floor_confirmed";
     }
     "unexpected_pattern"
@@ -421,19 +435,19 @@ fn round_trip_identity() {
             case_c_max
         ),
         "CODEBOOK_bug" => format!(
-            "Case B max nrmse {:.4} > 0.15 threshold — codebook quantization error is too high",
+            "Case B max nrmse {:.4} > 0.11 floor-band ceiling — codebook quantization error exceeds analytic Lloyd-Max floor 0.09747",
             case_b_max
         ),
         "FWHT_normalization_bug" => format!(
-            "Case A/B ratio max {:.4} > 1.5 — FWHT introduces extra error beyond quant floor",
+            "Case A/B ratio max {:.4} > 1.10 — FWHT introduces extra error beyond quant floor (encode/decode scale pairing drift)",
             case_a_over_b_max
         ),
         "representation_floor_confirmed" => format!(
-            "Case A max nrmse {:.4} <= 0.15 and A/B ratio max {:.4} <= 1.5 — error is at Lloyd-Max 4-bit floor ~0.097",
+            "Case A max nrmse {:.4} within floor band [0.085, 0.11] and A/B ratio max {:.4} within [0.90, 1.10] — error is at analytic Lloyd-Max 4-bit N(0,1) floor (RMSE=0.09747, independently verified by CFA queen + Codex review 2026-04-22)",
             case_a_max, case_a_over_b_max
         ),
         _ => format!(
-            "No threshold triggered (case_c_max={:.2e}, case_b_max={:.4}, a_over_b_max={:.4}, case_a_max={:.4})",
+            "No threshold triggered (case_c_max={:.2e}, case_b_max={:.4}, a_over_b_max={:.4}, case_a_max={:.4}); band [0.085,0.11] x ratio [0.90,1.10]",
             case_c_max, case_b_max, case_a_over_b_max, case_a_max
         ),
     };
@@ -516,6 +530,41 @@ fn round_trip_identity() {
     println!("Written: /tmp/cfa-20260422-C3-roundtrip/result.json");
     println!("Written: /tmp/cfa-20260422-C3-roundtrip/result.md");
 
-    // Gate: test always passes — real assertion is determinism (verified by launcher re-run)
-    assert!(true);
+    // Regression gates — test FAILS if any of these drift. Each assertion
+    // pairs with one of the decision-tree branches so a future regression
+    // lands on the right hypothesis without requiring manual interpretation.
+    for c in &cells {
+        if c.case == 'C' {
+            assert!(
+                c.nrmse_mean < 1e-5,
+                "FWHT non-reversible at head_dim={} (nrmse={:.3e}); orthogonal FWHT should round-trip to machine epsilon",
+                c.head_dim, c.nrmse_mean
+            );
+        }
+        if c.case == 'A' || c.case == 'B' {
+            assert!(
+                c.nrmse_mean >= 0.085 && c.nrmse_mean <= 0.11,
+                "Case {} at head_dim={} nrmse={:.5} outside Lloyd-Max 4-bit N(0,1) floor band [0.085, 0.11] (analytic RMSE=0.09747); indicates CODEBOOK drift or scale-pairing regression",
+                c.case, c.head_dim, c.nrmse_mean
+            );
+        }
+        if c.case == 'A' {
+            let case_b_match = cells
+                .iter()
+                .find(|o| o.case == 'B' && o.head_dim == c.head_dim)
+                .map(|o| o.nrmse_mean)
+                .expect("Case B cell for this head_dim");
+            let ratio = c.nrmse_mean / case_b_match;
+            assert!(
+                ratio >= 0.90 && ratio <= 1.10,
+                "Case A/B ratio at head_dim={} = {:.4} outside [0.90, 1.10]; indicates FWHT normalization convention has drifted from its round-trip-identity pair",
+                c.head_dim, ratio
+            );
+        }
+    }
+    assert_eq!(
+        verdict, "representation_floor_confirmed",
+        "Verdict regression: expected representation_floor_confirmed (per ADR-007 C-3 outcome 2026-04-22), got {}",
+        verdict
+    );
 }
