@@ -1,22 +1,30 @@
-//! TQ kernel replay binary for ADR-007 C-4 E1 localization.
+//! TQ kernel replay binary for ADR-007 C-1-unlock harness fix.
 //!
-//! Runs the flash_attn_vec_tq kernel against captured C-0 inputs and compares
-//! to a CPU reference SDPA computed in-memory from the same TQ-packed data.
+//! Runs the flash_attn_vec_tq / flash_attn_vec kernels against captured inputs
+//! and compares to a CPU reference SDPA computed from the same TQ-packed data.
+//!
+//! Fixes applied in C-1-unlock:
+//!   D1 - encoder.memory_barrier() inserted at 3 sites (mirroring forward_mlx.rs:1429-1431,
+//!        1441-1446, 1477-1480).
+//!   D2 - Variation C replaced with true dense control: flash_attn_vec on dequantized F32 K/V.
+//!   D3 - Canary in-range: --canary in-range mutates k_norms[head=0, pos=10] *= 2.0.
+//!   D4 - Raw sdpa_out .bin written per variation alongside metrics JSON.
+//!   D5 - kv_seq_len=23 accepted from manifest (was 22); CPU reference loops 0..kvl.
 //!
 //! Usage:
 //!   cargo run --release --example tq_kernel_replay -- \
-//!     --manifest /tmp/cfa-20260422-C1-kernel-replay/manifest.json \
+//!     --manifest /tmp/cfa-20260422-C1-unlock/manifest.json \
 //!     --variation A \
-//!     [--canary 1e9] \
-//!     --out /tmp/cfa-20260422-C1-kernel-replay/out/A.json
+//!     [--canary in-range] \
+//!     --out /tmp/cfa-20260422-C1-unlock/out/claude/A
 //!
 //! Variations:
 //!   A  Full production path: forward-FWHT(Q) + TQ kernel + inverse-FWHT(output)
-//!   B  FWHT-disabled: skip both FWHT dispatches; pass Q as-is to kernel
-//!   C  Dense-KV re-encoded: dequant TQ-packed → re-FWHT → re-quantize → kernel
+//!   B  FWHT-disabled: skip both FWHT dispatches; pass Q as-is to TQ kernel
+//!   C  Dense control: flash_attn_vec (F32 K/V, natural basis) — no FWHT on either side
 //!
-//! Canary (--canary 1e9): positions 22..1023 in norms set to 1e9; if
-//!   sdpa_out differs from the normal run, the mask is leaking.
+//! Canary (--canary in-range): k_norms[head=0 * kv_capacity + pos=10] *= 2.0 before H2D.
+//!   In-range mutation (pos=10 < kv_seq_len=23); expected nrmse_delta vs A baseline > 0.01.
 //!
 //! Exit codes:
 //!   0  Success
@@ -26,6 +34,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(target_vendor = "apple")]
 
+use mlx_native::ops::flash_attn_vec::{self, FlashAttnVecParams};
 use mlx_native::ops::flash_attn_vec_tq::{self, FlashAttnVecTqParams};
 use mlx_native::ops::fwht_standalone;
 use mlx_native::turboquant::{fwht_inplace, CODEBOOK_4BIT};
@@ -42,8 +51,15 @@ use std::time::SystemTime;
 struct Args {
     manifest: PathBuf,
     variation: Variation,
-    canary: bool,
+    canary: CanaryMode,
     out: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanaryMode {
+    None,
+    InRange,
+    OutOfRange, // legacy: k_norms at positions >= kv_seq_len set to 1e9
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +74,7 @@ impl std::fmt::Display for Variation {
         match self {
             Variation::A => write!(f, "A"),
             Variation::B => write!(f, "B"),
-            Variation::C => write!(f, "C"),
+            Variation::C => write!(f, "C (dense control)"),
         }
     }
 }
@@ -67,7 +83,7 @@ fn parse_args() -> Result<Args, String> {
     let argv: Vec<String> = std::env::args().collect();
     let mut manifest: Option<PathBuf> = None;
     let mut variation: Option<Variation> = None;
-    let mut canary = false;
+    let mut canary = CanaryMode::None;
     let mut out: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -87,13 +103,29 @@ fn parse_args() -> Result<Args, String> {
                 });
             }
             "--canary" => {
-                // Accept either bare "--canary" or "--canary 1e9"
-                canary = true;
-                // Skip the next arg if it looks like the canary value (not a flag)
+                // Accept "--canary in-range", "--canary out-of-range", or bare "--canary" (= in-range)
                 if let Some(next) = argv.get(i + 1) {
-                    if !next.starts_with('-') {
-                        i += 1; // consume the value
+                    match next.as_str() {
+                        "in-range" => {
+                            canary = CanaryMode::InRange;
+                            i += 1;
+                        }
+                        "out-of-range" => {
+                            canary = CanaryMode::OutOfRange;
+                            i += 1;
+                        }
+                        s if !s.starts_with('-') => {
+                            // Legacy: numeric value like "1e9" → treat as out-of-range
+                            canary = CanaryMode::OutOfRange;
+                            i += 1;
+                        }
+                        _ => {
+                            // Next arg is a flag — bare --canary defaults to in-range
+                            canary = CanaryMode::InRange;
+                        }
                     }
+                } else {
+                    canary = CanaryMode::InRange;
                 }
             }
             "--out" => {
@@ -138,8 +170,14 @@ struct ManifestInputs {
     v_packed_padded: String,
     k_norms_padded: String,
     v_norms_padded: String,
+    // Legacy out-of-range canary files (optional — kept for backward compat)
+    #[serde(default)]
     k_norms_canary: String,
+    #[serde(default)]
     v_norms_canary: String,
+    // In-range canary: harness constructs this in-memory; path in manifest is optional
+    #[serde(default)]
+    k_norms_canary_in_range: String,
 }
 
 #[allow(dead_code)]
@@ -171,13 +209,14 @@ struct PerHeadDiff {
 #[derive(Debug, Serialize)]
 struct ReplayMetrics {
     variation: String,
-    canary: bool,
+    canary: String,
     ran_at: String,
     nrmse: f64,
     max_abs_diff: f32,
     per_head_max_abs_diff: Vec<PerHeadDiff>,
     any_nan_inf_in_gpu_output: bool,
     exit_status: String,
+    bin_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +411,8 @@ fn compute_metrics(
 fn run_variation(
     manifest: &Manifest,
     variation: Variation,
-    use_canary: bool,
+    canary: CanaryMode,
+    out_path: &PathBuf,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
 ) -> ReplayMetrics {
@@ -382,7 +422,7 @@ fn run_variation(
     let nh = p.num_heads as usize;
     let nkv = p.num_kv_heads as usize;
     let hd = p.head_dim as usize;
-    let kvl = p.kv_seq_len as usize;
+    let kvl = p.kv_seq_len as usize; // now 23 per C-1-unlock spec
     let kv_capacity = p.kv_capacity as usize;
 
     // --- Load inputs ---
@@ -395,21 +435,7 @@ fn run_variation(
     assert_eq!(k_packed_padded.len(), nkv * kv_capacity * (hd / 2));
     assert_eq!(v_packed_padded.len(), nkv * kv_capacity * (hd / 2));
 
-    // Norms — choose normal or canary
-    let k_norms_padded: Vec<f32> = if use_canary {
-        load_f32(&inp.k_norms_canary)
-    } else {
-        load_f32(&inp.k_norms_padded)
-    };
-    let v_norms_padded: Vec<f32> = if use_canary {
-        load_f32(&inp.v_norms_canary)
-    } else {
-        load_f32(&inp.v_norms_padded)
-    };
-    assert_eq!(k_norms_padded.len(), nkv * kv_capacity);
-    assert_eq!(v_norms_padded.len(), nkv * kv_capacity);
-
-    // --- Load compact TQ-packed K/V for CPU reference (22 rows, compact stride) ---
+    // --- Load compact TQ-packed K/V for CPU reference (kvl rows, compact stride) ---
     // Compact stride: element (kv_h, pos, byte) at offset kv_h*kvl*(hd/2) + pos*(hd/2) + byte
     let k_packed_compact: Vec<u8> = load_u8(&manifest.compact_sources.k_packed_compact);
     let v_packed_compact: Vec<u8> = load_u8(&manifest.compact_sources.v_packed_compact);
@@ -420,8 +446,9 @@ fn run_variation(
     assert_eq!(k_norms_compact.len(), nkv * kvl);
     assert_eq!(v_norms_compact.len(), nkv * kvl);
 
-    // --- Compute CPU reference: dequantize TQ-packed (22 rows) → natural-basis K/V ---
+    // --- Compute CPU reference: dequantize TQ-packed (kvl rows) → natural-basis K/V ---
     // This is the authoritative reference — mirrors test_flash_attn_vec_tq.rs lines 127-200.
+    // CPU reference is the same for all variations (A, B, C): natural-basis SDPA from TQ dequant.
     let mut k_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
     let mut v_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
 
@@ -446,7 +473,7 @@ fn run_variation(
         }
     }
 
-    // CPU SDPA in natural basis
+    // CPU SDPA in natural basis (same reference for all variations A/B/C)
     let cpu_ref = cpu_sdpa(
         &q_natural,
         &k_dequant,
@@ -458,66 +485,51 @@ fn run_variation(
         p.scale,
     );
 
+    // --- Load norms (padded); apply canary mutation if requested ---
+    // Baseline norms from padded files
+    let mut k_norms_padded: Vec<f32> = load_f32(&inp.k_norms_padded);
+    let mut v_norms_padded: Vec<f32> = load_f32(&inp.v_norms_padded);
+    assert_eq!(k_norms_padded.len(), nkv * kv_capacity);
+    assert_eq!(v_norms_padded.len(), nkv * kv_capacity);
 
-    // --- Variation C: re-encode dequantized K/V into fresh packed + norms ---
-    // Re-encode: natural-basis K/V → nibble_quantize (which applies FWHT internally)
-    // Then pad to kv_capacity with zeros, just like Worker 1 did for A/B.
-    let (k_packed_reenc, v_packed_reenc, k_norms_reenc, v_norms_reenc);
-    if variation == Variation::C {
-        let mut kp = vec![0u8; nkv * kv_capacity * (hd / 2)];
-        let mut vp = vec![0u8; nkv * kv_capacity * (hd / 2)];
-        let mut kn = vec![0.0f32; nkv * kv_capacity];
-        let mut vn = vec![0.0f32; nkv * kv_capacity];
-
-        for kv_h in 0..nkv {
-            for pos in 0..kvl {
-                // Padded buffer stride: h*kv_capacity*(hd/2) + pos*(hd/2)
-                let packed_dst_off = kv_h * kv_capacity * (hd / 2) + pos * (hd / 2);
-                let norms_dst_off = kv_h * kv_capacity + pos;
-
-                // K
-                let kv_deq_idx = kv_h * kvl + pos;
-                let (k_enc, k_norm) = nibble_quantize(&k_dequant[kv_deq_idx], hd);
-                kp[packed_dst_off..packed_dst_off + hd / 2].copy_from_slice(&k_enc);
-                kn[norms_dst_off] = k_norm;
-
-                // V
-                let (v_enc, v_norm) = nibble_quantize(&v_dequant[kv_deq_idx], hd);
-                vp[packed_dst_off..packed_dst_off + hd / 2].copy_from_slice(&v_enc);
-                vn[norms_dst_off] = v_norm;
+    match canary {
+        CanaryMode::None => {
+            // No mutation — use baseline norms as-is
+        }
+        CanaryMode::InRange => {
+            // D3: in-range canary — mutate k_norms at (head=0, pos=10).
+            // pos=10 is within kv_seq_len=23, so the kernel provably reads this position.
+            // Mutation: scale norm by 2x → dequantized K[h=0, pos=10, :] magnitudes ~2x.
+            // Expected: nrmse_delta vs A baseline > 0.01 (kernel reads the mutated value).
+            // Mirror canary_spec from queen's spec: k_norms_padded[0 * kv_capacity + 10] *= 2.0
+            let canary_idx = 0 * kv_capacity + 10;
+            k_norms_padded[canary_idx] *= 2.0;
+            eprintln!(
+                "canary in-range: k_norms[head=0, pos=10] *= 2.0 → new value = {}",
+                k_norms_padded[canary_idx]
+            );
+        }
+        CanaryMode::OutOfRange => {
+            // Legacy out-of-range canary: load from manifest file if available,
+            // otherwise set norms at positions >= kvl to 1e9.
+            if !inp.k_norms_canary.is_empty() && !inp.v_norms_canary.is_empty() {
+                k_norms_padded = load_f32(&inp.k_norms_canary);
+                v_norms_padded = load_f32(&inp.v_norms_canary);
+                assert_eq!(k_norms_padded.len(), nkv * kv_capacity);
+                assert_eq!(v_norms_padded.len(), nkv * kv_capacity);
+            } else {
+                // Construct in-memory: positions >= kvl set to 1e9
+                for kv_h in 0..nkv {
+                    for pos in kvl..kv_capacity {
+                        k_norms_padded[kv_h * kv_capacity + pos] = 1e9;
+                        v_norms_padded[kv_h * kv_capacity + pos] = 1e9;
+                    }
+                }
             }
         }
-
-        k_packed_reenc = kp;
-        v_packed_reenc = vp;
-        k_norms_reenc = kn;
-        v_norms_reenc = vn;
-    } else {
-        k_packed_reenc = Vec::new();
-        v_packed_reenc = Vec::new();
-        k_norms_reenc = Vec::new();
-        v_norms_reenc = Vec::new();
     }
 
-    // Select which packed / norm buffers go to GPU
-    let (k_packed_gpu, v_packed_gpu, k_norms_gpu, v_norms_gpu): (
-        &[u8], &[u8], &[f32], &[f32],
-    ) = match variation {
-        Variation::A | Variation::B => (
-            &k_packed_padded,
-            &v_packed_padded,
-            &k_norms_padded,
-            &v_norms_padded,
-        ),
-        Variation::C => (
-            &k_packed_reenc,
-            &v_packed_reenc,
-            &k_norms_reenc,
-            &v_norms_reenc,
-        ),
-    };
-
-    // --- Allocate GPU buffers ---
+    // --- GPU buffer allocation ---
     // Q: [nh, 1, hd] F32 — production shape
     let mut q_buf = device
         .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
@@ -525,7 +537,7 @@ fn run_variation(
     q_buf.as_mut_slice::<f32>().expect("write Q")[..nh * hd]
         .copy_from_slice(&q_natural);
 
-    // K/V packed: [nkv, kv_capacity, hd/2] u8
+    // K/V packed: [nkv, kv_capacity, hd/2] u8 (used by A/B)
     let k_packed_bytes = nkv * kv_capacity * (hd / 2);
     let v_packed_bytes = nkv * kv_capacity * (hd / 2);
 
@@ -533,54 +545,49 @@ fn run_variation(
         .alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kv_capacity, hd / 2])
         .expect("alloc K packed");
     k_packed_buf.as_mut_slice::<u8>().expect("write K packed")
-        .copy_from_slice(k_packed_gpu);
+        .copy_from_slice(&k_packed_padded);
 
     let mut v_packed_buf = device
         .alloc_buffer(v_packed_bytes, DType::U8, vec![nkv, kv_capacity, hd / 2])
         .expect("alloc V packed");
     v_packed_buf.as_mut_slice::<u8>().expect("write V packed")
-        .copy_from_slice(v_packed_gpu);
+        .copy_from_slice(&v_packed_padded);
 
-    // Norms: [nkv, kv_capacity] f32
+    // Norms: [nkv, kv_capacity] f32 (used by A/B; includes canary mutation if active)
     let norms_bytes = nkv * kv_capacity * 4;
 
     let mut k_norms_buf = device
         .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kv_capacity])
         .expect("alloc K norms");
     k_norms_buf.as_mut_slice::<f32>().expect("write K norms")
-        .copy_from_slice(k_norms_gpu);
+        .copy_from_slice(&k_norms_padded);
 
     let mut v_norms_buf = device
         .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kv_capacity])
         .expect("alloc V norms");
     v_norms_buf.as_mut_slice::<f32>().expect("write V norms")
-        .copy_from_slice(v_norms_gpu);
+        .copy_from_slice(&v_norms_padded);
 
-    // Output + tmp
+    // Output buffer: [nh, 1, hd] F32
     let output_buf = device
         .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
         .expect("alloc output");
 
-    let tmp_bytes = flash_attn_vec_tq::tmp_buffer_bytes(p.num_heads, p.head_dim);
+    // Tmp buffer for TQ SDPA kernel
+    let tmp_bytes_tq = flash_attn_vec_tq::tmp_buffer_bytes(p.num_heads, p.head_dim);
     let tmp_buf = device
-        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .alloc_buffer(tmp_bytes_tq, DType::F32, vec![tmp_bytes_tq / 4])
         .expect("alloc tmp");
 
-    // --- Build params struct verbatim from manifest (mirrors forward_mlx.rs:1452-1462) ---
-    //
-    // DISPATCH MIRROR NOTE: The production call (forward_mlx.rs:1464-1474) passes
-    // &self.activations.attn_q_normed which has ALREADY been FWHT-pre-rotated in-place
-    // by dispatch_fwht_f32 at line 1433. In the harness, q_buf starts in natural basis
-    // and we apply dispatch_fwht_f32 (Variation A/C) or skip it (Variation B), mirroring
-    // the production dispatch structure faithfully.
-    let params = FlashAttnVecTqParams {
+    // --- Build TQ SDPA params struct from manifest (mirrors forward_mlx.rs:1452-1462) ---
+    let tq_params = FlashAttnVecTqParams {
         num_heads: p.num_heads,
         num_kv_heads: p.num_kv_heads,
         head_dim: p.head_dim,
         kv_seq_len: p.kv_seq_len,
         kv_capacity: p.kv_capacity,
         scale: p.scale,
-        mask_type: p.mask_type,     // 2 (sliding) — corrected from meta JSON mask_type=1
+        mask_type: p.mask_type,
         sliding_window: p.sliding_window,
         softcap: p.softcap,
         ring_start: p.ring_start,
@@ -590,7 +597,10 @@ fn run_variation(
     let mut encoder = device.command_encoder().expect("command_encoder");
 
     match variation {
-        Variation::A | Variation::C => {
+        Variation::A => {
+            // Mirror forward_mlx.rs:1429-1431 — RAW on q_buf before in-place forward FWHT
+            encoder.memory_barrier(); // BARRIER 1 (D1): before forward FWHT on Q
+
             // Forward FWHT on Q (in-place) — mirrors forward_mlx.rs:1433-1437
             fwht_standalone::dispatch_fwht_f32(
                 &mut encoder,
@@ -601,6 +611,9 @@ fn run_variation(
                 p.head_dim,
             )
             .expect("FWHT forward-Q dispatch");
+
+            // Mirror forward_mlx.rs:1441-1446 — publish Q (post-FWHT) + packed K/V + norms
+            encoder.memory_barrier(); // BARRIER 2 (D1): before TQ SDPA
 
             // TQ SDPA kernel — mirrors forward_mlx.rs:1464-1474
             flash_attn_vec_tq::flash_attn_vec_tq(
@@ -614,9 +627,12 @@ fn run_variation(
                 &v_norms_buf,
                 &output_buf,
                 &tmp_buf,
-                &params,
+                &tq_params,
             )
             .expect("flash_attn_vec_tq dispatch");
+
+            // Mirror forward_mlx.rs:1477-1480 — RAW on sdpa_out before in-place inverse FWHT
+            encoder.memory_barrier(); // BARRIER 3 (D1): before inverse FWHT on output
 
             // Inverse FWHT on output (in-place) — mirrors forward_mlx.rs:1481-1485
             fwht_standalone::dispatch_fwht_f32(
@@ -631,14 +647,13 @@ fn run_variation(
         }
 
         Variation::B => {
-            // FWHT-disabled: pass Q in natural basis; read output in rotated domain.
+            // FWHT-disabled: pass Q in natural basis; no FWHT on either side.
             // This deliberately mismatches the kernel's assumption that Q is pre-rotated.
-            // If the output nrmse improves vs A, FWHT is the locus.
+            // Only barrier_2 equivalent needed: publish packed K/V + norms before kernel reads.
             //
-            // NOTE: The CPU reference is the SAME as A/C (natural-basis SDPA from TQ dequant).
-            // Variation B is mathematically wrong on purpose — its nrmse vs the natural-basis
-            // reference reveals whether the FWHT pair (forward+inverse) is the source of
-            // divergence seen in C-0.
+            // Mirror forward_mlx.rs:1441-1446 — publish packed K/V + norms before TQ SDPA
+            encoder.memory_barrier(); // BARRIER 1 of B (D1): before TQ SDPA
+
             flash_attn_vec_tq::flash_attn_vec_tq(
                 &mut encoder,
                 registry,
@@ -650,10 +665,81 @@ fn run_variation(
                 &v_norms_buf,
                 &output_buf,
                 &tmp_buf,
-                &params,
+                &tq_params,
             )
             .expect("flash_attn_vec_tq dispatch (no FWHT)");
             // No inverse FWHT — output remains in rotated domain.
+        }
+
+        Variation::C => {
+            // D2: Dense control — flash_attn_vec on dequantized F32 K/V.
+            // Natural basis on both sides (no FWHT on Q or output).
+            // This isolates whether TQ packed-read path / FWHT bracketing is the locus.
+            //
+            // Allocate F32 dense K/V buffers: [nkv, kv_capacity, hd]
+            // Fill positions 0..kvl from k_dequant / v_dequant (already natural basis).
+            // Leave positions kvl..kv_capacity as 0.0f32.
+            let dense_kv_bytes = nkv * kv_capacity * hd * 4;
+            let mut k_dense_buf = device
+                .alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kv_capacity, hd])
+                .expect("alloc K dense");
+            let mut v_dense_buf = device
+                .alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kv_capacity, hd])
+                .expect("alloc V dense");
+
+            {
+                let k_slice = k_dense_buf.as_mut_slice::<f32>().expect("write K dense");
+                let v_slice = v_dense_buf.as_mut_slice::<f32>().expect("write V dense");
+                // Fill: stride is h*kv_capacity*hd + pos*hd
+                for kv_h in 0..nkv {
+                    for pos in 0..kvl {
+                        let deq_idx = kv_h * kvl + pos;
+                        let dst_off = kv_h * kv_capacity * hd + pos * hd;
+                        k_slice[dst_off..dst_off + hd]
+                            .copy_from_slice(&k_dequant[deq_idx]);
+                        v_slice[dst_off..dst_off + hd]
+                            .copy_from_slice(&v_dequant[deq_idx]);
+                    }
+                    // Positions kvl..kv_capacity remain 0.0f32 (already zero from alloc)
+                }
+            }
+
+            // Tmp buffer for dense flash_attn_vec kernel
+            let tmp_bytes_dense = flash_attn_vec::tmp_buffer_bytes(p.num_heads, p.head_dim);
+            let tmp_dense_buf = device
+                .alloc_buffer(tmp_bytes_dense, DType::F32, vec![tmp_bytes_dense / 4])
+                .expect("alloc tmp dense");
+
+            // Dense flash_attn_vec params — no ring_start field (implicit 0 when kv_seq_len < kv_capacity)
+            let dense_params = FlashAttnVecParams {
+                num_heads: p.num_heads,
+                num_kv_heads: p.num_kv_heads,
+                head_dim: p.head_dim,
+                kv_seq_len: p.kv_seq_len,
+                kv_capacity: p.kv_capacity,
+                scale: p.scale,
+                mask_type: p.mask_type,       // 2 (sliding window)
+                sliding_window: p.sliding_window, // 1024
+                softcap: p.softcap,
+            };
+
+            // Mirror: ONE barrier before flash_attn_vec dispatch (publish q + k_dense + v_dense)
+            encoder.memory_barrier(); // BARRIER 1 of C (D1): before dense flash_attn_vec
+
+            // Dispatch dense SDPA (not flash_attn_vec_tq)
+            flash_attn_vec::flash_attn_vec(
+                &mut encoder,
+                registry,
+                device,
+                &q_buf,
+                &k_dense_buf,
+                &v_dense_buf,
+                &output_buf,
+                &tmp_dense_buf,
+                &dense_params,
+            )
+            .expect("flash_attn_vec dispatch (dense control)");
+            // No forward/inverse FWHT on q_buf or output_buf — natural basis throughout.
         }
     }
 
@@ -673,34 +759,52 @@ fn run_variation(
     let (nrmse, max_abs_diff, per_head) =
         compute_metrics(&cpu_ref, &gpu_output, nh, hd);
 
-    // --- Write sdpa_out binary alongside the metrics JSON ---
-    // (raw f32 LE, same layout as production sdpa_out [nh, 1, hd])
+    // --- D4: Write raw sdpa_out .bin alongside the metrics JSON ---
+    // Format: raw F32 little-endian, shape [nh, 1, hd] = nh*hd*4 bytes = 16384 bytes for nh=16, hd=256
     let gpu_out_bytes: Vec<u8> = gpu_output
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    // Write to <out_base>.bin  (if --out is A.json, bin is A.bin)
-    // We just print, not enforce — Worker 3 reads the JSON.
+
+    // Derive bin path from out_path: strip any extension, append _sdpa_out.bin
+    let out_stem = out_path.with_extension("");
+    let bin_path = {
+        let mut p = out_stem.into_os_string();
+        p.push("_sdpa_out.bin");
+        PathBuf::from(p)
+    };
+
+    if let Some(parent) = bin_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(&bin_path, &gpu_out_bytes).unwrap_or_else(|e| {
+        eprintln!("ERROR: failed to write sdpa_out bin to {:?}: {}", bin_path, e);
+        std::process::exit(1);
+    });
+    eprintln!("sdpa_out bin written: {:?} ({} bytes)", bin_path, gpu_out_bytes.len());
 
     let ran_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "unknown".into());
 
+    let canary_str = match canary {
+        CanaryMode::None => "none".to_string(),
+        CanaryMode::InRange => "in-range".to_string(),
+        CanaryMode::OutOfRange => "out-of-range".to_string(),
+    };
+
     let metrics = ReplayMetrics {
         variation: variation.to_string(),
-        canary: use_canary,
+        canary: canary_str,
         ran_at,
         nrmse,
         max_abs_diff,
         per_head_max_abs_diff: per_head,
         any_nan_inf_in_gpu_output: has_nan_inf,
         exit_status: if has_nan_inf { "NaN/Inf" } else { "ok" }.into(),
+        bin_path: bin_path.to_string_lossy().into_owned(),
     };
-
-    // Also emit per-run binary (best-effort, ignore errors)
-    // Named <out stem>_sdpa_out.bin
-    let _ = gpu_out_bytes; // suppress unused warning; caller writes the JSON
 
     if has_nan_inf {
         eprintln!(
@@ -718,14 +822,12 @@ fn run_variation(
 // ---------------------------------------------------------------------------
 
 fn main() {
-    // On non-Apple targets this code will not compile anyway due to #[cfg] at the
-    // top, but we add an explicit guard for clarity.
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("argument error: {}", e);
             eprintln!(
-                "usage: tq_kernel_replay --manifest <path> --variation <A|B|C> [--canary [1e9]] --out <path.json>"
+                "usage: tq_kernel_replay --manifest <path> --variation <A|B|C> [--canary in-range|out-of-range] --out <path>"
             );
             std::process::exit(1);
         }
@@ -744,13 +846,14 @@ fn main() {
     // Initialise Metal device and kernel registry
     let device = MlxDevice::new().expect("MlxDevice::new");
     let mut registry = KernelRegistry::new();
-    // TQ SDPA kernel + reduce kernel (registered explicitly)
+    // TQ SDPA kernel
     flash_attn_vec_tq::register(&mut registry);
+    // Dense flash_attn_vec kernel (used by Variation C)
     mlx_native::ops::flash_attn_vec::register(&mut registry);
     // fwht_standalone kernels are pre-registered inside KernelRegistry::new()
 
     eprintln!(
-        "tq_kernel_replay: variation={} canary={} manifest={:?}",
+        "tq_kernel_replay: variation={} canary={:?} manifest={:?}",
         args.variation, args.canary, args.manifest
     );
 
@@ -758,41 +861,34 @@ fn main() {
         &manifest,
         args.variation,
         args.canary,
+        &args.out,
         &device,
         &mut registry,
     );
 
-    // Print summary to stdout (for Worker 3 to capture)
+    // Print summary to stdout
     let json = serde_json::to_string_pretty(&metrics).expect("serialize metrics");
     println!("{}", json);
 
-    // Write metrics to --out path
-    if let Some(parent) = args.out.parent() {
+    // Write metrics JSON to --out path (with .json extension if not already present)
+    let out_json = if args.out.extension().map(|e| e == "json").unwrap_or(false) {
+        args.out.clone()
+    } else {
+        args.out.with_extension("json")
+    };
+
+    if let Some(parent) = out_json.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(&args.out, &json).unwrap_or_else(|e| {
-        eprintln!("failed to write metrics to {:?}: {}", args.out, e);
+    fs::write(&out_json, &json).unwrap_or_else(|e| {
+        eprintln!("failed to write metrics to {:?}: {}", out_json, e);
         std::process::exit(1);
     });
 
-    // Also write the raw GPU sdpa_out binary alongside (stem + _sdpa_out.bin)
-    let out_stem = args.out.with_extension("");
-    let bin_path = {
-        let mut p = out_stem.into_os_string();
-        p.push("_sdpa_out.bin");
-        PathBuf::from(p)
-    };
-    // Re-run to get gpu bytes — or just re-derive from already-printed nrmse
-    // (We already have the metrics, so we can't cheaply re-get the raw bytes here
-    //  without restructuring. This is fine: the analyst reads the JSON metrics;
-    //  if raw bytes are needed, re-run with a modified harness.)
     eprintln!(
-        "metrics written to {:?}; raw sdpa_out bin would be at {:?} (not written separately in this run)",
-        args.out, bin_path
+        "RESULT: variation={} canary={:?} nrmse={:.6} max_abs_diff={:.6} nan_inf={}",
+        metrics.variation, args.canary, metrics.nrmse, metrics.max_abs_diff,
+        metrics.any_nan_inf_in_gpu_output
     );
-
-    eprintln!(
-        "RESULT: variation={} nrmse={:.6} max_abs_diff={:.6} nan_inf={}",
-        metrics.variation, metrics.nrmse, metrics.max_abs_diff, metrics.any_nan_inf_in_gpu_output
-    );
+    eprintln!("metrics written to {:?}", out_json);
 }
