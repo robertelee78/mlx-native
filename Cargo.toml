@@ -47,6 +47,9 @@ tag-name = "{{prefix}}{{version}}"
 # Push tag and commits to remote after publish.
 push-remote = "origin"
 
+[[example]]
+name = "tq_kernel_replay"
+
 [[bench]]
 name = "bench_quantized_matmul"
 harness = false
