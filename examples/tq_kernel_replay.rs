@@ -9,7 +9,7 @@
 //!   D2 - Variation C replaced with true dense control: flash_attn_vec on dequantized F32 K/V.
 //!   D3 - Canary in-range: --canary in-range mutates k_norms[head=0, pos=10] *= 2.0.
 //!   D4 - Raw sdpa_out .bin written per variation alongside metrics JSON.
-//!   D5 - kv_seq_len=23 accepted from manifest (was 22); CPU reference loops 0..kvl.
+//!   D5 - kv_seq_len=23 accepted from manifest; CPU reference loops 0..kvl.
 //!
 //! Usage:
 //!   cargo run --release --example tq_kernel_replay -- \
@@ -146,7 +146,11 @@ fn parse_args() -> Result<Args, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Manifest schema
+// Manifest schema — supports the instrumenter's C-1-unlock format.
+//
+// The instrumenter manifest uses `dump_paths` (not `inputs`) and has no
+// `compact_sources` section. Compact K/V for CPU reference is derived
+// in-memory by slicing rows 0..kvl from the padded buffers.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -163,37 +167,47 @@ struct ManifestParams {
     ring_start: u32,
 }
 
+/// Paths section — accepts both the new `dump_paths` key (instrumenter format)
+/// and the old `inputs` key (C-1 format) via `#[serde(alias)]`.
 #[derive(Debug, Deserialize)]
-struct ManifestInputs {
-    q_natural: String,
+struct ManifestPaths {
+    #[serde(alias = "k_packed_post_quant", alias = "k_packed_padded")]
     k_packed_padded: String,
+    #[serde(alias = "v_packed_post_quant", alias = "v_packed_padded")]
     v_packed_padded: String,
+    #[serde(alias = "k_norms_post_quant", alias = "k_norms_padded")]
     k_norms_padded: String,
+    #[serde(alias = "v_norms_post_quant", alias = "v_norms_padded")]
     v_norms_padded: String,
-    // Legacy out-of-range canary files (optional — kept for backward compat)
+    q_natural: String,
+    // Optional legacy canary files (old format only)
     #[serde(default)]
     k_norms_canary: String,
     #[serde(default)]
     v_norms_canary: String,
-    // In-range canary: harness constructs this in-memory; path in manifest is optional
+}
+
+/// Top-level manifest. Accepts both:
+///   - New format: `dump_paths` key (instrumenter C-1-unlock)
+///   - Old format: `inputs` key (C-1 harness)
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    params: ManifestParams,
+    /// New instrumenter format uses `dump_paths`; old harness format uses `inputs`.
+    #[serde(alias = "inputs")]
+    dump_paths: ManifestPaths,
+    /// Old format only — if absent, compact sources are derived in-memory.
     #[serde(default)]
-    k_norms_canary_in_range: String,
+    compact_sources: Option<LegacyCompactSources>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct ManifestCompactSources {
+#[derive(Debug, Deserialize, Default)]
+struct LegacyCompactSources {
     k_packed_compact: String,
     v_packed_compact: String,
     k_norms_compact: String,
     v_norms_compact: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Manifest {
-    params: ManifestParams,
-    inputs: ManifestInputs,
-    compact_sources: ManifestCompactSources,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +419,50 @@ fn compute_metrics(
 }
 
 // ---------------------------------------------------------------------------
+// Derive compact K/V from padded buffers by slicing rows 0..kvl
+//
+// Padded layout:  [nkv, kv_capacity, hd/2] u8 — stride h*kv_capacity*(hd/2) + pos*(hd/2)
+// Compact layout: [nkv, kvl, hd/2] u8         — stride h*kvl*(hd/2) + pos*(hd/2)
+// ---------------------------------------------------------------------------
+
+fn compact_from_padded_u8(
+    padded: &[u8],
+    nkv: usize,
+    kv_capacity: usize,
+    kvl: usize,
+    hd: usize,
+) -> Vec<u8> {
+    let half_hd = hd / 2;
+    let mut compact = vec![0u8; nkv * kvl * half_hd];
+    for kv_h in 0..nkv {
+        for pos in 0..kvl {
+            let src_off = kv_h * kv_capacity * half_hd + pos * half_hd;
+            let dst_off = kv_h * kvl * half_hd + pos * half_hd;
+            compact[dst_off..dst_off + half_hd]
+                .copy_from_slice(&padded[src_off..src_off + half_hd]);
+        }
+    }
+    compact
+}
+
+fn compact_from_padded_f32(
+    padded: &[f32],
+    nkv: usize,
+    kv_capacity: usize,
+    kvl: usize,
+) -> Vec<f32> {
+    let mut compact = vec![0.0f32; nkv * kvl];
+    for kv_h in 0..nkv {
+        for pos in 0..kvl {
+            let src_off = kv_h * kv_capacity + pos;
+            let dst_off = kv_h * kvl + pos;
+            compact[dst_off] = padded[src_off];
+        }
+    }
+    compact
+}
+
+// ---------------------------------------------------------------------------
 // Core replay logic
 // ---------------------------------------------------------------------------
 
@@ -417,37 +475,65 @@ fn run_variation(
     registry: &mut KernelRegistry,
 ) -> ReplayMetrics {
     let p = &manifest.params;
-    let inp = &manifest.inputs;
+    let paths = &manifest.dump_paths;
 
     let nh = p.num_heads as usize;
     let nkv = p.num_kv_heads as usize;
     let hd = p.head_dim as usize;
-    let kvl = p.kv_seq_len as usize; // now 23 per C-1-unlock spec
+    let kvl = p.kv_seq_len as usize; // 23 in C-1-unlock
     let kv_capacity = p.kv_capacity as usize;
 
-    // --- Load inputs ---
-    let q_natural: Vec<f32> = load_f32(&inp.q_natural);
+    // --- Load padded inputs ---
+    let q_natural: Vec<f32> = load_f32(&paths.q_natural);
     assert_eq!(q_natural.len(), nh * hd, "q_natural size mismatch");
 
-    // Padded packed K/V buffers [nkv, kv_capacity, hd/2]
-    let k_packed_padded: Vec<u8> = load_u8(&inp.k_packed_padded);
-    let v_packed_padded: Vec<u8> = load_u8(&inp.v_packed_padded);
-    assert_eq!(k_packed_padded.len(), nkv * kv_capacity * (hd / 2));
+    let k_packed_padded: Vec<u8> = load_u8(&paths.k_packed_padded);
+    let v_packed_padded: Vec<u8> = load_u8(&paths.v_packed_padded);
+    assert_eq!(k_packed_padded.len(), nkv * kv_capacity * (hd / 2),
+        "k_packed_padded size mismatch: expected {} got {}",
+        nkv * kv_capacity * (hd / 2), k_packed_padded.len());
     assert_eq!(v_packed_padded.len(), nkv * kv_capacity * (hd / 2));
 
-    // --- Load compact TQ-packed K/V for CPU reference (kvl rows, compact stride) ---
-    // Compact stride: element (kv_h, pos, byte) at offset kv_h*kvl*(hd/2) + pos*(hd/2) + byte
-    let k_packed_compact: Vec<u8> = load_u8(&manifest.compact_sources.k_packed_compact);
-    let v_packed_compact: Vec<u8> = load_u8(&manifest.compact_sources.v_packed_compact);
-    let k_norms_compact: Vec<f32> = load_f32(&manifest.compact_sources.k_norms_compact);
-    let v_norms_compact: Vec<f32> = load_f32(&manifest.compact_sources.v_norms_compact);
+    let k_norms_padded_base: Vec<f32> = load_f32(&paths.k_norms_padded);
+    let v_norms_padded_base: Vec<f32> = load_f32(&paths.v_norms_padded);
+    assert_eq!(k_norms_padded_base.len(), nkv * kv_capacity);
+    assert_eq!(v_norms_padded_base.len(), nkv * kv_capacity);
+
+    // --- Derive compact K/V (rows 0..kvl) for CPU reference ---
+    // New instrumenter format has no compact_sources — derive in-memory by slicing.
+    // Legacy format may have compact_sources on disk.
+    let (k_packed_compact, v_packed_compact, k_norms_compact, v_norms_compact) =
+        if let Some(ref cs) = manifest.compact_sources {
+            if !cs.k_packed_compact.is_empty() {
+                // Legacy: load from disk
+                let kp = load_u8(&cs.k_packed_compact);
+                let vp = load_u8(&cs.v_packed_compact);
+                let kn = load_f32(&cs.k_norms_compact);
+                let vn = load_f32(&cs.v_norms_compact);
+                (kp, vp, kn, vn)
+            } else {
+                // Empty legacy struct — derive in-memory
+                let kp = compact_from_padded_u8(&k_packed_padded, nkv, kv_capacity, kvl, hd);
+                let vp = compact_from_padded_u8(&v_packed_padded, nkv, kv_capacity, kvl, hd);
+                let kn = compact_from_padded_f32(&k_norms_padded_base, nkv, kv_capacity, kvl);
+                let vn = compact_from_padded_f32(&v_norms_padded_base, nkv, kv_capacity, kvl);
+                (kp, vp, kn, vn)
+            }
+        } else {
+            // No compact_sources key — instrumenter format, derive in-memory
+            let kp = compact_from_padded_u8(&k_packed_padded, nkv, kv_capacity, kvl, hd);
+            let vp = compact_from_padded_u8(&v_packed_padded, nkv, kv_capacity, kvl, hd);
+            let kn = compact_from_padded_f32(&k_norms_padded_base, nkv, kv_capacity, kvl);
+            let vn = compact_from_padded_f32(&v_norms_padded_base, nkv, kv_capacity, kvl);
+            (kp, vp, kn, vn)
+        };
+
     assert_eq!(k_packed_compact.len(), nkv * kvl * (hd / 2));
     assert_eq!(v_packed_compact.len(), nkv * kvl * (hd / 2));
     assert_eq!(k_norms_compact.len(), nkv * kvl);
     assert_eq!(v_norms_compact.len(), nkv * kvl);
 
     // --- Compute CPU reference: dequantize TQ-packed (kvl rows) → natural-basis K/V ---
-    // This is the authoritative reference — mirrors test_flash_attn_vec_tq.rs lines 127-200.
     // CPU reference is the same for all variations (A, B, C): natural-basis SDPA from TQ dequant.
     let mut k_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
     let mut v_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
@@ -485,12 +571,10 @@ fn run_variation(
         p.scale,
     );
 
-    // --- Load norms (padded); apply canary mutation if requested ---
-    // Baseline norms from padded files
-    let mut k_norms_padded: Vec<f32> = load_f32(&inp.k_norms_padded);
-    let mut v_norms_padded: Vec<f32> = load_f32(&inp.v_norms_padded);
-    assert_eq!(k_norms_padded.len(), nkv * kv_capacity);
-    assert_eq!(v_norms_padded.len(), nkv * kv_capacity);
+    // --- Prepare norms with optional canary mutation ---
+    // Start from the padded baseline norms
+    let mut k_norms_gpu: Vec<f32> = k_norms_padded_base.clone();
+    let mut v_norms_gpu: Vec<f32> = v_norms_padded_base.clone();
 
     match canary {
         CanaryMode::None => {
@@ -500,29 +584,27 @@ fn run_variation(
             // D3: in-range canary — mutate k_norms at (head=0, pos=10).
             // pos=10 is within kv_seq_len=23, so the kernel provably reads this position.
             // Mutation: scale norm by 2x → dequantized K[h=0, pos=10, :] magnitudes ~2x.
-            // Expected: nrmse_delta vs A baseline > 0.01 (kernel reads the mutated value).
-            // Mirror canary_spec from queen's spec: k_norms_padded[0 * kv_capacity + 10] *= 2.0
+            // Mirror canary_spec: k_norms_padded[0 * kv_capacity + 10] *= 2.0
             let canary_idx = 0 * kv_capacity + 10;
-            k_norms_padded[canary_idx] *= 2.0;
+            k_norms_gpu[canary_idx] *= 2.0;
             eprintln!(
                 "canary in-range: k_norms[head=0, pos=10] *= 2.0 → new value = {}",
-                k_norms_padded[canary_idx]
+                k_norms_gpu[canary_idx]
             );
         }
         CanaryMode::OutOfRange => {
-            // Legacy out-of-range canary: load from manifest file if available,
-            // otherwise set norms at positions >= kvl to 1e9.
-            if !inp.k_norms_canary.is_empty() && !inp.v_norms_canary.is_empty() {
-                k_norms_padded = load_f32(&inp.k_norms_canary);
-                v_norms_padded = load_f32(&inp.v_norms_canary);
-                assert_eq!(k_norms_padded.len(), nkv * kv_capacity);
-                assert_eq!(v_norms_padded.len(), nkv * kv_capacity);
+            // Legacy out-of-range canary: positions >= kvl set to 1e9.
+            // If manifest has old canary files, load them; otherwise construct in-memory.
+            if !paths.k_norms_canary.is_empty() && !paths.v_norms_canary.is_empty() {
+                k_norms_gpu = load_f32(&paths.k_norms_canary);
+                v_norms_gpu = load_f32(&paths.v_norms_canary);
+                assert_eq!(k_norms_gpu.len(), nkv * kv_capacity);
+                assert_eq!(v_norms_gpu.len(), nkv * kv_capacity);
             } else {
-                // Construct in-memory: positions >= kvl set to 1e9
                 for kv_h in 0..nkv {
                     for pos in kvl..kv_capacity {
-                        k_norms_padded[kv_h * kv_capacity + pos] = 1e9;
-                        v_norms_padded[kv_h * kv_capacity + pos] = 1e9;
+                        k_norms_gpu[kv_h * kv_capacity + pos] = 1e9;
+                        v_norms_gpu[kv_h * kv_capacity + pos] = 1e9;
                     }
                 }
             }
@@ -553,20 +635,20 @@ fn run_variation(
     v_packed_buf.as_mut_slice::<u8>().expect("write V packed")
         .copy_from_slice(&v_packed_padded);
 
-    // Norms: [nkv, kv_capacity] f32 (used by A/B; includes canary mutation if active)
+    // Norms: [nkv, kv_capacity] f32 (includes canary mutation if active)
     let norms_bytes = nkv * kv_capacity * 4;
 
     let mut k_norms_buf = device
         .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kv_capacity])
         .expect("alloc K norms");
     k_norms_buf.as_mut_slice::<f32>().expect("write K norms")
-        .copy_from_slice(&k_norms_padded);
+        .copy_from_slice(&k_norms_gpu);
 
     let mut v_norms_buf = device
         .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kv_capacity])
         .expect("alloc V norms");
     v_norms_buf.as_mut_slice::<f32>().expect("write V norms")
-        .copy_from_slice(&v_norms_padded);
+        .copy_from_slice(&v_norms_gpu);
 
     // Output buffer: [nh, 1, hd] F32
     let output_buf = device
@@ -579,7 +661,7 @@ fn run_variation(
         .alloc_buffer(tmp_bytes_tq, DType::F32, vec![tmp_bytes_tq / 4])
         .expect("alloc tmp");
 
-    // --- Build TQ SDPA params struct from manifest (mirrors forward_mlx.rs:1452-1462) ---
+    // --- TQ SDPA params from manifest ---
     let tq_params = FlashAttnVecTqParams {
         num_heads: p.num_heads,
         num_kv_heads: p.num_kv_heads,
@@ -648,8 +730,7 @@ fn run_variation(
 
         Variation::B => {
             // FWHT-disabled: pass Q in natural basis; no FWHT on either side.
-            // This deliberately mismatches the kernel's assumption that Q is pre-rotated.
-            // Only barrier_2 equivalent needed: publish packed K/V + norms before kernel reads.
+            // Only barrier_2 equivalent: publish packed K/V + norms before kernel reads.
             //
             // Mirror forward_mlx.rs:1441-1446 — publish packed K/V + norms before TQ SDPA
             encoder.memory_barrier(); // BARRIER 1 of B (D1): before TQ SDPA
@@ -674,11 +755,7 @@ fn run_variation(
         Variation::C => {
             // D2: Dense control — flash_attn_vec on dequantized F32 K/V.
             // Natural basis on both sides (no FWHT on Q or output).
-            // This isolates whether TQ packed-read path / FWHT bracketing is the locus.
-            //
-            // Allocate F32 dense K/V buffers: [nkv, kv_capacity, hd]
-            // Fill positions 0..kvl from k_dequant / v_dequant (already natural basis).
-            // Leave positions kvl..kv_capacity as 0.0f32.
+            // Allocate F32 dense K/V: [nkv, kv_capacity, hd]; fill 0..kvl from k_dequant/v_dequant.
             let dense_kv_bytes = nkv * kv_capacity * hd * 4;
             let mut k_dense_buf = device
                 .alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kv_capacity, hd])
@@ -700,7 +777,7 @@ fn run_variation(
                         v_slice[dst_off..dst_off + hd]
                             .copy_from_slice(&v_dequant[deq_idx]);
                     }
-                    // Positions kvl..kv_capacity remain 0.0f32 (already zero from alloc)
+                    // Positions kvl..kv_capacity remain 0.0f32
                 }
             }
 
@@ -710,7 +787,7 @@ fn run_variation(
                 .alloc_buffer(tmp_bytes_dense, DType::F32, vec![tmp_bytes_dense / 4])
                 .expect("alloc tmp dense");
 
-            // Dense flash_attn_vec params — no ring_start field (implicit 0 when kv_seq_len < kv_capacity)
+            // Dense flash_attn_vec params — no ring_start (implicit 0 when kv_seq_len < kv_capacity)
             let dense_params = FlashAttnVecParams {
                 num_heads: p.num_heads,
                 num_kv_heads: p.num_kv_heads,
@@ -718,7 +795,7 @@ fn run_variation(
                 kv_seq_len: p.kv_seq_len,
                 kv_capacity: p.kv_capacity,
                 scale: p.scale,
-                mask_type: p.mask_type,       // 2 (sliding window)
+                mask_type: p.mask_type,        // 2 (sliding window)
                 sliding_window: p.sliding_window, // 1024
                 softcap: p.softcap,
             };
@@ -760,14 +837,18 @@ fn run_variation(
         compute_metrics(&cpu_ref, &gpu_output, nh, hd);
 
     // --- D4: Write raw sdpa_out .bin alongside the metrics JSON ---
-    // Format: raw F32 little-endian, shape [nh, 1, hd] = nh*hd*4 bytes = 16384 bytes for nh=16, hd=256
+    // Format: raw F32 little-endian, shape [nh, hd] = nh*hd*4 bytes = 16384 bytes for nh=16, hd=256
     let gpu_out_bytes: Vec<u8> = gpu_output
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
 
-    // Derive bin path from out_path: strip any extension, append _sdpa_out.bin
-    let out_stem = out_path.with_extension("");
+    // Derive bin path from out_path: strip any .json extension, append _sdpa_out.bin
+    let out_stem = if out_path.extension().map(|e| e == "json").unwrap_or(false) {
+        out_path.with_extension("")
+    } else {
+        out_path.clone()
+    };
     let bin_path = {
         let mut p = out_stem.into_os_string();
         p.push("_sdpa_out.bin");
@@ -870,7 +951,7 @@ fn main() {
     let json = serde_json::to_string_pretty(&metrics).expect("serialize metrics");
     println!("{}", json);
 
-    // Write metrics JSON to --out path (with .json extension if not already present)
+    // Write metrics JSON to --out path (add .json extension if absent)
     let out_json = if args.out.extension().map(|e| e == "json").unwrap_or(false) {
         args.out.clone()
     } else {
