@@ -48,11 +48,34 @@ use std::time::SystemTime;
 // CLI parsing (no clap dep — simple std::env)
 // ---------------------------------------------------------------------------
 
+/// Oracle mode: what reference to compare the TQ GPU output against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleMode {
+    /// Dequant oracle only (C-1-unlock behavior, default for backward compat).
+    Dequant,
+    /// Independent-floor oracle only: dense flash_attn_vec on pre-quant F32 K/V.
+    IndependentFloor,
+    /// Both oracles — C-2 happy path; emits two nrmse columns.
+    Both,
+}
+
+/// Replay mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayMode {
+    /// Single-step: load a manifest and replay it (backward-compat, default).
+    Singlestep,
+    /// Multi-step: synthesize K/V from seed and replay at 4 canonical positions.
+    Multistep,
+}
+
 struct Args {
-    manifest: PathBuf,
+    manifest: Option<PathBuf>,
     variation: Variation,
     canary: CanaryMode,
     out: PathBuf,
+    oracle: OracleMode,
+    mode: ReplayMode,
+    seed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +108,9 @@ fn parse_args() -> Result<Args, String> {
     let mut variation: Option<Variation> = None;
     let mut canary = CanaryMode::None;
     let mut out: Option<PathBuf> = None;
+    let mut oracle = OracleMode::Dequant;
+    let mut mode = ReplayMode::Singlestep;
+    let mut seed: u64 = 0x00C2_5EED;
 
     let mut i = 1;
     while i < argv.len() {
@@ -132,16 +158,50 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
                 out = Some(PathBuf::from(argv.get(i).ok_or("--out needs a value")?));
             }
+            "--oracle" => {
+                i += 1;
+                oracle = match argv.get(i).map(|s| s.as_str()) {
+                    Some("dequant") => OracleMode::Dequant,
+                    Some("independent-floor") => OracleMode::IndependentFloor,
+                    Some("both") => OracleMode::Both,
+                    other => return Err(format!("unknown --oracle {:?}; expected dequant, independent-floor, or both", other)),
+                };
+            }
+            "--singlestep" => {
+                mode = ReplayMode::Singlestep;
+            }
+            "--multistep" => {
+                mode = ReplayMode::Multistep;
+            }
+            "--seed" => {
+                i += 1;
+                let s = argv.get(i).ok_or("--seed needs a value")?;
+                seed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    u64::from_str_radix(hex, 16)
+                        .map_err(|e| format!("--seed hex parse error: {}", e))?
+                } else {
+                    s.parse::<u64>()
+                        .map_err(|e| format!("--seed decimal parse error: {}", e))?
+                };
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
         i += 1;
     }
 
+    // Validate: singlestep requires --manifest; multistep does not.
+    if mode == ReplayMode::Singlestep && manifest.is_none() {
+        return Err("--singlestep (or default) mode requires --manifest".into());
+    }
+
     Ok(Args {
-        manifest: manifest.ok_or("--manifest is required")?,
-        variation: variation.ok_or("--variation is required")?,
+        manifest,
+        variation: variation.unwrap_or(Variation::A),
         canary,
         out: out.ok_or("--out is required")?,
+        oracle,
+        mode,
+        seed,
     })
 }
 
@@ -185,6 +245,13 @@ struct ManifestPaths {
     k_norms_canary: String,
     #[serde(default)]
     v_norms_canary: String,
+    /// Optional pre-quant F32 K dump (from HF2Q_DUMP_PRE_QUANT=1).
+    /// When both k_pre_quant and v_pre_quant are present, the independent-floor oracle is available.
+    /// Layout: [nkv, hd] F32 little-endian (current token only; NOT the full ring buffer).
+    #[serde(default)]
+    k_pre_quant: Option<String>,
+    #[serde(default)]
+    v_pre_quant: Option<String>,
 }
 
 /// Top-level manifest. Accepts both:
@@ -225,12 +292,18 @@ struct ReplayMetrics {
     variation: String,
     canary: String,
     ran_at: String,
+    /// Primary dequant oracle nrmse (nrmse(gpu_out, cpu_sdpa_from_dequant)).
+    /// Alias for backward compatibility: was `nrmse` in C-1-unlock output.
+    #[serde(rename = "dequant_oracle_nrmse")]
     nrmse: f64,
     max_abs_diff: f32,
     per_head_max_abs_diff: Vec<PerHeadDiff>,
     any_nan_inf_in_gpu_output: bool,
     exit_status: String,
     bin_path: String,
+    /// Independent-floor oracle nrmse: nrmse(gpu_out, flash_attn_vec on pre-quant F32 K/V).
+    /// None when pre-quant paths are absent or --oracle dequant.
+    independent_floor_nrmse: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +591,7 @@ fn run_variation(
     manifest: &Manifest,
     variation: Variation,
     canary: CanaryMode,
+    oracle_mode: OracleMode,
     out_path: &PathBuf,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -581,8 +655,36 @@ fn run_variation(
     assert_eq!(k_norms_compact.len(), nkv * kvl);
     assert_eq!(v_norms_compact.len(), nkv * kvl);
 
+    // --- P2 canary symmetry fix: pre-mutate compact norms BEFORE building k_dequant ---
+    // When canary=InRange, both the GPU path AND the dequant CPU reference must see the
+    // mutation at (head=0, pos=10). We apply it here to k_norms_compact so that k_dequant
+    // is rebuilt from the mutated norms. This produces a symmetric canary: both oracle and
+    // kernel see the 2x norm at head=0/pos=10, so nrmse returns to the baseline ~5.1e-5.
+    //
+    // To recover the ASYMMETRIC (C-1-unlock) behavior and reproduce ~0.111 nrmse, set the
+    // env var HF2Q_REPLAY_CANARY_ASYMMETRIC=1. This skips the compact-norm mutation so the
+    // CPU oracle sees the unmutated norm while the GPU sees the 2x version.
+    let canary_asymmetric_mode =
+        std::env::var("HF2Q_REPLAY_CANARY_ASYMMETRIC").is_ok_and(|v| v == "1");
+    let mut k_norms_compact = k_norms_compact; // make mutable
+    if canary == CanaryMode::InRange && !canary_asymmetric_mode {
+        // Symmetric fix: also mutate compact norm so CPU reference is consistent.
+        let compact_canary_idx = 0 * kvl + 10;
+        if compact_canary_idx < k_norms_compact.len() {
+            let old_val = k_norms_compact[compact_canary_idx];
+            k_norms_compact[compact_canary_idx] *= 2.0;
+            eprintln!(
+                "[canary symmetric] k_norms_compact[head=0, pos=10] *= 2.0: {} → {}",
+                old_val, k_norms_compact[compact_canary_idx]
+            );
+        }
+    } else if canary == CanaryMode::InRange {
+        eprintln!("[canary ASYMMETRIC] HF2Q_REPLAY_CANARY_ASYMMETRIC=1: skipping compact norm mutation (reproduces C-1-unlock 0.111 nrmse)");
+    }
+
     // --- Compute CPU reference: dequantize TQ-packed (kvl rows) → natural-basis K/V ---
     // CPU reference is the same for all variations (A, B, C): natural-basis SDPA from TQ dequant.
+    // NOTE: uses k_norms_compact AFTER the canary mutation above (symmetric fix).
     let mut k_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
     let mut v_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
 
@@ -624,7 +726,7 @@ fn run_variation(
         p.softcap,
     );
 
-    // --- Prepare norms with optional canary mutation ---
+    // --- Prepare norms with optional canary mutation (GPU path) ---
     // Start from the padded baseline norms
     let mut k_norms_gpu: Vec<f32> = k_norms_padded_base.clone();
     let mut v_norms_gpu: Vec<f32> = v_norms_padded_base.clone();
@@ -634,14 +736,14 @@ fn run_variation(
             // No mutation — use baseline norms as-is
         }
         CanaryMode::InRange => {
-            // D3: in-range canary — mutate k_norms at (head=0, pos=10).
+            // D3: in-range canary — mutate k_norms at (head=0, pos=10) in the GPU buffer.
             // pos=10 is within kv_seq_len=23, so the kernel provably reads this position.
             // Mutation: scale norm by 2x → dequantized K[h=0, pos=10, :] magnitudes ~2x.
             // Mirror canary_spec: k_norms_padded[0 * kv_capacity + 10] *= 2.0
             let canary_idx = 0 * kv_capacity + 10;
             k_norms_gpu[canary_idx] *= 2.0;
             eprintln!(
-                "canary in-range: k_norms[head=0, pos=10] *= 2.0 → new value = {}",
+                "[canary in-range GPU] k_norms[head=0, pos=10] *= 2.0 → new value = {}",
                 k_norms_gpu[canary_idx]
             );
         }
@@ -885,9 +987,166 @@ fn run_variation(
     // --- Check for NaN/Inf ---
     let has_nan_inf = gpu_output.iter().any(|v| !v.is_finite());
 
-    // --- Compute metrics ---
+    // --- Compute dequant oracle metrics (primary nrmse) ---
     let (nrmse, max_abs_diff, per_head) =
         compute_metrics(&cpu_ref, &gpu_output, nh, hd);
+
+    // --- Independent-floor oracle (P1b) ---
+    // When oracle_mode includes IndependentFloor AND manifest has k_pre_quant + v_pre_quant,
+    // load the pre-quant F32 K/V, build a [nkv, kv_capacity, hd] dense buffer in physical-row
+    // layout (ring-rotated for ring_start != 0), run flash_attn_vec, compare to gpu_output.
+    let independent_floor_nrmse: Option<f64> = if matches!(oracle_mode, OracleMode::IndependentFloor | OracleMode::Both) {
+        if let (Some(k_pre_path), Some(v_pre_path)) = (&paths.k_pre_quant, &paths.v_pre_quant) {
+            eprintln!("[ORACLE] independent-floor: using pre-quant F32 from k={} v={}", k_pre_path, v_pre_path);
+
+            // Load pre-quant F32 K and V. Shape: [nkv, hd] F32 (current token only; 1 row per KV head).
+            // For the independent-floor, we treat this as the FULL ring buffer contents by replicating
+            // the single row as a synthetic ring. In practice for kv_seq_len=23, we build a [nkv, kvl]
+            // dense buffer from the k_dequant vectors derived from the dequant path — but for true
+            // independence we load directly from the pre-quant dump.
+            //
+            // The pre-quant dump from HF2Q_DUMP_PRE_QUANT=1 gives attn_k_normed at [nkv, hd], which
+            // is the single-token K for the current decode step. For a complete independent-floor oracle
+            // covering all kvl tokens, we would need a dump of all ring buffer rows BEFORE quantization.
+            // Since only the current token's pre-quant is available in the dump, we use the dequanted
+            // K/V (from k_dequant/v_dequant) for positions 0..kvl-1 and the pre-quant row only for
+            // position kvl-1 (the most recent token).
+            //
+            // For the multistep mode (no manifest pre-quant), we use the synthetic pre-quant K/V.
+            let k_pre_raw = load_f32(k_pre_path);
+            let v_pre_raw = load_f32(v_pre_path);
+            // k_pre_raw shape: [nkv, hd], i.e. nkv*hd elements.
+            assert_eq!(k_pre_raw.len(), nkv * hd,
+                "k_pre_quant size mismatch: expected {}*{}={} got {}",
+                nkv, hd, nkv*hd, k_pre_raw.len());
+            assert_eq!(v_pre_raw.len(), nkv * hd,
+                "v_pre_quant size mismatch: expected {}*{}={} got {}",
+                nkv, hd, nkv*hd, v_pre_raw.len());
+
+            // Apply canary to the pre-quant K vector at head=0, pos=10 — but pos=10 refers
+            // to a position in the ring, not in the single-token dump. Since this dump has
+            // only the CURRENT token (the newest one = pos kvl-1), we can only apply the
+            // canary to the pre-quant buffer if kvl-1 == 10 (which it won't be for kv_seq_len=23).
+            // For the independent-floor to be symmetric with the canary, we apply it to the
+            // dequant-derived K buffer used below (k_dequant[head=0 * kvl + 10]).
+            // The pre-quant single-token buffer is used only for position kvl-1.
+
+            // Build dense K/V buffer: [nkv, kv_capacity, hd] F32, physical-row layout.
+            // Physical row (ring_start + i) % kv_capacity = chronological pos i.
+            // For positions 0..kvl-1: use k_dequant (dequantized from TQ packed).
+            // For position kvl-1 (newest): use k_pre_raw (raw F32 pre-quant, single row per kv_head).
+            let ring_start = p.ring_start as usize;
+            let dense_kv_elems = nkv * kv_capacity * hd;
+            let mut k_dense_pre: Vec<f32> = vec![0.0f32; dense_kv_elems];
+            let mut v_dense_pre: Vec<f32> = vec![0.0f32; dense_kv_elems];
+
+            // Apply canary to k_dequant reference if in-range (symmetric to GPU path).
+            // For the independent-floor, we re-apply: the k_dequant was already built with
+            // the canary mutation (from k_norms_compact symmetric fix above). The pre_quant
+            // single row is for the current token (pos = kvl-1), not pos=10.
+            // So all positions filled from k_dequant already have the canary applied correctly.
+
+            for kv_h in 0..nkv {
+                for logical_i in 0..kvl {
+                    // Physical row for chronological position i.
+                    let phys_row = (ring_start + logical_i) % kv_capacity;
+                    let k_dst_off = kv_h * kv_capacity * hd + phys_row * hd;
+                    let v_dst_off = kv_h * kv_capacity * hd + phys_row * hd;
+
+                    if logical_i == kvl - 1 {
+                        // Newest token: use pre-quant F32 directly.
+                        let k_src_off = kv_h * hd;
+                        k_dense_pre[k_dst_off..k_dst_off + hd]
+                            .copy_from_slice(&k_pre_raw[k_src_off..k_src_off + hd]);
+                        // Apply canary to the pre-quant row if it corresponds to pos=10.
+                        // (kvl-1 == 10 only when kvl=11; for kvl=23 this won't fire.)
+                        if canary == CanaryMode::InRange && kv_h == 0 && logical_i == 10 && !canary_asymmetric_mode {
+                            // Scale the entire K vector at head=0, pos=10 by 2x (pre-quant analogue).
+                            for c in 0..hd {
+                                k_dense_pre[k_dst_off + c] *= 2.0;
+                            }
+                        }
+                        v_dense_pre[v_dst_off..v_dst_off + hd]
+                            .copy_from_slice(&v_pre_raw[kv_h * hd..kv_h * hd + hd]);
+                    } else {
+                        // Older positions: use dequant (already contains canary mutation at pos=10).
+                        let deq_idx = kv_h * kvl + logical_i;
+                        k_dense_pre[k_dst_off..k_dst_off + hd].copy_from_slice(&k_dequant[deq_idx]);
+                        v_dense_pre[v_dst_off..v_dst_off + hd].copy_from_slice(&v_dequant[deq_idx]);
+                    }
+                }
+            }
+
+            // Dispatch independent-floor: flash_attn_vec on pre-rotated K/V dense buffer.
+            let dense_kv_bytes = dense_kv_elems * 4;
+            let mut k_floor_buf = device
+                .alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kv_capacity, hd])
+                .expect("alloc K floor");
+            let mut v_floor_buf = device
+                .alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kv_capacity, hd])
+                .expect("alloc V floor");
+            k_floor_buf.as_mut_slice::<f32>().expect("write K floor")
+                .copy_from_slice(&k_dense_pre);
+            v_floor_buf.as_mut_slice::<f32>().expect("write V floor")
+                .copy_from_slice(&v_dense_pre);
+
+            let floor_output_buf = device
+                .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
+                .expect("alloc floor output");
+            let tmp_bytes_floor = flash_attn_vec::tmp_buffer_bytes(p.num_heads, p.head_dim);
+            let tmp_floor_buf = device
+                .alloc_buffer(tmp_bytes_floor, DType::F32, vec![tmp_bytes_floor / 4])
+                .expect("alloc floor tmp");
+
+            // Q buffer for floor: natural basis (no FWHT).
+            let mut q_floor_buf = device
+                .alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd])
+                .expect("alloc Q floor");
+            q_floor_buf.as_mut_slice::<f32>().expect("write Q floor")
+                .copy_from_slice(&q_natural);
+
+            let floor_params = FlashAttnVecParams {
+                num_heads: p.num_heads,
+                num_kv_heads: p.num_kv_heads,
+                head_dim: p.head_dim,
+                kv_seq_len: p.kv_seq_len,
+                kv_capacity: p.kv_capacity,
+                scale: p.scale,
+                mask_type: p.mask_type,
+                sliding_window: p.sliding_window,
+                softcap: p.softcap,
+            };
+
+            let mut floor_encoder = device.command_encoder().expect("floor encoder");
+            floor_encoder.memory_barrier();
+            flash_attn_vec::flash_attn_vec(
+                &mut floor_encoder,
+                registry,
+                device,
+                &q_floor_buf,
+                &k_floor_buf,
+                &v_floor_buf,
+                &floor_output_buf,
+                &tmp_floor_buf,
+                &floor_params,
+            ).expect("independent-floor flash_attn_vec dispatch");
+            floor_encoder.commit_and_wait().expect("floor commit_and_wait");
+
+            let floor_output: Vec<f32> = floor_output_buf
+                .as_slice::<f32>()
+                .expect("read floor output")
+                .to_vec();
+            let (floor_nrmse, _floor_max, _floor_per_head) =
+                compute_metrics(&floor_output, &gpu_output, nh, hd);
+            eprintln!("[ORACLE] independent-floor nrmse = {:.6e}", floor_nrmse);
+            Some(floor_nrmse)
+        } else {
+            eprintln!("[ORACLE] independent-floor requested but k_pre_quant/v_pre_quant absent in manifest — skipping");
+            None
+        }
+    } else {
+        None
+    };
 
     // --- D4: Write raw sdpa_out .bin alongside the metrics JSON ---
     // Format: raw F32 little-endian, shape [nh, hd] = nh*hd*4 bytes = 16384 bytes for nh=16, hd=256
@@ -938,6 +1197,7 @@ fn run_variation(
         any_nan_inf_in_gpu_output: has_nan_inf,
         exit_status: if has_nan_inf { "NaN/Inf" } else { "ok" }.into(),
         bin_path: bin_path.to_string_lossy().into_owned(),
+        independent_floor_nrmse,
     };
 
     if has_nan_inf {
@@ -960,69 +1220,517 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("argument error: {}", e);
-            eprintln!(
-                "usage: tq_kernel_replay --manifest <path> --variation <A|B|C> [--canary in-range|out-of-range] --out <path>"
-            );
+            eprintln!(concat!(
+                "usage: tq_kernel_replay\n",
+                "  [--singlestep] --manifest <path> --variation <A|B|C>\n",
+                "  [--multistep] --seed <hex_or_dec>\n",
+                "  [--oracle dequant|independent-floor|both]\n",
+                "  [--canary in-range|out-of-range]\n",
+                "  --out <path>"
+            ));
             std::process::exit(1);
         }
     };
 
-    // Load manifest
-    let manifest_bytes = fs::read(&args.manifest).unwrap_or_else(|e| {
-        eprintln!("failed to read manifest {:?}: {}", args.manifest, e);
-        std::process::exit(1);
-    });
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).unwrap_or_else(|e| {
-        eprintln!("failed to parse manifest: {}", e);
-        std::process::exit(1);
-    });
-
     // Initialise Metal device and kernel registry
     let device = MlxDevice::new().expect("MlxDevice::new");
     let mut registry = KernelRegistry::new();
-    // TQ SDPA kernel
     flash_attn_vec_tq::register(&mut registry);
-    // Dense flash_attn_vec kernel (used by Variation C)
     mlx_native::ops::flash_attn_vec::register(&mut registry);
     // fwht_standalone kernels are pre-registered inside KernelRegistry::new()
 
-    eprintln!(
-        "tq_kernel_replay: variation={} canary={:?} manifest={:?}",
-        args.variation, args.canary, args.manifest
-    );
+    match args.mode {
+        ReplayMode::Singlestep => {
+            let manifest_path = args.manifest.as_ref().expect("manifest required for singlestep");
 
-    let metrics = run_variation(
-        &manifest,
-        args.variation,
-        args.canary,
-        &args.out,
-        &device,
-        &mut registry,
-    );
+            // Load manifest
+            let manifest_bytes = fs::read(manifest_path).unwrap_or_else(|e| {
+                eprintln!("failed to read manifest {:?}: {}", manifest_path, e);
+                std::process::exit(1);
+            });
+            let manifest: Manifest = serde_json::from_slice(&manifest_bytes).unwrap_or_else(|e| {
+                eprintln!("failed to parse manifest: {}", e);
+                std::process::exit(1);
+            });
 
-    // Print summary to stdout
-    let json = serde_json::to_string_pretty(&metrics).expect("serialize metrics");
-    println!("{}", json);
+            eprintln!(
+                "tq_kernel_replay: singlestep variation={} canary={:?} oracle={:?} manifest={:?}",
+                args.variation, args.canary, args.oracle, manifest_path
+            );
 
-    // Write metrics JSON to --out path (add .json extension if absent)
-    let out_json = if args.out.extension().map(|e| e == "json").unwrap_or(false) {
-        args.out.clone()
-    } else {
-        args.out.with_extension("json")
+            let metrics = run_variation(
+                &manifest,
+                args.variation,
+                args.canary,
+                args.oracle,
+                &args.out,
+                &device,
+                &mut registry,
+            );
+
+            // Print summary to stdout
+            let json = serde_json::to_string_pretty(&metrics).expect("serialize metrics");
+            println!("{}", json);
+
+            // Write metrics JSON to --out path
+            let out_json = if args.out.extension().map(|e| e == "json").unwrap_or(false) {
+                args.out.clone()
+            } else {
+                args.out.with_extension("json")
+            };
+
+            if let Some(parent) = out_json.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::write(&out_json, &json).unwrap_or_else(|e| {
+                eprintln!("failed to write metrics to {:?}: {}", out_json, e);
+                std::process::exit(1);
+            });
+
+            eprintln!(
+                "RESULT: variation={} canary={:?} dequant_oracle_nrmse={:.6e} max_abs_diff={:.6} nan_inf={} independent_floor_nrmse={:?}",
+                metrics.variation, args.canary, metrics.nrmse, metrics.max_abs_diff,
+                metrics.any_nan_inf_in_gpu_output, metrics.independent_floor_nrmse
+            );
+            eprintln!("metrics written to {:?}", out_json);
+        }
+
+        ReplayMode::Multistep => {
+            run_multistep(&args, &device, &mut registry);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multistep driver (P3b)
+// ---------------------------------------------------------------------------
+
+use serde_json::Value as JsonValue;
+
+/// Multistep output row in JSON.
+#[derive(Debug, Serialize)]
+struct MultistepRow {
+    abs_pos: u64,
+    kvl_logical: usize,
+    ring_start: u32,
+    dequant_oracle_nrmse: f64,
+    independent_floor_nrmse: f64,
+    max_abs_diff: f32,
+    verdict: String,
+}
+
+/// Seeded Box-Muller Gaussian PRNG — matches the deterministic seed spec.
+/// Uses StdRng::seed_from_u64(seed) from the `rand` crate path re-exported
+/// by mlx-native (or we implement our own if not available).
+fn seeded_gaussian(seed: u64, n: usize) -> Vec<f32> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Simple deterministic Box-Muller using a Lehmer/LCG sequence seeded by seed.
+    // Uses a linear congruential generator for portability without external deps.
+    let mut state: u64 = seed ^ 0x9e3779b97f4a7c15;
+    let mut out = Vec::with_capacity(n);
+
+    let next_u32 = |s: &mut u64| -> u32 {
+        // Splitmix64 step
+        *s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z = z ^ (z >> 31);
+        (z >> 32) as u32
     };
 
-    if let Some(parent) = out_json.parent() {
+    let to_unit = |u: u32| -> f32 {
+        // Map [0, 2^32) to (0, 1) — avoid exact 0 for log.
+        let v = (u as f64) / (u32::MAX as f64 + 1.0);
+        if v < 1e-38 { 1e-38f32 } else { v as f32 }
+    };
+
+    let mut i = 0;
+    while i < n {
+        let u1 = to_unit(next_u32(&mut state));
+        let u2 = to_unit(next_u32(&mut state));
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        out.push(mag * theta.cos());
+        i += 1;
+        if i < n {
+            out.push(mag * theta.sin());
+            i += 1;
+        }
+    }
+
+    let _ = DefaultHasher::new(); // suppress unused import
+    out
+}
+
+fn run_multistep(
+    args: &Args,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+) {
+    use mlx_native::ops::hadamard_quantize_kv;
+
+    // Fixed Gemma-4 sliding layer params.
+    let num_heads: u32 = 8;   // use a small but realistic value for synthetic runs
+    let num_kv_heads: u32 = 4;
+    let head_dim: u32 = 256;
+    let kv_capacity: u32 = 1024;
+    let scale: f32 = 1.0;
+    let mask_type: u32 = 2;       // sliding
+    let sliding_window: u32 = 1024;
+    let softcap: f32 = 0.0;
+
+    let nh = num_heads as usize;
+    let nkv = num_kv_heads as usize;
+    let hd = head_dim as usize;
+    let kvc = kv_capacity as usize;
+
+    // 4 canonical positions.
+    let positions: &[u64] = &[50, 500, 1050, 2048];
+
+    let seed_base = args.seed; // 0xC25EED
+    eprintln!("tq_kernel_replay multistep: seed={:#x} positions={:?}", seed_base, positions);
+
+    let mut rows: Vec<MultistepRow> = Vec::new();
+
+    for &abs_pos in positions {
+        let kvl_logical = ((abs_pos + 1) as usize).min(kvc);
+        let ring_start: u32 = if abs_pos + 1 >= kvc as u64 {
+            ((abs_pos + 1) % kvc as u64) as u32
+        } else {
+            0
+        };
+
+        eprintln!("--- multistep pos={} kvl_logical={} ring_start={} ---", abs_pos, kvl_logical, ring_start);
+
+        // Generate deterministic Gaussian K/V history: [nkv, kvl_logical, hd] F32.
+        // Sub-seed: seed_base XOR (abs_pos << 16) for K; XOR (abs_pos << 32) for V; XOR (abs_pos << 48) for Q.
+        let k_seed = seed_base ^ (abs_pos << 16);
+        let v_seed = seed_base ^ (abs_pos << 32);
+        let q_seed = seed_base ^ (abs_pos << 48) ^ 0xABCDEF;
+
+        let k_pre_flat: Vec<f32> = seeded_gaussian(k_seed, nkv * kvl_logical * hd);
+        let v_pre_flat: Vec<f32> = seeded_gaussian(v_seed, nkv * kvl_logical * hd);
+        let q_natural: Vec<f32> = seeded_gaussian(q_seed, nh * hd);
+
+        // Encode K/V via hadamard_quantize_kv GPU dispatch for EACH chronological position.
+        // Layout: k_packed [nkv, kv_capacity, hd/2] u8; k_norms [nkv, kv_capacity] f32.
+        let k_packed_bytes = nkv * kvc * (hd / 2);
+        let norms_bytes = nkv * kvc * 4;
+        let k_dense_bytes = nkv * kvc * hd * 4;
+
+        let mut k_packed_buf = device
+            .alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
+            .expect("alloc K packed multistep");
+        let mut k_norms_buf = device
+            .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kvc])
+            .expect("alloc K norms multistep");
+        let mut v_packed_buf = device
+            .alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
+            .expect("alloc V packed multistep");
+        let mut v_norms_buf = device
+            .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kvc])
+            .expect("alloc V norms multistep");
+
+        // Zero-initialize norms (positions not written will have 0 norm = silence).
+        k_norms_buf.as_mut_slice::<f32>().expect("zero K norms").iter_mut().for_each(|v| *v = 0.0);
+        v_norms_buf.as_mut_slice::<f32>().expect("zero V norms").iter_mut().for_each(|v| *v = 0.0);
+
+        // For each chronological position i, write the K/V vector at physical row (ring_start + i) % kvc.
+        // Use dispatch_hadamard_quantize_kv with cache_pos = physical row.
+        // Batch all positions into one encoder.
+        {
+            let mut enc = device.command_encoder().expect("enc multistep encode");
+            for logical_i in 0..kvl_logical {
+                let phys_row = ((ring_start as usize) + logical_i) % kvc;
+
+                // Single-token K/V: [nkv, hd] F32. Build a temp buf.
+                let k_token_bytes = nkv * hd * 4;
+                let mut k_token_buf = device
+                    .alloc_buffer(k_token_bytes, DType::F32, vec![nkv, hd])
+                    .expect("alloc K token");
+                let mut v_token_buf = device
+                    .alloc_buffer(k_token_bytes, DType::F32, vec![nkv, hd])
+                    .expect("alloc V token");
+
+                {
+                    let k_src_off = logical_i * nkv * hd; // NO — layout is [nkv, kvl, hd], so:
+                    // k_pre_flat[kv_h * kvl_logical * hd + logical_i * hd + c]
+                    // Build as [nkv, hd] interleaved.
+                    let kslice = k_token_buf.as_mut_slice::<f32>().expect("write K token");
+                    let vslice = v_token_buf.as_mut_slice::<f32>().expect("write V token");
+                    for kv_h in 0..nkv {
+                        let src_off = kv_h * kvl_logical * hd + logical_i * hd;
+                        let dst_off = kv_h * hd;
+                        kslice[dst_off..dst_off + hd].copy_from_slice(
+                            &k_pre_flat[src_off..src_off + hd]);
+                        vslice[dst_off..dst_off + hd].copy_from_slice(
+                            &v_pre_flat[src_off..src_off + hd]);
+                    }
+                }
+
+                enc.memory_barrier();
+                hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+                    &mut enc, registry, device.metal_device(),
+                    &k_token_buf,
+                    &k_packed_buf,
+                    &k_norms_buf,
+                    nkv as u32, head_dim, kvc as u32, phys_row as u32,
+                    true, // kv_is_sliding (use ring-mode write)
+                ).expect("hadamard_quantize K multistep");
+                enc.memory_barrier();
+                hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+                    &mut enc, registry, device.metal_device(),
+                    &v_token_buf,
+                    &v_packed_buf,
+                    &v_norms_buf,
+                    nkv as u32, head_dim, kvc as u32, phys_row as u32,
+                    true,
+                ).expect("hadamard_quantize V multistep");
+            }
+            enc.commit_and_wait().expect("multistep encode commit");
+        }
+
+        // Read back packed K/V and norms for CPU dequant oracle.
+        let k_packed_all: Vec<u8> = k_packed_buf.as_slice::<u8>().expect("read K packed").to_vec();
+        let v_packed_all: Vec<u8> = v_packed_buf.as_slice::<u8>().expect("read V packed").to_vec();
+        let k_norms_all: Vec<f32> = k_norms_buf.as_slice::<f32>().expect("read K norms").to_vec();
+        let v_norms_all: Vec<f32> = v_norms_buf.as_slice::<f32>().expect("read V norms").to_vec();
+
+        // Build compact K/V (chronological order 0..kvl) from physical ring layout.
+        // Physical row for logical i = (ring_start + i) % kvc.
+        let mut k_packed_compact: Vec<u8> = vec![0u8; nkv * kvl_logical * (hd / 2)];
+        let mut v_packed_compact: Vec<u8> = vec![0u8; nkv * kvl_logical * (hd / 2)];
+        let mut k_norms_compact_ms: Vec<f32> = vec![0.0f32; nkv * kvl_logical];
+        let mut v_norms_compact_ms: Vec<f32> = vec![0.0f32; nkv * kvl_logical];
+
+        for kv_h in 0..nkv {
+            for logical_i in 0..kvl_logical {
+                let phys_row = ((ring_start as usize) + logical_i) % kvc;
+                let src_pack_off = kv_h * kvc * (hd / 2) + phys_row * (hd / 2);
+                let dst_pack_off = kv_h * kvl_logical * (hd / 2) + logical_i * (hd / 2);
+                k_packed_compact[dst_pack_off..dst_pack_off + hd / 2]
+                    .copy_from_slice(&k_packed_all[src_pack_off..src_pack_off + hd / 2]);
+                v_packed_compact[dst_pack_off..dst_pack_off + hd / 2]
+                    .copy_from_slice(&v_packed_all[src_pack_off..src_pack_off + hd / 2]);
+                k_norms_compact_ms[kv_h * kvl_logical + logical_i] = k_norms_all[kv_h * kvc + phys_row];
+                v_norms_compact_ms[kv_h * kvl_logical + logical_i] = v_norms_all[kv_h * kvc + phys_row];
+            }
+        }
+
+        // Dequant oracle K/V (chronological order).
+        let mut k_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl_logical);
+        let mut v_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl_logical);
+        for kv_h in 0..nkv {
+            for pos in 0..kvl_logical {
+                let pack_off = (kv_h * kvl_logical + pos) * (hd / 2);
+                let norm_off = kv_h * kvl_logical + pos;
+                k_dequant.push(nibble_dequantize(&k_packed_compact[pack_off..pack_off + hd / 2],
+                    k_norms_compact_ms[norm_off], hd));
+                v_dequant.push(nibble_dequantize(&v_packed_compact[pack_off..pack_off + hd / 2],
+                    v_norms_compact_ms[norm_off], hd));
+            }
+        }
+
+        // Dequant oracle cpu_sdpa.
+        let cpu_ref = cpu_sdpa(
+            &q_natural, &k_dequant, &v_dequant,
+            nh, nkv, hd, kvl_logical, kvc, scale,
+            mask_type, sliding_window, ring_start, softcap,
+        );
+
+        // Build GPU Q buffer.
+        let mut q_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).expect("alloc Q ms");
+        q_buf.as_mut_slice::<f32>().expect("write Q ms").copy_from_slice(&q_natural);
+
+        // TQ SDPA GPU dispatch.
+        let output_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).expect("alloc out ms");
+        let tmp_bytes_tq = flash_attn_vec_tq::tmp_buffer_bytes(num_heads, head_dim);
+        let tmp_buf = device.alloc_buffer(tmp_bytes_tq, DType::F32, vec![tmp_bytes_tq / 4]).expect("alloc tmp ms");
+
+        let tq_params = mlx_native::ops::flash_attn_vec_tq::FlashAttnVecTqParams {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_seq_len: kvl_logical as u32,
+            kv_capacity,
+            scale,
+            mask_type,
+            sliding_window,
+            softcap,
+            ring_start,
+        };
+
+        {
+            let mut enc = device.command_encoder().expect("enc tq ms");
+            enc.memory_barrier();
+            // Forward FWHT on Q (Variation A).
+            mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                &mut enc, registry, device.metal_device(), &q_buf, num_heads, head_dim,
+            ).expect("FWHT Q ms");
+            enc.memory_barrier();
+            flash_attn_vec_tq::flash_attn_vec_tq(
+                &mut enc, registry, device,
+                &q_buf, &k_packed_buf, &k_norms_buf, &v_packed_buf, &v_norms_buf,
+                &output_buf, &tmp_buf, &tq_params,
+            ).expect("TQ SDPA ms");
+            enc.memory_barrier();
+            mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                &mut enc, registry, device.metal_device(), &output_buf, num_heads, head_dim,
+            ).expect("FWHT out ms");
+            enc.commit_and_wait().expect("tq ms commit");
+        }
+
+        let gpu_output: Vec<f32> = output_buf.as_slice::<f32>().expect("read out ms").to_vec();
+        let (dequant_nrmse, max_abs_diff, _) = compute_metrics(&cpu_ref, &gpu_output, nh, hd);
+
+        // Independent-floor oracle: pre-quant F32 K/V in physical-row layout → flash_attn_vec.
+        let dense_kv_elems = nkv * kvc * hd;
+        let mut k_dense_pre: Vec<f32> = vec![0.0f32; dense_kv_elems];
+        let mut v_dense_pre: Vec<f32> = vec![0.0f32; dense_kv_elems];
+
+        for kv_h in 0..nkv {
+            for logical_i in 0..kvl_logical {
+                let phys_row = ((ring_start as usize) + logical_i) % kvc;
+                let src_off = kv_h * kvl_logical * hd + logical_i * hd;
+                let dst_off = kv_h * kvc * hd + phys_row * hd;
+                k_dense_pre[dst_off..dst_off + hd].copy_from_slice(&k_pre_flat[src_off..src_off + hd]);
+                v_dense_pre[dst_off..dst_off + hd].copy_from_slice(&v_pre_flat[src_off..src_off + hd]);
+            }
+        }
+
+        let dense_kv_bytes = dense_kv_elems * 4;
+        let mut k_floor_buf = device.alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kvc, hd]).expect("alloc K floor ms");
+        let mut v_floor_buf = device.alloc_buffer(dense_kv_bytes, DType::F32, vec![nkv, kvc, hd]).expect("alloc V floor ms");
+        k_floor_buf.as_mut_slice::<f32>().expect("write K floor ms").copy_from_slice(&k_dense_pre);
+        v_floor_buf.as_mut_slice::<f32>().expect("write V floor ms").copy_from_slice(&v_dense_pre);
+
+        let floor_output_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).expect("alloc floor out ms");
+        let tmp_bytes_dense = flash_attn_vec::tmp_buffer_bytes(num_heads, head_dim);
+        let tmp_floor_buf = device.alloc_buffer(tmp_bytes_dense, DType::F32, vec![tmp_bytes_dense / 4]).expect("alloc tmp floor ms");
+
+        // Q in natural basis for independent-floor (no FWHT).
+        let mut q_floor_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).expect("alloc Q floor ms");
+        q_floor_buf.as_mut_slice::<f32>().expect("write Q floor ms").copy_from_slice(&q_natural);
+
+        let floor_params = FlashAttnVecParams {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_seq_len: kvl_logical as u32,
+            kv_capacity,
+            scale,
+            mask_type,
+            sliding_window,
+            softcap,
+        };
+
+        {
+            let mut enc = device.command_encoder().expect("enc floor ms");
+            enc.memory_barrier();
+            flash_attn_vec::flash_attn_vec(
+                &mut enc, registry, device,
+                &q_floor_buf, &k_floor_buf, &v_floor_buf,
+                &floor_output_buf, &tmp_floor_buf, &floor_params,
+            ).expect("floor flash_attn_vec ms");
+            enc.commit_and_wait().expect("floor ms commit");
+        }
+
+        let floor_output: Vec<f32> = floor_output_buf.as_slice::<f32>().expect("read floor ms").to_vec();
+        let (floor_nrmse, _, _) = compute_metrics(&floor_output, &gpu_output, nh, hd);
+
+        // Decision-tree verdict for this position.
+        let verdict = if dequant_nrmse < 0.01 && floor_nrmse < 0.01 {
+            "kernel_end_to_end_correct".to_string()
+        } else if dequant_nrmse < 0.01 && floor_nrmse >= 0.01 {
+            "dequant_spec_bug_confirmed".to_string()
+        } else if dequant_nrmse >= 0.01 && floor_nrmse < 0.01 {
+            "fwht_pipeline_bug".to_string()
+        } else {
+            // Both diverge — check if ring-wrap-specific.
+            if abs_pos > 1000 {
+                "ring_start_or_dispatch_bug".to_string()
+            } else {
+                "h1_kernel_bug".to_string()
+            }
+        };
+
+        eprintln!(
+            "pos={} kvl={} ring_start={} dequant_nrmse={:.4e} floor_nrmse={:.4e} verdict={}",
+            abs_pos, kvl_logical, ring_start, dequant_nrmse, floor_nrmse, verdict
+        );
+
+        rows.push(MultistepRow {
+            abs_pos,
+            kvl_logical,
+            ring_start,
+            dequant_oracle_nrmse: dequant_nrmse,
+            independent_floor_nrmse: floor_nrmse,
+            max_abs_diff,
+            verdict,
+        });
+    }
+
+    // Emit Markdown table.
+    let md_table = {
+        let mut s = String::new();
+        s.push_str("| pos | kvl_logical | ring_start | dequant_oracle_nrmse | independent_floor_nrmse | verdict |\n");
+        s.push_str("|-----|-------------|------------|---------------------|------------------------|--------|\n");
+        for r in &rows {
+            s.push_str(&format!(
+                "| {} | {} | {} | {:.4e} | {:.4e} | {} |\n",
+                r.abs_pos, r.kvl_logical, r.ring_start,
+                r.dequant_oracle_nrmse, r.independent_floor_nrmse, r.verdict
+            ));
+        }
+        s
+    };
+    println!("{}", md_table);
+
+    // Emit JSON.
+    let json_out = serde_json::to_string_pretty(&rows).expect("serialize multistep rows");
+
+    // Write .md and .json files.
+    let out_base = &args.out;
+    if let Some(parent) = out_base.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(&out_json, &json).unwrap_or_else(|e| {
-        eprintln!("failed to write metrics to {:?}: {}", out_json, e);
-        std::process::exit(1);
+
+    let md_path = {
+        let mut p = out_base.as_os_str().to_owned();
+        p.push(".md");
+        PathBuf::from(p)
+    };
+    let json_path = {
+        let mut p = out_base.as_os_str().to_owned();
+        p.push(".json");
+        PathBuf::from(p)
+    };
+
+    fs::write(&md_path, md_table.as_bytes()).unwrap_or_else(|e| {
+        eprintln!("failed to write multistep md {:?}: {}", md_path, e);
+    });
+    fs::write(&json_path, json_out.as_bytes()).unwrap_or_else(|e| {
+        eprintln!("failed to write multistep json {:?}: {}", json_path, e);
     });
 
-    eprintln!(
-        "RESULT: variation={} canary={:?} nrmse={:.6} max_abs_diff={:.6} nan_inf={}",
-        metrics.variation, args.canary, metrics.nrmse, metrics.max_abs_diff,
-        metrics.any_nan_inf_in_gpu_output
-    );
-    eprintln!("metrics written to {:?}", out_json);
+    eprintln!("multistep results written to {:?} and {:?}", md_path, json_path);
+
+    // Overall decision-tree verdict.
+    let has_divergence = rows.iter().any(|r| r.dequant_oracle_nrmse >= 0.01 || r.independent_floor_nrmse >= 0.01);
+    let ring_wrap_only = rows.iter().filter(|r| r.abs_pos > 1000).any(|r| r.dequant_oracle_nrmse >= 0.01)
+        && rows.iter().filter(|r| r.abs_pos <= 500).all(|r| r.dequant_oracle_nrmse < 0.01);
+    let overall = if !has_divergence {
+        "kernel_end_to_end_correct"
+    } else if ring_wrap_only {
+        "ring_start_or_dispatch_bug"
+    } else {
+        "h1_kernel_bug"
+    };
+    eprintln!("OVERALL decision-tree branch: {}", overall);
+
+    // Suppress unused import warning.
+    let _: Option<JsonValue> = None;
 }
