@@ -1311,6 +1311,9 @@ fn main() {
 use serde_json::Value as JsonValue;
 
 /// Multistep output row in JSON.
+/// Emitted as a 4-row Markdown table + JSON for the 4 canonical positions {50, 500, 1050, 2048}.
+/// ring_start = (abs_pos+1) % kv_capacity when abs_pos+1 >= kv_capacity, else 0.
+/// kvl_logical = min(abs_pos+1, kv_capacity).
 #[derive(Debug, Serialize)]
 struct MultistepRow {
     abs_pos: u64,
