@@ -306,8 +306,20 @@ fn nibble_dequantize(packed: &[u8], norm: f32, head_dim: usize) -> Vec<f32> {
 /// CPU SDPA reference (mirrors test_flash_attn_vec_tq.rs cpu_sdpa).
 ///
 /// Q: flat [num_heads * head_dim] F32 (natural basis)
-/// k_dequant: [num_kv_heads * kv_seq_len] entries of [head_dim] each
-/// v_dequant: same layout
+/// k_dequant: [num_kv_heads * kvl_logical] entries of [head_dim] each,
+///            indexed in CHRONOLOGICAL order (pos 0 = oldest, pos kvl_logical-1 = newest).
+/// v_dequant: same layout as k_dequant.
+/// kvl_logical: number of valid chronological positions (= min(abs_pos+1, kv_capacity)).
+/// kv_capacity: physical ring buffer capacity (used only for ring_start modulo).
+/// mask_type: 0=none/dense (attend all), 1=causal (all <= current step), 2=sliding_window.
+/// sliding_window: only last sliding_window chronological positions attend (mask_type=2 only).
+/// ring_start: chronological position 0 maps to physical row ring_start. For the dequant
+///             oracle path, k_dequant is already compact (chronological order), so ring_start
+///             does NOT remap into k_dequant — it is passed here for interface symmetry and
+///             used only by the independent-floor path where physical layout matters.
+///             In the dequant oracle, iterate p in 0..kvl_logical directly.
+/// softcap: logit soft-capping. When > 0: score = softcap * tanh(score * scale / softcap).
+///          When 0: score *= scale (standard).
 ///
 /// Returns: flat [num_heads * head_dim] F32
 fn cpu_sdpa(
@@ -317,8 +329,13 @@ fn cpu_sdpa(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    kv_seq_len: usize,
+    kvl_logical: usize,
+    kv_capacity: usize,
     scale: f32,
+    mask_type: u32,
+    sliding_window: u32,
+    _ring_start: u32,  // unused in dequant oracle path (k_dequant is already chronological)
+    softcap: f32,
 ) -> Vec<f32> {
     let mut output = vec![0.0f32; num_heads * head_dim];
     let heads_per_kv = num_heads / num_kv_heads;
@@ -327,17 +344,41 @@ fn cpu_sdpa(
         let kv_h = h / heads_per_kv;
         let q_offset = h * head_dim;
 
-        let mut scores = Vec::with_capacity(kv_seq_len);
-        for p in 0..kv_seq_len {
+        let mut scores: Vec<f32> = Vec::with_capacity(kvl_logical);
+        // Bitmask: which chronological positions are masked in.
+        // For sliding (mask_type=2): only last sliding_window positions attend.
+        // For causal (mask_type=1) and none (mask_type=0): all positions attend.
+        let first_valid: usize = if mask_type == 2 {
+            let sw = sliding_window as usize;
+            if kvl_logical > sw { kvl_logical - sw } else { 0 }
+        } else {
+            0
+        };
+
+        for p in 0..kvl_logical {
+            if p < first_valid {
+                // Masked out — push NEG_INFINITY so softmax weight → 0.
+                scores.push(f32::NEG_INFINITY);
+                continue;
+            }
             let mut dot = 0.0f32;
             for c in 0..head_dim {
-                dot += q[q_offset + c] * k_dequant[kv_h * kv_seq_len + p][c];
+                dot += q[q_offset + c] * k_dequant[kv_h * kvl_logical + p][c];
             }
-            scores.push(dot * scale);
+            let score = if softcap > 0.0 {
+                softcap * (dot * scale / softcap).tanh()
+            } else {
+                dot * scale
+            };
+            scores.push(score);
         }
 
+        // Online softmax: ignore -inf entries (masked positions).
         let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_score).exp()).collect();
+        let mut exp_scores: Vec<f32> = scores
+            .iter()
+            .map(|&s| if s == f32::NEG_INFINITY { 0.0f32 } else { (s - max_score).exp() })
+            .collect();
         let sum: f32 = exp_scores.iter().sum();
         if sum > 0.0 {
             for e in &mut exp_scores {
@@ -346,13 +387,20 @@ fn cpu_sdpa(
         }
 
         let o_offset = h * head_dim;
-        for p in 0..kv_seq_len {
+        for p in 0..kvl_logical {
             let w = exp_scores[p];
+            if w == 0.0 {
+                continue;
+            }
             for c in 0..head_dim {
-                output[o_offset + c] += w * v_dequant[kv_h * kv_seq_len + p][c];
+                output[o_offset + c] += w * v_dequant[kv_h * kvl_logical + p][c];
             }
         }
     }
+
+    // kv_capacity is retained as a parameter for interface symmetry with the
+    // independent-floor oracle path; suppress the unused-variable warning.
+    let _ = kv_capacity;
 
     output
 }
@@ -568,7 +616,12 @@ fn run_variation(
         nkv,
         hd,
         kvl,
+        kv_capacity,
         p.scale,
+        p.mask_type,
+        p.sliding_window,
+        p.ring_start,
+        p.softcap,
     );
 
     // --- Prepare norms with optional canary mutation ---
