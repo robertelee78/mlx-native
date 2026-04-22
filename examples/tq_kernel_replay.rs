@@ -1724,16 +1724,30 @@ fn run_multistep(
 
     eprintln!("multistep results written to {:?} and {:?}", md_path, json_path);
 
-    // Overall decision-tree verdict.
-    let has_divergence = rows.iter().any(|r| r.dequant_oracle_nrmse >= 0.01 || r.independent_floor_nrmse >= 0.01);
-    let ring_wrap_only = rows.iter().filter(|r| r.abs_pos > 1000).any(|r| r.dequant_oracle_nrmse >= 0.01)
-        && rows.iter().filter(|r| r.abs_pos <= 500).all(|r| r.dequant_oracle_nrmse < 0.01);
-    let overall = if !has_divergence {
+    // Overall decision-tree verdict — mirror of per-row reducer (lines 1651-1664)
+    // applied to the aggregate matrix. Four dequant-vs-floor branches then
+    // ring-wrap-vs-all fallback when both oracles diverge.
+    let all_dequant_clean = rows.iter().all(|r| r.dequant_oracle_nrmse < 0.01);
+    let all_floor_clean = rows.iter().all(|r| r.independent_floor_nrmse < 0.01);
+    let overall = if all_dequant_clean && all_floor_clean {
         "kernel_end_to_end_correct"
-    } else if ring_wrap_only {
-        "ring_start_or_dispatch_bug"
+    } else if all_dequant_clean && !all_floor_clean {
+        "dequant_spec_bug_confirmed"
+    } else if !all_dequant_clean && all_floor_clean {
+        "fwht_pipeline_bug"
     } else {
-        "h1_kernel_bug"
+        // Both oracles show divergence. Distinguish ring-wrap-only from whole-matrix.
+        let pre_wrap_clean = rows.iter()
+            .filter(|r| r.abs_pos <= 500)
+            .all(|r| r.dequant_oracle_nrmse < 0.01 && r.independent_floor_nrmse < 0.01);
+        let wrap_divergent = rows.iter()
+            .filter(|r| r.abs_pos > 1000)
+            .any(|r| r.dequant_oracle_nrmse >= 0.01 || r.independent_floor_nrmse >= 0.01);
+        if pre_wrap_clean && wrap_divergent {
+            "ring_start_or_dispatch_bug"
+        } else {
+            "h1_kernel_bug"
+        }
     };
     eprintln!("OVERALL decision-tree branch: {}", overall);
 
