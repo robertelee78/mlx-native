@@ -664,6 +664,9 @@ fn run_variation(
     // To recover the ASYMMETRIC (C-1-unlock) behavior and reproduce ~0.111 nrmse, set the
     // env var HF2Q_REPLAY_CANARY_ASYMMETRIC=1. This skips the compact-norm mutation so the
     // CPU oracle sees the unmutated norm while the GPU sees the 2x version.
+    // P2 canary asymmetric debug flag: set HF2Q_REPLAY_CANARY_ASYMMETRIC=1 to reproduce
+    // C-1-unlock's 0.111 nrmse (one-sided mutation: GPU sees 2x, CPU oracle does not).
+    // Expected: symmetric run → nrmse ≤ 1e-4; asymmetric → ~0.111.
     let canary_asymmetric_mode =
         std::env::var("HF2Q_REPLAY_CANARY_ASYMMETRIC").is_ok_and(|v| v == "1");
     let mut k_norms_compact = k_norms_compact; // make mutable
