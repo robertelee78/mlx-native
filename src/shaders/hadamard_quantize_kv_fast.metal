@@ -9,10 +9,39 @@
 // - head_dim=512: 16 elements/thread, 9 butterfly stages (4 local + 5 shuffle)
 //
 // Reference: HadaCore (arxiv 2412.08832) SIMD butterfly pattern.
+//
+// D1 random sign pre-multiplication (SRHT) per ADR-007 iter-13 shipping-impl study + iter-14 hypothesis test.
+// Sign table verbatim from AmesianX TurboQuant at ggml-cuda/cpy-utils.cuh:158-163 (D=256) + :211-220 (D=512).
+// Without D1, plain-WHT fails to decorrelate structured K/V (real Gemma activations, not random Gaussian).
+// Sign is applied BEFORE WHT in encode + AFTER IWHT in decode (self-inverse since sign*sign=1).
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
+
+// D1 sign table for D=256 (32 bytes, 256 bits).
+// Verbatim from AmesianX cpy-utils.cuh:158-163. sha256=3ef1038e6c232e9519101daa2d6efd637d4c6bfdb29f4ee7101625c39d0ddc89
+// Bit j = (table[j>>3] >> (j&7)) & 1; bit=1 → sign=-1, bit=0 → sign=+1 (LSB-first).
+constant uint8_t TBQ_SIGNS_256[32] = {
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+};
+
+// D1 sign table for D=512 (64 bytes, 512 bits).
+// Verbatim from AmesianX cpy-utils.cuh:211-220. sha256=44f13ce9f6db1edac62f558ee054f9de29cd474fd051362cadcaa98a55745f17
+// Same convention: bit j → table_512[j>>3] >> (j&7); bit=1 → sign=-1, bit=0 → sign=+1.
+constant uint8_t TBQ_SIGNS_512[64] = {
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+};
 
 constant float CODEBOOK_4BIT[16] = {
     -2.7325896f, -2.0690172f, -1.6180464f, -1.2562312f,
@@ -106,6 +135,25 @@ kernel void hadamard_quantize_kv_fast(
     float elems[EPT];
     for (ushort i = 0; i < EPT; i++) {
         elems[i] = src[src_base + i];
+    }
+
+    // 1b. D1 sign pre-multiplication (SRHT) — applied BEFORE FWHT.
+    // Select table by HEAD_DIM at compile time (constexpr branch).
+    // Element global index j = lane * EPT + i.
+    // sign_bit = (table[j>>3] >> (j&7)) & 1; sign = bit ? -1.0f : +1.0f.
+    // Mirror of AmesianX cpy-utils.cuh:181 (D=256) / :229 (D=512).
+    {
+        for (ushort i = 0; i < EPT; i++) {
+            ushort j = lane * EPT + i;  // global element index within head
+            uint8_t sign_byte;
+            if (HEAD_DIM == 256) {
+                sign_byte = TBQ_SIGNS_256[j >> 3];
+            } else {
+                sign_byte = TBQ_SIGNS_512[j >> 3];
+            }
+            float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+            elems[i] *= sign_val;
+        }
     }
 
     // 2. FWHT via SIMD shuffle (ZERO threadgroup barriers).
