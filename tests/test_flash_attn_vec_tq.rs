@@ -340,6 +340,7 @@ fn run_sdpa_tq_test(
         mask_type: 1, // causal
         sliding_window: 0,
         softcap: 0.0,
+        ring_start: 0,
     };
 
     flash_attn_vec_tq::flash_attn_vec_tq(
