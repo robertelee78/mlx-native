@@ -166,9 +166,14 @@ fn nibble_quantize(x: &[f32], head_dim: usize) -> (Vec<u8>, Vec<f32>) {
 
 /// Dequantize from nibble-packed format back to original domain.
 /// norms: length 1 for D=256, length 2 for D=512 (per-block).
+///
+/// iter-16 convention:
+/// - D=256: scale = norm * inv_sqrt(head_dim) (unchanged single-norm).
+/// - D=512: scale = blk_norm only (no inv_sqrt factor — encoder stores raw norm).
 fn nibble_dequantize(packed: &[u8], norms: &[f32], head_dim: usize) -> Vec<f32> {
     let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
     let mut rotated = Vec::with_capacity(head_dim);
+    let per_block = norms.len() > 1;  // true for D=512
 
     for c in 0..head_dim {
         let byte_idx = c / 2;
@@ -177,9 +182,10 @@ fn nibble_dequantize(packed: &[u8], norms: &[f32], head_dim: usize) -> Vec<f32> 
         } else {
             ((packed[byte_idx] >> 4) & 0xF) as usize
         };
-        // Dequant scale: norm * inv_sqrt(head_dim), using per-block norm for D=512.
-        let blk = if norms.len() > 1 { c / 256 } else { 0 };
-        rotated.push(CODEBOOK_4BIT[idx] * norms[blk] * inv_sqrt_d);
+        let blk = if per_block { c / 256 } else { 0 };
+        // iter-16: D=512 uses raw blk_norm (no inv_sqrt_d). D=256 unchanged.
+        let scale = if per_block { norms[blk] } else { norms[blk] * inv_sqrt_d };
+        rotated.push(CODEBOOK_4BIT[idx] * scale);
     }
 
     fwht_inplace(&mut rotated).unwrap();
