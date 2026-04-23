@@ -1806,6 +1806,7 @@ fn run_multistep(
 /// ONE instance is created at the top of run_multistep_production_faithful and
 /// advances through ALL data generation for ALL sweep points in declaration order.
 /// Catalog #13: NO per-position reseed-via-xor, NO xor-with-abs_pos, NO xor-with-kvl, NO XOR derivation.
+#[derive(Clone)]
 struct Xoshiro256StarStar {
     s: [u64; 4],
 }
@@ -2008,17 +2009,25 @@ fn nrmse_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Run the prerequisite regression gates via std::process::Command.
 /// Returns the structured gate results. Panics if any gate fails exit_code != 0.
 /// Catalog #12: gate statuses MUST be binary-emitted, not narrative-injected.
+/// Catalog #14: manifest path resolved at compile time from env!("CARGO_MANIFEST_DIR") so
+///   gates run against the WORKTREE (the checkout that was compiled), not a hardcoded main.
+///   The resolved path is emitted into audit.json.regression_gates.manifest_path.
 fn run_regression_gates() -> serde_json::Value {
     use std::process::Command;
     use std::time::Instant;
 
-    let manifest_path = "/opt/mlx-native/Cargo.toml";
-    let gates = [
+    // H1 (catalog #14): compile-time resolution — CARGO_MANIFEST_DIR is set by cargo to
+    // the package root at build time. Because this binary is built FROM the worktree,
+    // this path is guaranteed to point to the worktree's Cargo.toml, NOT to /opt/mlx-native.
+    const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+    let manifest_path: String = format!("{}/Cargo.toml", MANIFEST_DIR);
+    let mp = manifest_path.as_str(); // borrow for use in Vec<&str> below
+    let gates: &[(&str, Vec<&str>)] = &[
         (
             "gate_round_trip_identity",
             vec![
                 "test", "--release",
-                "--manifest-path", manifest_path,
+                "--manifest-path", mp,
                 "--test", "round_trip_identity",
                 "--", "--nocapture",
             ],
@@ -2027,7 +2036,7 @@ fn run_regression_gates() -> serde_json::Value {
             "gate_bitwidth_ab",
             vec![
                 "test", "--release",
-                "--manifest-path", manifest_path,
+                "--manifest-path", mp,
                 "--test", "bitwidth_ab",
                 "--", "--nocapture",
             ],
@@ -2036,7 +2045,7 @@ fn run_regression_gates() -> serde_json::Value {
             "gate_multistep_self_check",
             vec![
                 "test", "--release",
-                "--manifest-path", manifest_path,
+                "--manifest-path", mp,
                 "--test", "test_flash_attn_vec_tq",
                 "--", "--nocapture",
             ],
@@ -2045,7 +2054,10 @@ fn run_regression_gates() -> serde_json::Value {
 
     let mut gate_results = serde_json::Map::new();
 
-    for (gate_id, cargo_args) in &gates {
+    // Emit resolved manifest_path for R-11 / AC-3 verification.
+    gate_results.insert("manifest_path".to_string(), serde_json::json!(&manifest_path));
+
+    for (gate_id, cargo_args) in gates {
         eprintln!("[gate] running: cargo {}", cargo_args.join(" "));
         let start = Instant::now();
         let result = Command::new("cargo")
@@ -2188,6 +2200,14 @@ fn encode_and_get_oracle(
 ///
 /// Dense floor oracle: flash_attn_vec on POST-RMSNorm POST-RoPE F32 Q/K/V (same tensors
 /// fed to hadamard_quantize_kv). This is the #7-compliant upstream-independent reference.
+///
+/// H3 (catalog #16): `override_ring_start` — when Some(x), use x as ring_start for BOTH
+///   the kernel dispatch (FlashAttnVecTqParams.ring_start) AND the physical-ring layout
+///   construction for K/V encoding (phys_row = (ring_start + logical_i) % kvc).
+///   When None, the production formula is used: (abs_pos+1) % kvc when abs_pos+1 >= kvc.
+///   The ring_wrap legs call this function TWICE with identical drawn data (via RNG clone/
+///   restore by the caller) and different override_ring_start values, so ab_delta measures
+///   kernel sensitivity to ring_start, not RNG noise.
 fn run_sweep_point(
     rng: &mut Xoshiro256StarStar,
     rng_counter: &mut u64,
@@ -2195,6 +2215,7 @@ fn run_sweep_point(
     kvl: usize,
     kvc: usize,
     sliding_window: u32,
+    override_ring_start: Option<u32>,  // H3: R-13 — flows to kernel AND oracle layout
     device: &MlxDevice,
     registry: &mut KernelRegistry,
 ) -> f32 {
@@ -2210,7 +2231,10 @@ fn run_sweep_point(
     let softcap:   f32 = 0.0;
     let rope_theta:  f32 = 10000.0;
 
-    let ring_start = if abs_pos + 1 >= kvc { (abs_pos + 1) % kvc } else { 0 };
+    // H3 / R-13: use override if provided; otherwise compute production formula.
+    let ring_start = override_ring_start
+        .map(|x| x as usize)
+        .unwrap_or_else(|| if abs_pos + 1 >= kvc { (abs_pos + 1) % kvc } else { 0 });
 
     // Draw K, V, Q from the persistent RNG (catalog #13: single seed, single instance).
     // Order per spec: draw (nkv × kvl × hd) K, then (nkv × kvl × hd) V, then (nh × hd) Q.
@@ -2386,7 +2410,7 @@ fn run_sweep_point(
     nrmse_f32(&tq_out, &dense_out)
 }
 
-/// The iter-5 production-faithful controlled sweep.
+/// The iter-6 production-faithful controlled sweep (additive on iter-5 carcass 75116ad).
 ///
 /// PRODUCTION CONTRACT CITATIONS:
 ///   forward_mlx.rs:1617 — dense scale=1.0
@@ -2396,12 +2420,20 @@ fn run_sweep_point(
 ///   forward_mlx.rs:1665  — mask_type=2 for sliding
 ///   forward_mlx.rs:1666  — sliding_window from config=1024
 ///
-/// MISTAKES CATALOG CITATIONS (must appear verbatim per AC-9):
+/// MISTAKES CATALOG CITATIONS (must appear verbatim per AC-9 / R-10):
 ///   #3:  Verdict gates too loose — tighten to physics-justified narrow bands.
+///   #8:  Ring-chronology tests need kvl_logical < sliding_window to manifest.
 ///   #9:  Narrative overclaim vs code-generated evidence — emit statuses from binary.
 ///   #11: Pre-registered asserts bands — never widen after measurement.
 ///   #12: Regression-gate statuses MUST be binary-emitted, not narrative-injected.
 ///   #13: Non-controlled sweeps confound the claim — fix seed, vary one param only.
+///   #14: Subprocess gates must run against the worktree, not a hardcoded other checkout.
+///   #15: Copied-intersection-as-determinism-tautology — both sweeps must independently measure.
+///   #16: Ring-wrap A/B without independent ring_start control is measuring RNG noise.
+///   #17: Parallel artifact sources-of-truth violate single-source evidence discipline.
+///
+/// META-CLASS: report-vs-measurement drift — every field in audit.json must correspond to
+///   a real function evaluation at measurement time; no pre-computed, copied, or constructed values.
 fn run_multistep_production_faithful(
     out_dir: &PathBuf,
     device: &MlxDevice,
@@ -2428,14 +2460,16 @@ fn run_multistep_production_faithful(
     // Production shape (config.rs:95-98,103).
     let kvc: usize = 1024;
 
-    // STEP 4: Sweep A — fix abs_pos=500, vary kvl ∈ {128, 256, 512, 768, 1024}.
+    // STEP 4: Sweep A — fix abs_pos=500, vary kvl ∈ {128, 256, 500, 512, 768, 1024}.
     // Purpose: isolate the LENGTH effect. Phase is held constant.
-    let sweep_a_kvls:     &[usize] = &[128, 256, 512, 768, 1024];
+    // H2 (catalog #15): kvl=500 is NOW included so (abs_pos=500, kvl=500) is measured
+    // INDEPENDENTLY in sweep_A with its own RNG state, not copied from sweep_B.
+    let sweep_a_kvls:     &[usize] = &[128, 256, 500, 512, 768, 1024]; // 6 elements, kvl=500 added
     let sweep_a_abs_pos:   usize   = 500;
     let sweep_a_sw:        u32     = 1024;
 
     let mut sweep_a: Vec<SweepRow> = Vec::new();
-    // Track intersection point value for determinism check.
+    // Track intersection point value from sweep_A's OWN measurement (catalog #15).
     let mut sweep_a_nrmse_at_500: Option<f32> = None;
 
     for &kvl in sweep_a_kvls {
@@ -2443,6 +2477,7 @@ fn run_multistep_production_faithful(
         let nrmse = run_sweep_point(
             &mut rng, &mut rng_counter,
             sweep_a_abs_pos, kvl, kvc, sweep_a_sw,
+            None, // no ring_start override for sweep legs
             device, registry,
         );
         let band_ok = nrmse >= NRMSE_BAND_LOWER && nrmse <= NRMSE_BAND_UPPER;
@@ -2450,6 +2485,7 @@ fn run_multistep_production_faithful(
         eprintln!("[sweep_A] abs_pos={} kvl={} sw={} nrmse={:.7} band_ok={}", sweep_a_abs_pos, kvl, sweep_a_sw, nrmse, band_ok);
 
         if kvl == 500 {
+            // H2: Record the independently-measured sweep_A value at the intersection point.
             sweep_a_nrmse_at_500 = Some(nrmse);
         }
 
@@ -2457,7 +2493,7 @@ fn run_multistep_production_faithful(
             // Catalog #11: log BAND_PRE_FALSIFIED message but CONTINUE collecting to emit full audit.
             // Do NOT widen band. Do NOT edit NRMSE_BAND_UPPER. Exit code 2 at the end.
             eprintln!(
-                "BAND_PRE_FALSIFIED: sweep_A/kvl={} nrmse={:.7} outside pre-registered band [{}, {}]; iter-5 verdict REJECT; no remeasurement; no band edit",
+                "BAND_PRE_FALSIFIED: sweep_A/kvl={} nrmse={:.7} outside pre-registered band [{}, {}]; iter-6 verdict REJECT; no remeasurement; no band edit",
                 kvl, nrmse, NRMSE_BAND_LOWER, NRMSE_BAND_UPPER
             );
         }
@@ -2491,6 +2527,7 @@ fn run_multistep_production_faithful(
         let nrmse = run_sweep_point(
             &mut rng, &mut rng_counter,
             abs_pos, effective_kvl, kvc, sweep_b_sw,
+            None, // no ring_start override for sweep legs
             device, registry,
         );
         let band_ok = nrmse >= NRMSE_BAND_LOWER && nrmse <= NRMSE_BAND_UPPER;
@@ -2498,13 +2535,14 @@ fn run_multistep_production_faithful(
         eprintln!("[sweep_B] abs_pos={} kvl={} sw={} nrmse={:.7} band_ok={}", abs_pos, effective_kvl, sweep_b_sw, nrmse, band_ok);
 
         if abs_pos == 500 {
+            // H2: Record sweep_B's independently-measured value at the intersection point.
             sweep_b_nrmse_at_500 = Some(nrmse);
         }
 
         if !band_ok {
             // Catalog #11: log but continue collecting. Exit code 2 emitted at end.
             eprintln!(
-                "BAND_PRE_FALSIFIED: sweep_B/abs_pos={} nrmse={:.7} outside pre-registered band [{}, {}]; iter-5 verdict REJECT; no remeasurement; no band edit",
+                "BAND_PRE_FALSIFIED: sweep_B/abs_pos={} nrmse={:.7} outside pre-registered band [{}, {}]; iter-6 verdict REJECT; no remeasurement; no band edit",
                 abs_pos, nrmse, NRMSE_BAND_LOWER, NRMSE_BAND_UPPER
             );
         }
@@ -2519,93 +2557,90 @@ fn run_multistep_production_faithful(
         });
     }
 
-    // STEP 6: Intersection determinism check (AC-5).
-    // The intersection point is (abs_pos=500, kvl=500). sweep_A has abs_pos=500 fixed
-    // but kvl ∈ {128,256,512,768,1024} — 500 is NOT in that list. sweep_B has kvl=500
-    // fixed and abs_pos=500 IS in its list (abs_pos ∈ {50,100,200,500,1000}).
-    //
-    // Per spec: "The measurement at this point should appear ONCE in the matrix, and the
-    // nrmse value should match exactly between sweep A reporting and sweep B reporting."
-    //
-    // Correct approach: the sweep_B abs_pos=500 row IS the canonical intersection measurement.
-    // We report that exact value in sweep_A as an extra row (kvl=500 at abs_pos=500).
-    // No extra RNG draw — same measurement, reported twice. This gives exact bit-identity.
-    let intersection_nrmse = sweep_b_nrmse_at_500
+    // STEP 6: Intersection determinism check (AC-5, H2, catalog #15).
+    // The intersection point is (abs_pos=500, kvl=500).
+    // H2 fix: sweep_A NOW includes kvl=500, so BOTH sweeps independently measure this point.
+    // sweep_A measured it at its own RNG state; sweep_B measured it at a later RNG state.
+    // The two values are EXPECTED to differ (different RNG advance = different random data).
+    // We binary-compute equality at 7 decimal places to confirm this is NOT a tautological copy.
+    // A mismatch is the HONEST outcome; a match would itself be suspicious (coincidental f32 equality).
+    let a_val: f32 = sweep_a_nrmse_at_500
+        .expect("sweep_A kvl=500 row must exist (H2: added to sweep_a_kvls)");
+    let b_val: f32 = sweep_b_nrmse_at_500
         .expect("sweep_B abs_pos=500 row must exist");
-    let intersection_band_ok = intersection_nrmse >= NRMSE_BAND_LOWER && intersection_nrmse <= NRMSE_BAND_UPPER;
 
-    // Find the sweep_B abs_pos=500 row's rng_counter value for the sweep_A entry.
-    let intersection_rng_before = sweep_b.iter()
-        .find(|r| r.abs_pos == 500)
-        .map(|r| r.rng_u64s_consumed_before)
-        .unwrap_or(0);
+    // Binary-compute match: round both to 7 decimal places and compare as integers.
+    // (catalog #15: must be computed, NEVER hardcoded true)
+    let match_to_7_decimal_places: bool =
+        ((a_val as f64 * 1e7).round() as i64) == ((b_val as f64 * 1e7).round() as i64);
+    let absdiff: f64 = ((a_val as f64) - (b_val as f64)).abs();
 
-    eprintln!("[intersection] abs_pos=500 kvl=500 nrmse={:.7} (from sweep_B; reported in intersection_check AC-5/R-6)", intersection_nrmse);
+    let intersection_band_ok = a_val >= NRMSE_BAND_LOWER && a_val <= NRMSE_BAND_UPPER;
 
-    // intersection_nrmse is stored in sweep_B's abs_pos=500 row (already in sweep_B matrix).
-    // It is NOT added to sweep_A to keep sweep_A length=5 (R-5, AC-4).
-    // The intersection_check section in audit.json carries the value for Codex R-6 verification.
+    eprintln!(
+        "[intersection] sweep_A/kvl=500 nrmse_A={:.7} sweep_B/abs_pos=500 nrmse_B={:.7} absdiff={:.2e} match_7dp={} (H2: two independent RNG states; mismatch is expected)",
+        a_val, b_val, absdiff, match_to_7_decimal_places
+    );
 
-    // Band check for intersection (already tracked as part of sweep_B, defensive log).
+    // Band check for intersection (sweep_A measurement).
     if !intersection_band_ok {
         eprintln!(
-            "BAND_PRE_FALSIFIED: intersection abs_pos=500 kvl=500 nrmse={:.7} outside band [{}, {}]",
-            intersection_nrmse, NRMSE_BAND_LOWER, NRMSE_BAND_UPPER
+            "BAND_PRE_FALSIFIED: intersection abs_pos=500 kvl=500 sweep_A_nrmse={:.7} outside band [{}, {}]",
+            a_val, NRMSE_BAND_LOWER, NRMSE_BAND_UPPER
         );
     }
 
-    let _ = sweep_a_nrmse_at_500; // not used (500 is not in sweep_A's kvl list)
-
-    // STEP 7: Ring-wrap legs — sliding_window=512 < kvc=1024 so chronology manifests (#8).
+    // STEP 7: Ring-wrap legs.
+    // M1 (catalog #8): kvl_logical MUST be < sliding_window for mask to differentiate slot
+    //   chronology. iter-5 had kvl=1024 >= sliding_window=512 — degenerate (both ring_start
+    //   formulas expose the full slot set). Fixed: kvl=256 < sliding_window=512.
+    //   This is synthetic (production at abs_pos=1024 would have kvl=1024) but required by
+    //   catalog #8 for chronology differences to physically manifest in the mask.
+    // H3 (catalog #16): draw K/V/Q ONCE per abs_pos using an RNG clone/restore mechanism,
+    //   then dispatch kernel TWICE with override_ring_start=Some(ring_start_a) and
+    //   override_ring_start=Some(ring_start_b) on BYTE-IDENTICAL data.
+    //   ab_delta = |nrmse_a - nrmse_b| measures kernel sensitivity to ring_start, not RNG noise.
     let ring_wrap_points = [(1024usize, 512u32), (1050usize, 512u32)];
+    let ring_wrap_kvl: usize = 256; // strictly < sliding_window=512 (catalog #8 / M1)
     let mut ring_wrap: Vec<serde_json::Value> = Vec::new();
 
     for (abs_pos, sw) in ring_wrap_points {
-        let kvl = kvc.min(abs_pos + 1); // at abs_pos=1024: kvl=min(1024,1025)=1024
-        let ring_start_a = if abs_pos + 1 >= kvc { (abs_pos + 1) % kvc } else { 0 };
-        let ring_start_b = if abs_pos + 1 > kvc  { abs_pos % kvc } else { 0 };
+        let kvl = ring_wrap_kvl; // 256 < 512 (M1 fix: catalog #8)
+        let ring_start_a: u32 = if abs_pos + 1 >= kvc { ((abs_pos + 1) % kvc) as u32 } else { 0 };
+        let ring_start_b: u32 = if abs_pos + 1 > kvc  { (abs_pos % kvc) as u32 } else { 0 };
         let before_count = rng_counter;
 
-        // Ring-start A (production formula: (abs_pos+1) % kvc when abs_pos+1 >= kvc).
+        // H3: Save RNG state before drawing data for this abs_pos.
+        // Xoshiro256StarStar derives Clone (added in iter-6), so we can snapshot and restore.
+        let rng_snapshot = rng.clone();
+        let counter_snapshot = rng_counter;
+
+        // First invocation: ring_start_a (production formula). Advances rng.
         let nrmse_a = run_sweep_point(
             &mut rng, &mut rng_counter,
             abs_pos, kvl, kvc, sw,
+            Some(ring_start_a), // H3: override_ring_start flows to kernel dispatch + CPU oracle
             device, registry,
         );
-        // Ring-start B (alternative: abs_pos % kvc). We measure nrmse_b by shifting
-        // ring_start by 1 to test if dispatch formula matters. We run the sweep point
-        // with the B formula by adjusting the ring_start in the encoding.
-        // Since run_sweep_point computes ring_start internally, we need a helper.
-        // For simplicity, run_sweep_point uses the A formula. We report ring_start_a
-        // nrmse as ring_start_A_nrmse and note ring_start_B would equal ring_start_A - 1.
-        // The ab_delta is the NRMSE difference between A-ring and B-ring SDPA outputs,
-        // measuring sensitivity to the ring_start off-by-one.
-        // Run a second point at the same position but with the B ring_start embedded:
-        let nrmse_b = {
-            // We can't easily pass a custom ring_start into run_sweep_point without
-            // restructuring. Instead, the production ring_start formula IS (abs_pos+1)%kvc.
-            // ring_start_B = ring_start_A - 1 (mod kvc). The "B delta" test checks whether
-            // switching from formula A to formula B changes nrmse. We compute nrmse_b as
-            // nrmse from the same data but with ring_start forced to ring_start_b.
-            // Since the oracle is position-agnostic (CPU SDPA is chronological), the only
-            // difference is where in the GPU ring buffer chronological position 0 maps.
-            // Running the same rng draw again is not an option (advances state). We approximate:
-            // nrmse_b = nrmse_a when ring_start_a == ring_start_b (degenerate case at abs_pos < kvc).
-            // At abs_pos=1024: ring_start_A=(1025)%1024=1, ring_start_B=1024%1024=0.
-            // At abs_pos=1050: ring_start_A=(1051)%1024=27, ring_start_B=1050%1024=26.
-            // To measure ab_delta properly, we need to draw fresh random data (since we
-            // can't reuse the same data with a different ring_start without re-running the kernel).
-            // We draw fresh data for the B-formula run at the same abs_pos.
-            run_sweep_point(
-                &mut rng, &mut rng_counter,
-                abs_pos, kvl, kvc, sw,
-                device, registry,
-            )
-        };
+
+        // H3: Restore RNG to pre-draw state so nrmse_b uses BYTE-IDENTICAL K/V/Q data.
+        // The rng state is reset to exactly what it was before the A draw, then B draws
+        // the same sequence — only ring_start differs in the kernel dispatch and oracle layout.
+        rng = rng_snapshot;
+        rng_counter = counter_snapshot;
+
+        // Second invocation: ring_start_b (alternative formula). Same data as A.
+        let nrmse_b = run_sweep_point(
+            &mut rng, &mut rng_counter,
+            abs_pos, kvl, kvc, sw,
+            Some(ring_start_b), // H3: different ring_start, same K/V/Q data
+            device, registry,
+        );
+
         let ab_delta = (nrmse_a - nrmse_b).abs();
 
         eprintln!(
-            "[ring_wrap] abs_pos={} kvl={} sw={} ring_start_A={} ring_start_B={} nrmse_a={:.7} nrmse_b={:.7} ab_delta={:.2e}",
+            "[ring_wrap] abs_pos={} kvl={} sw={} ring_start_A={} ring_start_B={} nrmse_a={:.7} nrmse_b={:.7} ab_delta={:.2e} (H3: byte-identical data, different ring_start)",
             abs_pos, kvl, sw, ring_start_a, ring_start_b, nrmse_a, nrmse_b, ab_delta
         );
 
@@ -2620,22 +2655,25 @@ fn run_multistep_production_faithful(
         }
         if !band_ok_b {
             eprintln!(
-                "iter-5 REJECTED: ring_wrap abs_pos={} nrmse_b={:.7} outside band [{}, {}]; BAND_PRE_FALSIFIED",
+                "BAND_PRE_FALSIFIED: ring_wrap abs_pos={} nrmse_b={:.7} outside band [{}, {}]",
                 abs_pos, nrmse_b, NRMSE_BAND_LOWER, NRMSE_BAND_UPPER
             );
         }
 
         ring_wrap.push(serde_json::json!({
             "abs_pos": abs_pos,
-            "kvl_logical": kvl,
-            "sliding_window": sw,
+            "kvl_logical": kvl,          // 256 < sliding_window=512 (M1 / catalog #8)
+            "sliding_window": sw,         // 512
             "ring_start_a": ring_start_a,
             "ring_start_b": ring_start_b,
+            "ring_start_A_passed_to_kernel": ring_start_a, // R-13: emitted for AC-11 verification
+            "ring_start_B_passed_to_kernel": ring_start_b, // R-13: emitted for AC-11 verification
             "ring_start_A_nrmse": nrmse_a,
             "ring_start_B_nrmse": nrmse_b,
             "ab_delta": ab_delta,
             "band_ok": band_ok_a && band_ok_b,
             "rng_u64s_consumed_before": before_count,
+            "h3_data_reuse": "byte-identical K/V/Q via RNG clone/restore; only ring_start differs",
         }));
     }
 
@@ -2651,8 +2689,8 @@ fn run_multistep_production_faithful(
         "BAND_PRE_FALSIFIED"
     } else {
         // Spearman rho for sweep_A (length effect): monotone-rising → rho > 0.7
+        // H2: kvl=500 is NOW a real sweep_A row; include all 6 rows in the Spearman analysis.
         let sweep_a_nrmse: Vec<f32> = sweep_a.iter()
-            .filter(|r| r.kvl_logical != 500) // exclude intersection row for shape analysis
             .map(|r| r.nrmse).collect();
         let n_a = sweep_a_nrmse.len() as f32;
         let spearman_rho_a = if n_a >= 2.0 {
@@ -2676,8 +2714,8 @@ fn run_multistep_production_faithful(
         let sweep_b_min = sweep_b_nrmse_core.iter().cloned().fold(f32::INFINITY, f32::min);
         let sweep_b_range = sweep_b_max - sweep_b_min;
 
+        // H2: all 6 sweep_A rows included (kvl=500 is now a real row, not a phantom).
         let sweep_a_range_core: Vec<f32> = sweep_a.iter()
-            .filter(|r| r.kvl_logical != 500)
             .map(|r| r.nrmse).collect();
         let sweep_a_max = sweep_a_range_core.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let sweep_a_min = sweep_a_range_core.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -2700,7 +2738,7 @@ fn run_multistep_production_faithful(
     // V-norm policy: forward_mlx.rs:1167-1205 direct read confirms V gets
     // dispatch_rms_norm_unit_perhead (unit weights, no learned weight tensor for V).
     // Q/K: forward_mlx.rs:1144-1165 uses learned q_norm_weight/k_norm_weight.
-    // Iter-5 uses unit weights for Q/K (GGUF not present on test machine).
+    // Iter-6 uses unit weights for Q/K (GGUF not present on test machine).
     let regime = serde_json::json!({
         "rmsnorm_weights": "unit_fallback",
         "rmsnorm_weights_reason": "Gemma-4-27B GGUF not present on test machine; GGUF extraction path non-trivial. Q/K use unit RMSNorm weights (learned q_norm_weight/k_norm_weight available in production at forward_mlx.rs:1148,1159). Delta vs learned: unit weights normalize Q/K to unit sphere before RoPE; learned weights add a per-element multiplicative scale. For N(0,1) synthetic inputs the difference is O(weight_scale - 1), typically <5% for near-unit weights in trained models. Regime-faithful in shape/scale/eps/formula.",
@@ -2718,13 +2756,16 @@ fn run_multistep_production_faithful(
         "mask_type": 2,
         "mask_type_evidence": "forward_mlx.rs:1665 (mask_type=2 for sliding layers)",
         "softcap": 0.0,
+        // M1 / catalog #8: ring_wrap uses kvl=256 < sliding_window=512 so chronology manifests.
+        "ring_wrap_kvl_reason": "catalog #8: ring-chronology tests need kvl_logical < sliding_window to manifest. At kvl_logical >= sliding_window both ring_start formulas expose the full slot set; chronology differences physically cannot show. ring_wrap uses kvl=256 < sliding_window=512 (synthetic; production at abs_pos=1024 would have kvl=1024, but the A/B test is measuring kernel dispatch sensitivity to ring_start, which requires mask differentiation of slot chronology).",
     });
 
-    // STEP 10: Write audit.json — SOLE reporting artifact.
+    // STEP 10: Write audit.json — SOLE reporting artifact (catalog #17 / M2).
     // No "pending", "TBD", or "pending_manual_run" strings anywhere (catalog #12, AC-3).
+    // M2: sweep_A and sweep_B are embedded as arrays in audit.json; NO sidecar CSVs written.
     let audit = serde_json::json!({
-        "session": "cfa-20260422-C4t3i5-strict-evidence",
-        "iter": 5,
+        "session": "cfa-20260422-C4t3i6-evidence-package-integrity",
+        "iter": 6,
         "ran_at": SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2749,52 +2790,48 @@ fn run_multistep_production_faithful(
         "intersection_check": {
             "abs_pos": 500,
             "kvl_logical": 500,
-            "nrmse": intersection_nrmse,
+            // H2 (catalog #15): sweep_A_intersection_nrmse and sweep_B_intersection_nrmse are
+            // INDEPENDENTLY MEASURED from distinct RNG states (sweep_A draws first; sweep_B draws
+            // after sweep_A has advanced the RNG). A mismatch is the EXPECTED honest outcome.
+            "sweep_A_intersection_nrmse": a_val,   // from sweep_A's kvl=500 row (independently measured)
+            "sweep_B_intersection_nrmse": b_val,   // from sweep_B's abs_pos=500 row (different RNG state)
+            // Binary-computed equality — NEVER hardcoded (catalog #15 / AC-8).
+            "match_to_7_decimal_places": match_to_7_decimal_places,
+            "absdiff": absdiff,     // numeric distance for AC-7 verification
             "band_ok": intersection_band_ok,
-            "sweep_A_intersection_nrmse": intersection_nrmse,
-            "sweep_B_intersection_nrmse": intersection_nrmse,
-            "match_to_7_decimal_places": true,
-            "note": "The intersection point (abs_pos=500, kvl=500) is the sweep_B abs_pos=500 row. sweep_A has 5 rows (kvl in {128,256,512,768,1024}), sweep_B has 5 rows (abs_pos in {50,100,200,500,1000}). The intersection value is the sweep_B abs_pos=500 measurement, reported here for R-6 verification.",
+            "note": "H2 / catalog #15: (abs_pos=500, kvl=500) is measured TWICE with distinct RNG states. sweep_A includes kvl=500 as of iter-6 (6 rows total). sweep_B has abs_pos=500 as its 4th row. The two values come from different RNG advances so a numerical mismatch is expected and is the HONEST outcome. match_to_7_decimal_places is COMPUTED, not hardcoded.",
         },
         "mistakes_catalog_citations": [
             "#3: Verdict gates too loose — tighten to physics-justified narrow bands",
+            "#8: Ring-chronology tests need kvl_logical < sliding_window to manifest",
             "#9: Narrative overclaim vs code-generated evidence — emit statuses from binary",
             "#11: Pre-registered asserts bands — never widen after measurement (iter-4 HIGH-1 defect)",
             "#12: Regression-gate statuses MUST be binary-emitted, not narrative-injected (iter-4 HIGH-2 defect)",
             "#13: Non-controlled sweeps confound the claim — fix seed, vary one param only (iter-4 MED defect)",
+            "#14: Subprocess gates must run against the worktree, not a hardcoded other checkout (iter-5 HIGH-1 defect)",
+            "#15: Copied-intersection-as-determinism-tautology — both sweeps must independently measure (iter-5 HIGH-2 defect)",
+            "#16: Ring-wrap A/B without independent ring_start control is measuring RNG noise (iter-5 HIGH-3 defect)",
+            "#17: Parallel artifact sources-of-truth violate single-source evidence discipline (iter-5 MED-2 defect)",
+            "meta-class: report-vs-measurement drift — every field in audit.json must correspond to a real function evaluation at measurement time; no pre-computed, copied, or constructed values",
         ],
+        // M2 (catalog #17): CSV-equivalent documentation for downstream jq post-processing.
+        // The binary writes ONLY audit.json. No sidecar CSVs. R-15 / AC-13 / AC-14.
+        "csv_equivalent": {
+            "sweep_a_columns": ["abs_pos", "kvl_logical", "sliding_window", "nrmse", "band_ok", "rng_u64s_consumed_before"],
+            "sweep_b_columns": ["abs_pos", "kvl_logical", "sliding_window", "nrmse", "band_ok", "rng_u64s_consumed_before"],
+            "ring_wrap_columns": ["abs_pos", "kvl_logical", "sliding_window", "ring_start_a", "ring_start_b", "ring_start_A_nrmse", "ring_start_B_nrmse", "ab_delta", "band_ok", "rng_u64s_consumed_before"],
+            "note": "sweep_A and sweep_B arrays in this audit.json are the canonical source. jq one-liner: jq -r '.sweep_A[] | [.abs_pos,.kvl_logical,.sliding_window,.nrmse,.band_ok,.rng_u64s_consumed_before] | @csv' audit.json",
+        },
     });
 
     let audit_json = serde_json::to_string_pretty(&audit).expect("serialize audit");
 
+    // M2 (catalog #17): write ONLY audit.json — the SOLE reporting artifact.
+    // Sidecar sweep_a.csv / sweep_b.csv REMOVED in iter-6. Use csv_equivalent.note for jq.
     let audit_path = out_dir.join("audit.json");
     fs::write(&audit_path, audit_json.as_bytes())
         .unwrap_or_else(|e| panic!("failed to write audit.json: {}", e));
-    eprintln!("[pf] audit.json written to {:?}", audit_path);
-
-    // Write sweep CSVs for Codex review.
-    let sweep_a_csv = {
-        let mut s = String::from("abs_pos,kvl_logical,sliding_window,nrmse,band_ok,rng_u64s_consumed_before\n");
-        for r in &sweep_a {
-            s.push_str(&format!("{},{},{},{:.7},{},{}\n",
-                r.abs_pos, r.kvl_logical, r.sliding_window, r.nrmse, r.band_ok, r.rng_u64s_consumed_before));
-        }
-        s
-    };
-    let sweep_b_csv = {
-        let mut s = String::from("abs_pos,kvl_logical,sliding_window,nrmse,band_ok,rng_u64s_consumed_before\n");
-        for r in &sweep_b {
-            s.push_str(&format!("{},{},{},{:.7},{},{}\n",
-                r.abs_pos, r.kvl_logical, r.sliding_window, r.nrmse, r.band_ok, r.rng_u64s_consumed_before));
-        }
-        s
-    };
-
-    fs::write(out_dir.join("sweep_a.csv"), sweep_a_csv.as_bytes())
-        .unwrap_or_else(|e| panic!("failed to write sweep_a.csv: {}", e));
-    fs::write(out_dir.join("sweep_b.csv"), sweep_b_csv.as_bytes())
-        .unwrap_or_else(|e| panic!("failed to write sweep_b.csv: {}", e));
-    eprintln!("[pf] sweep_a.csv and sweep_b.csv written");
+    eprintln!("[pf] audit.json written to {:?} (sole artifact; no sidecar CSVs — catalog #17 / M2)", audit_path);
 
     // Print summary to stdout.
     println!("=== iter-5 production-faithful verdict: {} ===", verdict);
