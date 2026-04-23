@@ -209,11 +209,15 @@ kernel void hadamard_quantize_kv_fast(
     }
 
     // 5. Normalize each element: scale to N(0,1) using per-block norm.
-    //    D=256: scale = inv_norm0 * sqrt(256) (unchanged).
-    //    D=512: element in block b gets scale = sqrt(512) / blk_norm[b].
-    //    The sqrt(HEAD_DIM) factor cancels the inv_sqrt_d applied in step 3, so stored
-    //    element = FWHT_unnorm(sign*x)[j] / blk_norm[b].
-    //    Decode recovers: CODEBOOK[idx] * blk_norm[b] * inv_sqrt(HEAD_DIM) = FWHT_norm(sign*x)[j].
+    //    D=256: scale = inv_norm0 * sqrt(256) (unchanged — single-global-norm, algebraically
+    //           equivalent to AmesianX for the single-norm case).
+    //    D=512 (iter-16 fix): scale = inv_blk_norm only. FWHT is normalized (inv_sqrt_d applied
+    //           in step 3), so blk_norm ≈ 1 after FWHT → stored element ≈ N(0,1) via 1/norm alone.
+    //           AmesianX cpy-utils.cuh:241-269 works on UNNORMALIZED 512-WHT and uses
+    //           val = blk_data * inv_norm — no sqrt factor. Our normalized FWHT + AmesianX's
+    //           sqrt factor = double normalization → quantizer input RMS = sqrt(512) ≈ 22.6
+    //           instead of ~1.0, grossly misfitting N(0,1) codebook. Fix: remove sqrt(HEAD_DIM).
+    //    Decode recovers: CODEBOOK[idx] * blk_norm = FWHT_norm(sign*x)[j].
     if (HEAD_DIM == 256) {
         float inv_norm = (norm0 > 1.0e-10f) ? (1.0f / norm0) : 0.0f;
         float scale = inv_norm * sqrt(float(HEAD_DIM));
@@ -224,7 +228,7 @@ kernel void hadamard_quantize_kv_fast(
         // D=512: apply per-block scale. Lanes 0..15 use norm0, lanes 16..31 use norm1.
         float blk_norm = (lane < 16u) ? norm0 : norm1;
         float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
-        float scale = inv_blk_norm * sqrt(float(HEAD_DIM));
+        float scale = inv_blk_norm;  // iter-16: removed sqrt(HEAD_DIM); FWHT is normalized, blk RMS≈1 → N(0,1) via 1/norm alone. Ref AmesianX cpy-utils.cuh:241-269.
         for (ushort i = 0; i < EPT; i++) {
             elems[i] *= scale;
         }

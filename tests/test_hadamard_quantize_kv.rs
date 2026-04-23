@@ -61,10 +61,11 @@ fn nearest_centroid_4bit(value: f32) -> u8 {
 ///   - D=256: norms = [global_norm] (1 element)
 ///   - D=512: norms = [blk0_norm, blk1_norm] (2 elements, per AmesianX cpy-utils.cuh:241-269)
 ///
-/// D=512 per-block norm (ADR-007 iter-15):
+/// D=512 per-block norm (ADR-007 iter-16 fix):
 ///   After 512-FWHT, split into block0=[0..255] and block1=[256..511].
-///   blk_norm[b] = sqrt(sum_sq[b] / 256.0f) — RMS norm, matches AmesianX.
-///   Scale for block b: sqrt(head_dim) / blk_norm[b], same convention as D=256 global.
+///   blk_norm[b] = sqrt(sum_sq[b] / 256.0f) — RMS norm of already-normalized values.
+///   Scale for block b: inv_blk_norm only (iter-16: removed sqrt(head_dim) factor).
+///   FWHT is normalized (inv_sqrt_d applied), blk_norm ≈ 1 → N(0,1) via 1/norm alone.
 ///   Decode: CODEBOOK[idx] * blk_norm[b] * inv_sqrt(head_dim) = FWHT_norm(sign*x)[j].
 fn cpu_hadamard_quantize_head(src: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let d = src.len();
@@ -108,11 +109,12 @@ fn cpu_hadamard_quantize_head(src: &[f32]) -> (Vec<u8>, Vec<f32>) {
             let sq: f32 = blk_data.iter().map(|v| v * v).sum();
             blk_norms[blk] = (sq / 256.0f32).sqrt();
         }
-        let sqrt_d = (d as f32).sqrt();
+        // iter-16: removed sqrt_d factor. FWHT is normalized (inv_sqrt_d applied in fwht_inplace),
+        // blk_norm ≈ 1 → quantizer input ≈ N(0,1) via 1/norm alone. Ref cpy-utils.cuh:241-269.
         indices = rotated.iter().enumerate().map(|(j, &v)| {
             let blk = j / 256;
             let inv_blk_norm = if blk_norms[blk] > 1.0e-10 { 1.0 / blk_norms[blk] } else { 0.0f32 };
-            nearest_centroid_4bit(v * inv_blk_norm * sqrt_d)
+            nearest_centroid_4bit(v * inv_blk_norm)
         }).collect();
         norms = vec![blk_norms[0], blk_norms[1]];
         let _ = norms_per_pos; // suppress unused warning for D=256 case
