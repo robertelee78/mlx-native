@@ -470,15 +470,21 @@ fn nrmse_vec_f64(original: &[f32], reconstructed: &[f32]) -> f64 {
 // running_sum, acc[] are all `float` in the Metal shader). This eliminates
 // the precision deviation introduced in iter 1.
 
-/// Per-vector RMS-norm: x / sqrt(mean(x^2)) = x * sqrt(d) / ||x||.
-/// Avoids division by near-zero by returning zeros for degenerate input.
+/// Per-vector RMS-norm with production-matching `+eps` stabilization:
+/// `x / sqrt(mean(x^2) + eps)`. Mirrors `dispatch_rms_norm_unit_perhead`
+/// semantics exactly (see `/opt/hf2q/src/serve/forward_mlx.rs:3207-3237,
+/// 3410-3424` + `rms_norm.metal:397-434`). Gemma's `rms_norm_eps = 1e-6`
+/// is the default at `/opt/hf2q/src/serve/config.rs:100`.
+///
+/// The `+eps` term is numerically trivial for Gaussian-distributed V
+/// (RMS ~ 1 so eps ~ 1e-6 is invisible at f32), but documenting and
+/// implementing it faithfully closes the Codex iter-2 MED finding that
+/// the previous helper overclaimed production parity.
 fn rms_norm_vec(v: &[f32]) -> Vec<f32> {
+    const RMS_NORM_EPS: f32 = 1e-6;
     let n = v.len() as f32;
     let mean_sq: f32 = v.iter().map(|&x| x * x).sum::<f32>() / n;
-    let rms = mean_sq.sqrt();
-    if rms < 1e-30 {
-        return vec![0.0f32; v.len()];
-    }
+    let rms = (mean_sq + RMS_NORM_EPS).sqrt();
     v.iter().map(|&x| x / rms).collect()
 }
 
