@@ -15,7 +15,13 @@
 // Packed KV layout: [num_kv_heads, capacity, head_dim/2] u8
 //   Low nibble = even coordinate index, high nibble = odd coordinate index
 //
-// Norms layout: [num_kv_heads, capacity] f32
+// Norms layout:
+//   D=256: [num_kv_heads, capacity] f32 — 1 norm per head-position (NORMS_PER_POS=1)
+//   D=512: [num_kv_heads, capacity, 2] f32 — 2 norms per head-position (NORMS_PER_POS=2)
+//   Per AmesianX cpy-utils.cuh:241-269 (ADR-007 iter-15 per-256-block norm):
+//     After full 512-FWHT, elements split into block0=[0..255] and block1=[256..511].
+//     Each block stored with independent RMS norm. Decode: scale_b = norm_b * inv_sqrt(head_dim).
+//     In decode kernel for DK=512: loop ii=0,1 → block0 (norm0), ii=2,3 → block1 (norm1).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -294,6 +300,14 @@ kernel void flash_attn_vec_tq_impl(
             // Pre-compute inv_sqrt(DK) once — used for all K dequant in this chunk.
             const float inv_sqrt_dk = rsqrt(float(DK));
 
+            // Per-block norm layout for D=512 (ADR-007 iter-15, AmesianX cpy-utils.cuh:241-269):
+            //   K_norms indexed as [kv_head * capacity * NORMS_PER_POS + pos * NORMS_PER_POS + blk]
+            //   where NORMS_PER_POS = DK / 256.
+            //   ii=0,1 (elements 0..255) → block 0 (norm index +0)
+            //   ii=2,3 (elements 256..511) → block 1 (norm index +1)
+            //   Only applies when DK == 512; DK == 256 uses single norm (NORMS_PER_POS=1).
+            constexpr short NORMS_PER_POS_K = DK / 256;
+
             for (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) {
@@ -301,15 +315,21 @@ kernel void flash_attn_vec_tq_impl(
                     continue;
                 }
 
-                float k_sn = K_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dk;
-
                 // Base pointer to packed K for this position.
                 // Precompute the position offset once, then stride by 2 bytes per ii.
                 device const uint8_t *k_base =
                     K_packed + (kv_head * params.kv_capacity + kv_pos) * (DK / 2) + tx * 2u;
 
+                // Norm base for this position (accounts for NORMS_PER_POS).
+                uint k_norm_base = kv_head * params.kv_capacity * NORMS_PER_POS_K
+                                 + kv_pos * NORMS_PER_POS_K;
+
                 float partial = 0.0f;
                 for (short ii = 0; ii < DK4 / NL; ++ii) {
+                    // For DK=256: NORMS_PER_POS_K=1, always block 0.
+                    // For DK=512: ii=0,1 → block 0 (norm[+0]); ii=2,3 → block 1 (norm[+1]).
+                    short blk = (NORMS_PER_POS_K > 1) ? (ii / (DK4 / NL / 2)) : 0;
+                    float k_sn = K_norms[k_norm_base + blk] * inv_sqrt_dk;
                     float4 k_val = dequant_tq_float4(k_base, (uint)(ii * NL) * 2u, k_sn);
                     partial += dot(k_val, float4(pq4[ii * NL]));
                 }
@@ -354,16 +374,29 @@ kernel void flash_attn_vec_tq_impl(
             // Pre-compute inv_sqrt(DV) once — used for all V dequant in this chunk.
             const float inv_sqrt_dv = rsqrt(float(DV));
 
+            // Per-block norm layout for D=512 V side (ADR-007 iter-15).
+            // Same block mapping as K: ii=0,1 → block0, ii=2,3 → block1.
+            constexpr short NORMS_PER_POS_V = DV / 256;
+
             for (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) continue;
 
-                // Fold weight into scale_norm: dequant returns pre-weighted values.
-                float v_sw = V_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dv * ss[cc];
                 device const uint8_t *v_base =
                     V_packed + (kv_head * params.kv_capacity + kv_pos) * (DV / 2) + tx * 2u;
 
+                // Norm base for this V position.
+                uint v_norm_base = kv_head * params.kv_capacity * NORMS_PER_POS_V
+                                 + kv_pos * NORMS_PER_POS_V;
+
+                float softmax_weight = ss[cc];
+
                 for (short ii = 0; ii < DV4 / NL; ++ii) {
+                    // For DV=256: NORMS_PER_POS_V=1, always block 0.
+                    // For DV=512: ii=0,1 → block 0; ii=2,3 → block 1.
+                    short blk = (NORMS_PER_POS_V > 1) ? (ii / (DV4 / NL / 2)) : 0;
+                    // Fold weight into scale_norm: dequant returns pre-weighted values.
+                    float v_sw = V_norms[v_norm_base + blk] * inv_sqrt_dv * softmax_weight;
                     lo[ii] += dequant_tq_float4(v_base, (uint)(ii * NL) * 2u, v_sw);
                 }
             }

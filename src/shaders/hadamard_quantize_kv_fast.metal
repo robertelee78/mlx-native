@@ -115,6 +115,17 @@ inline void fwht_simd(thread float *elems, uint lane) {
 
 // Quantize one KV head's vector: load → FWHT → normalize → quantize → pack nibbles.
 // 1 simdgroup per head. 32 threads. Each thread handles EPT = head_dim/32 elements.
+//
+// D=256 path: single global L2 norm, stored at norms[head * capacity + pos].
+//
+// D=512 path (ADR-007 iter-15 per-256-block norm, per AmesianX cpy-utils.cuh:241-269):
+//   After full 512-FWHT the vector is split into 2 contiguous 256-halves (block 0 = [0..255],
+//   block 1 = [256..511]). Each half gets an independent RMS norm. The norms buffer is indexed
+//   as norms[head * capacity * NORMS_PER_POS + pos * NORMS_PER_POS + blk] where
+//   NORMS_PER_POS = 1 for D=256, NORMS_PER_POS = 2 for D=512.
+//   Lane assignment: for EPT=16, lane 0..15 own elements 0..255 (block 0),
+//                                lane 16..31 own elements 256..511 (block 1).
+//   Cite: AmesianX cpy-utils.cuh:241-269 (queen-verified); ADR-007 iter-14 D1 SRHT + iter-15 per-block norm.
 template<ushort HEAD_DIM>
 kernel void hadamard_quantize_kv_fast(
     device const float             *src    [[buffer(0)]],
@@ -159,24 +170,64 @@ kernel void hadamard_quantize_kv_fast(
     // 2. FWHT via SIMD shuffle (ZERO threadgroup barriers).
     fwht_simd<EPT>(elems, lane);
 
-    // 3. Normalize by 1/sqrt(head_dim).
+    // 3. Normalize by 1/sqrt(head_dim) (normalized WHT convention).
     const float inv_sqrt_d = rsqrt(float(HEAD_DIM));
     for (ushort i = 0; i < EPT; i++) {
         elems[i] *= inv_sqrt_d;
     }
 
-    // 4. Compute L2 norm via SIMD reduction (ZERO threadgroup barriers).
+    // 4. Compute norm(s) via SIMD reduction (ZERO threadgroup barriers).
+    //
+    // D=256: single global L2 norm over all 256 elements.
+    // D=512: 2 per-block RMS norms per AmesianX cpy-utils.cuh:241-269.
+    //   Block 0 = elements [0..255], owned by lanes 0..15 (EPT=16 → lane*16+i in [0..255] iff lane<16).
+    //   Block 1 = elements [256..511], owned by lanes 16..31.
+    //   RMS norm: blk_norm[b] = sqrt(sum_sq[b] / 256.0f) where sum_sq[b] includes inv_sqrt_d factor.
+    //   This matches AmesianX decode convention when decode uses: scale = blk_norm[b] * inv_sqrt(512).
     float local_sq_sum = 0.0f;
     for (ushort i = 0; i < EPT; i++) {
         local_sq_sum += elems[i] * elems[i];
     }
-    float norm = sqrt(simd_sum(local_sq_sum));
 
-    // 5. Normalize to unit sphere and scale to N(0,1).
-    float inv_norm = (norm > 1.0e-10f) ? (1.0f / norm) : 0.0f;
-    float scale = inv_norm * sqrt(float(HEAD_DIM));
-    for (ushort i = 0; i < EPT; i++) {
-        elems[i] *= scale;
+    float norm0, norm1;
+    if (HEAD_DIM == 256) {
+        // Single global L2 norm (unchanged D=256 path).
+        float norm = sqrt(simd_sum(local_sq_sum));
+        norm0 = norm;
+        norm1 = 0.0f;  // unused for D=256
+    } else {
+        // D=512: per-block RMS norms.
+        // Lane 0..15 (block 0): contribute to blk0_sq; lanes 16..31 zero out.
+        // Lane 16..31 (block 1): contribute to blk1_sq; lanes 0..15 zero out.
+        float blk0_contribution = (lane < 16u) ? local_sq_sum : 0.0f;
+        float blk1_contribution = (lane >= 16u) ? local_sq_sum : 0.0f;
+        float blk0_sq = simd_sum(blk0_contribution);  // sum over all 32 lanes (blk1 contributes 0)
+        float blk1_sq = simd_sum(blk1_contribution);  // sum over all 32 lanes (blk0 contributes 0)
+        // RMS norm per block (256 elements each).
+        norm0 = sqrt(blk0_sq / 256.0f);
+        norm1 = sqrt(blk1_sq / 256.0f);
+    }
+
+    // 5. Normalize each element: scale to N(0,1) using per-block norm.
+    //    D=256: scale = inv_norm0 * sqrt(256) (unchanged).
+    //    D=512: element in block b gets scale = sqrt(512) / blk_norm[b].
+    //    The sqrt(HEAD_DIM) factor cancels the inv_sqrt_d applied in step 3, so stored
+    //    element = FWHT_unnorm(sign*x)[j] / blk_norm[b].
+    //    Decode recovers: CODEBOOK[idx] * blk_norm[b] * inv_sqrt(HEAD_DIM) = FWHT_norm(sign*x)[j].
+    if (HEAD_DIM == 256) {
+        float inv_norm = (norm0 > 1.0e-10f) ? (1.0f / norm0) : 0.0f;
+        float scale = inv_norm * sqrt(float(HEAD_DIM));
+        for (ushort i = 0; i < EPT; i++) {
+            elems[i] *= scale;
+        }
+    } else {
+        // D=512: apply per-block scale. Lanes 0..15 use norm0, lanes 16..31 use norm1.
+        float blk_norm = (lane < 16u) ? norm0 : norm1;
+        float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
+        float scale = inv_blk_norm * sqrt(float(HEAD_DIM));
+        for (ushort i = 0; i < EPT; i++) {
+            elems[i] *= scale;
+        }
     }
 
     // 6. Quantize each element: find nearest Lloyd-Max centroid.
@@ -209,10 +260,24 @@ kernel void hadamard_quantize_kv_fast(
         packed[byte_base + i / 2] = lo | hi;
     }
 
-    // 8. Store norm (lane 0 only).
-    if (lane == 0) {
-        uint norm_idx = head_idx * params.cache_capacity + actual_pos;
-        norms[norm_idx] = norm;
+    // 8. Store norm(s).
+    //    D=256: 1 norm at norms[head * capacity + pos] (NORMS_PER_POS = 1).
+    //    D=512: 2 norms at norms[head * capacity * 2 + pos * 2 + blk] (NORMS_PER_POS = 2).
+    //    Per AmesianX cpy-utils.cuh:256 y[blk].d = __float2half(blk_norm).
+    if (HEAD_DIM == 256) {
+        if (lane == 0) {
+            uint norm_idx = head_idx * params.cache_capacity + actual_pos;
+            norms[norm_idx] = norm0;
+        }
+    } else {
+        // D=512: lane 0 writes norm0 (block 0), lane 16 writes norm1 (block 1).
+        if (lane == 0u) {
+            uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 0u] = norm0;
+        } else if (lane == 16u) {
+            uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 1u] = norm1;
+        }
     }
 }
 

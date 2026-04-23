@@ -7,7 +7,13 @@
 //!
 //! Output format per head per token:
 //! - `packed`: `[num_kv_heads, cache_capacity, head_dim/2]` u8 — nibble-packed 4-bit indices
-//! - `norms`:  `[num_kv_heads, cache_capacity]` f32 — per-position L2 norm scalar
+//! - `norms`:
+//!   - D=256: `[num_kv_heads, cache_capacity]` f32 — 1 norm per position (NORMS_PER_POS=1)
+//!   - D=512: `[num_kv_heads, cache_capacity, 2]` f32 — 2 per-block norms per position
+//!     (NORMS_PER_POS=2), per AmesianX cpy-utils.cuh:241-269 (ADR-007 iter-15 per-block norm).
+//!
+//! `norms_per_pos(head_dim)` = `head_dim / 256`. Callers must allocate norms buffers
+//! with `num_kv_heads * cache_capacity * norms_per_pos(head_dim)` f32 elements.
 
 use metal::MTLSize;
 
@@ -156,15 +162,19 @@ pub fn dispatch_hadamard_quantize_kv(
     }
 
     // Validate norms buffer size.
-    let required_norms = (num_kv_heads as u64) * (cache_capacity as u64);
+    // D=256: 1 norm per position (NORMS_PER_POS=1).
+    // D=512: 2 norms per position (NORMS_PER_POS=2), per AmesianX cpy-utils.cuh:241-269.
+    let norms_per_pos = (head_dim / 256).max(1) as u64;
+    let required_norms = (num_kv_heads as u64) * (cache_capacity as u64) * norms_per_pos;
     if (norms.element_count() as u64) < required_norms {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv: norms buffer has {} elements but need {} \
-             (num_kv_heads={} * cache_capacity={})",
+             (num_kv_heads={} * cache_capacity={} * norms_per_pos={})",
             norms.element_count(),
             required_norms,
             num_kv_heads,
             cache_capacity,
+            norms_per_pos,
         )));
     }
 
