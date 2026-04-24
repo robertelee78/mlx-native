@@ -327,6 +327,12 @@ impl KernelRegistry {
         let cumsum_src: &'static str = include_str!("shaders/cumsum.metal");
         sources.insert("cumsum_f32".into(), cumsum_src);
         sources.insert("cumsum_bf16".into(), cumsum_src);
+        // SSM conv kernels (ADR-013 Decision 7 — DeltaNet 1D causal conv + SiLU)
+        let ssm_conv_src: &'static str = include_str!("shaders/ssm_conv.metal");
+        sources.insert("ssm_conv_forward_f32".into(), ssm_conv_src);
+        sources.insert("ssm_conv_forward_bf16".into(), ssm_conv_src);
+        sources.insert("ssm_conv_state_update_f32".into(), ssm_conv_src);
+        sources.insert("ssm_conv_state_update_bf16".into(), ssm_conv_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
