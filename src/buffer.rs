@@ -31,6 +31,23 @@ pub struct MlxBuffer {
 // metal::Buffer is Send + Sync; our extra fields (DType, Vec<usize>) are too.
 crate::static_assertions_send_sync!(MlxBuffer);
 
+impl Clone for MlxBuffer {
+    /// Increment the Metal buffer's ARC retain count and wrap it in a new
+    /// `MlxBuffer`.  Both the original and the clone refer to the same
+    /// underlying GPU allocation — no data is copied.
+    ///
+    /// This is safe because `metal::Buffer` wraps an `MTLBuffer` Objective-C
+    /// object whose lifetime is managed by ARC; `Clone` calls `retain` and
+    /// `drop` calls `release`.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            dtype: self.dtype,
+            shape: self.shape.clone(),
+        }
+    }
+}
+
 impl MlxBuffer {
     /// Create a new `MlxBuffer` wrapping an already-allocated Metal buffer.
     ///

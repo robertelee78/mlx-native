@@ -137,6 +137,7 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_ggml.metal");
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
