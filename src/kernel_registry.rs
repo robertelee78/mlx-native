@@ -333,6 +333,10 @@ impl KernelRegistry {
         sources.insert("ssm_conv_forward_bf16".into(), ssm_conv_src);
         sources.insert("ssm_conv_state_update_f32".into(), ssm_conv_src);
         sources.insert("ssm_conv_state_update_bf16".into(), ssm_conv_src);
+        // Tri-solve kernels (ADR-013 Decision 5 — chunked DeltaNet debug path)
+        let tri_solve_src: &'static str = include_str!("shaders/tri_solve.metal");
+        sources.insert("tri_solve_lower_unit_f32".into(), tri_solve_src);
+        sources.insert("tri_solve_lower_unit_bf16".into(), tri_solve_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);

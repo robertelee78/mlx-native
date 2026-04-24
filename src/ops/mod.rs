@@ -45,3 +45,4 @@ pub mod softmax;
 pub mod softmax_sample;
 pub mod ssm_conv;
 pub mod transpose;
+pub mod tri_solve;
