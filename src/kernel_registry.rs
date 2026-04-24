@@ -344,10 +344,6 @@ impl KernelRegistry {
         // Gated DeltaNet fused kernel (ADR-013 Decision 6 — centerpiece)
         let gdn_src: &'static str = include_str!("shaders/gated_delta_net.metal");
         sources.insert("gated_delta_net_f32".into(), gdn_src);
-        // Sigmoid-gated elementwise multiply (ADR-013 Decision 9 — full-attn output gate)
-        let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
-        sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
-        sources.insert("sigmoid_mul_bf16".into(), sigmoid_mul_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
@@ -421,11 +417,30 @@ impl KernelRegistry {
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
         sources.insert("fwht_standalone_f32_d256".into(), fwht_src);
         sources.insert("fwht_standalone_f32_d512".into(), fwht_src);
+        // ADR-007 iter-14 D1 SRHT variants: sign pre-mult (for Q) + sign undo (for output)
+        sources.insert("fwht_sign_premult_f32_d256".into(), fwht_src);
+        sources.insert("fwht_sign_premult_f32_d512".into(), fwht_src);
+        sources.insert("fwht_sign_undo_f32_d256".into(), fwht_src);
+        sources.insert("fwht_sign_undo_f32_d512".into(), fwht_src);
 
         // Fast Hadamard quantize (SIMD shuffle, zero barriers)
         let hq_fast_src: &'static str = include_str!("shaders/hadamard_quantize_kv_fast.metal");
         sources.insert("hadamard_quantize_kv_fast_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_fast_d512".into(), hq_fast_src);
+        // Track B (iter-21): higher-bit (5/6-bit) quantize kernels (byte-packed)
+        sources.insert("hadamard_quantize_kv_hb_d256".into(), hq_fast_src);
+        sources.insert("hadamard_quantize_kv_hb_d512".into(), hq_fast_src);
+
+        // iter-20 Leg F: TQ KV dequantize kernel (nibbles+norms → F32)
+        let tq_dq_src: &'static str = include_str!("shaders/tq_dequantize_kv.metal");
+        sources.insert("tq_dequantize_kv".into(), tq_dq_src);
+        // Track B (iter-21): higher-bit dequantize kernel (byte-packed indices)
+        sources.insert("tq_dequantize_hb_kv".into(), tq_dq_src);
+
+        // iter-24: native higher-bit (5/6/8-bit) TQ SDPA kernel (byte-packed K/V)
+        let tq_hb_src: &'static str = include_str!("shaders/flash_attn_vec_tq_hb.metal");
+        sources.insert("flash_attn_vec_tq_hb_dk256".into(), tq_hb_src);
+        sources.insert("flash_attn_vec_tq_hb_dk512".into(), tq_hb_src);
 
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");

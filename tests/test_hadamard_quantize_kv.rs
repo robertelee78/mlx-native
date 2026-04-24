@@ -52,45 +52,117 @@ fn nearest_centroid_4bit(value: f32) -> u8 {
     idx
 }
 
+/// D1 sign tables verbatim from AmesianX cpy-utils.cuh:158-163 (D=256) + :211-220 (D=512).
+/// Bit j = (table[j>>3] >> (j&7)) & 1; bit=1 → sign=-1, bit=0 → sign=+1 (LSB-first).
+/// sha256(D=256)=3ef1038e... sha256(D=512)=44f13ce9...
+const TBQ_SIGNS_256: [u8; 32] = [
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+];
+const TBQ_SIGNS_512: [u8; 64] = [
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+];
+
+fn d1_sign(j: usize, d: usize) -> f32 {
+    let table = if d <= 256 { &TBQ_SIGNS_256[..] } else { &TBQ_SIGNS_512[..] };
+    let bit = (table[j >> 3] >> (j & 7)) & 1;
+    if bit == 1 { -1.0f32 } else { 1.0f32 }
+}
+
 /// CPU reference for one KV head vector.
 ///
-/// Returns `(packed_nibbles, norm)` where `packed_nibbles` is a `Vec<u8>` of
-/// length `head_dim / 2` with the same nibble layout as the GPU kernel:
+/// Returns `(packed_nibbles, norms)` where:
+/// - `packed_nibbles` is a `Vec<u8>` of length `head_dim / 2` with nibble layout:
 ///   byte[i] = (index[2*i+1] << 4) | index[2*i]
-fn cpu_hadamard_quantize_head(src: &[f32]) -> (Vec<u8>, f32) {
+/// - `norms` is a `Vec<f32>` of length `norms_per_pos`:
+///   - D=256: norms = [global_norm] (1 element)
+///   - D=512: norms = [blk0_norm, blk1_norm] (2 elements, per AmesianX cpy-utils.cuh:241-269)
+///
+/// D=512 per-block norm (ADR-007 iter-16 fix):
+///   After 512-FWHT, split into block0=[0..255] and block1=[256..511].
+///   blk_norm[b] = sqrt(sum_sq[b] / 256.0f) — RMS norm of already-normalized values.
+///   Scale for block b: inv_blk_norm only (iter-16: removed sqrt(head_dim) factor).
+///   FWHT is normalized (inv_sqrt_d applied), blk_norm ≈ 1 → N(0,1) via 1/norm alone.
+///   Decode: CODEBOOK[idx] * blk_norm[b] * inv_sqrt(head_dim) = FWHT_norm(sign*x)[j].
+fn cpu_hadamard_quantize_head(src: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let d = src.len();
     assert!(d.is_power_of_two() && d >= 2);
 
+    // Step 1b: D1 sign pre-mult BEFORE FWHT (ADR-007 iter-14 SRHT).
+    // Mirrors GPU kernel 1b. sign applied before fwht_simd.
+    let mut signed: Vec<f32> = src.iter().enumerate()
+        .map(|(j, &v)| v * d1_sign(j, d))
+        .collect();
+
     // Step 1+2: FWHT then normalize by 1/sqrt(d).
-    let mut rotated = src.to_vec();
-    fwht_inplace(&mut rotated).unwrap();
+    fwht_inplace(&mut signed).unwrap();
+    let rotated = signed;
     // fwht_inplace already normalizes by 1/sqrt(d) in turboquant.rs.
 
-    // Step 3: Compute L2 norm of rotated vector.
-    let norm_sq: f32 = rotated.iter().map(|v| v * v).sum();
-    let norm = norm_sq.sqrt();
+    // Step 3+4+5: Compute norm(s) and scale elements.
+    //
+    // D=256: single global norm (unchanged).
+    // D=512: 2 per-block RMS norms per AmesianX cpy-utils.cuh:241-269.
+    //   block0 = rotated[0..256], block1 = rotated[256..512].
+    //   blk_norm[b] = sqrt(sum_sq[b] / 256.0) where sum_sq uses inv_sqrt_d-scaled values.
+    let norms_per_pos = (d / 256).max(1);
+    let norms: Vec<f32>;
+    let indices: Vec<u8>;
 
-    // Step 4+5: Normalize to unit vector then scale to N(0,1) domain.
-    let scale = (d as f32).sqrt();
-    let indices: Vec<u8> = if norm > 1.0e-10 {
-        rotated
-            .iter()
-            .map(|&v| {
+    if d == 256 {
+        // D=256: unchanged single-norm path.
+        let norm_sq: f32 = rotated.iter().map(|v| v * v).sum();
+        let norm = norm_sq.sqrt();
+        let scale = (d as f32).sqrt();
+        indices = if norm > 1.0e-10 {
+            rotated.iter().map(|&v| {
                 let unit_val = v / norm;
-                let scaled = unit_val * scale;
-                nearest_centroid_4bit(scaled)
-            })
-            .collect()
+                nearest_centroid_4bit(unit_val * scale)
+            }).collect()
+        } else {
+            vec![0u8; d]
+        };
+        norms = vec![norm];
     } else {
-        vec![0u8; d]
-    };
+        // D=512: per-block path (ADR-007 iter-15).
+        // block0 = rotated[0..256], block1 = rotated[256..512].
+        let mut blk_norms = [0.0f32; 2];
+        for blk in 0..2 {
+            let blk_data = &rotated[blk * 256..(blk + 1) * 256];
+            let sq: f32 = blk_data.iter().map(|v| v * v).sum();
+            blk_norms[blk] = (sq / 256.0f32).sqrt();
+        }
+        // iter-16: removed sqrt_d factor. FWHT is normalized (inv_sqrt_d applied in fwht_inplace),
+        // blk_norm ≈ 1 → quantizer input ≈ N(0,1) via 1/norm alone. Ref cpy-utils.cuh:241-269.
+        indices = rotated.iter().enumerate().map(|(j, &v)| {
+            let blk = j / 256;
+            let inv_blk_norm = if blk_norms[blk] > 1.0e-10 { 1.0 / blk_norms[blk] } else { 0.0f32 };
+            nearest_centroid_4bit(v * inv_blk_norm)
+        }).collect();
+        norms = vec![blk_norms[0], blk_norms[1]];
+        let _ = norms_per_pos; // suppress unused warning for D=256 case
+    }
 
     // Step 6: Nibble pack — even index in low nibble, odd index in high nibble.
     let packed: Vec<u8> = (0..d / 2)
         .map(|i| (indices[2 * i] & 0xF) | ((indices[2 * i + 1] & 0xF) << 4))
         .collect();
 
-    (packed, norm)
+    (packed, norms)
+}
+
+/// Norms per position for a given head_dim (1 for D=256, 2 for D=512).
+fn norms_per_pos(head_dim: u32) -> usize {
+    ((head_dim / 256) as usize).max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +243,9 @@ fn setup() -> (MlxDevice, KernelRegistry) {
 ///
 /// `src_flat`: `[num_kv_heads * head_dim]` f32.
 /// Returns packed bytes of length `num_kv_heads * cache_capacity * head_dim/2`
-/// and norms of length `num_kv_heads * cache_capacity`.
+/// and norms of length `num_kv_heads * cache_capacity * norms_per_pos(head_dim)`.
+///
+/// norms_per_pos(256) = 1; norms_per_pos(512) = 2 (ADR-007 iter-15 per-block norm).
 fn run_gpu_quantize(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -185,7 +259,8 @@ fn run_gpu_quantize(
     let src_byte_len = src_flat.len() * 4;
     let packed_byte_len =
         (num_kv_heads as usize) * (cache_capacity as usize) * (head_dim as usize / 2);
-    let norms_elem = (num_kv_heads as usize) * (cache_capacity as usize);
+    let npp = norms_per_pos(head_dim);
+    let norms_elem = (num_kv_heads as usize) * (cache_capacity as usize) * npp;
     let norms_byte_len = norms_elem * 4;
 
     // Allocate and fill src buffer.
@@ -206,6 +281,7 @@ fn run_gpu_quantize(
     }
 
     // Allocate norms buffer (f32), zeroed.
+    // D=256: norms_elem = nkv * capacity * 1; D=512: norms_elem = nkv * capacity * 2.
     let mut norms_buf = device
         .alloc_buffer(norms_byte_len, DType::F32, vec![norms_elem])
         .expect("alloc norms");
@@ -226,6 +302,8 @@ fn run_gpu_quantize(
         cache_capacity,
         write_pos,
         is_sliding,
+        None, // scale_factor_d512
+        None, // rms_scratch
     )
     .expect("dispatch_hadamard_quantize_kv");
     encoder.commit_and_wait().expect("commit_and_wait");
@@ -265,7 +343,7 @@ fn test_quantize_d256_heads2_global() {
     // CPU reference — one head at a time.
     for h in 0..num_kv_heads as usize {
         let head_src = &src_flat[h * head_dim as usize..(h + 1) * head_dim as usize];
-        let (cpu_packed, cpu_norm) = cpu_hadamard_quantize_head(head_src);
+        let (cpu_packed, cpu_norms) = cpu_hadamard_quantize_head(head_src);
 
         let packed_stride = head_dim as usize / 2;
         let gpu_packed_offset = h * (cache_capacity as usize) * packed_stride
@@ -292,9 +370,11 @@ fn test_quantize_d256_heads2_global() {
             );
         }
 
-        // Check norm.
-        let norm_offset = h * cache_capacity as usize + write_pos as usize;
-        let gpu_norm = gpu_norms[norm_offset];
+        // Check norm (D=256: single norm at cpu_norms[0], norms_per_pos=1).
+        let npp = norms_per_pos(head_dim);
+        let norm_base = h * cache_capacity as usize * npp + write_pos as usize * npp;
+        let gpu_norm = gpu_norms[norm_base];
+        let cpu_norm = cpu_norms[0];
         let norm_err = (gpu_norm - cpu_norm).abs();
         assert!(
             norm_err < 1.0e-4,
@@ -334,10 +414,11 @@ fn test_quantize_d512_heads8_sliding() {
     );
 
     let actual_pos = write_pos % cache_capacity;
+    let npp = norms_per_pos(head_dim); // 2 for D=512
 
     for h in 0..num_kv_heads as usize {
         let head_src = &src_flat[h * head_dim as usize..(h + 1) * head_dim as usize];
-        let (cpu_packed, cpu_norm) = cpu_hadamard_quantize_head(head_src);
+        let (cpu_packed, cpu_norms) = cpu_hadamard_quantize_head(head_src);
 
         let packed_stride = head_dim as usize / 2;
         let gpu_packed_offset = h * (cache_capacity as usize) * packed_stride
@@ -363,14 +444,20 @@ fn test_quantize_d512_heads8_sliding() {
             );
         }
 
-        let norm_offset = h * cache_capacity as usize + actual_pos as usize;
-        let gpu_norm = gpu_norms[norm_offset];
-        let norm_err = (gpu_norm - cpu_norm).abs();
-        assert!(
-            norm_err < 1.0e-4,
-            "d512 heads8 sliding: head={h} norm mismatch: gpu={gpu_norm} cpu={cpu_norm} \
-             err={norm_err}"
-        );
+        // D=512: 2 norms per position (ADR-007 iter-15 per-block norm).
+        // norm_base = head * capacity * 2 + actual_pos * 2.
+        // norm[+0] = block 0 norm (elements 0..255), norm[+1] = block 1 norm (256..511).
+        let norm_base = h * cache_capacity as usize * npp + actual_pos as usize * npp;
+        for blk in 0..npp {
+            let gpu_norm = gpu_norms[norm_base + blk];
+            let cpu_norm = cpu_norms[blk];
+            let norm_err = (gpu_norm - cpu_norm).abs();
+            assert!(
+                norm_err < 1.0e-4,
+                "d512 heads8 sliding: head={h} blk={blk} norm mismatch: \
+                 gpu={gpu_norm} cpu={cpu_norm} err={norm_err}"
+            );
+        }
     }
 
     println!("PASS test_quantize_d512_heads8_sliding");
@@ -405,9 +492,10 @@ fn test_sliding_modulo_wrap() {
         true, // sliding
     );
 
+    let npp = norms_per_pos(head_dim);
     for h in 0..num_kv_heads as usize {
         let head_src = &src_flat[h * head_dim as usize..(h + 1) * head_dim as usize];
-        let (cpu_packed, cpu_norm) = cpu_hadamard_quantize_head(head_src);
+        let (cpu_packed, cpu_norms) = cpu_hadamard_quantize_head(head_src);
 
         let packed_stride = head_dim as usize / 2;
         let gpu_packed_offset = h * (cache_capacity as usize) * packed_stride
@@ -429,13 +517,16 @@ fn test_sliding_modulo_wrap() {
             );
         }
 
-        let norm_offset = h * cache_capacity as usize + expected_actual_pos as usize;
-        let gpu_norm = gpu_norms[norm_offset];
-        let norm_err = (gpu_norm - cpu_norm).abs();
-        assert!(
-            norm_err < 1.0e-4,
-            "sliding wrap: head={h} norm mismatch: gpu={gpu_norm} cpu={cpu_norm} err={norm_err}"
-        );
+        let norm_base = h * cache_capacity as usize * npp + expected_actual_pos as usize * npp;
+        for blk in 0..npp {
+            let gpu_norm = gpu_norms[norm_base + blk];
+            let cpu_norm = cpu_norms[blk];
+            let norm_err = (gpu_norm - cpu_norm).abs();
+            assert!(
+                norm_err < 1.0e-4,
+                "sliding wrap: head={h} blk={blk} norm mismatch: gpu={gpu_norm} cpu={cpu_norm} err={norm_err}"
+            );
+        }
     }
 
     println!("PASS test_sliding_modulo_wrap");
@@ -471,6 +562,8 @@ fn test_validation_non_power_of_two() {
         4,    // cache_capacity
         0,    // write_pos
         false,
+        None, // scale_factor_d512
+        None, // rms_scratch
     );
     assert!(
         result.is_err(),
@@ -509,6 +602,8 @@ fn test_validation_global_out_of_bounds() {
         capacity,
         capacity, // write_pos == capacity — out of bounds for global
         false,
+        None, // scale_factor_d512
+        None, // rms_scratch
     );
     assert!(
         result.is_err(),
@@ -543,6 +638,8 @@ fn test_noop_on_zero_heads() {
         8,
         0,
         false,
+        None, // scale_factor_d512
+        None, // rms_scratch
     );
     assert!(result.is_ok(), "num_kv_heads=0 should be a no-op, not an error");
     encoder.commit_and_wait().expect("commit_and_wait");

@@ -93,40 +93,87 @@ fn nearest_centroid_4bit(value: f32) -> u8 {
 }
 
 // ---- Nibble-format quantize/dequantize (matching GPU kernel) ----
+//
+// iter-16 convention:
+//   D=256: single global L2 norm; scale = inv_norm * sqrt(256) before quantize.
+//          Decode: CODEBOOK[idx] * norm * inv_sqrt(256).
+//   D=512: 2 per-block RMS norms (block0=[0..255], block1=[256..511]).
+//          Scale for each block: inv_blk_norm only (NO sqrt factor — iter-16 fix).
+//          Decode: CODEBOOK[idx] * blk_norm * inv_sqrt(512) for each block.
+//          norms_per_pos = 2 for D=512, returns Vec<f32> of length 2.
+//
+// The D=256 path uses sqrt(256) to match the unchanged D=256 GPU branch.
+// The D=512 path omits sqrt(512) per the iter-16 surgical fix.
+
+/// Returns norms_per_pos for head_dim (1 for D=256, 2 for D=512).
+fn norms_per_pos(head_dim: usize) -> usize {
+    (head_dim / 256).max(1)
+}
 
 /// Quantize a head vector into nibble-packed format matching the GPU kernel.
-fn nibble_quantize(x: &[f32], head_dim: usize) -> (Vec<u8>, f32) {
+/// Returns (packed_bytes, norms) where norms has length norms_per_pos(head_dim).
+fn nibble_quantize(x: &[f32], head_dim: usize) -> (Vec<u8>, Vec<f32>) {
     let mut rotated = x.to_vec();
     fwht_inplace(&mut rotated).unwrap();
 
-    let norm: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm < 1e-30 {
-        return (vec![0u8; head_dim / 2], 0.0);
-    }
-
-    let inv_norm = 1.0 / norm;
-    let scale = (head_dim as f32).sqrt();
-
-    // Find nearest centroid for each coordinate
+    let npp = norms_per_pos(head_dim);
     let mut packed = vec![0u8; head_dim / 2];
-    for c in 0..head_dim {
-        let scaled = rotated[c] * inv_norm * scale;
-        let idx = nearest_centroid_4bit(scaled);
-        let byte_idx = c / 2;
-        if c % 2 == 0 {
-            packed[byte_idx] = idx & 0xF;
-        } else {
-            packed[byte_idx] |= (idx & 0xF) << 4;
-        }
-    }
 
-    (packed, norm)
+    if head_dim == 256 {
+        // D=256: unchanged single-norm path with sqrt(head_dim) scale.
+        let norm: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm < 1e-30 {
+            return (packed, vec![0.0f32; npp]);
+        }
+        let inv_norm = 1.0 / norm;
+        let scale = (head_dim as f32).sqrt();
+        for c in 0..head_dim {
+            let scaled = rotated[c] * inv_norm * scale;
+            let idx = nearest_centroid_4bit(scaled);
+            let byte_idx = c / 2;
+            if c % 2 == 0 {
+                packed[byte_idx] = idx & 0xF;
+            } else {
+                packed[byte_idx] |= (idx & 0xF) << 4;
+            }
+        }
+        (packed, vec![norm])
+    } else {
+        // D=512: per-block path — iter-16 fix (no sqrt factor).
+        // block0 = rotated[0..256], block1 = rotated[256..512].
+        let mut blk_norms = [0.0f32; 2];
+        for blk in 0..2 {
+            let blk_data = &rotated[blk * 256..(blk + 1) * 256];
+            let sq: f32 = blk_data.iter().map(|v| v * v).sum();
+            blk_norms[blk] = (sq / 256.0f32).sqrt();
+        }
+        for c in 0..head_dim {
+            let blk = c / 256;
+            let inv_blk_norm = if blk_norms[blk] > 1.0e-10 { 1.0 / blk_norms[blk] } else { 0.0f32 };
+            // iter-16: NO sqrt(head_dim) factor. FWHT is already normalized.
+            let scaled = rotated[c] * inv_blk_norm;
+            let idx = nearest_centroid_4bit(scaled);
+            let byte_idx = c / 2;
+            if c % 2 == 0 {
+                packed[byte_idx] = idx & 0xF;
+            } else {
+                packed[byte_idx] |= (idx & 0xF) << 4;
+            }
+        }
+        (packed, vec![blk_norms[0], blk_norms[1]])
+    }
 }
 
 /// Dequantize from nibble-packed format back to original domain.
-fn nibble_dequantize(packed: &[u8], norm: f32, head_dim: usize) -> Vec<f32> {
-    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+/// norms: length 1 for D=256, length 2 for D=512 (per-block).
+///
+/// iter-16 convention:
+/// - D=256: scale = norm * inv_sqrt(head_dim) (unchanged single-norm).
+/// - D=512: scale = blk_norm only (no inv_sqrt factor — encoder stores raw norm).
+fn nibble_dequantize(packed: &[u8], norms: &[f32], head_dim: usize) -> Vec<f32> {
+    let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
     let mut rotated = Vec::with_capacity(head_dim);
+    let per_block = norms.len() > 1;  // true for D=512
 
     for c in 0..head_dim {
         let byte_idx = c / 2;
@@ -135,7 +182,10 @@ fn nibble_dequantize(packed: &[u8], norm: f32, head_dim: usize) -> Vec<f32> {
         } else {
             ((packed[byte_idx] >> 4) & 0xF) as usize
         };
-        rotated.push(CODEBOOK_4BIT[idx] * inv_scale * norm);
+        let blk = if per_block { c / 256 } else { 0 };
+        // iter-16: D=512 uses raw blk_norm (no inv_sqrt_d). D=256 unchanged.
+        let scale = if per_block { norms[blk] } else { norms[blk] * inv_sqrt_d };
+        rotated.push(CODEBOOK_4BIT[idx] * scale);
     }
 
     fwht_inplace(&mut rotated).unwrap();
@@ -229,12 +279,16 @@ fn run_sdpa_tq_test(
     // Generate random Q [num_heads, head_dim]
     let q_data = random_f32_vec(&mut rng, nh * hd);
 
+    // norms_per_pos: 1 for D=256, 2 for D=512 (per-block).
+    let npp = norms_per_pos(hd);
+
     // Generate random KV vectors and quantize them
-    // K/V: [num_kv_heads, kv_seq_len, head_dim] original, then quantized to nibble format
+    // K/V packed: [num_kv_heads * kv_seq_len * head_dim/2] bytes
+    // K/V norms:  [num_kv_heads * kv_seq_len * norms_per_pos] floats
     let mut k_packed_all = vec![0u8; nkv * kvl * (hd / 2)];
-    let mut k_norms_all = vec![0.0f32; nkv * kvl];
+    let mut k_norms_all = vec![0.0f32; nkv * kvl * npp];
     let mut v_packed_all = vec![0u8; nkv * kvl * (hd / 2)];
-    let mut v_norms_all = vec![0.0f32; nkv * kvl];
+    let mut v_norms_all = vec![0.0f32; nkv * kvl * npp];
 
     // Store dequantized vectors for CPU reference
     let mut k_dequant: Vec<Vec<f32>> = Vec::with_capacity(nkv * kvl);
@@ -244,24 +298,26 @@ fn run_sdpa_tq_test(
         for p in 0..kvl {
             // Random K vector
             let k_vec = random_f32_vec(&mut rng, hd);
-            let (k_packed, k_norm) = nibble_quantize(&k_vec, hd);
-            let k_deq = nibble_dequantize(&k_packed, k_norm, hd);
+            let (k_packed, k_norms) = nibble_quantize(&k_vec, hd);
+            let k_deq = nibble_dequantize(&k_packed, &k_norms, hd);
 
-            // Copy packed data into flat buffers
-            // Layout: [kv_head, capacity, head_dim/2] for packed, [kv_head, capacity] for norms
+            // Copy packed data: layout [kv_head * capacity + pos] * head_dim/2
             let packed_offset = (kv_h * kvl + p) * (hd / 2);
             k_packed_all[packed_offset..packed_offset + hd / 2].copy_from_slice(&k_packed);
-            k_norms_all[kv_h * kvl + p] = k_norm;
+            // Copy norms: layout [kv_head * capacity * npp + pos * npp]
+            let norm_offset = (kv_h * kvl + p) * npp;
+            k_norms_all[norm_offset..norm_offset + npp].copy_from_slice(&k_norms);
             k_dequant.push(k_deq);
 
             // Random V vector
             let v_vec = random_f32_vec(&mut rng, hd);
-            let (v_packed, v_norm) = nibble_quantize(&v_vec, hd);
-            let v_deq = nibble_dequantize(&v_packed, v_norm, hd);
+            let (v_packed, v_norms) = nibble_quantize(&v_vec, hd);
+            let v_deq = nibble_dequantize(&v_packed, &v_norms, hd);
 
             let v_packed_offset = (kv_h * kvl + p) * (hd / 2);
             v_packed_all[v_packed_offset..v_packed_offset + hd / 2].copy_from_slice(&v_packed);
-            v_norms_all[kv_h * kvl + p] = v_norm;
+            let v_norm_offset = (kv_h * kvl + p) * npp;
+            v_norms_all[v_norm_offset..v_norm_offset + npp].copy_from_slice(&v_norms);
             v_dequant.push(v_deq);
         }
     }
@@ -300,8 +356,10 @@ fn run_sdpa_tq_test(
     k_packed_buf.as_mut_slice::<u8>().expect("write K packed")
         .copy_from_slice(&k_packed_all);
 
+    // Norms buffer layout for D=512: [nkv * kvl * npp] with npp=2.
+    // GPU shader uses: norms[kv_head * capacity * npp + pos * npp + blk].
     let mut k_norms_buf = device
-        .alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv, kvl])
+        .alloc_buffer(nkv * kvl * npp * 4, DType::F32, vec![nkv * kvl * npp])
         .expect("alloc K norms");
     k_norms_buf.as_mut_slice::<f32>().expect("write K norms")
         .copy_from_slice(&k_norms_all);
@@ -313,7 +371,7 @@ fn run_sdpa_tq_test(
         .copy_from_slice(&v_packed_all);
 
     let mut v_norms_buf = device
-        .alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv, kvl])
+        .alloc_buffer(nkv * kvl * npp * 4, DType::F32, vec![nkv * kvl * npp])
         .expect("alloc V norms");
     v_norms_buf.as_mut_slice::<f32>().expect("write V norms")
         .copy_from_slice(&v_norms_all);
@@ -341,6 +399,7 @@ fn run_sdpa_tq_test(
         sliding_window: 0,
         softcap: 0.0,
         ring_start: 0,
+        scale_factor_d512: 1.0,
     };
 
     flash_attn_vec_tq::flash_attn_vec_tq(

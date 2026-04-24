@@ -854,6 +854,7 @@ fn run_variation(
         sliding_window: p.sliding_window,
         softcap: p.softcap,
         ring_start: p.ring_start,
+        scale_factor_d512: 1.0,
     };
 
     // --- Dispatch ---
@@ -1528,6 +1529,7 @@ fn run_multistep(
                     &k_norms_buf,
                     nkv as u32, head_dim, kvc as u32, phys_row as u32,
                     true, // kv_is_sliding (use ring-mode write)
+                    None, None,
                 ).expect("hadamard_quantize K multistep");
                 enc.memory_barrier();
                 hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
@@ -1536,7 +1538,7 @@ fn run_multistep(
                     &v_packed_buf,
                     &v_norms_buf,
                     nkv as u32, head_dim, kvc as u32, phys_row as u32,
-                    true,
+                    true, None, None,
                 ).expect("hadamard_quantize V multistep");
             }
             enc.commit_and_wait().expect("multistep encode commit");
@@ -1610,6 +1612,7 @@ fn run_multistep(
             sliding_window,
             softcap,
             ring_start,
+            scale_factor_d512: 1.0,
         };
 
         {
@@ -2175,13 +2178,13 @@ fn encode_and_get_oracle(
         hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
             &mut enc, registry, device.metal_device(),
             &k_tok, &k_packed_buf, &k_norms_buf,
-            nkv as u32, hd as u32, kvc as u32, phys_row as u32, true,
+            nkv as u32, hd as u32, kvc as u32, phys_row as u32, true, None, None,
         ).expect("hadamard_quantize K pf");
         enc.memory_barrier();
         hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
             &mut enc, registry, device.metal_device(),
             &v_tok, &v_packed_buf, &v_norms_buf,
-            nkv as u32, hd as u32, kvc as u32, phys_row as u32, true,
+            nkv as u32, hd as u32, kvc as u32, phys_row as u32, true, None, None,
         ).expect("hadamard_quantize V pf");
     }
     enc.commit_and_wait().expect("pf encode commit");
@@ -2386,6 +2389,7 @@ fn run_sweep_point(
         sliding_window,
         softcap,
         ring_start: ring_start as u32,
+        scale_factor_d512: 1.0,
     };
 
     {
