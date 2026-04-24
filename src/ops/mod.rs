@@ -32,6 +32,7 @@ pub mod rms_norm;
 pub mod rope;
 pub mod rope_multi;
 pub mod scale_mask_softmax;
+pub mod sigmoid_mul;
 pub mod flash_attn_prefill;
 pub mod flash_attn_prefill_blk;
 pub mod flash_attn_prefill_d512;

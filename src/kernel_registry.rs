@@ -344,6 +344,10 @@ impl KernelRegistry {
         // Gated DeltaNet fused kernel (ADR-013 Decision 6 — centerpiece)
         let gdn_src: &'static str = include_str!("shaders/gated_delta_net.metal");
         sources.insert("gated_delta_net_f32".into(), gdn_src);
+        // Sigmoid-gated elementwise multiply (ADR-013 Decision 9 — full-attn output gate)
+        let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
+        sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
+        sources.insert("sigmoid_mul_bf16".into(), sigmoid_mul_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
