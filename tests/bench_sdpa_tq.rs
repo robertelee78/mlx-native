@@ -206,6 +206,7 @@ fn bench_tq_sdpa(
         mask_type: 1,
         sliding_window: 0,
         softcap: 0.0,
+        ring_start: 0,
     };
 
     // Set NWG override if requested

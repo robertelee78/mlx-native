@@ -318,6 +318,15 @@ impl KernelRegistry {
         sources.insert("rms_norm_mul_f32".into(), rms_norm_src);
         sources.insert("rms_norm_mul_f16".into(), rms_norm_src);
         sources.insert("rms_norm_mul_bf16".into(), rms_norm_src);
+        // L2 norm kernels (ADR-013 Decision 3 — Gated DeltaNet Q/K norm)
+        let l2_norm_src: &'static str = include_str!("shaders/l2_norm.metal");
+        sources.insert("l2_norm_f32".into(), l2_norm_src);
+        sources.insert("l2_norm_f16".into(), l2_norm_src);
+        sources.insert("l2_norm_bf16".into(), l2_norm_src);
+        // Cumulative-sum kernels (ADR-013 Decision 4 — DeltaNet decay-mask base)
+        let cumsum_src: &'static str = include_str!("shaders/cumsum.metal");
+        sources.insert("cumsum_f32".into(), cumsum_src);
+        sources.insert("cumsum_bf16".into(), cumsum_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
