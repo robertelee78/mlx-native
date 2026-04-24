@@ -33,6 +33,11 @@ const BLOCK_Q8_0_BYTES: u32 = 34;
 const QK4_K: u32 = 256;
 const BLOCK_Q4_K_BYTES: u32 = 144;
 
+/// Q5_K: 256 values per block, 176 bytes per block.
+/// Block layout: d(fp16) + dmin(fp16) + scales[12] + qh[32] + qs[128] = 176.
+const QK5_K: u32 = 256;
+const BLOCK_Q5_K_BYTES: u32 = 176;
+
 /// Q6_K: 256 values per block, 210 bytes per block.
 const QK6_K: u32 = 256;
 const BLOCK_Q6_K_BYTES: u32 = 210;
@@ -53,8 +58,16 @@ pub enum GgmlType {
     Q8_0,
     /// 4-bit super-block quantization. 256 values per block, 144 bytes per block.
     Q4_K,
+    /// 5-bit super-block quantization. 256 values per block, 176 bytes per block.
+    /// Recognized for GGUF header parsing; dequant / matmul kernels not yet
+    /// implemented (ADR-013 P7+ depending on need).
+    Q5_K,
     /// 6-bit super-block quantization. 256 values per block, 210 bytes per block.
     Q6_K,
+    /// 16-bit signed integer (1 element per block, 2 bytes per block).
+    /// Recognized for GGUF header parsing; dequant depends on per-tensor
+    /// scale metadata (ADR-013 Decision 12). No matmul kernel.
+    I16,
 }
 
 impl GgmlType {
@@ -66,7 +79,9 @@ impl GgmlType {
             GgmlType::Q4_0 => QK4_0,
             GgmlType::Q8_0 => QK8_0,
             GgmlType::Q4_K => QK4_K,
+            GgmlType::Q5_K => QK5_K,
             GgmlType::Q6_K => QK6_K,
+            GgmlType::I16 => 1,
         }
     }
 
@@ -78,7 +93,9 @@ impl GgmlType {
             GgmlType::Q4_0 => BLOCK_Q4_0_BYTES,
             GgmlType::Q8_0 => BLOCK_Q8_0_BYTES,
             GgmlType::Q4_K => BLOCK_Q4_K_BYTES,
+            GgmlType::Q5_K => BLOCK_Q5_K_BYTES,
             GgmlType::Q6_K => BLOCK_Q6_K_BYTES,
+            GgmlType::I16 => 2,
         }
     }
 
@@ -86,9 +103,10 @@ impl GgmlType {
     /// — used for `m <= MM_ROUTING_THRESHOLD`.
     fn kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => {
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K
+            | GgmlType::Q5_K | GgmlType::I16 => {
                 // These types do not have a direct mat-vec kernel in this module.
-                // Q4_K support for mat-vec will be added separately.
+                // Q4_K / Q5_K / I16 support for mat-vec will be added separately.
                 "unsupported"
             }
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
@@ -102,7 +120,8 @@ impl GgmlType {
     /// llama.cpp's `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
     fn mm_kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K
+            | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_f32",
@@ -117,7 +136,8 @@ impl GgmlType {
     /// pipeline fails to compile (pre-M3 hardware).
     fn mm_tensor_kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K
+            | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_f32",

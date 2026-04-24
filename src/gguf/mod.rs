@@ -69,7 +69,9 @@ const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_K: u32 = 12;
+const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
+const GGML_TYPE_I16: u32 = 17;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -302,7 +304,9 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_Q4_0 => Ok(GgmlType::Q4_0),
         GGML_TYPE_Q8_0 => Ok(GgmlType::Q8_0),
         GGML_TYPE_Q4_K => Ok(GgmlType::Q4_K),
+        GGML_TYPE_Q5_K => Ok(GgmlType::Q5_K),
         GGML_TYPE_Q6_K => Ok(GgmlType::Q6_K),
+        GGML_TYPE_I16 => Ok(GgmlType::I16),
         other => Err(MlxError::GgufParseError(format!(
             "unsupported GGML type ID {other}"
         ))),
@@ -637,6 +641,16 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::Q8_0 => dequantize_q8_0(data, output),
         GgmlType::Q4_K => dequantize_q4_k(data, output),
         GgmlType::Q6_K => dequantize_q6_k(data, output),
+        // Q5_K / I16: type is recognized for GGUF header parsing but dequant
+        // is not yet implemented — see ADR-013 Decision 12 / iter 7+ plan.
+        // Tensors of these types can be read as opaque bytes via
+        // `read_tensor_raw_bytes()` but not dequantized to f32 yet.
+        GgmlType::Q5_K => Err(MlxError::GgufParseError(
+            "Q5_K dequant not yet implemented (ADR-013 Decision 12 follow-up)".into(),
+        )),
+        GgmlType::I16 => Err(MlxError::GgufParseError(
+            "I16 dequant not yet implemented (ADR-013 Decision 12 follow-up)".into(),
+        )),
     }
 }
 
@@ -888,8 +902,14 @@ impl GgufFile {
                 }
                 Ok(buf)
             }
-            GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K => {
-                // Store raw GGML blocks as U8 buffer.
+            GgmlType::Q4_0
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::I16 => {
+                // Store raw GGML blocks as U8 buffer. Q5_K and I16 are held
+                // opaque until dequant kernels land (ADR-013 Decision 12).
                 let mut buf =
                     device.alloc_buffer(info.byte_len, DType::U8, info.shape.clone())?;
                 {
