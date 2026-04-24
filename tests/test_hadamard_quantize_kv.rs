@@ -52,6 +52,32 @@ fn nearest_centroid_4bit(value: f32) -> u8 {
     idx
 }
 
+/// D1 sign tables verbatim from AmesianX cpy-utils.cuh:158-163 (D=256) + :211-220 (D=512).
+/// Bit j = (table[j>>3] >> (j&7)) & 1; bit=1 → sign=-1, bit=0 → sign=+1 (LSB-first).
+/// sha256(D=256)=3ef1038e... sha256(D=512)=44f13ce9...
+const TBQ_SIGNS_256: [u8; 32] = [
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+];
+const TBQ_SIGNS_512: [u8; 64] = [
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+];
+
+fn d1_sign(j: usize, d: usize) -> f32 {
+    let table = if d <= 256 { &TBQ_SIGNS_256[..] } else { &TBQ_SIGNS_512[..] };
+    let bit = (table[j >> 3] >> (j & 7)) & 1;
+    if bit == 1 { -1.0f32 } else { 1.0f32 }
+}
+
 /// CPU reference for one KV head vector.
 ///
 /// Returns `(packed_nibbles, norms)` where:
@@ -71,9 +97,15 @@ fn cpu_hadamard_quantize_head(src: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let d = src.len();
     assert!(d.is_power_of_two() && d >= 2);
 
+    // Step 1b: D1 sign pre-mult BEFORE FWHT (ADR-007 iter-14 SRHT).
+    // Mirrors GPU kernel 1b. sign applied before fwht_simd.
+    let mut signed: Vec<f32> = src.iter().enumerate()
+        .map(|(j, &v)| v * d1_sign(j, d))
+        .collect();
+
     // Step 1+2: FWHT then normalize by 1/sqrt(d).
-    let mut rotated = src.to_vec();
-    fwht_inplace(&mut rotated).unwrap();
+    fwht_inplace(&mut signed).unwrap();
+    let rotated = signed;
     // fwht_inplace already normalizes by 1/sqrt(d) in turboquant.rs.
 
     // Step 3+4+5: Compute norm(s) and scale elements.

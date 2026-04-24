@@ -68,8 +68,13 @@ struct HadamardQuantizeParams {
     // bare=1.0  (iter-16 control), sqrt256=16.0, sqrt512≈22.627.
     // ONLY applied to D=512 path. D=256 path is unchanged.
     float scale_factor_d512;
-    // iter-18 S2A: post-scale RMS probe flag.
-    // When non-zero, kernel writes first 16 post-scale values to scratch buffer.
+    // iter-19 A1: post-scale RMS probe flag (catalog #21 fix).
+    // When non-zero, kernel writes ALL EPT post-scale values per lane to scratch buffer.
+    // Layout: rms_scratch[head_idx * HEAD_DIM + lane * EPT + i].
+    //   D=256: each lane writes EPT=8 elements → 32 * 8 = 256 samples per block per head.
+    //   D=512: blk 0 (lanes 0..15) writes EPT=16 each → 256 samples; blk 1 (lanes 16..31) writes 256.
+    //          Layout: rms_scratch[head_idx * 512 + lane * 16 + i] (contiguous; blk0=[0..255], blk1=[256..511]).
+    // Host divisor: 256 per block (D=256: sum over all 256 samples; D=512 blk0: samples [0..255]).
     uint rms_probe_enabled;
 };
 
@@ -248,35 +253,22 @@ kernel void hadamard_quantize_kv_fast(
         }
     }
 
-    // 5b. iter-18 S2A: post-scale RMS probe — write first 16 post-scale values per block per head.
-    //     Layout: rms_scratch[head_idx * NORMS_PER_POS * 16 + blk * 16 + sample_i]
-    //     Only lane 0 writes (it owns elements 0..EPT-1 of block 0 for D=512, or 0 for D=256).
-    //     For D=512: lane 0 writes first 16 elements of block 0 (samples from block 0).
-    //                lane 16 writes first 16 elements of block 1.
-    //     For D=256: lane 0 writes first 16 elements (EPT=8 → write all 8, pad remaining 8 with 0).
+    // 5b. iter-19 A1: post-scale RMS probe — ALL lanes write ALL EPT post-scale values (catalog #21 fix).
+    //     FIXED from iter-18: iter-18 wrote only 8 of 16 EPT samples for D=256 (8 real + 8 zeros)
+    //     and the host divided by 16 → reported RMS ≈ sqrt(0.5) × true_RMS ≈ 0.7039. Fix: all 32
+    //     lanes each write EPT samples → 256 samples per block; host divides by 256.
+    //
+    //     Layout: rms_scratch[head_idx * HEAD_DIM + lane * EPT + i]
+    //       D=256: HEAD_DIM=256, EPT=8, 32 lanes × 8 = 256 samples per head (1 block).
+    //       D=512: HEAD_DIM=512, EPT=16, lanes 0..15 (blk0) at offsets 0..255; lanes 16..31 (blk1) at 256..511.
+    //     Host reads: rms_scratch[head_idx*HEAD_DIM .. head_idx*HEAD_DIM+256] for blk 0,
+    //                 rms_scratch[head_idx*HEAD_DIM+256 .. head_idx*HEAD_DIM+512] for blk 1 (D=512 only).
+    //     Host divisor: 256 per block (not 16, not HEAD_DIM/2).
     if (params.rms_probe_enabled != 0u && rms_scratch != nullptr) {
-        constexpr ushort PROBE_N = 16;
-        if (HEAD_DIM == 256) {
-            if (lane == 0) {
-                uint scratch_base = head_idx * 1u * PROBE_N;  // NORMS_PER_POS=1
-                for (ushort i = 0; i < PROBE_N; i++) {
-                    rms_scratch[scratch_base + i] = (i < EPT) ? elems[i] : 0.0f;
-                }
-            }
-        } else {
-            // D=512: 2 blocks. Lane 0 = block 0 head (elements 0..EPT-1 = elements 0..15).
-            //                  Lane 16 = block 1 head (elements 0..EPT-1 = elements 256..271).
-            if (lane == 0u) {
-                uint scratch_base = head_idx * 2u * PROBE_N + 0u * PROBE_N;
-                for (ushort i = 0; i < PROBE_N; i++) {
-                    rms_scratch[scratch_base + i] = (i < EPT) ? elems[i] : 0.0f;
-                }
-            } else if (lane == 16u) {
-                uint scratch_base = head_idx * 2u * PROBE_N + 1u * PROBE_N;
-                for (ushort i = 0; i < PROBE_N; i++) {
-                    rms_scratch[scratch_base + i] = (i < EPT) ? elems[i] : 0.0f;
-                }
-            }
+        // Every lane writes its EPT elements; scratch is contiguous by [head_idx * HEAD_DIM + lane * EPT + i].
+        uint scratch_base = head_idx * HEAD_DIM + lane * EPT;
+        for (ushort i = 0; i < EPT; i++) {
+            rms_scratch[scratch_base + i] = elems[i];
         }
     }
 
