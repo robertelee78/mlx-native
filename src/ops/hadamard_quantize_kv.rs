@@ -433,7 +433,9 @@ struct HadamardQuantizeHbParams {
     cache_capacity: u32,
     is_sliding: u32,
     scale_factor_d512: f32,
-    codebook_bits: u32,  // 5 or 6
+    codebook_bits: u32,        // 5, 6, or 8
+    /// iter-27: 1 = use empirically-calibrated codebook; 0 = N(0,1)-fit default.
+    codebook_calibrated: u32,
 }
 
 /// Dispatch the higher-bit Hadamard-quantize KV kernel.
@@ -444,6 +446,7 @@ struct HadamardQuantizeHbParams {
 ///
 /// * `packed` must be `[num_kv_heads, cache_capacity, head_dim]` u8 (byte-packed).
 /// * `norms` layout is identical to 4-bit path.
+/// * `codebook_calibrated`: iter-27 flag (1=empirical codebook, 0=N(0,1) default).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_hadamard_quantize_kv_hb(
     encoder: &mut CommandEncoder,
@@ -458,7 +461,8 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     write_pos: u32,
     is_sliding: bool,
     scale_factor_d512: f32,
-    codebook_bits: u32,      // 5 or 6
+    codebook_bits: u32,          // 5, 6, or 8
+    codebook_calibrated: u32,    // iter-27: 1=calibrated, 0=default
 ) -> Result<()> {
     if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
     if !matches!(codebook_bits, 5 | 6 | 8) {
@@ -483,6 +487,7 @@ pub fn dispatch_hadamard_quantize_kv_hb(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        codebook_calibrated,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 

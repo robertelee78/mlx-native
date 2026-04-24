@@ -39,6 +39,9 @@ struct FlashAttnVecTqHbParams {
     uint  ring_start;
     float scale_factor_d512;  // for D=512 norm dequant
     uint  codebook_bits;      // 5, 6, or 8 (runtime selector)
+    // iter-27: 0 = N(0,1)-fit codebook (default), 1 = empirically-calibrated 8-bit codebook.
+    // Only meaningful when codebook_bits == 8.
+    uint  codebook_calibrated;
 };
 
 // Reduce params — shared with flash_attn_vec.
@@ -156,6 +159,81 @@ constant float CODEBOOK_HB_8BIT[256] = {
 };
 
 // ---------------------------------------------------------------------------
+// 8-bit calibrated codebook (256 centroids, iter-27 empirical fit).
+// PLACEHOLDER: values are patched by iter27_audit after Lloyd-Max on real
+// Gemma-4-27B K/V distribution. sha256 stored in iter27_audit.json.
+// Must match CODEBOOK_8BIT_CALIBRATED in hadamard_quantize_kv_fast.metal exactly.
+// ---------------------------------------------------------------------------
+// ITER27_CALIBRATED_CODEBOOK_BEGIN
+constant float CODEBOOK_HB_8BIT_CALIBRATED[256] = {
+    -5.0652659f, -4.6836997f, -4.4467193f, -4.2715508f,
+    -4.1311907f, -4.0132856f, -3.9111092f, -3.8205780f,
+    -3.7390194f, -3.6645851f, -3.5959415f, -3.5320936f,
+    -3.4722785f, -3.4158977f, -3.3624729f, -3.3116156f,
+    -3.2630056f, -3.2163758f, -3.1715011f, -3.1281899f,
+    -3.0862780f, -3.0456229f, -3.0061011f, -2.9676040f,
+    -2.9300362f, -2.8933131f, -2.8573596f, -2.8221086f,
+    -2.7874999f, -2.7534795f, -2.7199985f, -2.6870129f,
+    -2.6544825f, -2.6223710f, -2.5906452f, -2.5592748f,
+    -2.5282321f, -2.4974918f, -2.4670306f, -2.4368270f,
+    -2.4068614f, -2.3771157f, -2.3475732f, -2.3182184f,
+    -2.2890372f, -2.2600165f, -2.2311440f, -2.2024086f,
+    -2.1737998f, -2.1453081f, -2.1169245f, -2.0886408f,
+    -2.0604493f, -2.0323430f, -2.0043154f, -1.9763603f,
+    -1.9484722f, -1.9206458f, -1.8928763f, -1.8651592f,
+    -1.8374904f, -1.8098662f, -1.7822828f, -1.7547372f,
+    -1.7272261f, -1.6997469f, -1.6722970f, -1.6448739f,
+    -1.6174755f, -1.5900996f, -1.5627445f, -1.5354084f,
+    -1.5080897f, -1.4807869f, -1.4534986f, -1.4262237f,
+    -1.3989610f, -1.3717093f, -1.3444678f, -1.3172356f,
+    -1.2900118f, -1.2627956f, -1.2355865f, -1.2083838f,
+    -1.1811868f, -1.1539951f, -1.1268081f, -1.0996255f,
+    -1.0724469f, -1.0452718f, -1.0180999f, -0.9909310f,
+    -0.9637647f, -0.9366008f, -0.9094390f, -0.8822793f,
+    -0.8551212f, -0.8279648f, -0.8008098f, -0.7736561f,
+    -0.7465035f, -0.7193520f, -0.6922014f, -0.6650517f,
+    -0.6379027f, -0.6107544f, -0.5836067f, -0.5564596f,
+    -0.5293129f, -0.5021667f, -0.4750208f, -0.4478753f,
+    -0.4207301f, -0.3935852f, -0.3664405f, -0.3392960f,
+    -0.3121517f, -0.2850076f, -0.2578636f, -0.2307198f,
+    -0.2035761f, -0.1764324f, -0.1492888f, -0.1221453f,
+    -0.0950019f, -0.0678584f, -0.0407151f, -0.0135717f,
+     0.0135717f,  0.0407151f,  0.0678584f,  0.0950019f,
+     0.1221453f,  0.1492888f,  0.1764324f,  0.2035761f,
+     0.2307198f,  0.2578636f,  0.2850076f,  0.3121517f,
+     0.3392960f,  0.3664405f,  0.3935852f,  0.4207301f,
+     0.4478753f,  0.4750208f,  0.5021667f,  0.5293129f,
+     0.5564596f,  0.5836067f,  0.6107544f,  0.6379027f,
+     0.6650517f,  0.6922014f,  0.7193520f,  0.7465035f,
+     0.7736561f,  0.8008098f,  0.8279648f,  0.8551212f,
+     0.8822793f,  0.9094390f,  0.9366008f,  0.9637647f,
+     0.9909310f,  1.0180999f,  1.0452718f,  1.0724469f,
+     1.0996255f,  1.1268081f,  1.1539951f,  1.1811868f,
+     1.2083838f,  1.2355865f,  1.2627956f,  1.2900118f,
+     1.3172356f,  1.3444678f,  1.3717093f,  1.3989610f,
+     1.4262237f,  1.4534986f,  1.4807869f,  1.5080897f,
+     1.5354084f,  1.5627445f,  1.5900996f,  1.6174755f,
+     1.6448739f,  1.6722970f,  1.6997469f,  1.7272261f,
+     1.7547372f,  1.7822828f,  1.8098662f,  1.8374904f,
+     1.8651592f,  1.8928763f,  1.9206458f,  1.9484722f,
+     1.9763603f,  2.0043154f,  2.0323430f,  2.0604493f,
+     2.0886408f,  2.1169245f,  2.1453081f,  2.1737998f,
+     2.2024086f,  2.2311440f,  2.2600165f,  2.2890372f,
+     2.3182184f,  2.3475732f,  2.3771157f,  2.4068614f,
+     2.4368270f,  2.4670306f,  2.4974918f,  2.5282321f,
+     2.5592748f,  2.5906452f,  2.6223710f,  2.6544825f,
+     2.6870129f,  2.7199985f,  2.7534795f,  2.7874999f,
+     2.8221086f,  2.8573596f,  2.8933131f,  2.9300362f,
+     2.9676040f,  3.0061011f,  3.0456229f,  3.0862780f,
+     3.1281899f,  3.1715011f,  3.2163758f,  3.2630056f,
+     3.3116156f,  3.3624729f,  3.4158977f,  3.4722785f,
+     3.5320936f,  3.5959415f,  3.6645851f,  3.7390194f,
+     3.8205780f,  3.9111092f,  4.0132856f,  4.1311907f,
+     4.2715508f,  4.4467193f,  4.6836997f,  5.0652659f,
+};
+// ITER27_CALIBRATED_CODEBOOK_END
+
+// ---------------------------------------------------------------------------
 // Inline dequant: look up byte index in the selected codebook, scale by norm.
 // CODEBOOK_BITS is a runtime value from params (not compile-time template),
 // so we use if-else. The Metal compiler will constant-fold if the value is
@@ -166,12 +244,14 @@ constant float CODEBOOK_HB_8BIT[256] = {
 // coord:       coordinate index (0..head_dim-1)
 // scale_norm:  pre-multiplied scale (norm * inv_sqrt_dk for D=256, norm/sf for D=512)
 // cbits:       codebook_bits field from params (5, 6, or 8)
+// calibrated:  iter-27 flag (1=use CODEBOOK_HB_8BIT_CALIBRATED instead of CODEBOOK_HB_8BIT)
 // ---------------------------------------------------------------------------
 inline float dequant_hb_single(
     device const uint8_t *packed_pos,
     uint coord,
     float scale_norm,
-    uint cbits
+    uint cbits,
+    uint calibrated
 ) {
     uint idx = (uint)packed_pos[coord];
     float centroid;
@@ -179,8 +259,10 @@ inline float dequant_hb_single(
         centroid = CODEBOOK_HB_5BIT[idx & 0x1Fu];
     } else if (cbits == 6u) {
         centroid = CODEBOOK_HB_6BIT[idx & 0x3Fu];
+    } else if (calibrated != 0u) {
+        centroid = CODEBOOK_HB_8BIT_CALIBRATED[idx];  // iter-27 empirical codebook
     } else {
-        centroid = CODEBOOK_HB_8BIT[idx];  // 8-bit: full byte
+        centroid = CODEBOOK_HB_8BIT[idx];  // 8-bit: full byte, N(0,1)-fit
     }
     return centroid * scale_norm;
 }
@@ -191,13 +273,14 @@ inline float4 dequant_hb_float4(
     device const uint8_t *packed_pos,
     uint coord_base,
     float scale_norm,
-    uint cbits
+    uint cbits,
+    uint calibrated
 ) {
     return float4(
-        dequant_hb_single(packed_pos, coord_base + 0, scale_norm, cbits),
-        dequant_hb_single(packed_pos, coord_base + 1, scale_norm, cbits),
-        dequant_hb_single(packed_pos, coord_base + 2, scale_norm, cbits),
-        dequant_hb_single(packed_pos, coord_base + 3, scale_norm, cbits)
+        dequant_hb_single(packed_pos, coord_base + 0, scale_norm, cbits, calibrated),
+        dequant_hb_single(packed_pos, coord_base + 1, scale_norm, cbits, calibrated),
+        dequant_hb_single(packed_pos, coord_base + 2, scale_norm, cbits, calibrated),
+        dequant_hb_single(packed_pos, coord_base + 3, scale_norm, cbits, calibrated)
     );
 }
 
@@ -289,6 +372,7 @@ kernel void flash_attn_vec_tq_hb_impl(
     const uint kv_capacity = params.kv_capacity;
     const uint ring_start = params.ring_start;
     const uint cbits = params.codebook_bits;
+    const uint calibrated = params.codebook_calibrated;  // iter-27: 1=empirical, 0=N(0,1)
     const float sf_d512 = params.scale_factor_d512;
     const bool is_d512 = (DK > 256);
 
@@ -357,7 +441,7 @@ kernel void flash_attn_vec_tq_hb_impl(
                         float sn0 = knorm[0] / sf_d512;
                         for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
                             uint coord = (uint)(tx + ii * NL) * 4u;
-                            float4 k_val = dequant_hb_float4(k_base, coord, sn0, cbits);
+                            float4 k_val = dequant_hb_float4(k_base, coord, sn0, cbits, calibrated);
                             partial += dot(k_val, float4(pq4[ii * NL]));
                         }
                     }
@@ -367,7 +451,7 @@ kernel void flash_attn_vec_tq_hb_impl(
                         const uint blk1_start = DK / 2;
                         for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
                             uint coord = blk1_start + (uint)(tx + ii * NL) * 4u;
-                            float4 k_val = dequant_hb_float4(k_base, coord, sn1, cbits);
+                            float4 k_val = dequant_hb_float4(k_base, coord, sn1, cbits, calibrated);
                             partial += dot(k_val, float4(pq4[(DK4/2/NL + ii) * NL]));
                         }
                     }
@@ -382,7 +466,7 @@ kernel void flash_attn_vec_tq_hb_impl(
 
                     float partial = 0.0f;
                     for (short ii = 0; ii < DK4 / NL; ++ii) {
-                        float4 k_val = dequant_hb_float4(k_base, (uint)(ii * NL) * 4u, k_sn, cbits);
+                        float4 k_val = dequant_hb_float4(k_base, (uint)(ii * NL) * 4u, k_sn, cbits, calibrated);
                         partial += dot(k_val, float4(pq4[ii * NL]));
                     }
                     mqk[cc] = simd_sum(partial);
@@ -432,13 +516,13 @@ kernel void flash_attn_vec_tq_hb_impl(
                     float sn0 = vnorm[0] / sf_d512 * w;
                     for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
                         uint coord = (uint)(tx + ii * NL) * 4u;
-                        lo[ii] += dequant_hb_float4(v_base, coord, sn0, cbits);
+                        lo[ii] += dequant_hb_float4(v_base, coord, sn0, cbits, calibrated);
                     }
                     // Block 1: coords 256..511
                     float sn1 = vnorm[1] / sf_d512 * w;
                     for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
                         uint coord = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
-                        lo[DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, cbits);
+                        lo[DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, cbits, calibrated);
                     }
                 } else {
                     float v_norm_val = V_norms[kv_head * kv_capacity + kv_pos];
@@ -447,7 +531,7 @@ kernel void flash_attn_vec_tq_hb_impl(
                         V_packed + (kv_head * kv_capacity + kv_pos) * DV + tx * 4u;
 
                     for (short ii = 0; ii < DV4 / NL; ++ii) {
-                        lo[ii] += dequant_hb_float4(v_base, (uint)(ii * NL) * 4u, v_sw, cbits);
+                        lo[ii] += dequant_hb_float4(v_base, (uint)(ii * NL) * 4u, v_sw, cbits, calibrated);
                     }
                 }
             }

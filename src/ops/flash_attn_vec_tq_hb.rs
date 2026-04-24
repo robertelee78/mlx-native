@@ -44,6 +44,9 @@ pub struct FlashAttnVecTqHbParams {
     pub scale_factor_d512: f32,
     /// Codebook bit-width: 5, 6, or 8.
     pub codebook_bits: u32,
+    /// iter-27: use empirically-calibrated codebook (1) or N(0,1)-fit default (0).
+    /// Only meaningful at 8-bit (codebook_bits==8). Passed to GPU for runtime selection.
+    pub codebook_calibrated: u32,
 }
 
 /// GPU-side parameter struct. Must match `FlashAttnVecTqHbParams` in the MSL exactly.
@@ -63,6 +66,8 @@ struct FlashAttnVecTqHbParamsGpu {
     ring_start: u32,
     scale_factor_d512: f32,
     codebook_bits: u32,
+    /// iter-27: calibrated codebook selector (0=N(0,1), 1=empirical).
+    codebook_calibrated: u32,
 }
 
 /// GPU-side reduce params. Reuses the same reduce kernel as flash_attn_vec_tq.
@@ -161,6 +166,7 @@ pub fn flash_attn_vec_tq_hb(
         ring_start: params.ring_start,
         scale_factor_d512: params.scale_factor_d512,
         codebook_bits: params.codebook_bits,
+        codebook_calibrated: params.codebook_calibrated,
     };
 
     let kernel_name = match head_dim {
@@ -251,8 +257,8 @@ mod tests {
 
     #[test]
     fn test_gpu_params_size() {
-        // 13 fields × 4 bytes = 52 bytes
-        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 52);
+        // 14 fields × 4 bytes = 56 bytes (iter-27: +codebook_calibrated)
+        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 56);
     }
 
     #[test]
@@ -270,6 +276,7 @@ mod tests {
             ring_start: 0,
             scale_factor_d512: 1.0,
             codebook_bits: 4,  // invalid
+            codebook_calibrated: 0,
         };
         assert!(validate_params(&p).is_err());
     }
@@ -289,6 +296,7 @@ mod tests {
             ring_start: 0,
             scale_factor_d512: 1.0,
             codebook_bits: 8,
+            codebook_calibrated: 0,
         };
         assert!(validate_params(&p).is_ok());
     }
