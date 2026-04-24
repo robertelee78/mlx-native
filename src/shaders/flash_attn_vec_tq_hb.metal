@@ -351,14 +351,14 @@ kernel void flash_attn_vec_tq_hb_impl(
 
                     float partial = 0.0f;
                     // Block 0: coords 0..255
+                    // Each thread tx covers elements (tx + ii*NL)*4 .. (tx + ii*NL)*4+3
+                    // for ii in [0..(DK/2)/4/NL). This mirrors the D=256 striding pattern.
                     {
                         float sn0 = knorm[0] / sf_d512;
                         for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
-                            uint coord = (uint)(tx * (DK/2/4) + ii) * 4;
-                            if (coord + 3 < (uint)(DK/2)) {
-                                float4 k_val = dequant_hb_float4(k_base, coord, sn0, cbits);
-                                partial += dot(k_val, float4(pq4[ii * NL]));
-                            }
+                            uint coord = (uint)(tx + ii * NL) * 4u;
+                            float4 k_val = dequant_hb_float4(k_base, coord, sn0, cbits);
+                            partial += dot(k_val, float4(pq4[ii * NL]));
                         }
                     }
                     // Block 1: coords 256..511
@@ -366,11 +366,9 @@ kernel void flash_attn_vec_tq_hb_impl(
                         float sn1 = knorm[1] / sf_d512;
                         const uint blk1_start = DK / 2;
                         for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
-                            uint coord = blk1_start + (uint)(tx * (DK/2/4) + ii) * 4;
-                            if (coord + 3 < (uint)DK) {
-                                float4 k_val = dequant_hb_float4(k_base, coord, sn1, cbits);
-                                partial += dot(k_val, float4(pq4[(DK4/2/NL + ii) * NL]));
-                            }
+                            uint coord = blk1_start + (uint)(tx + ii * NL) * 4u;
+                            float4 k_val = dequant_hb_float4(k_base, coord, sn1, cbits);
+                            partial += dot(k_val, float4(pq4[(DK4/2/NL + ii) * NL]));
                         }
                     }
                     mqk[cc] = simd_sum(partial);
@@ -430,20 +428,17 @@ kernel void flash_attn_vec_tq_hb_impl(
                     float w = ss[cc];
 
                     // Block 0: coords 0..255
+                    // Same striding pattern as D=256 and K D=512 above.
                     float sn0 = vnorm[0] / sf_d512 * w;
                     for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
-                        uint coord = (uint)(tx * (DV/2/4) + ii) * 4;
-                        if (coord + 3 < (uint)(DV/2)) {
-                            lo[ii] += dequant_hb_float4(v_base, coord, sn0, cbits);
-                        }
+                        uint coord = (uint)(tx + ii * NL) * 4u;
+                        lo[ii] += dequant_hb_float4(v_base, coord, sn0, cbits);
                     }
                     // Block 1: coords 256..511
                     float sn1 = vnorm[1] / sf_d512 * w;
                     for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
-                        uint coord = (uint)(DV/2) + (uint)(tx * (DV/2/4) + ii) * 4;
-                        if (coord + 3 < (uint)DV) {
-                            lo[DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, cbits);
-                        }
+                        uint coord = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
+                        lo[DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, cbits);
                     }
                 } else {
                     float v_norm_val = V_norms[kv_head * kv_capacity + kv_pos];
