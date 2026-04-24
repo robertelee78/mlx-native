@@ -403,7 +403,8 @@ struct HadamardQuantizeHbParams {
 /// Dispatch the higher-bit Hadamard-quantize KV kernel.
 ///
 /// Same pipeline as 4-bit (FWHT + norm) but writes 1 byte per element
-/// (byte-packed) using 5-bit (32 centroids) or 6-bit (64 centroids) codebook.
+/// (byte-packed) using 5-bit (32 centroids), 6-bit (64 centroids), or
+/// 8-bit (256 centroids) codebook. (iter-24 adds 8-bit support)
 ///
 /// * `packed` must be `[num_kv_heads, cache_capacity, head_dim]` u8 (byte-packed).
 /// * `norms` layout is identical to 4-bit path.
@@ -424,9 +425,9 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     codebook_bits: u32,      // 5 or 6
 ) -> Result<()> {
     if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
-    if codebook_bits != 5 && codebook_bits != 6 {
+    if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_hadamard_quantize_kv_hb: codebook_bits must be 5 or 6, got {}", codebook_bits)));
+            "dispatch_hadamard_quantize_kv_hb: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
     }
 
     let kernel_name = match head_dim {
