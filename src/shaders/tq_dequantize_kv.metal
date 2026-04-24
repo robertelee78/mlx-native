@@ -1,4 +1,4 @@
-// TQ KV dequantize kernel — iter-20 Leg F ablation.
+// TQ KV dequantize kernel — iter-21 Track A fix.
 //
 // Reads nibble-packed TurboQuant K or V cache at a given position and
 // writes a dense F32 buffer of shape [num_kv_heads, head_dim].
@@ -8,11 +8,22 @@
 // FWHT-rotated domain (same as the TQ SDPA readpath), NOT the original F32.
 // This isolates the SDPA kernel math from TQ representation noise.
 //
-// Dequant formula (matches flash_attn_vec_tq.metal inline dequant exactly):
-//   D=256: value = CODEBOOK_4BIT[nibble] * inv_sqrt(head_dim) * norm
-//   D=512: block0 (coords 0..255)  = CODEBOOK_4BIT[nibble] * inv_sqrt(head_dim) * norm0
-//          block1 (coords 256..511) = CODEBOOK_4BIT[nibble] * inv_sqrt(head_dim) * norm1
-//   where norm0, norm1 are the per-block norms (norms_per_pos=2).
+// Dequant formula MUST match flash_attn_vec_tq.metal inline dequant exactly
+// (see flash_attn_vec_tq.metal:305-348):
+//   D=256: scale_norm = norm * inv_sqrt(256)     — single-norm convention (unchanged)
+//   D=512: scale_norm = norm / scale_factor_d512 — per-block norm, NO inv_sqrt factor
+//          (iter-16 fix: encoder stores raw blk_norm; decoder uses blk_norm directly)
+//
+// IMPORTANT (iter-21 Track A): iter-20 erroneously applied inv_sqrt_hd to BOTH
+// D=256 and D=512. For D=512 this introduces a sqrt(512)≈22.6x scale error vs
+// the TQ SDPA kernel, corrupting attention scores for global-attention layers
+// even when the prefill shadow cache is correctly populated.
+//
+// Packed layout: [num_kv_heads, cache_capacity, head_dim/2] u8 (nibble-packed)
+// Norms layout:
+//   D=256: [num_kv_heads, cache_capacity] f32 — 1 norm per position
+//   D=512: [num_kv_heads, cache_capacity, 2] f32 — 2 per-block norms per position
+// Output: [num_kv_heads, head_dim] f32 — dense dequantized values for ONE position
 //
 // Packed layout: [num_kv_heads, cache_capacity, head_dim/2] u8 (nibble-packed)
 // Norms layout:
@@ -53,8 +64,11 @@ kernel void tq_dequantize_kv(
     const uint hd       = params.head_dim;
     const uint cap      = params.cache_capacity;
     const uint pos      = params.read_pos;
+    // inv_sqrt_hd is only used for D=256 (single-norm convention).
+    // D=512 uses per-block raw norm (no inv_sqrt_dk factor) per iter-16 fix.
     const float inv_sqrt_hd = rsqrt(float(hd));
     const float sf      = params.scale_factor_d512;
+    const bool is_d512  = (hd > 256);
 
     if (kv_head >= params.num_kv_heads) return;
 
@@ -73,14 +87,21 @@ kernel void tq_dequantize_kv(
     // For large head_dim we may need multiple passes; here threadgroups are sized to hd.
     for (uint coord = tiitg; coord < hd; coord += /* threads per TG */ hd) {
         // Determine which block this coord falls in (for D=512 per-block norms)
-        uint block_idx = (hd > 256) ? (coord / 256) : 0;
+        uint block_idx = is_d512 ? (coord / 256u) : 0u;
         block_idx = min(block_idx, npp - 1);
         float norm = norms_pos[block_idx];
-        // Apply scale divisor for D=512 ablation
-        if (hd > 256) {
-            norm = norm / sf;
+
+        // scale_norm: must match flash_attn_vec_tq.metal decode convention exactly.
+        //   D=256: norm * inv_sqrt(256)     — single-norm, same as before
+        //   D=512: norm / scale_factor_d512 — per-block raw norm, NO inv_sqrt factor
+        // (iter-21 Track A: iter-20 incorrectly applied inv_sqrt_hd to D=512 also,
+        //  introducing a sqrt(512)≈22.6x scale error for global-attention layers.)
+        float scale_norm;
+        if (is_d512) {
+            scale_norm = norm / sf;
+        } else {
+            scale_norm = norm * inv_sqrt_hd;
         }
-        float scale_norm = norm * inv_sqrt_hd;
 
         // Read nibble for this coord
         uint byte_idx = coord / 2;
