@@ -270,6 +270,8 @@ fn run_gpu_quantize(
         cache_capacity,
         write_pos,
         is_sliding,
+        None, // scale_factor_d512
+        None, // rms_scratch
     )
     .expect("dispatch_hadamard_quantize_kv");
     encoder.commit_and_wait().expect("commit_and_wait");
@@ -528,6 +530,8 @@ fn test_validation_non_power_of_two() {
         4,    // cache_capacity
         0,    // write_pos
         false,
+        None, // scale_factor_d512
+        None, // rms_scratch
     );
     assert!(
         result.is_err(),
@@ -566,6 +570,8 @@ fn test_validation_global_out_of_bounds() {
         capacity,
         capacity, // write_pos == capacity — out of bounds for global
         false,
+        None, // scale_factor_d512
+        None, // rms_scratch
     );
     assert!(
         result.is_err(),
@@ -600,6 +606,8 @@ fn test_noop_on_zero_heads() {
         8,
         0,
         false,
+        None, // scale_factor_d512
+        None, // rms_scratch
     );
     assert!(result.is_ok(), "num_kv_heads=0 should be a no-op, not an error");
     encoder.commit_and_wait().expect("commit_and_wait");

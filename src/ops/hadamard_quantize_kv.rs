@@ -45,6 +45,11 @@ struct HadamardQuantizeParams {
     write_pos: u32,
     cache_capacity: u32,
     is_sliding: u32,
+    /// iter-18 S2B: D=512 per-block scale factor (ablation via HF2Q_SCALE_FORMULA).
+    /// bare=1.0 (control), sqrt256=16.0, sqrt512≈22.627. D=256 path ignores this.
+    scale_factor_d512: f32,
+    /// iter-18 S2A: post-scale RMS probe flag (1=enabled, 0=disabled).
+    rms_probe_enabled: u32,
 }
 
 /// Dispatch the fused Hadamard-quantize KV kernel on the GPU.
@@ -59,17 +64,21 @@ struct HadamardQuantizeParams {
 ///
 /// # Arguments
 ///
-/// * `encoder`       — Command encoder to record the dispatch into.
-/// * `registry`      — Kernel registry (must have `hadamard_quantize_kv` registered).
-/// * `device`        — Metal device for pipeline compilation.
-/// * `src`           — F32 buffer of shape `[num_kv_heads, head_dim]` (one token, all heads).
-/// * `packed`        — u8 buffer of shape `[num_kv_heads, cache_capacity, head_dim/2]`.
-/// * `norms`         — F32 buffer of shape `[num_kv_heads, cache_capacity]`.
-/// * `num_kv_heads`  — Number of KV heads (threadgroups dispatched).
-/// * `head_dim`      — Elements per head.  Must be a power of two in `[4, 4096]`.
-/// * `cache_capacity`— Cache capacity (ring buffer size for sliding, max_seq_len for global).
-/// * `write_pos`     — Write position in cache (the kernel applies modulo for sliding window).
-/// * `is_sliding`    — If `true`, `write_pos` is wrapped modulo `cache_capacity`.
+/// * `encoder`          — Command encoder to record the dispatch into.
+/// * `registry`         — Kernel registry (must have `hadamard_quantize_kv` registered).
+/// * `device`           — Metal device for pipeline compilation.
+/// * `src`              — F32 buffer of shape `[num_kv_heads, head_dim]` (one token, all heads).
+/// * `packed`           — u8 buffer of shape `[num_kv_heads, cache_capacity, head_dim/2]`.
+/// * `norms`            — F32 buffer of shape `[num_kv_heads, cache_capacity]`.
+/// * `num_kv_heads`     — Number of KV heads (threadgroups dispatched).
+/// * `head_dim`         — Elements per head.  Must be a power of two in `[4, 4096]`.
+/// * `cache_capacity`   — Cache capacity (ring buffer size for sliding, max_seq_len for global).
+/// * `write_pos`        — Write position in cache (the kernel applies modulo for sliding window).
+/// * `is_sliding`       — If `true`, `write_pos` is wrapped modulo `cache_capacity`.
+/// * `scale_factor_d512`— iter-18 S2B: D=512 per-block scale factor (1.0=bare, 16.0=sqrt256,
+///                        22.627=sqrt512). Pass `None` to use 1.0 (bare, iter-16 control).
+/// * `rms_scratch`      — iter-18 S2A: optional scratch buffer for post-scale RMS probe.
+///                        Layout: `[num_kv_heads, norms_per_pos, 16]` f32.  Pass `None` to disable.
 ///
 /// # Errors
 ///
@@ -94,6 +103,8 @@ pub fn dispatch_hadamard_quantize_kv(
     cache_capacity: u32,
     write_pos: u32,
     is_sliding: bool,
+    scale_factor_d512: Option<f32>,
+    rms_scratch: Option<&MlxBuffer>,
 ) -> Result<()> {
     if num_kv_heads == 0 || head_dim == 0 {
         return Ok(());
@@ -187,18 +198,27 @@ pub fn dispatch_hadamard_quantize_kv(
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
+    let effective_scale = scale_factor_d512.unwrap_or(1.0_f32);
+    let probe_enabled = rms_scratch.is_some() as u32;
     let params = HadamardQuantizeParams {
         head_dim,
         num_kv_heads,
         write_pos,
         cache_capacity,
         is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512: effective_scale,
+        rms_probe_enabled: probe_enabled,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
     if kernel_name.starts_with("hadamard_quantize_kv_fast") {
         // Fast kernel: 1 simdgroup (32 threads) per head, no shared memory.
         use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+        // Scratch buffer at slot 4: bind real buffer if probe enabled, otherwise a dummy
+        // (Metal requires a bound buffer even if the kernel won't write it).
+        // We use the norms buffer as the dummy — the kernel only writes scratch when
+        // rms_probe_enabled!=0, so the dummy binding is never written.
+        let scratch_binding = rms_scratch.unwrap_or(norms);
         encode_threadgroups_with_args(
             encoder,
             pipeline,
@@ -207,6 +227,7 @@ pub fn dispatch_hadamard_quantize_kv(
                 (1, KA::Buffer(packed)),
                 (2, KA::Buffer(norms)),
                 (3, KA::Bytes(params_bytes)),
+                (4, KA::Buffer(scratch_binding)),
             ],
             MTLSize::new(num_kv_heads as u64, 1, 1),
             MTLSize::new(32, 1, 1), // 1 simdgroup
@@ -287,6 +308,7 @@ pub fn dispatch_hadamard_quantize_kv_seq(
     n_tokens: u32,
     src_tok_offset: u32,
     is_sliding: bool,
+    scale_factor_d512: Option<f32>,
 ) -> Result<()> {
     if n_tokens == 0 || num_kv_heads == 0 || head_dim == 0 {
         return Ok(());
@@ -348,12 +370,15 @@ pub fn dispatch_hadamard_quantize_kv_seq(
             )));
         }
 
+        let effective_scale = scale_factor_d512.unwrap_or(1.0_f32);
         let params = HadamardQuantizeParams {
             head_dim,
             num_kv_heads,
             write_pos,
             cache_capacity,
             is_sliding: if is_sliding { 1 } else { 0 },
+            scale_factor_d512: effective_scale,
+            rms_probe_enabled: 0, // probe not supported in bulk seq dispatch
         };
         let params_bytes = bytemuck::bytes_of(&params);
         let src_offset = ((src_tok_offset + i) as u64) * bytes_per_token;
@@ -368,6 +393,7 @@ pub fn dispatch_hadamard_quantize_kv_seq(
                     (1, KernelArg::Buffer(packed)),
                     (2, KernelArg::Buffer(norms)),
                     (3, KernelArg::Bytes(params_bytes)),
+                    (4, KernelArg::Buffer(norms)), // dummy slot 4 (probe disabled)
                 ],
                 MTLSize::new(num_kv_heads as u64, 1, 1),
                 MTLSize::new(32, 1, 1),

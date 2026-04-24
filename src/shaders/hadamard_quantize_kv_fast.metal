@@ -63,6 +63,14 @@ struct HadamardQuantizeParams {
     uint write_pos;
     uint cache_capacity;
     uint is_sliding;
+    // iter-18 S2B: D=512 per-block scale factor ablation.
+    // Passed from Rust at dispatch time via HF2Q_SCALE_FORMULA env var.
+    // bare=1.0  (iter-16 control), sqrt256=16.0, sqrt512≈22.627.
+    // ONLY applied to D=512 path. D=256 path is unchanged.
+    float scale_factor_d512;
+    // iter-18 S2A: post-scale RMS probe flag.
+    // When non-zero, kernel writes first 16 post-scale values to scratch buffer.
+    uint rms_probe_enabled;
 };
 
 // Butterfly operation on a local element pair.
@@ -128,10 +136,11 @@ inline void fwht_simd(thread float *elems, uint lane) {
 //   Cite: AmesianX cpy-utils.cuh:241-269 (queen-verified); ADR-007 iter-14 D1 SRHT + iter-15 per-block norm.
 template<ushort HEAD_DIM>
 kernel void hadamard_quantize_kv_fast(
-    device const float             *src    [[buffer(0)]],
-    device       uint8_t           *packed [[buffer(1)]],
-    device       float             *norms  [[buffer(2)]],
-    constant HadamardQuantizeParams &params [[buffer(3)]],
+    device const float              *src        [[buffer(0)]],
+    device       uint8_t            *packed     [[buffer(1)]],
+    device       float              *norms      [[buffer(2)]],
+    constant HadamardQuantizeParams &params     [[buffer(3)]],
+    device       float              *rms_scratch [[buffer(4)]],  // iter-18 S2A: post-scale probe (may be null/unused when rms_probe_enabled=0)
     uint  tgid [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]])
 {
@@ -225,12 +234,49 @@ kernel void hadamard_quantize_kv_fast(
             elems[i] *= scale;
         }
     } else {
-        // D=512: apply per-block scale. Lanes 0..15 use norm0, lanes 16..31 use norm1.
+        // D=512: apply per-block scale with ablation factor.
+        // iter-18 S2B: scale = inv_blk_norm * params.scale_factor_d512.
+        //   bare (1.0):       iter-16 control — inv_blk_norm only.
+        //   sqrt256 (16.0):   hypothesis — matches unnormalized FWHT convention.
+        //   sqrt512 (≈22.627): iter-15 regression (known FAIL from iter 15/16).
+        // Decoder MUST apply the reciprocal: blk_norm / scale_factor_d512.
         float blk_norm = (lane < 16u) ? norm0 : norm1;
         float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
-        float scale = inv_blk_norm;  // iter-16: removed sqrt(HEAD_DIM); FWHT is normalized, blk RMS≈1 → N(0,1) via 1/norm alone. Ref AmesianX cpy-utils.cuh:241-269.
+        float scale = inv_blk_norm * params.scale_factor_d512;
         for (ushort i = 0; i < EPT; i++) {
             elems[i] *= scale;
+        }
+    }
+
+    // 5b. iter-18 S2A: post-scale RMS probe — write first 16 post-scale values per block per head.
+    //     Layout: rms_scratch[head_idx * NORMS_PER_POS * 16 + blk * 16 + sample_i]
+    //     Only lane 0 writes (it owns elements 0..EPT-1 of block 0 for D=512, or 0 for D=256).
+    //     For D=512: lane 0 writes first 16 elements of block 0 (samples from block 0).
+    //                lane 16 writes first 16 elements of block 1.
+    //     For D=256: lane 0 writes first 16 elements (EPT=8 → write all 8, pad remaining 8 with 0).
+    if (params.rms_probe_enabled != 0u && rms_scratch != nullptr) {
+        constexpr ushort PROBE_N = 16;
+        if (HEAD_DIM == 256) {
+            if (lane == 0) {
+                uint scratch_base = head_idx * 1u * PROBE_N;  // NORMS_PER_POS=1
+                for (ushort i = 0; i < PROBE_N; i++) {
+                    rms_scratch[scratch_base + i] = (i < EPT) ? elems[i] : 0.0f;
+                }
+            }
+        } else {
+            // D=512: 2 blocks. Lane 0 = block 0 head (elements 0..EPT-1 = elements 0..15).
+            //                  Lane 16 = block 1 head (elements 0..EPT-1 = elements 256..271).
+            if (lane == 0u) {
+                uint scratch_base = head_idx * 2u * PROBE_N + 0u * PROBE_N;
+                for (ushort i = 0; i < PROBE_N; i++) {
+                    rms_scratch[scratch_base + i] = (i < EPT) ? elems[i] : 0.0f;
+                }
+            } else if (lane == 16u) {
+                uint scratch_base = head_idx * 2u * PROBE_N + 1u * PROBE_N;
+                for (ushort i = 0; i < PROBE_N; i++) {
+                    rms_scratch[scratch_base + i] = (i < EPT) ? elems[i] : 0.0f;
+                }
+            }
         }
     }
 
@@ -289,7 +335,7 @@ kernel void hadamard_quantize_kv_fast(
 template [[host_name("hadamard_quantize_kv_fast_d256")]]
 kernel void hadamard_quantize_kv_fast<256>(
     device const float *, device uint8_t *, device float *,
-    constant HadamardQuantizeParams &, uint, uint);
+    constant HadamardQuantizeParams &, device float *, uint, uint);
 
 template [[host_name("hadamard_quantize_kv_fast_d512")]]
 kernel void hadamard_quantize_kv_fast<512>(

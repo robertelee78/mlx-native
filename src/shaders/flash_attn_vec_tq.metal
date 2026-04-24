@@ -45,6 +45,11 @@ struct FlashAttnVecTqParams {
     float softcap;
     uint  nwg;
     uint  ring_start;  // ADR-009 Track 2: physical slot of oldest entry in ring buffer
+    // iter-18 S2B: reciprocal scale factor for D=512 dequant ablation.
+    // Decoder: actual_blk_norm = stored_blk_norm / scale_factor_d512.
+    // bare=1.0 → blk_norm unchanged. sqrt256=16.0 → blk_norm/16. sqrt512≈22.627 → blk_norm/22.627.
+    // For D=256 this field is unused (D=256 uses inv_sqrt_dk convention unchanged).
+    float scale_factor_d512;
 };
 
 // Reduce params — shared with flash_attn_vec.
@@ -332,11 +337,15 @@ kernel void flash_attn_vec_tq_impl(
                     // For DK=256: NORMS_PER_POS_K=1, always block 0.
                     // For DK=512: ii=0,1 → block 0 (norm[+0]); ii=2,3 → block 1 (norm[+1]).
                     short blk = (NORMS_PER_POS_K > 1) ? (ii / (DK4 / NL / 2)) : 0;
-                    // iter-16: D=512 per-block encode stores raw blk_norm (no sqrt factor).
-                    // D=512 decode uses blk_norm directly. D=256 uses blk_norm * inv_sqrt_dk.
+                    // iter-18 S2B: D=512 decode applies reciprocal of encoder scale_factor.
+                    // Encoder stores: quantized_val = post_fwht_val * inv_blk_norm * scale_factor_d512.
+                    // Decoder recovers: post_fwht_val ≈ CODEBOOK[idx] * blk_norm / scale_factor_d512.
+                    // bare (1.0): blk_norm/1.0 = blk_norm (iter-16 behavior).
+                    // sqrt256 (16.0): blk_norm/16.0. sqrt512 (≈22.627): blk_norm/22.627.
+                    // D=256 path unchanged: uses blk_norm * inv_sqrt_dk.
                     float k_sn = (NORMS_PER_POS_K > 1)
-                        ? K_norms[k_norm_base + blk]           // D=512: raw norm, no inv_sqrt_dk
-                        : K_norms[k_norm_base + blk] * inv_sqrt_dk;  // D=256: unchanged convention
+                        ? K_norms[k_norm_base + blk] / params.scale_factor_d512   // D=512: reciprocal scale
+                        : K_norms[k_norm_base + blk] * inv_sqrt_dk;               // D=256: unchanged
                     float4 k_val = dequant_tq_float4(k_base, (uint)(ii * NL) * 2u, k_sn);
                     partial += dot(k_val, float4(pq4[ii * NL]));
                 }
@@ -404,10 +413,11 @@ kernel void flash_attn_vec_tq_impl(
                     // For DV=512: ii=0,1 → block 0; ii=2,3 → block 1.
                     short blk = (NORMS_PER_POS_V > 1) ? (ii / (DV4 / NL / 2)) : 0;
                     // Fold weight into scale_norm: dequant returns pre-weighted values.
-                    // iter-16: D=512 uses raw blk_norm (no inv_sqrt_dv). D=256 uses blk_norm * inv_sqrt_dv.
+                    // iter-18 S2B: D=512 applies reciprocal scale_factor (matching encoder).
+                    // D=256 path unchanged: uses blk_norm * inv_sqrt_dv.
                     float v_norm = (NORMS_PER_POS_V > 1)
-                        ? V_norms[v_norm_base + blk]                      // D=512: raw norm
-                        : V_norms[v_norm_base + blk] * inv_sqrt_dv;       // D=256: unchanged
+                        ? V_norms[v_norm_base + blk] / params.scale_factor_d512   // D=512: reciprocal
+                        : V_norms[v_norm_base + blk] * inv_sqrt_dv;               // D=256: unchanged
                     float v_sw = v_norm * softmax_weight;
                     lo[ii] += dequant_tq_float4(v_base, (uint)(ii * NL) * 2u, v_sw);
                 }
