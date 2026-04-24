@@ -432,6 +432,11 @@ impl KernelRegistry {
         // Track B (iter-21): higher-bit dequantize kernel (byte-packed indices)
         sources.insert("tq_dequantize_hb_kv".into(), tq_dq_src);
 
+        // iter-24: native higher-bit (5/6/8-bit) TQ SDPA kernel (byte-packed K/V)
+        let tq_hb_src: &'static str = include_str!("shaders/flash_attn_vec_tq_hb.metal");
+        sources.insert("flash_attn_vec_tq_hb_dk256".into(), tq_hb_src);
+        sources.insert("flash_attn_vec_tq_hb_dk512".into(), tq_hb_src);
+
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);

@@ -38,6 +38,7 @@ pub mod flash_attn_prefill_d512;
 pub mod flash_attn_prefill_mask;
 pub mod flash_attn_vec;
 pub mod flash_attn_vec_tq;
+pub mod flash_attn_vec_tq_hb;
 pub mod fwht_standalone;
 pub mod gated_delta_net;
 pub mod tq_dequantize_kv;
