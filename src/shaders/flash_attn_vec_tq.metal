@@ -15,7 +15,13 @@
 // Packed KV layout: [num_kv_heads, capacity, head_dim/2] u8
 //   Low nibble = even coordinate index, high nibble = odd coordinate index
 //
-// Norms layout: [num_kv_heads, capacity] f32
+// Norms layout:
+//   D=256: [num_kv_heads, capacity] f32 — 1 norm per head-position (NORMS_PER_POS=1)
+//   D=512: [num_kv_heads, capacity, 2] f32 — 2 norms per head-position (NORMS_PER_POS=2)
+//   Per AmesianX cpy-utils.cuh:241-269 (ADR-007 iter-15 per-256-block norm):
+//     After full 512-FWHT, elements split into block0=[0..255] and block1=[256..511].
+//     Each block stored with independent RMS norm. Decode: scale_b = norm_b * inv_sqrt(head_dim).
+//     In decode kernel for DK=512: loop ii=0,1 → block0 (norm0), ii=2,3 → block1 (norm1).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -39,6 +45,11 @@ struct FlashAttnVecTqParams {
     float softcap;
     uint  nwg;
     uint  ring_start;  // ADR-009 Track 2: physical slot of oldest entry in ring buffer
+    // iter-18 S2B: reciprocal scale factor for D=512 dequant ablation.
+    // Decoder: actual_blk_norm = stored_blk_norm / scale_factor_d512.
+    // bare=1.0 → blk_norm unchanged. sqrt256=16.0 → blk_norm/16. sqrt512≈22.627 → blk_norm/22.627.
+    // For D=256 this field is unused (D=256 uses inv_sqrt_dk convention unchanged).
+    float scale_factor_d512;
 };
 
 // Reduce params — shared with flash_attn_vec.
@@ -291,8 +302,19 @@ kernel void flash_attn_vec_tq_impl(
         {
             float mqk[C];
 
-            // Pre-compute inv_sqrt(DK) once — used for all K dequant in this chunk.
+            // Pre-compute inv_sqrt(DK) — used for D=256 K dequant (D=512 per-block uses raw norm).
+            // iter-16: D=512 encode stores raw blk_norm (no sqrt(HEAD_DIM) factor).
+            // D=512 decode uses blk_norm directly so encode-decode round-trip is exact.
+            // D=256 decode uses blk_norm * inv_sqrt_dk (single-norm convention unchanged).
             const float inv_sqrt_dk = rsqrt(float(DK));
+
+            // Per-block norm layout for D=512 (ADR-007 iter-15/16, AmesianX cpy-utils.cuh:241-269):
+            //   K_norms indexed as [kv_head * capacity * NORMS_PER_POS + pos * NORMS_PER_POS + blk]
+            //   where NORMS_PER_POS = DK / 256.
+            //   ii=0,1 (elements 0..255) → block 0 (norm index +0)
+            //   ii=2,3 (elements 256..511) → block 1 (norm index +1)
+            //   Only applies when DK == 512; DK == 256 uses single norm (NORMS_PER_POS=1).
+            constexpr short NORMS_PER_POS_K = DK / 256;
 
             for (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
@@ -301,15 +323,29 @@ kernel void flash_attn_vec_tq_impl(
                     continue;
                 }
 
-                float k_sn = K_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dk;
-
                 // Base pointer to packed K for this position.
                 // Precompute the position offset once, then stride by 2 bytes per ii.
                 device const uint8_t *k_base =
                     K_packed + (kv_head * params.kv_capacity + kv_pos) * (DK / 2) + tx * 2u;
 
+                // Norm base for this position (accounts for NORMS_PER_POS).
+                uint k_norm_base = kv_head * params.kv_capacity * NORMS_PER_POS_K
+                                 + kv_pos * NORMS_PER_POS_K;
+
                 float partial = 0.0f;
                 for (short ii = 0; ii < DK4 / NL; ++ii) {
+                    // For DK=256: NORMS_PER_POS_K=1, always block 0.
+                    // For DK=512: ii=0,1 → block 0 (norm[+0]); ii=2,3 → block 1 (norm[+1]).
+                    short blk = (NORMS_PER_POS_K > 1) ? (ii / (DK4 / NL / 2)) : 0;
+                    // iter-18 S2B: D=512 decode applies reciprocal of encoder scale_factor.
+                    // Encoder stores: quantized_val = post_fwht_val * inv_blk_norm * scale_factor_d512.
+                    // Decoder recovers: post_fwht_val ≈ CODEBOOK[idx] * blk_norm / scale_factor_d512.
+                    // bare (1.0): blk_norm/1.0 = blk_norm (iter-16 behavior).
+                    // sqrt256 (16.0): blk_norm/16.0. sqrt512 (≈22.627): blk_norm/22.627.
+                    // D=256 path unchanged: uses blk_norm * inv_sqrt_dk.
+                    float k_sn = (NORMS_PER_POS_K > 1)
+                        ? K_norms[k_norm_base + blk] / params.scale_factor_d512   // D=512: reciprocal scale
+                        : K_norms[k_norm_base + blk] * inv_sqrt_dk;               // D=256: unchanged
                     float4 k_val = dequant_tq_float4(k_base, (uint)(ii * NL) * 2u, k_sn);
                     partial += dot(k_val, float4(pq4[ii * NL]));
                 }
@@ -351,19 +387,38 @@ kernel void flash_attn_vec_tq_impl(
                 lo[ii] = float4(0.0f);
             }
 
-            // Pre-compute inv_sqrt(DV) once — used for all V dequant in this chunk.
+            // Pre-compute inv_sqrt(DV) — used for D=256 V dequant only.
+            // iter-16: D=512 per-block encode stores raw blk_norm. Decode uses raw norm directly.
             const float inv_sqrt_dv = rsqrt(float(DV));
+
+            // Per-block norm layout for D=512 V side (ADR-007 iter-15/16).
+            // Same block mapping as K: ii=0,1 → block0, ii=2,3 → block1.
+            constexpr short NORMS_PER_POS_V = DV / 256;
 
             for (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) continue;
 
-                // Fold weight into scale_norm: dequant returns pre-weighted values.
-                float v_sw = V_norms[kv_head * params.kv_capacity + kv_pos] * inv_sqrt_dv * ss[cc];
                 device const uint8_t *v_base =
                     V_packed + (kv_head * params.kv_capacity + kv_pos) * (DV / 2) + tx * 2u;
 
+                // Norm base for this V position.
+                uint v_norm_base = kv_head * params.kv_capacity * NORMS_PER_POS_V
+                                 + kv_pos * NORMS_PER_POS_V;
+
+                float softmax_weight = ss[cc];
+
                 for (short ii = 0; ii < DV4 / NL; ++ii) {
+                    // For DV=256: NORMS_PER_POS_V=1, always block 0.
+                    // For DV=512: ii=0,1 → block 0; ii=2,3 → block 1.
+                    short blk = (NORMS_PER_POS_V > 1) ? (ii / (DV4 / NL / 2)) : 0;
+                    // Fold weight into scale_norm: dequant returns pre-weighted values.
+                    // iter-18 S2B: D=512 applies reciprocal scale_factor (matching encoder).
+                    // D=256 path unchanged: uses blk_norm * inv_sqrt_dv.
+                    float v_norm = (NORMS_PER_POS_V > 1)
+                        ? V_norms[v_norm_base + blk] / params.scale_factor_d512   // D=512: reciprocal
+                        : V_norms[v_norm_base + blk] * inv_sqrt_dv;               // D=256: unchanged
+                    float v_sw = v_norm * softmax_weight;
                     lo[ii] += dequant_tq_float4(v_base, (uint)(ii * NL) * 2u, v_sw);
                 }
             }

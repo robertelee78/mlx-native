@@ -59,6 +59,12 @@ pub struct FlashAttnVecTqParams {
     /// The shader uses this to map physical slots to logical positions
     /// for correct causal/sliding-window masking after wrap.
     pub ring_start: u32,
+    /// iter-18 S2B: reciprocal of the D=512 per-block encoder scale factor.
+    /// Decoder applies: actual_blk_norm = stored_blk_norm / scale_factor_d512.
+    /// bare=1.0 (iter-16 control), sqrt256=16.0, sqrt512≈22.627.
+    /// D=256 path ignores this field.
+    /// Use `None`/0.0 to default to 1.0 (bare behavior).
+    pub scale_factor_d512: f32,
 }
 
 /// GPU-side reduce params. Must match `FlashAttnVecReduceParams` in the MSL.
@@ -83,6 +89,8 @@ struct FlashAttnVecTqParamsGpu {
     softcap: f32,
     nwg: u32,
     ring_start: u32,
+    /// iter-18 S2B: reciprocal scale factor for D=512 dequant. See FlashAttnVecTqParams.
+    scale_factor_d512: f32,
 }
 
 /// Validate TQ flash attention parameters.
@@ -172,6 +180,8 @@ pub fn flash_attn_vec_tq(
     let head_dim = params.head_dim;
     let nwg = compute_nwg(params.kv_seq_len);
 
+    // Ensure scale_factor_d512 is always >= 1.0 (0.0 treated as 1.0 for safety).
+    let effective_scale_d512 = if params.scale_factor_d512 < 1e-6 { 1.0_f32 } else { params.scale_factor_d512 };
     let gpu_params = FlashAttnVecTqParamsGpu {
         n_heads: params.num_heads,
         n_kv_heads: params.num_kv_heads,
@@ -184,6 +194,7 @@ pub fn flash_attn_vec_tq(
         softcap: params.softcap,
         nwg,
         ring_start: params.ring_start,
+        scale_factor_d512: effective_scale_d512,
     };
 
     let kernel_name = match head_dim {
@@ -296,6 +307,7 @@ mod tests {
             sliding_window: 0,
             softcap: 0.0,
             ring_start: 0,
+            scale_factor_d512: 1.0,
         };
         assert!(validate_params(&p).is_ok());
     }
@@ -313,6 +325,7 @@ mod tests {
             sliding_window: 0,
             softcap: 0.0,
             ring_start: 0,
+            scale_factor_d512: 1.0,
         };
         assert!(validate_params(&p).is_err());
     }
@@ -321,7 +334,7 @@ mod tests {
     fn test_gpu_params_layout() {
         assert_eq!(
             std::mem::size_of::<FlashAttnVecTqParamsGpu>(),
-            44, // 11 x u32/f32 = 44 bytes
+            48, // 12 x u32/f32 = 48 bytes (iter-18: +scale_factor_d512)
         );
     }
 }
