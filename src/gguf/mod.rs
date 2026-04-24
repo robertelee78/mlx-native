@@ -449,6 +449,125 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Dequantize Q5_K blocks to f32.
+///
+/// Block layout (176 bytes, 256 elements):
+///   f16 d           — super-block scale      (offset 0,  2 bytes)
+///   f16 dmin        — super-block minimum     (offset 2,  2 bytes)
+///   u8  scales[12]  — packed 6-bit scales/mins (offset 4,  12 bytes; shared with Q4_K)
+///   u8  qh[32]      — high bits of quants      (offset 16, 32 bytes = QK_K/8)
+///   u8  qs[128]     — low 4 bits of quants     (offset 48, 128 bytes = QK_K/2)
+///
+/// 8 sub-blocks of 32 elements each. Dequantization walks pairs of
+/// sub-blocks (is, is+1), each pair consumes 32 bytes of qs (low nibble
+/// for is, high nibble for is+1). The qh array is SHARED across all 4
+/// pairs — the high bit per element is masked out of qh using shifting
+/// selector values `u1 = 1 << (2*pair_idx)` / `u2 = 2 << (2*pair_idx)`.
+///
+/// Spec source: derived from `ggml/src/ggml-quants.c::dequantize_row_q5_K`.
+/// No code copied — formula reproduced from the mathematical definition.
+fn dequantize_q5_k(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 176;
+    const BLOCK_ELEMS: usize = 256;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "Q5_K data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "Q5_K output buffer too small".into(),
+        ));
+    }
+
+    for i in 0..num_blocks {
+        let block = &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+
+        let d = f16_from_le_bytes([block[0], block[1]]);
+        let dmin = f16_from_le_bytes([block[2], block[3]]);
+        let scales = &block[4..16]; // 12 bytes
+        let qh = &block[16..48]; // 32 bytes — high bit of quants
+        let qs = &block[48..176]; // 128 bytes — low 4 bits
+
+        let out = &mut output[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
+
+        // Process 4 pairs of sub-blocks (256 values total).
+        // u1 / u2 are the high-bit selector masks: they shift left by 2 each
+        // iteration so the 4 pairs pick bits 0/1, 2/3, 4/5, 6/7 of each qh byte.
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        let mut ys_index = 0usize;
+        let mut ql_off = 0usize;
+
+        while ql_off < 128 {
+            let ql = &qs[ql_off..ql_off + 32];
+
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * m1 as f32;
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * m2 as f32;
+
+            // Sub-block `is` (low nibble + high bit from qh masked by u1).
+            for l in 0..32 {
+                let low = (ql[l] & 0x0F) as u32;
+                let high = if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let q = low + high;
+                out[ys_index] = d1 * q as f32 - m1;
+                ys_index += 1;
+            }
+            // Sub-block `is + 1` (high nibble + high bit from qh masked by u2).
+            for l in 0..32 {
+                let low = (ql[l] >> 4) as u32;
+                let high = if (qh[l] & u2) != 0 { 16 } else { 0 };
+                let q = low + high;
+                out[ys_index] = d2 * q as f32 - m2;
+                ys_index += 1;
+            }
+
+            is += 2;
+            ql_off += 32;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize I16 tensors to f32.
+///
+/// Simple bitcast: `f32_val = i16_val as f32`. No scale metadata is used
+/// (apex GGUF convention — raw int16 values are meaningful as-is).
+///
+/// ADR-013 Decision 12 originally anticipated a per-tensor scale factor,
+/// but the apex GGUF does not emit one; values are stored as raw ints.
+/// If future GGUFs emit a scale, extend this with a scale parameter.
+fn dequantize_i16(data: &[u8], output: &mut [f32]) -> Result<()> {
+    if data.len() % 2 != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "I16 data length {} not even",
+            data.len()
+        )));
+    }
+    let num_elements = data.len() / 2;
+    if output.len() < num_elements {
+        return Err(MlxError::GgufParseError(
+            "I16 output buffer too small".into(),
+        ));
+    }
+    for i in 0..num_elements {
+        let v = i16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
+        output[i] = v as f32;
+    }
+    Ok(())
+}
+
 /// Dequantize Q4_K blocks to f32.
 ///
 /// Block layout (144 bytes, 256 elements):
@@ -641,16 +760,8 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::Q8_0 => dequantize_q8_0(data, output),
         GgmlType::Q4_K => dequantize_q4_k(data, output),
         GgmlType::Q6_K => dequantize_q6_k(data, output),
-        // Q5_K / I16: type is recognized for GGUF header parsing but dequant
-        // is not yet implemented — see ADR-013 Decision 12 / iter 7+ plan.
-        // Tensors of these types can be read as opaque bytes via
-        // `read_tensor_raw_bytes()` but not dequantized to f32 yet.
-        GgmlType::Q5_K => Err(MlxError::GgufParseError(
-            "Q5_K dequant not yet implemented (ADR-013 Decision 12 follow-up)".into(),
-        )),
-        GgmlType::I16 => Err(MlxError::GgufParseError(
-            "I16 dequant not yet implemented (ADR-013 Decision 12 follow-up)".into(),
-        )),
+        GgmlType::Q5_K => dequantize_q5_k(data, output),
+        GgmlType::I16 => dequantize_i16(data, output),
     }
 }
 
