@@ -159,7 +159,7 @@ struct TqDequantizeHbKvParamsGpu {
 
 /// Dispatch the higher-bit TQ KV dequantize kernel.
 ///
-/// Reads byte-packed 5-bit or 6-bit indices from `packed` at `read_pos` and
+/// Reads byte-packed 5-bit, 6-bit, or 8-bit indices from `packed` at `read_pos` and
 /// writes F32 dequantized values to `dst` in the FWHT-rotated domain.
 /// Same scale convention as `dispatch_tq_dequantize_kv`.
 #[allow(clippy::too_many_arguments)]
@@ -178,9 +178,9 @@ pub fn dispatch_tq_dequantize_hb_kv(
     codebook_bits: u32,
 ) -> Result<()> {
     if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
-    if codebook_bits != 5 && codebook_bits != 6 {
+    if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_tq_dequantize_hb_kv: codebook_bits must be 5 or 6, got {}", codebook_bits)));
+            "dispatch_tq_dequantize_hb_kv: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
     }
 
     let norms_per_pos = (head_dim / 256).max(1);
