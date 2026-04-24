@@ -111,3 +111,112 @@ kernel void tq_dequantize_kv(
         dst_head[coord] = CODEBOOK_4BIT_DQ[nibble] * scale_norm;
     }
 }
+
+// ============================================================================
+// Track B (iter-21): higher-bit dequantize kernel.
+// Reads byte-packed 5-bit or 6-bit indices from the higher-bit KV cache and
+// writes dense F32 values in the FWHT-rotated domain (same as tq_dequantize_kv).
+//
+// Packed layout: [num_kv_heads, capacity, head_dim] u8 (byte-packed, 1 byte/elem)
+// Norms layout: same as 4-bit (D=256: 1 norm/pos, D=512: 2 per-block norms/pos)
+// ============================================================================
+
+constant float CODEBOOK_5BIT_DQ[32] = {
+    -3.2606790f, -2.6910589f, -2.3176743f, -2.0286608f,
+    -1.7871646f, -1.5761599f, -1.3862739f, -1.2117410f,
+    -1.0487242f, -0.8945114f, -0.7470884f, -0.6048936f,
+    -0.4666676f, -0.3313550f, -0.1980377f, -0.0658849f,
+     0.0658849f,  0.1980377f,  0.3313550f,  0.4666676f,
+     0.6048936f,  0.7470884f,  0.8945114f,  1.0487242f,
+     1.2117410f,  1.3862739f,  1.5761599f,  1.7871646f,
+     2.0286608f,  2.3176743f,  2.6910589f,  3.2606790f,
+};
+
+constant float CODEBOOK_6BIT_DQ[64] = {
+    -3.6996161f, -3.1907215f, -2.8640626f, -2.6161277f,
+    -2.4129324f, -2.2388464f, -2.0853192f, -1.9471373f,
+    -1.8208742f, -1.7041502f, -1.5952401f, -1.4928497f,
+    -1.3959804f, -1.3038428f, -1.2157998f, -1.1313277f,
+    -1.0499889f, -0.9714118f, -0.8952766f, -0.8213046f,
+    -0.7492492f, -0.6788902f, -0.6100285f, -0.5424819f,
+    -0.4760822f, -0.4106724f, -0.3461048f, -0.2822386f,
+    -0.2189392f, -0.1560761f, -0.0935225f, -0.0311537f,
+     0.0311537f,  0.0935225f,  0.1560761f,  0.2189392f,
+     0.2822386f,  0.3461048f,  0.4106724f,  0.4760822f,
+     0.5424819f,  0.6100285f,  0.6788902f,  0.7492492f,
+     0.8213046f,  0.8952766f,  0.9714118f,  1.0499889f,
+     1.1313277f,  1.2157998f,  1.3038428f,  1.3959804f,
+     1.4928497f,  1.5952401f,  1.7041502f,  1.8208742f,
+     1.9471373f,  2.0853192f,  2.2388464f,  2.4129324f,
+     2.6161277f,  2.8640626f,  3.1907215f,  3.6996161f,
+};
+
+struct TqDequantizeHbKvParams {
+    uint head_dim;
+    uint num_kv_heads;
+    uint read_pos;
+    uint cache_capacity;
+    uint norms_per_pos;
+    float scale_factor_d512;
+    uint codebook_bits;  // 5 or 6
+};
+
+// ============================================================================
+// Track B alternate approach: requantize-to-F32 kernel.
+// Takes FWHT-rotated+normalized F32 K/V (from attn_k_normed after FWHT+norm)
+// and snaps each value to the nearest 5-bit or 6-bit centroid, then writes
+// the centroid value back as F32.  This simulates the quantize→dequantize
+// round-trip without allocating a separate packed buffer.
+//
+// Input: [num_kv_heads, head_dim] f32 — post-FWHT normalized values
+// Output: same shape — centroid-snapped F32 values
+//
+// Workflow for Track B:
+//  1. Encode K/V to TQ 4-bit (existing hadamard_quantize_kv_fast path)
+//  2. Dequantize K/V to F32 (tq_dequantize_kv) into attn_k_normed
+//  3. Apply requantize_to_f32_hb to snap values to 5/6-bit centroids
+//  4. Copy requantized F32 into leg_hb_kvs shadow cache
+// ============================================================================
+// Not used in the primary Track B ablation (see tq_dequantize_hb_kv below);
+// this is here for future use if a cleaner 1-step path is needed.
+
+kernel void tq_dequantize_hb_kv(
+    device const uint8_t            *packed    [[buffer(0)]], // [nkv, capacity, hd] u8 byte-packed
+    device const float              *norms     [[buffer(1)]],
+    device       float              *dst       [[buffer(2)]], // [nkv, hd] f32
+    constant TqDequantizeHbKvParams &params   [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    uint   tiitg [[thread_index_in_threadgroup]])
+{
+    const uint kv_head  = tgpig[0];
+    const uint hd       = params.head_dim;
+    const uint cap      = params.cache_capacity;
+    const uint pos      = params.read_pos;
+    const float inv_sqrt_hd = rsqrt(float(hd));
+    const float sf      = params.scale_factor_d512;
+    const bool is_d512  = (hd > 256);
+    const bool use_5bit = (params.codebook_bits == 5u);
+
+    if (kv_head >= params.num_kv_heads) return;
+
+    // Packed base: [kv_head, pos, 0..hd] — byte-packed (1 byte per element)
+    device const uint8_t *packed_pos = packed + kv_head * cap * hd + pos * hd;
+
+    const uint npp = params.norms_per_pos;
+    device const float *norms_pos = norms + kv_head * cap * npp + pos * npp;
+    device float *dst_head = dst + kv_head * hd;
+
+    for (uint coord = tiitg; coord < hd; coord += hd) {
+        uint block_idx = is_d512 ? (coord / 256u) : 0u;
+        block_idx = min(block_idx, npp - 1u);
+        float norm = norms_pos[block_idx];
+
+        // Same scale convention as tq_dequantize_kv (Track A fix)
+        float scale_norm = is_d512 ? (norm / sf) : (norm * inv_sqrt_hd);
+
+        uint idx = packed_pos[coord];  // byte-packed index
+        float centroid = use_5bit ? CODEBOOK_5BIT_DQ[idx & 0x1Fu]
+                                  : CODEBOOK_6BIT_DQ[idx & 0x3Fu];
+        dst_head[coord] = centroid * scale_norm;
+    }
+}

@@ -422,10 +422,15 @@ impl KernelRegistry {
         let hq_fast_src: &'static str = include_str!("shaders/hadamard_quantize_kv_fast.metal");
         sources.insert("hadamard_quantize_kv_fast_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_fast_d512".into(), hq_fast_src);
+        // Track B (iter-21): higher-bit (5/6-bit) quantize kernels (byte-packed)
+        sources.insert("hadamard_quantize_kv_hb_d256".into(), hq_fast_src);
+        sources.insert("hadamard_quantize_kv_hb_d512".into(), hq_fast_src);
 
         // iter-20 Leg F: TQ KV dequantize kernel (nibbles+norms → F32)
         let tq_dq_src: &'static str = include_str!("shaders/tq_dequantize_kv.metal");
         sources.insert("tq_dequantize_kv".into(), tq_dq_src);
+        // Track B (iter-21): higher-bit dequantize kernel (byte-packed indices)
+        sources.insert("tq_dequantize_hb_kv".into(), tq_dq_src);
 
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");

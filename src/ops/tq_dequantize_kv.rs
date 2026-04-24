@@ -139,3 +139,84 @@ pub fn dispatch_tq_dequantize_kv(
 
     Ok(())
 }
+
+// ============================================================================
+// Track B (iter-21): higher-bit dequantize dispatch.
+// ============================================================================
+
+/// GPU-side params for the higher-bit dequantize kernel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TqDequantizeHbKvParamsGpu {
+    head_dim: u32,
+    num_kv_heads: u32,
+    read_pos: u32,
+    cache_capacity: u32,
+    norms_per_pos: u32,
+    scale_factor_d512: f32,
+    codebook_bits: u32,  // 5 or 6
+}
+
+/// Dispatch the higher-bit TQ KV dequantize kernel.
+///
+/// Reads byte-packed 5-bit or 6-bit indices from `packed` at `read_pos` and
+/// writes F32 dequantized values to `dst` in the FWHT-rotated domain.
+/// Same scale convention as `dispatch_tq_dequantize_kv`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tq_dequantize_hb_kv(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    packed: &MlxBuffer,     // [nkv, capacity, head_dim] u8 (byte-packed)
+    norms: &MlxBuffer,
+    dst: &MlxBuffer,        // [nkv, head_dim] f32
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    read_pos: u32,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if codebook_bits != 5 && codebook_bits != 6 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_tq_dequantize_hb_kv: codebook_bits must be 5 or 6, got {}", codebook_bits)));
+    }
+
+    let norms_per_pos = (head_dim / 256).max(1);
+
+    let params = TqDequantizeHbKvParamsGpu {
+        head_dim,
+        num_kv_heads,
+        read_pos,
+        cache_capacity,
+        norms_per_pos,
+        scale_factor_d512,
+        codebook_bits,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    let pipeline = registry.get_pipeline("tq_dequantize_hb_kv", device)?;
+
+    let threadgroups = MTLSize { width: num_kv_heads as u64, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize {
+        width: head_dim.min(1024) as u64,
+        height: 1,
+        depth: 1,
+    };
+
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(packed)),
+            (1, KernelArg::Buffer(norms)),
+            (2, KernelArg::Buffer(dst)),
+            (3, KernelArg::Bytes(params_bytes)),
+        ],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    Ok(())
+}

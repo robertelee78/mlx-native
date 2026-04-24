@@ -382,3 +382,86 @@ pub fn dispatch_hadamard_quantize_kv_seq(
 
     Ok(())
 }
+
+// ============================================================================
+// Track B (iter-21): higher-bit dispatch (5-bit or 6-bit, byte-packed).
+// ============================================================================
+
+/// GPU-side params for the higher-bit quantize kernel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HadamardQuantizeHbParams {
+    head_dim: u32,
+    num_kv_heads: u32,
+    write_pos: u32,
+    cache_capacity: u32,
+    is_sliding: u32,
+    scale_factor_d512: f32,
+    codebook_bits: u32,  // 5 or 6
+}
+
+/// Dispatch the higher-bit Hadamard-quantize KV kernel.
+///
+/// Same pipeline as 4-bit (FWHT + norm) but writes 1 byte per element
+/// (byte-packed) using 5-bit (32 centroids) or 6-bit (64 centroids) codebook.
+///
+/// * `packed` must be `[num_kv_heads, cache_capacity, head_dim]` u8 (byte-packed).
+/// * `norms` layout is identical to 4-bit path.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_hb(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,      // byte-packed: [nkv, capacity, head_dim] u8
+    norms: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,      // 5 or 6
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if codebook_bits != 5 && codebook_bits != 6 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_hadamard_quantize_kv_hb: codebook_bits must be 5 or 6, got {}", codebook_bits)));
+    }
+
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_hb_d256",
+        512 => "hadamard_quantize_kv_hb_d512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_hb: head_dim {} not supported (need 256 or 512)", head_dim))),
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos,
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512,
+        codebook_bits,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src)),
+            (1, KA::Buffer(packed)),
+            (2, KA::Buffer(norms)),
+            (3, KA::Bytes(params_bytes)),
+        ],
+        MTLSize::new(num_kv_heads as u64, 1, 1),
+        MTLSize::new(32, 1, 1), // 1 simdgroup (32 threads)
+    );
+
+    Ok(())
+}
