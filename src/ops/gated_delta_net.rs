@@ -4,11 +4,15 @@
 //! Implements the recurrence (per token `t` within a sequence):
 //!
 //! ```text
-//! alpha     = exp(-g[t])
-//! delta     = v[t] - state @ k[t]
-//! state'    = alpha * state + beta[t] * outer(delta, k[t])
-//! output[t] = state' @ q[t]
+//! alpha       = exp(-g[t])
+//! state_dec   = alpha * state                               // decay FIRST
+//! delta       = v[t] - state_dec @ k[t]                    // use decayed state
+//! state'      = state_dec + beta[t] * outer(delta, k[t])
+//! output[t]   = state' @ q[t]
 //! ```
+//!
+//! IMPORTANT: alpha is applied before computing delta. This matches
+//! llama.cpp build_delta_net_autoregressive which does: s=s*exp(gate); sk=sum(s*k).
 //!
 //! Spec source: ADR-013 Decision 6. Derived from the mathematical spec;
 //! no llama.cpp code copied.
@@ -248,8 +252,8 @@ pub fn cpu_reference_f32(
     let nh_v = p.n_v_heads as usize;
     let n_t = p.n_tokens as usize;
     let n_s = p.n_seqs as usize;
-    let group_ratio = nh_v / nh_k;
-
+    // GQA: tiled mapping k_head = v_head % n_k_heads (matches llama.cpp fused kernel).
+    // Not block-style (v_head / group_ratio) which gives wrong ordering.
     let kq_token_stride = nh_k * d_k;
     let kq_seq_stride = n_t * kq_token_stride;
     let v_token_stride = nh_v * d_v;
@@ -264,7 +268,7 @@ pub fn cpu_reference_f32(
 
     for s in 0..n_s {
         for vh in 0..nh_v {
-            let kh = vh / group_ratio;
+            let kh = vh % nh_k;  // tiled GQA: matches llama.cpp k_head = v_head % n_k_heads
 
             for t in 0..n_t {
                 let kq_base = s * kq_seq_stride + t * kq_token_stride + kh * d_k;
@@ -277,7 +281,15 @@ pub fn cpu_reference_f32(
 
                 let state_base = s * state_seq_stride + vh * state_head_stride;
 
-                // Compute delta[i] = v[i] - sum_j state[j, i] * k[j]
+                // Step 1: decay state — apply alpha BEFORE computing delta.
+                // Matches llama.cpp: s = s * exp(gate); sk = sum(s * k).
+                for i in 0..d_v {
+                    for j in 0..d_k {
+                        state[state_base + i * d_k + j] *= alpha;
+                    }
+                }
+
+                // Step 2: Compute delta[i] = v[i] - sum_j (alpha*state)[j, i] * k[j]
                 let mut delta = vec![0.0f32; d_v];
                 for i in 0..d_v {
                     let mut sk = 0.0f32;
@@ -287,12 +299,13 @@ pub fn cpu_reference_f32(
                     delta[i] = v[v_base + i] - sk;
                 }
 
-                // Update state: state[j, i] = alpha * state[j, i] + beta * delta[i] * k[j]
+                // Step 3: Update state: state[j, i] += beta * delta[i] * k[j]
+                // (state is already alpha-decayed from step 1)
                 for i in 0..d_v {
                     let beta_delta = beta_val * delta[i];
                     for j in 0..d_k {
                         let idx = state_base + i * d_k + j;
-                        state[idx] = alpha * state[idx] + beta_delta * k[kq_base + j];
+                        state[idx] += beta_delta * k[kq_base + j];
                     }
                 }
 

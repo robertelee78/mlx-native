@@ -8,10 +8,15 @@ using namespace metal;
 //
 // # Mathematical recurrence (per token t within a seq)
 //
-//   alpha     = exp(-g[t])                                   // scalar
-//   delta     = v[t] - state @ k[t]                          // [D_v]
-//   state'    = alpha * state + beta[t] * outer(delta, k[t]) // [D_k, D_v]
-//   output[t] = state' @ q[t]                                // [D_v]
+//   alpha       = exp(-g[t])                                         // scalar
+//   state_dec   = alpha * state                                      // [D_k, D_v]
+//   delta       = v[t] - state_dec @ k[t]                           // [D_v]
+//   state'      = state_dec + beta[t] * outer(delta, k[t])          // [D_k, D_v]
+//   output[t]   = state' @ q[t]                                      // [D_v]
+//
+// IMPORTANT: alpha is applied to state BEFORE computing delta = v - state@k.
+// This matches llama.cpp build_delta_net_autoregressive (line 338-360):
+//   g = ggml_exp(g); s = s*g; sk = sum(s*k); d = v-sk; s = s + outer(beta*d, k)
 //
 // GQA broadcast: `num_v_heads` may exceed `num_k_heads`. Each v_head is
 // mapped to a k_head by `k_head = v_head / group_ratio` where
@@ -89,9 +94,11 @@ kernel void gated_delta_net_f32(
     if (v_head >= n_v_heads || seq >= n_seqs) return;
     if (tid >= D_v) return;
 
-    // GQA broadcast. group_ratio >= 1 is enforced on the Rust side.
-    const uint group_ratio = n_v_heads / n_k_heads;
-    const uint k_head = v_head / group_ratio;
+    // GQA broadcast: map v_head to k_head using modulo (tiled), matching
+    // llama.cpp's fused Metal kernel (i01 = i21 % args.ne01) and the
+    // ggml_repeat_4d tiled expansion used in the non-fused path.
+    // NOT division (block-style), which would give a different ordering.
+    const uint k_head = v_head % n_k_heads;
 
     // Strides.
     const uint kq_token_stride   = n_k_heads * D_k;
@@ -137,21 +144,28 @@ kernel void gated_delta_net_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // state @ k for this thread's d_v row: dot(state_row, k).
+        // Step 1: decay state — apply alpha to state_row BEFORE computing sk.
+        // This matches llama.cpp: s = s * exp(gate); sk = sum(s * k).
+        for (uint j = 0; j < D_k; ++j) {
+            state_row[j] *= alpha;
+        }
+
+        // Step 2: sk = (alpha*state) @ k for this thread's d_v row.
         float sk = 0.0f;
         for (uint j = 0; j < D_k; ++j) {
             sk += state_row[j] * sh_k[j];
         }
-        // delta[tid] = v[tid] - sk
+        // delta[tid] = v[tid] - sk  (using decayed state)
         sh_delta[tid] = sh_v[tid] - sk;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Update state_row: state[j, i] = alpha * state[j, i] + beta * delta[i] * k[j].
+        // Step 3: update state_row: state[j, i] += beta * delta[i] * k[j].
+        // Note: state_row is already alpha-decayed from step 1.
         const float delta_i = sh_delta[tid];
         const float beta_delta = beta_val * delta_i;
         for (uint j = 0; j < D_k; ++j) {
-            state_row[j] = alpha * state_row[j] + beta_delta * sh_k[j];
+            state_row[j] += beta_delta * sh_k[j];
         }
 
         // output[i] = state' @ q = dot(state_row, q).
