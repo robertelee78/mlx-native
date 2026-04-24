@@ -337,6 +337,10 @@ impl KernelRegistry {
         let tri_solve_src: &'static str = include_str!("shaders/tri_solve.metal");
         sources.insert("tri_solve_lower_unit_f32".into(), tri_solve_src);
         sources.insert("tri_solve_lower_unit_bf16".into(), tri_solve_src);
+        // Rope-multi kernels (ADR-013 Decision 10 — IMROPE for Qwen3.5)
+        let rope_multi_src: &'static str = include_str!("shaders/rope_multi.metal");
+        sources.insert("rope_multi_f32".into(), rope_multi_src);
+        sources.insert("rope_multi_bf16".into(), rope_multi_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);

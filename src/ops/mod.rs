@@ -30,6 +30,7 @@ pub mod quantized_matmul_id;
 pub mod quantized_matmul_id_ggml;
 pub mod rms_norm;
 pub mod rope;
+pub mod rope_multi;
 pub mod scale_mask_softmax;
 pub mod flash_attn_prefill;
 pub mod flash_attn_prefill_blk;
