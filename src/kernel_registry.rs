@@ -341,6 +341,9 @@ impl KernelRegistry {
         let rope_multi_src: &'static str = include_str!("shaders/rope_multi.metal");
         sources.insert("rope_multi_f32".into(), rope_multi_src);
         sources.insert("rope_multi_bf16".into(), rope_multi_src);
+        // Gated DeltaNet fused kernel (ADR-013 Decision 6 — centerpiece)
+        let gdn_src: &'static str = include_str!("shaders/gated_delta_net.metal");
+        sources.insert("gated_delta_net_f32".into(), gdn_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);

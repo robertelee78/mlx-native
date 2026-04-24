@@ -39,6 +39,7 @@ pub mod flash_attn_prefill_mask;
 pub mod flash_attn_vec;
 pub mod flash_attn_vec_tq;
 pub mod fwht_standalone;
+pub mod gated_delta_net;
 pub mod sdpa;
 pub mod sdpa_sliding;
 pub mod softcap;
