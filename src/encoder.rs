@@ -158,12 +158,29 @@ pub enum CapturedNode {
 }
 
 /// Apply a slice of `KernelArg` bindings to a compute encoder.
+///
+/// `KernelArg::Buffer(buf)` propagates the `MlxBuffer::byte_offset()` so
+/// `slice_view`-derived sub-buffers are honored automatically — the
+/// kernel sees memory starting at the slice's offset. This matches the
+/// documented contract of `slice_view` and the offset-handling in the
+/// other binding paths in this file (`encode`, `encode_threadgroups`,
+/// `encode_threadgroups_with_shared`, replay). Without it, every
+/// `slice_view`-derived buffer bound via `KernelArg::Buffer` silently
+/// exposes the entire underlying allocation — surfaced by hf2q's
+/// nomic-bert iter-79 cosine parity bisection (cosine 0.098 → 0.999962
+/// after fix).
+///
+/// `KernelArg::BufferWithOffset(buf, offset)` continues to use the
+/// explicit `offset` argument verbatim (callers asking for an explicit
+/// offset get exactly that, even on sliced buffers). The two API
+/// surfaces are intentional: implicit (sliced views auto-propagate) vs.
+/// explicit (caller-controlled).
 #[inline]
 fn apply_bindings(encoder: &ComputeCommandEncoderRef, bindings: &[(u64, KernelArg<'_>)]) {
     for &(index, ref arg) in bindings {
         match arg {
             KernelArg::Buffer(buf) => {
-                encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+                encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
             }
             KernelArg::BufferWithOffset(buf, offset) => {
                 encoder.set_buffer(index, Some(buf.metal_buffer()), *offset);
@@ -370,6 +387,10 @@ impl CommandEncoder {
     }
 
     /// Record `KernelArg` bindings into `RecordedBinding` form.
+    ///
+    /// `KernelArg::Buffer(buf)` records `buf.byte_offset()` so capture →
+    /// replay round-trips of `slice_view`-derived buffers preserve their
+    /// offsets, matching `record_buffer_bindings`'s behavior at line 382.
     fn record_arg_bindings(bindings: &[(u64, KernelArg<'_>)]) -> Vec<(u64, RecordedBinding)> {
         bindings
             .iter()
@@ -377,7 +398,7 @@ impl CommandEncoder {
                 let recorded = match arg {
                     KernelArg::Buffer(buf) => RecordedBinding::Buffer {
                         metal_buffer: buf.metal_buffer().clone(),
-                        offset: 0,
+                        offset: buf.byte_offset(),
                     },
                     KernelArg::BufferWithOffset(buf, offset) => RecordedBinding::Buffer {
                         metal_buffer: buf.metal_buffer().clone(),

@@ -250,3 +250,164 @@ fn partial_k_tile_k_eq_100_long_bert_seq() {
     // was the iter-67 cosine-fail regime.
     run_case(64, 128, 100, 1, 1, 19, 20, 3e-1);
 }
+
+/// Regression test for hf2q nomic-bert iter-79 cosine-parity bug.
+///
+/// `MlxBuffer::slice_view(byte_offset, n_elements)` documents that the
+/// kernel sees memory starting at the slice's offset. Pre-fix
+/// (encoder.rs:166), `KernelArg::Buffer(buf)` bound with hardcoded
+/// offset=0 — silently exposing the entire underlying allocation
+/// regardless of `buf.byte_offset()`. Symptom in hf2q: three Q/K/V
+/// slices of a fused QKV weight all delivered Q's bytes to the matmul,
+/// collapsing K and V projections onto Q's, gutting attention.
+///
+/// This test exercises the fixed contract directly:
+///   1. Allocate a 3-block fused weight `[3*N, K]` with deterministic
+///      content per block (block i filled with seed = i).
+///   2. Slice block 1 (the middle block) via `slice_view(N*K*2,
+///      N*K)`.
+///   3. Run `dense_matmul_bf16_f32_tensor` with the SLICE as src0.
+///   4. Compute the CPU reference for ONLY the middle block.
+///   5. Assert max_err is within the standard bf16 tolerance.
+///
+/// Pre-fix this test would fail max_err ≈ 1.0+ (the kernel saw block
+/// 0's bytes regardless of slice offset). Post-fix max_err ≤ 0.2.
+#[test]
+fn slice_view_kernel_arg_buffer_propagates_byte_offset() {
+    use mlx_native::ops::dense_mm_bf16::{
+        dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params,
+    };
+
+    let (device, mut registry) = setup();
+    let m = 32u32;
+    let n = 64u32;
+    let k = 32u32;
+    let n_blocks = 3u32;
+
+    // Three concatenated `[N, K]` blocks, each filled from a
+    // distinct seed so they're guaranteed numerically distinct.
+    let block_elems = (n * k) as usize;
+    let mut fused_f32: Vec<f32> = Vec::with_capacity(n_blocks as usize * block_elems);
+    let mut block_seeds = vec![];
+    for b in 0..n_blocks {
+        let seed = 0xC0FFEE_u64.wrapping_add((b as u64) * 31);
+        block_seeds.push(seed);
+        fused_f32.extend(pseudo_random_f32(seed, block_elems));
+    }
+    let fused_bf16: Vec<u16> = fused_f32
+        .iter()
+        .map(|&v| bf16::from_f32(v).to_bits())
+        .collect();
+
+    // Single fused buffer of 3 × N × K bf16 elements.
+    let fused_bytes = (n_blocks as usize) * block_elems * 2;
+    let mut fused_buf = device
+        .alloc_buffer(
+            fused_bytes,
+            DType::BF16,
+            vec![n_blocks as usize, n as usize, k as usize],
+        )
+        .expect("alloc fused");
+    fused_buf
+        .as_mut_slice::<u16>()
+        .expect("write fused")
+        .copy_from_slice(&fused_bf16);
+
+    // Slice the MIDDLE block via slice_view at block-1's byte offset.
+    let block_byte_off = (block_elems * 2) as u64; // 1 block × bf16
+    let middle_slice = fused_buf.slice_view(block_byte_off, block_elems);
+
+    // src1 (M=32, K=32) and dst (M=32, N=64).
+    let src1_f32 = pseudo_random_f32(0xDEAD_C0DE, (m * k) as usize);
+    let src1_bytes = (m * k) as usize * 4;
+    let mut src1_buf = device
+        .alloc_buffer(
+            src1_bytes,
+            DType::F32,
+            vec![m as usize, k as usize],
+        )
+        .expect("alloc src1");
+    src1_buf
+        .as_mut_slice::<f32>()
+        .expect("write src1")
+        .copy_from_slice(&src1_f32);
+
+    let dst_bytes = (m * n) as usize * 4;
+    let mut dst_buf = device
+        .alloc_buffer(dst_bytes, DType::F32, vec![m as usize, n as usize])
+        .expect("alloc dst");
+
+    let params = DenseMmBf16F32Params {
+        m,
+        n,
+        k,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dense_matmul_bf16_f32_tensor(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &middle_slice, // ← slice_view, byte_offset = block_byte_off
+        &src1_buf,
+        &mut dst_buf,
+        &params,
+    )
+    .expect("dispatch on slice_view");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    // CPU reference: matmul against the MIDDLE block only.
+    let middle_f32: &[f32] = &fused_f32[block_elems..2 * block_elems];
+    let expected = cpu_ref(
+        middle_f32,
+        &src1_f32,
+        m as usize,
+        n as usize,
+        k as usize,
+        1,
+        1,
+    );
+    let actual = dst_buf.as_slice::<f32>().expect("read dst").to_vec();
+    let max_err = actual
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Pre-fix: kernel sees block 0's bytes (offset ignored), max_err
+    // is ~RMS of (block0 - block1) projection differences ≈ 1.0+.
+    // Post-fix: kernel sees block 1's bytes (offset honored), max_err
+    // is the standard bf16 tolerance.
+    assert!(
+        max_err < 1e-1,
+        "slice_view byte_offset NOT propagated to dense_matmul: max_err = {}",
+        max_err
+    );
+
+    // Sanity: also verify the WRONG-block matmul (using full buffer
+    // pointing at block 0) gives a CLEARLY-different result, so the
+    // test isn't trivially passing.
+    let block0_f32: &[f32] = &fused_f32[..block_elems];
+    let wrong_expected = cpu_ref(
+        block0_f32,
+        &src1_f32,
+        m as usize,
+        n as usize,
+        k as usize,
+        1,
+        1,
+    );
+    let wrong_max_err = actual
+        .iter()
+        .zip(wrong_expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        wrong_max_err > 0.2,
+        "block-0 vs block-1 outputs are too close — test is not discriminating: \
+         wrong_max_err = {}",
+        wrong_max_err
+    );
+}
