@@ -349,6 +349,8 @@ impl KernelRegistry {
         let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
         sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
         sources.insert("sigmoid_mul_bf16".into(), sigmoid_mul_src);
+        let silu_mul_src: &'static str = include_str!("shaders/silu_mul.metal");
+        sources.insert("silu_mul_f32".into(), silu_mul_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
