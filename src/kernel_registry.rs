@@ -471,6 +471,9 @@ impl KernelRegistry {
         let moe_wr_src: &'static str =
             include_str!("shaders/moe_weighted_reduce.metal");
         sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
+        let sdpa_decode_src: &'static str =
+            include_str!("shaders/sdpa_decode.metal");
+        sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
         Self {
             cache: HashMap::new(),

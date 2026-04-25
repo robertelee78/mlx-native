@@ -49,6 +49,7 @@ pub mod fwht_standalone;
 pub mod gated_delta_net;
 pub mod tq_dequantize_kv;
 pub mod sdpa;
+pub mod sdpa_decode;
 pub mod sdpa_sliding;
 pub mod softcap;
 pub mod softmax;
