@@ -43,13 +43,17 @@ struct SdpaDecodeParamsGpu {
 
 /// Select the number of simdgroups based on kv_seq_len.
 ///
-/// - kv_seq_len < 64  → 1 (no benefit in splitting tiny KV cache)
-/// - kv_seq_len < 256 → 2
-/// - otherwise        → 4
+/// The threadgroup overhead of writing/reading shared memory and executing
+/// the barrier dominates when kv_seq_len is small, so we start with n_sg=1
+/// and ramp up as the KV cache grows:
+///
+/// - kv_seq_len < 32   → 1  (overhead dominates; single sg is faster)
+/// - kv_seq_len < 128  → 2  (2× speedup, barrier cost amortized)
+/// - otherwise         → 4  (4× speedup at long context)
 fn select_n_sg(kv_seq_len: u32) -> u32 {
-    if kv_seq_len < 64 {
+    if kv_seq_len < 32 {
         1
-    } else if kv_seq_len < 256 {
+    } else if kv_seq_len < 128 {
         2
     } else {
         4
