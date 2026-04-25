@@ -26,6 +26,9 @@ pub struct MlxBuffer {
     dtype: DType,
     /// Tensor shape (e.g. `[2, 3, 4]` for a rank-3 tensor).
     shape: Vec<usize>,
+    /// Byte offset into the underlying Metal buffer (for slice views).
+    /// Zero for normally-allocated buffers.
+    byte_offset: u64,
 }
 
 // metal::Buffer is Send + Sync; our extra fields (DType, Vec<usize>) are too.
@@ -44,6 +47,7 @@ impl Clone for MlxBuffer {
             inner: self.inner.clone(),
             dtype: self.dtype,
             shape: self.shape.clone(),
+            byte_offset: self.byte_offset,
         }
     }
 }
@@ -68,6 +72,36 @@ impl MlxBuffer {
             inner,
             dtype,
             shape,
+            byte_offset: 0,
+        }
+    }
+
+    /// Create a zero-copy slice view of this buffer.
+    ///
+    /// Returns a new `MlxBuffer` that shares the same underlying Metal buffer
+    /// but starts at `byte_offset` bytes from the beginning and contains
+    /// `n_elements` elements of type `dtype`. No data is copied.
+    ///
+    /// When this view is bound to a kernel, the encoder passes the byte offset
+    /// to Metal's `setBuffer:offset:atIndex:`, so the kernel sees only the
+    /// slice region.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `byte_offset + n_elements * dtype.size_of() > self.inner.length()`.
+    #[inline]
+    pub fn slice_view(&self, byte_offset: u64, n_elements: usize) -> Self {
+        let end = byte_offset as usize + n_elements * self.dtype.size_of();
+        assert!(
+            end <= self.inner.length() as usize,
+            "slice_view: out of bounds (byte_offset={}, n_elements={}, dtype_size={}, buf_len={})",
+            byte_offset, n_elements, self.dtype.size_of(), self.inner.length()
+        );
+        Self {
+            inner: self.inner.clone(),
+            dtype: self.dtype,
+            shape: vec![n_elements],
+            byte_offset,
         }
     }
 
@@ -112,6 +146,15 @@ impl MlxBuffer {
     #[inline]
     pub fn metal_buffer(&self) -> &MetalBuffer {
         &self.inner
+    }
+
+    /// Byte offset into the underlying Metal buffer (zero for non-slice buffers).
+    ///
+    /// When passing this buffer to a Metal kernel via `setBuffer:offset:atIndex:`,
+    /// use this offset so the kernel sees only the intended sub-region.
+    #[inline]
+    pub fn byte_offset(&self) -> u64 {
+        self.byte_offset
     }
 
     /// Consume self and return the inner `metal::Buffer` (used by buffer pool).

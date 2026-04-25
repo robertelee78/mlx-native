@@ -362,7 +362,7 @@ impl CommandEncoder {
                     index,
                     RecordedBinding::Buffer {
                         metal_buffer: buf.metal_buffer().clone(),
-                        offset: 0,
+                        offset: buf.byte_offset(),
                     },
                 )
             })
@@ -510,7 +510,7 @@ impl CommandEncoder {
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
-            encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+            encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
         encoder.dispatch_threads(grid_size, threadgroup_size);
     }
@@ -546,7 +546,7 @@ impl CommandEncoder {
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
-            encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+            encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
     }
@@ -593,7 +593,7 @@ impl CommandEncoder {
         let encoder = self.get_or_create_encoder();
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
-            encoder.set_buffer(index, Some(buf.metal_buffer()), 0);
+            encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
         for &(index, byte_length) in threadgroup_mem {
             encoder.set_threadgroup_memory_length(index, byte_length);
