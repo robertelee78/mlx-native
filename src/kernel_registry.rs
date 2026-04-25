@@ -117,6 +117,16 @@ impl KernelRegistry {
             include_str!("shaders/dense_mm_bf16_tensor.metal");
         sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
 
+        // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
+        // for M=1 single-token decode.  Port of llama.cpp's
+        // kernel_mul_mv_bf16_f32_4 (bfloat4-vectorized GEMV kernel).
+        // Used in apply_linear_projection_f32 when seq_len=1 and the
+        // weight matrix is BF16, replacing the MM kernel (~2× faster for
+        // M=1 due to better memory bandwidth utilization per thread).
+        let dense_gemv_bf16_src: &'static str =
+            include_str!("shaders/dense_gemv_bf16.metal");
+        sources.insert("hf2q_dense_gemv_bf16_f32_4".into(), dense_gemv_bf16_src);
+
         // Fused scale-mask-softmax for the non-flash-attention prefill
         // path.  One row-local threadgroup per (head, query) pair
         // replaces three separate dispatches (scale, mask-add, softmax);
