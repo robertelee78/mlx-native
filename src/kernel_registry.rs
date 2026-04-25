@@ -463,6 +463,15 @@ impl KernelRegistry {
         let top_k_src: &'static str = include_str!("shaders/top_k.metal");
         sources.insert("top_k_f32".into(), top_k_src);
 
+        // MoE GPU routing + weighted reduce (ADR-013 P13.3 perf).
+        // Replaces CPU softmax+topk round-trip and CPU weighted accumulate.
+        let moe_stk_src: &'static str =
+            include_str!("shaders/moe_softmax_topk.metal");
+        sources.insert("moe_softmax_topk_f32".into(), moe_stk_src);
+        let moe_wr_src: &'static str =
+            include_str!("shaders/moe_weighted_reduce.metal");
+        sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
+
         Self {
             cache: HashMap::new(),
             sources,

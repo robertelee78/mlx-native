@@ -24,6 +24,8 @@ pub mod kv_cache_copy;
 pub mod l2_norm;
 pub mod moe_dispatch;
 pub mod moe_gate;
+pub mod moe_softmax_topk;
+pub mod moe_weighted_reduce;
 pub mod quantized_matmul;
 pub mod quantized_matmul_ggml;
 pub mod quantized_matmul_id;
