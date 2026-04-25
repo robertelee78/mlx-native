@@ -1,3 +1,12 @@
 /target
-/.cfa-worktrees
-/.worktrees
+
+# Git worktrees — long-lived parallel branches (moved from
+# /opt/mlx-native-adr013 sibling-path convention to nested on 2026-04-24).
+.worktrees/
+.cfa-worktrees/
+
+# Local dev tooling
+.mcp.json
+.claude/
+.claude-flow/
+CLAUDE.md
