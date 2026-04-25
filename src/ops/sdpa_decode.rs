@@ -1,16 +1,15 @@
-//! GPU SDPA decode kernel — F32 Q/K/V, SIMD-vectorized, single-token decode.
+//! GPU SDPA decode kernel — F32 Q/K/V, multi-simdgroup tiled, single-token decode.
 //!
-//! Replaces the naive `sdpa` kernel for seq_len=1 decode with a SIMD-parallel
-//! implementation that avoids the F16 Q precision loss of `flash_attn_vec`.
+//! The kernel divides the KV sequence across N_SG simdgroups that each scan an
+//! independent KV chunk and produce a local (max, sum, unnorm_acc) triple.
+//! Simdgroup 0 then merges all N_SG partial results using the log-sum-exp
+//! combination rule and writes the final F32 output.
 //!
-//! Each threadgroup (32 threads, one SIMD group) handles one query head.
-//! Threads cooperate on QK dot products via `simd_sum`, eliminating the
-//! scalar inner loop from the naive kernel.
-//!
-//! Constraints:
-//! - seq_len must be 1
-//! - head_dim must be a multiple of 32 (128, 256, 512)
+//! # Constraints
+//! - seq_len must be 1 (decode path only)
+//! - head_dim must be a multiple of 32 (128, 256, 512 are supported)
 //! - Q/K/V must be F32
+//! - n_sg must be 1, 2, or 4
 
 use metal::MTLSize;
 
@@ -39,9 +38,25 @@ struct SdpaDecodeParamsGpu {
     kv_seq_len:  u32,
     kv_capacity: u32,
     scale:       f32,
+    n_sg:        u32,
 }
 
-/// Dispatch the vectorized decode SDPA kernel.
+/// Select the number of simdgroups based on kv_seq_len.
+///
+/// - kv_seq_len < 64  → 1 (no benefit in splitting tiny KV cache)
+/// - kv_seq_len < 256 → 2
+/// - otherwise        → 4
+fn select_n_sg(kv_seq_len: u32) -> u32 {
+    if kv_seq_len < 64 {
+        1
+    } else if kv_seq_len < 256 {
+        2
+    } else {
+        4
+    }
+}
+
+/// Dispatch the tiled decode SDPA kernel.
 ///
 /// # Constraints
 /// - `head_dim` must be a multiple of 32 (128, 256, 512 are supported).
@@ -65,7 +80,6 @@ pub fn dispatch_sdpa_decode(
     kv_capacity: u32,
     scale:       f32,
 ) -> Result<()> {
-    // Validate head_dim.
     if head_dim % 32 != 0 {
         return Err(MlxError::InvalidArgument(format!(
             "sdpa_decode: head_dim ({}) must be a multiple of 32", head_dim
@@ -96,6 +110,8 @@ pub fn dispatch_sdpa_decode(
     chk!(v,      kv_elems, "V");
     chk!(output, o_elems,  "output");
 
+    let n_sg = select_n_sg(kv_seq_len);
+
     let gpu_params = SdpaDecodeParamsGpu {
         n_heads,
         n_kv_heads,
@@ -103,13 +119,21 @@ pub fn dispatch_sdpa_decode(
         kv_seq_len,
         kv_capacity,
         scale,
+        n_sg,
     };
+
+    // Shared memory layout:
+    //   sg_max : [n_sg]          floats
+    //   sg_sum : [n_sg]          floats
+    //   sg_acc : [n_sg*head_dim] floats
+    // Total: 4 * n_sg * (head_dim + 2) bytes
+    let shmem_bytes: u64 = 4 * n_sg as u64 * (head_dim as u64 + 2);
 
     let pipeline = registry.get_pipeline("sdpa_decode", device.metal_device())?;
 
-    // Grid: one TG per query head, 32 threads per TG (1 SIMD group).
+    // Grid: one TG per query head; TG has n_sg * 32 threads.
     let threadgroups   = MTLSize::new(n_heads as u64, 1, 1);
-    let threadgroup_sz = MTLSize::new(32, 1, 1);
+    let threadgroup_sz = MTLSize::new(n_sg as u64 * 32, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
@@ -120,7 +144,7 @@ pub fn dispatch_sdpa_decode(
             (3, KernelArg::Buffer(output)),
             (4, KernelArg::Bytes(as_bytes(&gpu_params))),
         ],
-        &[],
+        &[(0, shmem_bytes)],
         threadgroups,
         threadgroup_sz,
     );
