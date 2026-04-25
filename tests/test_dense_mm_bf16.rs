@@ -194,3 +194,59 @@ fn prefill_attn_shape() {
     // 4 KV heads broadcast to 16 Q heads.
     run_case(128, 128, 256, 4, 16, 9, 10, 4e-1);
 }
+
+// ------------------------------------------------------------------------
+// Partial K-tile coverage — K = ne00 not a multiple of NK=32. Without the
+// kernel's `loop_k + NK <= args.ne00` guard, the in-tile unconditional
+// 16-element / 8-element loads read past the end of the src0/src1
+// buffers on the trailing partial tile, accumulating garbage into the
+// output. Discovered externally by hf2q ADR-005 iter 67 on
+// bge-small-en-v1.5 BERT embeddings (cosine 0.99999 at K=32 → 0.75-0.92
+// at K=33-200). These tests lock the fix at the kernel level.
+//
+// The CPU reference does an exact F32 multiply-accumulate; the GPU path
+// casts src0 to bfloat for the tensor-core matmul, so the tolerance
+// reflects per-element BF16 round-off accumulated over K terms.
+
+#[test]
+fn partial_k_tile_k_eq_33() {
+    // K=33: one full NK=32 tile + one 1-element trailing tile. The
+    // simplest non-multiple-of-32 case. Pre-fix this test fails with
+    // unbounded error from past-end reads; post-fix the trailing tile
+    // is zero-padded and the matmul accumulates only valid k=0..32.
+    run_case(32, 64, 33, 1, 1, 11, 12, 2e-1);
+}
+
+#[test]
+fn partial_k_tile_k_eq_47() {
+    // K=47: one full tile + a 15-element partial. Exercises every
+    // intra-tile-position threshold (15 of 32 positions valid) so the
+    // per-element gate has to evaluate true and false within a single
+    // iteration's load.
+    run_case(32, 64, 47, 1, 1, 13, 14, 2e-1);
+}
+
+#[test]
+fn partial_k_tile_k_eq_63() {
+    // K=63: one full tile + a 31-element partial. Off-by-one boundary
+    // — only the very last position (k=31 within the trailing tile) is
+    // out of range; the gate must zero exactly that single element.
+    run_case(32, 64, 63, 1, 1, 15, 16, 2e-1);
+}
+
+#[test]
+fn partial_k_tile_k_eq_72_vit_attention_path() {
+    // K=72 mirrors Gemma 4 ViT's head_dim=72 attention `scores @ V`
+    // (where K = seq_len = 49 also produces partial tiles, but K=72
+    // is the more numerically-stressed first matmul in the chain).
+    // Two full tiles + 8-element partial.
+    run_case(64, 128, 72, 1, 1, 17, 18, 3e-1);
+}
+
+#[test]
+fn partial_k_tile_k_eq_100_long_bert_seq() {
+    // K=100 mirrors hf2q BERT `scores @ V` matmul on a 100-token
+    // input — three full tiles + 4-element partial. End-to-end this
+    // was the iter-67 cosine-fail regime.
+    run_case(64, 128, 100, 1, 1, 19, 20, 3e-1);
+}
