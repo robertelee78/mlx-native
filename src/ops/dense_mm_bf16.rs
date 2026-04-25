@@ -15,6 +15,7 @@ use crate::dtypes::DType;
 use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 
 /// Host-side parameters for `dense_matmul_bf16_f32_tensor`.
 #[derive(Debug, Clone, Copy)]
