@@ -35,6 +35,7 @@ pub mod scale_mask_softmax;
 pub mod sigmoid_mul;
 pub mod silu_mul;
 pub mod compute_g_beta;
+pub mod ssm_norm_gate;
 pub mod flash_attn_prefill;
 pub mod flash_attn_prefill_blk;
 pub mod flash_attn_prefill_d512;
