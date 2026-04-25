@@ -147,6 +147,17 @@ kernel void hf2q_dense_mm_bf16_f32_tensor(
     auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // Full-tile fast path when the entire NK=32 K-block fits inside
+        // ne00; gated slow path for the partial trailing tile when
+        // ne00 is not a multiple of NK. Without the gate, the in-tile
+        // unconditional 16-element / 8-element loads read past the end
+        // of `x` / `y` buffers and the matmul accumulates garbage into
+        // cT — visible at the consumer as random per-row drift (hf2q
+        // ADR-005 iter 67 bisection on bge-small-en-v1.5: cosine
+        // 0.99999 at K=32 → 0.75-0.92 at K=33-200, regardless of
+        // softmax masking; smooth per-K cliff localized to this loop).
+        const bool full_tile = (loop_k + NK <= args.ne00);
+
         // ---- Stage A tile (bfloat -> bfloat copy into sa [NR0][NK]).
         // No dequantize: A is already bfloat in device memory.  Same
         // destination layout as quantized_matmul_mm_tensor.metal:
@@ -155,14 +166,28 @@ kernel void hf2q_dense_mm_bf16_f32_tensor(
         {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (short i = 0; i < 16; i++) {
-                const short sx = 2*il0 + i/8;
-                const short sy = (tiitg/NL0)/8;
-
-                const short lx = i%8;
-                const short ly = (tiitg/NL0)%8;
-
-                *(sa + NK*(8*sy + ly) + 8*sx + lx) = x[i];
+            if (full_tile) {
+                for (short i = 0; i < 16; i++) {
+                    const short sx = 2*il0 + i/8;
+                    const short sy = (tiitg/NL0)/8;
+                    const short lx = i%8;
+                    const short ly = (tiitg/NL0)%8;
+                    *(sa + NK*(8*sy + ly) + 8*sx + lx) = x[i];
+                }
+            } else {
+                // Partial tile: gate per-element. This thread's x[i]
+                // covers absolute K = loop_k + il0*16 + i (see line
+                // 129 — x is initialized at offset il0*16 within the
+                // src0 row).
+                for (short i = 0; i < 16; i++) {
+                    const short sx = 2*il0 + i/8;
+                    const short sy = (tiitg/NL0)/8;
+                    const short lx = i%8;
+                    const short ly = (tiitg/NL0)%8;
+                    const int abs_k = loop_k + il0*16 + i;
+                    const bfloat v = (abs_k < args.ne00) ? x[i] : bfloat(0.0);
+                    *(sa + NK*(8*sy + ly) + 8*sx + lx) = v;
+                }
             }
         }
 
@@ -179,18 +204,29 @@ kernel void hf2q_dense_mm_bf16_f32_tensor(
             const short sy = (tiitg/NL1)/8;
             const short ly = (tiitg/NL1)%8;
 
-            float4 y_lo = *((device const float4 *) y);
-            float4 y_hi = *((device const float4 *)(y + 4));
-
             threadgroup bfloat * sb_ptr = sb + NK*(8*sy + ly) + 8*sx;
-            sb_ptr[0] = bfloat(y_lo[0]);
-            sb_ptr[1] = bfloat(y_lo[1]);
-            sb_ptr[2] = bfloat(y_lo[2]);
-            sb_ptr[3] = bfloat(y_lo[3]);
-            sb_ptr[4] = bfloat(y_hi[0]);
-            sb_ptr[5] = bfloat(y_hi[1]);
-            sb_ptr[6] = bfloat(y_hi[2]);
-            sb_ptr[7] = bfloat(y_hi[3]);
+
+            if (full_tile) {
+                float4 y_lo = *((device const float4 *) y);
+                float4 y_hi = *((device const float4 *)(y + 4));
+
+                sb_ptr[0] = bfloat(y_lo[0]);
+                sb_ptr[1] = bfloat(y_lo[1]);
+                sb_ptr[2] = bfloat(y_lo[2]);
+                sb_ptr[3] = bfloat(y_lo[3]);
+                sb_ptr[4] = bfloat(y_hi[0]);
+                sb_ptr[5] = bfloat(y_hi[1]);
+                sb_ptr[6] = bfloat(y_hi[2]);
+                sb_ptr[7] = bfloat(y_hi[3]);
+            } else {
+                // Partial tile: y[i] for thread (tiitg%NL1) covers
+                // absolute K = loop_k + iy + i (line 131 — iy is the
+                // thread's K-base within the tile).
+                for (short i = 0; i < 8; i++) {
+                    const int abs_k = loop_k + iy + i;
+                    sb_ptr[i] = (abs_k < args.ne00) ? bfloat(y[i]) : bfloat(0.0);
+                }
+            }
         }
 
         x += NK;
