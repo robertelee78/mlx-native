@@ -423,6 +423,10 @@ impl KernelRegistry {
         sources.insert("dense_gemm_f16".into(), dense_gemm_src);
         sources.insert("dense_matvec_f16".into(), dense_gemm_src);
         sources.insert("dense_matvec_f16w_f32io".into(), dense_gemm_src);
+        // BF16-weight mat-vec: BF16 weights × F32 input → F32 output (decode lm_head)
+        sources.insert("dense_matvec_bf16w_f32io".into(), dense_gemm_src);
+        // Pure F32 mat-vec: F32 weights × F32 input → F32 output (decode lm_head)
+        sources.insert("dense_matvec_f32".into(), dense_gemm_src);
 
         // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");

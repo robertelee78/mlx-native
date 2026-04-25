@@ -28,6 +28,8 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("dense_gemm_f16", DENSE_GEMM_SHADER_SOURCE);
     registry.register_source("dense_matvec_f16", DENSE_GEMM_SHADER_SOURCE);
     registry.register_source("dense_matvec_f16w_f32io", DENSE_GEMM_SHADER_SOURCE);
+    registry.register_source("dense_matvec_bf16w_f32io", DENSE_GEMM_SHADER_SOURCE);
+    registry.register_source("dense_matvec_f32", DENSE_GEMM_SHADER_SOURCE);
 }
 
 /// MSL-compatible params struct for dense GEMM.
@@ -197,6 +199,122 @@ pub fn dispatch_dense_matvec_f16w_f32io(
         ));
     }
     let pipeline = registry.get_pipeline("dense_matvec_f16w_f32io", device)?;
+
+    let gpu_params = GpuDenseGemmParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+    };
+
+    let n_dst: u64 = 4;
+    let n_simdgroup: u64 = 2;
+    let rows_per_tg = n_dst * n_simdgroup;
+
+    let threadgroups = MTLSize::new(
+        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
+        1,
+        1,
+    );
+    let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
+
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(a)),
+            (1, KernelArg::Buffer(b)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
+/// Dispatch a BF16-weight mat-vec: BF16 weights × F32 input → F32 output.
+///
+/// Use this for lm_head decode when weights have been cast F32→BF16.
+/// Produces numerically identical results to `dense_matmul_bf16_f32_tensor`
+/// for M=1 while using the much faster SIMD mat-vec instead of the tiled GEMM.
+/// M must be 1.
+///
+/// * `a`      - Input buffer `[1, K]` (f32)
+/// * `b`      - Weight buffer `[N, K]` (bf16)
+/// * `output` - Output buffer `[1, N]` (f32)
+pub fn dispatch_dense_matvec_bf16w_f32io(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DenseGemmF16Params,
+) -> Result<()> {
+    if params.m != 1 {
+        return Err(MlxError::InvalidArgument(
+            "dense_matvec_bf16w_f32io: M must be 1 (decode only)".into(),
+        ));
+    }
+    let pipeline = registry.get_pipeline("dense_matvec_bf16w_f32io", device)?;
+
+    let gpu_params = GpuDenseGemmParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+    };
+
+    let n_dst: u64 = 4;
+    let n_simdgroup: u64 = 2;
+    let rows_per_tg = n_dst * n_simdgroup;
+
+    let threadgroups = MTLSize::new(
+        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
+        1,
+        1,
+    );
+    let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
+
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(a)),
+            (1, KernelArg::Buffer(b)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
+/// Dispatch a pure F32 mat-vec: F32 input × F32 weights → F32 output.
+///
+/// This is the highest-precision M=1 path — no weight casting, no precision
+/// loss. Used for lm_head decode where weights are stored as F32. M must be 1.
+///
+/// * `a`      - Input buffer `[1, K]` (f32)
+/// * `b`      - Weight buffer `[N, K]` (f32)
+/// * `output` - Output buffer `[1, N]` (f32)
+pub fn dispatch_dense_matvec_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DenseGemmF16Params,
+) -> Result<()> {
+    if params.m != 1 {
+        return Err(MlxError::InvalidArgument(
+            "dense_matvec_f32: M must be 1 (decode only)".into(),
+        ));
+    }
+    let pipeline = registry.get_pipeline("dense_matvec_f32", device)?;
 
     let gpu_params = GpuDenseGemmParams {
         m: params.m,

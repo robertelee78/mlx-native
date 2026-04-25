@@ -227,6 +227,190 @@ kernel void dense_matvec_f16w_f32io(
 }
 
 // ============================================================
+// Kernel 1b-2: Mixed-precision mat-vec — BF16 weights × F32 input → F32 output
+// ============================================================
+//
+// Identical to dense_matvec_f16w_f32io but B (weights) is bfloat* not half*.
+// Used for lm_head decode when weights have been cast F32→BF16 to match the
+// precision of the tiled GEMM path (dense_matmul_bf16_f32_tensor). This
+// preserves byte-identical logit ordering vs the tiled GEMM while using the
+// much faster M=1 SIMD mat-vec.
+//
+// Buffer layout:
+//   buffer(0): A      — float  [1, K]  (input, F32)
+//   buffer(1): B      — bfloat [N, K]  (weights, BF16)
+//   buffer(2): C      — float  [1, N]  (output, F32)
+//   buffer(3): params — DenseGemmParams {M=1, N, K}
+
+kernel void dense_matvec_bf16w_f32io(
+    device const float*          A      [[buffer(0)]],
+    device const bfloat*         B      [[buffer(1)]],
+    device float*                C      [[buffer(2)]],
+    constant DenseGemmParams&    params [[buffer(3)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    uint    sgitg [[simdgroup_index_in_threadgroup]],
+    uint    tiisg [[thread_index_in_simdgroup]]
+) {
+    const uint K = params.K;
+    const uint N = params.N;
+
+    const uint row_base = tgpig.x * (MV_N_DST * 2);
+    const uint row0 = row_base + sgitg * MV_N_DST;
+
+    if (row0 >= N) return;
+
+    device const float* a_ptr = A;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    device const bfloat* b0 = B + (row0 + 0) * K;
+    device const bfloat* b1 = B + min(row0 + 1, N - 1) * K;
+    device const bfloat* b2 = B + min(row0 + 2, N - 1) * K;
+    device const bfloat* b3 = B + min(row0 + 3, N - 1) * K;
+
+    // Main K-loop: vectorized float4 loads for A, bfloat4 for B weights
+    const uint k_stride = MV_N_SIMDWIDTH * 4; // 128
+    uint k = tiisg * 4;
+
+    for (; k + 3 < K; k += k_stride) {
+        float4 afv = *((device const float4*)(a_ptr + k));
+
+        bfloat4 bv0 = *((device const bfloat4*)(b0 + k));
+        acc0 += dot(afv, float4(bv0));
+
+        if (row0 + 1 < N) {
+            bfloat4 bv1 = *((device const bfloat4*)(b1 + k));
+            acc1 += dot(afv, float4(bv1));
+        }
+        if (row0 + 2 < N) {
+            bfloat4 bv2 = *((device const bfloat4*)(b2 + k));
+            acc2 += dot(afv, float4(bv2));
+        }
+        if (row0 + 3 < N) {
+            bfloat4 bv3 = *((device const bfloat4*)(b3 + k));
+            acc3 += dot(afv, float4(bv3));
+        }
+    }
+
+    // Scalar remainder
+    for (; k < K; k += MV_N_SIMDWIDTH) {
+        if (k < K) {
+            float av = a_ptr[k];
+            acc0 += av * float(b0[k]);
+            if (row0 + 1 < N) acc1 += av * float(b1[k]);
+            if (row0 + 2 < N) acc2 += av * float(b2[k]);
+            if (row0 + 3 < N) acc3 += av * float(b3[k]);
+        }
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+
+    if (tiisg == 0) {
+        C[row0 + 0] = acc0;
+        if (row0 + 1 < N) C[row0 + 1] = acc1;
+        if (row0 + 2 < N) C[row0 + 2] = acc2;
+        if (row0 + 3 < N) C[row0 + 3] = acc3;
+    }
+}
+
+// ============================================================
+// Kernel 1c: Pure F32 mat-vec — F32 weights × F32 input → F32 output
+// ============================================================
+//
+// Identical to dense_matvec_f16w_f32io but B (weights) is float* not half*.
+// Used for lm_head decode when weights are stored as F32 (avoids precision
+// loss from the F16 or BF16 cast path).
+//
+// Buffer layout:
+//   buffer(0): A      — float [1, K]  (input, F32)
+//   buffer(1): B      — float [N, K]  (weights, F32)
+//   buffer(2): C      — float [1, N]  (output, F32)
+//   buffer(3): params — DenseGemmParams {M=1, N, K}
+
+kernel void dense_matvec_f32(
+    device const float*          A      [[buffer(0)]],
+    device const float*          B      [[buffer(1)]],
+    device float*                C      [[buffer(2)]],
+    constant DenseGemmParams&    params [[buffer(3)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    uint    sgitg [[simdgroup_index_in_threadgroup]],
+    uint    tiisg [[thread_index_in_simdgroup]]
+) {
+    const uint K = params.K;
+    const uint N = params.N;
+
+    const uint row_base = tgpig.x * (MV_N_DST * 2);
+    const uint row0 = row_base + sgitg * MV_N_DST;
+
+    if (row0 >= N) return;
+
+    device const float* a_ptr = A;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    device const float* b0 = B + (row0 + 0) * K;
+    device const float* b1 = B + min(row0 + 1, N - 1) * K;
+    device const float* b2 = B + min(row0 + 2, N - 1) * K;
+    device const float* b3 = B + min(row0 + 3, N - 1) * K;
+
+    // Main K-loop: vectorized float4 loads for both A and B
+    const uint k_stride = MV_N_SIMDWIDTH * 4; // 128
+    uint k = tiisg * 4;
+
+    for (; k + 3 < K; k += k_stride) {
+        float4 afv = *((device const float4*)(a_ptr + k));
+
+        float4 bv0 = *((device const float4*)(b0 + k));
+        acc0 += dot(afv, bv0);
+
+        if (row0 + 1 < N) {
+            float4 bv1 = *((device const float4*)(b1 + k));
+            acc1 += dot(afv, bv1);
+        }
+        if (row0 + 2 < N) {
+            float4 bv2 = *((device const float4*)(b2 + k));
+            acc2 += dot(afv, bv2);
+        }
+        if (row0 + 3 < N) {
+            float4 bv3 = *((device const float4*)(b3 + k));
+            acc3 += dot(afv, bv3);
+        }
+    }
+
+    // Scalar remainder
+    for (; k < K; k += MV_N_SIMDWIDTH) {
+        if (k < K) {
+            float av = a_ptr[k];
+            acc0 += av * b0[k];
+            if (row0 + 1 < N) acc1 += av * b1[k];
+            if (row0 + 2 < N) acc2 += av * b2[k];
+            if (row0 + 3 < N) acc3 += av * b3[k];
+        }
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+
+    if (tiisg == 0) {
+        C[row0 + 0] = acc0;
+        if (row0 + 1 < N) C[row0 + 1] = acc1;
+        if (row0 + 2 < N) C[row0 + 2] = acc2;
+        if (row0 + 3 < N) C[row0 + 3] = acc3;
+    }
+}
+
+// ============================================================
 // Kernel 2: Fallback tiled GEMM for M>1
 // ============================================================
 //
