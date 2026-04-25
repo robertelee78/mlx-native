@@ -364,7 +364,10 @@ fn test_gdn_gqa_broadcast_correct_k_head_picked() {
     let p = GatedDeltaNetParams {
         d_k: 4, d_v: 4, n_k_heads: 2, n_v_heads: 6, n_tokens: 2, n_seqs: 1,
     };
-    // group_ratio = 3. v_heads [0,1,2] -> k_head 0; v_heads [3,4,5] -> k_head 1.
+    // GQA mapping is modulo (k_head = v_head % n_k_heads, matching
+    // llama.cpp's tiled convention — see 4f00f6e).
+    // n_k_heads=2, n_v_heads=6 -> v_heads {0,2,4} share k_head 0;
+    // v_heads {1,3,5} share k_head 1.
 
     let mut k = vec![0.0f32; p.d_k as usize * 2 * 2]; // D_k * n_k_heads * n_tokens * 1
     // k_head 0, t=0: all ones. k_head 1, t=0: all tens. t=1 pattern different.
@@ -386,32 +389,52 @@ fn test_gdn_gqa_broadcast_correct_k_head_picked() {
     );
     let (out_cpu, _) = cpu_reference_f32(&q, &k, &v, &g, &beta, &state_in, p);
 
+    // Tolerance: 1e-3 matches the multi-seq test's threshold for the same
+    // GDN recurrence. The k_head 1 init values are 10–11, which the q·k·state
+    // recurrence amplifies to outputs ~O(4000); a 1e-4 absolute bound was
+    // tighter than f32 noise at this scale (~4e-4 absolute / ~8e-8 relative
+    // on a -4773 value — within reorder-induced rounding).
     for (idx, (&gu, &cu)) in out_gpu.iter().zip(out_cpu.iter()).enumerate() {
         assert!(
-            (gu - cu).abs() < 1e-4,
+            (gu - cu).abs() < 1e-3,
             "gqa out[{}]: gpu={}, cpu={}",
             idx, gu, cu
         );
     }
 
-    // Verify that v_heads 0..3 produce identical outputs (shared k_head 0,
-    // identical v/q/g/beta) AND differ from v_heads 3..6.
+    // Verify equivalence under modulo GQA mapping: v_heads {0,2,4} all share
+    // k_head 0, v_heads {1,3,5} all share k_head 1. Within a group, identical
+    // v/q/g/beta + same k_head ⇒ identical output. Across groups, k differs
+    // (k_head 1 init = 10× k_head 0) so outputs must differ measurably.
     let d_v = p.d_v as usize;
     let t = 0;
     let base = t * (p.n_v_heads as usize * d_v);
-    for vh in 1..3 {
+    // Group 0: {0, 2, 4} share k_head 0 — must match v_head 0 element-wise.
+    for vh in [2usize, 4] {
         for i in 0..d_v {
             assert!(
                 (out_gpu[base + 0 * d_v + i] - out_gpu[base + vh * d_v + i]).abs() < 1e-5,
-                "v_heads 0 and {} in same GQA group should produce identical output",
+                "v_heads 0 and {} share k_head 0 — should produce identical output",
                 vh
             );
         }
     }
-    // v_head 0 and v_head 3 are in different groups — should differ.
+    // Group 1: {1, 3, 5} share k_head 1 — must match v_head 1 element-wise.
+    for vh in [3usize, 5] {
+        for i in 0..d_v {
+            assert!(
+                (out_gpu[base + 1 * d_v + i] - out_gpu[base + vh * d_v + i]).abs() < 1e-5,
+                "v_heads 1 and {} share k_head 1 — should produce identical output",
+                vh
+            );
+        }
+    }
+    // Across groups: v_head 0 (k_head 0) and v_head 1 (k_head 1) must differ —
+    // k_head 1 init values are 10× k_head 0, so the recurrence diverges
+    // measurably.
     let mut any_differ = false;
     for i in 0..d_v {
-        if (out_gpu[base + 0 * d_v + i] - out_gpu[base + 3 * d_v + i]).abs() > 1e-3 {
+        if (out_gpu[base + 0 * d_v + i] - out_gpu[base + 1 * d_v + i]).abs() > 1e-3 {
             any_differ = true;
             break;
         }
