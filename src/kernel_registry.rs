@@ -117,6 +117,16 @@ impl KernelRegistry {
             include_str!("shaders/dense_mm_bf16_tensor.metal");
         sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
 
+        // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
+        // for M=1 single-token decode.  Port of llama.cpp's
+        // kernel_mul_mv_bf16_f32_4 (bfloat4-vectorized GEMV kernel).
+        // Used in apply_linear_projection_f32 when seq_len=1 and the
+        // weight matrix is BF16, replacing the MM kernel (~2× faster for
+        // M=1 due to better memory bandwidth utilization per thread).
+        let dense_gemv_bf16_src: &'static str =
+            include_str!("shaders/dense_gemv_bf16.metal");
+        sources.insert("hf2q_dense_gemv_bf16_f32_4".into(), dense_gemv_bf16_src);
+
         // Fused scale-mask-softmax for the non-flash-attention prefill
         // path.  One row-local threadgroup per (head, query) pair
         // replaces three separate dispatches (scale, mask-add, softmax);
@@ -137,6 +147,7 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_ggml.metal");
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
@@ -348,6 +359,12 @@ impl KernelRegistry {
         let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
         sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
         sources.insert("sigmoid_mul_bf16".into(), sigmoid_mul_src);
+        let silu_mul_src: &'static str = include_str!("shaders/silu_mul.metal");
+        sources.insert("silu_mul_f32".into(), silu_mul_src);
+        let compute_g_beta_src: &'static str = include_str!("shaders/compute_g_beta.metal");
+        sources.insert("compute_g_beta_f32".into(), compute_g_beta_src);
+        let ssm_norm_gate_src: &'static str = include_str!("shaders/ssm_norm_gate.metal");
+        sources.insert("ssm_norm_gate_f32".into(), ssm_norm_gate_src);
         let gelu_src: &'static str = include_str!("shaders/gelu.metal");
         sources.insert("gelu_f32".into(), gelu_src);
         sources.insert("gelu_f16".into(), gelu_src);
@@ -416,6 +433,10 @@ impl KernelRegistry {
         sources.insert("dense_gemm_f16".into(), dense_gemm_src);
         sources.insert("dense_matvec_f16".into(), dense_gemm_src);
         sources.insert("dense_matvec_f16w_f32io".into(), dense_gemm_src);
+        // BF16-weight mat-vec: BF16 weights × F32 input → F32 output (decode lm_head)
+        sources.insert("dense_matvec_bf16w_f32io".into(), dense_gemm_src);
+        // Pure F32 mat-vec: F32 weights × F32 input → F32 output (decode lm_head)
+        sources.insert("dense_matvec_f32".into(), dense_gemm_src);
 
         // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
@@ -455,6 +476,18 @@ impl KernelRegistry {
         // Top-K kernel for Q8 rerank: avoids full-logits readback.
         let top_k_src: &'static str = include_str!("shaders/top_k.metal");
         sources.insert("top_k_f32".into(), top_k_src);
+
+        // MoE GPU routing + weighted reduce (ADR-013 P13.3 perf).
+        // Replaces CPU softmax+topk round-trip and CPU weighted accumulate.
+        let moe_stk_src: &'static str =
+            include_str!("shaders/moe_softmax_topk.metal");
+        sources.insert("moe_softmax_topk_f32".into(), moe_stk_src);
+        let moe_wr_src: &'static str =
+            include_str!("shaders/moe_weighted_reduce.metal");
+        sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
+        let sdpa_decode_src: &'static str =
+            include_str!("shaders/sdpa_decode.metal");
+        sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
         Self {
             cache: HashMap::new(),

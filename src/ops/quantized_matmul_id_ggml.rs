@@ -66,8 +66,9 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
+            GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::I16 => "unsupported",
         }
     }
 
@@ -77,8 +78,10 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
+            // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
+            GgmlType::Q5_K => "unsupported",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::I16 => "unsupported",
         }
     }
 
@@ -89,8 +92,10 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
+            // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
+            GgmlType::Q5_K => "unsupported",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::I16 => "unsupported",
         }
     }
 }
@@ -237,9 +242,11 @@ pub fn quantized_matmul_id_ggml(
     //   * decode (n_tokens <= 8)
     //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
+    //   * Q5_K (mm_id not yet ported — only mv_id kernel exists)
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
+        && params.ggml_type != GgmlType::Q5_K
     {
         return dispatch_id_mm(
             encoder, registry, device, input, weight, ids, output, params,
@@ -346,9 +353,11 @@ pub fn quantized_matmul_id_ggml_pooled(
     }
 
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
+    // Q5_K: mm_id not yet ported; always use mv_id.
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
+        && params.ggml_type != GgmlType::Q5_K
     {
         return dispatch_id_mm_pooled(
             encoder, registry, device, input, weight, ids, output,
@@ -398,11 +407,11 @@ fn dispatch_id_mv(
 
     let (nth0, nth1, align) = match params.ggml_type {
         GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
-        GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        // Q5_K and Q6_K both use the 2-row-per-threadgroup (2, 32) geometry.
+        GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::Q4_K
-        | GgmlType::Q5_K
         | GgmlType::I16 => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_id_ggml does not support {:?}",

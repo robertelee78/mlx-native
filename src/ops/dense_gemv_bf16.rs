@@ -44,26 +44,28 @@ pub fn register(registry: &mut KernelRegistry) {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DenseGemvBf16GpuParams {
-    ne00: i32,    // K
-    ne01: i32,    // N
-    ne02: i32,    // src0_batch
-    nb00: u64,    // sizeof(bfloat) = 2  (unused by kernel, kept for layout)
-    nb01: u64,    // K * 2  (src0 row stride in bytes)
-    nb02: u64,    // N * K * 2  (src0 batch stride in bytes)
-    nb03: u64,    // 0  (super-batch unused)
-    ne10: i32,    // K  (unused by kernel, kept for layout)
-    ne11: i32,    // M
-    ne12: i32,    // src1_batch
-    nb10: u64,    // sizeof(float) = 4  (unused by kernel)
-    nb11: u64,    // K * 4  (src1 row stride in bytes)
-    nb12: u64,    // M * K * 4  (src1 batch stride in bytes)
-    nb13: u64,    // 0
-    ne0:  i32,    // N
-    ne1:  i32,    // M
-    nr0:  i32,    // 2  (NR0 — weight rows per threadgroup)
-    r2:   i16,    // src1_batch / src0_batch
-    r3:   i16,    // 1
-    _pad: u32,    // padding to 8-byte align
+    ne00: i32,         // K
+    ne01: i32,         // N
+    ne02: i32,         // src0_batch
+    _pad0: u32,        // align ne02 → nb00 (4 bytes, uint64_t needs 8-byte alignment)
+    nb00: u64,         // sizeof(bfloat) = 2  (unused by kernel, kept for layout)
+    nb01: u64,         // K * 2  (src0 row stride in bytes)
+    nb02: u64,         // N * K * 2  (src0 batch stride in bytes)
+    nb03: u64,         // 0  (super-batch unused)
+    ne10: i32,         // K  (unused by kernel, kept for layout)
+    ne11: i32,         // M
+    ne12: i32,         // src1_batch
+    _pad1: u32,        // align ne12 → nb10 (4 bytes, uint64_t needs 8-byte alignment)
+    nb10: u64,         // sizeof(float) = 4  (unused by kernel)
+    nb11: u64,         // K * 4  (src1 row stride in bytes)
+    nb12: u64,         // M * K * 4  (src1 batch stride in bytes)
+    nb13: u64,         // 0
+    ne0:  i32,         // N
+    ne1:  i32,         // M
+    nr0:  i32,         // 2  (NR0 — weight rows per threadgroup)
+    r2:   i16,         // src1_batch / src0_batch
+    r3:   i16,         // 1
+    // Total: 112 bytes, 8-byte aligned — no trailing pad needed.
 }
 
 /// Dense bf16 × f32 → f32 GEMV — optimized for M = 1 (single-token decode).
@@ -146,6 +148,7 @@ pub fn dense_gemv_bf16_f32(
         ne00: params.k as i32,
         ne01: params.n as i32,
         ne02: params.src0_batch as i32,
+        _pad0: 0,
         nb00: bf16_sz as u64,
         nb01,
         nb02,
@@ -153,6 +156,7 @@ pub fn dense_gemv_bf16_f32(
         ne10: params.k as i32,
         ne11: params.m as i32,
         ne12: params.src1_batch as i32,
+        _pad1: 0,
         nb10: f32_sz as u64,
         nb11,
         nb12,
@@ -162,7 +166,6 @@ pub fn dense_gemv_bf16_f32(
         nr0:  NR0 as i32,
         r2,
         r3:   1,
-        _pad: 0,
     };
 
     let pipeline = registry.get_pipeline("hf2q_dense_gemv_bf16_f32_4", device.metal_device())?;
