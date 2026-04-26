@@ -141,10 +141,18 @@ const K_BF16_D512_BOOLMASK: &str = "flash_attn_prefill_bf16_d512_boolmask";
 const K_F16_D512: &str = "flash_attn_prefill_f16_d512";
 /// D=512, f16 I/O, bool mask.
 const K_F16_D512_BOOLMASK: &str = "flash_attn_prefill_f16_d512_boolmask";
+/// D=64, bf16 I/O, bf16 additive mask (BERT family).
+const K_BF16_D64: &str = "flash_attn_prefill_bf16_d64";
+/// D=64, bf16 I/O, bool (`is_attended`) mask.
+const K_BF16_D64_BOOLMASK: &str = "flash_attn_prefill_bf16_d64_boolmask";
+/// D=64, f16 I/O, f16 additive mask.
+const K_F16_D64: &str = "flash_attn_prefill_f16_d64";
+/// D=64, f16 I/O, bool mask.
+const K_F16_D64_BOOLMASK: &str = "flash_attn_prefill_f16_d64_boolmask";
 
-/// All 8 kernel entry-point names exported by `flash_attn_prefill.metal`.
+/// All 12 kernel entry-point names exported by `flash_attn_prefill.metal`.
 ///
-/// Registering all 8 against the single shader source costs nothing at
+/// Registering all of them against the single shader source costs nothing at
 /// registration time (source is a static `&str`) and ensures additional
 /// dispatchers (f16 paths, D=512 exposure) can be added later without
 /// touching registration here.
@@ -157,6 +165,10 @@ const ALL_KERNEL_NAMES: &[&str] = &[
     K_BF16_D512_BOOLMASK,
     K_F16_D512,
     K_F16_D512_BOOLMASK,
+    K_BF16_D64,
+    K_BF16_D64_BOOLMASK,
+    K_F16_D64,
+    K_F16_D64_BOOLMASK,
 ];
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -330,6 +342,35 @@ const WM_D256: u32 = 4;
 
 /// Simdgroups along K dimension for D=256: WN=1.
 const WN_D256: u32 = 1;
+
+// ─── Tile geometry constants (D=64) ──────────────────────────────────────────
+//
+// Same simdgroup geometry as D=256: 4 simdgroups along Q, 1 along K, with
+// BQ=32 / BK=16.  Threadgroup-memory math at bf16:
+//   Qs  = BQ × (BD + padQ) × 2   = 32 × (64 + 8) × 2  = 4 608 bytes
+//   KVs = max(BK*(BD+padV), (BK+padK)*BD) × 2
+//                                 = max(16×72, 24×64) × 2 = max(1152, 1536) × 2
+//                                 = 3 072 bytes
+//   total ≈ 7 680 bytes — fits well under the 32 KiB Apple Silicon TG limit.
+//
+// Static-asserts required by the kernel (with kFragSize=8):
+//   BQ % (kNWarps × kFragSize) = 32 % (4×8) = 0 ✓
+//   BQ ≥ kNWarps × kFragSize   = 32 ≥ 32     ✓
+//   TQ = BQ / (kNWarps × kFragSize) = 1       ✓
+//   TD = BD / kFragSize        = 64/8 = 8     ✓
+//   TK = BK / kFragSize        = 16/8 = 2     ✓
+
+/// Q tile size for D=64: BQ=32.
+const BQ_D64: u32 = 32;
+
+/// KV tile size for D=64: BK=16.
+const BK_D64: u32 = 16;
+
+/// Simdgroups along Q dimension for D=64: WM=4.
+const WM_D64: u32 = 4;
+
+/// Simdgroups along K dimension for D=64: WN=1.
+const WN_D64: u32 = 1;
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -764,6 +805,290 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_with_blk(
                 (4, KernelArg::Bytes(as_bytes(&attn_params))),
                 // buffers 5, 6, 7 intentionally absent — has_mask=false +
                 // has_blk=false constants dead-code-eliminate mask + blk loads.
+            ],
+            grid,
+            tg_size,
+        );
+    }
+
+    Ok(())
+}
+
+// ─── bf16 D=64 dispatcher ────────────────────────────────────────────────────
+
+/// Layout selector for [`dispatch_flash_attn_prefill_bf16_d64`].
+///
+/// The kernel reads from raw device pointers via integer strides, so any
+/// element layout that keeps `head_dim` (`D`) as the contiguous innermost
+/// axis is valid input.  The two layouts named here both satisfy that
+/// constraint and cover every BERT/embedding caller in hf2q today:
+///
+/// * `HeadMajor` — `[B, H, L, D]`, the same layout the D=256/D=512
+///   dispatchers assume.  Stride math:
+///   `seq = D`, `head = L * D`, `batch = H * L * D`.
+///
+/// * `SeqMajor` — `[B, L, H, D]`, the natural output of BERT linear
+///   projections (`hidden = H * D` row-major).  Stride math:
+///   `seq = H * D`, `head = D`, `batch = L * H * D`.
+///   Choosing this layout avoids three host-side transpose dispatches per
+///   layer (Q + K + V) plus one for the output, which is the entire point
+///   of the D=64 dispatcher's existence — the BERT family wins on dispatch
+///   count, not raw FA perf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttnPrefillLayout {
+    /// `[B, H, L, D]` — same as the D=256/D=512 dispatchers.
+    HeadMajor,
+    /// `[B, L, H, D]` — natural BERT/embedding-model layout.
+    SeqMajor,
+}
+
+impl FlashAttnPrefillLayout {
+    /// Compute (batch_stride, head_stride, seq_stride) given the shape and
+    /// number of heads at this layout.  All strides are in elements (not
+    /// bytes); the caller multiplies by `dtype.size_of()` if needed.
+    fn strides(self, n_heads: u32, seq_len: u32, head_dim: u32) -> [i64; 3] {
+        let h = n_heads as i64;
+        let l = seq_len as i64;
+        let d = head_dim as i64;
+        match self {
+            // `[B, H, L, D]`
+            //   seq stride  = D
+            //   head stride = L*D
+            //   batch stride = H*L*D
+            FlashAttnPrefillLayout::HeadMajor => [h * l * d, l * d, d],
+            // `[B, L, H, D]`
+            //   seq stride  = H*D
+            //   head stride = D
+            //   batch stride = L*H*D
+            FlashAttnPrefillLayout::SeqMajor => [l * h * d, d, h * d],
+        }
+    }
+}
+
+/// Dispatch flash-attention prefill for bf16 Q/K/V/O, head_dim=64.
+///
+/// Encodes a compute command into `encoder` without committing.  The caller
+/// controls when to call `encoder.commit_and_wait()`.
+///
+/// Designed for the BERT/embedding family (nomic-bert, bge, mxbai, MiniLM,
+/// …) where `head_dim` is 64 and the natural layout coming out of the
+/// linear projections is **seq-major** `[B, L, H, D]` — the outer axis of
+/// each row is the hidden dimension `H * D` rather than the per-head
+/// `[H, L, D]` of decoder-style models.  Pass `layout = SeqMajor` to consume
+/// that layout directly without three host-side transpose dispatches per
+/// layer.  Pass `layout = HeadMajor` for the same `[B, H, L, D]` contract
+/// that the D=256/D=512 dispatchers obey (e.g. unit tests, future decoder
+/// models that happen to land on D=64).
+///
+/// # Buffer layouts
+///
+/// All buffers must be contiguous along the innermost `D=64` axis.
+///
+/// HeadMajor (`layout = HeadMajor`):
+/// - `q`    — `[batch, n_heads,    seq_len_q, 64]`, dtype BF16
+/// - `k`    — `[batch, n_kv_heads, seq_len_k, 64]`, dtype BF16
+/// - `v`    — `[batch, n_kv_heads, seq_len_k, 64]`, dtype BF16
+/// - `out`  — `[batch, n_heads,    seq_len_q, 64]`, dtype BF16
+///
+/// SeqMajor (`layout = SeqMajor`):
+/// - `q`    — `[batch, seq_len_q, n_heads,    64]`, dtype BF16
+/// - `k`    — `[batch, seq_len_k, n_kv_heads, 64]`, dtype BF16
+/// - `v`    — `[batch, seq_len_k, n_kv_heads, 64]`, dtype BF16
+/// - `out`  — `[batch, seq_len_q, n_heads,    64]`, dtype BF16
+///
+/// `mask` may be either rank-2 `[seq_len_q, seq_len_k]` (broadcast across
+/// batch+heads — the BERT padding-mask shape) or rank-4
+/// `[batch, n_heads, seq_len_q, seq_len_k]` (per-head).  Both use the
+/// llama.cpp additive convention: 0.0 = attend, -inf = mask out.
+///
+/// # Function constants
+///
+/// Same as the D=256 dispatcher (indices 200, 201, 300, 301, 303 — the
+/// `has_blk` Wave-2E byte-buffer constant is forced to `false` here because
+/// the Wave-2E tile-skip pre-pass kernel is currently only instantiated for
+/// the D=256 BQ/BK tile shape; BERT models do not stack a tile-skip
+/// pass on top of attention so this is not a regression).
+///
+/// # Errors
+///
+/// Same error contract as `dispatch_flash_attn_prefill_bf16_d256` plus
+/// `head_dim != 64`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d64(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    out: &mut MlxBuffer,
+    params: &FlashAttnPrefillParams,
+    layout: FlashAttnPrefillLayout,
+) -> Result<()> {
+    // ── Validate ──────────────────────────────────────────────────────────
+    if params.head_dim != 64 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d64: head_dim must be 64, got {}",
+            params.head_dim
+        )));
+    }
+    validate_params(params)?;
+
+    // All buffers must be BF16 for this dispatcher.
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::BF16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_bf16_d64: {name} buffer must be BF16, got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+    if let Some(m) = mask {
+        if m.dtype() != DType::BF16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_bf16_d64: mask buffer must be BF16, got {:?}",
+                m.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let kl = params.seq_len_k as usize;
+    let d = params.head_dim as usize; // = 64
+
+    // Validate buffer element counts (layout-independent: total elements
+    // are `B * H * L * D` either way).
+    validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    validate_buffer_size(k, "K", batch * h_kv * kl * d)?;
+    validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
+    validate_buffer_size(out, "out", batch * h * ql * d)?;
+
+    let mask_is_rank2_broadcast = mask.is_some_and(|m| m.shape().len() == 2);
+    if let Some(m) = mask {
+        if mask_is_rank2_broadcast {
+            validate_buffer_size(m, "mask", ql * kl)?;
+        } else {
+            validate_buffer_size(m, "mask", batch * h * ql * kl)?;
+        }
+    }
+
+    // ── Tile geometry ─────────────────────────────────────────────────────
+    let bq = BQ_D64;
+    let bk = BK_D64;
+    let wm = WM_D64;
+    let wn = WN_D64;
+
+    let nq = params.seq_len_q.div_ceil(bq);
+    let nk = params.seq_len_k.div_ceil(bk);
+    let nq_aligned = params.seq_len_q / bq;
+    let nk_aligned = params.seq_len_k / bk;
+    let ql_rem = params.seq_len_q % bq;
+    let kl_rem = params.seq_len_k % bk;
+
+    // Function constants (specialised at pipeline creation time).
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = mask.is_some();
+    let has_blk = false;
+    let do_causal = params.do_causal;
+
+    // ── Kernel name ───────────────────────────────────────────────────────
+    let kernel_name = K_BF16_D64;
+
+    // ── Pipeline lookup (with function constants) ─────────────────────────
+    let pipeline = registry.get_pipeline_with_bool_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+    )?;
+
+    // ── Build AttnParams GPU struct (strides depend on layout) ────────────
+    let q_strides = layout.strides(params.n_heads, params.seq_len_q, params.head_dim);
+    let kv_strides = layout.strides(params.n_kv_heads, params.seq_len_k, params.head_dim);
+    let o_strides = layout.strides(params.n_heads, params.seq_len_q, params.head_dim);
+
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: 0,
+        _pad: 0,
+        q_strides,
+        k_strides: kv_strides,
+        v_strides: kv_strides,
+        o_strides,
+    };
+
+    // ── Grid geometry ──────────────────────────────────────────────────────
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
+    let tg_size = MTLSize::new(32, wm as u64, wn as u64);
+
+    // ── Encode ─────────────────────────────────────────────────────────────
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+
+    if has_mask {
+        let mask_buf = mask.ok_or_else(|| {
+            MlxError::InvalidArgument(
+                "flash_attn_prefill_d64: internal error — has_mask=true but mask is None".into(),
+            )
+        })?;
+
+        let (m_batch_stride, m_head_stride, m_ql_stride) = if mask_is_rank2_broadcast {
+            (0_i64, 0_i64, kl as i64)
+        } else {
+            ((h * ql * kl) as i64, (ql * kl) as i64, kl as i64)
+        };
+
+        let mask_params = AttnMaskParamsGpu {
+            m_strides: [m_batch_stride, m_head_stride, m_ql_stride],
+        };
+
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(q)),
+                (1, KernelArg::Buffer(k)),
+                (2, KernelArg::Buffer(v)),
+                (3, KernelArg::Buffer(out)),
+                (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                (6, KernelArg::Buffer(mask_buf)),
+            ],
+            grid,
+            tg_size,
+        );
+    } else {
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(q)),
+                (1, KernelArg::Buffer(k)),
+                (2, KernelArg::Buffer(v)),
+                (3, KernelArg::Buffer(out)),
+                (4, KernelArg::Bytes(as_bytes(&attn_params))),
             ],
             grid,
             tg_size,

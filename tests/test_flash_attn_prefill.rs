@@ -3231,6 +3231,415 @@ fn test_mask_rank4_preserved_regression() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// § D=64 GPU CORRECTNESS — BERT/embedding family
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Validates the new D=64 dispatcher (`dispatch_flash_attn_prefill_bf16_d64`)
+// against the bf16-rounded CPU reference at the same tolerance budget as
+// D=256.  Two layout paths (HeadMajor and SeqMajor) are tested separately
+// — both share the kernel binary but use different stride math, so a
+// stride bug in one cannot be masked by a passing test on the other.
+
+use mlx_native::ops::flash_attn_prefill::{
+    dispatch_flash_attn_prefill_bf16_d64,
+    FlashAttnPrefillLayout,
+};
+
+/// Run the D=64 dispatcher in HeadMajor layout (`[B, H, L, D]`) — the same
+/// layout the D=256/D=512 dispatchers consume.  Returns the bf16-rounded
+/// output as f32.
+#[allow(clippy::too_many_arguments)]
+fn run_bf16_gpu_d64_head_major(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_bf16: &[bf16],
+    k_bf16: &[bf16],
+    v_bf16: &[bf16],
+    mask_bf16: Option<&[bf16]>,
+    batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    ql: usize,
+    kl: usize,
+    head_dim: usize,
+    scale: f32,
+    do_causal: bool,
+) -> Vec<f32> {
+    assert_eq!(head_dim, 64, "D=64 dispatcher requires head_dim=64");
+
+    let q_elems = batch * n_heads * ql * head_dim;
+    let kv_elems = batch * n_kv_heads * kl * head_dim;
+
+    let q_buf = alloc_bf16(device, q_elems, "Q");
+    let k_buf = alloc_bf16(device, kv_elems, "K");
+    let v_buf = alloc_bf16(device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(device, q_elems, "out");
+
+    fill_bf16_buffer(&q_buf, q_bf16);
+    fill_bf16_buffer(&k_buf, k_bf16);
+    fill_bf16_buffer(&v_buf, v_bf16);
+
+    let mask_buf = mask_bf16.map(|m| {
+        let mask_elems = batch * n_heads * ql * kl;
+        assert_eq!(m.len(), mask_elems, "mask length mismatch");
+        let buf = alloc_bf16(device, mask_elems, "mask");
+        fill_bf16_buffer(&buf, m);
+        buf
+    });
+
+    let params = FlashAttnPrefillParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d64(
+        &mut encoder, device, registry,
+        &q_buf, &k_buf, &v_buf, mask_buf.as_ref(), &mut out_buf, &params,
+        FlashAttnPrefillLayout::HeadMajor,
+    ).expect("bf16 D=64 head-major dispatch");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let out_bf16 = read_bf16_buffer(&out_buf, q_elems);
+    bf16_to_f32(&out_bf16)
+}
+
+/// Transpose `[B, H, L, D]` → `[B, L, H, D]` (head-major to seq-major).
+fn head_to_seq_major(
+    src: &[bf16], batch: usize, n_heads: usize, l: usize, d: usize,
+) -> Vec<bf16> {
+    let mut out = vec![bf16::from_f32(0.0); batch * l * n_heads * d];
+    for b in 0..batch {
+        for h in 0..n_heads {
+            for s in 0..l {
+                for k in 0..d {
+                    let src_idx = b * n_heads * l * d + h * l * d + s * d + k;
+                    let dst_idx = b * l * n_heads * d + s * n_heads * d + h * d + k;
+                    out[dst_idx] = src[src_idx];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Transpose `[B, L, H, D]` → `[B, H, L, D]` (seq-major back to head-major).
+fn seq_to_head_major(
+    src: &[bf16], batch: usize, n_heads: usize, l: usize, d: usize,
+) -> Vec<bf16> {
+    let mut out = vec![bf16::from_f32(0.0); batch * n_heads * l * d];
+    for b in 0..batch {
+        for s in 0..l {
+            for h in 0..n_heads {
+                for k in 0..d {
+                    let src_idx = b * l * n_heads * d + s * n_heads * d + h * d + k;
+                    let dst_idx = b * n_heads * l * d + h * l * d + s * d + k;
+                    out[dst_idx] = src[src_idx];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run the D=64 dispatcher in SeqMajor layout (`[B, L, H, D]`) — the
+/// natural BERT/embedding layout.  Caller passes head-major bf16 inputs;
+/// helper transposes them in/out so the test math stays in head-major
+/// (matching the CPU reference).
+#[allow(clippy::too_many_arguments)]
+fn run_bf16_gpu_d64_seq_major(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_bf16_head_major: &[bf16],
+    k_bf16_head_major: &[bf16],
+    v_bf16_head_major: &[bf16],
+    mask_bf16_rank2: Option<&[bf16]>, // rank-2 [qL, kL] broadcast across batch+heads
+    batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    ql: usize,
+    kl: usize,
+    head_dim: usize,
+    scale: f32,
+    do_causal: bool,
+) -> Vec<f32> {
+    assert_eq!(head_dim, 64, "D=64 dispatcher requires head_dim=64");
+
+    let q_elems = batch * n_heads * ql * head_dim;
+    let kv_elems = batch * n_kv_heads * kl * head_dim;
+
+    // Transpose inputs to seq-major before binding.
+    let q_seq = head_to_seq_major(q_bf16_head_major, batch, n_heads, ql, head_dim);
+    let k_seq = head_to_seq_major(k_bf16_head_major, batch, n_kv_heads, kl, head_dim);
+    let v_seq = head_to_seq_major(v_bf16_head_major, batch, n_kv_heads, kl, head_dim);
+
+    let q_buf = alloc_bf16(device, q_elems, "Q");
+    let k_buf = alloc_bf16(device, kv_elems, "K");
+    let v_buf = alloc_bf16(device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(device, q_elems, "out");
+
+    fill_bf16_buffer(&q_buf, &q_seq);
+    fill_bf16_buffer(&k_buf, &k_seq);
+    fill_bf16_buffer(&v_buf, &v_seq);
+
+    // Rank-2 mask buffer: shape [qL, kL].
+    let mask_buf = mask_bf16_rank2.map(|m| {
+        let mask_elems = ql * kl;
+        assert_eq!(m.len(), mask_elems, "rank-2 mask length mismatch");
+        let buf = device
+            .alloc_buffer(mask_elems * 2, DType::BF16, vec![ql, kl])
+            .unwrap_or_else(|e| panic!("alloc rank-2 mask: {e:?}"));
+        fill_bf16_buffer(&buf, m);
+        buf
+    });
+
+    let params = FlashAttnPrefillParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d64(
+        &mut encoder, device, registry,
+        &q_buf, &k_buf, &v_buf, mask_buf.as_ref(), &mut out_buf, &params,
+        FlashAttnPrefillLayout::SeqMajor,
+    ).expect("bf16 D=64 seq-major dispatch");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    // Read seq-major output, transpose back to head-major for comparison.
+    let out_seq = read_bf16_buffer(&out_buf, q_elems);
+    let out_head = seq_to_head_major(&out_seq, batch, n_heads, ql, head_dim);
+    bf16_to_f32(&out_head)
+}
+
+/// D=64 HeadMajor: unmasked, non-causal, multiple seq lengths.
+#[test]
+fn test_gpu_bf16_d64_head_major_unmasked() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    for &(ql, kl) in &[(32usize, 32usize), (128, 128), (512, 512)] {
+        let batch = 1; let h = 12; let kv_h = 12; let d = 64;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let q = pseudo_random_f32(SEED + 90, batch * h * ql * d);
+        let k = pseudo_random_f32(SEED + 91, batch * kv_h * kl * d);
+        let v = pseudo_random_f32(SEED + 92, batch * kv_h * kl * d);
+        let q_bf = f32_to_bf16(&q);
+        let k_bf = f32_to_bf16(&k);
+        let v_bf = f32_to_bf16(&v);
+
+        let gpu_out = run_bf16_gpu_d64_head_major(
+            &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+        let ref_out = reference_for_bf16(
+            &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+
+        assert_all_finite(&gpu_out, &format!("d64_hm_unmasked_ql{ql}_kl{kl}"));
+        assert_close_gpu(
+            &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+            &format!("d64_hm_unmasked_ql{ql}_kl{kl}"),
+        );
+    }
+}
+
+/// D=64 HeadMajor: with rank-4 additive mask (per-head BERT-style padding).
+#[test]
+fn test_gpu_bf16_d64_head_major_additive_mask() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let batch = 1; let h = 12; let kv_h = 12; let ql = 128; let kl = 128; let d = 64;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 100, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 101, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 102, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    let mask_f32: Vec<f32> = (0..batch * h * ql * kl)
+        .map(|i| if i % 2 == 0 { 0.0_f32 } else { -1.0e4_f32 })
+        .collect();
+    let mask_bf = f32_to_bf16(&mask_f32);
+
+    let gpu_out = run_bf16_gpu_d64_head_major(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, Some(&mask_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&mask_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_all_finite(&gpu_out, "d64_hm_additive_mask");
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "d64_hm_additive_mask",
+    );
+}
+
+/// D=64 SeqMajor: unmasked — verifies the seq-major stride math agrees
+/// with head-major (and with the CPU reference).  This is the production
+/// path for nomic-bert and friends.
+#[test]
+fn test_gpu_bf16_d64_seq_major_unmasked() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    for &(ql, kl) in &[(32usize, 32usize), (128, 128), (512, 512)] {
+        let batch = 1; let h = 12; let kv_h = 12; let d = 64;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let q = pseudo_random_f32(SEED + 110, batch * h * ql * d);
+        let k = pseudo_random_f32(SEED + 111, batch * kv_h * kl * d);
+        let v = pseudo_random_f32(SEED + 112, batch * kv_h * kl * d);
+        let q_bf = f32_to_bf16(&q);
+        let k_bf = f32_to_bf16(&k);
+        let v_bf = f32_to_bf16(&v);
+
+        let gpu_out = run_bf16_gpu_d64_seq_major(
+            &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+        let ref_out = reference_for_bf16(
+            &q_bf, &k_bf, &v_bf, None,
+            batch, h, kv_h, ql, kl, d, scale, false,
+        );
+
+        assert_all_finite(&gpu_out, &format!("d64_sm_unmasked_ql{ql}_kl{kl}"));
+        assert_close_gpu(
+            &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+            &format!("d64_sm_unmasked_ql{ql}_kl{kl}"),
+        );
+    }
+}
+
+/// D=64 SeqMajor: with rank-2 broadcast mask (BERT padding-mask shape).
+///
+/// nomic-bert and BERT family use a single `[seq_len, seq_len]` padding
+/// mask broadcast across batch + heads — verifies the rank-2 path in the
+/// dispatcher works at the seq-major stride convention.
+#[test]
+fn test_gpu_bf16_d64_seq_major_rank2_mask() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let batch = 1; let h = 12; let kv_h = 12; let ql = 64; let kl = 64; let d = 64;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q = pseudo_random_f32(SEED + 120, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 121, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 122, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // Rank-2 mask `[ql, kl]`: even-position keys attend, odd-position keys
+    // are blocked.  Same checkerboard pattern as the additive_mask test
+    // but expressed once (broadcast across all heads).
+    let mask_rank2_f32: Vec<f32> = (0..ql * kl)
+        .map(|i| if i % 2 == 0 { 0.0_f32 } else { -1.0e4_f32 })
+        .collect();
+    let mask_rank2_bf = f32_to_bf16(&mask_rank2_f32);
+
+    // CPU reference takes a per-head rank-4 mask: replicate the rank-2
+    // plane across all heads + batches so the reference and GPU compute
+    // identical things.
+    let mut mask_rank4_f32 = vec![0.0_f32; batch * h * ql * kl];
+    for b in 0..batch {
+        for hd in 0..h {
+            for q_pos in 0..ql {
+                for k_pos in 0..kl {
+                    let dst = b * h * ql * kl + hd * ql * kl + q_pos * kl + k_pos;
+                    let src = q_pos * kl + k_pos;
+                    mask_rank4_f32[dst] = mask_rank2_f32[src];
+                }
+            }
+        }
+    }
+    let mask_rank4_bf = f32_to_bf16(&mask_rank4_f32);
+
+    let gpu_out = run_bf16_gpu_d64_seq_major(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, Some(&mask_rank2_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+    let ref_out = reference_for_bf16(
+        &q_bf, &k_bf, &v_bf, Some(&mask_rank4_bf),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_all_finite(&gpu_out, "d64_sm_rank2_mask");
+    assert_close_gpu(
+        &gpu_out, &ref_out, BF16_GPU_ATOL, BF16_GPU_RTOL,
+        "d64_sm_rank2_mask",
+    );
+}
+
+/// Wrong head_dim must reject before any GPU resource is touched.
+#[test]
+fn test_d64_dispatcher_rejects_wrong_head_dim() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let q_elems = 1 * 2 * 32 * 128;
+    let kv_elems = 1 * 2 * 32 * 128;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+
+    let params = FlashAttnPrefillParams {
+        n_heads: 2,
+        n_kv_heads: 2,
+        head_dim: 128, // wrong: D=64 dispatcher requires 64
+        seq_len_q: 32,
+        seq_len_k: 32,
+        batch: 1,
+        scale: 1.0,
+        do_causal: false,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let result = dispatch_flash_attn_prefill_bf16_d64(
+        &mut encoder, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, None, &mut out_buf, &params,
+        FlashAttnPrefillLayout::HeadMajor,
+    );
+
+    assert!(result.is_err(), "Expected error for head_dim=128 on D=64 dispatcher");
+    if let Err(MlxError::InvalidArgument(msg)) = result {
+        assert!(
+            msg.contains("64") || msg.contains("head_dim"),
+            "Error should reference head_dim or 64: {msg}"
+        );
+    } else {
+        panic!("Expected InvalidArgument, got: {result:?}");
+    }
+}
+
 } // mod flash_attn_prefill_tests
 
 // ─── Non-macOS stub ───────────────────────────────────────────────────────────

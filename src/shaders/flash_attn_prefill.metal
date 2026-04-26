@@ -1664,4 +1664,17 @@ instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d512_boolmask", bfloat16
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d512",           half,       8, 8, 512, 1, 1, half)
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d512_boolmask",  half,       8, 8, 512, 1, 1, bool)
 
+// D=64 — small head dim (BERT family: nomic-bert/bge/mxbai/minilm and any
+// other 64-dim attention-head model).  Same 4-simdgroup geometry as D=256
+// (BQ=32, BK=16, WM=4, WN=1 → 128 threads/threadgroup); threadgroup memory
+// drops to ~5 KB at bf16/f16 because Qs (BQ × BD × sizeof(T)) scales with
+// BD.  Static-asserts pass: BQ=32 ≥ kNWarps×kFragSize = 4×8 = 32, divisible;
+// TQ = 32/(4×8) = 1 ✓; TD = 64/8 = 8 ✓; TK = 16/8 = 2 ✓.  f32 is excluded
+// for ABI consistency with D=256/D=512 and because BERT linears land in f32
+// then cast to bf16 before this kernel.
+instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d64",          bfloat16_t, 32, 16, 64, 4, 1, bfloat16_t)
+instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d64_boolmask", bfloat16_t, 32, 16, 64, 4, 1, bool)
+instantiate_flash_attn_prefill("flash_attn_prefill_f16_d64",           half,       32, 16, 64, 4, 1, half)
+instantiate_flash_attn_prefill("flash_attn_prefill_f16_d64_boolmask",  half,       32, 16, 64, 4, 1, bool)
+
 // clang-format on
