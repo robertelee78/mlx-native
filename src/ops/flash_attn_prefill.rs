@@ -36,16 +36,18 @@
 //! | `flash_attn_prefill_f16_d512`            | f16  | f16 additive |
 //! | `flash_attn_prefill_f16_d512_boolmask`   | f16  | bool |
 //!
-//! ### f32 is NOT instantiated at either D
+//! ### f32 is NOT instantiated at any D
 //!
 //! The f32 Qs threadgroup tile alone is `BQ * BD * 4` bytes — at D=256 this
 //! is 32 KB exactly, the Apple Silicon `MTLDevice.maxThreadgroupMemoryLength`
 //! hard limit, before KV_smem or scratch.  Verified empirically on M5 Max:
 //! f32 D=256 requires ~53.7 KB and fails at library compile.  bf16 and f16
-//! halve the tile footprint (~29 KB) and fit within the limit.  f32
+//! halve the tile footprint (~29 KB) and fit within the limit.  D=512 f32
+//! is excluded for the same reason.  D=64 inherits the same exclusion for
+//! consistency (bf16/f16 only across the entire dispatcher family).  f32
 //! correctness is verified at the CPU reference layer in
-//! `tests/test_flash_attn_prefill.rs`.  D=512 f32 is excluded for the same
-//! reason.  See `ADR-011-phase1-port-source-decision.md` §3 for the full
+//! `tests/test_flash_attn_prefill.rs`.  See
+//! `ADR-011-phase1-port-source-decision.md` §3 for the full
 //! threadgroup-memory analysis.
 //!
 //! ## Function constants
