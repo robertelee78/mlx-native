@@ -111,6 +111,14 @@ inline float block_q4_0_dot_y(
 //   output[r] = matmul(src1[token], src0_cur)
 //
 // Dispatch geometry: threadgroups=(ceil(N/8), n_tokens*top_k, 1), tg=(8,8,1)
+//
+// Routing index is in dim Y, NOT dim Z (despite llama.cpp's mul_mv_id grid
+// using ne123 in z at ggml-metal-ops.cpp:2452).  Tested 2026-04-26 on M5 Max
+// dwq46 64-token decode: switching kernel to read tgpig.z + dispatcher
+// MTLSize::new(N/8, 1, m) regressed throughput from 114 t/s to 90.9 t/s
+// (-19%).  Apple GPU's threadgroup scheduler distributes this dispatch
+// shape better via Y than Z — 7th confirmed static-evidence kernel
+// hypothesis falsified per `project_metal_compiler_auto_optimizes_static_levers.md`.
 
 kernel void kernel_mul_mv_id_q4_0_f32(
     device const  char  * src0   [[buffer(0)]],

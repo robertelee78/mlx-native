@@ -434,6 +434,13 @@ fn dispatch_id_mv(
     let n = params.n as usize;
     let m = total_rows;
 
+    // Dispatch routing dim in Y, NOT Z (despite llama.cpp's mul_mv_id using
+    // ne123 in z at ggml-metal-ops.cpp:2452).  Tested 2026-04-26: switching
+    // to z-routing on M5 Max regressed dwq46 256-token decode from 112 t/s
+    // to 90.9 t/s (-19%).  Apple GPU's threadgroup scheduler distributes
+    // this dispatch shape better via y than z — 7th confirmed static-
+    // evidence kernel hypothesis falsified per
+    // `project_metal_compiler_auto_optimizes_static_levers.md`.
     let threadgroups = metal::MTLSize::new(
         div_ceil(n, align) as u64,
         m as u64,
