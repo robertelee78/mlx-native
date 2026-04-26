@@ -1019,8 +1019,23 @@ impl GgufFile {
             | GgmlType::Q5_K
             | GgmlType::Q6_K
             | GgmlType::I16 => {
-                // Store raw GGML blocks as U8 buffer. Q5_K and I16 are held
-                // opaque until dequant kernels land (ADR-013 Decision 12).
+                // Store raw GGML blocks as a U8 buffer. Quantized matmul
+                // kernels consume these blocks directly without an explicit
+                // dequant pass on the GPU; the U8 view is the on-device
+                // storage contract, not an "unsupported" placeholder.
+                //
+                // Coverage status (2026-04-25):
+                //   * Q4_0 / Q8_0 / Q4_K / Q6_K — full mat-vec + mat-mat.
+                //   * Q5_K — host-side dequant-to-F32 implemented in
+                //     `dequantize_q5_k` (`src/gguf/mod.rs:469`), wired into
+                //     `dequantize_to_f32` at `src/gguf/mod.rs:763`. An
+                //     expert-indexed mat-vec (`mv_id`) kernel exists at
+                //     `src/ops/quantized_matmul_id_ggml.rs:69` and
+                //     `src/shaders/quantized_matmul_id_ggml.metal:250`. The
+                //     dense `mm_id` (large-batch matmul) variant for Q5_K is
+                //     not yet ported — see ADR-013 Decision 12 for the
+                //     remaining gap.
+                //   * I16 — held opaque; no dequant kernel has landed yet.
                 let mut buf =
                     device.alloc_buffer(info.byte_len, DType::U8, info.shape.clone())?;
                 {
