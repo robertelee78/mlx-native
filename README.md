@@ -6,6 +6,36 @@
 
 Pure-Rust Metal GPU compute library for transformer inference on Apple Silicon. Built as the GPU backend for the [hf2q](https://github.com/robertelee78/hf2q) inference engine.
 
+## When to use this
+
+mlx-native is the right tool when **all** of these hold:
+
+- You're running transformer (or Mamba / Gated DeltaNet) **inference on Apple Silicon**
+- Your weights are **GGUF, MLX-quant, or safetensors** (no PyTorch checkpoints, no ONNX)
+- You want **low Metal decode latency** and are willing to drive a kernel-dispatch API
+- You're fine assembling the forward pass yourself — there is no `Tensor` type, no `Module` system, no model zoo
+
+Reach for **[candle](https://github.com/huggingface/candle)** instead if you need autograd / training, multi-backend support (CUDA / CPU / WASM), Python bindings, ONNX import, a built-in model zoo, or a high-level tensor algebra surface. The two are complementary: candle is "PyTorch-shaped Rust ML framework," mlx-native is the Metal compute backend of a llama.cpp-shaped inference engine.
+
+### What we do that candle's Metal backend doesn't
+
+- **One `ComputeCommandEncoder` per forward pass** (`GraphExecutor` / `GraphSession`) — candle acquires an encoder per op and pools ~50 per command buffer
+- **TurboQuant KV cache** — Lloyd-Max codebooks (2 / 3 / 4-bit nibble-packed) and byte-packed higher-bit (5 / 6 / 8-bit) variants, with fused Hadamard incoherence transform
+- **MoE routing on GPU** — `moe_gate` + `moe_softmax_topk` + expert-routed quantized matmul (no CPU round-trip for top-k expert selection)
+- **Custom Metal kernels for state-space models** — `gated_delta_net`, `ssm_conv`, `ssm_norm_gate`, `tri_solve`, `cumsum`
+- **Shape-specialized prefill** — D=256 / D=512 tiled flash-attention kernels tuned for production model shapes (Qwen3, Gemma 3 / 4)
+- **Fused norm-family kernels** — `fused_norm_add`, `fused_residual_norm`, `fused_post_attn_triple_norm`, `fused_moe_wsum_norm_add`, `fused_head_norm_rope`
+- **GPU-resident sampling** — `softmax_sample` eliminates the logits-to-CPU readback on the hot path
+- **Sliding-window KV cache copy with ring wrap** — single GPU kernel instead of CPU-side index math
+- **Explicit barrier control** — `session.barrier()` and `session.barrier_between(reads, writes)` for precise GPU sync between dependent ops
+
+### Trade-offs to know going in
+
+- **Apple Silicon only.** No CPU, no CUDA, no WASM. If you need to ship cross-platform, this is the wrong layer.
+- **No training.** No autograd, no `Var` / `VarMap`, no optimizers. Forward-pass kernels only.
+- **GGML matmul coverage is the inference subset, not the full set.** Q4_0, Q8_0, Q6_K have full mat-vec / mat-mat / tensor-mm and expert-routed variants. Q5_K has expert-routed mat-vec only. Q4_K, Q4_1, Q5_0, Q5_1, Q8_1, Q2_K, Q3_K, Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
+- **No high-level model code.** This is a kernel library; the consumer (e.g. hf2q) builds the actual transformer forward pass.
+
 ## Status
 
 **Active development, pre-1.0.** API may change between minor versions (`0.x.0 → 0.(x+1).0` signals breaking changes). Public functions and structs evolve as new model families are added. Patch versions (`0.x.y → 0.x.(y+1)`) are non-breaking.
