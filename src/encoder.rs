@@ -198,10 +198,17 @@ static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Number of times an encode method has been called (GPU dispatches).
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Reset both `SYNC_COUNT` and `DISPATCH_COUNT` to zero.
+/// Number of `MTLCommandBuffer` instances created via `CommandEncoder::new`.
+/// Increments once per `device.command_encoder()` call.  Used by hf2q's
+/// `HF2Q_DECODE_PROFILE` instrumentation to measure command-buffer
+/// overhead per decode token (ADR-012 §Optimize / Task #15 follow-up).
+static CMD_BUF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Reset all counters to zero.
 pub fn reset_counters() {
     SYNC_COUNT.store(0, Ordering::Relaxed);
     DISPATCH_COUNT.store(0, Ordering::Relaxed);
+    CMD_BUF_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Read the current value of `SYNC_COUNT`.
@@ -217,6 +224,15 @@ pub fn sync_count() -> u64 {
 /// `encode_threadgroups_with_shared()` increments this counter.
 pub fn dispatch_count() -> u64 {
     DISPATCH_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read the current value of `CMD_BUF_COUNT`.
+///
+/// Each `CommandEncoder::new` (i.e. each `MlxDevice::command_encoder()`)
+/// increments this counter.  Useful for diagnosing per-dispatch Metal
+/// command-buffer overhead in inner loops.
+pub fn cmd_buf_count() -> u64 {
+    CMD_BUF_COUNT.load(Ordering::Relaxed)
 }
 
 /// A batched compute command encoder.
@@ -279,8 +295,31 @@ impl CommandEncoder {
     /// Create a new command encoder from the given command queue.
     ///
     /// This immediately creates a Metal command buffer.
+    ///
+    /// # Why retained references
+    ///
+    /// We use the regular `commandBuffer` (Metal retains every bound
+    /// resource for the lifetime of the buffer) rather than
+    /// `commandBufferWithUnretainedReferences`.  llama.cpp uses unretained
+    /// refs for an additional perf bump (~3-5% on M-series GPUs), but the
+    /// hf2q dispatch pattern allocates many transient scratch buffers
+    /// inside helper functions (`apply_proj` → `weight_bf16_owned`,
+    /// `apply_pre_norm` → `params`, etc.) that go out of scope at the
+    /// helper's return.  With unretained refs the metal::Buffer's ARC
+    /// drops to zero, freeing the underlying GPU memory before the
+    /// dispatch executes.  Verified 2026-04-26: switching to unretained
+    /// hits "Command buffer error: GPU command buffer completed with
+    /// error status" on the first MoE FFN dispatch.
+    ///
+    /// To enable unretained refs in the future, every helper that
+    /// allocates and dispatches must thread its scratch buffers up to a
+    /// caller scope that outlives the eventual commit, OR all such
+    /// scratch must come from the per-decode-token pool (which already
+    /// ARC-retains in its in_use list).  Today the lm_head + router-
+    /// download paths are still unpooled.
     pub(crate) fn new(queue: &CommandQueue) -> Result<Self> {
         let cmd_buf = queue.new_command_buffer().to_owned();
+        CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             cmd_buf,
             active_encoder: std::ptr::null(),

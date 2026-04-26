@@ -64,8 +64,8 @@ pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{
-    dispatch_count, reset_counters, sync_count, CapturedNode, CommandEncoder, DispatchKind,
-    RecordedBinding,
+    cmd_buf_count, dispatch_count, reset_counters, sync_count, CapturedNode, CommandEncoder,
+    DispatchKind, RecordedBinding,
 };
 pub use error::{MlxError, Result};
 pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
