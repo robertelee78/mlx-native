@@ -117,6 +117,18 @@ impl KernelRegistry {
             include_str!("shaders/dense_mm_bf16_tensor.metal");
         sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
 
+        // Dense f32×f32 → f32 tensor-API matmul (F32-everywhere
+        // sibling of dense_mm_bf16_tensor).  Used by hf2q's ADR-005
+        // iter-118 BF16-vs-F32 ViT attention A/B diagnostic to remove
+        // the BF16 K-stage cast as a confounding variable.  Port of
+        // llama.cpp's kernel_mul_mm_f32_f32 specialization
+        // (ggml-metal.metal:10098) on the GGML_METAL_HAS_TENSOR
+        // branch.  Same tile geometry (NR0=64 NR1=32 NK=32) but
+        // float-everywhere shmem staging.
+        let dense_mm_f32_f32_tensor_src: &'static str =
+            include_str!("shaders/dense_mm_f32_f32.metal");
+        sources.insert("hf2q_dense_mm_f32_f32_tensor".into(), dense_mm_f32_f32_tensor_src);
+
         // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
         // for M=1 single-token decode.  Port of llama.cpp's
         // kernel_mul_mv_bf16_f32_4 (bfloat4-vectorized GEMV kernel).
