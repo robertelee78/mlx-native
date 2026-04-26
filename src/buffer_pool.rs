@@ -36,8 +36,10 @@ use crate::error::{MlxError, Result};
 ///   over-allocating by up to 2x.
 /// * `release()` returns a single buffer; `reset()` returns all outstanding
 ///   buffers handed out since the last reset.
-/// * The pool holds a reference to the `MlxDevice` so it can allocate fresh
-///   buffers when the free list is empty.
+/// * The `MlxDevice` is passed in at every [`alloc`] call (rather than stored
+///   in the pool).  This keeps the pool free of lifetime parameters so it
+///   can be embedded in any owner struct (e.g. the per-decode-token
+///   `DecodeBuffers` cache in hf2q's qwen35 forward path).
 ///
 /// # Why an arena reset matters
 ///
@@ -48,8 +50,7 @@ use crate::error::{MlxError, Result};
 /// `metal::Buffer` objects across token boundaries so steady-state allocation
 /// cost amortizes to near zero.  See ADR-012 §Optimize / Task #15 for the
 /// MoE dwq46 0.90× parity gap that motivated this work.
-pub struct MlxBufferPool<'d> {
-    device: &'d MlxDevice,
+pub struct MlxBufferPool {
     /// Free buffers keyed by their power-of-two bucket size.
     free: HashMap<usize, Vec<metal::Buffer>>,
     /// Buffers handed out by [`alloc`] since the last [`reset`].  Each entry
@@ -59,11 +60,17 @@ pub struct MlxBufferPool<'d> {
     in_use: Vec<(usize, metal::Buffer)>,
 }
 
-impl<'d> MlxBufferPool<'d> {
-    /// Create a new empty buffer pool backed by the given device.
-    pub fn new(device: &'d MlxDevice) -> Self {
+impl Default for MlxBufferPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MlxBufferPool {
+    /// Create a new empty buffer pool.  The Metal device is passed to
+    /// [`alloc`] at every call site, so the pool itself is lifetime-free.
+    pub fn new() -> Self {
         Self {
-            device,
             free: HashMap::new(),
             in_use: Vec::new(),
         }
@@ -73,7 +80,7 @@ impl<'d> MlxBufferPool<'d> {
     ///
     /// If a free buffer of compatible size exists in the pool, it is reused
     /// (with updated dtype/shape metadata).  Otherwise a new Metal buffer is
-    /// allocated from the device at the bucket size so future reuse is
+    /// allocated from `device` at the bucket size so future reuse is
     /// possible for any request up to that bucket.
     ///
     /// Each successful `alloc` registers the buffer in the pool's in-use
@@ -81,6 +88,7 @@ impl<'d> MlxBufferPool<'d> {
     /// the free list automatically.
     pub fn alloc(
         &mut self,
+        device: &MlxDevice,
         byte_len: usize,
         dtype: DType,
         shape: Vec<usize>,
@@ -97,7 +105,7 @@ impl<'d> MlxBufferPool<'d> {
             Some(b) => b,
             None => {
                 // Fresh allocation at bucket size.
-                let raw = self.device.metal_device().new_buffer(
+                let raw = device.metal_device().new_buffer(
                     bucket as u64,
                     metal::MTLResourceOptions::StorageModeShared,
                 );
@@ -221,14 +229,14 @@ mod tests {
         // Subsequent allocs must reuse the same Metal buffers (verified by ARC-cloned
         // contents pointer).
         let device = MlxDevice::new().expect("device");
-        let mut pool = MlxBufferPool::new(&device);
+        let mut pool = MlxBufferPool::new();
 
         // Cycle 1: allocate three buffers in different buckets, then drop them
         // (locals fall out of scope at the end of the block).
         let (ptr_a, ptr_b, ptr_c) = {
-            let buf_a = pool.alloc(1024, DType::F32, vec![256]).expect("alloc a");
-            let buf_b = pool.alloc(2048, DType::F32, vec![512]).expect("alloc b");
-            let buf_c = pool.alloc(1024, DType::F32, vec![256]).expect("alloc c");
+            let buf_a = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc a");
+            let buf_b = pool.alloc(&device, 2048, DType::F32, vec![512]).expect("alloc b");
+            let buf_c = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc c");
             (buf_a.contents_ptr(), buf_b.contents_ptr(), buf_c.contents_ptr())
         };
         assert_eq!(pool.in_use_count(), 3);
@@ -241,8 +249,8 @@ mod tests {
 
         // Cycle 2: allocate compatible-bucket buffers, must reuse the same
         // underlying Metal buffers (contents_ptr equal).
-        let buf_d = pool.alloc(1024, DType::F32, vec![256]).expect("alloc d");
-        let buf_e = pool.alloc(2048, DType::F32, vec![512]).expect("alloc e");
+        let buf_d = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc d");
+        let buf_e = pool.alloc(&device, 2048, DType::F32, vec![512]).expect("alloc e");
         let ptr_d = buf_d.contents_ptr();
         let ptr_e = buf_e.contents_ptr();
 
@@ -264,7 +272,7 @@ mod tests {
     fn test_pool_reset_with_no_alloc_is_idempotent() {
         // Empty reset must be a no-op.
         let device = MlxDevice::new().expect("device");
-        let mut pool = MlxBufferPool::new(&device);
+        let mut pool = MlxBufferPool::new();
         pool.reset();
         assert_eq!(pool.in_use_count(), 0);
         assert_eq!(pool.free_count(), 0);
@@ -281,9 +289,9 @@ mod tests {
         // unsupported but technically lands a duplicate clone in free —
         // verify the duplicate is harmless (alloc still picks up a buffer).
         let device = MlxDevice::new().expect("device");
-        let mut pool = MlxBufferPool::new(&device);
+        let mut pool = MlxBufferPool::new();
 
-        let buf = pool.alloc(1024, DType::F32, vec![256]).expect("alloc");
+        let buf = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc");
         assert_eq!(pool.in_use_count(), 1);
         pool.release(buf);
         // release() does NOT remove from in_use; that's acceptable per the
@@ -292,7 +300,7 @@ mod tests {
         assert_eq!(pool.in_use_count(), 1);
 
         // Allocating again pulls from free first.
-        let _buf2 = pool.alloc(1024, DType::F32, vec![256]).expect("alloc 2");
+        let _buf2 = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc 2");
         assert_eq!(pool.free_count(), 0);
         assert_eq!(pool.in_use_count(), 2);
     }

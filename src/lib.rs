@@ -191,11 +191,11 @@ mod tests {
     #[test]
     fn test_buffer_pool_reuse() {
         let device = MlxDevice::new().expect("device");
-        let mut pool = MlxBufferPool::new(&device);
+        let mut pool = MlxBufferPool::new();
 
         // Allocate a buffer.
         let buf1 = pool
-            .alloc(1024, DType::F32, vec![256])
+            .alloc(&device, 1024, DType::F32, vec![256])
             .expect("pool alloc 1");
         let buf1_ptr = buf1.contents_ptr();
         let buf1_byte_len = buf1.byte_len();
@@ -206,7 +206,7 @@ mod tests {
 
         // Allocate again — should reuse the same Metal buffer.
         let buf2 = pool
-            .alloc(1024, DType::F32, vec![256])
+            .alloc(&device, 1024, DType::F32, vec![256])
             .expect("pool alloc 2");
         let buf2_ptr = buf2.contents_ptr();
         let buf2_byte_len = buf2.byte_len();
@@ -329,10 +329,10 @@ mod tests {
     #[test]
     fn test_buffer_pool_size_buckets() {
         let device = MlxDevice::new().expect("device");
-        let mut pool = MlxBufferPool::new(&device);
+        let mut pool = MlxBufferPool::new();
 
         // Allocate a 100-byte buffer (rounds to 128-byte bucket).
-        let buf_100 = pool.alloc(100, DType::U8, vec![100]).expect("alloc 100");
+        let buf_100 = pool.alloc(&device, 100, DType::U8, vec![100]).expect("alloc 100");
         assert!(
             buf_100.byte_len() >= 100,
             "Buffer should be at least 100 bytes"
@@ -340,12 +340,12 @@ mod tests {
         pool.release(buf_100);
 
         // Allocate a 128-byte buffer — should reuse the same Metal buffer.
-        let buf_128 = pool.alloc(128, DType::U8, vec![128]).expect("alloc 128");
+        let buf_128 = pool.alloc(&device, 128, DType::U8, vec![128]).expect("alloc 128");
         assert!(buf_128.byte_len() >= 128);
         pool.release(buf_128);
 
         // Allocate a 200-byte buffer — different bucket (256), fresh allocation.
-        let buf_200 = pool.alloc(200, DType::U8, vec![200]).expect("alloc 200");
+        let buf_200 = pool.alloc(&device, 200, DType::U8, vec![200]).expect("alloc 200");
         assert!(buf_200.byte_len() >= 200);
         pool.release(buf_200);
 
