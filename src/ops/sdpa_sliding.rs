@@ -6,6 +6,35 @@
 //! the effective attention window is `[max(0, q_pos - window_size), q_pos]`.
 //!
 //! Used by Gemma 4 sliding-window layers (5 of every 6 layers, window=1024).
+//!
+//! # Status (2026-04-25): broken at prefill shapes — repair-or-remove TBD
+//!
+//! TODO(2026-04-25): remove or repair — see audit
+//! `cfa-20260425-fix-audit-findings`.
+//!
+//! At prefill seq_len `S < window_size` this kernel should be mathematically
+//! identical to plain [`sdpa`](super::sdpa) (every position is within the
+//! window, so the window mask is a no-op). It is not — measured against the
+//! plain-`sdpa` reference, this kernel emits the pad token at the first
+//! decode step on a Gemma-4 sliding layer with `seq_len=576`,
+//! `window_size=1024`. See `/opt/hf2q/docs/spike-gate-a-prefill.md:118-130`
+//! for the reproducer, and `Finding 2 — Blocker: sdpa_sliding broken at
+//! prefill shapes` for the gate-A blocker context.
+//!
+//! Two ADRs in hf2q reference this op while the repair decision is open:
+//!   * `ADR-011-flash-attn-prefill.md` — the in-flight flash-attn-prefill
+//!     port is the planned long-term replacement (one mask-driven kernel
+//!     covering both global and sliding layers); this op is the
+//!     byte-identical correctness baseline for that work.
+//!   * `ADR-011-phase2-port-swa-mask.md` — explicitly plans to keep this op
+//!     present for the decode path during the cutover.
+//!
+//! Live consumers in this crate: `tests/test_sdpa.rs` and
+//! `tests/bench_sdpa_tq.rs::bench_sdpa_sliding_layer`. There are no live
+//! call sites in /opt/hf2q (audited 2026-04-25); the public dispatch fn is
+//! marked `#[deprecated]` so any new caller surfaces a warning until the
+//! prefill bug is either fixed or this op is formally retired in favour of
+//! `flash_attn_prefill`.
 
 use metal::MTLSize;
 
@@ -144,6 +173,13 @@ fn validate_buffer(buf: &MlxBuffer, name: &str, expected_elements: usize) -> Res
 ///
 /// Returns `MlxError::InvalidArgument` for invalid parameters or mismatched
 /// buffer sizes.
+#[deprecated(
+    note = "broken at prefill shapes — see /opt/hf2q/docs/spike-gate-a-prefill.md:118-130. \
+            Use sdpa_decode for the seq_len=1 path or the in-flight flash_attn_prefill \
+            kernel (ADR-011) for the prefill path. Repair-or-remove decision is open; \
+            this attribute will lift once the kernel is fixed or the op is formally \
+            retired in favour of flash_attn_prefill."
+)]
 pub fn sdpa_sliding(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,

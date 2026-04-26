@@ -3,6 +3,13 @@
 //! These tests run the Metal GPU kernels and compare against CPU reference
 //! implementations for correctness.
 
+// `sdpa_sliding` is currently `#[deprecated]` pending repair-or-remove
+// (see `src/ops/sdpa_sliding.rs` module docs and audit
+// `cfa-20260425-fix-audit-findings`). These tests intentionally exercise
+// it as the correctness baseline for the eventual `flash_attn_prefill`
+// replacement, so the deprecation warning is silenced at file scope.
+#![allow(deprecated)]
+
 use mlx_native::ops::sdpa::{self, SdpaParams};
 use mlx_native::ops::sdpa_sliding::{self, SdpaSlidingParams};
 use mlx_native::{DType, KernelRegistry, MlxDevice};
