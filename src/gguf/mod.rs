@@ -1019,23 +1019,29 @@ impl GgufFile {
             | GgmlType::Q5_K
             | GgmlType::Q6_K
             | GgmlType::I16 => {
-                // Store raw GGML blocks as a U8 buffer. Quantized matmul
-                // kernels consume these blocks directly without an explicit
-                // dequant pass on the GPU; the U8 view is the on-device
-                // storage contract, not an "unsupported" placeholder.
+                // Store raw GGML blocks as a U8 buffer. Where a Metal
+                // quantized-matmul kernel exists for the type, it consumes
+                // these blocks directly without an explicit dequant pass on
+                // the GPU; otherwise the U8 view is opaque on-device storage
+                // pending either a kernel port or a host-side dequant.
                 //
-                // Coverage status (2026-04-25):
-                //   * Q4_0 / Q8_0 / Q4_K / Q6_K — full mat-vec + mat-mat.
-                //   * Q5_K — host-side dequant-to-F32 implemented in
-                //     `dequantize_q5_k` (`src/gguf/mod.rs:469`), wired into
-                //     `dequantize_to_f32` at `src/gguf/mod.rs:763`. An
-                //     expert-indexed mat-vec (`mv_id`) kernel exists at
+                // Coverage status (2026-04-25; see also README.md:36):
+                //   * Q4_0 / Q8_0 / Q6_K — full mat-vec + mat-mat + expert-
+                //     routed (mv_id / mm_id / tensor-mm).
+                //   * Q5_K — expert-routed mat-vec (`mv_id`) only. Kernel at
                 //     `src/ops/quantized_matmul_id_ggml.rs:69` and
-                //     `src/shaders/quantized_matmul_id_ggml.metal:250`. The
+                //     `src/shaders/quantized_matmul_id_ggml.metal:250`.
+                //     Host-side dequant-to-F32 implemented in
+                //     `dequantize_q5_k` (`src/gguf/mod.rs:469`), wired into
+                //     `dequantize_to_f32` at `src/gguf/mod.rs:763`. The
                 //     dense `mm_id` (large-batch matmul) variant for Q5_K is
-                //     not yet ported — see ADR-013 Decision 12 for the
-                //     remaining gap.
-                //   * I16 — held opaque; no dequant kernel has landed yet.
+                //     not yet ported — ADR-013 Decision 12.
+                //   * Q4_K — no Metal matmul kernel; host-side dequant
+                //     available via `dequantize_to_f32`. Use F32 fallback
+                //     for any matmul consumer until the kernel lands.
+                //   * I16 — no Metal matmul kernel; host-side dequant
+                //     available (`dequantize_i16` at `src/gguf/mod.rs:551`,
+                //     wired at `:764`). Same F32-fallback story as Q4_K.
                 let mut buf =
                     device.alloc_buffer(info.byte_len, DType::U8, info.shape.clone())?;
                 {
