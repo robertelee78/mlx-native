@@ -6,8 +6,17 @@
 //!
 //! ## Kernel variants registered
 //!
-//! Eight entry points are registered, all backed by the single
+//! Twelve entry points are registered, all backed by the single
 //! `flash_attn_prefill.metal` shader source:
+//!
+//! ### D=64 (BQ=32, BK=16, WM=4, WN=1 — 128 threads/threadgroup, BERT family)
+//!
+//! | Kernel name | I/O dtype | Mask kind |
+//! |---|---|---|
+//! | `flash_attn_prefill_bf16_d64`            | bf16 | bf16 additive |
+//! | `flash_attn_prefill_bf16_d64_boolmask`   | bf16 | bool |
+//! | `flash_attn_prefill_f16_d64`             | f16  | f16 additive |
+//! | `flash_attn_prefill_f16_d64_boolmask`    | f16  | bool |
 //!
 //! ### D=256 (BQ=32, BK=16, WM=4, WN=1 — 128 threads/threadgroup)
 //!
@@ -123,7 +132,7 @@ use crate::DType;
 pub static FLASH_ATTN_PREFILL_SHADER_SOURCE: &str =
     include_str!("../shaders/flash_attn_prefill.metal");
 
-// ─── All 8 kernel entry-point names ──────────────────────────────────────────
+// ─── All 12 kernel entry-point names ─────────────────────────────────────────
 
 /// D=256, bf16 I/O, bf16 additive mask.
 const K_BF16_D256: &str = "flash_attn_prefill_bf16_d256";
@@ -175,16 +184,16 @@ const ALL_KERNEL_NAMES: &[&str] = &[
 
 /// Register all flash-attention prefill kernel entry points with the registry.
 ///
-/// Maps all 8 entry-point names to the single `flash_attn_prefill.metal`
+/// Maps all 12 entry-point names to the single `flash_attn_prefill.metal`
 /// source.  This must be called before any dispatch to these kernels.
 ///
 /// # Design note
 ///
-/// `KernelRegistry` compiles one Metal library per kernel name.  All 8 names
+/// `KernelRegistry` compiles one Metal library per kernel name.  All 12 names
 /// point at the same source text, so the Metal compiler sees the same ~1 500-line
 /// source each time — compilation is amortised in `KernelRegistry::get_pipeline`
 /// (first call per name triggers compilation; subsequent calls return the cached
-/// pipeline).  Registering all 8 here rather than only the Phase 1a subset
+/// pipeline).  Registering all 12 here rather than only the Phase 1a subset
 /// means Phase 2/4 dispatcher functions can be added without touching this file.
 pub fn register(registry: &mut KernelRegistry) {
     for &name in ALL_KERNEL_NAMES {
@@ -1194,21 +1203,75 @@ mod tests {
     }
 
     #[test]
-    fn test_all_8_kernel_names_registered() {
-        assert_eq!(ALL_KERNEL_NAMES.len(), 8);
+    fn test_all_expected_kernel_names_registered() {
+        // Name-pinned, not count-pinned: asserts each expected entry point is
+        // present AND that no unexpected entry points have been added.  When a
+        // new dispatcher lands (e.g. a future D=128 instantiation), update this
+        // EXPECTED list explicitly — the test will tell you whether you are
+        // adding (missing entry) or removing (unexpected entry).
+        //
+        // History: previously hard-coded at 8 entries (D=256 + D=512 ×
+        // bf16/f16 × additive/boolmask).  Commit 7e35d74 added the D=64
+        // BERT-family quartet (bf16/f16 × additive/boolmask), bringing the
+        // total to 12.  The count-pinned shape rotted on that landing; the
+        // name-pinned shape below is robust to future intentional additions
+        // while still failing loudly on accidental ones.
+        const EXPECTED: &[&str] = &[
+            // D=256 — general-purpose decoder LLMs (Llama/Qwen-class)
+            "flash_attn_prefill_bf16_d256",
+            "flash_attn_prefill_bf16_d256_boolmask",
+            "flash_attn_prefill_f16_d256",
+            "flash_attn_prefill_f16_d256_boolmask",
+            // D=512 — wide-head models
+            "flash_attn_prefill_bf16_d512",
+            "flash_attn_prefill_bf16_d512_boolmask",
+            "flash_attn_prefill_f16_d512",
+            "flash_attn_prefill_f16_d512_boolmask",
+            // D=64 — BERT-family encoders (nomic-bert, bge, mxbai, MiniLM); 7e35d74
+            "flash_attn_prefill_bf16_d64",
+            "flash_attn_prefill_bf16_d64_boolmask",
+            "flash_attn_prefill_f16_d64",
+            "flash_attn_prefill_f16_d64_boolmask",
+        ];
 
-        // Verify each constant is non-empty and unique.
-        let mut seen = std::collections::HashSet::new();
+        let registered: std::collections::HashSet<&str> =
+            ALL_KERNEL_NAMES.iter().copied().collect();
+        let expected: std::collections::HashSet<&str> = EXPECTED.iter().copied().collect();
+
+        // Each constant in the registry must be non-empty and unique.
+        assert_eq!(
+            registered.len(),
+            ALL_KERNEL_NAMES.len(),
+            "ALL_KERNEL_NAMES contains duplicate entries"
+        );
         for &name in ALL_KERNEL_NAMES {
             assert!(!name.is_empty(), "kernel name must not be empty");
-            assert!(seen.insert(name), "duplicate kernel name: {name}");
         }
+
+        // Every expected name must be present (catches accidental removals).
+        let missing: Vec<&str> = expected.difference(&registered).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "expected kernel names missing from ALL_KERNEL_NAMES: {missing:?}"
+        );
+
+        // No unexpected names may be present (catches accidental additions —
+        // forces this EXPECTED list to be updated alongside any new dispatcher).
+        let extra: Vec<&str> = registered.difference(&expected).copied().collect();
+        assert!(
+            extra.is_empty(),
+            "unexpected kernel names registered (update EXPECTED in this test): {extra:?}"
+        );
 
         // Verify no f32 entry points are registered — f32 is excluded by
         // Apple Silicon threadgroup memory limits (see module doc).
         for &name in ALL_KERNEL_NAMES {
             assert!(
                 !name.contains("float32"),
+                "f32 kernel {name} must not be registered — exceeds 32 KB TG mem limit"
+            );
+            assert!(
+                !name.contains("_f32_"),
                 "f32 kernel {name} must not be registered — exceeds 32 KB TG mem limit"
             );
         }
