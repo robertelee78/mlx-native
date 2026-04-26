@@ -273,6 +273,86 @@ pub fn transpose_last2_bf16(
     Ok(())
 }
 
+/// Swap the last two axes of a 3D f16 tensor: [A, B, C] -> [A, C, B].
+///
+/// F16 sibling of [`transpose_last2_bf16`].  Added for ADR-005 Phase 2c
+/// iter-129 (gemma4v ViT precision parity): peer's `flash_attn_ext`
+/// stages V at F16 (10-bit mantissa) and runs `simdgroup_half8x8` MMA
+/// on V@scores.  Pre-iter-129 hf2q cast V F32→BF16 (7-bit mantissa)
+/// before the transpose, capturing the dominant residual per-block
+/// cascade after iter-128's weight-matmul F16 fix.
+///
+/// Used by `vit_attention_gpu` to materialise V_t (V transposed over
+/// seq↔hd) so the F16-staged `scores @ V` matmul
+/// (`dense_matmul_f16_f32_tensor`) can consume it at the tile geometry
+/// the kernel expects.
+///
+/// One dispatch covers all A batches; each thread copies a single half.
+pub fn transpose_last2_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    dim_a: usize,
+    dim_b: usize,
+    dim_c: usize,
+) -> Result<()> {
+    if dim_a == 0 || dim_b == 0 || dim_c == 0 {
+        return Err(MlxError::InvalidArgument(
+            "transpose_last2_f16: all dimensions must be > 0".into(),
+        ));
+    }
+
+    let total_elements = dim_a * dim_b * dim_c;
+    let elem_bytes = total_elements * 2; // f16 = 2 bytes
+    if input.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "transpose_last2_f16: input buffer too small: need {} bytes, have {}",
+            elem_bytes, input.byte_len()
+        )));
+    }
+    if output.byte_len() < elem_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "transpose_last2_f16: output buffer too small: need {} bytes, have {}",
+            elem_bytes, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("transpose_last2_f16", device)?;
+
+    let gpu_params = GpuPermute021Params {
+        dim_a: dim_a as u32,
+        dim_b: dim_b as u32,
+        dim_c: dim_c as u32,
+    };
+
+    // Grid: (dim_b, dim_c, dim_a).  Kernel maps (gid.x, gid.y, gid.z) →
+    // (b, c, a); see shaders/elementwise.metal::transpose_last2_f16.
+    // Same threadgroup geometry as the BF16 sibling — bfloat and half
+    // share the 16-bit storage size, so the dispatch is byte-identical.
+    let grid = MTLSize::new(dim_b as u64, dim_c as u64, dim_a as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(16, dim_b as u64),
+        std::cmp::min(16, dim_c as u64),
+        std::cmp::min(4, dim_a as u64),
+    );
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}
+
 pub fn permute_021_bf16(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,

@@ -206,3 +206,163 @@ fn test_permute_021_zero_dim_error() {
 
     assert!(result.is_err(), "Should error on dim_a=0");
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// transpose_last2_f16 — F16 sibling of transpose_last2_bf16.
+// Added for ADR-005 Phase 2c iter-129 (gemma4v ViT V-staging F16
+// precision parity with peer's flash_attn_ext path).
+//
+// CPU reference: input[a,b,c] = output[a,c,b].
+// ──────────────────────────────────────────────────────────────────────
+
+/// CPU reference: swap last two axes [A, B, C] -> [A, C, B].
+///
+/// Input layout:  input[a][b][c]  = input_flat[a * B * C + b * C + c]
+/// Output layout: output[a][c][b] = output_flat[a * C * B + c * B + b]
+fn cpu_transpose_last2(input: &[f32], dim_a: usize, dim_b: usize, dim_c: usize) -> Vec<f32> {
+    let mut output = vec![0.0f32; dim_a * dim_b * dim_c];
+    for a in 0..dim_a {
+        for b in 0..dim_b {
+            for c in 0..dim_c {
+                let in_idx = a * dim_b * dim_c + b * dim_c + c;
+                let out_idx = a * dim_c * dim_b + c * dim_b + b;
+                output[out_idx] = input[in_idx];
+            }
+        }
+    }
+    output
+}
+
+#[test]
+fn test_transpose_last2_f16_2_16_64() {
+    use half::f16;
+
+    let (device, mut registry) = setup();
+
+    // Realistic gemma4v ViT shape factor: num_heads=2, batch=16, head_dim=64.
+    let dim_a = 2;
+    let dim_b = 16;
+    let dim_c = 64;
+    let total = dim_a * dim_b * dim_c;
+
+    // Generate test data as f32, then quantize to f16 to compute the
+    // reference *at f16 precision* (so we measure the kernel's copy
+    // fidelity, not f32→f16 rounding).
+    let input_f32: Vec<f32> = (0..total).map(|i| (i as f32) * 0.01 - 10.0).collect();
+    let input_f16: Vec<f16> = input_f32.iter().map(|&v| f16::from_f32(v)).collect();
+    let input_f16_f32: Vec<f32> = input_f16.iter().map(|&v| v.to_f32()).collect();
+
+    let expected = cpu_transpose_last2(&input_f16_f32, dim_a, dim_b, dim_c);
+
+    let byte_len = total * 2; // f16
+
+    let mut input_buf = device
+        .alloc_buffer(byte_len, DType::F16, vec![dim_a, dim_b, dim_c])
+        .expect("alloc input");
+    {
+        let dst: &mut [f16] = input_buf.as_mut_slice::<f16>().expect("write input");
+        dst.copy_from_slice(&input_f16);
+    }
+
+    let output_buf = device
+        .alloc_buffer(byte_len, DType::F16, vec![dim_a, dim_c, dim_b])
+        .expect("alloc output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    transpose::transpose_last2_f16(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input_buf,
+        &output_buf,
+        dim_a,
+        dim_b,
+        dim_c,
+    )
+    .expect("transpose_last2_f16 dispatch");
+
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let output_f16: Vec<f16> = output_buf.as_slice::<f16>().expect("read").to_vec();
+    let mut max_diff = 0.0f32;
+    let mut max_diff_idx = 0usize;
+    for i in 0..total {
+        let actual = output_f16[i].to_f32();
+        let diff = (actual - expected[i]).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            max_diff_idx = i;
+        }
+    }
+
+    // f16 copy/permute is a typed memcpy — must be bitwise exact.
+    assert!(
+        max_diff < 1e-10,
+        "transpose_last2_f16 [{},{},{}]: max|delta| = {} at index {} (got {}, want {}) — should be bitwise exact for a typed copy",
+        dim_a, dim_b, dim_c, max_diff, max_diff_idx,
+        output_f16[max_diff_idx].to_f32(), expected[max_diff_idx]
+    );
+}
+
+#[test]
+fn test_transpose_last2_f16_1_1_1() {
+    use half::f16;
+
+    let (device, mut registry) = setup();
+
+    let val: f32 = 3.14;
+    let v_f16 = f16::from_f32(val);
+
+    let mut input_buf = device
+        .alloc_buffer(2, DType::F16, vec![1, 1, 1])
+        .expect("alloc input");
+    input_buf.as_mut_slice::<f16>().expect("write")[0] = v_f16;
+
+    let output_buf = device
+        .alloc_buffer(2, DType::F16, vec![1, 1, 1])
+        .expect("alloc output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    transpose::transpose_last2_f16(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input_buf,
+        &output_buf,
+        1,
+        1,
+        1,
+    )
+    .expect("transpose_last2_f16");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let result = output_buf.as_slice::<f16>().expect("read")[0].to_f32();
+    let expected = v_f16.to_f32();
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "1x1x1 transpose_last2_f16: expected {}, got {}",
+        expected, result
+    );
+}
+
+#[test]
+fn test_transpose_last2_f16_zero_dim_error() {
+    let (device, mut registry) = setup();
+
+    let buf = device
+        .alloc_buffer(2, DType::F16, vec![1])
+        .expect("buf");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let result = transpose::transpose_last2_f16(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &buf,
+        &buf,
+        0,
+        1,
+        1,
+    );
+    assert!(result.is_err(), "Should error on dim_a=0");
+}

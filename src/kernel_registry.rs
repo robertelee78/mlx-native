@@ -259,6 +259,7 @@ impl KernelRegistry {
         sources.insert("embedding_gather_scale_batch_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16".into(), elementwise_src);
         sources.insert("transpose_last2_bf16".into(), elementwise_src);
+        sources.insert("transpose_last2_f16".into(), elementwise_src);
         sources.insert("permute_021_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16_to_f32".into(), elementwise_src);
         sources.insert("transpose_2d_f32".into(), elementwise_src);

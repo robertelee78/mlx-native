@@ -497,3 +497,45 @@ kernel void transpose_last2_bf16(
 
     output[out_idx] = input[in_idx];
 }
+
+// --------------------------------------------------------------------------
+// transpose_last2_f16 — swap the last two axes of a 3D half-precision tensor.
+//
+//   input:  half [A, B, C] row-major
+//   output: half [A, C, B] row-major
+//
+// F16 sibling of `transpose_last2_bf16`.  Added for ADR-005 Phase 2c
+// iter-129 to keep the gemma4v ViT V-staging at peer's `simdgroup_half8x8`
+// MMA precision (10-bit mantissa) end-to-end through the transpose into
+// the scores@V matmul.  Pre-iter-129 hf2q cast V F32→BF16 (7-bit mantissa)
+// before transpose, capturing the dominant residual per-block cascade
+// after iter-128's weight-matmul F16 fix.
+//
+// Byte layout, grid, dispatch geometry are identical to the BF16 sibling:
+// `bfloat` and `half` share the 16-bit storage size, and the kernel is
+// pure copy (no arithmetic) so the MSL compiler emits the same store
+// pattern modulo the typed pointer.
+//
+// Buffers:
+//   0: input  — half [A * B * C]
+//   1: output — half [A * C * B]
+//   2: params — Permute021Params { dim_a, dim_b, dim_c } (shared struct)
+// --------------------------------------------------------------------------
+kernel void transpose_last2_f16(
+    device const half* input  [[buffer(0)]],
+    device half*       output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint b = gid.x;
+    const uint c = gid.y;
+    const uint a = gid.z;
+
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+
+    const uint in_idx  = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    // output layout: [A, C, B].  dim_c rows of length dim_b per slice.
+    const uint out_idx = a * (params.dim_c * params.dim_b) + c * params.dim_b + b;
+
+    output[out_idx] = input[in_idx];
+}
