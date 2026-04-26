@@ -406,6 +406,17 @@ fn dispatch_id_mv(
     };
 
     let (nth0, nth1, align) = match params.ggml_type {
+        // Q4_0/Q8_0: historical (8, 8) layout = 64 threads = 2 simdgroups
+        // of 32.  Tested 2026-04-26 against llama.cpp's (32, 2) layout —
+        // (32, 2) gave a 1.8% short-bench improvement on dwq46 but a
+        // 2.0% REGRESSION on the 5-cold-run 256-token decode bench
+        // (median 108.0 vs 110.2 t/s).  Likely cache/scheduling
+        // interaction with the multi-token KV-cache memory access
+        // pattern that the (8, 8) layout happens to align with on M5
+        // Max.  6th confirmed M5 Max static-evidence kernel hypothesis
+        // falsified — Metal compiler/scheduler optimizes both layouts
+        // similarly, with workload-specific edges that don't match
+        // llama.cpp's tuning.
         GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
         // Q5_K and Q6_K both use the 2-row-per-threadgroup (2, 32) geometry.
         GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
