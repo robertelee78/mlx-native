@@ -188,6 +188,124 @@ kernel void kernel_mul_mv_id_q4_0_f32(
 }
 
 // ====================================================================
+// Q4_0 fused-SwiGLU expert-indexed mat-vec kernel
+// ====================================================================
+//
+// Computes: dst[r][n] = sum_k(dequant(W_q4_0[expert_id][n][k])
+//                              * (silu(gate[r][k]) * up[r][k]))
+//
+// where r = token*top_k + slot, expert_id = ids[r].
+//
+// Replaces the dispatch sequence:
+//   silu_mul_f32(gate, up → h_all)        # 1 dispatch + memory_barrier
+//   kernel_mul_mv_id_q4_0_f32(W, h_all → dst)  # 1 dispatch
+//
+// with a single dispatch that reads gate + up directly and computes
+// swiglu inline before the dot product.  Closes ~5-10µs/layer × 40
+// layers ≈ 0.3-0.4ms/token of CPU dispatch overhead in the dwq46
+// decode hot path (ADR-012 §Optimize / Task #15).
+//
+// Buffer layout:
+//   buffer(0): src0   - Q4_0 packed weight, [n_experts, N, K/QK4_0] blocks
+//   buffer(1): gate   - f32 [n_tokens*top_k, K]
+//   buffer(2): up     - f32 [n_tokens*top_k, K]
+//   buffer(3): dst    - f32 [n_tokens*top_k, N]
+//   buffer(4): ids    - u32 [n_tokens*top_k]
+//   buffer(5): params - GgmlMatvecIdParams
+//
+// Dispatch geometry: identical to kernel_mul_mv_id_q4_0_f32 —
+// threadgroups=(ceil(N/8), n_tokens*top_k, 1), tg=(8, 8, 1).
+kernel void kernel_mul_mv_id_q4_0_f32_swiglu(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * gate   [[buffer(1)]],
+    device const float  * up     [[buffer(2)]],
+    device       float  * dst    [[buffer(3)]],
+    device const  uint  * ids    [[buffer(4)]],
+    constant GgmlMatvecIdParams & p [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int output_row = tgpig.y;  // flat index into output: token*top_k + slot
+
+    if (output_row >= (int)p.ne1) return;
+
+    // For expert_down in the decode-time MoE pipeline, the input row IS
+    // the output row index (one h_all row per (token, expert_slot) pair),
+    // not token_idx.  Each (token, expert_slot) has its own gate/up vectors.
+    const uint expert_id = ids[output_row];
+    const uint input_row = output_row;  // gate/up are pre-routed per (token, slot).
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    // Expert's weight slice.
+    device const block_q4_0 * x = (device const block_q4_0 *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
+
+    // Per-row gate and up vectors.
+    device const float * gate_y = gate + input_row * p.ne10;
+    device const float * up_y   = up   + input_row * p.ne10;
+
+    float yl[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * gb = gate_y + ix * QK4_0 + il;
+    device const float * ub = up_y   + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        float sumy = 0;
+        // Compute swiglu = silu(gate) * up = gate * sigmoid(gate) * up
+        // for each of the 16 active elements per simdthread, reusing the
+        // same yl[] / sumy aggregation as the unfused kernel.
+        for (int i = 0; i < 8; i += 2) {
+            // Lane block 0 (i=0, i+1).
+            float g0 = gb[i+0];
+            float g1 = gb[i+1];
+            float u0 = ub[i+0];
+            float u1 = ub[i+1];
+            float s0 = (g0 / (1.0f + metal::exp(-g0))) * u0;
+            float s1 = (g1 / (1.0f + metal::exp(-g1))) * u1;
+            sumy += s0 + s1;
+            yl[i+0] = s0;
+            yl[i+1] = s1 / 256.f;
+
+            // Lane block 1 (i+16, i+17).
+            float g2 = gb[i+16];
+            float g3 = gb[i+17];
+            float u2 = ub[i+16];
+            float u3 = ub[i+17];
+            float s2 = (g2 / (1.0f + metal::exp(-g2))) * u2;
+            float s3 = (g3 / (1.0f + metal::exp(-g3))) * u3;
+            sumy += s2 + s3;
+            yl[i+8] = s2 / 16.f;
+            yl[i+9] = s3 / 4096.f;
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_q4_0_dot_y(x + ib + row*nb, sumy, yl, il);
+        }
+
+        gb += QK4_0 * 16;
+        ub += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ====================================================================
 // Q8_0 expert-indexed mat-vec kernel
 // ====================================================================
 

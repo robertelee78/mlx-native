@@ -464,6 +464,147 @@ fn dispatch_id_mv(
     Ok(())
 }
 
+/// Fused SwiGLU + expert-routed Q4_0 mat-vec.
+///
+/// Computes `output[r][n] = sum_k(dequant(W_q4_0[ids[r]][n][k]) * (silu(gate[r][k]) * up[r][k]))`
+/// in a single dispatch — replaces the `silu_mul + quantized_matmul_id_ggml`
+/// sequence that hf2q's MoE FFN decode path used (Phase D + Phase E in
+/// `gpu_ffn.rs:build_moe_ffn_layer_gpu_q_into`).
+///
+/// Saves one dispatch + one memory_barrier per MoE layer × 40 layers per
+/// decode token, targeting the dispatch-count component of the dwq46
+/// 0.93× decode parity gap (per the `MLX_PROFILE_CB=1` per-cb breakdown
+/// in ADR-012 §Optimize / Task #15).
+///
+/// Currently supports `GgmlType::Q4_0` only (the dominant expert-down
+/// quant type in dwq46).  Q8_0 / Q6_K support is straightforward to add
+/// by templating the inner dot-product over the dequant kernel; not yet
+/// implemented because dwq46's expert_down is 95% Q4_0.
+///
+/// # Arguments
+///
+/// * `encoder`  -- Command encoder.
+/// * `registry` -- Kernel registry.
+/// * `device`   -- Metal device.
+/// * `gate`     -- f32 gate input `[n_tokens*top_k, K]`.
+/// * `up`       -- f32 up input `[n_tokens*top_k, K]`.
+/// * `weight`   -- Q4_0 expert weight stack `[n_experts, N, packed_K]`.
+/// * `ids`      -- u32 expert index buffer `[n_tokens*top_k]`.
+/// * `output`   -- f32 output `[n_tokens*top_k, N]`.
+/// * `params`   -- Same params struct as `quantized_matmul_id_ggml` (must have ggml_type=Q4_0).
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if dimensions don't match expected
+/// shapes or `params.ggml_type` is not `Q4_0`.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_swiglu_q4_0(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    gate: &MlxBuffer,
+    up: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &mut MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: expected Q4_0, got {:?}",
+            params.ggml_type
+        )));
+    }
+    let qk = GgmlType::Q4_0.block_values();
+
+    // --- Validate dimensions (mirror quantized_matmul_id_ggml) ---
+    if params.n_tokens == 0 || params.k == 0 || params.n == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_swiglu_q4_0: n_tokens, K, and N must all be > 0".into(),
+        ));
+    }
+    if params.top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_swiglu_q4_0: top_k must be > 0".into(),
+        ));
+    }
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: K ({}) must be divisible by block QK ({})",
+            params.k, qk
+        )));
+    }
+
+    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
+    let expected_in_bytes = total_rows * (params.k as usize) * DType::F32.size_of();
+    if gate.byte_len() < expected_in_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: gate buffer too small: expected {} bytes, got {}",
+            expected_in_bytes, gate.byte_len()
+        )));
+    }
+    if up.byte_len() < expected_in_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: up buffer too small: expected {} bytes, got {}",
+            expected_in_bytes, up.byte_len()
+        )));
+    }
+    let expected_out_bytes = total_rows * (params.n as usize) * DType::F32.size_of();
+    if output.byte_len() < expected_out_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: output buffer too small: expected {} bytes, got {}",
+            expected_out_bytes, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(
+        "kernel_mul_mv_id_q4_0_f32_swiglu",
+        device.metal_device(),
+    )?;
+
+    let gpu_params = GgmlMatvecIdGpuParams {
+        ne00: params.k as i64,
+        ne01: params.n as i64,
+        ne02: 1,
+        ne10: params.k as i64,
+        ne12: 1,
+        ne0: params.n as i64,
+        ne1: total_rows as i64,
+        r2: 1,
+        r3: 1,
+        top_k: params.top_k,
+        n_tokens: params.n_tokens,
+        expert_stride: params.expert_stride as i64,
+    };
+
+    // Same (8, 8) geometry as the unfused Q4_0 mv_id kernel.
+    let (nth0, nth1, align) = (8u64, 8u64, 8usize);
+    let n = params.n as usize;
+    let m = total_rows;
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(n, align) as u64,
+        m as u64,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
+
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(gate)),
+            (2, KernelArg::Buffer(up)),
+            (3, KernelArg::Buffer(output)),
+            (4, KernelArg::Buffer(ids)),
+            (5, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
 /// Caller-owned scratch for the `_id` mm path's map0 stage.
 ///
 /// Holds the two small buffers map0 writes and mm_id reads
