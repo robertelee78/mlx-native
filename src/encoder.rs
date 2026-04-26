@@ -838,6 +838,46 @@ impl CommandEncoder {
         }
     }
 
+    /// Commit + wait, accumulating GPU wall-clock time under `label` into
+    /// the [`crate::kernel_profile`] global table when `MLX_PROFILE_CB=1`
+    /// is set.  When the env var is unset, this is identical to
+    /// [`commit_and_wait`](Self::commit_and_wait) — zero overhead.
+    ///
+    /// Used by hf2q's decode hot path to attribute per-cb GPU time to
+    /// labeled phases (per-layer attn, per-layer ffn, output_head, etc.)
+    /// without manually wiring `commit_wait_with_gpu_time` everywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
+    pub fn commit_and_wait_labeled(&mut self, label: &str) -> Result<()> {
+        if crate::kernel_profile::is_enabled() {
+            let (start_s, end_s) = self.commit_wait_with_gpu_time()?;
+            let ns = ((end_s - start_s).max(0.0) * 1_000_000_000.0) as u64;
+            crate::kernel_profile::record(label, ns);
+            Ok(())
+        } else {
+            self.commit_and_wait()
+        }
+    }
+
+    /// Async commit, but with profiling label.  When `MLX_PROFILE_CB=1`
+    /// is set, redirects to a synchronous [`commit_and_wait_labeled`]
+    /// call to capture per-cb GPU time (this defeats async pipelining
+    /// while profiling, which is the whole point — profile-mode is slow
+    /// but informative).  When unset, identical to [`commit`](Self::commit).
+    pub fn commit_labeled(&mut self, label: &str) {
+        if crate::kernel_profile::is_enabled() {
+            // Profile mode: force sync to capture GPU time.  Errors are
+            // logged via stderr because the void return matches commit().
+            if let Err(e) = self.commit_and_wait_labeled(label) {
+                eprintln!("[mlx-native] commit_labeled({}) failed: {}", label, e);
+            }
+        } else {
+            self.commit();
+        }
+    }
+
     /// Commit + wait, returning `(gpu_start_s, gpu_end_s)` CFTimeInterval
     /// timestamps from `MTLCommandBuffer`'s `GPUStartTime`/`GPUEndTime`
     /// properties.  Both are mach-absolute CFTimeInterval seconds (double).

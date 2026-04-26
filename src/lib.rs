@@ -53,6 +53,7 @@ mod dtypes;
 mod encoder;
 mod kernel_registry;
 pub mod gguf;
+pub mod kernel_profile;
 pub mod graph;
 pub mod ops;
 pub mod turboquant;
