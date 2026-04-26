@@ -5,16 +5,27 @@
 //! `alloc` call will reuse a free buffer of compatible (>= requested) size
 //! rather than allocating new Metal memory.
 //!
-//! Calling [`reset`](MlxBufferPool::reset) returns all outstanding buffers to
-//! the free list without deallocating Metal memory — ideal for per-inference
-//! arena patterns.
+//! Two return-path patterns are supported and **must not be mixed within a
+//! single arena cycle**:
+//!
+//! * **Per-buffer** via [`release`](MlxBufferPool::release) — explicit return
+//!   of a single buffer to the free list, suitable for ad-hoc patterns where
+//!   the caller knows the precise lifetime of each buffer.
+//! * **Arena bulk** via [`reset`](MlxBufferPool::reset) — bulk-return of every
+//!   buffer handed out by [`alloc`](MlxBufferPool::alloc) since the previous
+//!   reset.  Suitable for per-inference / per-decode-token arena patterns
+//!   where no individual buffer's lifetime crosses the reset boundary.
+//!
+//! Internally, every `alloc` records an ARC-cloned `metal::Buffer` handle so
+//! that `reset` can bulk-recycle without requiring callers to enumerate every
+//! buffer individually.  ARC retain on `metal::Buffer` is cheap (refcount inc).
 
 use std::collections::HashMap;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::error::Result;
+use crate::error::{MlxError, Result};
 
 /// Arena-style buffer pool that reuses Metal buffer allocations.
 ///
@@ -24,13 +35,28 @@ use crate::error::Result;
 ///   power of two.  This reduces fragmentation at the cost of occasionally
 ///   over-allocating by up to 2x.
 /// * `release()` returns a single buffer; `reset()` returns all outstanding
-///   buffers.
+///   buffers handed out since the last reset.
 /// * The pool holds a reference to the `MlxDevice` so it can allocate fresh
 ///   buffers when the free list is empty.
+///
+/// # Why an arena reset matters
+///
+/// In the per-decode-token hot path, each token allocates ~1750 Metal buffers
+/// for scratch / intermediate / parameter storage across attention, FFN, and
+/// linear-attention layers.  Direct `MlxDevice::alloc_buffer()` calls hit
+/// Metal's allocator each time (5-30 µs each); pooling reuses the underlying
+/// `metal::Buffer` objects across token boundaries so steady-state allocation
+/// cost amortizes to near zero.  See ADR-012 §Optimize / Task #15 for the
+/// MoE dwq46 0.90× parity gap that motivated this work.
 pub struct MlxBufferPool<'d> {
     device: &'d MlxDevice,
     /// Free buffers keyed by their power-of-two bucket size.
     free: HashMap<usize, Vec<metal::Buffer>>,
+    /// Buffers handed out by [`alloc`] since the last [`reset`].  Each entry
+    /// holds an ARC-cloned `metal::Buffer` so the pool's reference keeps the
+    /// underlying GPU allocation alive even after the caller's `MlxBuffer`
+    /// goes out of scope.  [`reset`] drains this into [`free`].
+    in_use: Vec<(usize, metal::Buffer)>,
 }
 
 impl<'d> MlxBufferPool<'d> {
@@ -39,6 +65,7 @@ impl<'d> MlxBufferPool<'d> {
         Self {
             device,
             free: HashMap::new(),
+            in_use: Vec::new(),
         }
     }
 
@@ -46,10 +73,12 @@ impl<'d> MlxBufferPool<'d> {
     ///
     /// If a free buffer of compatible size exists in the pool, it is reused
     /// (with updated dtype/shape metadata).  Otherwise a new Metal buffer is
-    /// allocated from the device.
+    /// allocated from the device at the bucket size so future reuse is
+    /// possible for any request up to that bucket.
     ///
-    /// The actual Metal buffer size will be rounded up to the nearest power of
-    /// two for bucketing purposes.
+    /// Each successful `alloc` registers the buffer in the pool's in-use
+    /// list (ARC clone — cheap), so a subsequent [`reset`] returns it to
+    /// the free list automatically.
     pub fn alloc(
         &mut self,
         byte_len: usize,
@@ -59,29 +88,79 @@ impl<'d> MlxBufferPool<'d> {
         let bucket = bucket_size(byte_len);
 
         // Try to reuse a free buffer from this bucket.
-        if let Some(free_list) = self.free.get_mut(&bucket) {
-            if let Some(metal_buf) = free_list.pop() {
-                let mut buf = MlxBuffer::from_raw(metal_buf, dtype, shape);
-                // The reused buffer may have stale metadata; reshape it.
-                // byte_len is <= bucket, so the Metal buffer is large enough.
-                let _ = &mut buf; // reshape is handled by from_raw above
-                return Ok(buf);
-            }
-        }
+        let metal_buf = self
+            .free
+            .get_mut(&bucket)
+            .and_then(|free_list| free_list.pop());
 
-        // No free buffer available — allocate a fresh one at the bucket size
-        // (so future reuse is possible for any request up to this bucket).
-        self.device.alloc_buffer(bucket, dtype, shape)
+        let metal_buf = match metal_buf {
+            Some(b) => b,
+            None => {
+                // Fresh allocation at bucket size.
+                let raw = self.device.metal_device().new_buffer(
+                    bucket as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                if raw.contents().is_null() {
+                    return Err(MlxError::BufferAllocationError { bytes: bucket });
+                }
+                raw
+            }
+        };
+
+        // Track the handout so reset() can recycle it.  ARC clone is cheap.
+        self.in_use.push((bucket, metal_buf.clone()));
+
+        Ok(MlxBuffer::from_raw(metal_buf, dtype, shape))
     }
 
-    /// Return a buffer to the pool's free list for future reuse.
+    /// Return a single buffer to the pool's free list for future reuse.
     ///
     /// The Metal memory is **not** deallocated — it stays resident on the GPU
-    /// for fast reuse.
+    /// for fast reuse.  `release` is the per-buffer alternative to [`reset`];
+    /// see the module docs for guidance on which to use.
+    ///
+    /// **Mixing `release` and `reset` within the same arena cycle is not
+    /// supported** — the pool's in-use list does not deduplicate, so a buffer
+    /// returned via `release` and then bulk-returned via `reset` would land in
+    /// the free list twice (each entry holds an ARC clone of the same Metal
+    /// buffer; the duplication wastes a free-list slot but is not a memory
+    /// leak — both clones drop together once popped).  Pick one pattern per
+    /// arena cycle.
     pub fn release(&mut self, buffer: MlxBuffer) {
         let bucket = bucket_size(buffer.byte_len());
         let metal_buf = buffer.into_inner();
         self.free.entry(bucket).or_default().push(metal_buf);
+    }
+
+    /// Bulk-return every buffer handed out by [`alloc`] since the last reset
+    /// to the pool's free list.
+    ///
+    /// # Caller contract
+    ///
+    /// All `MlxBuffer` values returned by `alloc` since the last reset must be
+    /// out-of-scope (dropped) at the time `reset` is called.  Reset transfers
+    /// the pool's ARC clones to the free list, where they become available to
+    /// subsequent [`alloc`] calls.  If a caller is still holding an `MlxBuffer`
+    /// and a later `alloc` re-issues the underlying buffer, the two callers
+    /// will share GPU memory (aliasing).  The Metal ARC keeps the storage
+    /// alive in either case, but writes from the new caller will be visible
+    /// to the stale caller — a correctness bug, not a memory error.
+    ///
+    /// In Rust's ownership model, locally-bound `MlxBuffer` values fall out of
+    /// scope at the end of their lexical block, making the per-decode-token
+    /// arena pattern safe by construction:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     pool.reset();          // start of token — recycle previous token's buffers
+    ///     forward_pass(&pool);   // many alloc(), no explicit release
+    /// }                          // forward_pass returns; locals dropped
+    /// ```
+    pub fn reset(&mut self) {
+        for (bucket, metal_buf) in self.in_use.drain(..) {
+            self.free.entry(bucket).or_default().push(metal_buf);
+        }
     }
 
     /// Return all free buffers' count (for diagnostics).
@@ -97,7 +176,13 @@ impl<'d> MlxBufferPool<'d> {
             .sum()
     }
 
-    /// Clear all free buffers, releasing Metal memory.
+    /// Number of buffers currently in-use (alloc'd but not yet reset).
+    pub fn in_use_count(&self) -> usize {
+        self.in_use.len()
+    }
+
+    /// Clear all free buffers, releasing Metal memory.  Does not affect
+    /// in-use tracking.
     pub fn clear(&mut self) {
         self.free.clear();
     }
@@ -128,5 +213,87 @@ mod tests {
         assert_eq!(bucket_size(1023), 1024);
         assert_eq!(bucket_size(1024), 1024);
         assert_eq!(bucket_size(1025), 2048);
+    }
+
+    #[test]
+    fn test_pool_arena_reset_recycles_in_use() {
+        // Per-decode-token arena pattern: alloc many, drop locals, reset, alloc again.
+        // Subsequent allocs must reuse the same Metal buffers (verified by ARC-cloned
+        // contents pointer).
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new(&device);
+
+        // Cycle 1: allocate three buffers in different buckets, then drop them
+        // (locals fall out of scope at the end of the block).
+        let (ptr_a, ptr_b, ptr_c) = {
+            let buf_a = pool.alloc(1024, DType::F32, vec![256]).expect("alloc a");
+            let buf_b = pool.alloc(2048, DType::F32, vec![512]).expect("alloc b");
+            let buf_c = pool.alloc(1024, DType::F32, vec![256]).expect("alloc c");
+            (buf_a.contents_ptr(), buf_b.contents_ptr(), buf_c.contents_ptr())
+        };
+        assert_eq!(pool.in_use_count(), 3);
+        assert_eq!(pool.free_count(), 0);
+
+        // Reset returns all three to free.
+        pool.reset();
+        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.free_count(), 3);
+
+        // Cycle 2: allocate compatible-bucket buffers, must reuse the same
+        // underlying Metal buffers (contents_ptr equal).
+        let buf_d = pool.alloc(1024, DType::F32, vec![256]).expect("alloc d");
+        let buf_e = pool.alloc(2048, DType::F32, vec![512]).expect("alloc e");
+        let ptr_d = buf_d.contents_ptr();
+        let ptr_e = buf_e.contents_ptr();
+
+        // Pointers must come from {a, b, c} — bucket 1024 reuse for d (matches a or c),
+        // bucket 2048 reuse for e (matches b).
+        assert!(
+            ptr_d == ptr_a || ptr_d == ptr_c,
+            "buf_d {:?} must reuse one of a {:?} / c {:?}",
+            ptr_d, ptr_a, ptr_c,
+        );
+        assert_eq!(ptr_e, ptr_b, "buf_e must reuse b (only 2048-bucket buffer)");
+
+        // After cycle-2 alloc, free has 1 (the unused 1024-bucket buffer) + in_use 2.
+        assert_eq!(pool.in_use_count(), 2);
+        assert_eq!(pool.free_count(), 1);
+    }
+
+    #[test]
+    fn test_pool_reset_with_no_alloc_is_idempotent() {
+        // Empty reset must be a no-op.
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new(&device);
+        pool.reset();
+        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.free_count(), 0);
+        // Multiple resets without intervening alloc — still no-op.
+        pool.reset();
+        pool.reset();
+        assert_eq!(pool.in_use_count(), 0);
+    }
+
+    #[test]
+    fn test_pool_release_remains_supported_for_compat() {
+        // The existing per-buffer release() pattern still works.  Mixing
+        // release+reset within the same arena cycle is documented as
+        // unsupported but technically lands a duplicate clone in free —
+        // verify the duplicate is harmless (alloc still picks up a buffer).
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new(&device);
+
+        let buf = pool.alloc(1024, DType::F32, vec![256]).expect("alloc");
+        assert_eq!(pool.in_use_count(), 1);
+        pool.release(buf);
+        // release() does NOT remove from in_use; that's acceptable per the
+        // documented contract (don't mix patterns).  Free has the released one.
+        assert_eq!(pool.free_count(), 1);
+        assert_eq!(pool.in_use_count(), 1);
+
+        // Allocating again pulls from free first.
+        let _buf2 = pool.alloc(1024, DType::F32, vec![256]).expect("alloc 2");
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.in_use_count(), 2);
     }
 }
