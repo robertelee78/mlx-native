@@ -34,6 +34,7 @@ pub mod quantized_matmul_id_ggml;
 pub mod rms_norm;
 pub mod rope;
 pub mod rope_multi;
+pub mod vision_2d_rope;
 pub mod scale_mask_softmax;
 pub mod sigmoid_mul;
 pub mod silu_mul;
