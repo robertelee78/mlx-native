@@ -129,6 +129,21 @@ impl KernelRegistry {
             include_str!("shaders/dense_mm_f32_f32.metal");
         sources.insert("hf2q_dense_mm_f32_f32_tensor".into(), dense_mm_f32_f32_tensor_src);
 
+        // Dense f16×f32 → f32 tensor-API matmul (F16-staging sibling
+        // of dense_mm_bf16_tensor).  Used by hf2q's ADR-005 Phase 2c
+        // iter-128 gemma4v ViT precision-parity path: every mmproj
+        // weight is stored as F16 in GGUF, peer's `kernel_mul_mm_f16_f32`
+        // (`ggml-metal.metal:10099`) stages BOTH A and B as `half` in
+        // shmem and computes on `simdgroup_half8x8`.  Matches peer
+        // per-element rounding budget exactly (10-bit mantissa vs
+        // BF16's 7-bit), closing the 1.16x/block cascade compound that
+        // iter-127 numerically bisected to BF16 staging.  Same tile
+        // geometry as the BF16 sibling (NR0=64 NR1=32 NK=32, 8 KB
+        // shmem) — half and bfloat share 16-bit storage.
+        let dense_mm_f16_tensor_src: &'static str =
+            include_str!("shaders/dense_mm_f16_tensor.metal");
+        sources.insert("hf2q_dense_mm_f16_f32_tensor".into(), dense_mm_f16_tensor_src);
+
         // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
         // for M=1 single-token decode.  Port of llama.cpp's
         // kernel_mul_mv_bf16_f32_4 (bfloat4-vectorized GEMV kernel).

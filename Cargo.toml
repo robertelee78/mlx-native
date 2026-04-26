@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
