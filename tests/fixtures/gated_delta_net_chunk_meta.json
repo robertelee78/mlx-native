@@ -1,0 +1,107 @@
+{
+  "version": "wave5b.1-iter1-v1",
+  "seed": 12648430,
+  "B": 1,
+  "T": 128,
+  "Hg": 2,
+  "H": 4,
+  "K": 128,
+  "V": 128,
+  "BT": 64,
+  "NT": 2,
+  "group_ratio": 2,
+  "fla_reference": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64 at /opt/vllm/vllm/model_executor/layers/fla/ops/chunk_delta_h.py:43-298",
+  "fla_commit_note": "vendored copy in /opt/vllm; original FLA repo github.com/sustcsonglin/flash-linear-attention. vllm /opt/vllm head: 11e2375fe",
+  "inputs": {
+    "k": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_input_k.bin"
+    },
+    "w": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_input_w.bin"
+    },
+    "u": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_input_u.bin"
+    },
+    "g": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_chunk_input_g.bin"
+    },
+    "h0": {
+      "shape": [
+        1,
+        4,
+        128,
+        128
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_chunk_input_h0.bin"
+    }
+  },
+  "outputs": {
+    "h": {
+      "shape": [
+        1,
+        2,
+        4,
+        128,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_state_ref.bin"
+    },
+    "v_new": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_v_new_ref.bin"
+    },
+    "final_state": {
+      "shape": [
+        1,
+        4,
+        128,
+        128
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_chunk_final_ref.bin"
+    }
+  },
+  "tolerance": {
+    "h_atol": 0.005,
+    "h_rtol": 0.02,
+    "v_new_atol": 0.005,
+    "v_new_rtol": 0.02,
+    "final_atol": 0.005,
+    "final_rtol": 0.02
+  }
+}
