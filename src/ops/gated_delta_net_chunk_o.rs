@@ -365,3 +365,64 @@ pub fn build_gated_delta_net_chunk_o_params(
     Ok(buf)
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    //! Wave 5b.1 iter 3 — K=256 clamp unit test.
+    //!
+    //! Mirrors iter-2.5 discipline (see kkt + recompute_w_u for sibling
+    //! tests at /opt/mlx-native/src/ops/gated_delta_net_kkt.rs and
+    //! /opt/mlx-native/src/ops/gated_delta_net_recompute_wu.rs). Closes the
+    //! validation unit-test gap proactively for the new chunk_fwd_o op.
+    use super::*;
+    use crate::MlxDevice;
+
+    /// Allocate a 1-element dummy buffer of the given dtype. The K-cap
+    /// check inside `validate` fires before any buffer-size check, so
+    /// these placeholder buffers are sufficient to exercise the error
+    /// path.
+    fn dummy_buf(device: &MlxDevice, dtype: DType) -> MlxBuffer {
+        device
+            .alloc_buffer(2, dtype, vec![1])
+            .expect("alloc dummy")
+    }
+
+    #[test]
+    fn validate_rejects_k_above_max() {
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let q_buf = dummy_buf(&device, DType::BF16);
+        let k_buf = dummy_buf(&device, DType::BF16);
+        let v_buf = dummy_buf(&device, DType::BF16);
+        let h_buf = dummy_buf(&device, DType::BF16);
+        let g_buf = dummy_buf(&device, DType::F32);
+        let o_buf = dummy_buf(&device, DType::BF16);
+
+        let p = GatedDeltaNetChunkOParams {
+            b: 1,
+            t: 128,
+            hg: 2,
+            h: 4,
+            k: 256, // > MAX_K (192) — must reject.
+            v: 128,
+            bt: 64,
+            scale: (128f32).powf(-0.5),
+        };
+
+        let err = validate(&p, &q_buf, &k_buf, &v_buf, &h_buf, &g_buf, &o_buf)
+            .expect_err("validate must reject K=256");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("256"),
+            "expected K=256 in error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("32 KB") || msg.contains("threadgroup"),
+            "expected threadgroup-memory-budget context in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("max k = 192") || msg.contains("max k=192"),
+            "expected explicit max-K cap in error, got: {msg}"
+        );
+    }
+}
+
