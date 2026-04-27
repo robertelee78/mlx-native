@@ -1,0 +1,86 @@
+{
+  "version": "wave5b.1-iter3-chunk-o-v1",
+  "seed": 12648430,
+  "B": 1,
+  "T": 128,
+  "Hg": 2,
+  "H": 4,
+  "K": 128,
+  "V": 128,
+  "BT": 64,
+  "BK": 32,
+  "BV": 32,
+  "NT": 2,
+  "group_ratio": 2,
+  "scale": 0.08838834764831845,
+  "fla_reference": "chunk_fwd_kernel_o at /opt/vllm/vllm/model_executor/layers/fla/ops/chunk_o.py:42-138",
+  "fla_commit_note": "vendored copy in /opt/vllm; original FLA repo github.com/sustcsonglin/flash-linear-attention. vllm /opt/vllm head: 11e2375fe",
+  "inputs": {
+    "q": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_o_input_q.bin"
+    },
+    "k": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_o_input_k.bin"
+    },
+    "v_new": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_o_input_v.bin"
+    },
+    "h": {
+      "shape": [
+        1,
+        2,
+        4,
+        128,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_o_input_h.bin"
+    },
+    "g": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_chunk_o_input_g.bin"
+    }
+  },
+  "outputs": {
+    "o": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_chunk_o_o_ref.bin"
+    }
+  },
+  "tolerance": {
+    "o_atol": 0.005,
+    "o_rtol": 0.02
+  }
+}
