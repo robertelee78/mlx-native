@@ -16,29 +16,44 @@ using namespace metal;
 //
 // # Algorithm (per (batch b, head i_h, V-tile i_v))
 //
-//   b_h := h0[b, i_h, i_v_tile, :]              # [BV, K] f32 in shared mem
+//   bh := h0[b, i_h, BV-rows-of-tile, :]        # [BV, K] f32 in shared mem
 //   for i_t in 0..NT:
-//       store b_h -> h_out[b, i_t, i_h, i_v_tile, :]   # bf16 store
-//       b_w  := w[b, t_chunk, i_h, :]                  # [BT, K] bf16
-//       b_u  := u[b, t_chunk, i_h, i_v_tile]            # [BT, BV] bf16
-//       b_v  := b_u - b_w @ b_h^T                      # [BT, BV] f32
-//       store bf16(b_v) -> v_new[b, t_chunk, i_h, i_v_tile]
+//       store bh -> h_out[b, i_t, i_h, BV-rows, :]    # bf16 store
+//       bv  := u[b, t_chunk, i_h, BV-rows]            # [BT, BV] f32
+//             - w[b, t_chunk, i_h, :] @ bh^T          # [BT, K] @ [K, BV]
+//       store bf16(bv) -> v_new[b, t_chunk, i_h, BV-rows]
 //
 //       last_t := (i_t+1)*BT - 1
-//       g_last := g[b, last_t, i_h]                    # f32 scalar
-//       g_blk  := g[b, t_chunk, i_h]                   # f32 [BT]
-//       b_v    := b_v * exp(g_last - g_blk)[:, None]
-//       b_h    := b_h * exp(g_last)
+//       g_last := g[b, last_t, i_h]                   # f32 scalar
+//       g_blk  := g[b, t_start..t_end, i_h]           # f32 [BT]
+//       bv     := bf16-roundtrip(bv) * exp(g_last - g_blk)[:, None]
+//       bh     := bh * exp(g_last)
 //
-//       b_k := k[b, t_chunk, i_h / GROUP_RATIO, :]     # [BT, K] bf16, GQA
-//       b_h += b_v.T @ b_k                              # outer accumulate
+//       bh += bv.T @ k[b, t_chunk, i_h/group_ratio, :]  # outer accumulate
 //
-//   final_state[b, i_h, i_v_tile, :] := b_h            # f32 store
+//   final_state[b, i_h, BV-rows, :] := bh             # f32 store
 //
-// All matmul-style dots: bf16 storage → f32 accumulator.  b_h stays in f32
-// in shared memory across the T loop.  The state is V-tile-blocked
-// (BV=32 V rows per threadgroup), so threadgroup memory holds a `[BV, K]`
-// f32 tile = 32 * 128 * 4 = 16 KB, well under M5 Max's 32 KB limit.
+// # Numerical precision
+//
+//   Inputs / stored intermediates: bf16. Accumulators: f32. The bh state
+//   stays in f32 in shared memory across the T-loop (matches FLA's policy
+//   at chunk_delta_h.py:85 — `b_h1 = tl.zeros([BV, 64], dtype=tl.float32)`).
+//
+// # bf16 round-trip on bv before the gate-multiply (FLA parity)
+//
+//   FLA explicitly casts bv through bf16 at line 255 (`b_v = b_v.to(
+//   k.dtype.element_ty)`) before the outer-update dot.  Our reference
+//   fixture matches this exactly (see
+//   tests/fixtures/gated_delta_net_chunk_reference.py).  We must match it
+//   here in the Metal kernel to stay within the bf16 5e-3 tolerance.
+//
+// # Threadgroup memory layout
+//
+//   We allocate (BT*BV + BV*K) * 4 bytes = (2048 + 4096) * 4 = 24 KB at
+//   threadgroup(0). The first BT*BV floats are `bv_stage` (used to
+//   publish per-thread bv values to all threads for the outer-update);
+//   the next BV*K floats are `bh` (the running f32 state tile).
+//   24 KB < 32 KB M5 Max max threadgroup memory.
 //
 // # Memory layouts (innermost-first)
 //
@@ -54,8 +69,7 @@ using namespace metal;
 // # Threading
 //
 //   Grid: (NV_TILES = V/BV, H, B)
-//   Threadgroup: 128 threads (4 simdgroups × 32 lanes), arranged as a flat 1D
-//     so we can repurpose them flexibly across the per-stage operations.
+//   Threadgroup: TG_THREADS = 128 (4 simdgroups × 32 lanes), flat 1D.
 //
 // # Buffer bindings (matching the host)
 //
@@ -69,16 +83,14 @@ using namespace metal;
 //   buffer(7): final_state f32
 //   buffer(8): params      uint[8] = [B, T, Hg, H, K, V, BT, NT]
 
-// =====================================================================
-// Iter 1 (commit 2): STUB — kernel registered but body intentionally
-// returns zero outputs. The test exercises the dispatch path correctly
-// (so a stub-only commit is sufficient to confirm the dispatch is wired
-// up); the assertion against the FLA fixture will fail until commit 3
-// lands the real recurrence body.
-// =====================================================================
+constant uint BV = 32u;          // V-tile width (per-threadgroup V slice)
+constant uint TG_THREADS = 128u; // threadgroup size
 
-constant uint BV = 32u;          // V-tile width
-constant uint TG_THREADS = 128u; // threadgroup size (4 simdgroups)
+// bf16 round-trip — cast to bfloat then back to float to truncate
+// f32 -> bf16 -> f32 (matches PyTorch `.to(bfloat16).float()`).
+inline float bf16_round(float x) {
+    return float(bfloat(x));
+}
 
 kernel void gated_delta_net_chunk_inter_state_bf16(
     device const bfloat *k         [[buffer(0)]],
@@ -94,66 +106,201 @@ kernel void gated_delta_net_chunk_inter_state_bf16(
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    // Unused in stub; suppress warnings.
-    (void)k; (void)w; (void)u; (void)g; (void)h0;
-    (void)shared_mem;
-
     const uint B   = params[0];
     const uint T   = params[1];
-    (void)params;
-    (void)B; (void)T;
     const uint Hg  = params[2];
     const uint H   = params[3];
     const uint K   = params[4];
     const uint V   = params[5];
     const uint BT  = params[6];
     const uint NT  = params[7];
-    (void)Hg; (void)BT;
 
     const uint i_v = tgid.x; // V-tile index
-    const uint i_h = tgid.y; // head
+    const uint i_h = tgid.y; // V-head
     const uint i_b = tgid.z; // batch
     const uint tid = tid3.x;
 
-    if (i_v * BV >= V || i_h >= H) return;
+    if (i_b >= B || i_h >= H) return;
+    if (i_v * BV >= V) return;
 
-    // Stub: zero the per-(batch, head, v-tile) slice of h_out, v_new,
-    // and final_state. The tests' first assertion (FLA reference parity)
-    // will fail with a 5e-3 tolerance violation, demonstrating the test
-    // is wired but the kernel body is not yet correct.
+    const uint v_base       = i_v * BV;          // first V-row in tile
+    const uint group_ratio  = H / Hg;
+    const uint kh           = i_h / group_ratio; // GQA-mapped K-head
 
-    // Zero h_out[b, *, i_h, i_v_tile, *]    — [NT, BV, K] bf16
-    for (uint i_t = 0; i_t < NT; ++i_t) {
+    // Strides (in elements).
+    const uint k_t_stride   = Hg * K;
+    const uint k_seq_stride = T * k_t_stride;
+    const uint w_t_stride   = H * K;
+    const uint w_seq_stride = T * w_t_stride;
+    const uint u_t_stride   = H * V;
+    const uint u_seq_stride = T * u_t_stride;
+    const uint g_t_stride   = H;
+    const uint g_seq_stride = T * g_t_stride;
+    const uint state_head_stride = V * K;
+    const uint state_seq_stride  = H * state_head_stride;
+    const uint h_chunk_stride    = H * state_head_stride;
+    const uint h_seq_stride      = NT * h_chunk_stride;
+
+    // Threadgroup-memory partition (24 KB total — host allocates exactly
+    // this much; see gated_delta_net_chunk.rs `dispatch_*`).
+    //   shared_mem[0          .. BT*BV)        = bv_stage    [BT, BV]  f32
+    //   shared_mem[BT*BV      .. BT*BV + BV*K) = bh          [BV, K]   f32
+    threadgroup float *bv_stage = shared_mem;
+    threadgroup float *bh       = shared_mem + (BT * BV);
+
+    // ===================================================================
+    // 1. Load h0 -> bh.
+    // ===================================================================
+    {
+        const uint h0_base = i_b * state_seq_stride + i_h * state_head_stride;
         for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
-            const uint vv = flat / K;        // 0..BV
-            const uint kk = flat - vv * K;   // 0..K
-            const uint v_idx = i_v * BV + vv;
-            if (v_idx < V) {
-                const uint h_off = ((((i_b * NT) + i_t) * H + i_h) * V + v_idx) * K + kk;
-                h_out[h_off] = bfloat(0.0f);
+            const uint vv = flat / K;
+            const uint kk = flat - vv * K;
+            const uint vidx = v_base + vv;
+            float val = 0.0f;
+            if (vidx < V) {
+                val = h0[h0_base + vidx * K + kk];
             }
+            bh[vv * K + kk] = val;
         }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Zero v_new[b, *, i_h, i_v_tile]       — [T, BV] bf16
-    for (uint t = 0; t < T; ++t) {
-        for (uint vv = tid; vv < BV; vv += TG_THREADS) {
-            const uint v_idx = i_v * BV + vv;
-            if (v_idx < V) {
-                const uint vn_off = (((i_b * T) + t) * H + i_h) * V + v_idx;
-                v_new[vn_off] = bfloat(0.0f);
+    // Per-thread accumulator for bv during phase 2b.  We don't persist
+    // it across the loop — it's regenerated each chunk.
+    constexpr uint CELLS_BV          = 64u * 32u;       // BT * BV
+    constexpr uint CELLS_PER_THREAD  = CELLS_BV / TG_THREADS; // 16
+    thread float local_v[CELLS_PER_THREAD];
+
+    // ===================================================================
+    // 2. Per-chunk loop.
+    // ===================================================================
+    for (uint i_t = 0; i_t < NT; ++i_t) {
+        const uint t_start = i_t * BT;
+        const uint last_t  = t_start + BT - 1;
+
+        // -----------------------------------------------------------
+        // 2a. Snapshot bh -> h_out.
+        // -----------------------------------------------------------
+        const uint h_out_base =
+            i_b * h_seq_stride + i_t * h_chunk_stride + i_h * state_head_stride;
+        for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
+            const uint vv = flat / K;
+            const uint kk = flat - vv * K;
+            const uint vidx = v_base + vv;
+            if (vidx < V) {
+                h_out[h_out_base + vidx * K + kk] = bfloat(bh[vv * K + kk]);
             }
         }
+        // No barrier needed — bh is read-only here.
+
+        // -----------------------------------------------------------
+        // 2b. Compute bv = u_chunk - w_chunk @ bh^T.
+        //     Each thread owns CELLS_PER_THREAD (bt, bv) cells, walked
+        //     by `flat = c * TG_THREADS + tid`.
+        // -----------------------------------------------------------
+        const uint w_base = i_b * w_seq_stride + (t_start * w_t_stride) + i_h * K;
+        const uint u_base = i_b * u_seq_stride + (t_start * u_t_stride) + i_h * V;
+
+        for (uint c = 0; c < CELLS_PER_THREAD; ++c) {
+            const uint flat = c * TG_THREADS + tid;
+            const uint bt_idx = flat / BV;
+            const uint bv_idx = flat - bt_idx * BV;
+            const uint vidx   = v_base + bv_idx;
+
+            float u_val = 0.0f;
+            if (vidx < V) {
+                u_val = float(u[u_base + bt_idx * u_t_stride + vidx]);
+            }
+
+            float dot = 0.0f;
+            for (uint kk = 0; kk < K; ++kk) {
+                const float w_val  = float(w[w_base + bt_idx * w_t_stride + kk]);
+                const float bh_val = bh[bv_idx * K + kk];
+                dot += w_val * bh_val;
+            }
+            local_v[c] = u_val - dot;
+        }
+
+        // -----------------------------------------------------------
+        // 2c. Store bf16(bv) -> v_new (BEFORE the gate multiply, matching
+        //     FLA's tl.store at line 199-203 — the stored v_new is
+        //     u - w @ h^T without the gate scaling).
+        // -----------------------------------------------------------
+        const uint vn_base = i_b * u_seq_stride + (t_start * u_t_stride) + i_h * V;
+        for (uint c = 0; c < CELLS_PER_THREAD; ++c) {
+            const uint flat = c * TG_THREADS + tid;
+            const uint bt_idx = flat / BV;
+            const uint bv_idx = flat - bt_idx * BV;
+            const uint vidx   = v_base + bv_idx;
+            if (vidx < V) {
+                v_new[vn_base + bt_idx * u_t_stride + vidx] = bfloat(local_v[c]);
+            }
+        }
+
+        // -----------------------------------------------------------
+        // 2d. Gate multiplies.
+        //     local_v[c] *= exp(g_last - g_blk[bt])   (after bf16 round-trip)
+        //     bh[*]      *= exp(g_last)
+        // -----------------------------------------------------------
+        const uint g_base = i_b * g_seq_stride + i_h;
+        const float g_last = g[g_base + last_t * g_t_stride];
+        const float exp_g_last = metal::exp(g_last);
+
+        for (uint c = 0; c < CELLS_PER_THREAD; ++c) {
+            const uint flat = c * TG_THREADS + tid;
+            const uint bt_idx = flat / BV;
+            const float g_t = g[g_base + (t_start + bt_idx) * g_t_stride];
+            const float scale = metal::exp(g_last - g_t);
+            local_v[c] = bf16_round(local_v[c]) * scale;
+        }
+
+        // Scale bh by exp_g_last in place (cooperative across threads).
+        for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
+            bh[flat] *= exp_g_last;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // -----------------------------------------------------------
+        // 2e. Publish local_v to bv_stage; barrier.
+        // -----------------------------------------------------------
+        for (uint c = 0; c < CELLS_PER_THREAD; ++c) {
+            const uint flat = c * TG_THREADS + tid;
+            bv_stage[flat] = local_v[c]; // [bt, bv] flat = bt*BV + bv
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // -----------------------------------------------------------
+        // 2f. Outer-update: bh[bv, kk] += sum_bt(bv_stage[bt, bv] * k[bt, kk]).
+        //     Each thread owns BV*K / TG_THREADS = 32 cells.
+        // -----------------------------------------------------------
+        const uint k_chunk_base = i_b * k_seq_stride + t_start * k_t_stride + kh * K;
+        for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
+            const uint bv_idx = flat / K;
+            const uint kk     = flat - bv_idx * K;
+            float acc = 0.0f;
+            for (uint bt_idx = 0; bt_idx < BT; ++bt_idx) {
+                const float bv_val = bv_stage[bt_idx * BV + bv_idx];
+                const float bk_val = float(k[k_chunk_base + bt_idx * k_t_stride + kk]);
+                acc += bv_val * bk_val;
+            }
+            bh[flat] += acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Zero final_state[b, i_h, i_v_tile, *] — [BV, K] f32
-    for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
-        const uint vv = flat / K;
-        const uint kk = flat - vv * K;
-        const uint v_idx = i_v * BV + vv;
-        if (v_idx < V) {
-            const uint fs_off = ((i_b * H + i_h) * V + v_idx) * K + kk;
-            final_state[fs_off] = 0.0f;
+    // ===================================================================
+    // 3. Store final state.
+    // ===================================================================
+    {
+        const uint fs_base = i_b * state_seq_stride + i_h * state_head_stride;
+        for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
+            const uint vv = flat / K;
+            const uint kk = flat - vv * K;
+            const uint vidx = v_base + vv;
+            if (vidx < V) {
+                final_state[fs_base + vidx * K + kk] = bh[vv * K + kk];
+            }
         }
     }
 }

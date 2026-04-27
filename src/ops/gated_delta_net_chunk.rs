@@ -286,10 +286,11 @@ pub fn dispatch_gated_delta_net_chunk_inter_state(
 
     // Threadgroup memory budget — see header comment in
     // gated_delta_net_chunk.metal for the exact accounting.
-    //   bh tile      : BV × K × 4 = 32 × 128 × 4 = 16 KB
-    //   bw tile      : BT × K × 2 = 64 × 128 × 2 = 16 KB ❌ over budget
-    // We stage bw and bk in registers/private and only put bh in shared.
-    let shared_floats: u64 = (DEFAULT_BV * p.k) as u64;
+    //   bv_stage : BT × BV × 4 = 64 × 32 × 4 = 8 KB   (per-thread bv -> all-threads)
+    //   bh tile  : BV × K  × 4 = 32 × 128 × 4 = 16 KB (running f32 state)
+    // Total: 24 KB.  M5 Max max threadgroup memory is 32 KB, so this fits
+    // with 8 KB headroom.
+    let shared_floats: u64 = ((p.bt * DEFAULT_BV) + (DEFAULT_BV * p.k)) as u64;
     let shared_bytes = shared_floats * 4;
 
     encoder.encode_threadgroups_with_shared(
