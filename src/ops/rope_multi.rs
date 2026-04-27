@@ -25,6 +25,9 @@
 //! the height-axis, then width, then extra. For Qwen3.5 text, all four
 //! axes are set to the token's 1D position.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
@@ -207,6 +210,136 @@ pub fn dispatch_rope_multi(
     );
 
     Ok(())
+}
+
+/// Pre-built triple of small parameter buffers for a `rope_multi` dispatch.
+///
+/// Held in the per-thread [`ROPE_PACK_CACHE`] so callers that issue
+/// repeated dispatches with stable shape (the qwen35 / qwen36 decode hot
+/// path: identical `head_dim`, `rope_dim`, `n_heads`, `seq_len=1`,
+/// `freq_base`, `mode`, `sections` every step) skip the per-call
+/// allocation triplet (~208 µs/token measured on M5 Max in
+/// `cfa-20260426-adr015-wave2a-p3aprime`).  Decode-out-of-scope cases
+/// (variable `seq_len`) populate one entry per `seq_len` value seen,
+/// then reuse on re-encounter.
+pub struct RopeMultiBufferPack {
+    pub params_buf: MlxBuffer,
+    pub rope_params_buf: MlxBuffer,
+    pub sections_buf: MlxBuffer,
+}
+
+/// Cache key for [`ROPE_PACK_CACHE`].  Includes the [`MlxDevice`] pointer
+/// so two consecutive sessions with different devices (e.g. model swap)
+/// never share entries — required for correctness, not just isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RopeMultiCacheKey {
+    device_ptr: usize,
+    head_dim: u32,
+    rope_dim: u32,
+    n_heads: u32,
+    seq_len: u32,
+    freq_base_bits: u32,
+    mode: u32,
+    sections: [u32; 4],
+}
+
+impl RopeMultiCacheKey {
+    fn from_params(device: &crate::MlxDevice, p: &RopeMultiParams) -> Self {
+        Self {
+            device_ptr: device as *const _ as usize,
+            head_dim: p.head_dim,
+            rope_dim: p.rope_dim,
+            n_heads: p.n_heads,
+            seq_len: p.seq_len,
+            freq_base_bits: p.freq_base.to_bits(),
+            mode: p.mode as u32,
+            sections: p.sections,
+        }
+    }
+}
+
+thread_local! {
+    /// Per-thread cache of pre-built `rope_multi` parameter buffers,
+    /// keyed by [`RopeMultiCacheKey`].  Built lazily on first
+    /// [`dispatch_rope_multi_cached`] call for a given key, retained for
+    /// the thread's lifetime (cleared by [`clear_rope_pack_cache`] in
+    /// tests / on explicit model unload).
+    static ROPE_PACK_CACHE: RefCell<HashMap<RopeMultiCacheKey, RopeMultiBufferPack>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clear the thread-local rope-multi pack cache.
+///
+/// Useful between model loads (the cache key includes the device pointer
+/// so old entries can never be returned for a new device, but they leak
+/// memory until cleared) and in test suites that swap mocked devices.
+pub fn clear_rope_pack_cache() {
+    ROPE_PACK_CACHE.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Inspect the current pack-cache size — diagnostic only.
+pub fn rope_pack_cache_len() -> usize {
+    ROPE_PACK_CACHE.with(|cell| cell.borrow().len())
+}
+
+/// Dispatch a `rope_multi` operation, reusing pre-built parameter
+/// buffers from the per-thread cache.
+///
+/// Functionally equivalent to [`dispatch_rope_multi`] preceded by
+/// [`build_rope_multi_buffers`], but the small param/rope_params/sections
+/// buffers (3 × 16 bytes each) are built once per
+/// `(device, head_dim, rope_dim, n_heads, seq_len, freq_base, mode,
+/// sections)` tuple and reused on every subsequent call.  See
+/// `docs/ADR-015-mlx-native-single-cb-decode.md` §"P3a' live profile pass"
+/// rank-4 finding — `build_rope_multi_buffers` per-call alloc was
+/// measured at 208 µs/token on the qwen3.6-27b-dwq46 dense-FFN-Q hot
+/// path (16 FullAttn layers × 2 calls/layer = 32 calls/token, each
+/// allocating 3 fresh `MlxBuffer`s via Mach IPC).  This helper closes
+/// that residual.
+///
+/// Bit-exact to the per-call form: identical kernel, identical inputs,
+/// only the small parameter triplet is sourced from the cache.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rope_multi_cached(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &crate::MlxDevice,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    positions: &MlxBuffer,
+    p: RopeMultiParams,
+) -> Result<()> {
+    let key = RopeMultiCacheKey::from_params(device, &p);
+    ROPE_PACK_CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(&key) {
+            let (params_buf, rope_params_buf, sections_buf) =
+                build_rope_multi_buffers(device, p)?;
+            map.insert(
+                key,
+                RopeMultiBufferPack {
+                    params_buf,
+                    rope_params_buf,
+                    sections_buf,
+                },
+            );
+        }
+        let pack = map
+            .get(&key)
+            .expect("inserted above if missing; cache is single-threaded");
+        dispatch_rope_multi(
+            encoder,
+            registry,
+            device.metal_device(),
+            input,
+            output,
+            positions,
+            &pack.params_buf,
+            &pack.rope_params_buf,
+            &pack.sections_buf,
+            p,
+        )
+    })
 }
 
 /// Convenience: build all three small parameter buffers given a [`RopeMultiParams`].

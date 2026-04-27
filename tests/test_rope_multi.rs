@@ -583,3 +583,207 @@ fn test_rope_multi_rejects_rope_dim_gt_head_dim() {
     );
     assert!(res.is_err(), "rope_dim > head_dim should error");
 }
+
+// =================================================================
+// dispatch_rope_multi_cached parity (ADR-015 P3b rank-4)
+// =================================================================
+//
+// The cached dispatch path reuses pre-built parameter buffers across
+// calls.  This test verifies it is bit-exact to the per-call path on
+// the qwen3.5 decode hot-path shape (seq_len=1, head_dim=256, rope_dim=64,
+// IMROPE), and that re-issuing the same dispatch returns the same bytes
+// (cache hit path).
+
+fn run_rope_multi_cached(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    input_data: &[f32],
+    positions_data: &[i32],
+    p: RopeMultiParams,
+) -> Vec<f32> {
+    let input_buf = upload_f32(device, input_data);
+    let output_buf = device
+        .alloc_buffer(input_data.len() * 4, DType::F32, vec![input_data.len()])
+        .expect("output");
+    let positions_buf = upload_i32(device, positions_data);
+
+    let mut enc = device.command_encoder().expect("enc");
+    mlx_native::ops::rope_multi::dispatch_rope_multi_cached(
+        &mut enc,
+        registry,
+        device,
+        &input_buf,
+        &output_buf,
+        &positions_buf,
+        p,
+    )
+    .expect("dispatch_cached");
+    enc.commit_and_wait().expect("commit");
+
+    output_buf.as_slice::<f32>().expect("read").to_vec()
+}
+
+#[test]
+fn test_rope_multi_cached_matches_uncached_qwen35_decode_shape() {
+    let (device, mut registry) = setup();
+    mlx_native::ops::rope_multi::clear_rope_pack_cache();
+
+    // qwen3.5 FullAttn decode: seq_len=1 (the steady-state hot path).
+    let p_q = RopeMultiParams {
+        head_dim: 256,
+        rope_dim: 64,
+        n_heads: 32, // n_heads (Q)
+        seq_len: 1,
+        freq_base: 1e7,
+        mode: RopeMultiMode::Imrope,
+        sections: [11, 11, 10, 0],
+    };
+    let p_k = RopeMultiParams {
+        n_heads: 4, // n_kv_heads (K)
+        ..p_q
+    };
+
+    let n_q = (p_q.seq_len * p_q.n_heads) as usize * p_q.head_dim as usize;
+    let n_k = (p_k.seq_len * p_k.n_heads) as usize * p_k.head_dim as usize;
+
+    let mut seed = 0xc0ffee99u32;
+    let mut rand = || -> f32 {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        (seed as i32 as f32) / (i32::MAX as f32)
+    };
+
+    let input_q: Vec<f32> = (0..n_q).map(|_| rand()).collect();
+    let input_k: Vec<f32> = (0..n_k).map(|_| rand()).collect();
+    // Text positions: all 4 axes = same token index (decode position 42).
+    let positions: Vec<i32> = vec![42, 42, 42, 42];
+
+    let want_q = run_rope_multi(&device, &mut registry, &input_q, &positions, p_q);
+    let want_k = run_rope_multi(&device, &mut registry, &input_k, &positions, p_k);
+
+    // Same shape via the cached path — first call populates, second hits.
+    let got_q1 = run_rope_multi_cached(&device, &mut registry, &input_q, &positions, p_q);
+    let got_k1 = run_rope_multi_cached(&device, &mut registry, &input_k, &positions, p_k);
+    let got_q2 = run_rope_multi_cached(&device, &mut registry, &input_q, &positions, p_q);
+    let got_k2 = run_rope_multi_cached(&device, &mut registry, &input_k, &positions, p_k);
+
+    // Bit-exact (same kernel, same buffers; only param-buf source differs).
+    for i in 0..n_q {
+        assert_eq!(
+            got_q1[i].to_bits(),
+            want_q[i].to_bits(),
+            "cached-vs-uncached mismatch Q[{}] {} vs {}",
+            i, got_q1[i], want_q[i]
+        );
+        assert_eq!(
+            got_q2[i].to_bits(),
+            want_q[i].to_bits(),
+            "cache-hit re-dispatch mismatch Q[{}]",
+            i
+        );
+    }
+    for i in 0..n_k {
+        assert_eq!(
+            got_k1[i].to_bits(),
+            want_k[i].to_bits(),
+            "cached-vs-uncached mismatch K[{}] {} vs {}",
+            i, got_k1[i], want_k[i]
+        );
+        assert_eq!(
+            got_k2[i].to_bits(),
+            want_k[i].to_bits(),
+            "cache-hit re-dispatch mismatch K[{}]",
+            i
+        );
+    }
+
+    // After the 4 cached calls (Q, K, Q, K — 2 distinct keys), the cache
+    // should contain exactly 2 entries (one per (n_heads, ...) tuple).
+    assert_eq!(
+        mlx_native::ops::rope_multi::rope_pack_cache_len(),
+        2,
+        "expected 2 cache entries (Q + K), got {}",
+        mlx_native::ops::rope_multi::rope_pack_cache_len()
+    );
+
+    mlx_native::ops::rope_multi::clear_rope_pack_cache();
+    assert_eq!(
+        mlx_native::ops::rope_multi::rope_pack_cache_len(),
+        0,
+        "cache should be empty after clear"
+    );
+}
+
+#[test]
+fn test_rope_multi_cached_seq_len_variation() {
+    // Verify the cache key includes seq_len: prefill (seq>1) gets its
+    // own entry, decode (seq=1) keeps a separate one.  Both must remain
+    // bit-exact to the per-call path.
+    let (device, mut registry) = setup();
+    mlx_native::ops::rope_multi::clear_rope_pack_cache();
+
+    let p_decode = RopeMultiParams {
+        head_dim: 64,
+        rope_dim: 32,
+        n_heads: 4,
+        seq_len: 1,
+        freq_base: 1e6,
+        mode: RopeMultiMode::Imrope,
+        sections: [5, 5, 6, 0],
+    };
+    let p_prefill = RopeMultiParams {
+        seq_len: 7,
+        ..p_decode
+    };
+
+    let mut seed = 0xfacefeedu32;
+    let mut rand = || -> f32 {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        (seed as i32 as f32) / (i32::MAX as f32)
+    };
+
+    let n_decode = (p_decode.seq_len * p_decode.n_heads) as usize * p_decode.head_dim as usize;
+    let n_prefill = (p_prefill.seq_len * p_prefill.n_heads) as usize * p_prefill.head_dim as usize;
+
+    let input_decode: Vec<f32> = (0..n_decode).map(|_| rand()).collect();
+    let input_prefill: Vec<f32> = (0..n_prefill).map(|_| rand()).collect();
+
+    let positions_decode: Vec<i32> = vec![3, 3, 3, 3];
+    // Prefill: 4 * seq_len = 28 entries; cycle through token indices.
+    let positions_prefill: Vec<i32> = (0..p_prefill.seq_len as i32)
+        .cycle()
+        .take(4 * p_prefill.seq_len as usize)
+        .collect();
+
+    let want_d = run_rope_multi(&device, &mut registry, &input_decode, &positions_decode, p_decode);
+    let want_p = run_rope_multi(
+        &device,
+        &mut registry,
+        &input_prefill,
+        &positions_prefill,
+        p_prefill,
+    );
+
+    let got_d =
+        run_rope_multi_cached(&device, &mut registry, &input_decode, &positions_decode, p_decode);
+    let got_p = run_rope_multi_cached(
+        &device,
+        &mut registry,
+        &input_prefill,
+        &positions_prefill,
+        p_prefill,
+    );
+
+    for i in 0..n_decode {
+        assert_eq!(got_d[i].to_bits(), want_d[i].to_bits(), "decode {}", i);
+    }
+    for i in 0..n_prefill {
+        assert_eq!(got_p[i].to_bits(), want_p[i].to_bits(), "prefill {}", i);
+    }
+    assert_eq!(
+        mlx_native::ops::rope_multi::rope_pack_cache_len(),
+        2,
+        "expected 2 entries (decode seq_len=1 + prefill seq_len=7)"
+    );
+
+    mlx_native::ops::rope_multi::clear_rope_pack_cache();
+}
