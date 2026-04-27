@@ -161,14 +161,17 @@ def chunk_h_reference(
                 v_new[b, t_start:t_end, i_h] = b_v_f32.to(torch.bfloat16)
 
                 # 3. Apply gate to b_v and b_h.  (FLA chunk_delta_h.py:205-221)
+                # Per FLA spec, the only bf16 round-trip on b_v is at line 255
+                # (POST-gate, PRE-outer-dot). The gate multiplies (lines 213
+                # for b_v, 215 for b_h) operate on f32 b_v with no bf16 cast
+                # in front of them. Wave5b.1 iter1.5 removed an erroneous
+                # pre-gate bf16 cast that previously sat here and silently
+                # diverged from FLA's numerics by O(6e-4) on final_state.
                 last = t_end - 1
                 g_last = g[b, last, i_h]                          # f32 scalar
                 g_blk = g[b, t_start:t_end, i_h]                  # f32 [BT]
                 # Note: chunk_delta_h.py masks elements past T with `0`, but
                 # T is a multiple of BT here so no masking needed.
-                # Cast b_v -> bf16 -> f32 (matches `b_v = b_v.to(k.dtype)`
-                # at line 255, then f32 reduction in the dot below).
-                b_v_f32 = b_v_f32.to(torch.bfloat16).float()
                 b_v_f32 = b_v_f32 * torch.exp(g_last - g_blk).unsqueeze(-1)
                 b_h = b_h * torch.exp(g_last)
 
