@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
-"""Independent oracle for recompute_w_u_fwd (Wave 5b.1 iter 2).
+"""Independent oracle for recompute_w_u_fwd (Wave 5b.1 iter 2.5).
 
 Wave 5b.1 iter 1.5 lesson: every new kernel needs a third independent
-recipe to prevent fixture-and-kernel co-conspiracy bugs.
+recipe to prevent fixture-and-kernel co-conspiracy bugs. Wave 5b.1
+iter 2 audit (Codex, med-sev): the prior oracle removed BV/BK output-
+column tiling but still used the same per-(b, h, chunk) Python loop as
+the reference, so a co-conspiracy bug along the chunk-recurrence axis
+would have evaded detection. This iter-2.5 rewrite goes further:
 
-The reference fixture (gated_delta_net_recompute_wu_reference.py)
-decomposes the math as TWO inner loops over V-tiles and K-tiles, each
-of which casts the scaled operand to bf16 right before the dot
-(mirroring FLA wy_fast.py:92 and :114). The oracle uses a DIFFERENT
-recipe: NO inner loops — instead, cast the FULL [BT, V] / [BT, K] matrix
-in one shot, then matmul.
+ORACLE RECIPE — single batched einsum over (B, NT, H), NO Python loops:
 
-ORACLE RECIPE — single matmul per (b, h, i_t):
+    1. Reshape A         [B, T, H, BT]  -> [B, NT, H, BT, BT]    (chunk axis NT)
+    2. Reshape beta      [B, T, H]      -> [B, NT, H, BT]
+    3. Reshape v         [B, T, H, V]   -> [B, NT, H, BT, V]
+    4. Reshape k         [B, T, Hg, K]  -> [B, NT, Hg, BT, K]    (broadcast over GROUP_RATIO into H)
+    5. Reshape g         [B, T, H]      -> [B, NT, H, BT]; b_g = exp(g_chunk)
+    6. b_vb = (v_chunk.float() * beta_chunk[..., None]).to(bf16)        # [B, NT, H, BT, V]
+       b_kb = (k_chunk.float() * beta_chunk[..., None]
+              * b_g[..., None]).to(bf16)                                # [B, NT, H, BT, K]
+       u    = einsum("bnhij,bnhjV->bnhiV", A_chunk_f32, b_vb_f32)        # [B, NT, H, BT, V]
+       w    = einsum("bnhij,bnhjK->bnhiK", A_chunk_f32, b_kb_f32)        # [B, NT, H, BT, K]
+    7. Reshape u, w back to [B, T, H, V] / [B, T, H, K], cast to bf16.
 
-    For u (FLA wy_fast.py:74-94):
-        b_v_full     = v[b, t_chunk, i_h, :]                    # bf16 [BT, V]
-        b_vb_full_f32 = b_v_full.float() * b_beta[:, None]      # [BT, V] f32
-        b_vb_full_bf16 = b_vb_full_f32.to(torch.bfloat16)       # FLA :92 cast
-        u_chunk = b_A @ b_vb_full_bf16.float()                  # [BT, V] f32
-        u[chunk] = u_chunk.to(bf16)
+This decomposition is mathematically identical to the reference IFF:
+    (a) the bf16 cast is on the scaled operand (post-scale, pre-dot),
+    (b) the dot accumulator is f32 (einsum default with f32 inputs),
+    (c) no chunk-recurrence — chunks are independent (FLA wy_fast.py:91-94
+        and :112-116 make `b_w` / `b_u` purely a function of the i_t-th
+        chunk's b_A, b_beta, b_g, b_v / b_k).
 
-    For w (FLA wy_fast.py:96-116):
-        b_k_full     = k[b, t_chunk, kh, :]                     # bf16 [BT, K]
-        b_kb_full_f32 = b_k_full.float() * b_beta[:, None] * b_g[:, None]
-        b_kb_full_bf16 = b_kb_full_f32.to(torch.bfloat16)       # FLA :114 cast
-        w_chunk = b_A @ b_kb_full_bf16.float()                  # [BT, K] f32
-        w[chunk] = w_chunk.to(bf16)
-
-This matches the spec when (a) the bf16 cast is on the scaled operand
-(post-scale, pre-dot) and (b) the dot accumulator is f32. Tile-decomposition
-of the dot is mathematically identical to one-shot ONLY IF those properties
-hold; otherwise, the per-tile bf16 round-trip's elementwise nature would
-match column-tiles only when the operand-of-second-dim (V or K) is the
-column axis of the dot — which it IS here (b_A @ b_vb has BT rows, V cols;
-the V cols are tile-partitioned and the bf16 cast is elementwise so it
-commutes with the V-tile partition).
+If any of those properties is broken in the reference, this einsum
+disagrees. Crucially, going from a per-chunk Python `for i_t in range(NT)`
+to a single batched einsum exercises a fundamentally different math path:
+the reference visits chunks sequentially through the NT loop; the oracle
+fires every chunk in one tensor-contraction kernel. A co-conspiracy bug
+that walks the chunk axis the same way in both would now diverge.
 
 This oracle exits with code 1 if the existing reference output deviates
 from the bit-exact-spec computation by more than 1e-6.
@@ -74,34 +74,51 @@ def read_f32(path: str, n_elems: int) -> torch.Tensor:
 
 
 def recompute_wu_oracle(k, v, beta, g_cumsum, A, B, T, Hg, H, K, V, BT):
-    """Single-matmul recipe — no V-tile / K-tile inner loops."""
+    """Vectorized einsum recipe — NO Python loops over (b, h, i_t).
+
+    Different math path from the reference's per-chunk Python loop. References
+    FLA wy_fast.py:91-94 (post-scale bf16 cast on b_vb, then bf16 × f32 dot)
+    and :112-116 (same pattern on b_kb with extra b_g multiplier).
+    """
     NT = T // BT
     GROUP_RATIO = H // Hg
+    assert T == NT * BT
+    assert H == Hg * GROUP_RATIO
 
-    w = torch.zeros((B, T, H, K), dtype=torch.bfloat16)
-    u = torch.zeros((B, T, H, V), dtype=torch.bfloat16)
+    # 1. Chunk along the time axis: [B, T, ...] -> [B, NT, BT, ...] -> [B, NT, ..., BT, ...]
+    #    For A:    [B, T, H, BT] -> [B, NT, H, BT, BT]
+    A_chunk = A.reshape(B, NT, BT, H, BT).permute(0, 1, 3, 2, 4).contiguous()  # [B, NT, H, BT, BT]
 
-    for b in range(B):
-        for i_h in range(H):
-            kh = i_h // GROUP_RATIO
-            for i_t in range(NT):
-                ts, te = i_t * BT, (i_t + 1) * BT
+    # 2. beta: [B, T, H] -> [B, NT, H, BT]
+    beta_chunk = beta.reshape(B, NT, BT, H).permute(0, 1, 3, 2).contiguous()    # [B, NT, H, BT]
 
-                b_beta = beta[b, ts:te, i_h]                  # [BT] f32
-                b_A    = A[b, ts:te, i_h, :]                  # [BT, BT] f32
-                b_g    = torch.exp(g_cumsum[b, ts:te, i_h])   # [BT] f32
+    # 3. v: [B, T, H, V] -> [B, NT, H, BT, V]
+    v_chunk = v.reshape(B, NT, BT, H, V).permute(0, 1, 3, 2, 4).contiguous()    # [B, NT, H, BT, V] bf16
 
-                # u: full [BT, V] in one shot.
-                b_v = v[b, ts:te, i_h, :]                     # bf16 [BT, V]
-                b_vb_bf16 = (b_v.float() * b_beta[:, None]).to(torch.bfloat16)
-                b_u = b_A @ b_vb_bf16.float()                 # [BT, V] f32
-                u[b, ts:te, i_h, :] = b_u.to(torch.bfloat16)
+    # 4. k: [B, T, Hg, K] -> [B, NT, H, BT, K] (broadcast Hg -> H via GROUP_RATIO).
+    k_chunk = k.reshape(B, NT, BT, Hg, K).permute(0, 1, 3, 2, 4).contiguous()   # [B, NT, Hg, BT, K]
+    # Expand Hg into H by repeat_interleave on the head axis.
+    k_chunk = k_chunk.repeat_interleave(GROUP_RATIO, dim=2)                     # [B, NT, H, BT, K]
 
-                # w: full [BT, K] in one shot.
-                b_k = k[b, ts:te, kh, :]                      # bf16 [BT, K]
-                b_kb_bf16 = (b_k.float() * b_beta[:, None] * b_g[:, None]).to(torch.bfloat16)
-                b_w = b_A @ b_kb_bf16.float()                 # [BT, K] f32
-                w[b, ts:te, i_h, :] = b_w.to(torch.bfloat16)
+    # 5. g: [B, T, H] -> [B, NT, H, BT], then exp.
+    g_chunk = g_cumsum.reshape(B, NT, BT, H).permute(0, 1, 3, 2).contiguous()   # [B, NT, H, BT]
+    b_g = torch.exp(g_chunk)                                                    # [B, NT, H, BT]
+
+    # 6. Post-scale bf16 cast (FLA :92, :114).
+    b_vb_f32 = v_chunk.float() * beta_chunk[..., None]                           # [B, NT, H, BT, V] f32
+    b_vb_bf16 = b_vb_f32.to(torch.bfloat16)                                      # FLA :92 cast
+
+    b_kb_f32 = k_chunk.float() * beta_chunk[..., None] * b_g[..., None]          # [B, NT, H, BT, K] f32
+    b_kb_bf16 = b_kb_f32.to(torch.bfloat16)                                      # FLA :114 cast
+
+    # 7. Batched einsum — one contraction kernel for ALL (B, NT, H) at once.
+    #    A: [B, NT, H, BT_i, BT_j]   b_vb: [B, NT, H, BT_j, V]   -> u: [B, NT, H, BT_i, V]
+    u_chunk = torch.einsum("bnhij,bnhjV->bnhiV", A_chunk, b_vb_bf16.float())     # [B, NT, H, BT, V] f32
+    w_chunk = torch.einsum("bnhij,bnhjK->bnhiK", A_chunk, b_kb_bf16.float())     # [B, NT, H, BT, K] f32
+
+    # 8. Reshape back to [B, T, H, V/K] and cast to bf16.
+    u = u_chunk.permute(0, 1, 3, 2, 4).reshape(B, T, H, V).to(torch.bfloat16).contiguous()
+    w = w_chunk.permute(0, 1, 3, 2, 4).reshape(B, T, H, K).to(torch.bfloat16).contiguous()
 
     return w, u
 
