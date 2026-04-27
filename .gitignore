@@ -10,3 +10,6 @@
 .claude/
 .claude-flow/
 CLAUDE.md
+
+# BMAD session research artifacts (transient — distilled into ADRs/docs)
+_bmad-output/
