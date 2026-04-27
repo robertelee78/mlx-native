@@ -270,8 +270,11 @@ mod tests {
 
     #[test]
     fn test_pool_reset_with_no_alloc_is_idempotent() {
-        // Empty reset must be a no-op.
-        let device = MlxDevice::new().expect("device");
+        // Empty reset must be a no-op.  No MlxDevice required — pool
+        // operations on an empty pool don't touch the device; the
+        // smoke check used to live here was incidental and triggered
+        // the unused-variable warning since `device` was bound but
+        // never consumed.
         let mut pool = MlxBufferPool::new();
         pool.reset();
         assert_eq!(pool.in_use_count(), 0);
