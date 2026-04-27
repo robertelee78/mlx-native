@@ -415,6 +415,22 @@ impl KernelRegistry {
         let gdn_chunk_o_src: &'static str =
             include_str!("shaders/gated_delta_net_chunk_o.metal");
         sources.insert("gated_delta_net_chunk_o_bf16".into(), gdn_chunk_o_src);
+        // Wave 5b.1 iter 4 — orchestrator helper kernels:
+        //   chunk_local_cumsum_g_f32      — per-chunk prefix sum on g [B, T, H]
+        //   chunk_tri_solve_invert_f32    — per-chunk-block (I + A_strict)^-1
+        //                                   on FLA's [B, T, H, BT] layout.
+        let chunk_local_cumsum_g_src: &'static str =
+            include_str!("shaders/chunk_local_cumsum_g.metal");
+        sources.insert(
+            "chunk_local_cumsum_g_f32".into(),
+            chunk_local_cumsum_g_src,
+        );
+        let chunk_tri_solve_invert_src: &'static str =
+            include_str!("shaders/chunk_gated_delta_rule_tri_solve_invert.metal");
+        sources.insert(
+            "chunk_tri_solve_invert_f32".into(),
+            chunk_tri_solve_invert_src,
+        );
         // Sigmoid-gated elementwise multiply (ADR-013 Decision 9 — full-attn output gate)
         let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
         sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
