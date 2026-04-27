@@ -3285,6 +3285,210 @@ fn flash_attn_prefill_pp65536_no_overflow_in_mask_indexing() {
     );
 }
 
+/// Wave 4.5 / Item 1: blk pre-pass pp65536 site-2 regression test.
+///
+/// ## What this tests
+///
+/// `flash_attn_prefill_blk.metal` site-2 (line 188-189, fixed in commit
+/// 459f550): the pre-pass tile-classification kernel constructs a per-lane
+/// mask pointer as
+///
+/// ```text
+/// mask + (int64_t)(qt * BQ) * (int64_t)M_stride + tile_k_start + tiisg;
+/// ```
+///
+/// Before the fix the two operands were plain `int` (i32), making the product
+/// `qt * BQ * M_stride` overflow at `qt >= 1024`:
+/// `1024 * 32 * 65536 = 2 147 483 648 > i32::MAX = 2 147 483 647`.
+/// The signed-overflow wraps to a large negative pointer offset, causing the
+/// kernel to read bytes far before the mask buffer's base — producing garbage
+/// tile classifications for every Q-tile at index >= 1024.
+///
+/// ## Analytical correctness predicate (no full-mask readback)
+///
+/// At `seq_len_q = seq_len_k = 65536`, `window = 1024`, `causal = true`,
+/// `BQ = 32`, `BK = 16`:
+///
+/// - Q-tile `qt = 1024` covers rows `32768..32800` (0-indexed).
+/// - For row 32768 with SWA causal mask, the attended K-range is
+///   `[32768 - 1024 + 1, 32768] = [31745, 32768]`.
+/// - Any K-tile with `tile_k_end = (kt + 1) * 16 <= 31744` lies entirely
+///   before the attended window for EVERY row in this Q-tile, so every mask
+///   cell in that tile is `-inf` and the tile must be classified **0 (skip)**.
+/// - `kt <= 1983` satisfies `(kt + 1) * 16 <= 31744`.
+///
+/// Pre-patch: the i32 overflow makes the kernel read garbage bytes for rows at
+/// qt=1024 (and all higher Q-tiles).  Garbage mask values are non-`-inf`,
+/// flipping some or all of these tiles from class 0 to class 1 or 2 — the
+/// assertion below catches that.
+///
+/// Post-patch (459f550): the i64-widened pointer arithmetic is correct; every
+/// tile at `qt=1024, kt<=1983` reads genuine `-inf` cells and classifies as 0.
+///
+/// ## Memory budget
+///
+/// - bf16 mask buffer: 65536 × 65536 × 2 B = 8.6 GB
+/// - blk classification buffer: ceil(65536/32) × ceil(65536/16) = 2048 × 4096
+///   = 8 MB
+/// - Total peak: ~8.6 GB GPU.  Test is guarded by a 14 GB free-RAM check.
+///
+/// ## Acceptance
+///
+/// Pre-patch: FAILS — tiles at `qt=1024, kt<=1983` that should be 0 are
+/// reported as non-zero (garbage read).  Post-patch: PASSES — all such tiles
+/// are 0.
+#[test]
+fn flash_attn_prefill_blk_pp65536_no_overflow_in_mask_indexing() {
+    // ── RAM guard ────────────────────────────────────────────────────────────
+    // The mask buffer alone is 8.6 GB.  Refuse to run if available
+    // (free + inactive) physical pages sum to less than 14 GB to avoid
+    // jetsam-killing the test process.
+    {
+        use std::process::Command;
+        let vm = Command::new("vm_stat")
+            .output()
+            .expect("vm_stat failed");
+        let out = String::from_utf8_lossy(&vm.stdout);
+        let pages: u64 = {
+            let mut free: u64 = 0;
+            let mut inactive: u64 = 0;
+            for line in out.lines() {
+                if line.starts_with("Pages free:") {
+                    free = line
+                        .split_whitespace()
+                        .last()
+                        .and_then(|s| s.trim_end_matches('.').parse().ok())
+                        .unwrap_or(0);
+                }
+                if line.starts_with("Pages inactive:") {
+                    inactive = line
+                        .split_whitespace()
+                        .last()
+                        .and_then(|s| s.trim_end_matches('.').parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+            free + inactive
+        };
+        // 16 KiB pages; 14 GB = 14 * 1024 * 1024 * 1024 / 16384 pages
+        let min_pages: u64 = (14u64 * 1024 * 1024 * 1024) / 16384;
+        let free_gb = (pages as f64 * 16384.0) / (1024.0 * 1024.0 * 1024.0);
+        eprintln!(
+            "flash_attn_prefill_blk_pp65536: free+inactive = {:.1} GB (need >= 14 GB)",
+            free_gb
+        );
+        if pages < min_pages {
+            eprintln!(
+                "SKIP: only {:.1} GB free — need >= 14 GB for the 8.6 GB mask buffer",
+                free_gb
+            );
+            return;
+        }
+    }
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_mask::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let ql = 65536_u32;
+    let kl = 65536_u32;
+    let window = 1024_u32; // Gemma-4 SWA window.
+    // BQ=32 / BK=16 must match the tile shape used by the D=256 main kernel
+    // (dispatch_flash_attn_prefill_bf16_d256_with_blk).
+    let bq = 32_u32;
+    let bk = 16_u32;
+
+    eprintln!(
+        "flash_attn_prefill_blk_pp65536: allocating mask {:.1} GB + blk {} KB",
+        (kl as f64 * ql as f64 * 2.0) / 1e9,
+        (ql.div_ceil(bq) as usize * kl.div_ceil(bk) as usize) / 1024,
+    );
+
+    // ── Build the SWA+causal mask (same builder as production) ───────────────
+    let (mask_buf, blk_buf) = build_mask_and_blk(
+        &device,
+        &mut registry,
+        ql,
+        kl,
+        Some(window),
+        true,
+        bq,
+        bk,
+    );
+    let _ = &mask_buf; // keep alive
+
+    // ── Read back the blk classification buffer (8 MB — cheap) ──────────────
+    let nq_tiles = ql.div_ceil(bq) as usize; // 2048
+    let nk_tiles = kl.div_ceil(bk) as usize; // 4096
+    let blk_data = read_u8_buffer(&blk_buf, nq_tiles * nk_tiles);
+
+    // ── Analytical correctness check at the overflow boundary ────────────────
+    //
+    // Q-tile qt=1024 covers rows 32768..32800.  The earliest attended K
+    // position for any of those rows (worst case: row 32768, SWA window=1024)
+    // is K=31745.  K-tiles with tile_k_end = (kt+1)*16 <= 31744 are entirely
+    // outside the attended window for every row in qt=1024, so their mask
+    // cells are all -inf and classification MUST be 0 (skip).
+    //
+    // kt <= 1983  ↔  (1983+1)*16 = 31744 <= 31744  ✓
+    //
+    // We check a representative sample of such tiles: kt=0 (the far corner,
+    // maximum distance from the diagonal) and kt=1983 (the tile just before the
+    // window boundary) at qt=1024.
+    //
+    // Pre-patch: i32 overflow at qt=1024 corrupts the mask pointer → garbage
+    // reads → mmin/mmax are non-inf → tile class becomes 1 or 2 instead of 0.
+    // Post-patch (459f550): i64-widened arithmetic reads genuine -inf cells →
+    // tile class is 0.
+    let qt_boundary = 1024_usize; // first Q-tile that overflows pre-patch
+    let kt_far     = 0_usize;    // K-tile far from diagonal (should be 0)
+    let kt_near_edge = 1983_usize; // last K-tile fully outside the window (should be 0)
+
+    let class_far = blk_data[qt_boundary * nk_tiles + kt_far];
+    let class_near_edge = blk_data[qt_boundary * nk_tiles + kt_near_edge];
+
+    assert_eq!(
+        class_far, 0,
+        "blk[qt=1024][kt=0] must be 0 (fully-masked: far from diagonal at pp65536). \
+         Got {}. Pre-patch i32 overflow reads garbage mask bytes and produces wrong \
+         classification (non-zero) at this tile.",
+        class_far
+    );
+    assert_eq!(
+        class_near_edge, 0,
+        "blk[qt=1024][kt=1983] must be 0 (fully-masked: still outside SWA window). \
+         Got {}. Pre-patch i32 overflow reads garbage mask bytes.",
+        class_near_edge
+    );
+
+    // ── Sanity: tiles near the diagonal at qt=1024 must NOT all be 0 ─────────
+    // Tiles on or just below the diagonal should be class 1 (mixed) or 2
+    // (all-attended).  Verify at least one non-zero classification exists in
+    // the rows around qt=1024 to confirm the blk buffer is generally alive.
+    let qt_range_start = 1020_usize;
+    let qt_range_end   = 1028_usize.min(nq_tiles);
+    let any_nonzero = (qt_range_start..qt_range_end).any(|qt| {
+        let row_start = qt * bq as usize; // first q row of this tile
+        // K-tiles that overlap the window: kt where (kt*BK) is around row_start
+        let kt_window = row_start.saturating_sub(window as usize) / bk as usize;
+        let kt_end = (row_start / bk as usize + 2).min(nk_tiles);
+        (kt_window..kt_end).any(|kt| blk_data[qt * nk_tiles + kt] != 0)
+    });
+
+    assert!(
+        any_nonzero,
+        "Expected some non-zero blk classifications near the diagonal at qt~1024 \
+         (window/mixed tiles). All zero would indicate the blk buffer is zeroed out \
+         or the dispatch didn't run."
+    );
+
+    eprintln!(
+        "flash_attn_prefill_blk_pp65536: PASS — \
+         blk[1024][0]={class_far}, blk[1024][1983]={class_near_edge} (both 0 as required)"
+    );
+}
+
 /// Wave 4.1 / Test 2: rank-2 broadcast mask with multi-head D=512.
 ///
 /// Same as Test 1 but routes through `dispatch_flash_attn_prefill_bf16_d512`.
