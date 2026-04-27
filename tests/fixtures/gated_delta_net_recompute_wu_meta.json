@@ -1,0 +1,95 @@
+{
+  "version": "wave5b.1-iter2-recompute-wu-v1",
+  "seed": 12648430,
+  "B": 1,
+  "T": 128,
+  "Hg": 2,
+  "H": 4,
+  "K": 128,
+  "V": 128,
+  "BT": 64,
+  "BK": 64,
+  "BV": 64,
+  "NT": 2,
+  "group_ratio": 2,
+  "fla_reference": "recompute_w_u_fwd_kernel at /opt/vllm/vllm/model_executor/layers/fla/ops/wy_fast.py:29-117",
+  "A_input_chain": "kkt_pre_solve(k, beta, g) -> numpy linalg.inv(I + L) per chunk; spec-faithful equivalent to FLA chunk_scaled_dot_kkt_fwd + solve_tril",
+  "inputs": {
+    "k": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_recompute_wu_input_k.bin"
+    },
+    "v": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_recompute_wu_input_v.bin"
+    },
+    "beta": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_recompute_wu_input_beta.bin"
+    },
+    "g": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_recompute_wu_input_g.bin"
+    },
+    "A": {
+      "shape": [
+        1,
+        128,
+        4,
+        64
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_recompute_wu_input_A.bin"
+    }
+  },
+  "outputs": {
+    "w": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_recompute_wu_w_ref.bin"
+    },
+    "u": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_recompute_wu_u_ref.bin"
+    }
+  },
+  "tolerance": {
+    "w_atol": 0.005,
+    "w_rtol": 0.02,
+    "u_atol": 0.005,
+    "u_rtol": 0.02
+  }
+}

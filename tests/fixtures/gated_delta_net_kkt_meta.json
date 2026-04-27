@@ -1,0 +1,60 @@
+{
+  "version": "wave5b.1-iter2-kkt-v1",
+  "seed": 12648430,
+  "B": 1,
+  "T": 128,
+  "Hg": 2,
+  "H": 4,
+  "K": 128,
+  "BT": 64,
+  "BK": 64,
+  "NT": 2,
+  "group_ratio": 2,
+  "fla_reference": "chunk_scaled_dot_kkt_fwd_kernel at /opt/vllm/vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py:36-99",
+  "inputs": {
+    "k": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "gated_delta_net_kkt_input_k.bin"
+    },
+    "beta": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_kkt_input_beta.bin"
+    },
+    "g": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_kkt_input_g.bin"
+    }
+  },
+  "outputs": {
+    "A": {
+      "shape": [
+        1,
+        128,
+        4,
+        64
+      ],
+      "dtype": "f32",
+      "file": "gated_delta_net_kkt_A_ref.bin"
+    }
+  },
+  "tolerance": {
+    "A_atol": 0.005,
+    "A_rtol": 0.02
+  }
+}
