@@ -1,0 +1,9 @@
+{
+  "B": 4,
+  "T": 64,
+  "H": 1,
+  "BT": 64,
+  "seed": "0x00C0FFEE",
+  "spec_source": "FLA solve_tril (vllm/.../solve_tril.py:506-530)",
+  "reference_impl": "numpy.linalg.inv(I + A_strict)"
+}
