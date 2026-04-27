@@ -1,0 +1,110 @@
+{
+  "version": "wave5b.1-iter4-orchestrator-v1",
+  "seed": 12648430,
+  "B": 1,
+  "T": 128,
+  "Hg": 2,
+  "H": 4,
+  "K": 128,
+  "V": 128,
+  "BT": 64,
+  "BK": 64,
+  "BV": 64,
+  "BK_O": 32,
+  "BV_O": 32,
+  "NT": 2,
+  "group_ratio": 2,
+  "scale": 0.08838834764831845,
+  "use_qk_l2norm_in_kernel": true,
+  "eps_l2": 1e-06,
+  "fla_reference": "chunk_gated_delta_rule_fwd at /opt/vllm/vllm/model_executor/layers/fla/ops/chunk.py:23-84 + Function.forward l2norm pre-step at chunk.py:106-108",
+  "fla_commit_note": "vendored copy in /opt/vllm; original FLA repo github.com/sustcsonglin/flash-linear-attention. vllm /opt/vllm head: 11e2375fe",
+  "inputs": {
+    "q": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "chunk_gated_delta_rule_fwd_input_q.bin"
+    },
+    "k": {
+      "shape": [
+        1,
+        128,
+        2,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "chunk_gated_delta_rule_fwd_input_k.bin"
+    },
+    "v": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "chunk_gated_delta_rule_fwd_input_v.bin"
+    },
+    "g_log_decay": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "chunk_gated_delta_rule_fwd_input_g_log_decay.bin"
+    },
+    "beta": {
+      "shape": [
+        1,
+        128,
+        4
+      ],
+      "dtype": "f32",
+      "file": "chunk_gated_delta_rule_fwd_input_beta.bin"
+    },
+    "h0": {
+      "shape": [
+        1,
+        4,
+        128,
+        128
+      ],
+      "dtype": "f32",
+      "file": "chunk_gated_delta_rule_fwd_input_h0.bin"
+    }
+  },
+  "outputs": {
+    "o": {
+      "shape": [
+        1,
+        128,
+        4,
+        128
+      ],
+      "dtype": "bf16",
+      "file": "chunk_gated_delta_rule_fwd_o_ref.bin"
+    },
+    "final_state": {
+      "shape": [
+        1,
+        4,
+        128,
+        128
+      ],
+      "dtype": "f32",
+      "file": "chunk_gated_delta_rule_fwd_final_state_ref.bin"
+    }
+  },
+  "tolerance": {
+    "o_atol": 0.01,
+    "o_rtol": 0.05,
+    "final_state_atol": 0.01,
+    "_note": "End-to-end bar: 6 stages of bf16 round-off compound. Single-kernel fixtures use 5e-3 atol; this orchestrator needs ~2x for cumulative drift."
+  }
+}
