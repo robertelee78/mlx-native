@@ -410,6 +410,11 @@ impl KernelRegistry {
             "gated_delta_net_recompute_wu_bf16".into(),
             gdn_recompute_wu_src,
         );
+        // Wave 5b.1 iter 3 — chunk_fwd_o kernel (per-chunk output: closes
+        // the chunk pipeline; spec source: FLA chunk_o.py:42-138).
+        let gdn_chunk_o_src: &'static str =
+            include_str!("shaders/gated_delta_net_chunk_o.metal");
+        sources.insert("gated_delta_net_chunk_o_bf16".into(), gdn_chunk_o_src);
         // Sigmoid-gated elementwise multiply (ADR-013 Decision 9 — full-attn output gate)
         let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
         sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
