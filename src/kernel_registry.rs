@@ -387,6 +387,15 @@ impl KernelRegistry {
         // Gated DeltaNet fused kernel (ADR-013 Decision 6 — centerpiece)
         let gdn_src: &'static str = include_str!("shaders/gated_delta_net.metal");
         sources.insert("gated_delta_net_f32".into(), gdn_src);
+        // Wave 5b — chunk-parallel inter-chunk state-recurrence kernel
+        // (the one new kernel in the chunk-parallel pipeline; spec source:
+        // arXiv 2412.06464 §4 + FLA chunk_delta_h.py:43-298).
+        let gdn_chunk_src: &'static str =
+            include_str!("shaders/gated_delta_net_chunk.metal");
+        sources.insert(
+            "gated_delta_net_chunk_inter_state_bf16".into(),
+            gdn_chunk_src,
+        );
         // Sigmoid-gated elementwise multiply (ADR-013 Decision 9 — full-attn output gate)
         let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
         sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
