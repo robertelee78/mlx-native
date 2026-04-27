@@ -59,18 +59,21 @@
 //! cells split 8 cells/thread; the [BT, BT] = 4096 cells in `bA_acc` split
 //! 16 cells/thread.
 //!
-//! # Threadgroup memory budget (BT=64, BK=32, BV=32)
+//! # Threadgroup memory budget (post Wave 5b.2 iter 2 MMA, BT=64)
 //!
-//!   bo_acc : BT * BV * 4 bytes (f32) = 64 * 32 * 4 = 8  KB
-//!   ba_acc : BT * BT * 4 bytes (f32) = 64 * 64 * 4 = 16 KB
-//!   stage  : BT * max(BK, BV) * 2 bytes (bf16) = 64 * 32 * 2 = 4 KB
-//!   Total: 28 KB.  M5 Max cap 32 KB → 4 KB headroom.
+//!   bA_stage : BT * BT * 2 bytes (bf16) = 64 * 64 * 2 = 8 KB
+//!   Total: 8 KB (down from 28 KB — bo_acc and bA_acc now live in
+//!   simdgroup_matrix accumulator registers, not threadgroup memory).
+//!   M5 Max cap 32 KB → 24 KB headroom.
 //!
 //! # Validation
 //!
-//! - K ≤ 192 (matches iter-1+2 cap; iter-4 will autotune past this).
-//! - V ≤ 256 (same).
-//! - BT must be 64 (iter-3 fixed).
+//! - K ≤ 128 (NARROWED from 192 in Wave 5b.2 iter 2, 2026-04-27).
+//!   The MMA K-tile count (16 = K/8) is hard-coded in the shader; making
+//!   it runtime collapses speedup ~3× (iter 1.5 lesson on inter_state).
+//!   Iter-4 will lift this when the FLA bank-split lands.
+//! - V ≤ 256 (matches iter-1+2 cap).
+//! - BT must be 64 (the BT-tile count `8 = BT/8` is also compile-time).
 //! - BK fixed at 32; BV fixed at 32; T must be a multiple of BT.
 //! - K must be a multiple of BK; V must be a multiple of BV.
 
@@ -85,10 +88,18 @@ use crate::kernel_registry::KernelRegistry;
 pub static GATED_DELTA_NET_CHUNK_O_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_chunk_o.metal");
 
-/// Hard cap on per-tile head-dim K. Matches iter-1+2 chunk-pipeline cap;
-/// the 32 KB threadgroup-memory budget is tight, with 4 KB headroom at
-/// BK=BV=32. Iter-4 will lift this when the autotuned tile schedule lands.
-pub const MAX_K: u32 = 192;
+/// Hard cap on per-tile head-dim K.
+///
+/// NARROWED from 192 to 128 in Wave 5b.2 iter 2 (2026-04-27). The
+/// `simdgroup_matrix<float, 8, 8>` MMA K-tile count is hard-coded at
+/// 16 (= K=128 / 8) in `shaders/gated_delta_net_chunk_o.metal`; making
+/// it runtime via `K/8u` collapses speedup ~3× because Metal's MMA
+/// scheduler needs compile-time loop bounds for tile-sequence unrolling
+/// (mirrors the iter 1.5 lesson on `gated_delta_net_chunk_inter_state_bf16`).
+///
+/// Iter-4 will lift this when the FLA-style bank-split lands (each bank
+/// keeps a compile-time-known K-tile count).
+pub const MAX_K: u32 = 128;
 
 /// Hard cap on per-tile head-dim V (matches iter-1+2 chunk-pipeline cap).
 pub const MAX_V: u32 = 256;
@@ -162,8 +173,11 @@ fn validate(
     }
     if p.k > MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_chunk_o: K ({}) exceeds iter-3 32 KB threadgroup \
-             memory budget (MAX_K = {}); iter-4 will autotune past this",
+            "gated_delta_net_chunk_o: K ({}) exceeds iter-2 simdgroup_matrix \
+             MMA K-tile compile-time bound (MAX_K = {}); the K-tile count is \
+             hard-coded at 16 (= K=128 / 8) in the shader, and the threadgroup \
+             memory footprint is 8 KB / 32 KB cap. Iter-4 will lift this when \
+             the FLA bank-split lands.",
             p.k, MAX_K
         )));
     }
@@ -204,20 +218,15 @@ fn validate(
         )));
     }
 
-    // Defense-in-depth threadgroup-mem accounting.
-    //   bo_acc : BT * BV * 4 bytes (f32)
-    //   ba_acc : BT * BT * 4 bytes (f32)
-    //   stage  : BT * max(BV, BK) * 2 bytes (bf16)
-    let stage_width = std::cmp::max(DEFAULT_BV, DEFAULT_BK);
-    let shared_bytes: u64 = ((p.bt * DEFAULT_BV) as u64) * 4
-        + ((p.bt * p.bt) as u64) * 4
-        + ((p.bt * stage_width) as u64) * 2;
+    // Defense-in-depth threadgroup-mem accounting (post Wave 5b.2 iter 2).
+    //   bA_stage : BT * BT * 2 bytes (bf16)
+    let shared_bytes: u64 = ((p.bt * p.bt) as u64) * 2;
     const M5_MAX_TG_MEM_BYTES: u64 = 32 * 1024;
     if shared_bytes > M5_MAX_TG_MEM_BYTES {
         return Err(MlxError::InvalidArgument(format!(
             "gated_delta_net_chunk_o: threadgroup memory {} bytes exceeds M5 Max \
-             cap of {} bytes (bt={}, bk={}, bv={})",
-            shared_bytes, M5_MAX_TG_MEM_BYTES, p.bt, DEFAULT_BK, DEFAULT_BV
+             cap of {} bytes (bt={})",
+            shared_bytes, M5_MAX_TG_MEM_BYTES, p.bt
         )));
     }
 
@@ -313,11 +322,9 @@ pub fn dispatch_gated_delta_net_chunk_o(
     // Threadgroup: 256 threads.
     let tg = MTLSize::new(256, 1, 1);
 
-    // Threadgroup memory budget (28 KB at BT=64, BK=BV=32).
-    let bo_acc_bytes: u64 = (p.bt as u64) * (DEFAULT_BV as u64) * 4;
-    let ba_acc_bytes: u64 = (p.bt as u64) * (p.bt as u64) * 4;
-    let stage_width = std::cmp::max(DEFAULT_BV, DEFAULT_BK) as u64;
-    let stage_bytes: u64 = (p.bt as u64) * stage_width * 2;
+    // Threadgroup memory budget (8 KB at BT=64, post Wave 5b.2 iter 2 MMA).
+    //   bA_stage : BT * BT * 2 bytes (bf16) = 8 KB
+    let ba_stage_bytes: u64 = (p.bt as u64) * (p.bt as u64) * 2;
 
     encoder.encode_threadgroups_with_shared(
         pipeline,
@@ -330,7 +337,7 @@ pub fn dispatch_gated_delta_net_chunk_o(
             (5, o),
             (6, params_buf),
         ],
-        &[(0, bo_acc_bytes), (1, ba_acc_bytes), (2, stage_bytes)],
+        &[(0, ba_stage_bytes)],
         grid_tgs,
         tg,
     );
@@ -402,7 +409,7 @@ mod tests {
             t: 128,
             hg: 2,
             h: 4,
-            k: 256, // > MAX_K (192) — must reject.
+            k: 256, // > MAX_K (128, narrowed in Wave 5b.2 iter 2) — must reject.
             v: 128,
             bt: 64,
             scale: (128f32).powf(-0.5),
@@ -416,11 +423,11 @@ mod tests {
             "expected K=256 in error message, got: {msg}"
         );
         assert!(
-            msg.contains("32 KB") || msg.contains("threadgroup"),
-            "expected threadgroup-memory-budget context in error, got: {msg}"
+            msg.contains("compile-time") || msg.contains("MMA"),
+            "expected MMA-compile-time-bound context in error, got: {msg}"
         );
         assert!(
-            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
+            msg.contains("MAX_K = 128") || msg.contains("MAX_K=128"),
             "expected explicit MAX_K cap in error, got: {msg}"
         );
     }

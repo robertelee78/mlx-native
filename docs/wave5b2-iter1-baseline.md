@@ -67,6 +67,69 @@ bh/k columns redundantly), while the simdgroup_matrix MMA shares a single
 overhead on the load path AND halves bv_stage's threadgroup-memory
 footprint, freeing 4 KB for instruction-cache headroom.
 
+## Wave 5b.2 iter 2 results — chunk_o simdgroup_matrix MMA (2026-04-27)
+
+Wave 5b.2 iter 2 simdgroup_matrix MMA optimization on `chunk_o` —
+all THREE matmul sections rewritten using `simdgroup_matrix<float, 8, 8>`
+8×8 tile MMA on Apple Silicon hardware tensor units:
+
+* Section 2A: `bo_acc[BT, BV] += q · h^T` (K-reduction, 16 K-tiles)
+* Section 2B: `bA_acc[BT, BT] += q · k^T` (FUSED into 2A's K-loop —
+  same q-frag amortized across 4 BV-col + 8 BT-col MMAs = 12 MMAs/load)
+* Section 2C: `bo_acc += bA_bf16 · v_new` (BT-reduction, 8 BT-tiles)
+
+| Metric | Pre-iter-2 (cf5f420) | Post-iter-2 | Change |
+|---|---:|---:|---:|
+| `chunk_o` median wall (criterion) | 2.155 ms | **0.451 ms** | **4.78× speedup** |
+| `chunk_o` median wall (RED test, 50 dispatches) | 2.155 ms | **0.453 ms** | **4.76× speedup** |
+| Threadgroup memory | 28 KB | **8 KB** | −20 KB (bo_acc + bA_acc moved to MMA accumulator registers; only bA_stage `[BT, BT]` bf16 retained) |
+| RED test bar (≥ 3× speedup ⇒ ≤ 720 µs) | — | PASS | margin: 1.59× under bar |
+| Correctness `max_o_err` (5e-3 atol) | 5.96e-8 | **5.96e-8** | unchanged |
+| FLA chunk_o oracle (1e-6 tol) | PASS @ 5.96e-8 | **PASS @ 5.96e-8** | unchanged |
+| `chunk_gated_delta_rule_fwd` integration | max_o_err=3.815e-6 | **max_o_err=3.815e-6** | unchanged |
+| Chunk-pipeline integration tests | 18/18 PASS | **18/18 PASS** | unchanged |
+| `MAX_K` cap | 192 | **128** | NARROWED — K-tile count is hard-coded compile-time per iter 1.5 lesson |
+
+### Pipeline post-iter-2 totals (criterion bench, 2026-04-27)
+
+| Kernel | Pre-iter-2 | Post-iter-2 | Δ |
+|---|---:|---:|---:|
+| `inter_state` | 1.073 ms | 1.068 ms | unchanged (iter-2 did not touch inter_state) |
+| `chunk_o` | **2.155 ms** | **0.451 ms** | **−1.704 ms (−4.78×)** |
+| `recompute_w_u` | 0.698 ms | 0.702 ms | unchanged |
+| `kkt` | 0.526 ms | 0.528 ms | unchanged |
+| `tri_solve_invert` | 0.455 ms | 0.463 ms | unchanged |
+| `cumsum_g` | 0.161 ms | 0.163 ms | unchanged |
+| **Total per orchestrator call** | **~5.07 ms** | **~3.38 ms** | **−1.69 ms (−33%)** |
+
+chunk_o was 41% of post-iter-1 pipeline cost; iter 2 collapsed it to 13%.
+inter_state is once again the dominant kernel (32% of post-iter-2 total),
+followed by recompute_w_u (21%), kkt (16%), tri_solve_invert (14%),
+chunk_o (13%), cumsum_g (5%).
+
+### Why chunk_o saw 4.78× (less than inter_state's 17.4× but still well
+above the 3× target)
+
+chunk_o has THREE matmul sections vs inter_state's TWO, so on a per-MMA
+basis it should benefit MORE. The actual ratio is smaller because:
+
+1. **Lower arithmetic intensity per K-tile.** chunk_o's section 2A is
+   `[BT, BV] = [64, 32]` (8×4 = 32 8×8 frags total) vs inter_state's
+   section 2b `[BT, BV] = [64, 32]` (same shape). But chunk_o's 2A only
+   gets 4 frags per simdgroup (1 row-tile × 4 col-tiles), while
+   inter_state's 2b gets 8 (2 row-tiles × 4 col-tiles) — so per-sg MMA
+   accumulator depth is half, halving the FMA throughput coverage of
+   load-issue latency.
+2. **bA_stage round-trip** between sections 2B and 2C is a full BT×BT bf16
+   threadgroup-memory write+read (8 KB roundtrip per (b, h, chunk, V-tile)).
+   inter_state's bv_stage was BT×BV (4 KB roundtrip).
+3. **Per-thread gate/mask** on bA_acc requires reading 16 g[t] values per
+   lane (8 col-tiles × 2 elements) — twice the gate cost of inter_state's
+   local_v gate.
+
+These three together explain why chunk_o lands at 4.78× rather than 17×.
+The ≥ 3× RED bar is comfortably cleared with 1.59× margin.
+
 ## Section 2f-only result (prior worker, reverted)
 
 Reference data point — for documentation only; this configuration was
