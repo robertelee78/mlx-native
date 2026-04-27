@@ -52,6 +52,7 @@ mod device;
 mod dtypes;
 mod encoder;
 mod kernel_registry;
+mod residency;
 pub mod gguf;
 pub mod kernel_profile;
 pub mod graph;
@@ -71,6 +72,12 @@ pub use encoder::{
 pub use error::{MlxError, Result};
 pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
 pub use kernel_registry::KernelRegistry;
+#[doc(hidden)]
+pub use residency::{
+    macos_15_or_newer_for_test, reset_residency_env_cache_for_test,
+    reset_residency_test_counters, residency_allocation_count_for_test,
+    residency_commit_call_count_for_test,
+};
 
 // Re-export GGUF parser.
 pub use gguf::{GgufFile, MetadataValue, TensorInfo};

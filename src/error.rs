@@ -43,6 +43,10 @@ pub enum MlxError {
         bytes: usize,
     },
 
+    /// A Metal residency set could not be created or updated.
+    #[error("Residency set error: {0}")]
+    ResidencySetError(String),
+
     /// An argument to a public function was invalid.
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
