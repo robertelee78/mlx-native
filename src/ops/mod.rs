@@ -53,6 +53,7 @@ pub mod fwht_standalone;
 pub mod gated_delta_net;
 pub mod gated_delta_net_chunk;
 pub mod gated_delta_net_kkt;
+pub mod gated_delta_net_recompute_wu;
 pub mod tq_dequantize_kv;
 pub mod sdpa;
 pub mod sdpa_decode;

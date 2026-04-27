@@ -401,6 +401,15 @@ impl KernelRegistry {
         let gdn_kkt_src: &'static str =
             include_str!("shaders/gated_delta_net_kkt.metal");
         sources.insert("gated_delta_net_kkt_bf16".into(), gdn_kkt_src);
+        // Wave 5b.1 iter 2 — recompute_w_u_fwd kernel (applies post-solve A
+        // to (β·v) and (β·k·exp(g)) to produce w and u; spec source: FLA
+        // wy_fast.py:29-117).
+        let gdn_recompute_wu_src: &'static str =
+            include_str!("shaders/gated_delta_net_recompute_wu.metal");
+        sources.insert(
+            "gated_delta_net_recompute_wu_bf16".into(),
+            gdn_recompute_wu_src,
+        );
         // Sigmoid-gated elementwise multiply (ADR-013 Decision 9 — full-attn output gate)
         let sigmoid_mul_src: &'static str = include_str!("shaders/sigmoid_mul.metal");
         sources.insert("sigmoid_mul_f32".into(), sigmoid_mul_src);
