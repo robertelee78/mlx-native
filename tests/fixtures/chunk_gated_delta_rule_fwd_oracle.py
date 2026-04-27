@@ -77,6 +77,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chunk_gated_delta_rule_fwd_reference as ref
 
 
+def naive_l2norm_per_token_f32(x_row, eps=1e-6):
+    """Independent inline f32 L2 norm for a single per-token row vector.
+
+    Spec source: FLA `l2norm_fwd` at
+      /opt/vllm/vllm/model_executor/layers/fla/ops/l2norm.py
+    Math: y = x / sqrt(sum(x*x, dim=-1) + eps)
+    Reference: arXiv 2412.06464 §3 (Yang-Hatamizadeh 2024) — the QK-L2
+    pre-step before the gated delta-rule recurrence.
+
+    Wave 5b.1 iter 4.5 (M2): this oracle MUST NOT call back into
+    `ref.l2norm_fwd` — that would recreate the iter-1.5 fixture-oracle
+    co-conspiracy class (a bug in the reference's batched l2norm would be
+    invisible to this oracle). We therefore inline the math in pure f32,
+    per-token, no batched intermediate storage.
+    """
+    f = x_row.float()
+    sumsq = (f * f).sum()
+    return f / torch.sqrt(sumsq + eps)
+
+
 def naive_delta_rule_fwd(q, k, v, g_log_decay, beta, h0, scale,
                          use_qk_l2norm_in_kernel):
     """Naive per-token recurrence. NO chunking, NO WY, NO solve_tril.
@@ -84,17 +104,25 @@ def naive_delta_rule_fwd(q, k, v, g_log_decay, beta, h0, scale,
     Walks the token axis serially per (batch, V-head); compute is f32
     throughout. The chunk-parallel reference rewrites this same recurrence
     using A_inv + WY representation; this oracle does not.
+
+    Wave 5b.1 iter 4.5 (M2): l2norm is now done INLINE per-token in f32
+    (see `naive_l2norm_per_token_f32`). The previous version called
+    `ref.l2norm_fwd` (a shared FLA-style batched impl) which would have
+    masked any l2norm-side bug. The output buffer `o` is also kept in f32
+    throughout the recurrence; bf16 cast happens only at the final
+    comparison read-back to match the reference's bf16 storage.
     """
-    if use_qk_l2norm_in_kernel:
-        q = ref.l2norm_fwd(q)
-        k = ref.l2norm_fwd(k)
 
     B_, T_, _, K_ = q.shape
     _, _, H_, V_ = v.shape
     Hg_ = q.shape[2]
     GROUP_RATIO_ = H_ // Hg_
 
-    o = torch.zeros((B_, T_, H_, V_), dtype=torch.bfloat16)
+    # Keep o in pure f32 throughout the per-token recurrence; only the FINAL
+    # read-back is cast to bf16 to match the reference's bf16 storage type.
+    # This avoids per-token bf16 round-off in the oracle (oracle is supposed
+    # to be independent of bf16 staging concerns of the chunk-parallel path).
+    o_f32 = torch.zeros((B_, T_, H_, V_), dtype=torch.float32)
     final_state = torch.zeros((B_, H_, V_, K_), dtype=torch.float32)
 
     for b in range(B_):
@@ -111,6 +139,12 @@ def naive_delta_rule_fwd(q, k, v, g_log_decay, beta, h0, scale,
                 v_t = v[b, t, i_h, :].float()   # [V]
                 q_t = q[b, t, kh, :].float()    # [K]
 
+                # Inline per-token f32 L2 norm (M2 — independent of
+                # ref.l2norm_fwd; spec: FLA l2norm.py / arXiv 2412.06464 §3).
+                if use_qk_l2norm_in_kernel:
+                    q_t = naive_l2norm_per_token_f32(q_t)
+                    k_t = naive_l2norm_per_token_f32(k_t)
+
                 # Predict-then-correct delta-rule update
                 # (arXiv 2412.06464 §4 + Schlag 2021):
                 v_pred = S @ k_t                 # [V]
@@ -119,10 +153,13 @@ def naive_delta_rule_fwd(q, k, v, g_log_decay, beta, h0, scale,
 
                 # Output: post-update query.
                 o_t = S @ q_t * scale            # [V] (FLA applies scale on output)
-                o[b, t, i_h, :] = o_t.to(torch.bfloat16)
+                o_f32[b, t, i_h, :] = o_t        # f32 storage; cast at end.
 
             final_state[b, i_h] = S
 
+    # Cast to bf16 at the end (single quantization point, matches reference
+    # storage type for byte-stream comparison; per-token storage was f32).
+    o = o_f32.to(torch.bfloat16)
     return o, final_state
 
 
