@@ -89,15 +89,20 @@ pub static GATED_DELTA_NET_CHUNK_SHADER_SOURCE: &str =
 ///   bh tile  = BV * K  * 4 bytes = 32 * K * 4 = 128 * K bytes
 /// M5 Max threadgroup memory cap is 32 KB, so:
 ///   4096 + 128 * K <= 32768  =>  K <= 224
-/// We keep MAX_K conservatively at 192 (matches Wave 5b.1 iter 1's contract;
-/// lifting requires a separate audit of MMA tile counts at K=192/224).
+/// MAX_K = 128 (NARROWED from 192 in Wave 5b.2 iter 1.5 fixup, 2026-04-27).
 ///
-/// FLA's K=256 path uses a 4-bank `b_h1..b_h4` partition that we don't
-/// implement in iter 1; iter 2 will lift this cap by porting the bank
-/// split. Until then, we reject K > 192 with a clear error.
+/// Section 2f's simdgroup_matrix MMA loop hard-codes 16 K-tiles because
+/// Metal's MMA scheduler requires compile-time loop bounds — making the
+/// bound runtime via `K/8u` collapses perf 1.08 → 3.40 ms (3.15× regression
+/// measured on M5 Max). The constraint forces a hard K=128 contract.
 ///
-/// Qwen3.6 uses K = 128, well under the cap.
-pub const MAX_K: u32 = 192;
+/// To support K=192/256, port FLA's b_h1..b_h4 bank-split
+/// (chunk_delta_h.py:215-221), which keeps each kernel's K-tile count
+/// compile-time-known per bank. Out-of-scope for Wave 5b.2.
+///
+/// Qwen3.6 uses K = 128 in production (head_dim from config), so the K=192
+/// contract was speculative-only and is being narrowed to match reality.
+pub const MAX_K: u32 = 128;
 /// Hard cap on per-tile head-dim V (same threadgroup-memory budget; V is
 /// tiled by BV so any V <= 256 still produces 32-element tiles, but we
 /// keep the cap symmetric with K for documentation purposes).
@@ -447,7 +452,7 @@ mod tests {
             "expected threadgroup-memory-budget context in error, got: {msg}"
         );
         assert!(
-            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
+            msg.contains("MAX_K = 128") || msg.contains("MAX_K=128"),
             "expected explicit MAX_K cap in error, got: {msg}"
         );
     }

@@ -433,6 +433,15 @@ kernel void gated_delta_net_chunk_inter_state_bf16(
             i_b * k_seq_stride + t_start * k_t_stride + kh * K;
 
         // Load 16 bh accumulator frags (BV row-tile = sgid, all K col-tiles).
+        //   Tile count is hard-coded for K=128 (= 16 8-element K-tiles). The
+        //   compile-time loop bound is LOAD-BEARING — Metal's MMA scheduler
+        //   needs unrollable loops for the simdgroup_matrix tile sequence;
+        //   making the bound runtime via `K/8` collapses inter_state from
+        //   1.08 ms to 3.40 ms (3.15× regression, measured 2026-04-27).
+        //   So MAX_K is narrowed to 128 in src/ops/gated_delta_net_chunk.rs;
+        //   K=192 dispatch is rejected by validate(). To support K=192/256
+        //   later, port FLA's b_h1..b_h4 bank-split (chunk_delta_h.py:215-221)
+        //   which keeps each kernel's K-tile count compile-time-known per bank.
         simdgroup_matrix<float, 8, 8> bh_acc[16];
         {
             threadgroup const float *bh_row_ptr = bh + sgid * 8u * K;

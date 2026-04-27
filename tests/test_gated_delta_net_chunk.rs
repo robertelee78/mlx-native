@@ -317,3 +317,74 @@ fn test_chunk_inter_state_zero_inputs_yield_zero() {
         "final_state should be all-zero with zero inputs"
     );
 }
+
+/// Wave 5b.2 iter-1.5 regression: K=192 must be rejected by validate().
+///
+/// Codex iter-1 audit caught that section 2f's simdgroup_matrix MMA loop
+/// hard-codes 16 K-tiles (K=128/8). Generalizing to runtime `K/8u` defeats
+/// Metal's MMA scheduler (measured 3.15× regression, 1.08 → 3.40 ms), so
+/// MAX_K is narrowed to 128 to match the kernel's compile-time tile count.
+/// This test asserts the contract narrowing — K=192 dispatch must error
+/// rather than silently corrupting cols 128..191.
+#[test]
+fn test_chunk_inter_state_k192_rejected_by_validate() {
+    use mlx_native::ops::gated_delta_net_chunk::MAX_K;
+    assert_eq!(MAX_K, 128, "MAX_K narrowed to 128 in Wave 5b.2 iter 1.5");
+
+    // Try to dispatch at K=192 and observe the validate-side rejection.
+    let device = MlxDevice::new().expect("MlxDevice::new");
+    let mut registry = KernelRegistry::new();
+
+    const K_192: u32 = 192;
+    let k_elems = (B * T * HG * K_192) as usize;
+    let w_elems = (B * T * H * K_192) as usize;
+    let u_elems = (B * T * H * V) as usize;
+    let g_elems = (B * T * H) as usize;
+    let h0_elems = (B * H * V * K_192) as usize;
+    let h_out_elems = (B * NT * H * V * K_192) as usize;
+    let v_new_elems = (B * T * H * V) as usize;
+    let final_elems = (B * H * V * K_192) as usize;
+
+    let k_buf = alloc_zeroed_bf16(&device, k_elems);
+    let w_buf = alloc_zeroed_bf16(&device, w_elems);
+    let u_buf = alloc_zeroed_bf16(&device, u_elems);
+    let g_buf = upload_f32(&device, &vec![0.0f32; g_elems]);
+    let h0_buf = upload_f32(&device, &vec![0.0f32; h0_elems]);
+    let h_out_buf = alloc_zeroed_bf16(&device, h_out_elems);
+    let v_new_buf = alloc_zeroed_bf16(&device, v_new_elems);
+    let final_buf = upload_f32(&device, &vec![0.0f32; final_elems]);
+
+    let p = GatedDeltaNetChunkParams {
+        b: B,
+        t: T,
+        hg: HG,
+        h: H,
+        k: K_192,
+        v: V,
+        bt: BT,
+    };
+    let params_buf = build_gated_delta_net_chunk_params(&device, p).expect("params");
+
+    let mut enc = device.command_encoder().expect("enc");
+    let result = dispatch_gated_delta_net_chunk_inter_state(
+        &mut enc,
+        &mut registry,
+        device.metal_device(),
+        &k_buf,
+        &w_buf,
+        &u_buf,
+        &g_buf,
+        &h0_buf,
+        &h_out_buf,
+        &v_new_buf,
+        &final_buf,
+        &params_buf,
+        p,
+    );
+    let err = result.expect_err("K=192 dispatch must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("192") && (msg.contains("MAX_K") || msg.contains("threadgroup")),
+        "expected K=192-rejection error citing MAX_K or threadgroup budget, got: {msg}"
+    );
+}
