@@ -52,6 +52,7 @@ pub mod flash_attn_vec_tq_hb;
 pub mod fwht_standalone;
 pub mod gated_delta_net;
 pub mod gated_delta_net_chunk;
+pub mod gated_delta_net_kkt;
 pub mod tq_dequantize_kv;
 pub mod sdpa;
 pub mod sdpa_decode;
