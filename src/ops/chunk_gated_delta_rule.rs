@@ -314,7 +314,13 @@ fn dispatch_chunk_local_cumsum_g(
 ) -> Result<()> {
     let pipeline = registry.get_pipeline("chunk_local_cumsum_g_f32", device)?;
     let nt = p.num_chunks() as u64;
-    let grid_tgs = MTLSize::new(p.bt as u64, p.h as u64, (p.b as u64) * nt);
+    // Wave 5b.1 iter 4.5 (M1): one threadgroup per (i_t, h, b) block.
+    // The shader reads tg_pos.{y,z} for the (h, b*NT) coords and ignores
+    // tg_pos.x — only thread 0 within the threadgroup walks the BT-long
+    // serial scan (see chunk_local_cumsum_g.metal:39-68). Previously we
+    // launched grid_x = BT = 64, which produced 64 redundant threadgroups
+    // per block all writing the same outputs.
+    let grid_tgs = MTLSize::new(1, p.h as u64, (p.b as u64) * nt);
     // Threadgroup: BT lanes wide; the kernel has only thread 0 do the
     // serial scan. Iter 5 perf can lift to a Hillis-Steele scan.
     let tg = MTLSize::new(p.bt as u64, 1, 1);
