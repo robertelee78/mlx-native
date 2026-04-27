@@ -126,7 +126,10 @@ fn test_chunk_tri_solve_invert_random_matrices() {
     let got = run_kernel(&a_strict);
     assert_eq!(got.len(), a_inv_ref.len(), "A_inv length mismatch");
 
-    let atol: f32 = 1e-3; // tight (both sides f32, well-conditioned inputs).
+    // Tight bar: f32 vs f32, well-conditioned inputs, observed max_err
+    // ~1.19e-7 (~1 ULP). 1e-5 leaves 100x safety margin while still catching
+    // any real numerical regression. Codex iter-4.5 audit recommended-revision.
+    let atol: f32 = 1e-5;
     let mut max_err = 0.0f32;
     let mut max_err_pos = 0usize;
     for (i, (&g, &r)) in got.iter().zip(a_inv_ref.iter()).enumerate() {

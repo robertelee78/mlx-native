@@ -20,8 +20,12 @@ using namespace metal;
 //
 // # Threading model
 //
-//   Grid: (BT, H, B*NT). One threadgroup per (i_t, h, b). Each thread
-//   owns one timestep i ∈ [0, BT).
+//   Grid: (1, H, B*NT). One threadgroup per (i_t, h, b). Each thread in the
+//   threadgroup owns one timestep i ∈ [0, BT) but only thread 0 writes the
+//   sequential per-chunk scan accumulator. (Iter 4.5 audit fix a62b111 reduced
+//   grid_x from BT to 1; the prior dispatch had 64 redundant threadgroups
+//   producing duplicate writes that the GPU coalesced — semantics correct
+//   but pure dispatch overhead.)
 //
 //   Sequential per-chunk scan: thread 0 walks i=0..BT-1, accumulating.
 //   This is acceptable because BT=64 is small and we have B*NT*H
