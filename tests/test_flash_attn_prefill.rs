@@ -3077,9 +3077,10 @@ fn test_mask_rank2_broadcast_d256_multihead() {
 ///
 /// On a from-scratch single-pass prefill at `seq_len_q = seq_len_k = 65536`
 /// with a Gemma-4-style sliding-window+causal rank-2 mask (`window = 1024`,
-/// `causal = true`), the LAST Q row (index 65535) is processed through
-/// 32768 K positions in its attended window — **all of which** overlap the
-/// upper-half overflow regime.  The bf16 output for row 65535 diverges
+/// `causal = true`), the LAST Q row (index 65535) attends exactly 1024 K
+/// positions (`[64512, 65535]` inclusive) — **all of which** lie inside the
+/// upper-half overflow regime (row_pos >= 32768).  The bf16 output for row
+/// 65535 diverges
 /// from the CPU reference by orders of magnitude (random bf16 garbage in
 /// the additive-mask term flips softmax winners arbitrarily).
 ///
@@ -3223,12 +3224,13 @@ fn flash_attn_prefill_pp65536_no_overflow_in_mask_indexing() {
     // K/V are MHA (kv_h = 1), layout [B, kv_h, kL, D].
     let k_f32 = bf16_to_f32(&k_bf);
     let v_f32 = bf16_to_f32(&v_bf);
-    // Read just the last row of the mask.
+    // Read the full mask back (8.6 GB) then extract the last row.
+    // Note: read_bf16_buffer reads the entire buffer into a Vec — this IS an
+    // 8.6 GB host-side allocation.  The mask layout is contiguous [qL, kL]
+    // row-major, so row (qL-1) occupies elements [(qL-1)*kL .. qL*kL].
+    // A future optimisation could map only those kL elements via contents_ptr
+    // to avoid the full copy; for now correctness is the priority.
     let mask_last_row_bf: Vec<half::bf16> = {
-        // Read the full mask back is 8.6 GB — instead, slice it.  The mask
-        // builder writes contiguous [qL, kL], so row (qL-1) starts at element
-        // (qL-1) * kL.  read_bf16_buffer reads the whole buffer; for memory
-        // economy we read only what we need by computing on a slice.
         let mask_all = read_bf16_buffer(&mask_buf, ql * kl);
         mask_all[(ql - 1) * kl..ql * kl].to_vec()
     };
