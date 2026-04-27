@@ -268,3 +268,56 @@ pub fn build_gated_delta_net_kkt_params(
     }
     Ok(buf)
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    //! Wave 5b.1 iter 2.5 — closes Codex audit "missed test" finding:
+    //! the K=256 rejection path in `validate` had no Rust assertion.
+    use super::*;
+    use crate::MlxDevice;
+
+    /// Allocate a 1-byte dummy buffer of the given dtype. The K-cap check
+    /// at the top of `validate` fires before any buffer-size check, so
+    /// these placeholder buffers are sufficient to exercise the error
+    /// path.
+    fn dummy_buf(device: &MlxDevice, dtype: DType) -> MlxBuffer {
+        device
+            .alloc_buffer(2, dtype, vec![1])
+            .expect("alloc dummy")
+    }
+
+    #[test]
+    fn validate_rejects_k_above_max() {
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let k_buf = dummy_buf(&device, DType::BF16);
+        let beta_buf = dummy_buf(&device, DType::F32);
+        let g_buf = dummy_buf(&device, DType::F32);
+        let a_buf = dummy_buf(&device, DType::F32);
+
+        let p = GatedDeltaNetKktParams {
+            b: 1,
+            t: 128,
+            hg: 2,
+            h: 4,
+            k: 256, // > MAX_K (192) — must reject.
+            bt: 64,
+        };
+
+        let err = validate(&p, &k_buf, &beta_buf, &g_buf, &a_buf)
+            .expect_err("validate must reject K=256");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("256"),
+            "expected K=256 in error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("32 KB") || msg.contains("threadgroup"),
+            "expected threadgroup-memory-budget context in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("max k = 192") || msg.contains("max k=192"),
+            "expected explicit max-K cap in error, got: {msg}"
+        );
+    }
+}
