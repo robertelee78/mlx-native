@@ -168,8 +168,8 @@ fn validate(
     }
     if p.k > MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_chunk: k ({}) exceeds iter-1 32 KB threadgroup memory \
-             budget (max k = {}); iter-2 will lift this when the FLA b_h1..b_h4 \
+            "gated_delta_net_chunk: K ({}) exceeds iter-1 32 KB threadgroup memory \
+             budget (MAX_K = {}); iter-2 will lift this when the FLA b_h1..b_h4 \
              bank split is ported",
             p.k, MAX_K
         )));

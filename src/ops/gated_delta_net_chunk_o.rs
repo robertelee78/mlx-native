@@ -162,8 +162,8 @@ fn validate(
     }
     if p.k > MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_chunk_o: k ({}) exceeds iter-3 32 KB threadgroup \
-             memory budget (max k = {}); iter-4 will autotune past this",
+            "gated_delta_net_chunk_o: K ({}) exceeds iter-3 32 KB threadgroup \
+             memory budget (MAX_K = {}); iter-4 will autotune past this",
             p.k, MAX_K
         )));
     }
@@ -420,8 +420,8 @@ mod tests {
             "expected threadgroup-memory-budget context in error, got: {msg}"
         );
         assert!(
-            msg.contains("max k = 192") || msg.contains("max k=192"),
-            "expected explicit max-K cap in error, got: {msg}"
+            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
+            "expected explicit MAX_K cap in error, got: {msg}"
         );
     }
 }
