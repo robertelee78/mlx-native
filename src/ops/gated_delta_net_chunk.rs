@@ -81,10 +81,24 @@ use crate::kernel_registry::KernelRegistry;
 pub static GATED_DELTA_NET_CHUNK_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_chunk.metal");
 
-/// Hard cap on per-tile head-dim K (matches FLA's `assert K <= 256`).
+/// Hard cap on per-tile head-dim K for iter 1.
+///
+/// The threadgroup-memory budget for the `bh` tile is `BV * K * 4` bytes,
+/// plus `BT * BV * 4` bytes for `bv_stage`. With `BT = 64`, `BV = 32`:
+///   bv_stage = 64 * 32 * 4 = 8 KB
+///   bh tile  = 32 * K  * 4 = 128 * K bytes
+/// M5 Max threadgroup memory cap is 32 KB, so:
+///   8192 + 128 * K <= 32768  =>  K <= 192
+///
+/// FLA's K=256 path uses a 4-bank `b_h1..b_h4` partition that we don't
+/// implement in iter 1; iter 2 will lift this cap by porting the bank
+/// split. Until then, we reject K > 192 with a clear error.
+///
 /// Qwen3.6 uses K = 128, well under the cap.
-pub const MAX_K: u32 = 256;
-/// Hard cap on per-tile head-dim V (same reasoning).
+pub const MAX_K: u32 = 192;
+/// Hard cap on per-tile head-dim V (same threadgroup-memory budget; V is
+/// tiled by BV so any V <= 256 still produces 32-element tiles, but we
+/// keep the cap symmetric with K for documentation purposes).
 pub const MAX_V: u32 = 256;
 
 /// Default V-tile width — matches FLA's mid-config autotune choice.
@@ -152,10 +166,31 @@ fn validate(
             p.h, p.hg
         )));
     }
-    if p.k > MAX_K || p.v > MAX_V {
+    if p.k > MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_chunk: k ({}) and v ({}) must be <= MAX (k:{}, v:{})",
-            p.k, p.v, MAX_K, MAX_V
+            "gated_delta_net_chunk: k ({}) exceeds iter-1 32 KB threadgroup memory \
+             budget (max k = {}); iter-2 will lift this when the FLA b_h1..b_h4 \
+             bank split is ported",
+            p.k, MAX_K
+        )));
+    }
+    if p.v > MAX_V {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_chunk: v ({}) must be <= MAX_V ({})",
+            p.v, MAX_V
+        )));
+    }
+    // Explicit threadgroup-memory accounting (defense-in-depth — MAX_K is
+    // chosen so this branch is unreachable when `bt = 64`, `bv = 32`, but
+    // future tile-size changes need to keep the inequality tight).
+    let bv = DEFAULT_BV;
+    let shared_bytes = ((p.bt * bv) + (bv * p.k)) as u64 * 4;
+    const M5_MAX_TG_MEM_BYTES: u64 = 32 * 1024;
+    if shared_bytes > M5_MAX_TG_MEM_BYTES {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_chunk: threadgroup memory {} bytes exceeds M5 Max \
+             cap of {} bytes (bt={}, bv={}, k={})",
+            shared_bytes, M5_MAX_TG_MEM_BYTES, p.bt, bv, p.k
         )));
     }
     if p.t % p.bt != 0 {

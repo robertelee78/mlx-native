@@ -39,13 +39,25 @@ using namespace metal;
 //   stays in f32 in shared memory across the T-loop (matches FLA's policy
 //   at chunk_delta_h.py:85 — `b_h1 = tl.zeros([BV, 64], dtype=tl.float32)`).
 //
-// # bf16 round-trip on bv before the gate-multiply (FLA parity)
+// # bf16 round-trip on bv (FLA parity, post-gate placement)
 //
-//   FLA explicitly casts bv through bf16 at line 255 (`b_v = b_v.to(
-//   k.dtype.element_ty)`) before the outer-update dot.  Our reference
-//   fixture matches this exactly (see
-//   tests/fixtures/gated_delta_net_chunk_reference.py).  We must match it
-//   here in the Metal kernel to stay within the bf16 5e-3 tolerance.
+//   FLA places the only bf16 round-trip on b_v at line 255
+//   (`b_v = b_v.to(k.dtype.element_ty)`) — AFTER the gate multiply at
+//   line 213, BEFORE the outer-update dot at line 261. The cast must
+//   sit between gate and dot, not before either.
+//
+//   The kernel mirrors that ordering exactly:
+//     1. local_v = u - w @ bh^T              (f32)
+//     2. local_v *= exp(g_last - g_blk)      (FLA :213, gate in f32)
+//     3. bh      *= exp(g_last)              (FLA :215, gate in f32)
+//     4. bv_stage[*] = bf16_round(local_v)   (FLA :255, post-gate cast)
+//     5. bh += bv_stage^T @ b_k              (FLA :261, outer dot reads
+//                                             bf16-rounded values)
+//
+//   Wave5b.1 iter1.5 corrected this from an earlier ordering that
+//   bf16-rounded BEFORE the gate; that diverged from FLA by ~6e-4 on
+//   final_state and was caught by the FLA-line-255 oracle in
+//   tests/fixtures/gated_delta_net_chunk_oracle.py.
 //
 // # Threadgroup memory layout
 //
@@ -239,8 +251,8 @@ kernel void gated_delta_net_chunk_inter_state_bf16(
         }
 
         // -----------------------------------------------------------
-        // 2d. Gate multiplies.
-        //     local_v[c] *= exp(g_last - g_blk[bt])   (after bf16 round-trip)
+        // 2d. Gate multiplies (FLA chunk_delta_h.py:213, :215).
+        //     local_v[c] *= exp(g_last - g_blk[bt])   (f32, pre-bf16-round)
         //     bh[*]      *= exp(g_last)
         // -----------------------------------------------------------
         const uint g_base = i_b * g_seq_stride + i_h;
@@ -252,7 +264,7 @@ kernel void gated_delta_net_chunk_inter_state_bf16(
             const uint bt_idx = flat / BV;
             const float g_t = g[g_base + (t_start + bt_idx) * g_t_stride];
             const float scale = metal::exp(g_last - g_t);
-            local_v[c] = bf16_round(local_v[c]) * scale;
+            local_v[c] = local_v[c] * scale; // FLA :213 — gate in f32, no pre-round
         }
 
         // Scale bh by exp_g_last in place (cooperative across threads).
@@ -262,11 +274,14 @@ kernel void gated_delta_net_chunk_inter_state_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // -----------------------------------------------------------
-        // 2e. Publish local_v to bv_stage; barrier.
+        // 2e. Publish bf16-rounded local_v to bv_stage (FLA chunk_delta_h.py:255).
+        //     The bf16 round-trip happens HERE (post-gate, pre-outer-dot),
+        //     not before the gate. The outer dot in 2f reads the
+        //     bf16-rounded values from bv_stage.
         // -----------------------------------------------------------
         for (uint c = 0; c < CELLS_PER_THREAD; ++c) {
             const uint flat = c * TG_THREADS + tid;
-            bv_stage[flat] = local_v[c]; // [bt, bv] flat = bt*BV + bv
+            bv_stage[flat] = bf16_round(local_v[c]); // FLA :255 — post-gate bf16 cast
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
