@@ -369,3 +369,79 @@ pub fn build_gated_delta_net_chunk_params(
     }
     Ok(buf)
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    //! Wave 5b.1 iter 4.5 (T2) — K=256 clamp unit test.
+    //!
+    //! Closes the consistency gap left by iter 4 commit 3e19baa: the K-cap
+    //! error message in this op was tightened to uppercase "K", but no
+    //! `validate_rejects_k_above_max` test was added (the other 3 ops in the
+    //! chunk pipeline — kkt, recompute_w_u, chunk_o — all have one). This
+    //! test mirrors their pattern.
+    use super::*;
+    use crate::MlxDevice;
+
+    /// Allocate a 1-element dummy buffer of the given dtype. The K-cap
+    /// check inside `validate` fires before any buffer-size check, so
+    /// these placeholder buffers are sufficient to exercise the error
+    /// path.
+    fn dummy_buf(device: &MlxDevice, dtype: DType) -> MlxBuffer {
+        device
+            .alloc_buffer(2, dtype, vec![1])
+            .expect("alloc dummy")
+    }
+
+    #[test]
+    fn validate_rejects_k_above_max() {
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        // Buffer dtypes match the op's actual signature (k/w/u/h0 are bf16,
+        // g is f32, h_out/v_new/final_state are bf16/bf16/f32 respectively
+        // per the iter-1 forward-pass contract).
+        let k_buf = dummy_buf(&device, DType::BF16);
+        let w_buf = dummy_buf(&device, DType::BF16);
+        let u_buf = dummy_buf(&device, DType::BF16);
+        let g_buf = dummy_buf(&device, DType::F32);
+        let h0_buf = dummy_buf(&device, DType::F32);
+        let h_out_buf = dummy_buf(&device, DType::BF16);
+        let v_new_buf = dummy_buf(&device, DType::BF16);
+        let final_state_buf = dummy_buf(&device, DType::F32);
+
+        let p = GatedDeltaNetChunkParams {
+            b: 1,
+            t: 128,
+            hg: 2,
+            h: 4,
+            k: 256, // > MAX_K (192) — must reject.
+            v: 128,
+            bt: 64,
+        };
+
+        let err = validate(
+            &p,
+            &k_buf,
+            &w_buf,
+            &u_buf,
+            &g_buf,
+            &h0_buf,
+            &h_out_buf,
+            &v_new_buf,
+            &final_state_buf,
+        )
+        .expect_err("validate must reject K=256");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("256"),
+            "expected K=256 in error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("32 KB") || msg.contains("threadgroup"),
+            "expected threadgroup-memory-budget context in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
+            "expected explicit MAX_K cap in error, got: {msg}"
+        );
+    }
+}
