@@ -173,11 +173,18 @@ fn validate(
             p.h, p.hg
         )));
     }
-    if p.k > MAX_K {
+    // K must be EXACTLY 128 — section 2f's simdgroup_matrix MMA loop is
+    // hard-coded at 16 K-tiles (= K=128/8). K<128 (32/64/96) would have
+    // the kernel read past input rows = OOB. K>128 already covered by the
+    // iter-1.5 narrow-MAX_K-to-128 fix.
+    // Codex iter-7 audit (2026-04-27 HIGH-sev) flagged the same class of
+    // bug for chunk_o; iter-2.5 fixup tightens here too for consistency.
+    if p.k != MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_chunk: K ({}) exceeds iter-1 32 KB threadgroup memory \
-             budget (MAX_K = {}); iter-2 will lift this when the FLA b_h1..b_h4 \
-             bank split is ported",
+            "gated_delta_net_chunk: K ({}) must equal MAX_K = {} exactly. \
+             Section 2f's simdgroup_matrix MMA K-tile loop is compile-time \
+             hard-coded at 16 (= K=128/8); K<128 would read OOB. To support \
+             K=32/64/96/192/256, port FLA's b_h1..b_h4 bank-split.",
             p.k, MAX_K
         )));
     }
@@ -448,12 +455,12 @@ mod tests {
             "expected K=256 in error message, got: {msg}"
         );
         assert!(
-            msg.contains("32 KB") || msg.contains("threadgroup"),
-            "expected threadgroup-memory-budget context in error, got: {msg}"
+            msg.contains("MAX_K = 128") || msg.contains("MAX_K=128"),
+            "expected explicit MAX_K=128 in error, got: {msg}"
         );
         assert!(
-            msg.contains("MAX_K = 128") || msg.contains("MAX_K=128"),
-            "expected explicit MAX_K cap in error, got: {msg}"
+            msg.contains("must equal") || msg.contains("hard-coded"),
+            "expected exact-equality wording in error (post iter-2.5 narrow), got: {msg}"
         );
     }
 }

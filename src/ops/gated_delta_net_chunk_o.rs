@@ -171,13 +171,20 @@ fn validate(
             p.h, p.hg
         )));
     }
-    if p.k > MAX_K {
+    // K must be EXACTLY 128 — the simdgroup_matrix MMA K-tile loop is
+    // hard-coded at 16 tiles (= K=128/8). K<128 (e.g., 32/64/96) would have
+    // the kernel read past the input arrays' rows = out-of-bounds.
+    // Codex iter-7 audit (2026-04-27 HIGH-sev) caught this; iter-2.5 fixup
+    // narrows from `K <= MAX_K` to `K == 128` exact match. To support
+    // K=32/64/96/192/256, port FLA's b_h1..b_h4 bank-split for compile-time
+    // tile counts per bank; out-of-scope for Wave 5b.2.
+    if p.k != MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_chunk_o: K ({}) exceeds iter-2 simdgroup_matrix \
-             MMA K-tile compile-time bound (MAX_K = {}); the K-tile count is \
-             hard-coded at 16 (= K=128 / 8) in the shader, and the threadgroup \
-             memory footprint is 8 KB / 32 KB cap. Iter-4 will lift this when \
-             the FLA bank-split lands.",
+            "gated_delta_net_chunk_o: K ({}) must equal MAX_K = {} exactly. \
+             The simdgroup_matrix MMA K-tile loop is compile-time hard-coded \
+             at 16 (= K=128/8) in the shader; runtime loop bounds defeat the \
+             MMA scheduler (3.15× regression measured 2026-04-27). Future \
+             iters will lift this via FLA's b_h1..b_h4 bank-split.",
             p.k, MAX_K
         )));
     }

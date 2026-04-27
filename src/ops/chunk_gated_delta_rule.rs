@@ -108,10 +108,11 @@ use crate::ops::l2_norm::dispatch_l2_norm;
 pub static CHUNK_LOCAL_CUMSUM_G_SHADER_SOURCE: &str =
     include_str!("../shaders/chunk_local_cumsum_g.metal");
 
-/// Hard cap on per-tile head-dim K — matches all four sub-kernel caps
-/// (chunk_inter_state, kkt, recompute_w_u, chunk_fwd_o all use 192).
-/// Iter 5+ will autotune past this.
-pub const MAX_K: u32 = 192;
+/// Required K — must equal 128 exactly. Sub-kernels inter_state and chunk_o
+/// have compile-time-fixed 16 K-tiles in their simdgroup_matrix MMA loops
+/// (Wave 5b.2 iter 1+2 + iter 1.5/2.5 narrowing). Codex iter-7 audit
+/// caught the K<128 silent-corruption hole.
+pub const MAX_K: u32 = 128;
 /// Hard cap on per-tile head-dim V — matches sub-kernel caps.
 pub const MAX_V: u32 = 256;
 /// Iter-4 fixed BT (matches all sub-kernels).
@@ -178,10 +179,18 @@ fn validate(
             p.h, p.hg
         )));
     }
-    if p.k > MAX_K {
+    // Orchestrator dispatches inter_state and chunk_o, both of which require
+    // K==128 exactly (their simdgroup_matrix MMA K-tile loops are compile-time
+    // hard-coded at 16 = K=128/8). Tighten orchestrator validation to match,
+    // so misuse surfaces here with a clear error rather than as a sub-kernel
+    // OOB or rejection cascade. Codex iter-7 audit (2026-04-27).
+    if p.k != MAX_K {
         return Err(MlxError::InvalidArgument(format!(
-            "chunk_gated_delta_rule_fwd: K ({}) exceeds chunk-pipeline 32 KB \
-             threadgroup memory budget; iter-5+ will autotune (MAX_K = {})",
+            "chunk_gated_delta_rule_fwd: K ({}) must equal MAX_K = {} exactly. \
+             Sub-kernels inter_state and chunk_o have compile-time-fixed 16 \
+             K-tiles in their simdgroup_matrix MMA loops; runtime K bounds \
+             defeat MMA scheduling (3.15× regression measured). To support \
+             other K values, port FLA's b_h1..b_h4 bank-split.",
             p.k, MAX_K
         )));
     }
@@ -657,12 +666,13 @@ mod tests {
             "expected K=256 in error message, got: {msg}"
         );
         assert!(
-            msg.contains("32 KB") || msg.contains("threadgroup"),
-            "expected threadgroup-memory-budget context in error, got: {msg}"
+            msg.contains("MAX_K = 128") || msg.contains("MAX_K=128"),
+            "expected explicit MAX_K=128 in error (orchestrator inherits sub-kernel \
+             K==128-exact constraint per Wave 5b.2 iter 2.5), got: {msg}"
         );
         assert!(
-            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
-            "expected explicit MAX_K cap in error, got: {msg}"
+            msg.contains("must equal") || msg.contains("hard-coded"),
+            "expected exact-equality wording in error, got: {msg}"
         );
     }
 }
