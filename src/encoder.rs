@@ -204,11 +204,40 @@ static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 /// overhead per decode token (ADR-012 §Optimize / Task #15 follow-up).
 static CMD_BUF_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Number of `memory_barrier()` calls that reached the
+/// `objc::msg_send![encoder, memoryBarrierWithScope:]` site.  Capture-mode
+/// no-ops and pre-encoder no-ops are excluded so the count reflects
+/// actual MTL barriers issued.
+///
+/// Always tracked — the increment is one atomic op, ~5 ns.  ADR-015 H4
+/// (Wave 2b hard gate #2) requires per-barrier counter resolution to
+/// confirm-or-falsify the barrier-coalescing lever; xctrace TimeProfiler
+/// at 1 ms sampling cannot resolve `memory_barrier` even though it fires
+/// ~440×/token (`docs/ADR-015-mlx-native-single-cb-decode.md` §"P3a' live
+/// profile pass" hypothesis register row H4).
+static BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Total nanoseconds spent inside the `objc::msg_send!` barrier site,
+/// summed across all calls.  ONLY updated when the env var
+/// `MLX_PROFILE_BARRIERS=1` is set on the process (cached on first
+/// `memory_barrier` call).  When disabled the timing path is a single
+/// branch + the unconditional barrier dispatch — same hot-path cost as
+/// before this counter was added.
+///
+/// Why env-gated: timing adds 2 × `Instant::now()` (~50–100 ns each via
+/// `mach_absolute_time`) per barrier.  At ~440 barriers/token that is
+/// ~22–44 µs/token of measurement overhead — comparable to what we are
+/// trying to measure.  Production must keep this off; profiling runs
+/// opt-in.
+static BARRIER_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Reset all counters to zero.
 pub fn reset_counters() {
     SYNC_COUNT.store(0, Ordering::Relaxed);
     DISPATCH_COUNT.store(0, Ordering::Relaxed);
     CMD_BUF_COUNT.store(0, Ordering::Relaxed);
+    BARRIER_COUNT.store(0, Ordering::Relaxed);
+    BARRIER_NS.store(0, Ordering::Relaxed);
 }
 
 /// Read the current value of `SYNC_COUNT`.
@@ -233,6 +262,61 @@ pub fn dispatch_count() -> u64 {
 /// command-buffer overhead in inner loops.
 pub fn cmd_buf_count() -> u64 {
     CMD_BUF_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read the current value of `BARRIER_COUNT`.
+///
+/// Each `memory_barrier()` call that reaches the underlying
+/// `objc::msg_send![encoder, memoryBarrierWithScope:]` site increments this
+/// counter.  Capture-mode no-ops and pre-encoder no-ops are excluded.
+/// ADR-015 H4 hypothesis: ~440 barriers/token on the qwen35 decode hot
+/// path (verify against this counter).
+pub fn barrier_count() -> u64 {
+    BARRIER_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read the total nanoseconds spent in the `memoryBarrierWithScope:`
+/// `objc::msg_send!` site.  Only non-zero when `MLX_PROFILE_BARRIERS=1`
+/// was in the environment at the time of the first `memory_barrier()`
+/// call (the env check is cached on first use).
+///
+/// Combined with [`barrier_count`] this gives µs/barrier =
+/// `barrier_total_ns() / 1000 / barrier_count()`.
+pub fn barrier_total_ns() -> u64 {
+    BARRIER_NS.load(Ordering::Relaxed)
+}
+
+/// Whether barrier timing is enabled (env-gated, cached on first check).
+///
+/// Reading the env var via `std::env::var` is itself non-trivial; using
+/// `OnceLock` caches the decision so the per-barrier branch is a single
+/// atomic-load + compare.
+fn barrier_profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("MLX_PROFILE_BARRIERS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Issue the underlying Metal `memoryBarrierWithScope:` ObjC msg_send.
+///
+/// Held in its own `#[inline(never)]` function so xctrace / Instruments
+/// has a stable Rust frame to attribute barrier time against, separate
+/// from the surrounding encoder accounting.  Per ADR-015 §P3a' Codex
+/// review Q2: TimeProfiler at 1 ms sampling cannot see this site when
+/// inlined; an explicit non-inline frame plus the [`BARRIER_NS`] counter
+/// closes the H4 hard gate.
+#[inline(never)]
+fn issue_metal_buffer_barrier(encoder: &ComputeCommandEncoderRef) {
+    // MTLBarrierScopeBuffers = 1 << 0 = 1.
+    const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
+    unsafe {
+        let _: () =
+            objc::msg_send![encoder, memoryBarrierWithScope: MTL_BARRIER_SCOPE_BUFFERS];
+    }
 }
 
 /// A batched compute command encoder.
@@ -503,12 +587,17 @@ impl CommandEncoder {
         if self.active_encoder.is_null() {
             return;
         }
+        BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
         // SAFETY: active_encoder is non-null and valid.
         let encoder = unsafe { &*self.active_encoder };
-        // MTLBarrierScopeBuffers = 1 << 0 = 1
-        const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
-        unsafe {
-            let _: () = objc::msg_send![encoder, memoryBarrierWithScope: MTL_BARRIER_SCOPE_BUFFERS];
+        if barrier_profile_enabled() {
+            // mach_absolute_time path — only on when MLX_PROFILE_BARRIERS=1.
+            let start = std::time::Instant::now();
+            issue_metal_buffer_barrier(encoder);
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            BARRIER_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        } else {
+            issue_metal_buffer_barrier(encoder);
         }
     }
 
