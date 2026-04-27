@@ -1484,10 +1484,21 @@ template <
 
           frag_t mfrag;
 
+          // Wave 4 Phase B: pass M_strides[2] as int64_t (its native type
+          // in `AttnMaskParams`) instead of narrowing through int().  The
+          // load_safe template body computes `(off_x + i) * str_x`; with
+          // off_x = row_pos (int) and str_x narrowed to int, the product
+          // overflows at row_pos * kL >= i32::MAX (e.g. row_pos >= 32768
+          // when kL = 65536), wrapping to a large negative pointer offset
+          // and reading garbage before the mask buffer's base.  Mirrors
+          // the already-correct flash_attn_prefill_d512.metal:411-413
+          // ulong-cast idiom.  See
+          // /tmp/cfa-cfa-20260427-adr005-wave4/phase-A-report.md §2.5.1
+          // for the closed-form overflow argument.
           MMAFrag_mask_t::load_safe(
               mfrag,
               mask,
-              int(mask_params->M_strides[2]),
+              mask_params->M_strides[2],
               Int<1>{},
               params->qL,
               params->kL,

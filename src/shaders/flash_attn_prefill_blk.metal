@@ -177,8 +177,16 @@ kernel void flash_attn_prefill_blk_bf16(
         // contribute identity values (bfloat16_t has no sentinel better
         // than what we start mmin/mmax at, so skipping the read is the
         // correct behaviour).
+        //
+        // Wave 4 Phase B: widen the row-offset multiplication to int64_t.
+        // With qt, BQ, M_stride all int the product `(qt * BQ) * M_stride`
+        // overflows i32 at qt >= 1024 (1024 * 32 * 65536 = 2^31), wrapping
+        // to a large negative pointer offset and reading garbage before
+        // the mask buffer's base.  Mirrors the already-correct
+        // flash_attn_prefill_d512.metal:411-413 ulong-cast idiom.  See
+        // /tmp/cfa-cfa-20260427-adr005-wave4/phase-A-report.md §2.5.2.
         device const bfloat16_t* mask_src =
-            mask + (qt * BQ) * M_stride + tile_k_start + tiisg;
+            mask + (int64_t)(qt * BQ) * (int64_t)M_stride + tile_k_start + tiisg;
 
         // Use f32 for reduction to avoid bf16 comparison subtleties — bf16
         // min/max are well-defined on Apple Silicon but f32 reductions are
