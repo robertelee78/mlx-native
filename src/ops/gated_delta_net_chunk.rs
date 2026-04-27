@@ -83,12 +83,14 @@ pub static GATED_DELTA_NET_CHUNK_SHADER_SOURCE: &str =
 
 /// Hard cap on per-tile head-dim K for iter 1.
 ///
-/// The threadgroup-memory budget for the `bh` tile is `BV * K * 4` bytes,
-/// plus `BT * BV * 4` bytes for `bv_stage`. With `BT = 64`, `BV = 32`:
-///   bv_stage = 64 * 32 * 4 = 8 KB
-///   bh tile  = 32 * K  * 4 = 128 * K bytes
+/// Wave 5b.2 iter 1 simdgroup_matrix MMA optimization repacks bv_stage from
+/// f32 `[BT, BV]` to bf16 `[BV, BT]`, halving its threadgroup-memory cost:
+///   bv_stage = BV * BT * 2 bytes = 32 * 64 * 2 = 4 KB
+///   bh tile  = BV * K  * 4 bytes = 32 * K * 4 = 128 * K bytes
 /// M5 Max threadgroup memory cap is 32 KB, so:
-///   8192 + 128 * K <= 32768  =>  K <= 192
+///   4096 + 128 * K <= 32768  =>  K <= 224
+/// We keep MAX_K conservatively at 192 (matches Wave 5b.1 iter 1's contract;
+/// lifting requires a separate audit of MMA tile counts at K=192/224).
 ///
 /// FLA's K=256 path uses a 4-bank `b_h1..b_h4` partition that we don't
 /// implement in iter 1; iter 2 will lift this cap by porting the bank
@@ -183,8 +185,10 @@ fn validate(
     // Explicit threadgroup-memory accounting (defense-in-depth — MAX_K is
     // chosen so this branch is unreachable when `bt = 64`, `bv = 32`, but
     // future tile-size changes need to keep the inequality tight).
+    //   bh        : BV * K  * 4 bytes (f32, running state)
+    //   bv_stage  : BV * BT * 2 bytes (bf16, post-iter-1 layout)
     let bv = DEFAULT_BV;
-    let shared_bytes = ((p.bt * bv) + (bv * p.k)) as u64 * 4;
+    let shared_bytes = ((bv * p.k) as u64 * 4) + ((bv * p.bt) as u64 * 2);
     const M5_MAX_TG_MEM_BYTES: u64 = 32 * 1024;
     if shared_bytes > M5_MAX_TG_MEM_BYTES {
         return Err(MlxError::InvalidArgument(format!(
@@ -321,12 +325,15 @@ pub fn dispatch_gated_delta_net_chunk_inter_state(
 
     // Threadgroup memory budget — see header comment in
     // gated_delta_net_chunk.metal for the exact accounting.
-    //   bv_stage : BT × BV × 4 = 64 × 32 × 4 = 8 KB   (per-thread bv -> all-threads)
-    //   bh tile  : BV × K  × 4 = 32 × 128 × 4 = 16 KB (running f32 state)
-    // Total: 24 KB.  M5 Max max threadgroup memory is 32 KB, so this fits
-    // with 8 KB headroom.
-    let shared_floats: u64 = ((p.bt * DEFAULT_BV) + (DEFAULT_BV * p.k)) as u64;
-    let shared_bytes = shared_floats * 4;
+    //   bh tile     : BV × K  × 4 = 32 × 128 × 4 = 16 KB (running f32 state)
+    //   bv_stage_bf : BV × BT × 2 = 32 × 64  × 2 =  4 KB (bf16 post-gate cast,
+    //                                                    transposed [BV, BT]
+    //                                                    layout for MMA)
+    // Total: 20 KB.  M5 Max max threadgroup memory is 32 KB, so this fits
+    // with 12 KB headroom (vs Wave 5b.1's 8 KB headroom at 24 KB).
+    let bh_bytes: u64 = (DEFAULT_BV * p.k) as u64 * 4;
+    let bv_stage_bytes: u64 = (DEFAULT_BV * p.bt) as u64 * 2;
+    let shared_bytes = bh_bytes + bv_stage_bytes;
 
     encoder.encode_threadgroups_with_shared(
         pipeline,
