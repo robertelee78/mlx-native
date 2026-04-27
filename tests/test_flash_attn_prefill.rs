@@ -3044,6 +3044,247 @@ fn test_mask_rank2_broadcast_d256_multihead() {
     );
 }
 
+/// Wave 4 Phase B regression: pp65536 mask indexing must not overflow i32.
+///
+/// # Bug being guarded
+///
+/// Phase A (`/tmp/cfa-cfa-20260427-adr005-wave4/phase-A-report.md` §2.5)
+/// identified two i32 multiplication overflow sites in the D=256 prefill path
+/// that fire at `seq_len_q >= 32768` when the mask is the rank-2 broadcast
+/// layout `[qL, kL]` (the layout the batched-prefill production code path
+/// uses):
+///
+/// 1. `flash_attn_prefill.metal:1487-1495` — `MMAFrag_t::load_safe` computes
+///    `(off_x + i) * str_x` where `off_x = row_pos` (int) and `str_x =
+///    int(M_strides[2]) = kL`.  At `row_pos * kL >= i32::MAX = 2^31 - 1`,
+///    i.e. `row_pos >= 32768` for `kL = 65536`, the i32 product wraps
+///    negative.  The resulting pointer offset addresses memory **before**
+///    the mask buffer; the bf16 garbage read perturbs the additive mask
+///    contribution and corrupts the attention output for every Q row in
+///    the upper half of the prompt.
+///
+/// 2. `flash_attn_prefill_blk.metal:181` — `mask_src = mask + (qt * BQ) *
+///    M_stride + ...` where `qt`, `BQ`, `M_stride` are all `int`.  At pp65536
+///    with `qt >= 1024`, `qt * BQ * M_stride >= 1024 * 32 * 65536 =
+///    2,147,483,648 > i32::MAX`, same wraparound, same corruption pattern.
+///
+/// The D=512 sibling kernel is correct because
+/// `flash_attn_prefill_d512.metal:411-413` casts each multiplicand to
+/// `ulong` before multiplication.  Phase B's fix mirrors that idiom in the
+/// two D=256 sites.
+///
+/// # Failure mode pre-patch
+///
+/// On a from-scratch single-pass prefill at `seq_len_q = seq_len_k = 65536`
+/// with a Gemma-4-style sliding-window+causal rank-2 mask (`window = 1024`,
+/// `causal = true`), the LAST Q row (index 65535) is processed through
+/// 32768 K positions in its attended window — **all of which** overlap the
+/// upper-half overflow regime.  The bf16 output for row 65535 diverges
+/// from the CPU reference by orders of magnitude (random bf16 garbage in
+/// the additive-mask term flips softmax winners arbitrarily).
+///
+/// Reproduces the empirical observation in
+/// `project_long_prefill_parity_inverts.md` that pp65536 emits
+/// `first_decode_token = 0` deterministically across 5 cold-process runs:
+/// the corrupted-but-finite forward pass yields a stable wrong argmax over
+/// the lm_head logits.
+///
+/// # Why we check only the last Q row
+///
+/// Memory budget (cold synthetic test):
+///   - bf16 rank-2 mask buffer: 65536 * 65536 * 2 B = 8.6 GB
+///   - bf16 Q/K/V/O (n_heads = 1, head_dim = 256): 4 * 65536 * 256 * 2 B = 128 MB
+///   - f32 K/V for CPU reference (last-row-only): 2 * 65536 * 256 * 4 B = 128 MB
+///   - f32 mask row 65535 only: 65536 * 4 B = 256 KB
+///   - Total peak: ~9 GB GPU + ~256 MB CPU.
+///
+/// CPU reference for the full GPU output would be 65536 * 33 M ops =
+/// 2.1 T ops at f32 — minutes on a single core.  Reference for the LAST
+/// row only is 33 M ops, ~50 ms on Apple Silicon.  The last row is the
+/// row that `forward_prefill_batched.rs` argmax-samples to compute
+/// `first_decode_token`, so it is the production-relevant row — perfect
+/// for a focused regression test.
+///
+/// # Acceptance
+///
+/// Pre-patch (current HEAD): FAILS with very large max abs error in row
+/// 65535 (the corrupted region).  Post-patch (i64/ulong cast in the two
+/// shaders): PASSES within the standard `BF16_GPU_ATOL / _RTOL` budget.
+#[test]
+fn flash_attn_prefill_pp65536_no_overflow_in_mask_indexing() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let batch = 1;
+    let h = 1;
+    let kv_h = 1;
+    let ql = 65536usize; // The smallest seq_len at which kL * row_pos > i32::MAX.
+    let kl = 65536usize;
+    let d = 256usize; // Affected path; D=512 is correct already.
+    let window = 1024_u32; // Gemma-4 sliding-layer window.
+    let scale = 1.0 / (d as f32).sqrt();
+
+    eprintln!(
+        "pp65536_overflow_test: allocating ~{} GB GPU (mask {} GB + Q/K/V/O {} MB)",
+        ((kl * ql * 2 + 4 * h * ql * d * 2) as f64) / 1e9,
+        (kl * ql * 2) as f64 / 1e9,
+        (4 * h * ql * d * 2) / 1_048_576,
+    );
+
+    // ── Build the rank-2 [qL, kL] sliding+causal mask via the production builder.
+    //     This is the same builder forward_prefill_batched.rs uses, so the
+    //     mask layout under test is bit-identical to the production layout.
+    let mask_params = SdpaMaskParams {
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        window_size: Some(window),
+        causal: true,
+        q_abs_offset: 0,
+    };
+    let mut mask_enc = device.command_encoder().expect("mask encoder");
+    let mask_buf = build_sdpa_mask_bf16(&device, &mut registry, &mut mask_enc, &mask_params)
+        .expect("build_sdpa_mask_bf16 @ pp65536");
+    mask_enc.commit_and_wait().expect("mask commit");
+    assert_eq!(
+        mask_buf.shape(),
+        &[ql, kl],
+        "mask must be rank-2 [qL, kL] for the rank-2 broadcast code path"
+    );
+
+    // ── Random Q/K/V (deterministic seed) ────────────────────────────────
+    let q = pseudo_random_f32(SEED + 4096, batch * h * ql * d);
+    let k = pseudo_random_f32(SEED + 4097, batch * kv_h * kl * d);
+    let v = pseudo_random_f32(SEED + 4098, batch * kv_h * kl * d);
+    let q_bf = f32_to_bf16(&q);
+    let k_bf = f32_to_bf16(&k);
+    let v_bf = f32_to_bf16(&v);
+
+    // ── GPU dispatch — single-pass prefill, rank-2 broadcast mask ────────
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+
+    let attn_params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: false, // causal+SWA both encoded into the rank-2 mask
+    };
+
+    let mut enc = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut enc,
+        &device,
+        &mut registry,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        Some(&mask_buf),
+        &mut out_buf,
+        &attn_params,
+    )
+    .expect("dispatch bf16 d256 @ pp65536");
+    enc.commit_and_wait().expect("commit");
+
+    // ── Read the LAST Q row only ─────────────────────────────────────────
+    //     forward_prefill_batched.rs argmax-samples row (seq_len_q - 1) to
+    //     compute first_decode_token, so this is the production-relevant
+    //     row.  Layout is [B, H, qL, D] contiguous in D, so row 65535 starts
+    //     at element offset (qL - 1) * D when batch=1, h=1.
+    let last_row_offset = (ql - 1) * d;
+    let out_all_bf = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_last_row: Vec<f32> = out_all_bf[last_row_offset..last_row_offset + d]
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+
+    assert_all_finite(&gpu_last_row, "pp65536_no_overflow_last_row_finite");
+
+    // ── CPU reference for the LAST row only ──────────────────────────────
+    //     attention(q[L-1], K, V, mask[L-1, :]) at scale * log2(e), base-2
+    //     softmax, finite-M sentinel — mirrors `sdpa_reference_f32` for one
+    //     row only to keep memory and compute bounded.
+    let q_last: Vec<f32> = q_bf[last_row_offset..last_row_offset + d]
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    // K/V are MHA (kv_h = 1), layout [B, kv_h, kL, D].
+    let k_f32 = bf16_to_f32(&k_bf);
+    let v_f32 = bf16_to_f32(&v_bf);
+    // Read just the last row of the mask.
+    let mask_last_row_bf: Vec<half::bf16> = {
+        // Read the full mask back is 8.6 GB — instead, slice it.  The mask
+        // builder writes contiguous [qL, kL], so row (qL-1) starts at element
+        // (qL-1) * kL.  read_bf16_buffer reads the whole buffer; for memory
+        // economy we read only what we need by computing on a slice.
+        let mask_all = read_bf16_buffer(&mask_buf, ql * kl);
+        mask_all[(ql - 1) * kl..ql * kl].to_vec()
+    };
+    let mask_last_row_f32: Vec<f32> = mask_last_row_bf.iter().map(|x| x.to_f32()).collect();
+
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    let q_scale = scale * LOG2E;
+
+    // Q · K^T for the last query row, base-2 scale.
+    let mut scores = vec![0.0f32; kl];
+    for k_pos in 0..kl {
+        let mut dot = 0.0f32;
+        let kv_base = k_pos * d;
+        for di in 0..d {
+            dot += q_last[di] * k_f32[kv_base + di];
+        }
+        scores[k_pos] = dot * q_scale + LOG2E * mask_last_row_f32[k_pos];
+    }
+
+    // Online softmax (base-2, finite-M sentinel).
+    let mut max_score = f32::MIN / 2.0;
+    for &s in &scores {
+        if s > max_score {
+            max_score = s;
+        }
+    }
+    let exp_scores: Vec<f32> = scores.iter().map(|&s| f32::exp2(s - max_score)).collect();
+    let sum_exp: f32 = exp_scores.iter().sum();
+    let safe_sum = if sum_exp == 0.0 { 1.0 } else { sum_exp };
+
+    // Weighted sum of V for the output row.
+    let mut ref_last_row = vec![0.0f32; d];
+    for di in 0..d {
+        let mut acc = 0.0f32;
+        for k_pos in 0..kl {
+            acc += (exp_scores[k_pos] / safe_sum) * v_f32[k_pos * d + di];
+        }
+        ref_last_row[di] = acc;
+    }
+
+    // Apply the bf16 store-rounding the GPU does on output.
+    let ref_last_row_bf = f32_to_bf16(&ref_last_row);
+    let ref_last_row_after_store: Vec<f32> = ref_last_row_bf.iter().map(|x| x.to_f32()).collect();
+
+    // Pre-patch this assertion will fail with a very large max_abs_error
+    // (the bf16 garbage perturbation pushes outputs far past BF16_GPU_ATOL).
+    // Post-patch (i64/ulong cast) it should pass with normal bf16 budget.
+    assert_close_gpu(
+        &gpu_last_row,
+        &ref_last_row_after_store,
+        BF16_GPU_ATOL,
+        BF16_GPU_RTOL,
+        "pp65536_no_overflow_in_mask_indexing_last_row",
+    );
+}
+
 /// Wave 4.1 / Test 2: rank-2 broadcast mask with multi-head D=512.
 ///
 /// Same as Test 1 but routes through `dispatch_flash_attn_prefill_bf16_d512`.
