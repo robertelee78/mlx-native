@@ -58,6 +58,12 @@ pub struct MlxBufferPool {
     /// underlying GPU allocation alive even after the caller's `MlxBuffer`
     /// goes out of scope.  [`reset`] drains this into [`free`].
     in_use: Vec<(usize, metal::Buffer)>,
+    /// Residency set that owns the allocations registered by this pool.
+    residency_set: Option<crate::residency::ResidencySet>,
+    /// Unique Metal buffers this pool added to the residency set, keyed by
+    /// their stable contents pointer. This avoids double-removing buffers if
+    /// callers mix release/reset despite that pattern being unsupported.
+    resident_buffers: HashMap<usize, metal::Buffer>,
 }
 
 impl Default for MlxBufferPool {
@@ -73,6 +79,8 @@ impl MlxBufferPool {
         Self {
             free: HashMap::new(),
             in_use: Vec::new(),
+            residency_set: None,
+            resident_buffers: HashMap::new(),
         }
     }
 
@@ -93,7 +101,47 @@ impl MlxBufferPool {
         dtype: DType,
         shape: Vec<usize>,
     ) -> Result<MlxBuffer> {
+        let (buffer, added_residency) = self.alloc_inner(device, byte_len, dtype, shape)?;
+        if added_residency {
+            if let Some(set) = self.residency_set.as_ref() {
+                set.commit();
+            }
+        }
+        Ok(buffer)
+    }
+
+    /// Allocate several buffers and commit residency-set updates once.
+    pub fn alloc_batch<I>(&mut self, device: &MlxDevice, requests: I) -> Result<Vec<MlxBuffer>>
+    where
+        I: IntoIterator<Item = (usize, DType, Vec<usize>)>,
+    {
+        let mut buffers = Vec::new();
+        let mut added_residency = false;
+
+        for (byte_len, dtype, shape) in requests {
+            let (buffer, added) = self.alloc_inner(device, byte_len, dtype, shape)?;
+            added_residency |= added;
+            buffers.push(buffer);
+        }
+
+        if added_residency {
+            if let Some(set) = self.residency_set.as_ref() {
+                set.commit();
+            }
+        }
+
+        Ok(buffers)
+    }
+
+    fn alloc_inner(
+        &mut self,
+        device: &MlxDevice,
+        byte_len: usize,
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<(MlxBuffer, bool)> {
         let bucket = bucket_size(byte_len);
+        let mut added_residency = false;
 
         // Try to reuse a free buffer from this bucket.
         let metal_buf = self
@@ -105,13 +153,13 @@ impl MlxBufferPool {
             Some(b) => b,
             None => {
                 // Fresh allocation at bucket size.
-                let raw = device.metal_device().new_buffer(
-                    bucket as u64,
-                    metal::MTLResourceOptions::StorageModeShared,
-                );
+                let raw = device
+                    .metal_device()
+                    .new_buffer(bucket as u64, metal::MTLResourceOptions::StorageModeShared);
                 if raw.contents().is_null() {
                     return Err(MlxError::BufferAllocationError { bytes: bucket });
                 }
+                added_residency = self.register_residency_allocation(device, &raw)?;
                 raw
             }
         };
@@ -119,7 +167,7 @@ impl MlxBufferPool {
         // Track the handout so reset() can recycle it.  ARC clone is cheap.
         self.in_use.push((bucket, metal_buf.clone()));
 
-        Ok(MlxBuffer::from_raw(metal_buf, dtype, shape))
+        Ok((MlxBuffer::from_raw(metal_buf, dtype, shape), added_residency))
     }
 
     /// Return a single buffer to the pool's free list for future reuse.
@@ -192,7 +240,76 @@ impl MlxBufferPool {
     /// Clear all free buffers, releasing Metal memory.  Does not affect
     /// in-use tracking.
     pub fn clear(&mut self) {
+        let mut removed_any = false;
+
+        if let Some(set) = self.residency_set.as_ref() {
+            for metal_buf in self.free.values().flatten() {
+                let key = buffer_key(metal_buf);
+                if let Some(resident_buf) = self.resident_buffers.remove(&key) {
+                    set.remove_allocation(&resident_buf);
+                    removed_any = true;
+                }
+            }
+
+            if removed_any {
+                set.commit();
+            }
+        }
+
         self.free.clear();
+    }
+
+    fn register_residency_allocation(
+        &mut self,
+        device: &MlxDevice,
+        buffer: &metal::Buffer,
+    ) -> Result<bool> {
+        let Some(device_set) = device.residency_set() else {
+            return Ok(false);
+        };
+
+        match self.residency_set.as_ref() {
+            Some(pool_set) if !pool_set.same_owner(device_set) => {
+                return Err(MlxError::InvalidArgument(
+                    "MlxBufferPool cannot mix residency-enabled devices".into(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                self.residency_set = Some(device_set.clone());
+            }
+        }
+
+        let key = buffer_key(buffer);
+        if !self.resident_buffers.contains_key(&key) {
+            device_set.add_allocation(buffer);
+            self.resident_buffers.insert(key, buffer.clone());
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn remove_all_residency_allocations(&mut self) {
+        let Some(set) = self.residency_set.as_ref() else {
+            return;
+        };
+
+        if self.resident_buffers.is_empty() {
+            return;
+        }
+
+        for buffer in self.resident_buffers.values() {
+            set.remove_allocation(buffer);
+        }
+        set.commit();
+        self.resident_buffers.clear();
+    }
+}
+
+impl Drop for MlxBufferPool {
+    fn drop(&mut self) {
+        self.remove_all_residency_allocations();
     }
 }
 
@@ -204,6 +321,11 @@ fn bucket_size(n: usize) -> usize {
         return 1;
     }
     n.next_power_of_two()
+}
+
+#[inline]
+fn buffer_key(buffer: &metal::Buffer) -> usize {
+    buffer.contents() as usize
 }
 
 #[cfg(test)]
