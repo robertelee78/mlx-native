@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use half::f16;
 
 use crate::ops::quantized_matmul_ggml::GgmlType;
-use crate::{DType, MlxBuffer, MlxDevice, MlxError, Result};
+use crate::{DType, MlxBuffer, MlxBufferPool, MlxDevice, MlxError, Result};
 
 // ---------------------------------------------------------------------------
 // GGUF constants
@@ -1086,6 +1086,52 @@ impl GgufFile {
             dequantize_to_f32(&data, info.ggml_type, out_slice)?;
         }
 
+        Ok(buf)
+    }
+
+    /// Load a tensor and register its underlying Metal buffer with `pool`'s
+    /// residency set, returning the [`MlxBuffer`] to the caller.
+    ///
+    /// This is functionally equivalent to:
+    ///
+    /// ```ignore
+    /// let buf = gguf.load_tensor(name, device)?;
+    /// pool.register_existing(device, &buf)?;
+    /// ```
+    ///
+    /// but exists as a single call so callers don't need to reach for the
+    /// underlying [`MlxBufferPool::register_existing`] API directly.  See
+    /// that method's docs for the residency-set ownership contract.
+    ///
+    /// # Why a separate method instead of a `pool` parameter on `load_tensor`
+    ///
+    /// `load_tensor` has stable callers across the codebase that pass only
+    /// `&MlxDevice`; making the pool registration optional via a new method
+    /// keeps the existing signature wire-compatible.
+    ///
+    /// # Note on bucket-rounding
+    ///
+    /// The buffer is allocated at exactly `info.byte_len` via
+    /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer) (no
+    /// bucket-rounding) and added to the pool's residency set only —
+    /// it is not placed in the recycling free list.  This is the path
+    /// hf2q's static weight loader uses to gain MTLResidencySet hints
+    /// without paying the 48% bucket-rounding tax that would have
+    /// inflated 17 GB of weights to 25 GB.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`load_tensor`](Self::load_tensor), plus any
+    /// [`MlxError::InvalidArgument`] from
+    /// [`MlxBufferPool::register_existing`].
+    pub fn load_tensor_into_pool(
+        &self,
+        name: &str,
+        device: &MlxDevice,
+        pool: &mut MlxBufferPool,
+    ) -> Result<MlxBuffer> {
+        let buf = self.load_tensor(name, device)?;
+        pool.register_existing(device, &buf)?;
         Ok(buf)
     }
 }

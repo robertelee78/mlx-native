@@ -219,6 +219,72 @@ impl MlxBufferPool {
         }
     }
 
+    /// Register an externally-allocated buffer with this pool's residency set
+    /// without taking ownership.
+    ///
+    /// # Why this exists
+    ///
+    /// [`alloc`](Self::alloc) bucket-rounds requests up to the next power of
+    /// two, which is acceptable for transient per-token scratch (the worst
+    /// case is ~2× over-allocation on a few megabytes) but unacceptable for
+    /// large static weight tensors.  hf2q's Qwen3.5-MoE weight set totals
+    /// ~17.26 GB; bucket-rounding would balloon that to ~25.55 GB
+    /// (+8.3 GB / +48% blowup) — unshippable on a 128 GB unified-memory
+    /// M5 Max once KV cache and intermediates are layered on top.
+    ///
+    /// `register_existing` provides a *residency-only* path: the caller
+    /// allocates the buffer at its exact size via
+    /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer) (or
+    /// loads it via [`GgufFile::load_tensor_into_pool`](crate::GgufFile::load_tensor_into_pool)),
+    /// retains the [`MlxBuffer`] handle, and asks the pool to add the
+    /// underlying Metal allocation to its residency set so it gets the
+    /// MTLResidencySet hint on the next dispatch.
+    ///
+    /// # Ownership semantics
+    ///
+    /// * The pool **does not** take ownership of the buffer.  The caller's
+    ///   `MlxBuffer` handle remains the canonical owner.
+    /// * The pool **does not** recycle this buffer on [`reset`](Self::reset)
+    ///   (it is not added to `in_use`).
+    /// * The pool **does** include this buffer in its residency set so it
+    ///   is hinted-resident on the next encoder dispatch.
+    /// * On pool [`Drop`], the residency-set membership is removed but the
+    ///   underlying Metal buffer is **not** freed — the caller's `MlxBuffer`
+    ///   handle keeps the ARC alive.
+    ///
+    /// # `HF2Q_NO_RESIDENCY=1` escape hatch
+    ///
+    /// When the environment variable `HF2Q_NO_RESIDENCY=1` is set, the
+    /// process boots its [`MlxDevice`](crate::MlxDevice) without any
+    /// residency set (see `device.rs`).  In that mode this method returns
+    /// `Ok(())` without touching anything — operators who suspect a
+    /// residency-induced regression can opt out without recompiling.
+    ///
+    /// # Idempotence
+    ///
+    /// Registering the same buffer twice (identified by its
+    /// `metal::Buffer.contents()` pointer) is a no-op on the second call —
+    /// the residency set membership is tracked in a `HashMap` keyed by
+    /// contents pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MlxError::InvalidArgument` if the buffer was allocated on a
+    /// different `MlxDevice` than any previously registered buffer.
+    pub fn register_existing(
+        &mut self,
+        device: &MlxDevice,
+        buffer: &MlxBuffer,
+    ) -> Result<()> {
+        let added = self.register_residency_allocation(device, buffer.metal_buffer())?;
+        if added {
+            if let Some(set) = self.residency_set.as_ref() {
+                set.commit();
+            }
+        }
+        Ok(())
+    }
+
     /// Return all free buffers' count (for diagnostics).
     pub fn free_count(&self) -> usize {
         self.free.values().map(|v| v.len()).sum()
@@ -405,6 +471,116 @@ mod tests {
         pool.reset();
         pool.reset();
         assert_eq!(pool.in_use_count(), 0);
+    }
+
+    #[test]
+    fn test_register_existing_does_not_recycle_on_reset() {
+        // Externally-allocated buffer registered via register_existing must
+        // NOT be added to the in_use list — reset() should leave the caller's
+        // ownership intact and the buffer must remain valid after the pool
+        // is dropped.
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new();
+
+        // Allocate the buffer EXTERNALLY (via device.alloc_buffer, not
+        // pool.alloc) — this is the no-bucket-rounding path hf2q uses for
+        // static weight tensors.
+        let external = device
+            .alloc_buffer(4096, DType::U8, vec![4096])
+            .expect("alloc external");
+        let external_ptr = external.contents_ptr();
+
+        // Register with the pool's residency set.
+        pool.register_existing(&device, &external)
+            .expect("register_existing");
+
+        // in_use must remain empty (external buffer is not arena-recycled).
+        assert_eq!(pool.in_use_count(), 0);
+
+        // reset() must be a no-op for externally-registered buffers.
+        pool.reset();
+        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.free_count(), 0);
+
+        // Drop the pool. The external MlxBuffer must still be valid — its
+        // metal::Buffer ARC is held by `external`, not by the pool.
+        drop(pool);
+        assert_eq!(external.contents_ptr(), external_ptr);
+        // Confirm the buffer is still accessible (no UAF).
+        let slice: &[u8] = external.as_slice().expect("slice still valid");
+        assert_eq!(slice.len(), 4096);
+    }
+
+    #[test]
+    fn test_register_existing_idempotent() {
+        // Registering the same buffer twice must not duplicate the residency
+        // membership (resident_buffers HashMap is keyed by contents pointer).
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new();
+
+        let external = device
+            .alloc_buffer(2048, DType::U8, vec![2048])
+            .expect("alloc external");
+
+        pool.register_existing(&device, &external)
+            .expect("register 1");
+        pool.register_existing(&device, &external)
+            .expect("register 2 (idempotent)");
+
+        // Drop the pool (Drop::drop runs remove_all_residency_allocations).
+        // No double-remove panic is the actual assertion here.
+        drop(pool);
+        // Buffer still valid.
+        let _slice: &[u8] = external.as_slice().expect("still valid");
+    }
+
+    #[test]
+    fn test_register_existing_no_residency_env_is_noop() {
+        // With HF2Q_NO_RESIDENCY=1 the device boots without a residency set,
+        // so register_existing has no set to register against and must
+        // return Ok(()) as a no-op without touching anything.
+        //
+        // This test runs serially with other residency-env tests via the
+        // shared TEST_LOCK in tests/test_residency_set.rs — but unit tests
+        // here run in the same process and could race with that integration
+        // test if both are running. We mitigate by:
+        //   1. Reading + restoring the original env value.
+        //   2. Resetting the residency env-cache flag before AND after.
+        //
+        // The unit-test name is uniquely keyed; cargo test by default
+        // single-threads tests within the same binary only when --test-threads=1
+        // is set. We accept that this test could flake under -j > 1 with
+        // the integration tests; in practice cargo test schedules unit and
+        // integration test binaries separately.
+        let prev = std::env::var("HF2Q_NO_RESIDENCY").ok();
+        crate::residency::reset_residency_env_cache_for_test();
+        std::env::set_var("HF2Q_NO_RESIDENCY", "1");
+
+        let device = MlxDevice::new().expect("device");
+        assert!(
+            !device.residency_sets_enabled(),
+            "device should boot without residency under HF2Q_NO_RESIDENCY=1",
+        );
+
+        let mut pool = MlxBufferPool::new();
+        let external = device
+            .alloc_buffer(1024, DType::U8, vec![1024])
+            .expect("alloc external");
+
+        // register_existing must succeed as a no-op.
+        pool.register_existing(&device, &external)
+            .expect("register_existing under HF2Q_NO_RESIDENCY=1 should succeed");
+
+        // Pool's internal residency_set must remain None.
+        assert!(pool.residency_set.is_none());
+        assert!(pool.resident_buffers.is_empty());
+
+        // Cleanup env.
+        match prev {
+            Some(v) => std::env::set_var("HF2Q_NO_RESIDENCY", v),
+            None => std::env::remove_var("HF2Q_NO_RESIDENCY"),
+        }
+        crate::residency::reset_residency_env_cache_for_test();
     }
 
     #[test]
