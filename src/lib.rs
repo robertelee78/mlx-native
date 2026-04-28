@@ -72,6 +72,11 @@ pub use encoder::{
 pub use error::{MlxError, Result};
 pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
 pub use kernel_registry::KernelRegistry;
+// Test-only counters and gate-reset helpers.  Marked #[doc(hidden)] so
+// they don't appear in published rustdoc; consumers should not depend
+// on them outside test code.  Not feature-gated because integration
+// tests in tests/ are a separate crate and cannot rely on the lib's
+// `test` cfg flag.
 #[doc(hidden)]
 pub use residency::{
     macos_15_or_newer_for_test, reset_residency_env_cache_for_test,

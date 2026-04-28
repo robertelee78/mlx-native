@@ -23,6 +23,13 @@ all-features = true
 name = "mlx_native"
 path = "src/lib.rs"
 
+[features]
+default = []
+# test-utils — exposes residency-set test counters for downstream integration tests.
+# Off by default; enable with `--features test-utils` for hf2q-side residency-set
+# integration testing without depending on dev-dep cargo test runner.
+test-utils = []
+
 [dependencies]
 metal = "0.33"
 objc = "0.2"

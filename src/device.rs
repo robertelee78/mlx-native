@@ -35,21 +35,30 @@ impl MlxDevice {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or(MlxError::DeviceNotFound)?;
         let queue = device.new_command_queue();
+        let log_init = std::env::var("MLX_NATIVE_LOG_INIT").as_deref() == Ok("1");
 
         let residency_set = if residency_disabled_by_env() {
-            eprintln!("[mlx-native] residency sets = false (reason: HF2Q_NO_RESIDENCY=1)");
+            if log_init {
+                eprintln!("[mlx-native] residency sets = false (reason: HF2Q_NO_RESIDENCY=1)");
+            }
             None
         } else if !macos_15_or_newer() {
-            eprintln!("[mlx-native] residency sets = false (reason: macOS < 15.0)");
+            if log_init {
+                eprintln!("[mlx-native] residency sets = false (reason: macOS < 15.0)");
+            }
             None
         } else {
             let set = ResidencySet::new(&device)?;
             if set.is_noop() {
-                eprintln!("[mlx-native] residency sets = false (reason: macOS < 15.0)");
+                if log_init {
+                    eprintln!("[mlx-native] residency sets = false (reason: macOS < 15.0)");
+                }
                 None
             } else {
                 set.register_with_queue(&queue);
-                eprintln!("[mlx-native] residency sets = true");
+                if log_init {
+                    eprintln!("[mlx-native] residency sets = true");
+                }
                 Some(set)
             }
         };

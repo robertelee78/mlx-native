@@ -91,7 +91,18 @@ impl ResidencySet {
                 ));
             }
 
-            let _: () = msg_send![descriptor, setInitialCapacity: 4096usize];
+            let _: () = msg_send![descriptor, setInitialCapacity: 256usize];
+
+            // Set a stable label so the residency set is identifiable in
+            // Instruments / Metal-system-trace.  Literal is statically
+            // NUL-terminated; NSString reads up to the NUL.
+            let label_ptr = b"mlx_native_default\0".as_ptr() as *const i8;
+            if let Some(nsstring_class) = Class::get("NSString") {
+                let label_ns: *mut Object = msg_send![nsstring_class, stringWithUTF8String: label_ptr];
+                if !label_ns.is_null() {
+                    let _: () = msg_send![descriptor, setLabel: label_ns];
+                }
+            }
 
             let mut error: *mut Object = ptr::null_mut();
             let set: *mut Object =
