@@ -5,7 +5,7 @@
 
 use std::ffi::CStr;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use metal::{BufferRef as MTLBufferRef, CommandQueueRef, DeviceRef};
@@ -37,13 +37,25 @@ enum ResidencySetInner {
     Active {
         object: ObjcResidencySet,
         lock: Mutex<()>,
+        /// ADR-015 iter8e (Phase 3b): defer-and-flush pending flag.
+        ///
+        /// `add_allocation` / `remove_allocation` set this to `true` instead
+        /// of calling `[set commit]` per-call. `flush_pending` issues a
+        /// single `[set commit]` iff this flag was set, then clears it.
+        ///
+        /// This converts the per-allocation commit storm
+        /// (~880 commits/token in iter8d/8e claude+codex variants) into one
+        /// commit per CB-submission boundary — mirrors llama.cpp's
+        /// `ggml-metal-device.m:1378-1382` (batch addAllocation in loop,
+        /// commit ONCE at the end of the batch).
+        pending: AtomicBool,
     },
     Noop,
 }
 
 impl Drop for ResidencySetInner {
     fn drop(&mut self) {
-        let Self::Active { object, lock } = self else {
+        let Self::Active { object, lock, .. } = self else {
             return;
         };
 
@@ -124,6 +136,7 @@ impl ResidencySet {
                 inner: Arc::new(ResidencySetInner::Active {
                     object: ObjcResidencySet { ptr: set },
                     lock: Mutex::new(()),
+                    pending: AtomicBool::new(false),
                 }),
             })
         }
@@ -141,57 +154,105 @@ impl ResidencySet {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Stage a buffer allocation to join the residency set.
+    /// Stage a buffer allocation to join the residency set (deferred).
+    ///
+    /// Calls Metal's `addAllocation:` but does NOT commit. The caller is
+    /// expected to invoke [`flush_pending`](Self::flush_pending) at the next
+    /// CB-submission boundary (or [`commit`](Self::commit) explicitly for a
+    /// batched-add path like `MlxBufferPool::alloc_batch`). This matches
+    /// llama.cpp's `ggml-metal-device.m:1378-1382` pattern: addAllocation
+    /// in a loop, commit ONCE.
     pub(crate) fn add_allocation(&self, buffer: &MTLBufferRef) {
-        self.with_active_set(|set| unsafe {
+        self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, addAllocation: buffer];
             TEST_ALLOCATION_COUNT.fetch_add(1, Ordering::AcqRel);
+            pending.store(true, Ordering::Release);
         });
     }
 
-    /// Stage a buffer allocation to leave the residency set.
+    /// Stage a buffer allocation to leave the residency set (deferred).
+    ///
+    /// Calls Metal's `removeAllocation:` but does NOT commit; same
+    /// defer-and-flush contract as [`add_allocation`](Self::add_allocation).
     pub(crate) fn remove_allocation(&self, buffer: &MTLBufferRef) {
-        self.with_active_set(|set| unsafe {
+        self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, removeAllocation: buffer];
             let _ = TEST_ALLOCATION_COUNT.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |count| count.checked_sub(1),
             );
+            pending.store(true, Ordering::Release);
         });
     }
 
     /// Stage all allocations to leave the residency set.
     #[allow(dead_code)]
     pub(crate) fn remove_all_allocations(&self) {
-        self.with_active_set(|set| unsafe {
+        self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, removeAllAllocations];
             TEST_ALLOCATION_COUNT.store(0, Ordering::Release);
+            pending.store(true, Ordering::Release);
         });
     }
 
-    /// Apply staged residency-set changes.
+    /// Apply staged residency-set changes immediately.
+    ///
+    /// Always issues a `[set commit]` call. Used by batched paths that have
+    /// gathered N add/remove calls and want to flush as a single op (e.g.
+    /// `MlxBufferPool::alloc_batch`, `MlxBufferPool::clear`). Also clears
+    /// the pending flag so a subsequent `flush_pending` is a no-op.
     pub(crate) fn commit(&self) {
-        self.with_active_set(|set| unsafe {
+        self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, commit];
             TEST_COMMIT_CALL_COUNT.fetch_add(1, Ordering::AcqRel);
+            pending.store(false, Ordering::Release);
         });
+    }
+
+    /// Defer-and-flush: commit only if a pending add/remove has been
+    /// recorded since the last commit, then clear the pending flag.
+    ///
+    /// Hooked at every `CommandEncoder::commit*` boundary so the
+    /// per-allocation commit storm collapses to at most one
+    /// `[set commit]` per CB submission. Mirrors the lifetime of
+    /// llama.cpp's `ggml_metal_buffer_rset_init` which batches addAllocation
+    /// in `ggml-metal-device.m:1378-1382` and commits exactly once.
+    ///
+    /// Returns whether a commit was actually issued (useful for tests).
+    pub(crate) fn flush_pending(&self) -> bool {
+        let mut committed = false;
+        self.with_active_set(|set, pending| {
+            // swap-to-false: only the first concurrent flusher actually
+            // issues `[set commit]`; subsequent racers see `false` and skip.
+            // The Mutex inside `with_active_set` already serializes against
+            // `add_allocation` / `remove_allocation`, so this is belt-and-
+            // braces against future lock-free callers.
+            if pending.swap(false, Ordering::AcqRel) {
+                unsafe {
+                    let _: () = msg_send![set, commit];
+                }
+                TEST_COMMIT_CALL_COUNT.fetch_add(1, Ordering::AcqRel);
+                committed = true;
+            }
+        });
+        committed
     }
 
     /// Register this residency set with a command queue.
     pub(crate) fn register_with_queue(&self, queue: &CommandQueueRef) {
-        self.with_active_set(|set| unsafe {
+        self.with_active_set(|set, _pending| unsafe {
             let _: () = msg_send![queue, addResidencySet: set];
         });
     }
 
-    fn with_active_set(&self, f: impl FnOnce(*mut Object)) {
-        let ResidencySetInner::Active { object, lock } = &*self.inner else {
+    fn with_active_set(&self, f: impl FnOnce(*mut Object, &AtomicBool)) {
+        let ResidencySetInner::Active { object, lock, pending } = &*self.inner else {
             return;
         };
 
         if let Ok(_guard) = lock.lock() {
-            f(object.ptr);
+            f(object.ptr, pending);
         }
     }
 }

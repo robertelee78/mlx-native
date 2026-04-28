@@ -30,6 +30,7 @@ use objc::{msg_send, sel, sel_impl};
 
 use crate::buffer::MlxBuffer;
 use crate::error::{MlxError, Result};
+use crate::residency::ResidencySet;
 
 /// A buffer or inline-bytes binding for a compute kernel argument slot.
 pub enum KernelArg<'a> {
@@ -357,6 +358,13 @@ pub struct CommandEncoder {
     pending_reads: Vec<MemRange>,
     /// Pending write buffer ranges for the NEXT captured dispatch.
     pending_writes: Vec<MemRange>,
+    /// ADR-015 iter8e (Phase 3b): residency set whose pending add/remove
+    /// staging is flushed at every `commit*` boundary.
+    ///
+    /// Cloned from the device at `device.command_encoder()` time. `None`
+    /// when residency sets are disabled (HF2Q_NO_RESIDENCY=1, macOS<15,
+    /// or test-only `CommandEncoder::new` from a residency-less queue).
+    residency_set: Option<ResidencySet>,
 }
 
 /// SAFETY: CommandEncoder is safe to Send across threads provided that:
@@ -401,7 +409,28 @@ impl CommandEncoder {
     /// scratch must come from the per-decode-token pool (which already
     /// ARC-retains in its in_use list).  Today the lm_head + router-
     /// download paths are still unpooled.
+    #[allow(dead_code)]
     pub(crate) fn new(queue: &CommandQueue) -> Result<Self> {
+        Self::new_with_residency(queue, None)
+    }
+
+    /// Create a new command encoder, optionally bound to a residency set so
+    /// `commit*` boundaries can flush deferred add/remove staging.
+    ///
+    /// ADR-015 iter8e (Phase 3b): the encoder's `commit_and_wait`,
+    /// `commit_and_wait_labeled`, `commit`, `commit_labeled`,
+    /// `commit_wait_with_gpu_time` all call
+    /// [`ResidencySet::flush_pending`](ResidencySet::flush_pending) before
+    /// submitting the Metal command buffer. This converts the
+    /// per-allocation `[set commit]` storm
+    /// (~880 commits/decode-token in iter8d/8e claude+codex variants) into
+    /// at most one commit per CB submission — mirrors llama.cpp's
+    /// `ggml-metal-device.m:1378-1382` pattern (batch addAllocation in
+    /// loop, commit ONCE).
+    pub(crate) fn new_with_residency(
+        queue: &CommandQueue,
+        residency_set: Option<ResidencySet>,
+    ) -> Result<Self> {
         let cmd_buf = queue.new_command_buffer().to_owned();
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
@@ -411,6 +440,7 @@ impl CommandEncoder {
             pending_op_kind: CapturedOpKind::Other,
             pending_reads: Vec::new(),
             pending_writes: Vec::new(),
+            residency_set,
         })
     }
 
@@ -899,6 +929,23 @@ impl CommandEncoder {
         }
     }
 
+    /// Flush any pending residency-set add/remove staging.
+    ///
+    /// Hooked at every commit boundary so per-allocation
+    /// [`ResidencySet::add_allocation`](ResidencySet::add_allocation) and
+    /// [`ResidencySet::remove_allocation`](ResidencySet::remove_allocation)
+    /// calls (as fired by `MlxDevice::alloc_buffer` and
+    /// `MlxBufferStorage::Drop`) collapse into at most ONE `[set commit]`
+    /// per CB submission. Mirrors llama.cpp's
+    /// `ggml-metal-device.m:1378-1382` (batch addAllocation in loop,
+    /// commit ONCE).
+    #[inline]
+    fn flush_residency_pending(&self) {
+        if let Some(set) = self.residency_set.as_ref() {
+            set.flush_pending();
+        }
+    }
+
     /// Commit the command buffer and block until the GPU finishes execution.
     ///
     /// # Errors
@@ -909,6 +956,12 @@ impl CommandEncoder {
 
         // End the persistent compute encoder before committing.
         self.end_active_encoder();
+
+        // ADR-015 iter8e (Phase 3b): flush deferred residency-set
+        // add/remove staging so the residency hint covers any buffers
+        // referenced by this CB. Single commit per CB boundary; no-op
+        // when no residency set or no staged changes.
+        self.flush_residency_pending();
 
         self.cmd_buf.commit();
         self.cmd_buf.wait_until_completed();
@@ -1002,6 +1055,9 @@ impl CommandEncoder {
     /// other work (e.g. preparing the next batch) while the GPU runs.
     pub fn commit(&mut self) {
         self.end_active_encoder();
+        // ADR-015 iter8e (Phase 3b): same flush hook as commit_and_wait —
+        // this is the async-pipeline path that production decode uses.
+        self.flush_residency_pending();
         self.cmd_buf.commit();
     }
 
