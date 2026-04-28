@@ -75,8 +75,15 @@ impl MlxDevice {
     /// The encoder wraps a fresh Metal command buffer from the device's command
     /// queue.  Encode one or more kernel dispatches, then call
     /// [`CommandEncoder::commit_and_wait`] to submit and block until completion.
+    ///
+    /// ADR-015 iter8e (Phase 3b): the encoder is bound to the device's
+    /// residency set so every `commit*` boundary flushes deferred
+    /// add/remove staging (one `[set commit]` per CB submission instead
+    /// of per-allocation). When residency sets are disabled
+    /// (HF2Q_NO_RESIDENCY=1, macOS<15) the binding is `None` and the
+    /// flush is a no-op.
     pub fn command_encoder(&self) -> Result<CommandEncoder> {
-        CommandEncoder::new(&self.queue)
+        CommandEncoder::new_with_residency(&self.queue, self.residency_set.clone())
     }
 
     /// Allocate a new GPU buffer with `StorageModeShared`.
@@ -110,7 +117,24 @@ impl MlxDevice {
         if metal_buf.contents().is_null() {
             return Err(MlxError::BufferAllocationError { bytes: byte_len });
         }
-        Ok(MlxBuffer::from_raw(metal_buf, dtype, shape))
+        // ADR-015 iter8e (Phase 3b): auto-register the new allocation with the
+        // device's residency set so it gets the MTLResidencySet hint on the
+        // next dispatch. The `with_residency` path stages the addAllocation
+        // but DEFERS the `[set commit]` to the next CommandEncoder::commit*
+        // boundary via flush_pending — mirrors llama.cpp's batch-add /
+        // single-commit pattern in ggml-metal-device.m:1378-1382.
+        //
+        // No-op when residency_set is None (HF2Q_NO_RESIDENCY=1, macOS<15,
+        // or no Metal device).
+        match self.residency_set.as_ref() {
+            Some(set) => Ok(MlxBuffer::with_residency(
+                metal_buf,
+                dtype,
+                shape,
+                set.clone(),
+            )),
+            None => Ok(MlxBuffer::from_raw(metal_buf, dtype, shape)),
+        }
     }
 
     /// Borrow the underlying `metal::Device` for direct Metal API calls

@@ -276,9 +276,47 @@ impl MlxBufferPool {
         device: &MlxDevice,
         buffer: &MlxBuffer,
     ) -> Result<()> {
+        // ADR-015 iter8e (Phase 3b): MlxDevice::alloc_buffer now
+        // auto-registers each new buffer with the device's residency set
+        // via Arc<MlxBufferStorage>. If this caller's buffer already owns
+        // its registration, short-circuit — re-registering would double-add
+        // and the pool's Drop would issue a stray removeAllocation: against
+        // a buffer the storage's RAII path will also remove.
+        if let Some(buffer_set) = buffer.residency_set() {
+            let Some(device_set) = device.residency_set() else {
+                return Err(MlxError::InvalidArgument(
+                    "MlxBuffer is registered with a residency set, but device has none".into(),
+                ));
+            };
+            if !buffer_set.same_owner(device_set) {
+                return Err(MlxError::InvalidArgument(
+                    "MlxBufferPool cannot register a buffer from a different residency-enabled device"
+                        .into(),
+                ));
+            }
+            // Adopt the buffer's residency set so the pool's same_owner
+            // checks downstream agree, but do NOT add the buffer — it's
+            // already in the set via its own Arc<MlxBufferStorage>.
+            match self.residency_set.as_ref() {
+                Some(pool_set) if !pool_set.same_owner(device_set) => {
+                    return Err(MlxError::InvalidArgument(
+                        "MlxBufferPool cannot mix residency-enabled devices".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.residency_set = Some(device_set.clone());
+                }
+            }
+            return Ok(());
+        }
+
         let added = self.register_residency_allocation(device, buffer.metal_buffer())?;
         if added {
             if let Some(set) = self.residency_set.as_ref() {
+                // Batched-add path: explicit commit (counts in the
+                // commit-call counter) preserves the
+                // `commit_called_after_alloc_batch`-style semantics.
                 set.commit();
             }
         }

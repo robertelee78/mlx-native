@@ -5,11 +5,13 @@
 //! [`as_slice`](MlxBuffer::as_slice) / [`as_mut_slice`](MlxBuffer::as_mut_slice)).
 
 use std::fmt;
+use std::sync::Arc;
 
 use metal::Buffer as MetalBuffer;
 
 use crate::dtypes::DType;
 use crate::error::{MlxError, Result};
+use crate::residency::ResidencySet;
 
 /// A Metal GPU buffer annotated with element dtype and tensor shape.
 ///
@@ -19,9 +21,20 @@ use crate::error::{MlxError, Result};
 /// # Thread Safety
 ///
 /// `MlxBuffer` is `Send + Sync` because the inner `metal::Buffer` is.
+///
+/// # Residency-set lifecycle
+///
+/// Buffers produced by [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer)
+/// on a residency-enabled device carry a shared
+/// [`Arc<MlxBufferStorage>`](MlxBufferStorage) that owns the residency-set
+/// reference and runs `removeAllocation:` (deferred — flushed at the next
+/// `CommandEncoder::commit*` boundary) when the last clone is dropped.
+/// Mirrors llama.cpp's `ggml-metal-device.m:1378-1382` pattern: batch
+/// `addAllocation:` calls in a loop, commit ONCE.
 pub struct MlxBuffer {
-    /// The underlying Metal buffer (StorageModeShared).
-    inner: MetalBuffer,
+    /// The underlying Metal buffer (StorageModeShared) plus optional
+    /// residency-set membership guard.
+    storage: Arc<MlxBufferStorage>,
     /// Element data type.
     dtype: DType,
     /// Tensor shape (e.g. `[2, 3, 4]` for a rank-3 tensor).
@@ -31,20 +44,54 @@ pub struct MlxBuffer {
     byte_offset: u64,
 }
 
+/// Owns a single Metal buffer allocation plus an optional residency-set
+/// membership guard.
+///
+/// Wrapped in [`Arc`] inside [`MlxBuffer`] so that [`Clone`] / [`slice_view`]
+/// share both the underlying Metal allocation and the residency-set
+/// registration. The Drop fires `removeAllocation:` only when the LAST clone
+/// goes out of scope — matching llama.cpp's `addAllocation:` /
+/// `removeAllocation:` lifecycle in `ggml-metal-device.m:1378-1382` and
+/// `ggml-metal-device.m:1397-1399`.
+///
+/// Drop is **deferred**: it calls `set.remove_allocation(buffer)` which marks
+/// the residency set's pending flag but does NOT call `[set commit]`. The
+/// commit is flushed at the next [`CommandEncoder::commit*`] boundary via
+/// [`ResidencySet::flush_pending`]. This collapses the per-allocation commit
+/// storm (~880 commits/decode-token in iter8d/8e claude+codex variants) into
+/// at most one commit per CB submission.
+pub(crate) struct MlxBufferStorage {
+    inner: MetalBuffer,
+    residency_set: Option<ResidencySet>,
+}
+
+impl Drop for MlxBufferStorage {
+    fn drop(&mut self) {
+        if let Some(set) = self.residency_set.as_ref() {
+            // Mirror ggml-metal-device.m:1397-1399 free-path semantics, but
+            // deferred — the actual `[set commit]` is issued at the next
+            // CommandEncoder::commit* boundary by flush_pending().
+            set.remove_allocation(&self.inner);
+        }
+    }
+}
+
 // metal::Buffer is Send + Sync; our extra fields (DType, Vec<usize>) are too.
 crate::static_assertions_send_sync!(MlxBuffer);
 
 impl Clone for MlxBuffer {
-    /// Increment the Metal buffer's ARC retain count and wrap it in a new
-    /// `MlxBuffer`.  Both the original and the clone refer to the same
-    /// underlying GPU allocation — no data is copied.
+    /// Increment the storage's `Arc` ref-count and wrap it in a new
+    /// `MlxBuffer`. Both the original and the clone refer to the same
+    /// underlying GPU allocation AND share the residency-set membership
+    /// guard — no data is copied, no double-registration occurs.
     ///
     /// This is safe because `metal::Buffer` wraps an `MTLBuffer` Objective-C
-    /// object whose lifetime is managed by ARC; `Clone` calls `retain` and
-    /// `drop` calls `release`.
+    /// object whose lifetime is managed by ARC; `Arc::clone` increments the
+    /// Rust-side refcount, and the inner `MlxBufferStorage` Drop runs once
+    /// when the last clone is released.
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            storage: self.storage.clone(),
             dtype: self.dtype,
             shape: self.shape.clone(),
             byte_offset: self.byte_offset,
@@ -67,9 +114,52 @@ impl MlxBuffer {
     /// the returned `MlxBuffer`.  If the buffer was obtained from another
     /// framework, the caller must ensure that framework does not deallocate
     /// the buffer while this `MlxBuffer` exists.
+    ///
+    /// The returned buffer carries no residency-set guard — pool / external
+    /// callers that want residency tracking should go through
+    /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer) or
+    /// [`MlxBufferPool::register_existing`](crate::MlxBufferPool::register_existing).
     pub fn from_raw(inner: MetalBuffer, dtype: DType, shape: Vec<usize>) -> Self {
         Self {
-            inner,
+            storage: Arc::new(MlxBufferStorage {
+                inner,
+                residency_set: None,
+            }),
+            dtype,
+            shape,
+            byte_offset: 0,
+        }
+    }
+
+    /// Create a new buffer and stage its Metal allocation for inclusion in
+    /// the given residency set.
+    ///
+    /// Calls `set.add_allocation(buffer)` (deferred — no `[set commit]` until
+    /// the next [`flush_pending`](ResidencySet::flush_pending) at a
+    /// `CommandEncoder::commit*` boundary). The buffer's residency-set guard
+    /// is dropped when the last clone of the returned `MlxBuffer` (and any
+    /// slice views) goes out of scope, which fires the matching
+    /// `removeAllocation:` (also deferred).
+    ///
+    /// Crate-private — external callers should go through
+    /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer).
+    pub(crate) fn with_residency(
+        inner: MetalBuffer,
+        dtype: DType,
+        shape: Vec<usize>,
+        residency_set: ResidencySet,
+    ) -> Self {
+        // Stage the addAllocation; the actual `[set commit]` is deferred to
+        // the next encoder.commit* boundary via flush_pending. This is the
+        // structural fix for the per-allocation commit storm; mirrors
+        // llama.cpp's ggml-metal-device.m:1378-1382 pattern.
+        residency_set.add_allocation(&inner);
+
+        Self {
+            storage: Arc::new(MlxBufferStorage {
+                inner,
+                residency_set: Some(residency_set),
+            }),
             dtype,
             shape,
             byte_offset: 0,
@@ -82,6 +172,10 @@ impl MlxBuffer {
     /// but starts at `byte_offset` bytes from the beginning and contains
     /// `n_elements` elements of type `dtype`. No data is copied.
     ///
+    /// The slice view shares the parent's residency-set guard via the
+    /// `Arc<MlxBufferStorage>`, so it does NOT trigger a second
+    /// `addAllocation:` and does NOT deregister the parent on drop.
+    ///
     /// When this view is bound to a kernel, the encoder passes the byte offset
     /// to Metal's `setBuffer:offset:atIndex:`, so the kernel sees only the
     /// slice region.
@@ -93,12 +187,15 @@ impl MlxBuffer {
     pub fn slice_view(&self, byte_offset: u64, n_elements: usize) -> Self {
         let end = byte_offset as usize + n_elements * self.dtype.size_of();
         assert!(
-            end <= self.inner.length() as usize,
+            end <= self.storage.inner.length() as usize,
             "slice_view: out of bounds (byte_offset={}, n_elements={}, dtype_size={}, buf_len={})",
-            byte_offset, n_elements, self.dtype.size_of(), self.inner.length()
+            byte_offset,
+            n_elements,
+            self.dtype.size_of(),
+            self.storage.inner.length()
         );
         Self {
-            inner: self.inner.clone(),
+            storage: self.storage.clone(),
             dtype: self.dtype,
             shape: vec![n_elements],
             byte_offset,
@@ -122,7 +219,7 @@ impl MlxBuffer {
     /// Total byte length of the Metal buffer.
     #[inline]
     pub fn byte_len(&self) -> usize {
-        self.inner.length() as usize
+        self.storage.inner.length() as usize
     }
 
     /// Number of elements (product of shape dimensions, or `byte_len / dtype.size_of()`).
@@ -139,13 +236,13 @@ impl MlxBuffer {
     /// command buffer that writes this buffer is in flight.
     #[inline]
     pub fn contents_ptr(&self) -> *mut std::ffi::c_void {
-        self.inner.contents()
+        self.storage.inner.contents()
     }
 
     /// Reference to the underlying `metal::Buffer` for passing to the encoder.
     #[inline]
     pub fn metal_buffer(&self) -> &MetalBuffer {
-        &self.inner
+        &self.storage.inner
     }
 
     /// Byte offset into the underlying Metal buffer (zero for non-slice buffers).
@@ -158,9 +255,28 @@ impl MlxBuffer {
     }
 
     /// Consume self and return the inner `metal::Buffer` (used by buffer pool).
+    ///
+    /// If this is the last clone of the underlying `Arc<MlxBufferStorage>`,
+    /// the storage Drop fires after this returns — staging a deferred
+    /// `removeAllocation:` if the buffer carried a residency-set guard.
+    /// Pool-internal buffers do not carry guards, so this is a no-op for
+    /// the pool's `release` path.
     #[inline]
     pub(crate) fn into_inner(self) -> MetalBuffer {
-        self.inner
+        self.storage.inner.clone()
+    }
+
+    /// Borrow the residency set that this buffer was registered with, if any.
+    ///
+    /// Used by [`MlxBufferPool::register_existing`](crate::MlxBufferPool::register_existing)
+    /// to short-circuit re-registration: a buffer created via
+    /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer) on a
+    /// residency-enabled device already owns its registration via the
+    /// `Arc<MlxBufferStorage>`, so the pool path is a no-op (modulo
+    /// validation that the device matches).
+    #[inline]
+    pub(crate) fn residency_set(&self) -> Option<&ResidencySet> {
+        self.storage.residency_set.as_ref()
     }
 
     // ---- typed CPU access (zero-copy on unified memory) ----
