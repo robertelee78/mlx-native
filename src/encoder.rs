@@ -302,6 +302,39 @@ fn barrier_profile_enabled() -> bool {
     })
 }
 
+/// Whether `MLX_UNRETAINED_REFS=1` is set in the process environment.
+///
+/// ADR-015 iter13 — when true, `CommandEncoder::new_with_residency` opens
+/// each `MTLCommandBuffer` via
+/// [`CommandQueueRef::new_command_buffer_with_unretained_references`]
+/// instead of the default `commandBuffer`.  llama.cpp's per-token decode
+/// CBs use this same call (`/opt/llama.cpp/ggml/src/ggml-metal/`
+/// `ggml-metal-context.m:512` `[queue commandBufferWithUnretainedReferences]`)
+/// and gain ~3-5% wall on M-series GPUs by skipping per-buffer-binding ARC
+/// retains on submit.
+///
+/// **Caller-side prerequisite.**  Every Metal buffer bound to a dispatch
+/// must outlive the CB — see the docstring on
+/// [`CommandEncoder::new_with_residency`] for the full caller contract.
+/// In hf2q, the per-decode-token `MlxBufferPool` (`buffer_pool.rs`)
+/// already keeps ARC clones alive in its `in_use` list across the entire
+/// decode token; routing transient scratches through that pool is the
+/// canonical way to satisfy the contract.
+///
+/// Cached on first read via `OnceLock` to keep the per-CB-construction
+/// branch single-atomic-load fast.  Default OFF so any production decode
+/// run that does NOT explicitly set the var preserves retained-refs
+/// behavior verbatim.
+fn unretained_refs_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("MLX_UNRETAINED_REFS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Issue the underlying Metal `memoryBarrierWithScope:` ObjC msg_send.
 ///
 /// Held in its own `#[inline(never)]` function so xctrace / Instruments
@@ -427,11 +460,41 @@ impl CommandEncoder {
     /// at most one commit per CB submission — mirrors llama.cpp's
     /// `ggml-metal-device.m:1378-1382` pattern (batch addAllocation in
     /// loop, commit ONCE).
+    ///
+    /// ADR-015 iter13: when the `MLX_UNRETAINED_REFS=1` env var is set at
+    /// process start, this constructor uses
+    /// [`CommandQueueRef::new_command_buffer_with_unretained_references`]
+    /// instead of `new_command_buffer`.  llama.cpp's per-token decode CBs
+    /// use `commandBufferWithUnretainedReferences` (see
+    /// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:512`) which
+    /// skips Metal's per-buffer-binding ARC-retain on submit and saves
+    /// ~3-5% on M-series GPUs (per the docstring above).
+    ///
+    /// **Caller contract under unretained refs.**  Every Metal buffer bound
+    /// to a dispatch in this CB MUST outlive the CB's GPU completion.  In
+    /// the hf2q decode path, that means every transient scratch must be
+    /// either (a) backed by the per-decode-token arena pool
+    /// (`MlxBufferPool` keeps an ARC clone in `in_use` until the next
+    /// `reset` — see `buffer_pool.rs:60`) or (b) hoisted to a caller scope
+    /// that lives across the terminal `commit_and_wait_labeled`.  Helpers
+    /// in `apply_proj` / `apply_pre_norm` / lm_head cast / router-download
+    /// that allocated transients via `device.alloc_buffer` and dropped
+    /// them at function return MUST be lifted to `pooled_alloc_buffer`
+    /// before `MLX_UNRETAINED_REFS=1` is enabled, or the first MoE FFN
+    /// dispatch will crash with "Command buffer error: GPU command buffer
+    /// completed with error status" (verified 2026-04-26).
+    ///
+    /// The default (`MLX_UNRETAINED_REFS` unset) preserves retained-refs
+    /// behavior verbatim — this is the sourdough-safe path.
     pub(crate) fn new_with_residency(
         queue: &CommandQueue,
         residency_set: Option<ResidencySet>,
     ) -> Result<Self> {
-        let cmd_buf = queue.new_command_buffer().to_owned();
+        let cmd_buf = if unretained_refs_enabled() {
+            queue.new_command_buffer_with_unretained_references().to_owned()
+        } else {
+            queue.new_command_buffer().to_owned()
+        };
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             cmd_buf,
