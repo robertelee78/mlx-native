@@ -82,5 +82,9 @@ name = "bench_prefill_qmatmul_shapes"
 harness = false
 
 [[bench]]
+name = "bench_moe_q_qwen36_shape"
+harness = false
+
+[[bench]]
 name = "bench_chunk_scan_pipeline"
 harness = false
