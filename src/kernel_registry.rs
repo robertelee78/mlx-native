@@ -510,6 +510,13 @@ impl KernelRegistry {
         let qkv_split_src: &'static str = include_str!("shaders/qkv_split.metal");
         sources.insert("qkv_split_f32".into(), qkv_split_src);
 
+        // Tiled-GQA broadcast kernel (ADR-005 W-5b.19 — replaces hf2q CPU
+        // tiled-replicate at gpu_delta_net::apply_gated_delta_net_chunk
+        // GQA pre-expansion, ~497 ms / 10.4 ms-per-layer at PP4106).
+        let repeat_tiled_src: &'static str =
+            include_str!("shaders/repeat_tiled.metal");
+        sources.insert("repeat_tiled_f32".into(), repeat_tiled_src);
+
         // Dense F16 GEMM kernel (Story 2.6) — lm_head projection
         let dense_gemm_src: &'static str = include_str!("shaders/dense_gemm.metal");
         sources.insert("dense_gemm_f16".into(), dense_gemm_src);
