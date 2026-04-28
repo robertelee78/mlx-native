@@ -86,5 +86,9 @@ name = "bench_moe_q_qwen36_shape"
 harness = false
 
 [[bench]]
+name = "bench_mul_mm_id_qwen36_ffn"
+harness = false
+
+[[bench]]
 name = "bench_chunk_scan_pipeline"
 harness = false
