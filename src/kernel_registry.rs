@@ -504,6 +504,12 @@ impl KernelRegistry {
         sources.insert("strided_copy_f32".into(), copy_src);
         sources.insert("offset_copy_f32".into(), copy_src);
 
+        // Fused-QKV split kernel (ADR-005 W-5b.18 — replaces hf2q CPU
+        // download → triple-loop split → 3× upload round-trip in
+        // gpu_delta_net::layer_qkv_deinterleave).
+        let qkv_split_src: &'static str = include_str!("shaders/qkv_split.metal");
+        sources.insert("qkv_split_f32".into(), qkv_split_src);
+
         // Dense F16 GEMM kernel (Story 2.6) — lm_head projection
         let dense_gemm_src: &'static str = include_str!("shaders/dense_gemm.metal");
         sources.insert("dense_gemm_f16".into(), dense_gemm_src);
