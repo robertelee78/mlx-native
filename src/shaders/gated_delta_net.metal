@@ -18,9 +18,17 @@ using namespace metal;
 // This matches llama.cpp build_delta_net_autoregressive (line 338-360):
 //   g = ggml_exp(g); s = s*g; sk = sum(s*k); d = v-sk; s = s + outer(beta*d, k)
 //
-// GQA broadcast: `num_v_heads` may exceed `num_k_heads`. Each v_head is
-// mapped to a k_head by `k_head = v_head / group_ratio` where
-// `group_ratio = num_v_heads / num_k_heads`.
+// GQA broadcast: `num_v_heads` may exceed `num_k_heads`. This kernel uses
+// the **TILED** convention `k_head = v_head % n_k_heads` (NOT the block
+// convention `v_head / group_ratio`), matching llama.cpp's `ggml_repeat`
+// at `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:1695-1737` and Qwen3.6
+// GGUF's GQA layout. The chunk-pipeline kernels (`gated_delta_net_kkt`,
+// `gated_delta_net_recompute_wu`, `gated_delta_net_chunk`,
+// `gated_delta_net_chunk_o`) use the BLOCK convention to stay
+// FLA-spec-conformant; the hf2q wrapper at
+// `apply_gated_delta_net_chunk` bridges between the two by tiled-
+// pre-expanding q/k from `[T, n_k_heads, K]` to `[T, n_v_heads, K]`
+// before dispatching the chunk pipeline (Wave 5b.4 fix, ADR-005).
 //
 // # Memory layouts (innermost-first / column-major)
 //
