@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use metal::{ComputePipelineState, FunctionConstantValues, MTLDataType};
+use metal::{ComputePipelineDescriptor, ComputePipelineState, FunctionConstantValues, MTLDataType};
 
 use crate::error::{MlxError, Result};
 
@@ -630,8 +630,21 @@ impl KernelRegistry {
                     message: msg,
                 })?;
 
+            // Build the pipeline through a descriptor so we can attach a
+            // human-readable label.  The label propagates into Instruments /
+            // xctrace Metal System Trace as the per-pipeline identifier
+            // (`metal-object-label` schema), giving us per-kernel attribution
+            // instead of the generic "Compute Command 0" placeholder.
+            //
+            // `MTLComputePipelineState.label` is read-only after creation per
+            // the Apple Metal spec; the only supported way to set it is via
+            // the descriptor before pipeline creation.  ADR-015 iter9b.
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            descriptor.set_label(name);
+
             let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
+                .new_compute_pipeline_state(&descriptor)
                 .map_err(|msg| MlxError::ShaderCompilationError {
                     name: name.to_string(),
                     message: msg,
@@ -742,8 +755,18 @@ impl KernelRegistry {
                     message: msg,
                 })?;
 
+            // Label this specialisation with the full composite cache key
+            // (e.g. `kernel_mul_mv_q4_0_f32|0:b1|3:i32`) so xctrace Metal
+            // System Trace shows each function-constant variant as a distinct
+            // pipeline.  Without this, all specialisations share a generic
+            // "Compute Command 0" identifier and we cannot attribute µs/token
+            // to a specific (kernel, constants) combination.  ADR-015 iter9b.
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            descriptor.set_label(&cache_key);
+
             let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
+                .new_compute_pipeline_state(&descriptor)
                 .map_err(|msg| MlxError::ShaderCompilationError {
                     name: name.to_string(),
                     message: msg,
@@ -942,6 +965,86 @@ kernel void bare_kernel(device int* out [[buffer(0)]], uint tid [[thread_positio
             registry.cached_count(),
             count_before_bool + 1,
             "bool-constants wrapper must insert one new cache entry"
+        );
+    }
+
+    /// Verify that the `MTLComputePipelineState.label` produced by
+    /// `get_pipeline` and `get_pipeline_with_constants` actually propagates
+    /// from the descriptor to the resulting pipeline state.
+    ///
+    /// This is the in-process smoke check for ADR-015 iter9b: we cannot
+    /// reach into xctrace from Rust, but we can read back the same `label`
+    /// property xctrace consumes via `ComputePipelineStateRef::label()`.
+    /// If labels are missing or wrong here, the MST trace will also show
+    /// generic identifiers — so this test gates the iter9 retry's
+    /// per-Q4_0-kernel attribution.
+    #[test]
+    fn test_pipeline_labels_propagate_for_mst() {
+        let device = metal::Device::system_default()
+            .expect("no Metal device — run on Apple Silicon or x86 Mac with Metal support");
+
+        let mut registry = KernelRegistry::new();
+
+        // Reuse the same trivial shaders as the int-FC test.
+        registry.register_source("int_fc_test_kernel", INT_FC_TEST_SHADER);
+
+        const BARE_SHADER_LABEL_TEST: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid == 0) { out[0] = 7; }
+}
+"#;
+        registry.register_source("label_smoke_kernel", BARE_SHADER_LABEL_TEST);
+
+        // Plain get_pipeline path — label must equal the kernel name.
+        // Capture as owned String so the cache borrow is released before
+        // the next get_pipeline_with_constants call below.
+        let plain_label = registry
+            .get_pipeline("label_smoke_kernel", &device)
+            .expect("plain pipeline must compile")
+            .label()
+            .to_string();
+        assert_eq!(
+            plain_label, "label_smoke_kernel",
+            "get_pipeline must label the pipeline with the kernel name (xctrace MST attribution)"
+        );
+
+        // Constants path — label must equal the composite cache key so each
+        // function-constant variant is individually attributable in MST.
+        // We capture the label as an owned String to release the borrow on
+        // the cache before fetching the next specialisation.
+        let label_v7 = registry
+            .get_pipeline_with_constants(
+                "int_fc_test_kernel",
+                &device,
+                &[],
+                &[(100, 7_i32)],
+            )
+            .expect("specialised pipeline must compile")
+            .label()
+            .to_string();
+        assert_eq!(
+            label_v7, "int_fc_test_kernel|100:i7",
+            "get_pipeline_with_constants must label with the cache_key so each \
+             specialisation is distinct in xctrace MST"
+        );
+
+        // A second specialisation must produce a different label.
+        let label_v13 = registry
+            .get_pipeline_with_constants(
+                "int_fc_test_kernel",
+                &device,
+                &[],
+                &[(100, 13_i32)],
+            )
+            .expect("second specialised pipeline must compile")
+            .label()
+            .to_string();
+        assert_eq!(label_v13, "int_fc_test_kernel|100:i13");
+        assert_ne!(
+            label_v7, label_v13,
+            "distinct constant values must yield distinct pipeline labels"
         );
     }
 }
