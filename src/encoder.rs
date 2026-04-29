@@ -1056,6 +1056,21 @@ impl CommandEncoder {
     ///
     /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
     pub fn commit_and_wait_labeled(&mut self, label: &str) -> Result<()> {
+        // ADR-015 iter16 — propagate `label` to MTLCommandBuffer.setLabel and
+        // (if a compute encoder is active) MTLComputeCommandEncoder.setLabel
+        // BEFORE end_encoding/commit so xctrace's
+        // `metal-application-encoders-list` table populates `cmdbuffer-label`
+        // and `encoder-label` columns with the semantic phase name (e.g.
+        // `layer.attn_moe_ffn`, `output_head.fused_norm_lm_argmax`,
+        // `layer.delta_net.ops1-9`).  Joined to per-CB GPU duration via
+        // `metal-gpu-submission-to-command-buffer-id` (sub_id ↔ encoder_id) →
+        // `metal-gpu-execution-points` (per-dispatch start/end), this enables
+        // per-phase µs/token attribution comparing hf2q vs llama side-by-side
+        // (iter15 §E "iter16 ATTRIBUTION PATH").  Cost is a single ObjC
+        // msg_send per CB submission — sub-µs on M5 Max — and a no-op when
+        // xctrace isn't recording, so this is unconditionally safe to call on
+        // the production decode hot path.
+        self.apply_labels(label);
         if crate::kernel_profile::is_enabled() {
             let (start_s, end_s) = self.commit_wait_with_gpu_time()?;
             let ns = ((end_s - start_s).max(0.0) * 1_000_000_000.0) as u64;
@@ -1072,14 +1087,51 @@ impl CommandEncoder {
     /// while profiling, which is the whole point — profile-mode is slow
     /// but informative).  When unset, identical to [`commit`](Self::commit).
     pub fn commit_labeled(&mut self, label: &str) {
+        // ADR-015 iter16 — see `commit_and_wait_labeled` for rationale.
         if crate::kernel_profile::is_enabled() {
-            // Profile mode: force sync to capture GPU time.  Errors are
-            // logged via stderr because the void return matches commit().
+            // Profile mode: force sync to capture GPU time.  apply_labels is
+            // called inside commit_and_wait_labeled — do NOT call it twice
+            // here (would double the ObjC msg_send under MLX_PROFILE_CB=1).
+            // Errors are logged via stderr because the void return matches
+            // commit().
             if let Err(e) = self.commit_and_wait_labeled(label) {
                 eprintln!("[mlx-native] commit_labeled({}) failed: {}", label, e);
             }
         } else {
+            // Async path: apply labels here so xctrace MST traces capture
+            // per-CB phase attribution under default decode (no
+            // `MLX_PROFILE_CB`).
+            self.apply_labels(label);
             self.commit();
+        }
+    }
+
+    /// Apply `label` to the underlying `MTLCommandBuffer` and, if a compute
+    /// encoder is currently active, to the `MTLComputeCommandEncoder`.
+    ///
+    /// Called from [`commit_labeled`] and [`commit_and_wait_labeled`] BEFORE
+    /// the encoder is ended / the CB is committed so xctrace's
+    /// `metal-application-encoders-list` table picks up the label on the
+    /// row emitted at the encoder's `endEncoding` / CB submission boundary.
+    /// Single ObjC `msg_send` per call (two if an encoder is active); sub-µs
+    /// on M5 Max; no-op when xctrace isn't recording.
+    ///
+    /// Skipped (debug-only assert) if `label` is empty — empty labels would
+    /// produce an indistinguishable trace row from the metal-rs default
+    /// `Command Buffer 0` placeholder.
+    #[inline]
+    fn apply_labels(&self, label: &str) {
+        debug_assert!(!label.is_empty(), "commit_*_labeled called with empty label");
+        if label.is_empty() {
+            return;
+        }
+        self.cmd_buf.set_label(label);
+        if !self.active_encoder.is_null() {
+            // SAFETY: active_encoder is non-null and points to a live encoder
+            // owned by cmd_buf — same invariant as get_or_create_encoder /
+            // memory_barrier.  set_label is a single property write on the
+            // ObjC object; safe before endEncoding.
+            unsafe { &*self.active_encoder }.set_label(label);
         }
     }
 
