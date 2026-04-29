@@ -1,5 +1,5 @@
 //! Integration test for the `dispatch_tracked` auto-barrier path
-//! (ADR-015 iter37).
+//! (ADR-015 iter37, extended in iter39).
 //!
 //! Verifies four behavioral invariants:
 //!
@@ -22,6 +22,17 @@
 //!
 //! 4. **Conflict-detection unit-level** — covered by
 //!    `src/mem_ranges.rs` lib tests (RAW/WAR/WAW/different-buffers).
+//!
+//! ## iter39 — full coverage extension
+//!
+//! Adds two more tracked variants to mirror all 5 production
+//! dispatch primitives used by `apply_gated_attn_layer_decode_into`
+//! (audit per ADR-015 §iter38):
+//!
+//! * `dispatch_tracked_threadgroups_with_shared` — wraps
+//!   `encode_threadgroups_with_shared` (rms_norm callsites).
+//! * `dispatch_tracked_threads_with_args` — wraps
+//!   `encode_with_args` (rope IMROPE, sigmoid-mul, kv_cache_copy).
 //!
 //! Note on env-gating: `auto_barrier_enabled()` caches the env-var
 //! decision in a `OnceLock` on first call.  Tests that need the gate

@@ -1186,6 +1186,109 @@ impl CommandEncoder {
         self.encode_threadgroups(pipeline, buffers, threadgroups, threadgroup_size);
     }
 
+    /// Auto-barrier-aware dispatch using `(slot, &MlxBuffer)` bindings
+    /// **plus shared threadgroup memory** (uses `dispatch_thread_groups`).
+    ///
+    /// Mirrors [`encode_threadgroups_with_shared`](Self::encode_threadgroups_with_shared)
+    /// — convenience variant for kernels that allocate threadgroup
+    /// memory (reductions in `rms_norm`, `softmax`, etc.) but don't
+    /// need [`KernelArg::Bytes`] inline-byte arguments.  See
+    /// [`dispatch_tracked_threadgroups_with_args`](Self::dispatch_tracked_threadgroups_with_args)
+    /// for the behavioral contract; the only addition here is the
+    /// `threadgroup_mem` slice forwarded to the underlying encode.
+    ///
+    /// Closes the iter38-audit coverage gap: the 5 `rms_norm.rs`
+    /// callsites (`/opt/mlx-native/src/ops/rms_norm.rs:124,236,443,
+    /// 516,589`) all use `encode_threadgroups_with_shared` and need
+    /// dataflow tracking when migrated to auto-barrier in iter40+.
+    ///
+    /// 7-argument signature; `clippy::too_many_arguments` is allowed
+    /// because each parameter is load-bearing for either the dispatch
+    /// (pipeline/buffers/threadgroups/threadgroup_size/shared_mem) or
+    /// the auto-barrier (reads/writes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_tracked_threadgroups_with_shared(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        buffers: &[(u64, &MlxBuffer)],
+        threadgroup_mem: &[(u64, u64)],
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        if self.is_capturing() {
+            let read_ranges = ranges_from_buffers(reads);
+            let write_ranges = ranges_from_buffers(writes);
+            self.set_pending_buffer_ranges(read_ranges, write_ranges);
+            self.encode_threadgroups_with_shared(
+                pipeline,
+                buffers,
+                threadgroup_mem,
+                threadgroups,
+                threadgroup_size,
+            );
+            return;
+        }
+
+        if auto_barrier_enabled() {
+            self.maybe_auto_barrier(reads, writes);
+        }
+
+        self.encode_threadgroups_with_shared(
+            pipeline,
+            buffers,
+            threadgroup_mem,
+            threadgroups,
+            threadgroup_size,
+        );
+    }
+
+    /// Auto-barrier-aware `dispatch_threads` variant with
+    /// [`KernelArg`] bindings.
+    ///
+    /// Mirrors [`encode_with_args`](Self::encode_with_args) — the
+    /// `dispatch_threads` (per-thread grid) flavor, as opposed to the
+    /// `dispatch_thread_groups` flavor of
+    /// [`dispatch_tracked_threadgroups_with_args`](Self::dispatch_tracked_threadgroups_with_args).
+    /// See that method for the behavioral contract.
+    ///
+    /// Closes the iter38-audit coverage gap: callers that use
+    /// per-thread grids — `rope.rs:108` (IMROPE), `sigmoid_mul.rs:76`
+    /// (sigmoid-mul), and `encode_helpers.rs:41` (kv_cache_copy) —
+    /// need a `dispatch_threads` flavor of the tracked dispatch
+    /// because their grid sizes are expressed in threads, not
+    /// threadgroups.
+    ///
+    /// Note: the simpler `(slot, &MlxBuffer)` form (from
+    /// [`encode`](Self::encode)) is a special case of this method —
+    /// callers can wrap each binding as `KernelArg::Buffer(buf)` to
+    /// reuse this single tracked variant rather than introducing a
+    /// fifth one.
+    pub fn dispatch_tracked_threads_with_args(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+        grid_size: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        if self.is_capturing() {
+            let read_ranges = ranges_from_buffers(reads);
+            let write_ranges = ranges_from_buffers(writes);
+            self.set_pending_buffer_ranges(read_ranges, write_ranges);
+            self.encode_with_args(pipeline, bindings, grid_size, threadgroup_size);
+            return;
+        }
+
+        if auto_barrier_enabled() {
+            self.maybe_auto_barrier(reads, writes);
+        }
+
+        self.encode_with_args(pipeline, bindings, grid_size, threadgroup_size);
+    }
+
     /// Run the dataflow check, emit a barrier on conflict, and record
     /// the dispatch's ranges into the cumulative state.
     ///
