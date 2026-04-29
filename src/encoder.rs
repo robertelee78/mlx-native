@@ -30,6 +30,7 @@ use objc::{msg_send, sel, sel_impl};
 
 use crate::buffer::MlxBuffer;
 use crate::error::{MlxError, Result};
+use crate::mem_ranges::MemRanges;
 use crate::residency::ResidencySet;
 
 /// A buffer or inline-bytes binding for a compute kernel argument slot.
@@ -158,6 +159,23 @@ pub enum CapturedNode {
     Barrier,
 }
 
+/// Convert a slice of buffer references into capture-mode
+/// [`MemRange`] tuples.  Used by the [`CommandEncoder::dispatch_tracked*`]
+/// family in capture mode — equivalent to the conversion
+/// `GraphSession::barrier_between` does at `graph.rs:1452-1465`.
+///
+/// `(start, end)` uses `contents_ptr() + byte_offset` as the start
+/// and `contents_ptr() + byte_offset + slice_extent` as the end.
+fn ranges_from_buffers(bufs: &[&MlxBuffer]) -> Vec<MemRange> {
+    bufs.iter()
+        .map(|b| {
+            let base = b.contents_ptr() as usize + b.byte_offset() as usize;
+            let extent = (b.byte_len()).saturating_sub(b.byte_offset() as usize);
+            (base, base + extent)
+        })
+        .collect()
+}
+
 /// Apply a slice of `KernelArg` bindings to a compute encoder.
 ///
 /// `KernelArg::Buffer(buf)` propagates the `MlxBuffer::byte_offset()` so
@@ -239,6 +257,8 @@ pub fn reset_counters() {
     CMD_BUF_COUNT.store(0, Ordering::Relaxed);
     BARRIER_COUNT.store(0, Ordering::Relaxed);
     BARRIER_NS.store(0, Ordering::Relaxed);
+    AUTO_BARRIER_COUNT.store(0, Ordering::Relaxed);
+    AUTO_BARRIER_CONCURRENT.store(0, Ordering::Relaxed);
 }
 
 /// Read the current value of `SYNC_COUNT`.
@@ -335,6 +355,60 @@ fn unretained_refs_enabled() -> bool {
     })
 }
 
+/// Whether `HF2Q_AUTO_BARRIER=1` is set in the process environment.
+///
+/// ADR-015 iter37 — when true, every [`CommandEncoder::dispatch_tracked`]
+/// call consults a [`MemRanges`](crate::mem_ranges::MemRanges) tracker
+/// and auto-emits a `memoryBarrierWithScope:` exactly when the new
+/// dispatch's read/write ranges conflict with previously-recorded
+/// ranges (mirrors llama.cpp's `ggml_metal_op_concurrency_check` at
+/// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:147-225`).
+/// When false, `dispatch_tracked` collapses to the same code path as
+/// `encode*` — no tracking, no auto-barriers — preserving sourdough
+/// behavior for any caller that opts into the tracked API but runs
+/// without the env gate.
+///
+/// Cached on first read via `OnceLock`.  Default OFF — production
+/// decode/prefill keeps its hand-placed `enc.memory_barrier()` calls
+/// until the migration in iter38+.
+fn auto_barrier_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("HF2Q_AUTO_BARRIER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Number of `memory_barrier()` calls auto-emitted by
+/// [`CommandEncoder::dispatch_tracked`] under
+/// `HF2Q_AUTO_BARRIER=1`.  Disjoint from [`BARRIER_COUNT`] —
+/// auto-barriers also bump `BARRIER_COUNT` since they go through
+/// `memory_barrier()`, so this counter measures only the
+/// auto-emitted subset.
+static AUTO_BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `dispatch_tracked` calls whose mem-ranges check returned
+/// "concurrent" (no barrier needed).  Together with
+/// [`AUTO_BARRIER_COUNT`] this measures the elision rate of the
+/// dataflow barrier: `concurrent / (concurrent + barriers)` is the
+/// fraction of dispatches that ran inside the previous concurrent
+/// group rather than starting a new one.
+static AUTO_BARRIER_CONCURRENT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the cumulative number of auto-emitted barriers across all
+/// encoders since process start (or last [`reset_counters`]).
+pub fn auto_barrier_count() -> u64 {
+    AUTO_BARRIER_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read the cumulative number of `dispatch_tracked` calls that did NOT
+/// emit a barrier (ran concurrent with the previous group).
+pub fn auto_barrier_concurrent_count() -> u64 {
+    AUTO_BARRIER_CONCURRENT.load(Ordering::Relaxed)
+}
+
 /// Issue the underlying Metal `memoryBarrierWithScope:` ObjC msg_send.
 ///
 /// Held in its own `#[inline(never)]` function so xctrace / Instruments
@@ -398,6 +472,21 @@ pub struct CommandEncoder {
     /// when residency sets are disabled (HF2Q_NO_RESIDENCY=1, macOS<15,
     /// or test-only `CommandEncoder::new` from a residency-less queue).
     residency_set: Option<ResidencySet>,
+    /// ADR-015 iter37: dataflow barrier inference state.
+    ///
+    /// Populated only when `HF2Q_AUTO_BARRIER=1` is set at process
+    /// start (cached via [`auto_barrier_enabled`]).  Each
+    /// [`Self::dispatch_tracked`] call consults this state to decide
+    /// whether a Metal memory barrier is required; on conflict the
+    /// barrier is emitted, the state is reset, and the new dispatch's
+    /// ranges seed the next concurrent group.  When the env gate is
+    /// off, `dispatch_tracked` collapses to its untracked equivalent
+    /// and this field is left empty for the encoder's lifetime.
+    ///
+    /// The field is always present (zero-sized when empty) so the
+    /// gate-off branch is a single bool-load + early return rather
+    /// than an allocation/Option indirection.
+    mem_ranges: MemRanges,
 }
 
 /// SAFETY: CommandEncoder is safe to Send across threads provided that:
@@ -504,6 +593,7 @@ impl CommandEncoder {
             pending_reads: Vec::new(),
             pending_writes: Vec::new(),
             residency_set,
+            mem_ranges: MemRanges::new(),
         })
     }
 
@@ -944,6 +1034,212 @@ impl CommandEncoder {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-015 iter37 — dataflow-driven auto-barrier dispatch family.
+    //
+    // These mirrors of `encode_threadgroups*_with_args*` take explicit
+    // `reads: &[&MlxBuffer]` and `writes: &[&MlxBuffer]` slices.  When
+    // the process started with `HF2Q_AUTO_BARRIER=1`, the encoder's
+    // [`MemRanges`] tracker checks the new ranges against the
+    // cumulative state since the last barrier; on conflict it emits
+    // `memory_barrier()` and resets the state before recording the
+    // new ranges.  When the env gate is unset, the check is skipped
+    // entirely and the dispatch is applied identically to the
+    // matching `encode_*` method — sourdough-safe by construction.
+    //
+    // Capture mode: the `reads`/`writes` ranges are recorded onto the
+    // captured node via the existing `pending_reads`/`pending_writes`
+    // mechanism, so a `dispatch_tracked` call inside capture mode is
+    // equivalent to `set_pending_buffer_ranges + encode_*`.
+    //
+    // No production callsite migrates in iter37 — this is the API
+    // surface the qwen35 forward path will adopt incrementally in
+    // iter38+.  Today, every call to `dispatch_tracked` from a
+    // production code path lives behind an explicit caller decision
+    // to opt in.
+    // -----------------------------------------------------------------
+
+    /// Auto-barrier-aware dispatch with [`KernelArg`] bindings (uses
+    /// `dispatch_thread_groups`).
+    ///
+    /// Behaves identically to
+    /// [`encode_threadgroups_with_args`](Self::encode_threadgroups_with_args)
+    /// when `HF2Q_AUTO_BARRIER` is unset.  When set, consults the
+    /// per-encoder [`MemRanges`] tracker:
+    ///
+    /// * Conflict (RAW/WAR/WAW on a same-buffer range) → emit
+    ///   `memory_barrier()`, increment [`AUTO_BARRIER_COUNT`], reset
+    ///   the tracker, then dispatch and seed the new concurrent group
+    ///   with this dispatch's ranges.
+    /// * No conflict → increment [`AUTO_BARRIER_CONCURRENT`], record
+    ///   the ranges into the cumulative state, dispatch.
+    pub fn dispatch_tracked_threadgroups_with_args(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        // Capture mode: stash ranges + delegate to the standard encode.
+        // The ranges flow through `pending_reads`/`pending_writes` and
+        // attach to the captured `Dispatch` node — identical to what
+        // `GraphSession::barrier_between` already does in capture mode.
+        if self.is_capturing() {
+            let read_ranges = ranges_from_buffers(reads);
+            let write_ranges = ranges_from_buffers(writes);
+            self.set_pending_buffer_ranges(read_ranges, write_ranges);
+            self.encode_threadgroups_with_args(pipeline, bindings, threadgroups, threadgroup_size);
+            return;
+        }
+
+        if auto_barrier_enabled() {
+            self.maybe_auto_barrier(reads, writes);
+        }
+
+        self.encode_threadgroups_with_args(pipeline, bindings, threadgroups, threadgroup_size);
+    }
+
+    /// Auto-barrier-aware dispatch with [`KernelArg`] bindings + shared
+    /// threadgroup memory.
+    ///
+    /// See [`dispatch_tracked_threadgroups_with_args`](Self::dispatch_tracked_threadgroups_with_args)
+    /// for the behavioral contract; this variant additionally takes a
+    /// `threadgroup_mem` slice that is forwarded to
+    /// [`encode_threadgroups_with_args_and_shared`](Self::encode_threadgroups_with_args_and_shared).
+    ///
+    /// The 8-argument signature mirrors the existing
+    /// `encode_threadgroups_with_args_and_shared` plus the two
+    /// dataflow slices; `clippy::too_many_arguments` is allowed
+    /// because each parameter is load-bearing for either the dispatch
+    /// (pipeline/bindings/threadgroups/threadgroup_size/shared_mem)
+    /// or the auto-barrier (reads/writes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_tracked_threadgroups_with_args_and_shared(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        threadgroup_mem: &[(u64, u64)],
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        if self.is_capturing() {
+            let read_ranges = ranges_from_buffers(reads);
+            let write_ranges = ranges_from_buffers(writes);
+            self.set_pending_buffer_ranges(read_ranges, write_ranges);
+            self.encode_threadgroups_with_args_and_shared(
+                pipeline,
+                bindings,
+                threadgroup_mem,
+                threadgroups,
+                threadgroup_size,
+            );
+            return;
+        }
+
+        if auto_barrier_enabled() {
+            self.maybe_auto_barrier(reads, writes);
+        }
+
+        self.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            bindings,
+            threadgroup_mem,
+            threadgroups,
+            threadgroup_size,
+        );
+    }
+
+    /// Auto-barrier-aware dispatch using `(slot, &MlxBuffer)` bindings
+    /// (uses `dispatch_thread_groups`).
+    ///
+    /// Convenience wrapper for callers that don't need
+    /// [`KernelArg::Bytes`] inline-byte arguments.  See
+    /// [`dispatch_tracked_threadgroups_with_args`](Self::dispatch_tracked_threadgroups_with_args)
+    /// for behavioral contract.
+    pub fn dispatch_tracked_threadgroups(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        buffers: &[(u64, &MlxBuffer)],
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+        threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        if self.is_capturing() {
+            let read_ranges = ranges_from_buffers(reads);
+            let write_ranges = ranges_from_buffers(writes);
+            self.set_pending_buffer_ranges(read_ranges, write_ranges);
+            self.encode_threadgroups(pipeline, buffers, threadgroups, threadgroup_size);
+            return;
+        }
+
+        if auto_barrier_enabled() {
+            self.maybe_auto_barrier(reads, writes);
+        }
+
+        self.encode_threadgroups(pipeline, buffers, threadgroups, threadgroup_size);
+    }
+
+    /// Run the dataflow check, emit a barrier on conflict, and record
+    /// the dispatch's ranges into the cumulative state.
+    ///
+    /// Always called *before* the underlying `encode_*` method
+    /// applies the dispatch.  Mirrors lines 220-225 of
+    /// `ggml-metal-ops.cpp` (`concurrency_check + concurrency_reset +
+    /// concurrency_add` around each node).
+    fn maybe_auto_barrier(
+        &mut self,
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+    ) {
+        if self.mem_ranges.check_dispatch(reads, writes) {
+            // Concurrent — no barrier needed; just record the new ranges.
+            self.mem_ranges.add_dispatch(reads, writes);
+            AUTO_BARRIER_CONCURRENT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Conflict — emit barrier, reset state, seed new group.
+            //
+            // `memory_barrier()` itself increments `BARRIER_COUNT` and,
+            // when `MLX_PROFILE_BARRIERS=1`, accumulates `BARRIER_NS`.
+            // We additionally bump `AUTO_BARRIER_COUNT` so the
+            // "auto-emitted vs hand-placed" subset is queryable.
+            self.memory_barrier();
+            self.mem_ranges.reset();
+            self.mem_ranges.add_dispatch(reads, writes);
+            AUTO_BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Force a barrier and reset the auto-barrier tracker.
+    ///
+    /// Use at boundaries where the caller knows a barrier is required
+    /// regardless of dataflow — typically before reading data back to
+    /// CPU, or at the end of an op group whose internal dependencies
+    /// the tracker can't see (e.g. host-driven memcpy).
+    ///
+    /// Equivalent to `memory_barrier()` plus a `MemRanges::reset()`
+    /// when `HF2Q_AUTO_BARRIER=1`; equivalent to plain
+    /// `memory_barrier()` otherwise.
+    pub fn force_barrier_and_reset_tracker(&mut self) {
+        self.memory_barrier();
+        if auto_barrier_enabled() {
+            self.mem_ranges.reset();
+        }
+    }
+
+    /// Diagnostic accessor — number of ranges currently recorded in
+    /// this encoder's [`MemRanges`] tracker.  Always zero unless
+    /// `HF2Q_AUTO_BARRIER=1` and at least one `dispatch_tracked` call
+    /// has fired since the last conflict.
+    #[inline]
+    pub fn mem_ranges_len(&self) -> usize {
+        self.mem_ranges.len()
     }
 
     /// Replay a single captured dispatch node into this encoder.

@@ -52,6 +52,7 @@ mod device;
 mod dtypes;
 mod encoder;
 mod kernel_registry;
+mod mem_ranges;
 mod residency;
 pub mod gguf;
 pub mod kernel_profile;
@@ -66,9 +67,11 @@ pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{
-    barrier_count, barrier_total_ns, cmd_buf_count, dispatch_count, reset_counters, sync_count,
-    CapturedNode, CommandEncoder, DispatchKind, RecordedBinding,
+    auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
+    cmd_buf_count, dispatch_count, reset_counters, sync_count, CapturedNode, CommandEncoder,
+    DispatchKind, RecordedBinding,
 };
+pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
 pub use error::{MlxError, Result};
 pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
 pub use kernel_registry::KernelRegistry;
