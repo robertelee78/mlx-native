@@ -387,6 +387,15 @@ impl KernelRegistry {
         // Gated DeltaNet fused kernel (ADR-013 Decision 6 — centerpiece)
         let gdn_src: &'static str = include_str!("shaders/gated_delta_net.metal");
         sources.insert("gated_delta_net_f32".into(), gdn_src);
+        // ADR-015 iter56 — decode-only `simd_sum` variant. Three NSG-templated
+        // host names share the same source; selection is by D_k via
+        // `dispatch_gated_delta_net_decode`. Drop-in for the fused kernel
+        // above when n_tokens=1.
+        let gdn_decode_src: &'static str =
+            include_str!("shaders/gated_delta_net_decode.metal");
+        sources.insert("gated_delta_net_decode_f32_1".into(), gdn_decode_src);
+        sources.insert("gated_delta_net_decode_f32_2".into(), gdn_decode_src);
+        sources.insert("gated_delta_net_decode_f32_4".into(), gdn_decode_src);
         // Wave 5b — chunk-parallel inter-chunk state-recurrence kernel
         // (the one new kernel in the chunk-parallel pipeline; spec source:
         // arXiv 2412.06464 §4 + FLA chunk_delta_h.py:43-298).
