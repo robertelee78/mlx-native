@@ -731,9 +731,24 @@ impl CommandEncoder {
             // Use MTLDispatchTypeConcurrent to allow independent dispatches
             // to overlap on the GPU.  Memory barriers are inserted between
             // dependent dispatches via `memory_barrier()`.
+            //
+            // ADR-015 iter61a-2 probe: HF2Q_FORCE_SERIAL_DISPATCH=1 falls back
+            // to MTLDispatchType::Serial — every dispatch waits for the
+            // previous to complete, eliminating concurrent-dispatch race
+            // windows. Used to falsify Hypothesis (g): missing memory_barrier
+            // calls between dependent dispatches cause cold-run logit
+            // non-determinism via thread-race on a shared buffer.
+            let dispatch_type = if std::env::var("HF2Q_FORCE_SERIAL_DISPATCH")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                MTLDispatchType::Serial
+            } else {
+                MTLDispatchType::Concurrent
+            };
             let encoder = self
                 .cmd_buf
-                .compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
+                .compute_command_encoder_with_dispatch_type(dispatch_type);
             self.active_encoder = encoder as *const ComputeCommandEncoderRef;
         }
         // SAFETY: active_encoder is non-null and points to a valid encoder

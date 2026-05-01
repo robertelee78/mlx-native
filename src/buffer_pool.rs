@@ -159,6 +159,38 @@ impl MlxBufferPool {
                 if raw.contents().is_null() {
                     return Err(MlxError::BufferAllocationError { bytes: bucket });
                 }
+                // ADR-015 iter61a-2 (broken-window B-W-1 residual fix): zero-init
+                // every fresh pool allocation. The same MTLResourceOptions::
+                // StorageModeShared recycling that affects MlxDevice::alloc_buffer
+                // (closed in iter61a, src/device.rs) ALSO affects the pool's
+                // fresh-allocation path. iter61a closed device-direct allocations
+                // but the per-decode-token / per-prefill-chunk arena pool grew its
+                // free list via this `new_buffer` call without zero-init — so on
+                // the FIRST cold-process prefill (where the pool is empty and
+                // every alloc takes the fresh path), kernels reading scratch /
+                // intermediate buffers before fully populating them propagated
+                // recycled-page garbage into logits. Empirically: 5/5 cold-run
+                // first-token logit dumps on 27B-dwq46 produced 5 distinct
+                // hashes, with max abs logit diff up to 5.06 across runs and
+                // 248044/248044 logits differing — far above kernel-reduction
+                // ULP noise, consistent with structural memory contamination.
+                //
+                // Cost: one memset per fresh allocation. Reused buffers (the
+                // steady-state hot path after warm-up) skip this entirely
+                // because their bytes are valid producer outputs from prior
+                // pool cycles. Per `feedback_no_broken_windows` + mantra
+                // "No fallback. No stub. Just pure excellence." — fix at the
+                // source.
+                //
+                // Safety: `raw.contents()` is non-null (verified above), points
+                // to exactly `bucket` bytes of `StorageModeShared` memory we
+                // just allocated and have exclusive access to. The buffer is
+                // not yet wrapped in `MlxBuffer` and not yet in `in_use` /
+                // residency set, so no other thread or GPU dispatch references
+                // it. Writing zero bytes is well-defined for any DType.
+                unsafe {
+                    std::ptr::write_bytes(raw.contents() as *mut u8, 0, bucket);
+                }
                 added_residency = self.register_residency_allocation(device, &raw)?;
                 raw
             }
