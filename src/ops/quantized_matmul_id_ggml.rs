@@ -262,7 +262,7 @@ pub fn quantized_matmul_id_ggml(
     //   * K < 32 (mm tile requires NK=32)
     //   * Q5_K (mm_id not yet ported — only mv_id kernel exists)
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
-    if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
+    if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
         && params.ggml_type != GgmlType::Q5_K
@@ -374,7 +374,7 @@ pub fn quantized_matmul_id_ggml_pooled(
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
     // Q5_K: mm_id not yet ported; always use mv_id.
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
-    if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
+    if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
         && params.ggml_type != GgmlType::Q5_K
@@ -395,6 +395,32 @@ pub fn quantized_matmul_id_ggml_pooled(
 // in `ggml-metal-ops.cpp:2312`. Below 32 tokens, mv_id is faster than mm_id
 // (the mm tile-reuse setup overhead doesn't amortize at small n_tokens).
 pub const MM_ID_ROUTING_THRESHOLD: u32 = 32;
+
+/// ADR-013 P19 H11 (2026-05-01) — runtime override for the mm_id routing
+/// threshold via `HF2Q_MM_ID_ROUTING_THRESHOLD` env. Setting it to a very
+/// large value (e.g. `99999`) forces every dispatch onto the `mv_id` route,
+/// which falsifies / confirms the "mm_id setup overhead is dominant at
+/// pp ≤ 256" hypothesis without recompiling. Read once into a `OnceLock`
+/// at first call and reused; absent or unparseable env falls back to the
+/// compile-time const above.
+fn mm_id_routing_threshold() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HF2Q_MM_ID_ROUTING_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| {
+                if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+                    eprintln!(
+                        "[mlx-native] mm_id_routing_threshold: OVERRIDE via HF2Q_MM_ID_ROUTING_THRESHOLD={v} (default {})",
+                        MM_ID_ROUTING_THRESHOLD
+                    );
+                }
+                v
+            })
+            .unwrap_or(MM_ID_ROUTING_THRESHOLD)
+    })
+}
 
 /// Matrix-vector `_id` dispatch (decode path, unchanged from pre-Phase-3).
 #[allow(clippy::too_many_arguments)]
