@@ -77,6 +77,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+        // ADR-013 P7 — Q4_K dense decode mat-vec (port of llama.cpp's
+        // kernel_mul_mv_q4_K_f32 at ggml-metal.metal:7715-7821).
+        sources.insert("kernel_mul_mv_q4_K_f32".into(), ggml_src);
 
         // GGML block-format quantized matrix-matrix kernels
         // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's kernel_mul_mm_<q>_f32).
@@ -174,6 +177,9 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_ggml.metal");
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
+        // ADR-013 P7 — Q4_K MoE expert-routed mat-vec (port of
+        // llama.cpp's kernel_mul_mv_id_q4_K_f32 at ggml-metal.metal:10349).
+        sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):

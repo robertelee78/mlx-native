@@ -66,9 +66,12 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
+            // ADR-013 P7 — Q4_K mv_id ported from llama.cpp
+            // (ggml-metal.metal:10349) for dwq46/dwq48 MoE expert weights.
+            GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 
@@ -243,10 +246,12 @@ pub fn quantized_matmul_id_ggml(
     //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
     //   * Q5_K (mm_id not yet ported — only mv_id kernel exists)
+    //   * Q4_K (mm_id not yet ported — only mv_id kernel exists; ADR-013 P7)
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
         && params.ggml_type != GgmlType::Q5_K
+        && params.ggml_type != GgmlType::Q4_K
     {
         return dispatch_id_mm(
             encoder, registry, device, input, weight, ids, output, params,
@@ -353,11 +358,12 @@ pub fn quantized_matmul_id_ggml_pooled(
     }
 
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
-    // Q5_K: mm_id not yet ported; always use mv_id.
+    // Q5_K / Q4_K: mm_id not yet ported; always use mv_id.
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
         && params.ggml_type != GgmlType::Q5_K
+        && params.ggml_type != GgmlType::Q4_K
     {
         return dispatch_id_mm_pooled(
             encoder, registry, device, input, weight, ids, output,
@@ -418,11 +424,12 @@ fn dispatch_id_mv(
         // similarly, with workload-specific edges that don't match
         // llama.cpp's tuning.
         GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
-        // Q5_K and Q6_K both use the 2-row-per-threadgroup (2, 32) geometry.
-        GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        // Q4_K, Q5_K, and Q6_K all use the 2-row-per-threadgroup (2, 32)
+        // geometry.  ADR-013 P7 — Q4_K added; mirrors Q5_K (NSG=2,
+        // 1 row per simdgroup; same kmask scale-decode).
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         GgmlType::F32
         | GgmlType::F16
-        | GgmlType::Q4_K
         | GgmlType::I16 => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_id_ggml does not support {:?}",

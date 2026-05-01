@@ -103,14 +103,17 @@ impl GgmlType {
     /// — used for `m <= MM_ROUTING_THRESHOLD`.
     fn kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K
-            | GgmlType::Q5_K | GgmlType::I16 => {
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q5_K | GgmlType::I16 => {
                 // These types do not have a direct mat-vec kernel in this module.
-                // Q4_K / Q5_K / I16 support for mat-vec will be added separately.
+                // Q5_K / I16 support for mat-vec will be added separately.
                 "unsupported"
             }
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
+            // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp
+            // (ggml-metal.metal:7715-7821) for dwq46/dwq48 dense
+            // ffn_*_shexp + ffn_gate_inp + ffn_gate_inp_shexp tensors.
+            GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_q6_K_f32",
         }
     }
@@ -274,8 +277,11 @@ pub fn quantized_matmul_ggml(
     let block_bytes = params.ggml_type.block_bytes();
 
     // --- Validate (common to mv and mm paths) ---
+    // ADR-013 P7 — Q4_K added (mv only; mm path falls back to mv at m <= 8
+    // and Q4_K's mm/mm_tensor kernels are not yet ported, so we only allow
+    // Q4_K when the dispatcher would route to mv).
     match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K => {}
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_ggml does not support {:?} — use a different dispatch path",
@@ -341,7 +347,13 @@ pub fn quantized_matmul_ggml(
     // (ggml-metal-ops.cpp:2046).  The mm kernel also requires K >= NK=32,
     // which every projection in our Gemma 4 DWQ model satisfies — guard
     // kept so any future shape smaller than 32 falls back to mv.
-    if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 {
+    // ADR-013 P7 — Q4_K mm/mm_tensor not yet ported; Q4_K always
+    // routes to mv (correct but slower for large m than a fully ported
+    // mm).  dwq46/dwq48 dense Q4_K shexp/gate_inp tensors are small
+    // (router weights with N <= 256), so the perf delta is negligible
+    // in practice.  Other ggml types route on m as before.
+    let mm_supported = !matches!(params.ggml_type, GgmlType::Q4_K);
+    if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
         dispatch_mm(encoder, registry, device, input, weight, output, params)
     } else {
         dispatch_mv(encoder, registry, device, input, weight, output, params)
@@ -420,7 +432,10 @@ fn dispatch_mv(
 
     let (nth0, nth1, align) = match params.ggml_type {
         GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
-        GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        // Q4_K mirrors Q6_K's 2-row-per-tg geometry: 2 simdgroups × 1 row
+        // per simdgroup = 2 rows per threadgroup.  Threads_per_tg=(2, 32)
+        // = 64 threads = 2 simdgroups.
+        GgmlType::Q4_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),
     };
 

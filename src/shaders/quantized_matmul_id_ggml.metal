@@ -74,6 +74,19 @@ typedef struct {
     uint8_t qs[QK_K/2];           // quants, low 4 bits (128 bytes)
 } block_q5_K;
 
+// Q4_K: 256 values per block, 144 bytes per block.
+// Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qs[128]]
+//   Structurally Q5_K minus the 32-byte qh "high-bit" array.
+//   Same K_SCALE_SIZE=12 layout for packed (sub-scale, sub-min) 6-bit pairs.
+//
+// Source: ggml-common.h block_q4_K (llama.cpp).
+typedef struct {
+    half    d;                    // super-block scale for quantized scales
+    half    dmin;                 // super-block scale for quantized mins
+    uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
+    uint8_t qs[QK_K/2];           // quants, low 4 bits (128 bytes)
+} block_q4_K;
+
 typedef struct {
     uint8_t ql[QK_K/2];
     uint8_t qh[QK_K/4];
@@ -581,5 +594,127 @@ kernel void kernel_mul_mv_id_q6_K_f32(
     const float tot = simd_sum(sumf);
     if (tiisg == 0 && row < (int)p.ne01) {
         dst[output_row_base * p.ne0 + row] = tot;
+    }
+}
+
+// ====================================================================
+// Q4_K expert-indexed mat-vec kernel
+// ====================================================================
+//
+// ADR-013 P7 — port of llama.cpp `kernel_mul_mv_id_q4_K_f32` (mv_id
+// thunk in ggml-metal.metal:10349 wrapping `kernel_mul_mv_q4_K_f32_impl`).
+//
+// Mirrors the Q5_K mv_id kernel above, differing only in:
+//   1. Block struct has no qh field (saves 32 bytes per block).
+//   2. The acc2 high-bit accumulators collapse to zero — Q4_K stores
+//      only the low 4 bits, no high-bit array.
+//   3. The dot-product reduces to (q1[l] & 0x0F) and (q1[l] & 0xF0) >> 4
+//      paired with the pre-summed yl/yh/sumy.
+//
+// Scale-decode is byte-identical to Q5_K: same kmask1/kmask2/kmask3,
+// same sc16[] packing — verified against llama.cpp's
+// kernel_mul_mv_q4_K_f32_impl at ggml-metal.metal:7727-7729.
+//
+// Geometry (mirrors Q5_K mv_id):
+//   2 simdgroups per threadgroup, 1 row per simdgroup → 2 rows per tg.
+//   tgpig.x = weight-row-pair index   (row = 2*r0 + sgitg)
+//   tgpig.y = flat output row         (token*top_k + slot)
+//
+// Routing index dim Y, NOT Z — see the Q5_K kernel's note at line 124.
+
+kernel void kernel_mul_mv_id_q4_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r0          = tgpig.x;
+    const int     output_row  = tgpig.y;  // flat: token*top_k + slot
+
+    if (output_row >= (int)p.ne1) return;
+
+    const uint token_idx = output_row / p.top_k;
+    const uint expert_id = ids[output_row];
+
+    // Each threadgroup covers weight-row pair (2*r0, 2*r0+1);
+    // sgitg selects which row this simdgroup computes.
+    const int row = 2 * (int)r0 + (int)sgitg;
+
+    device const block_q4_K * x  = (device const block_q4_K *)((device const char *)src0 + expert_id * p.expert_stride) + row * nb;
+    device const float      * yy = src1 + token_idx * p.ne10;
+
+    float sumf = 0.f;
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const int tid = tiisg / 4;
+    const int ix  = tiisg % 4;
+    const int iq  = tid / 4;
+    const int ir  = tid % 4;
+    const int n   = 8;
+
+    const int l0       = n * ir;
+    const int q_offset = 32 * iq + l0;
+    const int y_offset = 64 * iq + l0;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    device const float * y1 = yy + ix * QK_K + y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uint8_t  * q1 = x[i].qs + q_offset;
+        device const uint8_t  * q2 = q1 + 64;
+        device const half     * dh = &x[i].d;
+        // scales array is uint8_t[12]; cast to uint16_t[6] for the
+        // sc16 decoding identical to the reference candle kernel.
+        device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
+
+        device const float * y2 = y1 + 128;
+        float yl[16], yh[16];
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (int l = 0; l < n; ++l) {
+            yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
+            yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
+            yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
+            yh[l+8] = y2[l + 32]; sumy[3] += yh[l+8];
+        }
+
+        sc16[0] = a[0] & kmask1;
+        sc16[1] = a[2] & kmask1;
+        sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+        sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+        float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+        for (int l = 0; l < n; ++l) {
+            acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
+            acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
+            acc1[2] += yh[l+0] * (float)(q2[l] & 0x0F);
+            acc1[3] += yh[l+8] * (float)(q2[l] & 0xF0);
+        }
+
+        const float dall = (float)dh[0];
+        const float dmin = (float)dh[1];
+        sumf += dall * ((float)sc8[0] * (acc1[0]        ) +
+                        (float)sc8[1] * (acc1[1] / 16.f ) +
+                        (float)sc8[4] * (acc1[2]        ) +
+                        (float)sc8[5] * (acc1[3] / 16.f )) -
+               dmin * (sumy[0] * (float)sc8[2] + sumy[1] * (float)sc8[3] +
+                       sumy[2] * (float)sc8[6] + sumy[3] * (float)sc8[7]);
+
+        y1 += 4 * QK_K;
+    }
+
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0 && row < (int)p.ne01) {
+        dst[output_row * p.ne0 + row] = tot;
     }
 }

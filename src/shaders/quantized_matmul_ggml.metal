@@ -66,6 +66,29 @@ typedef struct {
 } block_q6_K;
 static_assert(sizeof(block_q6_K) == sizeof(half) + QK_K/16 + 3*QK_K/4, "wrong q6_K block size");
 
+// Q4_K: 256 values per block, 144 bytes per block.
+// Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qs[128]]
+//   d     : super-block scale for the 6-bit quantized sub-block scales
+//   dmin  : super-block scale for the 6-bit quantized sub-block mins
+//   scales: packed 6-bit (sub-scale, sub-min) pairs for 8 sub-blocks
+//           (same K_SCALE_SIZE=12 byte layout shared with Q5_K, decoded
+//            via the kmask1/kmask2/kmask3 machinery below).
+//   qs    : 128 bytes of 4-bit quantized values, low nibble = first half
+//           of pair, high nibble = second half of pair.
+//
+// Q4_K is structurally Q5_K minus the 32-byte qh "high-bit" array.
+//
+// Source: ggml-common.h block_q4_K (llama.cpp).
+#define K_SCALE_SIZE 12
+typedef struct {
+    half    d;                    // super-block scale for quantized scales
+    half    dmin;                 // super-block scale for quantized mins
+    uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
+    uint8_t qs[QK_K/2];           // quants, low 4 bits (128 bytes)
+} block_q4_K;
+static_assert(sizeof(block_q4_K) == 2*sizeof(half) + K_SCALE_SIZE + QK_K/2,
+              "wrong q4_K block size");
+
 // ---- Q4_0 mat-vec kernel ----
 //
 // Each SIMD group (32 threads) processes N_DST=4 rows.
@@ -302,6 +325,129 @@ kernel void kernel_mul_mv_q6_K_f32(
 
     const float tot = simd_sum(sumf);
     if (tiisg == 0) {
+        dst[r1*p.ne0 + im*p.ne0*p.ne1 + row] = tot;
+    }
+}
+
+// ---- Q4_K mat-vec kernel ----
+//
+// ADR-013 P7 — port of llama.cpp `kernel_mul_mv_q4_K_f32_impl`
+// (ggml-metal.metal:7715-7821). Algorithm: for each weight row, decode
+// the 8 sub-block (scale, min) 6-bit pairs from the packed 12-byte
+// `scales` array, dequant and dot-product against the input vector.
+//
+// Geometry (mirrors Q5_K mv_id pattern):
+//   NSG        = 2 simdgroups per threadgroup
+//   nr0_per_sg = 1 row per simdgroup
+//   rows/tg    = 2  (one per simdgroup; row = 2*r0 + sgitg)
+// Dispatch:    threadgroups=(ceil(N/2), M, B), threads_per_tg=(2, 32, 1)
+//
+// Scale-decode is identical to Q5_K's: same kmask1=0x3f3f, kmask2=0x0f0f,
+// kmask3=0xc0c0, same `sc16[]` packing. Q4_K differs from Q5_K only by
+// the absence of the `qh` (high-bit) accumulators — the inner loop
+// reduces to (q1[l] & 0x0F) and (q1[l] & 0xF0) >> 4 paired with the
+// pre-summed yl/yh/sumy.
+
+kernel void kernel_mul_mv_q4_K_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r0 = tgpig.x;
+    const int64_t r1 = tgpig.y;
+    const int     im = tgpig.z;
+
+    const int row = 2 * (int)r0 + (int)sgitg;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_q4_K * x  = (device const block_q4_K *) src0 + row * nb + offset0;
+    device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float sumf = 0.f;
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    // tiisg ∈ [0, 31].  Same partitioning as Q5_K mv_id:
+    //   tid = tiisg/4 (0..7)
+    //   ix  = tiisg%4 (0..3)  → block stride = 4
+    //   iq  = tid/4    (0..1) → which half of the super-block (low/high)
+    //   ir  = tid%4    (0..3) → which 8-element slice within iq's half
+    const int tid = tiisg / 4;
+    const int ix  = tiisg % 4;
+    const int iq  = tid / 4;
+    const int ir  = tid % 4;
+    const int n   = 8;
+
+    const int l0       = n * ir;
+    const int q_offset = 32 * iq + l0;
+    const int y_offset = 64 * iq + l0;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    device const float * y1 = yy + ix * QK_K + y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uint8_t  * q1 = x[i].qs + q_offset;
+        device const uint8_t  * q2 = q1 + 64;
+        device const half     * dh = &x[i].d;
+        // Read packed 6-bit scales/mins as 6 uint16_ts; iq selects
+        // which half of the super-block we're decoding.
+        device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
+
+        device const float * y2 = y1 + 128;
+        float yl[16], yh[16];
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (int l = 0; l < n; ++l) {
+            yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
+            yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
+            yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
+            yh[l+8] = y2[l + 32]; sumy[3] += yh[l+8];
+        }
+
+        sc16[0] = a[0] & kmask1;
+        sc16[1] = a[2] & kmask1;
+        sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+        sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+        float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+        for (int l = 0; l < n; ++l) {
+            // Low/high nibble pairs from q1 (first 32 vals) and q2 (third 32 vals).
+            // No qh: Q4_K has no high-bit array, so the Q5_K formula's
+            // acc2 (high-bit) accumulators collapse to zero; only the
+            // raw nibble dot-products contribute.
+            acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
+            acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
+            acc1[2] += yh[l+0] * (float)(q2[l] & 0x0F);
+            acc1[3] += yh[l+8] * (float)(q2[l] & 0xF0);
+        }
+
+        const float dall = (float)dh[0];
+        const float dmin = (float)dh[1];
+        sumf += dall * ((float)sc8[0] * (acc1[0]        ) +
+                        (float)sc8[1] * (acc1[1] / 16.f ) +
+                        (float)sc8[4] * (acc1[2]        ) +
+                        (float)sc8[5] * (acc1[3] / 16.f )) -
+               dmin * (sumy[0] * (float)sc8[2] + sumy[1] * (float)sc8[3] +
+                       sumy[2] * (float)sc8[6] + sumy[3] * (float)sc8[7]);
+
+        y1 += 4 * QK_K;
+    }
+
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0 && row < (int)p.ne01) {
         dst[r1*p.ne0 + im*p.ne0*p.ne1 + row] = tot;
     }
 }
