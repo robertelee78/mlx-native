@@ -635,3 +635,31 @@ fn q4k_mvid_4tok_8experts_top2() {
 fn q4k_mvid_8tok_16experts_top4() {
     run_q4k_mvid_vs_cpu(8, 16, 4, 16, 1024, 5e-2);
 }
+
+// ==========================================================================
+// ADR-013 P16 — Q4_K mm_id (prefill batch > 8) parity tests
+//
+// quantized_matmul_id_ggml dispatches to mm_id when:
+//   n_tokens > MM_ID_ROUTING_THRESHOLD (8) AND top_k ∈ {1, 8} AND K >= 32.
+// Before P16, Q4_K was excluded; now it routes through the new
+// kernel_mul_mm_id_q4_K_f32 + kernel_mul_mm_id_q4_K_tensor_f32.
+// ==========================================================================
+
+#[test]
+fn q4k_mmid_16tok_8experts_top8_k512() {
+    // n_tokens=16 > 8 + top_k=8 + k=512 → mm_id route engaged.
+    run_q4k_mvid_vs_cpu(16, 8, 8, 16, 512, 5e-2);
+}
+
+#[test]
+fn q4k_mmid_64tok_4experts_top1_k1024() {
+    // n_tokens=64 + top_k=1 + k=1024 → mm_id route, top_k=1 map.
+    run_q4k_mvid_vs_cpu(64, 4, 1, 16, 1024, 5e-2);
+}
+
+#[test]
+fn q4k_mmid_32tok_16experts_top8_k2048() {
+    // Production-shape Q4_K: n_tokens=32, top_k=8, k=2048 (matches
+    // qwen3.6 MoE moe_intermediate_size=512 with k=hidden_size=2048).
+    run_q4k_mvid_vs_cpu(32, 16, 8, 16, 2048, 5e-2);
+}

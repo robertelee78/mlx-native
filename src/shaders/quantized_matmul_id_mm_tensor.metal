@@ -63,6 +63,22 @@ typedef struct {
     half    d;
 } block_q6_K;
 
+// ADR-013 P16 — Q4_K block (144 bytes) for tensor-API mm_id port.
+#define K_SCALE_SIZE 12
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K/2];
+} block_q4_K;
+
+// Spec source: llama.cpp ggml-metal.metal:675.
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
 template <typename type4x4>
 void dq_q4_0_id(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
@@ -124,6 +140,27 @@ void dq_q6_K_id(device const block_q6_K * xb, short il, thread type4x4 & reg) {
         reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
     }
     reg = (type4x4) reg_f;
+}
+
+// ADR-013 P16 — Q4_K dequant for tensor-API MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:681 (`dequantize_q4_K`).
+template <typename type4x4>
+void dq_q4_K_id(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+    device const uchar * q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
 }
 
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
@@ -292,6 +329,13 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_q8_0, 2, dq_q8_0_id>(
 
 template [[host_name("kernel_mul_mm_id_q6_K_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_q6_K, QK_NL, dq_q6_K_id>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-013 P16 — Q4_K tensor-API mm_id template instantiation.
+template [[host_name("kernel_mul_mm_id_q4_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q4_K, QK_NL, dq_q4_K_id>(
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

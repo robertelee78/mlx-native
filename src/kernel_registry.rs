@@ -201,6 +201,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
+        // ADR-013 P16 — Q4_K mm_id (port of llama.cpp ggml-metal.metal:10169).
+        sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
 
         // MoE-routed quantized matrix-matrix kernels — tensor API variant
         // (ADR-011 Phase 3 Wave P3b-tensor).  Uses the MPP tensor_ops
@@ -212,6 +214,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q4_0_tensor_f32".into(), ggml_id_mm_tensor_src);
         sources.insert("kernel_mul_mm_id_q8_0_tensor_f32".into(), ggml_id_mm_tensor_src);
         sources.insert("kernel_mul_mm_id_q6_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+        // ADR-013 P16 — Q4_K tensor-API mm_id.
+        sources.insert("kernel_mul_mm_id_q4_K_tensor_f32".into(), ggml_id_mm_tensor_src);
 
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");

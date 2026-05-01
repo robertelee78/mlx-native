@@ -84,7 +84,10 @@ impl GgmlType {
             // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
             GgmlType::Q5_K => "unsupported",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::I16 => "unsupported",
+            // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
+            // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
+            GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 
@@ -98,7 +101,9 @@ impl GgmlType {
             // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
             GgmlType::Q5_K => "unsupported",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::I16 => "unsupported",
+            // ADR-013 P16 — Q4_K tensor-API mm_id ported.
+            GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 }
@@ -246,12 +251,11 @@ pub fn quantized_matmul_id_ggml(
     //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
     //   * Q5_K (mm_id not yet ported — only mv_id kernel exists)
-    //   * Q4_K (mm_id not yet ported — only mv_id kernel exists; ADR-013 P7)
+    // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
         && params.ggml_type != GgmlType::Q5_K
-        && params.ggml_type != GgmlType::Q4_K
     {
         return dispatch_id_mm(
             encoder, registry, device, input, weight, ids, output, params,
@@ -358,12 +362,12 @@ pub fn quantized_matmul_id_ggml_pooled(
     }
 
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
-    // Q5_K / Q4_K: mm_id not yet ported; always use mv_id.
+    // Q5_K: mm_id not yet ported; always use mv_id.
+    // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     if params.n_tokens > (MM_ID_ROUTING_THRESHOLD as u32)
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
         && params.ggml_type != GgmlType::Q5_K
-        && params.ggml_type != GgmlType::Q4_K
     {
         return dispatch_id_mm_pooled(
             encoder, registry, device, input, weight, ids, output,
@@ -871,8 +875,9 @@ pub fn dispatch_id_mm_for_test(
     let qk = params.ggml_type.block_values();
 
     // ---- Validate common shapes ----
+    // ADR-013 P16 — Q4_K added.
     match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K => {}
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm_for_test does not support {:?}", other

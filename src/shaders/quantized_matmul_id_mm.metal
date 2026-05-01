@@ -111,6 +111,25 @@ typedef struct {
     half    d;
 } block_q6_K;
 
+// ADR-013 P16 — Q4_K block (144 bytes) for mm_id port.
+// Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qs[128]]
+#define K_SCALE_SIZE 12
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K/2];
+} block_q4_K;
+
+// Spec source: llama.cpp ggml-metal.metal:675 — `get_scale_min_k4_just2`.
+// Decodes the (sub-block scale, sub-block min) 6-bit pair at index `j`
+// (within sub-block group `k`) from the packed K_SCALE_SIZE=12 array.
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
 // ---- Dequantize helpers (identical to quantized_matmul_mm.metal) ----
 
 template <typename type4x4>
@@ -176,6 +195,30 @@ void dequantize_q6_K(device const block_q6_K * xb, short il, thread type4x4 & re
         reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
     }
     reg = (type4x4) reg_f;
+}
+
+// ADR-013 P16 — Q4_K dequant for the mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:681. Fills a 4x4 tile with the
+// 16 dequantized values addressed by `il` (which selects sub-block + half
+// nibble), using the same scale/min decode as the mat-vec-id Q4_K kernel
+// already shipped at quantized_matmul_id_ggml.metal.
+template <typename type4x4>
+void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+    device const uchar * q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
 }
 
 // ====================================================================
@@ -472,6 +515,13 @@ kernel void hf2q_mul_mm_id_impl<block_q8_0, 2, dequantize_q8_0>(
 
 template [[host_name("kernel_mul_mm_id_q6_K_f32")]]
 kernel void hf2q_mul_mm_id_impl<block_q6_K, QK_NL, dequantize_q6_K>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-013 P16 — Q4_K mm_id template instantiation.
+template [[host_name("kernel_mul_mm_id_q4_K_f32")]]
+kernel void hf2q_mul_mm_id_impl<block_q4_K, QK_NL, dequantize_q4_K>(
     constant GgmlMatmulIdMm_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
