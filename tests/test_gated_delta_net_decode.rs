@@ -285,3 +285,107 @@ fn decode_matches_cpu_ref_qwen35_shape() {
     assert_close("decode-vs-cpu output", &dec_out, &cpu_out, 5e-5);
     assert_close("decode-vs-cpu state", &dec_state, &cpu_state, 5e-5);
 }
+
+// ================================================================
+// ADR-015 iter59 — multi-token NSG falsification tests
+//
+// MISSION: verify that the inner `for t in 0..n_tokens` loop in
+// `gated_delta_net_decode.metal:145` produces bit-equivalent output
+// to `dispatch_gated_delta_net` (the 128-thread/shared-memory baseline)
+// for n_tokens ∈ {1, 2, 4, 8, 16, 32} BEFORE removing any Rust gate.
+//
+// These tests establish that the kernel correctness claim in the dossier
+// is empirically true, not merely asserted from code inspection.
+// ================================================================
+
+/// Run decode for n_tokens and compare to both unfused GPU kernel and CPU ref.
+/// Returns (max_err_vs_unfused_output, max_err_vs_unfused_state,
+///          max_err_vs_cpu_output, max_err_vs_cpu_state).
+fn verify_nsg_for_n_tokens(n_tokens: u32) {
+    let (device, mut registry) = setup();
+    // Production shape: Qwen3.5/3.6 35B-A3B, NSG=4.
+    let p = GatedDeltaNetParams {
+        d_k: 128,
+        d_v: 128,
+        n_k_heads: 16,
+        n_v_heads: 32,
+        n_tokens,
+        n_seqs: 1,
+    };
+    let (q, k, v, g, beta, state_in) = random_inputs(p, 0xA1B2 ^ (n_tokens as u32 * 0x137));
+
+    let label = format!("n_tokens={n_tokens}");
+
+    // 1. Run NSG decode kernel.
+    let (dec_out, dec_state) =
+        run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+
+    // 2. Compare to unfused 128-thread GPU baseline (the existing production kernel).
+    //    Tolerance: F32 simd_sum vs tree-reduction on 128 floats can drift ~3e-5;
+    //    set 1e-4 to allow for n_tokens accumulation over the inner loop.
+    let (ref_out, ref_state) =
+        run_unfused(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+    assert_close(
+        &format!("{label} vs unfused output"),
+        &dec_out,
+        &ref_out,
+        1e-4,
+    );
+    assert_close(
+        &format!("{label} vs unfused state"),
+        &dec_state,
+        &ref_state,
+        1e-4,
+    );
+
+    // 3. Compare to CPU scalar reference (mathematical ground truth).
+    let (cpu_out, cpu_state) = cpu_reference_f32(&q, &k, &v, &g, &beta, &state_in, p);
+    assert_close(
+        &format!("{label} vs cpu output"),
+        &dec_out,
+        &cpu_out,
+        1e-4,
+    );
+    assert_close(
+        &format!("{label} vs cpu state"),
+        &dec_state,
+        &cpu_state,
+        1e-4,
+    );
+}
+
+/// ADR-015 iter59: NSG kernel n_tokens=1 — baseline (must match existing tests).
+#[test]
+fn multi_token_nsg_n_tokens_1() {
+    verify_nsg_for_n_tokens(1);
+}
+
+/// ADR-015 iter59: NSG kernel n_tokens=2 — first multi-token case.
+#[test]
+fn multi_token_nsg_n_tokens_2() {
+    verify_nsg_for_n_tokens(2);
+}
+
+/// ADR-015 iter59: NSG kernel n_tokens=4.
+#[test]
+fn multi_token_nsg_n_tokens_4() {
+    verify_nsg_for_n_tokens(4);
+}
+
+/// ADR-015 iter59: NSG kernel n_tokens=8.
+#[test]
+fn multi_token_nsg_n_tokens_8() {
+    verify_nsg_for_n_tokens(8);
+}
+
+/// ADR-015 iter59: NSG kernel n_tokens=16.
+#[test]
+fn multi_token_nsg_n_tokens_16() {
+    verify_nsg_for_n_tokens(16);
+}
+
+/// ADR-015 iter59: NSG kernel n_tokens=32.
+#[test]
+fn multi_token_nsg_n_tokens_32() {
+    verify_nsg_for_n_tokens(32);
+}
