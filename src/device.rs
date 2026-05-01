@@ -117,6 +117,33 @@ impl MlxDevice {
         if metal_buf.contents().is_null() {
             return Err(MlxError::BufferAllocationError { bytes: byte_len });
         }
+        // ADR-015 iter61a (broken-window B-W-1 fix): explicitly zero every
+        // newly-allocated GPU buffer. `MTLResourceOptions::StorageModeShared`
+        // does NOT guarantee zeroed pages on Apple Silicon — Metal's allocator
+        // recycles pages from recently-freed allocations within the device's
+        // private heap before the OS sees the free, so a fresh buffer can
+        // contain residual bytes from prior allocations in the same process.
+        // In a cold process this surfaces as run-to-run non-determinism: the
+        // heap state at the moment Metal services `newBufferWithLength`
+        // differs across cold invocations, and any kernel that reads a buffer
+        // before fully populating it (e.g. DeltaNet's `ssm_conv` reads
+        // conv_state, MoE expert routing reads scratch, attn-output buffers
+        // before the final write barrier) propagates that garbage into
+        // logits → argmax → divergent generations across cold runs.
+        // The cost is one memset per allocation; on workloads dominated by
+        // weight-load (one-time) and kvcache (one-time), this is negligible.
+        // Per `feedback_no_broken_windows` + mantra "No fallback. No stub.
+        // Just pure excellence." — fix at the source.
+        //
+        // Safety: `metal_buf.contents()` is non-null (verified above), points
+        // to exactly `byte_len` bytes of `StorageModeShared` memory we just
+        // allocated and have exclusive access to (no other thread or GPU
+        // dispatch references it yet — we haven't returned the MlxBuffer
+        // wrapper yet, and the underlying CB queue is not in flight on this
+        // allocation). Writing zero bytes is well-defined for any DType.
+        unsafe {
+            std::ptr::write_bytes(metal_buf.contents() as *mut u8, 0, byte_len);
+        }
         // ADR-015 iter8e (Phase 3b): auto-register the new allocation with the
         // device's residency set so it gets the MTLResidencySet hint on the
         // next dispatch. The `with_residency` path stages the addAllocation
