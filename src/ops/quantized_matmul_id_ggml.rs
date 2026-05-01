@@ -115,6 +115,16 @@ static TENSOR_MM_ID_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::
 
 fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     *TENSOR_MM_ID_AVAILABLE.get_or_init(|| {
+        // ADR-013 P17 — env-gate to force the simdgroup variant for A/B
+        // bench. llama.cpp does NOT use a tensor-API path for K-quants
+        // (only f32/f16/bf16), so for Q4_K/Q5_K/Q6_K the tensor variant
+        // is our addition and may be slower than the simdgroup MMA path.
+        if std::env::var("HF2Q_DISABLE_TENSOR_MM_ID").is_ok() {
+            if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+                eprintln!("[mlx-native] tensor_mm_id: DISABLED via HF2Q_DISABLE_TENSOR_MM_ID");
+            }
+            return false;
+        }
         let ok = registry
             .get_pipeline("kernel_mul_mm_id_q4_0_tensor_f32", device.metal_device())
             .is_ok();
@@ -381,7 +391,10 @@ pub fn quantized_matmul_id_ggml_pooled(
 /// The n_tokens threshold at which `quantized_matmul_id_ggml` switches
 /// from the mv_id kernel to the mm_id kernel.  Matches llama.cpp's
 /// `ne11_mm_min = 8` (ggml-metal-ops.cpp:2046).
-pub const MM_ID_ROUTING_THRESHOLD: u32 = 8;
+// ADR-013 P17 — bumped 8 → 32 to match llama.cpp's `ne21_mm_id_min = 32`
+// in `ggml-metal-ops.cpp:2312`. Below 32 tokens, mv_id is faster than mm_id
+// (the mm tile-reuse setup overhead doesn't amortize at small n_tokens).
+pub const MM_ID_ROUTING_THRESHOLD: u32 = 32;
 
 /// Matrix-vector `_id` dispatch (decode path, unchanged from pre-Phase-3).
 #[allow(clippy::too_many_arguments)]
