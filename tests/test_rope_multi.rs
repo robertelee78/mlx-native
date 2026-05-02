@@ -71,10 +71,26 @@ fn pick_axis_cpu(sector: u32, mode: RopeMultiMode, s: [u32; 4]) -> u32 {
                 3
             }
         }
+        RopeMultiMode::Vision => {
+            // Vision ignores sections 2 and 3; only y/x axes used.
+            // Mirrors /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:308-313.
+            if sector < s[0] {
+                0
+            } else {
+                1
+            }
+        }
     }
 }
 
 /// CPU reference — returns full output vector of length `n_rows * head_dim`.
+///
+/// Handles all three modes. For VISION (mode 24), `sect_dims = s0 + s1`
+/// (last two sections ignored), the theta exponent is the *per-section*
+/// `local_p` rather than the global `pair_idx`, and the denominator is
+/// `n_dims = head_dim/2` rather than `rope_dim`. Mirrors the CUDA
+/// reference at /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:268-328 and the
+/// `indep_sects` branch of /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5660-5710.
 fn cpu_rope_multi(
     input: &[f32],
     positions: &[i32],
@@ -85,7 +101,12 @@ fn cpu_rope_multi(
     let half_dim = head_dim / 2;
     let rope_dim = p.rope_dim as usize;
     let half_rope = rope_dim / 2;
-    let sect_dims = p.sections.iter().sum::<u32>().max(1);
+    let is_vision = matches!(p.mode, RopeMultiMode::Vision);
+    let sect_dims = if is_vision {
+        (p.sections[0] + p.sections[1]).max(1)
+    } else {
+        p.sections.iter().sum::<u32>().max(1)
+    };
 
     let mut out = input.to_vec();
     for row in 0..n_rows {
@@ -98,7 +119,21 @@ fn cpu_rope_multi(
                 let axis = pick_axis_cpu(sector, p.mode, p.sections);
                 let pos = positions[(axis * p.seq_len + seq_idx) as usize];
 
-                let dim_ratio = 2.0 * (pair as f32) / (rope_dim as f32);
+                let (theta_p, denom) = if is_vision {
+                    // Per-section local index; denom = n_dims = half_rope
+                    // (since for vision rope_dim == head_dim, half_rope ==
+                    // head_dim / 2 == n_dims).
+                    let local_p = if sector < p.sections[0] {
+                        sector
+                    } else {
+                        sector - p.sections[0]
+                    };
+                    (local_p, half_rope as u32)
+                } else {
+                    (pair as u32, p.rope_dim)
+                };
+
+                let dim_ratio = 2.0 * (theta_p as f32) / (denom as f32);
                 let freq = 1.0 / (p.freq_base.powf(dim_ratio));
                 let theta = (pos as f32) * freq;
                 let (cos_a, sin_a) = (theta.cos(), theta.sin());
@@ -786,4 +821,334 @@ fn test_rope_multi_cached_seq_len_variation() {
     );
 
     mlx_native::ops::rope_multi::clear_rope_pack_cache();
+}
+
+// =================================================================
+// VISION mode (mode == 24, RopeMultiMode::Vision) — Qwen3-VL ViT
+// =================================================================
+//
+// Spec sources:
+//   /opt/llama.cpp/ggml/include/ggml.h:253                (mode = 24)
+//   /opt/llama.cpp/ggml/include/ggml.h:1840-1846          ([yyyyxxxx] layout)
+//   /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:268-328     (kernel ref)
+//   /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5643-5711    (cache_init w/ indep_sects)
+//   /opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:14,111   (call site)
+//
+// Acceptance for the mlx-native PR: synthetic input where [yyyyxxxx] dim
+// layout produces specific output values from a hand-computed reference;
+// bitwise tolerance ≤ 1 ULP at FP32 (we use ≤ 1e-5 to allow `pow`/`cos`
+// implementation variance between Metal and host f32, matching the
+// existing IMROPE spec-driven test).
+
+/// Hand-computed expected output for the [yyyyxxxx] layout.
+///
+/// Setup: head_dim=8, rope_dim=8 (vision: rope_dim == head_dim),
+/// sections=[s0=2, s1=2, s2=0, s3=0], n_heads=1, seq_len=2,
+/// freq_base=10000.
+///
+/// Per-pair theta (n_dims = head_dim/2 = 4):
+///
+///   pair 0 -> axis 0 (y), local_p=0, freq = 10000^(-0/4) = 1
+///   pair 1 -> axis 0 (y), local_p=1, freq = 10000^(-2/4) = 1/100 = 0.01
+///   pair 2 -> axis 1 (x), local_p=0, freq = 1
+///   pair 3 -> axis 1 (x), local_p=1, freq = 0.01
+///
+/// With y_pos = [3, 5] and x_pos = [7, 11]:
+///
+///   row 0: thetas = [3.0, 0.03, 7.0, 0.07]
+///   row 1: thetas = [5.0, 0.05, 11.0, 0.11]
+///
+/// Pairing is NeoX-style: rotate (x[pair], x[pair+head_dim/2]).
+#[test]
+fn test_rope_multi_vision_yyyyxxxx_layout_spec_driven() {
+    let (device, mut registry) = setup();
+
+    let p = RopeMultiParams {
+        head_dim: 8,
+        rope_dim: 8, // vision invariant: must equal head_dim
+        n_heads: 1,
+        seq_len: 2,
+        freq_base: 10000.0,
+        mode: RopeMultiMode::Vision,
+        // s0=2 (y), s1=2 (x), last two ignored.
+        sections: [2, 2, 0, 0],
+    };
+
+    // Input: 16 values, row-major [seq=0; seq=1] x head_dim=8.
+    // Use 0.1 * (i + 1) so values are distinct and bounded.
+    let input: Vec<f32> = (0..16).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    // positions layout: 4 axes x seq_len=2 = 8 entries.
+    //   [y_0, y_1, x_0, x_1, _, _, _, _]
+    let positions = [3i32, 5, 7, 11, 0, 0, 0, 0];
+
+    let got = run_rope_multi(&device, &mut registry, &input, &positions, p);
+    let want = cpu_rope_multi(&input, &positions, p);
+
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        let d = (g - w).abs();
+        assert!(
+            d < 1e-5,
+            "vision spec-driven mismatch at {}: got {}, want {}, diff {}",
+            i,
+            g,
+            w,
+            d
+        );
+    }
+
+    // Independently pin pair 0 of row 0 (axis 0=y, local_p=0, theta=3).
+    // x0 = input[0] = 0.1, x1 = input[0 + half_dim=4] = 0.5.
+    // expected = (0.1*cos(3) - 0.5*sin(3),  0.1*sin(3) + 0.5*cos(3))
+    let pair0_row0 = (got[0], got[4]);
+    let expected_pair0_row0 = (
+        0.1_f32 * 3.0_f32.cos() - 0.5_f32 * 3.0_f32.sin(),
+        0.1_f32 * 3.0_f32.sin() + 0.5_f32 * 3.0_f32.cos(),
+    );
+    assert!(
+        (pair0_row0.0 - expected_pair0_row0.0).abs() < 1e-5,
+        "row0 pair0.x: got {}, want {}",
+        pair0_row0.0,
+        expected_pair0_row0.0
+    );
+    assert!(
+        (pair0_row0.1 - expected_pair0_row0.1).abs() < 1e-5,
+        "row0 pair0.y: got {}, want {}",
+        pair0_row0.1,
+        expected_pair0_row0.1
+    );
+
+    // Independently pin pair 2 of row 1 (axis 1=x, local_p=0, theta=11).
+    // Index in flattened buffer: row 1 base = 8; pair 2 -> indices 8+2=10
+    // and 8+2+4=14. x0 = input[10] = 1.1, x1 = input[14] = 1.5.
+    let pair2_row1 = (got[10], got[14]);
+    let expected_pair2_row1 = (
+        1.1_f32 * 11.0_f32.cos() - 1.5_f32 * 11.0_f32.sin(),
+        1.1_f32 * 11.0_f32.sin() + 1.5_f32 * 11.0_f32.cos(),
+    );
+    assert!(
+        (pair2_row1.0 - expected_pair2_row1.0).abs() < 1e-5,
+        "row1 pair2.x: got {}, want {}",
+        pair2_row1.0,
+        expected_pair2_row1.0
+    );
+    assert!(
+        (pair2_row1.1 - expected_pair2_row1.1).abs() < 1e-5,
+        "row1 pair2.y: got {}, want {}",
+        pair2_row1.1,
+        expected_pair2_row1.1
+    );
+
+    // Cross-check that vision actually differs from MROPE at the same
+    // shape. MROPE on the same input uses unified pair_idx as exponent,
+    // so pair 1 of row 0 should differ between the two modes.
+    // Switch only the mode and compute MROPE: with sections [2,2,0,0],
+    // sect_dims=4 in both modes, but for MROPE pair 1 -> axis 0, and the
+    // dim_ratio uses pair_idx=1 / rope_dim=8 = 0.125 (NOT local_p/n_dims).
+    let mut p_mrope = p;
+    p_mrope.mode = RopeMultiMode::Mrope;
+    let got_mrope = run_rope_multi(&device, &mut registry, &input, &positions, p_mrope);
+    let d_pair1_row0 = (got[1] - got_mrope[1]).abs();
+    let d_pair1_row0_b = (got[5] - got_mrope[5]).abs();
+    assert!(
+        d_pair1_row0 > 1e-3 || d_pair1_row0_b > 1e-3,
+        "vision and mrope produced identical pair 1 — exponent denominator may not have switched (got_v=({},{}), got_m=({},{}))",
+        got[1],
+        got[5],
+        got_mrope[1],
+        got_mrope[5]
+    );
+}
+
+// =================================================================
+// Vision rope: text-degenerate (y_pos == x_pos for all positions)
+// =================================================================
+//
+// When the y and x positions are identical, both axes contribute the
+// same `pos` value. The resulting output is well-defined and finite —
+// this test pins that property and acts as a smoke test for the
+// kernel's per-section-restart path under degenerate-axis inputs.
+// (We do NOT claim equivalence with IMROPE because the theta-exponent
+// denominator differs — n_dims=head_dim/2 for vision vs rope_dim for
+// mrope/imrope — so even with equal positions the outputs diverge by
+// design.)
+
+#[test]
+fn test_rope_multi_vision_degenerate_positions_finite() {
+    let (device, mut registry) = setup();
+
+    let p = RopeMultiParams {
+        head_dim: 16,
+        rope_dim: 16, // vision: rope_dim == head_dim
+        n_heads: 2,
+        seq_len: 4,
+        freq_base: 10000.0,
+        mode: RopeMultiMode::Vision,
+        // n_dims = 8 = s0 + s1; pick s0=s1=4 (matches Qwen3-VL's d_head/4 split).
+        sections: [4, 4, 0, 0],
+    };
+
+    let n_rows = (p.seq_len * p.n_heads) as usize;
+    let n_elem = n_rows * (p.head_dim as usize);
+
+    let mut seed = 0xa1b2c3d4u32;
+    let mut rand = || -> f32 {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        (seed as i32 as f32) / (i32::MAX as f32) * 1.5
+    };
+    let input: Vec<f32> = (0..n_elem).map(|_| rand()).collect();
+
+    // y_pos == x_pos: both axes are the token index, so every pair
+    // (y or x branch) gets the same `pos` value at a given seq_idx.
+    let mut positions = Vec::with_capacity(4 * p.seq_len as usize);
+    let token_pos: Vec<i32> = (0..p.seq_len as i32).collect();
+    positions.extend_from_slice(&token_pos); // axis 0 (y)
+    positions.extend_from_slice(&token_pos); // axis 1 (x)
+    positions.extend_from_slice(&token_pos); // axis 2 (unused)
+    positions.extend_from_slice(&token_pos); // axis 3 (unused)
+
+    let got = run_rope_multi(&device, &mut registry, &input, &positions, p);
+    let want = cpu_rope_multi(&input, &positions, p);
+
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(
+            g.is_finite(),
+            "non-finite output at {}: {}",
+            i,
+            g
+        );
+        let d = (g - w).abs();
+        assert!(
+            d < 1e-5,
+            "vision degenerate mismatch at {}: got {}, want {}",
+            i,
+            g,
+            w
+        );
+    }
+
+    // Also pin: with equal y/x positions, swapping s0<->s1 should NOT
+    // change the output (each pair maps to "the same pos" either way).
+    let mut p_swapped = p;
+    p_swapped.sections = [4, 4, 0, 0]; // s0=s1 already; trivially identical.
+    let got_swapped = run_rope_multi(&device, &mut registry, &input, &positions, p_swapped);
+    for (i, (&g, &gs)) in got.iter().zip(got_swapped.iter()).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            gs.to_bits(),
+            "section swap with equal positions changed output at {}: {} vs {}",
+            i,
+            g,
+            gs
+        );
+    }
+}
+
+// =================================================================
+// Vision rope: invalid section sum is rejected by host validation
+// =================================================================
+//
+// Vision requires sections[0] + sections[1] == head_dim/2. Any other
+// sum must surface MlxError::InvalidArgument before the kernel
+// dispatches. Also covers the rope_dim != head_dim rejection branch.
+
+#[test]
+fn test_rope_multi_vision_invalid_section_sum_rejected() {
+    let (device, mut registry) = setup();
+
+    // head_dim=4 -> n_dims=2, but sections sum to 4+4=8. Should fail
+    // BEFORE any dispatch.
+    let p_bad_sum = RopeMultiParams {
+        head_dim: 4,
+        rope_dim: 4,
+        n_heads: 1,
+        seq_len: 1,
+        freq_base: 10000.0,
+        mode: RopeMultiMode::Vision,
+        sections: [4, 4, 0, 0],
+    };
+
+    // The validation runs inside dispatch_rope_multi. Build the small
+    // buffers and a dummy input/output sized for the *requested* shape.
+    let n_elem = (p_bad_sum.seq_len * p_bad_sum.n_heads * p_bad_sum.head_dim) as usize;
+    let dummy_in = device
+        .alloc_buffer(n_elem * 4, DType::F32, vec![n_elem])
+        .expect("dummy input alloc");
+    let dummy_out = device
+        .alloc_buffer(n_elem * 4, DType::F32, vec![n_elem])
+        .expect("dummy output alloc");
+    let pos = device
+        .alloc_buffer(16, DType::I32, vec![4])
+        .expect("pos alloc");
+    let (params, rope_params, sections) =
+        build_rope_multi_buffers(&device, p_bad_sum).expect("build bufs");
+
+    let mut enc = device.command_encoder().expect("enc");
+    let res = mlx_native::ops::rope_multi::dispatch_rope_multi(
+        &mut enc,
+        &mut registry,
+        device.metal_device(),
+        &dummy_in,
+        &dummy_out,
+        &pos,
+        &params,
+        &rope_params,
+        &sections,
+        p_bad_sum,
+    );
+    assert!(
+        res.is_err(),
+        "vision: sections[0]+sections[1] != head_dim/2 must error"
+    );
+    let msg = format!("{:?}", res.err().expect("err present"));
+    assert!(
+        msg.contains("Vision") || msg.contains("vision"),
+        "error must mention Vision; got: {}",
+        msg
+    );
+
+    // Also assert rope_dim != head_dim is rejected for vision.
+    let p_partial = RopeMultiParams {
+        head_dim: 8,
+        rope_dim: 4, // vision forbids rope_dim < head_dim (no partial rotary)
+        n_heads: 1,
+        seq_len: 1,
+        freq_base: 10000.0,
+        mode: RopeMultiMode::Vision,
+        sections: [2, 2, 0, 0],
+    };
+    let n_elem2 = (p_partial.seq_len * p_partial.n_heads * p_partial.head_dim) as usize;
+    let dummy_in2 = device
+        .alloc_buffer(n_elem2 * 4, DType::F32, vec![n_elem2])
+        .expect("dummy input2 alloc");
+    let dummy_out2 = device
+        .alloc_buffer(n_elem2 * 4, DType::F32, vec![n_elem2])
+        .expect("dummy output2 alloc");
+    let pos2 = device
+        .alloc_buffer(16, DType::I32, vec![4])
+        .expect("pos2 alloc");
+    let (params2, rope_params2, sections2) =
+        build_rope_multi_buffers(&device, p_partial).expect("build bufs2");
+    let mut enc2 = device.command_encoder().expect("enc2");
+    let res2 = mlx_native::ops::rope_multi::dispatch_rope_multi(
+        &mut enc2,
+        &mut registry,
+        device.metal_device(),
+        &dummy_in2,
+        &dummy_out2,
+        &pos2,
+        &params2,
+        &rope_params2,
+        &sections2,
+        p_partial,
+    );
+    assert!(
+        res2.is_err(),
+        "vision: rope_dim != head_dim must error"
+    );
+    let msg2 = format!("{:?}", res2.err().expect("err2 present"));
+    assert!(
+        msg2.contains("Vision") || msg2.contains("vision"),
+        "rope_dim error must mention Vision; got: {}",
+        msg2
+    );
 }
