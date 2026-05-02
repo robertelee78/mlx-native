@@ -52,6 +52,54 @@ pub enum RopeMultiMode {
     /// Interleaved multi-section RoPE; `sector % 3` cycles through 3 axes.
     /// Used by Qwen3.5 / Qwen3.6.
     Imrope = 40,
+    /// Vision multi-section RoPE for ViT 2-D positions (Qwen3-VL ViT block).
+    ///
+    /// Mode value `24` matches `GGML_ROPE_TYPE_VISION` in
+    /// `/opt/llama.cpp/ggml/include/ggml.h:253` and the per-section
+    /// `[yyyyxxxx]` layout described at `ggml.h:1840-1846`.
+    ///
+    /// # Layout
+    ///
+    /// Only the first two section counts (`s0 = y`, `s1 = x`) are used; the
+    /// last two are ignored. With `n_dims = head_dim / 2` and `sect_dims =
+    /// s0 + s1 = n_dims`, the rotated pairs partition as:
+    ///
+    /// ```text
+    /// pair_idx in [0,    s0)        -> axis 0 (y), local_p = pair_idx
+    /// pair_idx in [s0,   s0 + s1)   -> axis 1 (x), local_p = pair_idx - s0
+    /// ```
+    ///
+    /// # Per-section theta
+    ///
+    /// Unlike `Mrope` / `Imrope` which use a unified theta sequence across
+    /// all sections (`theta = pos[axis] * freq_base^(-2*pair_idx/rope_dim)`),
+    /// vision rope **restarts the theta exponent at every section boundary**:
+    ///
+    /// ```text
+    /// theta_scale = freq_base^(-2 / n_dims)             where n_dims = head_dim/2
+    /// theta       = pos[axis] * theta_scale^local_p
+    /// ```
+    ///
+    /// `local_p` is the index of the pair *within its section*, not the
+    /// global `pair_idx`. This per-section restart is what produces the
+    /// `[0123][0123]` exponent pattern documented at `ggml.h:1845-1846`.
+    ///
+    /// # No partial-rotary tail
+    ///
+    /// The CPU reference at `ggml-cpu/ops.cpp:5860` calls
+    /// `rotate_pairs(ne0, n_dims, ...)` (rotating *all* `head_dim/2` pairs)
+    /// and at `:5866` skips the partial-rotary fill loop when `is_vision`,
+    /// so the caller MUST supply `rope_dim == head_dim`.
+    ///
+    /// # Caller-side requirements
+    ///
+    /// - `rope_dim == head_dim` (validated; no partial-rotary support).
+    /// - `sections[0] + sections[1] == head_dim / 2` (validated; the last
+    ///   two sections are ignored but must be present in the buffer for
+    ///   binary-layout uniformity with `Mrope` / `Imrope`).
+    /// - `positions` buffer length still `4 * seq_len`; only axes 0 and 1
+    ///   are read.
+    Vision = 24,
 }
 
 /// Shape + config for a rope_multi dispatch.
@@ -94,6 +142,26 @@ fn validate(
             "rope_multi: freq_base must be finite and positive, got {}",
             p.freq_base
         )));
+    }
+    // Vision-mode requires every pair to rotate (no partial-rotary tail —
+    // see /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5803,5866) and the first
+    // two section counts must sum to n_dims = head_dim / 2 (last 2 ignored
+    // per ggml.h:1843-1846).
+    if p.mode == RopeMultiMode::Vision {
+        if p.rope_dim != p.head_dim {
+            return Err(MlxError::InvalidArgument(format!(
+                "rope_multi(Vision): rope_dim must equal head_dim (no partial-rotary tail in vision mode), got rope_dim={}, head_dim={}",
+                p.rope_dim, p.head_dim
+            )));
+        }
+        let n_dims = p.head_dim / 2;
+        let sect_sum = p.sections[0] + p.sections[1];
+        if sect_sum != n_dims {
+            return Err(MlxError::InvalidArgument(format!(
+                "rope_multi(Vision): sections[0] + sections[1] must equal head_dim/2 ({}), got {} + {} = {}",
+                n_dims, p.sections[0], p.sections[1], sect_sum
+            )));
+        }
     }
 
     let n_rows = (p.seq_len as usize) * (p.n_heads as usize);
