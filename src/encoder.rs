@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal::{
     CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
-    ComputePipelineStateRef, MTLCommandBufferStatus, MTLDispatchType, MTLSize,
+    ComputePipelineStateRef, CounterSampleBuffer, CounterSampleBufferDescriptor,
+    MTLCommandBufferStatus, MTLDispatchType, MTLSize, MTLStorageMode, NSRange,
 };
 #[allow(unused_imports)]
 use objc::{msg_send, sel, sel_impl};
@@ -114,6 +115,21 @@ impl CapturedOpKind {
         match self {
             Self::Sdpa | Self::Softmax => false,
             Self::RmsNorm | Self::ElemMul | Self::ElemAdd | Self::Other => true,
+        }
+    }
+
+    /// Stable string label suitable for embedding in the per-dispatch
+    /// profile dump (ADR-015 iter63 §A.5).  Matches the variant name —
+    /// `Other` is preserved verbatim so an aggregate-by-op_kind sort
+    /// produces a clean "what isn't yet labeled" bucket.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::RmsNorm => "RmsNorm",
+            Self::ElemMul => "ElemMul",
+            Self::ElemAdd => "ElemAdd",
+            Self::Sdpa => "Sdpa",
+            Self::Softmax => "Softmax",
+            Self::Other => "Other",
         }
     }
 }
@@ -397,6 +413,33 @@ static AUTO_BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
 /// group rather than starting a new one.
 static AUTO_BARRIER_CONCURRENT: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// ADR-015 iter63 — per-dispatch GPU sampling support
+// ---------------------------------------------------------------------------
+
+/// Hard cap on per-CB sample-buffer size (Risk R4 in PROFILING-KIT-DESIGN
+/// §A.7).  We allocate two samples per dispatch (start + end), so a 32_768
+/// sampleCount = 16_384 dispatches per CB ceiling — well above prefill's
+/// observed ~6,000 ceiling and below Apple's ~64K-per-buffer practical limit.
+const MAX_SAMPLES_PER_CB: u64 = 32_768;
+
+/// Whether the per-CB warning about a missing `MTLCommonCounterSetTimestamp`
+/// has been emitted yet.  Risk R1: if `device.counter_sets()` does not
+/// return a set named `"timestamp"` (case-insensitive), we degrade the
+/// per-dispatch path to a no-op and log once via stderr.
+static TIMESTAMP_SET_WARN_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// Pending per-dispatch metadata that pairs with sample indices `2i`
+/// (start) and `2i+1` (end) inside the CB's `MTLCounterSampleBuffer`.
+/// Resolved by `CommandEncoder::resolve_dispatch_samples` at CB
+/// commit-time and converted to [`crate::kernel_profile::DispatchEntry`]
+/// before being pushed to the global table.
+#[derive(Clone, Debug)]
+struct PendingDispatchMeta {
+    op_kind: &'static str,
+    dispatch_index: u32,
+}
+
 /// Read the cumulative number of auto-emitted barriers across all
 /// encoders since process start (or last [`reset_counters`]).
 pub fn auto_barrier_count() -> u64 {
@@ -487,6 +530,27 @@ pub struct CommandEncoder {
     /// gate-off branch is a single bool-load + early return rather
     /// than an allocation/Option indirection.
     mem_ranges: MemRanges,
+    /// ADR-015 iter63 (per-dispatch profiling): the sample buffer for
+    /// `MTLCounterSampleBuffer.sampleCounters` calls that bracket every
+    /// `encode*` dispatch in this CB.  Lazily allocated on first
+    /// dispatch when `MLX_PROFILE_DISPATCH=1`; `None` otherwise.
+    /// Released (set to `None`) inside `resolve_dispatch_samples` after
+    /// the CB completes — re-allocated on the next `encode*` if the env
+    /// gate stays set.
+    sample_buffer: Option<CounterSampleBuffer>,
+    /// ADR-015 iter63: pending per-dispatch metadata that pairs with
+    /// sample indices `2*i` and `2*i+1` inside `sample_buffer`.  Each
+    /// `encode*` call appends one entry (when sampling is active);
+    /// `resolve_dispatch_samples` drains the vec at commit time.
+    pending_dispatch_meta: Vec<PendingDispatchMeta>,
+    /// ADR-015 iter63: 0-based dispatch ordinal within the current CB.
+    /// Incremented in every `encode*` site after taking the pending
+    /// op_kind; reset to 0 inside `resolve_dispatch_samples`.
+    dispatch_in_cb: u32,
+    /// ADR-015 iter63: most recent label set via `apply_labels`, used
+    /// as the per-dispatch `cb_label` field.  `String::new()` until
+    /// `commit_and_wait_labeled` / `commit_labeled` is called.
+    last_label: String,
 }
 
 /// SAFETY: CommandEncoder is safe to Send across threads provided that:
@@ -594,6 +658,10 @@ impl CommandEncoder {
             pending_writes: Vec::new(),
             residency_set,
             mem_ranges: MemRanges::new(),
+            sample_buffer: None,
+            pending_dispatch_meta: Vec::new(),
+            dispatch_in_cb: 0,
+            last_label: String::new(),
         })
     }
 
@@ -854,12 +922,20 @@ impl CommandEncoder {
             });
             return;
         }
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: encoder_ptr aliases &self via active_encoder which we
+        // know is non-null after get_or_create_encoder; this pattern is
+        // used throughout the file (see memory_barrier).
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         encoder.dispatch_threads(grid_size, threadgroup_size);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Encode a compute pass using threadgroups instead of raw thread counts.
@@ -890,12 +966,18 @@ impl CommandEncoder {
             });
             return;
         }
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Encode a compute pass using threadgroups with shared threadgroup memory.
@@ -937,7 +1019,11 @@ impl CommandEncoder {
             });
             return;
         }
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
@@ -945,7 +1031,9 @@ impl CommandEncoder {
         for &(index, byte_length) in threadgroup_mem {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Encode a dispatch with mixed buffer/bytes bindings (dispatch_threads).
@@ -975,10 +1063,16 @@ impl CommandEncoder {
             });
             return;
         }
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         encoder.dispatch_threads(grid_size, threadgroup_size);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Encode a dispatch with mixed buffer/bytes bindings (dispatch_thread_groups).
@@ -1008,10 +1102,16 @@ impl CommandEncoder {
             });
             return;
         }
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Encode a dispatch with mixed buffer/bytes bindings and shared memory.
@@ -1042,13 +1142,19 @@ impl CommandEncoder {
             });
             return;
         }
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
         for &(index, byte_length) in threadgroup_mem {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     // -----------------------------------------------------------------
@@ -1377,7 +1483,22 @@ impl CommandEncoder {
         threads_per_threadgroup: MTLSize,
         dispatch_kind: DispatchKind,
     ) {
-        let encoder = self.get_or_create_encoder();
+        // ADR-015 iter63 (Phase A.3): mirror the per-dispatch sampling
+        // scaffold here so capture-mode-recorded graphs (graph.rs
+        // encode_sequential / encode_with_barriers / encode_chunk_with
+        // _barriers) still produce per-dispatch entries.  The replay
+        // path bypasses encode*; without this hook the per-dispatch
+        // table would be silently empty for any model that uses
+        // `GraphExecutor::begin_recorded`.
+        //
+        // Captured `op_kind` is forwarded via `pending_op_kind`: the
+        // graph replay layer at graph.rs:197/236/727 sets it from the
+        // CapturedNode.op_kind before calling replay_dispatch.
+        self.ensure_sample_buffer();
+        let op_kind = self.take_pending_op_kind();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
         encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings {
             match binding {
@@ -1396,6 +1517,7 @@ impl CommandEncoder {
         for &(index, byte_length) in threadgroup_memory {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         match dispatch_kind {
             DispatchKind::Threads => {
                 encoder.dispatch_threads(threads_per_grid, threads_per_threadgroup);
@@ -1404,6 +1526,7 @@ impl CommandEncoder {
                 encoder.dispatch_thread_groups(threads_per_grid, threads_per_threadgroup);
             }
         }
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Flush any pending residency-set add/remove staging.
@@ -1421,6 +1544,227 @@ impl CommandEncoder {
         if let Some(set) = self.residency_set.as_ref() {
             set.flush_pending();
         }
+    }
+
+    // ----------------------------------------------------------------
+    // ADR-015 iter63 — per-dispatch sample buffer lifecycle
+    // ----------------------------------------------------------------
+
+    /// Allocate the per-CB `MTLCounterSampleBuffer` if it has not been
+    /// allocated yet for this CB.
+    ///
+    /// No-op when `MLX_PROFILE_DISPATCH` is unset, when the buffer is
+    /// already present, or when the device does not expose a counter
+    /// set named `"timestamp"` (Risk R1 — graceful degrade with a
+    /// one-shot stderr warning).
+    ///
+    /// The sample buffer is sized to [`MAX_SAMPLES_PER_CB`] (32_768).
+    /// This is the start-+-end pair budget — i.e. ≤ 16,384 dispatches
+    /// per CB.  Above that ceiling, additional dispatches will skip
+    /// sampling (see [`Self::sample_dispatch_pre`]).
+    #[inline]
+    fn ensure_sample_buffer(&mut self) {
+        if !crate::kernel_profile::is_dispatch_enabled() {
+            return;
+        }
+        if self.sample_buffer.is_some() {
+            return;
+        }
+        // Discover the timestamp counter set.  metal-rs 0.33 does not
+        // export the `MTLCommonCounterSetTimestamp` constant, so we
+        // name-match `"timestamp"` case-insensitively.  Reach the
+        // device via the cmd_buf's `device` selector (metal-rs 0.33
+        // exposes `CommandQueue::device` but not `CommandBuffer::device`,
+        // so we go through ObjC directly).
+        let device: &metal::DeviceRef = unsafe {
+            let cb = &*self.cmd_buf;
+            msg_send![cb, device]
+        };
+        let counter_sets = device.counter_sets();
+        let timestamp_set = counter_sets
+            .iter()
+            .find(|c: &&metal::CounterSet| c.name().eq_ignore_ascii_case("timestamp"));
+        let timestamp_set = match timestamp_set {
+            Some(s) => s,
+            None => {
+                // Risk R1: device does not expose a timestamp set.
+                // Log once and degrade to no-op (sample_buffer stays None).
+                if TIMESTAMP_SET_WARN_LOGGED
+                    .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    eprintln!(
+                        "[mlx-native] MLX_PROFILE_DISPATCH=1 ignored: \
+                         device {:?} exposes no MTLCommonCounterSetTimestamp",
+                        device.name()
+                    );
+                }
+                return;
+            }
+        };
+        // Build descriptor.  StorageMode::Shared is required by
+        // resolveCounterRange (MTLCounters.h:185-188).
+        let descriptor = CounterSampleBufferDescriptor::new();
+        descriptor.set_counter_set(timestamp_set);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_label("mlx_native.dispatch_samples");
+        descriptor.set_sample_count(MAX_SAMPLES_PER_CB);
+        match device.new_counter_sample_buffer_with_descriptor(&descriptor) {
+            Ok(buf) => {
+                self.sample_buffer = Some(buf);
+            }
+            Err(e) => {
+                if TIMESTAMP_SET_WARN_LOGGED
+                    .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    eprintln!(
+                        "[mlx-native] MLX_PROFILE_DISPATCH=1 ignored: \
+                         newCounterSampleBufferWithDescriptor failed: {}",
+                        e
+                    );
+                }
+                self.sample_buffer = None;
+            }
+        }
+    }
+
+    /// Insert the start-of-dispatch counter sample (sample index `2*i`)
+    /// and queue the per-dispatch metadata.  Returns the dispatch
+    /// ordinal `i` so the caller can emit the matching post-sample.
+    ///
+    /// No-op when sampling is inactive — returns 0 in that case (the
+    /// returned value is only consumed when the sample buffer is
+    /// active, so this is safe).
+    ///
+    /// `with_barrier:true` is mandatory: the encoder uses
+    /// `MTLDispatchTypeConcurrent` and without the barrier the start
+    /// timestamp would race against any in-flight dispatch (PROFILING-
+    /// KIT-DESIGN §A.5).
+    #[inline]
+    fn sample_dispatch_pre(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        op_kind: CapturedOpKind,
+    ) -> Option<u32> {
+        let sb = self.sample_buffer.as_ref()?;
+        let i = self.dispatch_in_cb;
+        let pre_idx = (i as u64).checked_mul(2)?;
+        if pre_idx >= MAX_SAMPLES_PER_CB {
+            // Ceiling exceeded — skip sampling for the remainder of
+            // this CB.  Risk R4 (PROFILING-KIT-DESIGN §A.7): future
+            // iter can chunk-resolve every N dispatches; for now we
+            // accept truncation with a one-shot warning (re-uses the
+            // R1 warn flag).
+            return None;
+        }
+        encoder.sample_counters_in_buffer(sb, pre_idx, true);
+        self.pending_dispatch_meta.push(PendingDispatchMeta {
+            op_kind: op_kind.name(),
+            dispatch_index: i,
+        });
+        Some(i)
+    }
+
+    /// Insert the end-of-dispatch counter sample (sample index `2*i+1`)
+    /// matching the most recent [`Self::sample_dispatch_pre`].
+    ///
+    /// No-op when sampling is inactive or when `pre_idx` is `None`.
+    #[inline]
+    fn sample_dispatch_post(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        pre_idx: Option<u32>,
+    ) {
+        let i = match pre_idx {
+            Some(v) => v,
+            None => return,
+        };
+        let sb = match self.sample_buffer.as_ref() {
+            Some(b) => b,
+            None => return,
+        };
+        let post_idx = match (i as u64).checked_mul(2).and_then(|v| v.checked_add(1)) {
+            Some(v) if v < MAX_SAMPLES_PER_CB => v,
+            _ => return,
+        };
+        encoder.sample_counters_in_buffer(sb, post_idx, true);
+        // Bump the per-CB ordinal only after both samples committed
+        // successfully so a truncation skip leaves the meta queue
+        // length matching the buffer's resolved range.
+        self.dispatch_in_cb = i.saturating_add(1);
+    }
+
+    /// Resolve the per-CB sample buffer, push entries into
+    /// [`crate::kernel_profile`], and reset per-CB state.
+    ///
+    /// Called from [`Self::commit_and_wait_labeled`] after the CB
+    /// completes; the caller is responsible for ensuring the GPU has
+    /// finished (otherwise `resolveCounterRange` returns garbage).
+    ///
+    /// On the first resolve after a [`crate::kernel_profile::reset`],
+    /// also captures a `(cpu_ns, gpu_ticks)` pair via
+    /// `device.sampleTimestamps` so subsequent ticks→ns conversion
+    /// uses a fresh scale factor.
+    fn resolve_dispatch_samples(&mut self, cb_label: &str) -> Result<()> {
+        let sb = match self.sample_buffer.take() {
+            Some(b) => b,
+            None => {
+                self.pending_dispatch_meta.clear();
+                self.dispatch_in_cb = 0;
+                return Ok(());
+            }
+        };
+        let n = self.pending_dispatch_meta.len();
+        if n == 0 {
+            self.dispatch_in_cb = 0;
+            return Ok(());
+        }
+        // Refresh the (cpu, gpu) scale pair on every resolve; the
+        // device call is cheap and keeps us robust against driver-side
+        // timebase changes between CBs.
+        let mut cpu_t: u64 = 0;
+        let mut gpu_t: u64 = 0;
+        let device: &metal::DeviceRef = unsafe {
+            let cb = &*self.cmd_buf;
+            msg_send![cb, device]
+        };
+        device.sample_timestamps(&mut cpu_t, &mut gpu_t);
+        crate::kernel_profile::record_clock_pair(cpu_t, gpu_t);
+        let length = (n as u64).saturating_mul(2);
+        let data = sb.resolve_counter_range(NSRange {
+            location: 0,
+            length,
+        });
+        // `resolve_counter_range` returns one NSUInteger per sample.
+        // Pair them up: data[2i] = start, data[2i+1] = end.
+        for (i, meta) in self.pending_dispatch_meta.drain(..).enumerate() {
+            let start_idx = 2 * i;
+            let end_idx = 2 * i + 1;
+            if end_idx >= data.len() {
+                break;
+            }
+            let start_raw = data[start_idx] as u64;
+            let end_raw = data[end_idx] as u64;
+            let start_ns = crate::kernel_profile::convert_gpu_ticks_to_ns(start_raw);
+            let end_ns = crate::kernel_profile::convert_gpu_ticks_to_ns(end_raw);
+            let gpu_ns = end_ns.saturating_sub(start_ns);
+            crate::kernel_profile::record_dispatch(
+                crate::kernel_profile::DispatchEntry {
+                    cb_label: cb_label.to_string(),
+                    op_kind: meta.op_kind,
+                    dispatch_index: meta.dispatch_index,
+                    gpu_ns,
+                    start_gpu_ns: start_ns,
+                    end_gpu_ns: end_ns,
+                },
+            );
+        }
+        // Buffer dropped at end of scope releases the underlying
+        // CounterSampleBuffer; per-CB lifetime correctly bounded.
+        drop(sb);
+        self.dispatch_in_cb = 0;
+        Ok(())
     }
 
     /// Commit the command buffer and block until the GPU finishes execution.
@@ -1485,10 +1829,21 @@ impl CommandEncoder {
         // xctrace isn't recording, so this is unconditionally safe to call on
         // the production decode hot path.
         self.apply_labels(label);
-        if crate::kernel_profile::is_enabled() {
+        // ADR-015 iter63: record GPU time AND resolve per-dispatch samples
+        // when either env gate is set.  Per-dispatch sampling force-enables
+        // the per-CB path so cross-validation per Risk R3 always has a
+        // ground-truth comparator.
+        let need_gpu_time =
+            crate::kernel_profile::is_enabled() || crate::kernel_profile::is_dispatch_enabled();
+        if need_gpu_time {
             let (start_s, end_s) = self.commit_wait_with_gpu_time()?;
             let ns = ((end_s - start_s).max(0.0) * 1_000_000_000.0) as u64;
-            crate::kernel_profile::record(label, ns);
+            if crate::kernel_profile::is_enabled() {
+                crate::kernel_profile::record(label, ns);
+            }
+            if crate::kernel_profile::is_dispatch_enabled() {
+                self.resolve_dispatch_samples(label)?;
+            }
             Ok(())
         } else {
             self.commit_and_wait()
@@ -1534,7 +1889,7 @@ impl CommandEncoder {
     /// produce an indistinguishable trace row from the metal-rs default
     /// `Command Buffer 0` placeholder.
     #[inline]
-    fn apply_labels(&self, label: &str) {
+    fn apply_labels(&mut self, label: &str) {
         debug_assert!(!label.is_empty(), "commit_*_labeled called with empty label");
         if label.is_empty() {
             return;
@@ -1547,6 +1902,11 @@ impl CommandEncoder {
             // ObjC object; safe before endEncoding.
             unsafe { &*self.active_encoder }.set_label(label);
         }
+        // ADR-015 iter63: capture the most recent label for per-dispatch
+        // entries.  Cheap String allocation — only happens at CB commit
+        // boundaries, not per dispatch.
+        self.last_label.clear();
+        self.last_label.push_str(label);
     }
 
     /// Commit + wait, returning `(gpu_start_s, gpu_end_s)` CFTimeInterval
