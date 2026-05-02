@@ -57,6 +57,7 @@ mod residency;
 pub mod gguf;
 pub mod kernel_profile;
 pub mod graph;
+pub mod metal_capture;
 pub mod ops;
 pub mod turboquant;
 pub mod weight;

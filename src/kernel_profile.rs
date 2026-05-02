@@ -30,6 +30,20 @@
 //! the encoder under `MTLDispatchTypeConcurrent`. The per-CB sum will
 //! therefore be ≥ the matching `MLX_PROFILE_CB` total.  Acceptable
 //! drift: ≤ 5%; > 10% indicates a clock-domain or sampling bug.
+//!
+//! ### Apple Silicon caveat (NEW Risk discovered iter63 impl)
+//!
+//! Verified runtime: `AGXG17XFamilyComputeContext` (M-series, macOS 26)
+//! supports counter sampling **only** at
+//! `MTLCounterSamplingPoint::AtStageBoundary`, never
+//! `AtDispatchBoundary`.  The latter is required for sampling between
+//! dispatches inside a persistent compute encoder (which mlx-native
+//! uses to amortize ~800 encoder create/end cycles per forward pass).
+//! On such hardware, `MLX_PROFILE_DISPATCH=1` gracefully degrades to a
+//! no-op + one-shot stderr warning; only the per-CB path
+//! (`MLX_PROFILE_CB=1`) populates.  The kit is forward-compatible for
+//! AMD/Intel discrete and any future Apple silicon that reports
+//! `AtDispatchBoundary` support.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

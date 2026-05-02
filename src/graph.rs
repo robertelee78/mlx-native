@@ -876,6 +876,17 @@ impl GraphExecutor {
     /// [`GraphSession::finish`] to commit and wait.
     pub fn begin(&self) -> Result<GraphSession<'_>> {
         let encoder = self.device.command_encoder()?;
+        // ADR-015 iter63 (Phase B): start a programmatic capture if
+        // MLX_METAL_CAPTURE+METAL_CAPTURE_ENABLED are set.  No-op when
+        // unset; one-shot per process so subsequent forward passes do
+        // not pay the env-check cost more than once.
+        let metal_capture = {
+            let mut c = crate::metal_capture::MetalCapture::from_env(&self.device);
+            if let Some(ref mut cap) = c {
+                cap.begin();
+            }
+            c
+        };
         Ok(GraphSession {
             encoder,
             device: &self.device,
@@ -885,6 +896,7 @@ impl GraphExecutor {
             total_dispatches: 0,
             group_sizes: [0; 8],
             recording: false,
+            metal_capture,
         })
     }
 
@@ -901,6 +913,14 @@ impl GraphExecutor {
     pub fn begin_recorded(&self) -> Result<GraphSession<'_>> {
         let mut encoder = self.device.command_encoder()?;
         encoder.start_capture();
+        // ADR-015 iter63 (Phase B): see GraphExecutor::begin().
+        let metal_capture = {
+            let mut c = crate::metal_capture::MetalCapture::from_env(&self.device);
+            if let Some(ref mut cap) = c {
+                cap.begin();
+            }
+            c
+        };
         Ok(GraphSession {
             encoder,
             device: &self.device,
@@ -910,6 +930,7 @@ impl GraphExecutor {
             total_dispatches: 0,
             group_sizes: [0; 8],
             recording: true,
+            metal_capture,
         })
     }
 
@@ -1016,6 +1037,16 @@ pub struct GraphSession<'a> {
     group_sizes: [u32; 8],
     /// Whether this session was created in capture/record mode.
     recording: bool,
+    /// ADR-015 iter63 (Phase B): optional Metal frame capture wrapping
+    /// this session's GPU work.  Populated by `MetalCapture::from_env`
+    /// when `MLX_METAL_CAPTURE=<path>` + `METAL_CAPTURE_ENABLED=1` are
+    /// both set in the process env AND the process-global one-shot
+    /// latch has not yet flipped.  `None` in all other cases (default
+    /// production path).  Capture scope is begun in
+    /// [`GraphExecutor::begin`] / [`GraphExecutor::begin_recorded`]
+    /// and ended in [`Self::finish`] / [`Self::commit`] BEFORE the
+    /// CB is committed, so all enqueued CBs land inside the trace.
+    metal_capture: Option<crate::metal_capture::MetalCapture>,
 }
 
 impl<'a> GraphSession<'a> {
@@ -1616,6 +1647,23 @@ impl<'a> GraphSession<'a> {
             }
         }
         self.encoder.commit();
+        // ADR-015 iter63 (Phase B): close the capture window AFTER
+        // commit (so the CB is recorded inside the trace) but BEFORE
+        // returning the encoder (so the trace finalizes promptly).
+        // `MTLCaptureManager.stopCapture` marks the recording
+        // boundary at exactly this point.  CBs committed BEFORE this
+        // line are in the trace; any work done by the caller through
+        // the returned encoder is NOT.  This matches llama.cpp's
+        // ggml-metal-context.m:608 pattern (`stopCapture` after the
+        // last `commit + waitUntilCompleted`).
+        //
+        // Note: for the async commit() path, the GPU may still be
+        // executing the CB when stopCapture fires.  Apple's
+        // MTLCaptureManager is documented to flush in-flight work
+        // into the trace before finalizing the file.
+        if let Some(mut cap) = self.metal_capture.take() {
+            cap.end();
+        }
         self.encoder
     }
 
