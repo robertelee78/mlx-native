@@ -68,8 +68,8 @@ pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{
     auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
-    cmd_buf_count, dispatch_count, reset_counters, sync_count, CapturedNode, CommandEncoder,
-    DispatchKind, KernelArg, RecordedBinding,
+    cmd_buf_count, dispatch_count, reset_counters, sync_count, CapturedNode, CapturedOpKind,
+    CommandEncoder, DispatchKind, KernelArg, RecordedBinding,
 };
 pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
 pub use error::{MlxError, Result};

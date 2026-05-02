@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use metal::{
     CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
     ComputePipelineStateRef, CounterSampleBuffer, CounterSampleBufferDescriptor,
-    MTLCommandBufferStatus, MTLDispatchType, MTLSize, MTLStorageMode, NSRange,
+    MTLCommandBufferStatus, MTLCounterSamplingPoint, MTLDispatchType, MTLSize, MTLStorageMode,
+    NSRange,
 };
 #[allow(unused_imports)]
 use objc::{msg_send, sel, sel_impl};
@@ -417,11 +418,28 @@ static AUTO_BARRIER_CONCURRENT: AtomicU64 = AtomicU64::new(0);
 // ADR-015 iter63 — per-dispatch GPU sampling support
 // ---------------------------------------------------------------------------
 
-/// Hard cap on per-CB sample-buffer size (Risk R4 in PROFILING-KIT-DESIGN
-/// §A.7).  We allocate two samples per dispatch (start + end), so a 32_768
-/// sampleCount = 16_384 dispatches per CB ceiling — well above prefill's
-/// observed ~6,000 ceiling and below Apple's ~64K-per-buffer practical limit.
-const MAX_SAMPLES_PER_CB: u64 = 32_768;
+/// Hard cap on per-CB sample-buffer sample count (Risk R4 in
+/// PROFILING-KIT-DESIGN §A.7).
+///
+/// Empirically verified on Apple Silicon (M-series, macOS 26): the
+/// underlying `MTLCounterSampleBufferDescriptor.sampleCount` is bounded
+/// by a per-buffer **byte-size** limit of 32768 B.  At 8 bytes per
+/// `MTLCounterResultTimestamp` sample that maps to a sample-count
+/// ceiling of `32_768 / 8 = 4096`.  We allocate two samples per
+/// dispatch (start + end), so this ceiling = 2048 dispatches per CB.
+/// Decode CBs (~120 dispatches) fit comfortably; long prefill CBs
+/// (~6K dispatches per design §A.7) will truncate after 2048 — see
+/// [`Self::sample_dispatch_pre`] for the truncation path.  Future
+/// iter can chunk-resolve every 2K dispatches.
+///
+/// The original design constant of 32_768 (PROFILING-KIT-DESIGN §A.7)
+/// was based on Apple's documented ~64K-per-buffer "practical" limit,
+/// but the measured constraint on this hardware is the 32 KB byte
+/// budget.  Setting the budget below that would underutilize the
+/// buffer; setting it above causes
+/// `newCounterSampleBufferWithDescriptor` to fail with `Invalid sample
+/// buffer length: <bytes> B. Expected range: 8 -> 32768`.
+const MAX_SAMPLES_PER_CB: u64 = 4096;
 
 /// Whether the per-CB warning about a missing `MTLCommonCounterSetTimestamp`
 /// has been emitted yet.  Risk R1: if `device.counter_sets()` does not
@@ -1580,6 +1598,45 @@ impl CommandEncoder {
             let cb = &*self.cmd_buf;
             msg_send![cb, device]
         };
+        // ADR-015 iter63 — Apple Silicon hardware constraint (NEW Risk
+        // discovered at impl time, supersedes design §A.7).  M-series
+        // GPUs (verified: AGXG17XFamilyComputeContext = M5 Max series,
+        // macOS 26) only support counter sampling AtStageBoundary —
+        // i.e. between compute *passes*, not between dispatches inside
+        // a persistent compute encoder.  Calling
+        // `sampleCountersInBuffer:atSampleIndex:withBarrier:` on such
+        // hardware aborts with `failed assertion ... not supported on
+        // this device`.  The persistent-encoder design (mlx-native uses
+        // ONE compute encoder per CB to amortize ~800 encoder
+        // create/end cycles per forward pass — see `get_or_create_
+        // encoder` docstring) is incompatible with stage-boundary-only
+        // sampling, so on Apple Silicon we degrade per-dispatch
+        // profiling to a no-op and log once.  Per-CB profiling is
+        // unaffected (it uses MTLCommandBuffer.GPUStartTime/
+        // GPUEndTime, which are always available).
+        //
+        // Future: if Apple ever ships AtDispatchBoundary support on
+        // Apple Silicon, this branch becomes a true cap check.  For
+        // now, the kit infrastructure is in place; only the sample-
+        // point cooperates.
+        if !device.supports_counter_sampling(MTLCounterSamplingPoint::AtDispatchBoundary) {
+            if TIMESTAMP_SET_WARN_LOGGED
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                eprintln!(
+                    "[mlx-native] MLX_PROFILE_DISPATCH=1 ignored: \
+                     device {:?} does NOT support \
+                     MTLCounterSamplingPointAtDispatchBoundary \
+                     (Apple Silicon limitation; only AtStageBoundary \
+                     is supported, which is incompatible with the \
+                     persistent compute-encoder pattern). \
+                     MLX_PROFILE_CB=1 still produces per-CB GPU times.",
+                    device.name()
+                );
+            }
+            return;
+        }
         let counter_sets = device.counter_sets();
         let timestamp_set = counter_sets
             .iter()

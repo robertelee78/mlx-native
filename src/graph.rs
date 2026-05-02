@@ -209,8 +209,15 @@ impl ComputeGraph {
                     threads_per_threadgroup,
                     threadgroup_memory,
                     dispatch_kind,
+                    op_kind,
                     ..
                 } => {
+                    // ADR-015 iter63 (Phase A.3): forward captured op_kind
+                    // into replay_dispatch via pending_op_kind so the
+                    // per-dispatch profile entries from a recorded graph
+                    // (GraphExecutor::begin_recorded path) are tagged with
+                    // the same op label as direct-dispatch encoding.
+                    encoder.set_op_kind(*op_kind);
                     encoder.replay_dispatch(
                         pipeline,
                         bindings,
@@ -248,6 +255,7 @@ impl ComputeGraph {
                     dispatch_kind,
                     reads,
                     writes,
+                    op_kind,
                     ..
                 } => {
                     let has_ranges = !reads.is_empty() || !writes.is_empty();
@@ -259,6 +267,8 @@ impl ComputeGraph {
                     if has_ranges {
                         tracker.add(reads, writes);
                     }
+                    // ADR-015 iter63 (Phase A.3): see encode_sequential note.
+                    encoder.set_op_kind(*op_kind);
                     encoder.replay_dispatch(
                         pipeline,
                         bindings,
@@ -746,6 +756,7 @@ fn encode_chunk_with_barriers(nodes: &[CapturedNode], encoder: &mut CommandEncod
                 dispatch_kind,
                 reads,
                 writes,
+                op_kind,
                 ..
             } => {
                 let has_ranges = !reads.is_empty() || !writes.is_empty();
@@ -757,6 +768,10 @@ fn encode_chunk_with_barriers(nodes: &[CapturedNode], encoder: &mut CommandEncod
                 if has_ranges {
                     tracker.add(reads, writes);
                 }
+                // ADR-015 iter63 (Phase A.3): forward captured op_kind so the
+                // per-dispatch profile dump groups dual-buffer chunked replay
+                // entries by the same op_kind label as direct dispatch.
+                encoder.set_op_kind(*op_kind);
                 encoder.replay_dispatch(
                     pipeline,
                     bindings,
