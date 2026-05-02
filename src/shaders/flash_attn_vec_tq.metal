@@ -23,6 +23,15 @@
 //     Each block stored with independent RMS norm. Decode: scale_b = norm_b * inv_sqrt(head_dim).
 //     In decode kernel for DK=512: loop ii=0,1 → block0 (norm0), ii=2,3 → block1 (norm1).
 
+// ADR-005 iter-223a (2026-05-01): match flash_attn_vec.metal:9 FOR_UNROLL pattern
+// originally added in ADR-009 Phase 3A. This file forked from flash_attn_vec.metal
+// before that landed; backporting now to close the ~14pp peer-perf gap (gemma-26B-dwq
+// cn=1: 0.86× → expected 0.91-0.94× per Worker T's iter-223 porting plan). Loops
+// with constant compile-time bounds (C=32, DK4/NL, DV4/NL) get the full-unroll hint;
+// thread-stride loops (i += NW) keep plain `for`. Identical macro to upstream
+// llama.cpp ggml-metal.metal:6666-7095 + our own dense flash_attn_vec.metal:9.
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -230,7 +239,7 @@ kernel void flash_attn_vec_tq_impl(
     // Zero the output accumulator.
     // Each thread owns its SIMD lane.
     so4 += tiisg;
-    for (short i = 0; i < DV4 / NL; ++i) {
+    FOR_UNROLL (short i = 0; i < DV4 / NL; ++i) {
         so4[i * NL] = float4(0.0f);
     }
 
@@ -316,7 +325,7 @@ kernel void flash_attn_vec_tq_impl(
             //   Only applies when DK == 512; DK == 256 uses single norm (NORMS_PER_POS=1).
             constexpr short NORMS_PER_POS_K = DK / 256;
 
-            for (short cc = 0; cc < C; ++cc) {
+            FOR_UNROLL (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) {
                     mqk[cc] = 0.0f;
@@ -333,7 +342,7 @@ kernel void flash_attn_vec_tq_impl(
                                  + kv_pos * NORMS_PER_POS_K;
 
                 float partial = 0.0f;
-                for (short ii = 0; ii < DK4 / NL; ++ii) {
+                FOR_UNROLL (short ii = 0; ii < DK4 / NL; ++ii) {
                     // For DK=256: NORMS_PER_POS_K=1, always block 0.
                     // For DK=512: ii=0,1 → block 0 (norm[+0]); ii=2,3 → block 1 (norm[+1]).
                     short blk = (NORMS_PER_POS_K > 1) ? (ii / (DK4 / NL / 2)) : 0;
@@ -373,7 +382,7 @@ kernel void flash_attn_vec_tq_impl(
             ss[tiisg] = vs;
 
             // Rescale previous output accumulation.
-            for (short ii = 0; ii < DV4 / NL; ++ii) {
+            FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                 so4[ii * NL] *= ms;
             }
         }
@@ -383,7 +392,7 @@ kernel void flash_attn_vec_tq_impl(
         // ---- O = O + softmax_weights * V (in rotated domain) ----
         {
             float4 lo[DV4 / NL];
-            for (short ii = 0; ii < DV4 / NL; ++ii) {
+            FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                 lo[ii] = float4(0.0f);
             }
 
@@ -395,7 +404,7 @@ kernel void flash_attn_vec_tq_impl(
             // Same block mapping as K: ii=0,1 → block0, ii=2,3 → block1.
             constexpr short NORMS_PER_POS_V = DV / 256;
 
-            for (short cc = 0; cc < C; ++cc) {
+            FOR_UNROLL (short cc = 0; cc < C; ++cc) {
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) continue;
 
@@ -408,7 +417,7 @@ kernel void flash_attn_vec_tq_impl(
 
                 float softmax_weight = ss[cc];
 
-                for (short ii = 0; ii < DV4 / NL; ++ii) {
+                FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                     // For DV=256: NORMS_PER_POS_V=1, always block 0.
                     // For DV=512: ii=0,1 → block 0; ii=2,3 → block 1.
                     short blk = (NORMS_PER_POS_V > 1) ? (ii / (DV4 / NL / 2)) : 0;
@@ -423,7 +432,7 @@ kernel void flash_attn_vec_tq_impl(
                 }
             }
 
-            for (short ii = 0; ii < DV4 / NL; ++ii) {
+            FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
                 so4[ii * NL] += lo[ii];
             }
         }
