@@ -506,6 +506,24 @@ fn issue_metal_buffer_barrier(encoder: &ComputeCommandEncoderRef) {
 /// ```
 pub struct CommandEncoder {
     cmd_buf: CommandBuffer,
+    /// Owned clone of the originating command queue.
+    ///
+    /// ADR-019 Phase 0b iter89e2-A: stored at `new_with_residency` time so
+    /// downstream lifecycle code (e.g. `EncoderSession::reset_for_next_stage`
+    /// in Phase 0b-B) can open a fresh `CommandBuffer` from the same queue
+    /// after a non-blocking `commit_stage()`. metal-rs 0.33's
+    /// `CommandQueue` type is `Send + Sync` via `foreign_obj_type!`
+    /// (`/Users/robert/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/metal-0.33.0/src/lib.rs:179`),
+    /// so adding this field preserves the existing unsafe `Send` impl
+    /// on `CommandEncoder` (declared below).
+    ///
+    /// Not consumed in iter89e2-A — the field is present to back the
+    /// 0b-B `reset_for_next_stage()` operation. Holding a clone here
+    /// (rather than a `&CommandQueue` borrow) avoids a lifetime parameter
+    /// on `CommandEncoder` that would propagate through every consumer
+    /// in mlx-native and hf2q.
+    #[allow(dead_code)] // 0b-B will read this; field is the load-bearing structural change for iter89e2-A.
+    queue: CommandQueue,
     // SAFETY marker: see unsafe Send impl below.
     /// Raw pointer to the persistent compute encoder.
     /// Non-null when a compute pass is active.
@@ -669,6 +687,7 @@ impl CommandEncoder {
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             cmd_buf,
+            queue: queue.to_owned(),
             active_encoder: std::ptr::null(),
             capture: None,
             pending_op_kind: CapturedOpKind::Other,
