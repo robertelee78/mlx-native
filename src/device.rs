@@ -9,6 +9,7 @@ use metal::{CommandQueue, Device, MTLResourceOptions};
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
 use crate::encoder::CommandEncoder;
+use crate::encoder_session::EncoderSession;
 use crate::error::{MlxError, Result};
 use crate::residency::{macos_15_or_newer, residency_disabled_by_env, ResidencySet};
 
@@ -84,6 +85,34 @@ impl MlxDevice {
     /// flush is a no-op.
     pub fn command_encoder(&self) -> Result<CommandEncoder> {
         CommandEncoder::new_with_residency(&self.queue, self.residency_set.clone())
+    }
+
+    /// Create an [`EncoderSession`] (ADR-019 Phase 0b iter89e2-A — bare
+    /// struct) for one transformer stage's worth of GPU work.
+    ///
+    /// Gated on `HF2Q_ENCODER_SESSION=1` (default OFF). When the gate is
+    /// unset, returns `Ok(None)` so callers can fall back to
+    /// [`Self::command_encoder`] without an extra conditional. When set,
+    /// returns `Ok(Some(EncoderSession))` carrying a fresh
+    /// [`CommandEncoder`] — same construction path as `command_encoder()`,
+    /// just wrapped in the session shell.
+    ///
+    /// In iter89e2-A no production code path consumes this method; it
+    /// exists so the env-gate has a callable factory and the lifecycle
+    /// tests have a public entry point. Phase 1+ migrations
+    /// (`forward_gpu.rs`, `gpu_full_attn.rs`, `gpu_delta_net.rs`) opt in
+    /// per-call site.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from the underlying `EncoderSession::new`
+    /// — currently infallible past metal-rs's `new_command_buffer`,
+    /// preserved for future-proofing.
+    pub fn encoder_session(&self) -> Result<Option<EncoderSession>> {
+        if !EncoderSession::env_enabled() {
+            return Ok(None);
+        }
+        EncoderSession::new(&self.device, &self.queue, self.residency_set.clone()).map(Some)
     }
 
     /// Allocate a new GPU buffer with `StorageModeShared`.

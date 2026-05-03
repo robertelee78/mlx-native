@@ -51,6 +51,7 @@ mod buffer_pool;
 mod device;
 mod dtypes;
 mod encoder;
+mod encoder_session;
 mod kernel_registry;
 mod mem_ranges;
 mod residency;
@@ -72,6 +73,7 @@ pub use encoder::{
     cmd_buf_count, dispatch_count, reset_counters, sync_count, CapturedNode, CapturedOpKind,
     CommandEncoder, DispatchKind, KernelArg, RecordedBinding,
 };
+pub use encoder_session::EncoderSession;
 pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
 pub use error::{MlxError, Result};
 pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
