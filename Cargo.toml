@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "bench_chunk_scan_pipeline"
 harness = false
+
+[[bench]]
+name = "bench_mtl_event_cost"
+harness = false
