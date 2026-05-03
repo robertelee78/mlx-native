@@ -417,7 +417,37 @@ impl MlxBufferPool {
         }
 
         let key = buffer_key(buffer);
-        if !self.resident_buffers.contains_key(&key) {
+
+        // 2026-05-03 — HF2Q_PROFILE_RESIDENCY_ABORT instrumentation gate.
+        // Falsifies/confirms the host-pointer-collision hypothesis behind
+        // the SIGABRT inside `-[IOGPUMetalResidencySet addAllocation:]`
+        // (6 macOS DiagnosticReports captured 2026-05-02 22:30 → 2026-05-03 07:15,
+        // all identical stack: abort ← addAllocation ← register_residency_allocation
+        // ← MlxBufferPool::alloc ← qwen35 forward-pass alloc site after long
+        // decode). When set, prints one line per call:
+        //   [RESIDENCY] N=<resident_count> key=<host_ptr> mtl=<obj_ptr> dup=<bool>
+        // dup=true means the host_ptr (`buffer.contents() as usize`) collides
+        // with a previously-registered allocation, possibly representing a
+        // DIFFERENT MTLBuffer ARC (Apple recycled the host page). In that
+        // case the existing dedup HashMap returns "skip" and Apple sees the
+        // new MTLBuffer as never-added — which is fine. The interesting case
+        // is dup=false but Apple aborts on the addAllocation: that means the
+        // MTLBuffer is somehow already-known to Apple's set despite our
+        // HashMap saying it isn't. Logged BEFORE the addAllocation so the
+        // log line precedes any abort.
+        let mtl_ptr = (&**buffer as *const metal::BufferRef as *const std::ffi::c_void) as usize;
+        let dup = self.resident_buffers.contains_key(&key);
+        if std::env::var("HF2Q_PROFILE_RESIDENCY_ABORT").is_ok() {
+            eprintln!(
+                "[RESIDENCY] N={} key=0x{:x} mtl=0x{:x} dup={}",
+                self.resident_buffers.len(),
+                key,
+                mtl_ptr,
+                dup,
+            );
+        }
+
+        if !dup {
             device_set.add_allocation(buffer);
             self.resident_buffers.insert(key, buffer.clone());
             return Ok(true);
