@@ -112,7 +112,7 @@ impl MlxDevice {
         if !EncoderSession::env_enabled() {
             return Ok(None);
         }
-        EncoderSession::new(&self.queue, self.residency_set.clone()).map(Some)
+        EncoderSession::new(&self.device, &self.queue, self.residency_set.clone()).map(Some)
     }
 
     /// Allocate a new GPU buffer with `StorageModeShared`.

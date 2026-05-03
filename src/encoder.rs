@@ -517,12 +517,13 @@ pub struct CommandEncoder {
     /// so adding this field preserves the existing unsafe `Send` impl
     /// on `CommandEncoder` (declared below).
     ///
-    /// Not consumed in iter89e2-A — the field is present to back the
-    /// 0b-B `reset_for_next_stage()` operation. Holding a clone here
-    /// (rather than a `&CommandQueue` borrow) avoids a lifetime parameter
-    /// on `CommandEncoder` that would propagate through every consumer
-    /// in mlx-native and hf2q.
-    #[allow(dead_code)] // 0b-B will read this; field is the load-bearing structural change for iter89e2-A.
+    /// ADR-019 Phase 0b iter89e2-B (CONSUMED): read by
+    /// [`Self::reset_command_buffer`] to spawn a fresh `CommandBuffer`
+    /// after a non-blocking `commit*` so `EncoderSession::reset_for_next_stage`
+    /// can chain stage CBs without re-constructing the encoder. Holding a
+    /// clone here (rather than a `&CommandQueue` borrow) avoids a lifetime
+    /// parameter on `CommandEncoder` that would propagate through every
+    /// consumer in mlx-native and hf2q.
     queue: CommandQueue,
     // SAFETY marker: see unsafe Send impl below.
     /// Raw pointer to the persistent compute encoder.
@@ -2052,6 +2053,178 @@ impl CommandEncoder {
     #[inline]
     pub fn metal_command_buffer(&self) -> &CommandBuffer {
         &self.cmd_buf
+    }
+
+    /// Borrow the residency set bound to this encoder, if one exists.
+    ///
+    /// ADR-019 Phase 0b iter89e2-B: exposed `pub(crate)` so
+    /// [`crate::EncoderSession`] can route caller-driven add/remove
+    /// requests through the same `Arc<ResidencySetInner>` the encoder
+    /// itself flushes at every `commit*` boundary. The single-set
+    /// invariant from `device.rs::MlxDevice` is preserved — both the
+    /// encoder's `flush_residency_pending` and the session's delegated
+    /// add/remove operate on the SAME residency set. Returns `None` when
+    /// residency sets are disabled (HF2Q_NO_RESIDENCY=1, macOS<15, or
+    /// `CommandEncoder::new` from a residency-less queue).
+    #[inline]
+    pub(crate) fn residency_set(&self) -> Option<&ResidencySet> {
+        self.residency_set.as_ref()
+    }
+
+    /// Reopen `cmd_buf` with a fresh `CommandBuffer` from the originating queue.
+    ///
+    /// ADR-019 Phase 0b iter89e2-B: enables multi-stage chaining. After a
+    /// non-blocking `commit*` has handed the prior CB to Metal, this method
+    /// rotates `cmd_buf` to a freshly-allocated CB on the same queue and
+    /// resets every per-CB scratch field so the next dispatch is encoded
+    /// onto the new CB.
+    ///
+    /// # Caller contract
+    ///
+    /// Only valid when `active_encoder.is_null()` (the persistent compute
+    /// encoder must have been ended via `end_active_encoder()`, which both
+    /// `commit_and_wait` and `commit` already do). Calling this method
+    /// while a compute encoder is open would leak the encoder (the new
+    /// `cmd_buf` does not own it) and trip Metal's "Command encoder
+    /// released without endEncoding" assertion when the prior `cmd_buf`
+    /// drops. Callers are [`crate::EncoderSession::reset_for_next_stage`]
+    /// only — the session has already committed before invoking this.
+    ///
+    /// # F2 / F11 / F12 fence preservation
+    ///
+    /// - **F2 — residency-rescission**: this method does NOT re-flush
+    ///   the residency set. The prior `commit*` already flushed; staged
+    ///   add/remove since then will flush at the next `commit*` on the
+    ///   new CB. The residency-set Arc clone is preserved.
+    /// - **F11 — zero-init alloc_buffer**: untouched (no buffer allocs).
+    /// - **F12 — `HF2Q_FORCE_SERIAL_DISPATCH`**: the new CB will lazily
+    ///   open its compute encoder via `get_or_create_encoder`, which
+    ///   re-reads the env var; the falsification probe still fires on
+    ///   the new CB.
+    ///
+    /// # Counter semantics
+    ///
+    /// Bumps `CMD_BUF_COUNT` exactly once per call, matching the
+    /// `new_with_residency` accounting. Does NOT bump `SYNC_COUNT` (no
+    /// commit/wait happens here).
+    pub(crate) fn reset_command_buffer(&mut self) {
+        debug_assert!(
+            self.active_encoder.is_null(),
+            "reset_command_buffer called with an active compute encoder \
+             — caller must commit (which calls end_active_encoder) first"
+        );
+        let cmd_buf = if unretained_refs_enabled() {
+            self.queue
+                .new_command_buffer_with_unretained_references()
+                .to_owned()
+        } else {
+            self.queue.new_command_buffer().to_owned()
+        };
+        CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.cmd_buf = cmd_buf;
+        // Per-CB scratch state — every field that's documented as being
+        // bounded by a CB lifetime resets here.
+        self.active_encoder = std::ptr::null();
+        self.dispatch_in_cb = 0;
+        self.last_label.clear();
+        self.pending_dispatch_meta.clear();
+        // `mem_ranges` is a per-CB barrier inference state; clearing on
+        // CB rotation matches the `commit_and_wait` post-commit invariant
+        // (any new CB starts with no pending hazards). The field's own
+        // `clear` is invoked via `MemRanges::default` here to avoid
+        // exposing internals.
+        self.mem_ranges = MemRanges::new();
+        // `sample_buffer` is dropped explicitly inside
+        // `resolve_dispatch_samples` after a CB completes; we leave it
+        // in whatever state the prior commit left it (typically `None`
+        // after `commit_and_wait` finishes). A stale `Some` here would
+        // be visible only under `MLX_PROFILE_DISPATCH=1` which fires its
+        // own one-shot warning; not worth a special case.
+        // `capture` (if Some) persists across CB rotation — capture mode
+        // accumulates across stages within a session by design.
+        // `pending_op_kind` / `pending_reads` / `pending_writes` only
+        // hold tags for the NEXT dispatch and are consumed when that
+        // dispatch fires — leaving them as-is is correct.
+    }
+
+    /// Encode an `MTLSharedEvent` wait at `value` on the current CB.
+    ///
+    /// ADR-019 Phase 0b iter89e2-B: pairs with [`Self::encode_signal_event`]
+    /// to express the inter-CB ordering D3 stage boundaries need. The new
+    /// CB's GPU work blocks until the prior CB's signal lands on the same
+    /// event at >= `value`.
+    ///
+    /// # Caller contract
+    ///
+    /// Must be called BEFORE any compute encoder is opened on the new
+    /// CB — the wait is a CB-level op that must precede every dispatch
+    /// in the new CB to actually order them. [`crate::EncoderSession::reset_for_next_stage`]
+    /// fires this immediately after `reset_command_buffer`, before any
+    /// dispatch lazy-opens the encoder.
+    #[inline]
+    pub(crate) fn encode_wait_for_event(&self, event: &metal::EventRef, value: u64) {
+        debug_assert!(
+            self.active_encoder.is_null(),
+            "encode_wait_for_event called with an open compute encoder \
+             — wait must precede the first dispatch on the new CB"
+        );
+        self.cmd_buf.encode_wait_for_event(event, value);
+    }
+
+    /// End the active compute encoder, encode a stage-fence signal, and
+    /// commit the CB non-blocking — atomically from the caller's view.
+    ///
+    /// ADR-019 Phase 0b iter89e2-B: this is the helper
+    /// [`crate::EncoderSession::fence_stage`] uses to thread the signal
+    /// between the encoder-end and the CB-commit boundaries that
+    /// `commit_labeled` would otherwise serialize. Sequence:
+    ///
+    /// 1. End the persistent compute encoder (so `encodeSignalEvent:` is
+    ///    encoded at CB-level, not encoder-level — Metal validates that
+    ///    `encodeSignalEvent:` outside any encoder pass is the only
+    ///    legal placement).
+    /// 2. Apply `label` (when `Some`) to the CB. Note: at this point
+    ///    the encoder is already ended, so the encoder's own
+    ///    `setLabel:` is a no-op site — only the CB label propagates.
+    ///    `last_label` and per-dispatch profiling keep working as
+    ///    documented.
+    /// 3. Encode `encodeSignalEvent:event:value:new_value` at CB-level.
+    /// 4. Flush the residency-set pending staging (matches the
+    ///    `commit_labeled` / `commit` flush at encoder.rs:2004).
+    /// 5. Commit the CB non-blocking (matches `commit()` at
+    ///    encoder.rs:2026).
+    ///
+    /// # Counter semantics
+    ///
+    /// Bumps `SYNC_COUNT` zero times (non-blocking). Bumps
+    /// `CMD_BUF_COUNT` zero times (no new CB allocated here —
+    /// [`Self::reset_command_buffer`] does that on the next stage).
+    ///
+    /// # Errors
+    ///
+    /// Infallible (matches `commit()` semantics — errors surface only
+    /// at `wait_until_completed`).
+    pub(crate) fn fence_signal_and_commit(
+        &mut self,
+        event: &metal::EventRef,
+        new_value: u64,
+        label: Option<&str>,
+    ) {
+        // Step 1: end the active compute encoder. encode_signal_event's
+        // debug_assert requires this be done first.
+        self.end_active_encoder();
+        // Step 2: apply the CB label so xctrace MST attribution still
+        // works on the fenced CB. apply_labels' debug_assert against
+        // empty labels matches commit_labeled's semantics.
+        if let Some(l) = label {
+            self.apply_labels(l);
+        }
+        // Step 3: encode the signal at CB-level.
+        self.cmd_buf.encode_signal_event(event, new_value);
+        // Step 4 + 5: same as commit() — flush residency staging, then
+        // hand the CB to Metal.
+        self.flush_residency_pending();
+        self.cmd_buf.commit();
     }
 }
 
