@@ -1491,6 +1491,220 @@ fn test_gpu_bf16_d256_determinism() {
     eprintln!("test_gpu_bf16_d256_determinism: PASS — two runs byte-identical");
 }
 
+/// VALUE-DRIVEN REPRO of production dim=10-NaN bug.
+///
+/// Loads actual layer-3 Q/K/V f32 dumps from /tmp/hf2q-dump/30654/ produced
+/// by hf2q running Qwen3.6-35B-A3B-dwq48 with the chat-template-rendered "Hi"
+/// prompt (qL=2 visible tokens; first FA layer at index 3).  Production
+/// dump shows 32 NaN at exactly dim=10 in every (seq, head) of `fa_sdpa_out`
+/// (a per-element write-pattern, not a row-pattern).
+///
+/// Synthetic random-data test at the same dim shape PASSES — bug is
+/// value-dependent.  This test feeds the EXACT production values to the
+/// kernel.  Skipped if dumps are absent so it doesn't break ordinary `cargo
+/// test` runs in fresh checkouts.
+///
+/// Dumps are seq-major `[seq, head, d]` (Q) and `[seq, kv_h, d]` (K, V);
+/// kernel expects head-major `[head, seq, d]` so we transpose before
+/// uploading — matching what `apply_flash_attn_prefill_seq_major_into`
+/// does via `permute_021_bf16`.
+#[test]
+#[ignore = "loads on-disk dumps; run via `cargo test --release ... -- --ignored`"]
+fn test_repro_qwen35_layer3_seq2_real_qkv_dim10_nan() {
+    use std::path::Path;
+
+    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+        .unwrap_or_else(|_| "/tmp/hf2q-dump/30654".to_string());
+
+    let q_path = Path::new(&dump_dir).join("step0000_layer003_fa_q_rope.f32");
+    let k_path = Path::new(&dump_dir).join("step0000_layer003_fa_k_rope.f32");
+    let v_path = Path::new(&dump_dir).join("step0000_layer003_fa_v_flat.f32");
+    if !q_path.exists() || !k_path.exists() || !v_path.exists() {
+        eprintln!("test_repro_qwen35_layer3: dumps absent at {dump_dir} — SKIP");
+        return;
+    }
+
+    fn read_f32(path: &Path) -> Vec<f32> {
+        let bytes = std::fs::read(path).expect("read dump");
+        let mut out = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        out
+    }
+
+    let q_seq = read_f32(&q_path);
+    let k_seq = read_f32(&k_path);
+    let v_seq = read_f32(&v_path);
+
+    let batch = 1; let h = 16; let kv_h = 2; let ql = 2; let kl = 2; let d = 256;
+    assert_eq!(q_seq.len(), ql * h * d, "q dump len");
+    assert_eq!(k_seq.len(), kl * kv_h * d, "k dump len");
+    assert_eq!(v_seq.len(), kl * kv_h * d, "v dump len");
+
+    // Verify all inputs finite (sanity — they were finite in the dump).
+    let q_nan = q_seq.iter().filter(|v| !v.is_finite()).count();
+    let k_nan = k_seq.iter().filter(|v| !v.is_finite()).count();
+    let v_nan = v_seq.iter().filter(|v| !v.is_finite()).count();
+    assert_eq!(q_nan, 0, "q dump has {q_nan} non-finite values");
+    assert_eq!(k_nan, 0, "k dump has {k_nan} non-finite values");
+    assert_eq!(v_nan, 0, "v dump has {v_nan} non-finite values");
+
+    // Permute seq-major [seq, h, d] → head-major [h, seq, d].
+    fn permute_seq_major_to_head_major(seq_major: &[f32], seq: usize, h: usize, d: usize) -> Vec<f32> {
+        let mut hm = vec![0.0_f32; seq * h * d];
+        for s in 0..seq {
+            for hh in 0..h {
+                for dd in 0..d {
+                    hm[hh * seq * d + s * d + dd] = seq_major[s * h * d + hh * d + dd];
+                }
+            }
+        }
+        hm
+    }
+    let q_hm = permute_seq_major_to_head_major(&q_seq, ql, h, d);
+    let k_hm = permute_seq_major_to_head_major(&k_seq, kl, kv_h, d);
+    let v_hm = permute_seq_major_to_head_major(&v_seq, kl, kv_h, d);
+
+    let q_bf = f32_to_bf16(&q_hm);
+    let k_bf = f32_to_bf16(&k_hm);
+    let v_bf = f32_to_bf16(&v_hm);
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // KEY EXPERIMENT: pre-fill output buffer with NaN to detect
+    // positions the kernel does NOT write to.  If 32 NaN remain at
+    // dim=10 across all (head, seq), the kernel has a coverage gap.
+    let q_elems = batch * h * ql * d;
+    let kv_elems = batch * kv_h * kl * d;
+
+    let q_buf = alloc_bf16(&device, q_elems, "Q");
+    let k_buf = alloc_bf16(&device, kv_elems, "K");
+    let v_buf = alloc_bf16(&device, kv_elems, "V");
+    let mut out_buf = alloc_bf16(&device, q_elems, "out");
+
+    fill_bf16_buffer(&q_buf, &q_bf);
+    fill_bf16_buffer(&k_buf, &k_bf);
+    fill_bf16_buffer(&v_buf, &v_bf);
+    // Fill out_buf with bf16 NaN sentinel.
+    let nan_bf16 = bf16::from_bits(0x7FC0); // canonical bf16 NaN
+    let nan_pattern: Vec<bf16> = vec![nan_bf16; q_elems];
+    fill_bf16_buffer(&out_buf, &nan_pattern);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: true,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut encoder, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, None, &mut out_buf, &params,
+    ).expect("FA dispatch");
+    encoder.commit_and_wait().expect("commit");
+
+    let out_bf16 = read_bf16_buffer(&out_buf, q_elems);
+    let gpu_out = bf16_to_f32(&out_bf16);
+
+    // Output is head-major [h, seq, d]; permute to seq-major to match the
+    // production dump layout for downstream comparison.
+    let mut out_seq_major = vec![0.0_f32; ql * h * d];
+    for hh in 0..h {
+        for s in 0..ql {
+            for dd in 0..d {
+                out_seq_major[s * h * d + hh * d + dd] = gpu_out[hh * ql * d + s * d + dd];
+            }
+        }
+    }
+
+    let nan_count = out_seq_major.iter().filter(|v| v.is_nan()).count();
+    let inf_count = out_seq_major.iter().filter(|v| v.is_infinite()).count();
+    eprintln!("real-qkv repro: total={} nan={} inf={}", out_seq_major.len(), nan_count, inf_count);
+    if nan_count > 0 {
+        let mut dim_hist = std::collections::BTreeMap::new();
+        for (i, v) in out_seq_major.iter().enumerate() {
+            if v.is_nan() {
+                let dim = i % d;
+                *dim_hist.entry(dim).or_insert(0_usize) += 1;
+            }
+        }
+        eprintln!("NaN by dim: {:?}", dim_hist);
+    }
+
+    // Compare to production dump for cross-validation.
+    let prod_path = Path::new(&dump_dir).join("step0000_layer003_fa_sdpa_out.f32");
+    if prod_path.exists() {
+        let prod = read_f32(&prod_path);
+        assert_eq!(prod.len(), out_seq_major.len(), "prod dump size mismatch");
+        let prod_nan = prod.iter().filter(|v| v.is_nan()).count();
+        eprintln!("production fa_sdpa_out NaN count: {}", prod_nan);
+
+        // Categorise differences.
+        let mut bit_match = 0_usize;
+        let mut close_match = 0_usize;     // same up to bf16 rounding tolerance
+        let mut diff_finite = 0_usize;     // both finite, materially different
+        let mut prod_nan_mine_finite = 0_usize;
+        let mut mine_nan_prod_finite = 0_usize;
+        let mut both_nan = 0_usize;
+        let mut sample_diffs: Vec<(usize, f32, f32)> = Vec::new();
+        for (i, (mine, p)) in out_seq_major.iter().zip(prod.iter()).enumerate() {
+            if mine.is_nan() && p.is_nan() {
+                both_nan += 1;
+            } else if p.is_nan() {
+                prod_nan_mine_finite += 1;
+                if sample_diffs.len() < 6 {
+                    sample_diffs.push((i, *mine, *p));
+                }
+            } else if mine.is_nan() {
+                mine_nan_prod_finite += 1;
+            } else if mine.to_bits() == p.to_bits() {
+                bit_match += 1;
+            } else {
+                let abs_diff = (mine - p).abs();
+                let rel_tol = 5e-3 * mine.abs().max(p.abs()).max(1e-6);
+                if abs_diff < rel_tol.max(5e-3) {
+                    close_match += 1;
+                } else {
+                    diff_finite += 1;
+                    if sample_diffs.len() < 12 {
+                        sample_diffs.push((i, *mine, *p));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "diff: bit_match={bit_match} close_match={close_match} \
+             diff_finite={diff_finite} prod_nan_mine_finite={prod_nan_mine_finite} \
+             mine_nan_prod_finite={mine_nan_prod_finite} both_nan={both_nan}"
+        );
+        for (i, m, p) in &sample_diffs {
+            let s = i / (h * d);
+            let hh = (i % (h * d)) / d;
+            let dim = i % d;
+            eprintln!("  idx={} (s={},h={},dim={}) mine={} prod={}", i, s, hh, dim, m, p);
+        }
+    }
+
+    // Assertion at the end: if production reproduces here, this test fails
+    // and pins the bug.  If the test now passes (no NaN), the bug is
+    // somewhere else in the wrapper (cast / permute / arena layout).
+    assert_eq!(
+        nan_count, 0,
+        "kernel produced {nan_count} NaN with REAL production Q/K/V — \
+         bug reproduces directly in the kernel"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // § 6  GPU CORRECTNESS — BF16 D=512 (NSG=8, llama.cpp-derived kernel)
 // ─────────────────────────────────────────────────────────────────────────────
