@@ -1705,6 +1705,177 @@ fn test_repro_qwen35_layer3_seq2_real_qkv_dim10_nan() {
     );
 }
 
+/// FULL-PIPELINE REPRO — replicates hf2q's wrapper sequence in mlx-native:
+/// F32 inputs → GPU cast F32→BF16 → permute_021_bf16 (seq-major→head-major)
+/// → flash_attn_prefill_bf16_d256 → permute_021_bf16_to_f32 → check NaN.
+/// Mirrors `apply_flash_attn_prefill_seq_major_into` byte-for-byte.
+///
+/// This test isolates whether the production NaN at dim=10 is introduced
+/// somewhere in the cast → permute → kernel → permute_back chain when run
+/// inside a SINGLE CommandEncoder with intra-CB barriers.
+#[test]
+#[ignore = "loads on-disk dumps; run via `--ignored`"]
+fn test_repro_full_pipeline_qwen35_layer3_seq2() {
+    use mlx_native::ops::elementwise::{cast, CastDirection};
+    use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32};
+    use std::path::Path;
+
+    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+        .unwrap_or_else(|_| "/tmp/hf2q-dump/30654".to_string());
+    let q_path = Path::new(&dump_dir).join("step0000_layer003_fa_q_rope.f32");
+    let k_path = Path::new(&dump_dir).join("step0000_layer003_fa_k_rope.f32");
+    let v_path = Path::new(&dump_dir).join("step0000_layer003_fa_v_flat.f32");
+    if !q_path.exists() || !k_path.exists() || !v_path.exists() {
+        eprintln!("full-pipeline repro: dumps absent — SKIP");
+        return;
+    }
+
+    fn read_f32(p: &Path) -> Vec<f32> {
+        let bytes = std::fs::read(p).expect("read");
+        bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+    let q_seq_f32 = read_f32(&q_path);
+    let k_seq_f32 = read_f32(&k_path);
+    let v_seq_f32 = read_f32(&v_path);
+
+    let batch = 1; let h = 16; let kv_h = 2; let ql = 2; let kl = 2; let d = 256;
+    assert_eq!(q_seq_f32.len(), ql * h * d);
+    assert_eq!(k_seq_f32.len(), kl * kv_h * d);
+    assert_eq!(v_seq_f32.len(), kl * kv_h * d);
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    fn alloc_f32(device: &MlxDevice, elems: usize) -> mlx_native::MlxBuffer {
+        device.alloc_buffer(elems * 4, DType::F32, vec![elems]).expect("alloc f32")
+    }
+    fn fill_f32(buf: &mut mlx_native::MlxBuffer, data: &[f32]) {
+        let dst = buf.as_mut_slice::<f32>().expect("as_mut_slice f32");
+        dst[..data.len()].copy_from_slice(data);
+    }
+
+    // F32 input buffers (seq-major).
+    let mut q_f32 = alloc_f32(&device, ql * h * d);
+    let mut k_f32 = alloc_f32(&device, kl * kv_h * d);
+    let mut v_f32 = alloc_f32(&device, kl * kv_h * d);
+    fill_f32(&mut q_f32, &q_seq_f32);
+    fill_f32(&mut k_f32, &k_seq_f32);
+    fill_f32(&mut v_f32, &v_seq_f32);
+
+    // BF16 staging (seq-major) and head-major scratch.
+    let q_bf16_seq = alloc_bf16(&device, ql * h * d, "q_bf16_seq");
+    let k_bf16_seq = alloc_bf16(&device, kl * kv_h * d, "k_bf16_seq");
+    let v_bf16_seq = alloc_bf16(&device, kl * kv_h * d, "v_bf16_seq");
+    let q_bf16_hm  = alloc_bf16(&device, ql * h * d, "q_bf16_hm");
+    let k_bf16_hm  = alloc_bf16(&device, kl * kv_h * d, "k_bf16_hm");
+    let v_bf16_hm  = alloc_bf16(&device, kl * kv_h * d, "v_bf16_hm");
+    let mut out_bf16_hm = alloc_bf16(&device, ql * h * d, "out_bf16_hm");
+    let mut out_f32 = alloc_f32(&device, ql * h * d);
+
+    // CRITICAL: pre-fill all scratch buffers with bf16 NaN sentinel so any
+    // unwritten position downstream stands out.
+    let nan_bf = bf16::from_bits(0x7FC0);
+    let nan_pat: Vec<bf16> = vec![nan_bf; ql * h * d];
+    fill_bf16_buffer(&q_bf16_seq, &nan_pat[..ql * h * d]);
+    fill_bf16_buffer(&q_bf16_hm,  &nan_pat[..ql * h * d]);
+    fill_bf16_buffer(&out_bf16_hm, &nan_pat[..ql * h * d]);
+    let nan_pat_kv: Vec<bf16> = vec![nan_bf; kl * kv_h * d];
+    fill_bf16_buffer(&k_bf16_seq, &nan_pat_kv);
+    fill_bf16_buffer(&k_bf16_hm,  &nan_pat_kv);
+    fill_bf16_buffer(&v_bf16_seq, &nan_pat_kv);
+    fill_bf16_buffer(&v_bf16_hm,  &nan_pat_kv);
+    let nan_pat_f32: Vec<f32> = vec![f32::NAN; ql * h * d];
+    fill_f32(&mut out_f32, &nan_pat_f32);
+
+    let mut enc = device.command_encoder().expect("enc");
+
+    // Step 1+2: Q F32 → BF16 → permute_021 to head-major.
+    cast(&mut enc, &mut registry, device.metal_device(),
+        &q_f32, &q_bf16_seq, ql * h * d, CastDirection::F32ToBF16)
+        .expect("cast Q");
+    enc.memory_barrier();
+    permute_021_bf16(&mut enc, &mut registry, device.metal_device(),
+        &q_bf16_seq, &q_bf16_hm, ql, h, d).expect("perm Q");
+
+    cast(&mut enc, &mut registry, device.metal_device(),
+        &k_f32, &k_bf16_seq, kl * kv_h * d, CastDirection::F32ToBF16)
+        .expect("cast K");
+    enc.memory_barrier();
+    permute_021_bf16(&mut enc, &mut registry, device.metal_device(),
+        &k_bf16_seq, &k_bf16_hm, kl, kv_h, d).expect("perm K");
+
+    cast(&mut enc, &mut registry, device.metal_device(),
+        &v_f32, &v_bf16_seq, kl * kv_h * d, CastDirection::F32ToBF16)
+        .expect("cast V");
+    enc.memory_barrier();
+    permute_021_bf16(&mut enc, &mut registry, device.metal_device(),
+        &v_bf16_seq, &v_bf16_hm, kl, kv_h, d).expect("perm V");
+
+    enc.memory_barrier();
+
+    let scale = 1.0 / (d as f32).sqrt();
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: true,
+    };
+    dispatch_flash_attn_prefill_bf16_d256(
+        &mut enc, &device, &mut registry,
+        &q_bf16_hm, &k_bf16_hm, &v_bf16_hm,
+        None, &mut out_bf16_hm, &params,
+    ).expect("FA dispatch");
+
+    enc.memory_barrier();
+
+    permute_021_bf16_to_f32(&mut enc, &mut registry, device.metal_device(),
+        &out_bf16_hm, &out_f32, h, ql, d).expect("perm out");
+
+    enc.commit_and_wait().expect("commit");
+
+    let out_slice = out_f32.as_slice::<f32>().expect("as_slice f32");
+    let mut out_vec = vec![0.0_f32; ql * h * d];
+    out_vec.copy_from_slice(&out_slice[..ql * h * d]);
+
+    let nan_count = out_vec.iter().filter(|v| v.is_nan()).count();
+    let inf_count = out_vec.iter().filter(|v| v.is_infinite()).count();
+    eprintln!("full-pipeline: total={} nan={} inf={}", out_vec.len(), nan_count, inf_count);
+
+    if nan_count > 0 {
+        let mut dim_hist = std::collections::BTreeMap::new();
+        for (i, v) in out_vec.iter().enumerate() {
+            if v.is_nan() {
+                let dim = i % d;
+                *dim_hist.entry(dim).or_insert(0_usize) += 1;
+            }
+        }
+        eprintln!("NaN by dim: {:?}", dim_hist);
+    }
+
+    // Compare against the production dump.
+    let prod_path = Path::new(&dump_dir).join("step0000_layer003_fa_sdpa_out.f32");
+    if prod_path.exists() {
+        let prod = read_f32(&prod_path);
+        if prod.len() == out_vec.len() {
+            let bit_match = out_vec.iter().zip(prod.iter())
+                .filter(|(a, b)| a.to_bits() == b.to_bits()).count();
+            let both_nan = out_vec.iter().zip(prod.iter())
+                .filter(|(a, b)| a.is_nan() && b.is_nan()).count();
+            eprintln!("vs prod: bit_match={bit_match} both_nan={both_nan} total={}", prod.len());
+        }
+    }
+
+    assert_eq!(nan_count, 0,
+        "full-pipeline produced {nan_count} NaN — bug reproduces in mlx-native space");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // § 6  GPU CORRECTNESS — BF16 D=512 (NSG=8, llama.cpp-derived kernel)
 // ─────────────────────────────────────────────────────────────────────────────
