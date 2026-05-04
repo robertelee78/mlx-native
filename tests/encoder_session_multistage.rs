@@ -882,3 +882,124 @@ fn test_session_arena_lifetime_under_fence_no_rescission() {
         "device usable after F2 adversarial session drop"
     );
 }
+
+// ===================================================================
+// Test 6 — iter90b borrowed-`&mut EncoderSession` multi-stage chain
+// ===================================================================
+//
+// Validates the borrowed-session pattern that iter90b's hf2q-side
+// `LayerEncoder<'sess>` will use across the per-layer loop.  Mirrors the
+// pseudocode in iter90b spec §2.3:
+//
+//   let mut sess = device.encoder_session()?.expect("env=1");
+//   for stage_idx in 0..N {
+//       {
+//           // borrow sess for this stage; drop borrow at end of block
+//           dispatch via sess.encoder() ...
+//           sess.fence_stage(...)?;
+//           sess.reset_for_next_stage()?;
+//       }
+//   }
+//   sess.commit_and_wait()?;
+//
+// PASS criterion (iter90b spec §2.3 line 250):
+//   `fence_value == N`
+//   `wait_count == N`   ← N because the loop calls reset after EVERY fence
+//                          (including the last), and commit_and_wait drains
+//                          the post-reset CB (which has the wait encoded).
+//   no panic
+//
+// Note vs `encoder_session_cb_count_smoke` shape: cb_count_smoke does NOT
+// reset after the last fence (5 fences + 4 resets); that test's PASS shape
+// is `wait_count == N-1`.  THIS test resets after every fence (including
+// the last) per spec §2.3 expectation of `wait_count == N`.
+#[test]
+fn test_session_borrowed_across_n_stages() {
+    let _guard = acquire_test_lock();
+
+    if !EncoderSession::env_enabled() {
+        eprintln!(
+            "[test_session_borrowed_across_n_stages] SKIP — HF2Q_ENCODER_SESSION not set to \"1\""
+        );
+        return;
+    }
+
+    const N: usize = 5;
+    let device = MlxDevice::new().expect("MlxDevice::new");
+    let mut registry = KernelRegistry::new();
+
+    let n_elems = 4usize;
+    let byte_len = n_elems * std::mem::size_of::<f32>();
+    let mut a = device
+        .alloc_buffer(byte_len, DType::F32, vec![n_elems])
+        .expect("a");
+    let mut b = device
+        .alloc_buffer(byte_len, DType::F32, vec![n_elems])
+        .expect("b");
+    let out = device
+        .alloc_buffer(byte_len, DType::F32, vec![n_elems])
+        .expect("out");
+    a.as_mut_slice::<f32>()
+        .unwrap()
+        .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+    b.as_mut_slice::<f32>()
+        .unwrap()
+        .copy_from_slice(&[10.0, 20.0, 30.0, 40.0]);
+
+    let mut sess = device
+        .encoder_session()
+        .expect("encoder_session() Ok")
+        .expect("Some under HF2Q_ENCODER_SESSION=1");
+
+    // N stages.  After EACH fence we reset (including the last), then
+    // commit_and_wait drains the post-reset CB.  This is the spec §2.3
+    // "wait_count == N" path.
+    for stage_idx in 0..N {
+        // Block scope mirrors hf2q-side `LayerEncoder<'sess>` borrow that
+        // drops at end of stage iteration — `sess` remains alive at scope
+        // exit, ready for the next iteration's re-borrow.
+        {
+            // Borrow sess.encoder() — analogous to LayerEncoder::Sessioned
+            // re-borrowing through &mut self in hf2q.
+            mlx_native::ops::elementwise::elementwise_add(
+                sess.encoder(),
+                &mut registry,
+                device.metal_device(),
+                &a,
+                &b,
+                &out,
+                n_elems,
+                DType::F32,
+            )
+            .expect("dispatch");
+
+            let label = format!("borrowed.stage{stage_idx}");
+            sess.fence_stage(Some(label.as_str()))
+                .expect("fence_stage Ok");
+            sess.reset_for_next_stage()
+                .expect("reset_for_next_stage Ok");
+        }
+    }
+
+    // Drain the final post-reset CB (which holds an encoded wait for the
+    // last fence value).  This is the spec §2.3 line 248 terminal
+    // `commit_and_wait()` — N waits total because every fence had a paired
+    // reset.
+    sess.commit_and_wait().expect("terminal commit_and_wait");
+
+    let fence_val = sess.fence_value();
+    let wait_count = sess.wait_count();
+
+    eprintln!("borrowed.fence_value={fence_val}");
+    eprintln!("borrowed.wait_count={wait_count}");
+
+    assert_eq!(
+        fence_val, N as u64,
+        "fence_value must equal N={N} (one per fence_stage)"
+    );
+    assert_eq!(
+        wait_count, N as u64,
+        "wait_count must equal N={N} when reset is called after every fence \
+         (including the last); spec §2.3 expectation"
+    );
+}

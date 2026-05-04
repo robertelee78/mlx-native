@@ -237,6 +237,35 @@ pub struct EncoderSession {
     /// `reset_for_next_stage` so a subsequent `commit_stage` (no fence)
     /// does not spuriously emit a wait on the next reset.
     fence_pending: bool,
+
+    /// Per-session count of `encodeWaitForEvent` calls actually emitted
+    /// inside [`Self::reset_for_next_stage`].
+    ///
+    /// Symmetric counterpart to `event_value` (the signal-side high-water
+    /// mark) — `wait_count` is the wait-side scoreboard. Bumped exactly
+    /// once each time `reset_for_next_stage` finds `fence_pending == true`
+    /// and routes through `inner.encode_wait_for_event`. Read-only via
+    /// [`Self::wait_count`]; never mutated by control flow (introspection
+    /// only — does NOT widen F1/F2/F11/F12 windows).
+    ///
+    /// iter90b §2 H1b proof: the multi-stage chain test asserts this
+    /// equals `(num_stages - 1)` for an N-stage chain (one wait per
+    /// reset; the first stage's CB never had a prior signal to wait on).
+    wait_count: u64,
+
+    /// Value of the most recent `encodeWaitForEvent` actually emitted
+    /// inside [`Self::reset_for_next_stage`].
+    ///
+    /// Mirrors the relationship between `event_value` (signal-side) and
+    /// the value passed to `inner.encode_wait_for_event`. Starts at 0
+    /// (no wait yet emitted); each successful wait sets this to the
+    /// `value` argument. Read-only via [`Self::wait_value`]; pure
+    /// introspection (does NOT widen F1/F2/F11/F12 windows).
+    ///
+    /// iter90b §2 H1b proof: after a `fence_stage(N)` followed by
+    /// `reset_for_next_stage()`, this MUST equal N (the wait-side
+    /// matches the signal we just signaled).
+    last_wait_value: u64,
 }
 
 // SAFETY: `EncoderSession` is `Send` provided that:
@@ -282,6 +311,8 @@ impl EncoderSession {
             stage_label: String::new(),
             drained: false,
             fence_pending: false,
+            wait_count: 0,
+            last_wait_value: 0,
         })
     }
 
@@ -563,6 +594,15 @@ impl EncoderSession {
             // ParentType = Event chain in metal-0.33.0/src/sync.rs:36-40.
             let event_ref: &metal::EventRef = event.as_ref();
             self.inner.encode_wait_for_event(event_ref, value);
+            // iter90b §2 H1b — track the wait-event for introspection.
+            // Bump scoreboard ONLY after the wait actually encoded
+            // (mirrors the signal-side discipline: `event_value` is
+            // updated AFTER `fence_signal_and_commit` returns). These
+            // fields are pure read-only observability — they do NOT
+            // alter F1 (encoder lazy-open), F2 (residency-flush), F11
+            // (alloc_buffer zero-init), or F12 (force-serial-dispatch).
+            self.wait_count += 1;
+            self.last_wait_value = value;
         }
 
         self.drained = false;
@@ -666,6 +706,58 @@ impl EncoderSession {
     #[inline]
     pub fn has_event(&self) -> bool {
         self.event.is_some()
+    }
+
+    /// The most recent value passed to `encode_wait_for_event` inside
+    /// [`Self::reset_for_next_stage`].
+    ///
+    /// Returns 0 until the first `reset_for_next_stage` actually emits
+    /// a wait (i.e. the prior commit was [`Self::fence_stage`], not
+    /// [`Self::commit_stage`] / [`Self::commit_and_wait`]). After a
+    /// `fence_stage(N)` followed by `reset_for_next_stage()`, this MUST
+    /// equal `N` — the wait-side scoreboard mirrors the signal-side
+    /// [`Self::fence_value`].
+    ///
+    /// iter90b §2 H1b proof helper: makes the wait-event encoding
+    /// observable from a Rust test without xctrace.
+    ///
+    /// # Risk register
+    ///
+    /// Pure read-only introspection. Reads a `u64` field updated under
+    /// `&mut self` exclusively (no concurrent mutation possible —
+    /// `EncoderSession` is `!Sync`). Does NOT widen F1/F2/F11/F12.
+    #[inline]
+    pub fn wait_value(&self) -> u64 {
+        self.last_wait_value
+    }
+
+    /// Cumulative count of `encode_wait_for_event` calls actually
+    /// emitted inside [`Self::reset_for_next_stage`] in this session.
+    ///
+    /// Bumped exactly once per `reset_for_next_stage` call that finds
+    /// `fence_pending == true` — i.e. once per "fence + reset" pair.
+    /// `commit_stage` / `commit_and_wait` followed by
+    /// `reset_for_next_stage` does NOT bump this (no wait emitted —
+    /// Metal queue FIFO is the implicit ordering primitive in that
+    /// case).
+    ///
+    /// For an N-stage chain (N fences + (N-1) resets), this returns
+    /// `N - 1` after the last reset. The Nth (terminal) fence is
+    /// drained by the caller via `metal_command_buffer().wait_until_completed()`
+    /// or by a subsequent `commit_and_wait`, neither of which emits an
+    /// additional wait.
+    ///
+    /// iter90b §2 H1b proof helper: paired with [`Self::wait_value`] to
+    /// make the wait-event side of the multi-stage chain observable.
+    ///
+    /// # Risk register
+    ///
+    /// Same as [`Self::wait_value`] — pure read-only introspection over
+    /// a `u64` field updated under `&mut self` exclusively. Does NOT
+    /// widen F1/F2/F11/F12.
+    #[inline]
+    pub fn wait_count(&self) -> u64 {
+        self.wait_count
     }
 
     /// Borrow the underlying Metal command buffer.
