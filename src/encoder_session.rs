@@ -426,18 +426,44 @@ impl EncoderSession {
     ///
     /// Returns `MlxError::CommandBufferError` if the GPU reports an
     /// error after wait — propagated from `CommandEncoder`.
+    ///
+    /// ADR-015 iter94 Task #2 — fail-loud contract.  iter93 final-report
+    /// §"Root-cause hypothesis" point 5 noted that under
+    /// `MLX_UNRETAINED_REFS=1` + `HF2Q_ENCODER_SESSION=1` + `K>1`, the
+    /// session appeared to silently absorb a `MTLCommandBufferStatus::
+    /// Error` and produce deterministic-but-wrong tokens.  By code
+    /// reading, the tail-expression `self.inner.commit_and_wait()`
+    /// already returns the inner error (commit_and_wait at
+    /// encoder.rs:1852 explicitly matches on `cmd_buf.status()`).  This
+    /// re-shape converts the implicit propagation into an explicit `?`
+    /// chain so future maintainers cannot accidentally swallow the
+    /// error by inserting a `let _ = inner.commit_and_wait();` or
+    /// adding fall-through logic between the inner call and the
+    /// function return.  Latched `drained = true` happens BEFORE the
+    /// inner call so a panicking unwind through Drop sees the same
+    /// drained-state contract.
     pub fn commit_and_wait(&mut self) -> Result<()> {
         if self.drained {
             return Ok(());
         }
         self.drained = true;
         self.fence_pending = false;
-        if self.stage_label.is_empty() {
+        let result = if self.stage_label.is_empty() {
             self.inner.commit_and_wait()
         } else {
             let label = self.stage_label.clone();
             self.inner.commit_and_wait_labeled(&label)
-        }
+        };
+        // Explicit `?`-style propagation: any `Err` from the inner
+        // commit_and_wait MUST surface to the caller.  This is the
+        // iter94 Task #2 fail-loud guarantee — silent absorption here
+        // would replicate the iter93 §"Root-cause hypothesis" point 5
+        // failure mode (deterministic-but-wrong outputs at the triple
+        // combo).  The extra `?` is a no-op codegen-wise vs the prior
+        // tail-expression form but documents intent and is unit-tested
+        // by `test_commit_and_wait_propagates_inner_cb_error`.
+        result?;
+        Ok(())
     }
 
     /// Encode a stage-fence signal on the current CB and commit non-blocking.

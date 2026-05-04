@@ -431,3 +431,131 @@ fn test_commit_and_wait_blocks_until_done() {
         "second commit_and_wait must not decrement SYNC_COUNT"
     );
 }
+
+/// Test 6 — ADR-015 iter94 Task #2 fail-loud contract verification.
+///
+/// iter93 final-report §"Root-cause hypothesis" point 5 noted that the
+/// session appeared to silently absorb `MTLCommandBufferStatus::Error`
+/// at the triple combo `MLX_UNRETAINED_REFS=1` + `HF2Q_ENCODER_SESSION=1`
+/// + `K>1`, producing deterministic-but-wrong tokens.  By code reading,
+/// `commit_and_wait` already returns the inner error via tail expression;
+/// iter94 Task #2 reshapes it to an explicit `?` chain so future edits
+/// cannot silently drop the error.
+///
+/// This test verifies:
+/// 1. The function signature returns `Result<()>` (compile-time check).
+/// 2. The success path returns `Ok(())` after a real GPU dispatch.
+/// 3. Source-code structural regression guard: `encoder_session.rs`
+///    contains the explicit `result?;` propagation pattern documented by
+///    Task #2's reshape.  If a future maintainer reverts to a tail-only
+///    expression OR introduces a `let _ =` swallow, this assertion fires
+///    in CI.
+///
+/// Real GPU-error injection is impractical from a unit test (Metal
+/// drivers do not expose a "force-fail-this-CB" hook; allocating
+/// oversized buffers triggers `MlxError::AllocationFailed` BEFORE the
+/// CB submission, not a CB-completion error).  Production-side
+/// regression is covered by the iter93 K-batch ladder evidence at
+/// `/opt/hf2q/.cfa-archive/iter93/27b_unretained_only.text` (CRASH at
+/// layer 7 with `MlxError::CommandBufferError`); the structural
+/// assertion below is the unit-level analog.
+#[test]
+fn test_commit_and_wait_propagates_inner_cb_error() {
+    // (1) Signature check.  This will fail at compile time if the
+    // return type changes.
+    fn _typecheck<F: FnOnce(&mut EncoderSession) -> mlx_native::Result<()>>(_f: F) {}
+    _typecheck(|sess| sess.commit_and_wait());
+
+    if !EncoderSession::env_enabled() {
+        eprintln!(
+            "[encoder_session_lifecycle] test_commit_and_wait_propagates_inner_cb_error \
+             SKIPPED — HF2Q_ENCODER_SESSION not set; structural source check still runs below."
+        );
+    } else {
+        // (2) Success path: a real elementwise dispatch through the
+        // session must return Ok(()).
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let mut registry = KernelRegistry::new();
+        let n = 4usize;
+        let byte_len = n * std::mem::size_of::<f32>();
+        let mut a = device
+            .alloc_buffer(byte_len, DType::F32, vec![n])
+            .expect("a");
+        let mut b = device
+            .alloc_buffer(byte_len, DType::F32, vec![n])
+            .expect("b");
+        let out = device
+            .alloc_buffer(byte_len, DType::F32, vec![n])
+            .expect("out");
+        a.as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        b.as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        let mut sess = device
+            .encoder_session()
+            .expect("encoder_session()")
+            .expect("Some under env=1");
+        sess.begin_stage("phase.iter94_task2_fail_loud_smoke");
+        mlx_native::ops::elementwise::elementwise_add(
+            sess.encoder(),
+            &mut registry,
+            device.metal_device(),
+            &a,
+            &b,
+            &out,
+            n,
+            DType::F32,
+        )
+        .expect("dispatch through session.encoder()");
+        // The Result MUST be inspectable — if a future edit introduces
+        // `let _ = sess.commit_and_wait();` this `expect` would still
+        // succeed, but the structural check below catches that pattern.
+        let res: mlx_native::Result<()> = sess.commit_and_wait();
+        assert!(res.is_ok(), "commit_and_wait must return Ok on success; got {res:?}");
+    }
+
+    // (3) Structural regression guard.  Read encoder_session.rs and
+    // assert it contains the explicit `result?;` propagation pattern
+    // and the iter94 Task #2 doc anchor.  This catches accidental
+    // reverts to a tail-only expression OR `let _ = ...` swallows.
+    //
+    // CARGO_MANIFEST_DIR for an integration test is the crate root
+    // (`/opt/mlx-native/`).
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src_path = std::path::Path::new(manifest_dir)
+        .join("src")
+        .join("encoder_session.rs");
+    let src = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", src_path.display()));
+    // Find the commit_and_wait body.
+    let needle_anchor = "ADR-015 iter94 Task #2";
+    assert!(
+        src.contains(needle_anchor),
+        "encoder_session.rs must contain the iter94 Task #2 doc anchor \
+         '{needle_anchor}' so future maintainers see the fail-loud rationale"
+    );
+    // Find the explicit propagation pattern: `result?;` immediately
+    // followed by `Ok(())`.  Tolerates whitespace variation.
+    let normalized: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("result?; Ok(())"),
+        "encoder_session.rs::commit_and_wait MUST end with the explicit \
+         `result?; Ok(())` propagation pattern (iter94 Task #2 fail-loud \
+         contract).  A tail-only `self.inner.commit_and_wait()` form is \
+         functionally equivalent but defeats the documentation intent and \
+         is brittle under future refactors."
+    );
+    // Ensure no `let _ = ` swallowing the inner result was introduced.
+    assert!(
+        !src.contains("let _ = self.inner.commit_and_wait("),
+        "encoder_session.rs::commit_and_wait MUST NOT swallow the inner \
+         commit_and_wait result with `let _ = ...` (iter94 Task #2)."
+    );
+    assert!(
+        !src.contains("let _ = self.inner.commit_and_wait_labeled("),
+        "encoder_session.rs::commit_and_wait MUST NOT swallow the inner \
+         commit_and_wait_labeled result with `let _ = ...` (iter94 Task #2)."
+    );
+}
