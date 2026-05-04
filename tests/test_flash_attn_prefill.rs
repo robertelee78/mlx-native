@@ -1876,6 +1876,100 @@ fn test_repro_full_pipeline_qwen35_layer3_seq2() {
         "full-pipeline produced {nan_count} NaN — bug reproduces in mlx-native space");
 }
 
+/// DIRECT-BYTES REPRO — feed exact production bf16 buffer dumps to the
+/// kernel.  If kernel is deterministic AND inputs are byte-identical to
+/// production, NaN must reproduce here.  If 0 NaN, the kernel is
+/// non-deterministic OR its behaviour depends on some other state
+/// (output buffer, threadgroup memory, encoder context).
+#[test]
+#[ignore = "loads on-disk hf2q-side dumps; run via `--ignored`"]
+fn test_repro_production_bf16_bytes_direct() {
+    use std::path::Path;
+
+    let q_path = Path::new("/tmp/hf2q_fa_bf16_step0000_layer003_q_bf16_hm.bin");
+    let k_path = Path::new("/tmp/hf2q_fa_bf16_step0000_layer003_k_bf16_hm.bin");
+    let v_path = Path::new("/tmp/hf2q_fa_bf16_step0000_layer003_v_bf16_hm.bin");
+    if !q_path.exists() || !k_path.exists() || !v_path.exists() {
+        eprintln!("direct-bytes repro: hf2q dumps absent — SKIP");
+        return;
+    }
+
+    fn read_bf16(p: &Path) -> Vec<bf16> {
+        let raw = std::fs::read(p).expect("read");
+        let mut out = Vec::with_capacity(raw.len() / 2);
+        for chunk in raw.chunks_exact(2) {
+            out.push(bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])));
+        }
+        out
+    }
+
+    let q_bf = read_bf16(q_path);
+    let k_bf = read_bf16(k_path);
+    let v_bf = read_bf16(v_path);
+
+    let batch = 1; let h = 16; let kv_h = 2; let ql = 2; let kl = 2; let d = 256;
+    assert_eq!(q_bf.len(), h * ql * d, "q bf16 len");
+    assert_eq!(k_bf.len(), kv_h * kl * d, "k bf16 len");
+    assert_eq!(v_bf.len(), kv_h * kl * d, "v bf16 len");
+
+    let q_nan = q_bf.iter().filter(|v| f32::from(**v).is_nan()).count();
+    let k_nan = k_bf.iter().filter(|v| f32::from(**v).is_nan()).count();
+    let v_nan = v_bf.iter().filter(|v| f32::from(**v).is_nan()).count();
+    eprintln!("direct-bytes input NaN: q={q_nan} k={k_nan} v={v_nan}");
+    assert_eq!(q_nan, 0); assert_eq!(k_nan, 0); assert_eq!(v_nan, 0);
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let scale = 1.0 / (d as f32).sqrt();
+    let gpu_out = run_bf16_gpu(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None,
+        batch, h, kv_h, ql, kl, d, scale, true,
+    );
+
+    let nan_count = gpu_out.iter().filter(|v| v.is_nan()).count();
+    eprintln!("direct-bytes output: total={} nan={}", gpu_out.len(), nan_count);
+
+    if nan_count > 0 {
+        let mut dim_hist = std::collections::BTreeMap::new();
+        for (i, v) in gpu_out.iter().enumerate() {
+            if v.is_nan() {
+                let dim = i % d;
+                *dim_hist.entry(dim).or_insert(0_usize) += 1;
+            }
+        }
+        eprintln!("NaN by dim: {:?}", dim_hist);
+    }
+
+    // Compare against the production out_bf16_hm dump (if present).
+    let prod_out_path = Path::new("/tmp/hf2q_fa_bf16_step0000_layer003_out_bf16_hm.bin");
+    if prod_out_path.exists() {
+        let prod_out_bf = read_bf16(prod_out_path);
+        // Production output is head-major [h=16, seq=2, d=256] = 8192 bf16.
+        let prod_f32: Vec<f32> = prod_out_bf.iter().map(|v| f32::from(*v)).collect();
+        // run_bf16_gpu also returns head-major.
+        let bit_match = gpu_out.iter().zip(prod_f32.iter())
+            .filter(|(a, b)| a.to_bits() == b.to_bits()).count();
+        let prod_nan_mine_finite = gpu_out.iter().zip(prod_f32.iter())
+            .filter(|(a, b)| !a.is_nan() && b.is_nan()).count();
+        let mine_nan_prod_finite = gpu_out.iter().zip(prod_f32.iter())
+            .filter(|(a, b)| a.is_nan() && !b.is_nan()).count();
+        eprintln!(
+            "vs prod_out_bf16_hm: bit_match={bit_match}/{} \
+             prod_nan_mine_finite={prod_nan_mine_finite} \
+             mine_nan_prod_finite={mine_nan_prod_finite}",
+            gpu_out.len()
+        );
+    }
+
+    // We expect: if kernel is deterministic, this MUST produce 32 NaN.
+    eprintln!("EXPECTED 32 NaN (production); GOT {nan_count}");
+    if nan_count == 0 {
+        eprintln!("BUG: kernel is non-deterministic OR depends on hidden state");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // § 6  GPU CORRECTNESS — BF16 D=512 (NSG=8, llama.cpp-derived kernel)
 // ─────────────────────────────────────────────────────────────────────────────
