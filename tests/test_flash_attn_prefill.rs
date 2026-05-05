@@ -1708,6 +1708,230 @@ fn flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic() {
     );
 }
 
+/// **ADR-017 Phase E.a B.5 path (i) probe** — does the FA bf16 d256
+/// kernel produce correct output at qL ∈ [2, 15] when kL >= 16
+/// (multi-K-tile)?  This is the gating question for whether B.5 needs
+/// new kernel work or just a host-side gate lift.
+///
+/// # Background
+///
+/// The hf2q-side gate at `gpu_full_attn.rs:1860` blocks FA fast/resume
+/// when `seq_len < 16`, citing the documented dim=10 NaN bug at
+/// qL ∈ [1, 15] with single K-tile (qL=2/kL=2).  But the chunked
+/// prefill last-chunk-with-seq < 16 case has DIFFERENT topology:
+/// kL = cur_len + qL >> 16, i.e. multi-K-tile.  The dim=10 NaN bug's
+/// trigger condition was "kL_rem != 0 AND qL_rem != 0 AND single K-tile"
+/// — multi-K-tile may not exhibit the same failure.
+///
+/// If this probe PASSES (output finite + byte-identical to the
+/// monolithic call's chunk-N region), B.5 = lift the host-side gate
+/// at `gpu_full_attn.rs:1860` from `seq_len >= 16` to `seq_len > 0`.
+/// Closes the 23% danger-zone coverage gap with zero kernel work.
+///
+/// If this probe FAILS (NaN in output OR byte-different from
+/// monolithic), B.5 needs Metal-shader work on
+/// `flash_attn_prefill.metal` — likely the partial-K-tile mask path
+/// when qL_rem != 0 AND qL < BK=16.
+///
+/// # Configuration
+///
+/// Three resume calls at qL ∈ {2, 8, 15} all with kL=130, qL_off
+/// chosen so qL + qL_off = kL:
+/// * qL=2,  qL_off=128, kL=130
+/// * qL=8,  qL_off=122, kL=130
+/// * qL=15, qL_off=115, kL=130
+///
+/// For each, compare against the corresponding rows of a monolithic
+/// dispatch at qL=130, kL=130.
+#[test]
+fn flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe() {
+    use mlx_native::ops::flash_attn_prefill::{
+        dispatch_flash_attn_prefill_bf16_d256_resume, FlashAttnPrefillResumeParams,
+    };
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let n_heads: u32 = 16;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 256;
+    let kl_total: u32 = 130;
+    let kv_capacity: u32 = 256;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let h = n_heads as usize;
+    let h_kv = n_kv_heads as usize;
+    let d = head_dim as usize;
+
+    // Build full Q/K/V at kl_total head-major.
+    let q_full_f32 = pseudo_random_f32(SEED + 300, h * kl_total as usize * d);
+    let k_full_f32 = pseudo_random_f32(SEED + 301, h_kv * kl_total as usize * d);
+    let v_full_f32 = pseudo_random_f32(SEED + 302, h_kv * kl_total as usize * d);
+    let q_full_bf16 = f32_to_bf16(&q_full_f32);
+    let k_full_bf16 = f32_to_bf16(&k_full_f32);
+    let v_full_bf16 = f32_to_bf16(&v_full_f32);
+
+    // Monolithic reference: FA d256 at qL=kL=130 with do_causal=true.
+    let q_mono = alloc_bf16(&device, h * kl_total as usize * d, "Q_mono");
+    let k_mono = alloc_bf16(&device, h_kv * kl_total as usize * d, "K_mono");
+    let v_mono = alloc_bf16(&device, h_kv * kl_total as usize * d, "V_mono");
+    fill_bf16_buffer(&q_mono, &q_full_bf16);
+    fill_bf16_buffer(&k_mono, &k_full_bf16);
+    fill_bf16_buffer(&v_mono, &v_full_bf16);
+    let mut out_mono = alloc_bf16(&device, h * kl_total as usize * d, "out_mono");
+    {
+        let mut enc = device.command_encoder().expect("enc mono");
+        dispatch_flash_attn_prefill_bf16_d256(
+            &mut enc, &device, &mut registry,
+            &q_mono, &k_mono, &v_mono, None, &mut out_mono,
+            &FlashAttnPrefillParams {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len_q: kl_total,
+                seq_len_k: kl_total,
+                batch: 1,
+                scale,
+                do_causal: true,
+            },
+        ).expect("dispatch monolithic");
+        enc.commit_and_wait().expect("commit mono");
+    }
+    let out_mono_bf16 = read_bf16_buffer(&out_mono, h * kl_total as usize * d);
+
+    // Slot K/V at kv_capacity, populated [0..kl_total].
+    let mut slot_k_bf16 = vec![bf16::ZERO; h_kv * kv_capacity as usize * d];
+    let mut slot_v_bf16 = vec![bf16::ZERO; h_kv * kv_capacity as usize * d];
+    for head in 0..h_kv {
+        for tok in 0..kl_total as usize {
+            let src_off = head * (kl_total as usize) * d + tok * d;
+            let dst_off = head * (kv_capacity as usize) * d + tok * d;
+            slot_k_bf16[dst_off..dst_off + d]
+                .copy_from_slice(&k_full_bf16[src_off..src_off + d]);
+            slot_v_bf16[dst_off..dst_off + d]
+                .copy_from_slice(&v_full_bf16[src_off..src_off + d]);
+        }
+    }
+    let k_slot = alloc_bf16(&device, h_kv * kv_capacity as usize * d, "K_slot");
+    let v_slot = alloc_bf16(&device, h_kv * kv_capacity as usize * d, "V_slot");
+    fill_bf16_buffer(&k_slot, &slot_k_bf16);
+    fill_bf16_buffer(&v_slot, &slot_v_bf16);
+
+    let mut all_pass = true;
+    for ql_test in &[2u32, 8u32, 15u32] {
+        let ql_test = *ql_test;
+        let ql_off = kl_total - ql_test;
+
+        // Build Q at chunk position [ql_off..kl_total) head-major.
+        let mut q_chunk_bf16 = vec![bf16::ZERO; h * ql_test as usize * d];
+        for head in 0..h {
+            for tok in 0..ql_test as usize {
+                let src_off =
+                    head * (kl_total as usize) * d + (ql_off as usize + tok) * d;
+                let dst_off = head * (ql_test as usize) * d + tok * d;
+                q_chunk_bf16[dst_off..dst_off + d]
+                    .copy_from_slice(&q_full_bf16[src_off..src_off + d]);
+            }
+        }
+        let q_chunk = alloc_bf16(&device, h * ql_test as usize * d, "Q_chunk");
+        fill_bf16_buffer(&q_chunk, &q_chunk_bf16);
+        let mut out_resume =
+            alloc_bf16(&device, h * ql_test as usize * d, "out_resume");
+        {
+            let mut enc = device.command_encoder().expect("enc resume");
+            let result = dispatch_flash_attn_prefill_bf16_d256_resume(
+                &mut enc, &device, &mut registry,
+                &q_chunk, &k_slot, &v_slot, &mut out_resume,
+                &FlashAttnPrefillResumeParams {
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    seq_len_q: ql_test,
+                    seq_len_k: kl_total,
+                    batch: 1,
+                    scale,
+                    do_causal: true,
+                    q_offset_in_k: ql_off,
+                    kv_capacity,
+                },
+            );
+            if let Err(e) = result {
+                eprintln!("  qL={ql_test} dispatch ERROR: {:?}", e);
+                all_pass = false;
+                continue;
+            }
+            enc.commit_and_wait().expect("commit resume");
+        }
+        let out_resume_bf16 =
+            read_bf16_buffer(&out_resume, h * ql_test as usize * d);
+
+        // Check finiteness.
+        let nan_count = out_resume_bf16
+            .iter()
+            .filter(|&&v| !v.to_f32().is_finite())
+            .count();
+        if nan_count > 0 {
+            eprintln!(
+                "  qL={ql_test} kL={kl_total} qL_off={ql_off}: NaN/Inf count = {nan_count}/{} \
+                 — kernel produces non-finite output at small qL"
+                , out_resume_bf16.len()
+            );
+            all_pass = false;
+            continue;
+        }
+
+        // Compare to monolithic[ql_off..kl_total] head-major.
+        let mut n_diff = 0usize;
+        let mut max_abs_diff = 0.0_f32;
+        for head in 0..h {
+            for tok in 0..ql_test as usize {
+                let mono_off = head * (kl_total as usize) * d
+                    + (ql_off as usize + tok) * d;
+                let resume_off = head * (ql_test as usize) * d + tok * d;
+                for elem in 0..d {
+                    let mono_v = out_mono_bf16[mono_off + elem];
+                    let resume_v = out_resume_bf16[resume_off + elem];
+                    if mono_v.to_bits() != resume_v.to_bits() {
+                        n_diff += 1;
+                        let diff = (mono_v.to_f32() - resume_v.to_f32()).abs();
+                        if diff > max_abs_diff {
+                            max_abs_diff = diff;
+                        }
+                    }
+                }
+            }
+        }
+        let total = h * ql_test as usize * d;
+        if n_diff > 0 {
+            eprintln!(
+                "  qL={ql_test} kL={kl_total} qL_off={ql_off}: {n_diff}/{total} \
+                 BF16 elements differ from monolithic, max |Δ|={max_abs_diff:.6e}"
+            );
+            all_pass = false;
+        } else {
+            eprintln!(
+                "  qL={ql_test} kL={kl_total} qL_off={ql_off}: 0/{total} differ ✓ \
+                 (kernel handles small qL multi-K-tile byte-correctly)"
+            );
+        }
+    }
+
+    assert!(
+        all_pass,
+        "flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe: at least \
+         one qL ∈ {{2, 8, 15}} produced non-finite OR byte-different output \
+         vs monolithic.  B.5 path (i) requires Metal-kernel work.  Per-qL \
+         findings printed above."
+    );
+    eprintln!(
+        "flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe: PASS — \
+         all qL ∈ {{2, 8, 15}} with kL=130 produce byte-identical output to \
+         monolithic.  B.5 path = lift the seq_len >= 16 gate at \
+         gpu_full_attn.rs:1860; no Metal-shader changes needed."
+    );
+}
+
 /// VALUE-DRIVEN REPRO of production dim=10-NaN bug.
 ///
 /// Loads actual layer-3 Q/K/V f32 dumps from /tmp/hf2q-dump/30654/ produced
