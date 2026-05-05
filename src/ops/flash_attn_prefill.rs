@@ -825,6 +825,323 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_with_blk(
     Ok(())
 }
 
+// ─── bf16 D=256 RESUME dispatcher (qL_off > 0 + slot-capacity strides) ──────
+//
+// ADR-017 Phase E.a B.2-fix: extend the FA bf16 d256 fast path to support
+// LCP partial-prefill resume (turn 2 of a multi-turn conversation prefilling
+// only the suffix against a slot that already contains the LCP prefix).
+//
+// The metal shader has supported this regime since Phase 1 port (the
+// `qL_off` field at flash_attn_prefill.metal:1045 + `K_strides[3]` /
+// `V_strides[3]` at lines 1048-1049 are read at lines 1325, 1437, 1445), but
+// the d256 dispatcher hardcoded `qL_off=0` and built K/V strides from
+// `seq_len_k` not `kv_capacity` because no Rust caller needed
+// "prefill-at-offset" semantics — Qwen3.5/3.6 production prefill is always
+// from token 0 (cur_len=0) and decode (cur_len > 0, seq_len=1) routes to
+// `flash_attn_vec` at gpu_full_attn.rs:1733 instead.
+//
+// The legacy F32 SDPA fallback at gpu_full_attn.rs:1900-1916 covered the
+// "prefill-at-offset" case for structural correctness, but with a F32
+// single-pass softmax that produces byte-different output to the BF16 MMA
+// + log-domain online softmax fast path (proven via
+// gpu_full_attn.rs::tests::phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence:
+// 131072/131072 elements differ, max |Δ| = 6.452e-4).
+//
+// This module fixes that: a sibling dispatcher that exposes `qL_off` and
+// `kv_capacity` so the FA bf16 d256 fast path is reachable for cur_len > 0
+// AND for slot reads (slot K/V's head stride is `kv_capacity * head_dim`,
+// not `kL * head_dim`, because a slot may have allocated more positions
+// than the current valid kL).
+
+/// Host-side parameters for the flash-attention prefill **resume** dispatcher.
+///
+/// Differs from [`FlashAttnPrefillParams`] in two ways:
+///
+/// 1. `q_offset_in_k` (mapped to the kernel's `qL_off`): the absolute Q
+///    position of the chunk Q within the larger K/V sequence.  When > 0,
+///    Q is being attended over a slot that already contains
+///    `q_offset_in_k` previous tokens.  The kernel's causal mask uses
+///    `qL_off` to compute `row_pos = tid.x * BQ + qL_off + ...`
+///    (`flash_attn_prefill.metal:1325, 1445`) so the per-chunk causal
+///    pattern stays correct relative to the absolute K/V position.
+///
+/// 2. `kv_capacity` (slot stride): K and V buffers may live in a slot of
+///    capacity ≥ `seq_len_k`.  The kernel reads K/V via integer strides
+///    from `K_strides[3]` / `V_strides[3]`, so we set
+///    `head_stride = kv_capacity * D` to skip unused slot capacity between
+///    heads.  When `kv_capacity == seq_len_k` the layout is identical to
+///    the non-resume dispatcher.
+///
+/// # Use case
+///
+/// ADR-017 Phase E.a LCP partial-prefill resume.  Turn 1 of a multi-turn
+/// conversation prefills the prompt, populates the KV slot, snapshots it.
+/// Turn 2 detects an LCP overlap with turn 1, restores the slot, and
+/// prefills only the suffix of turn 2 (M new tokens) against the full slot
+/// (kL = N + M, qL = M, qL_off = N).  The output is byte-identical to a
+/// fresh full prefill of the entire turn-2 prompt — proven by the parity
+/// unit test
+/// `flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic`.
+///
+/// The non-resume dispatcher remains the production path for prefill-from-
+/// zero (`q_offset_in_k == 0` && `kv_capacity == seq_len_k`).  The two
+/// dispatchers compile to the same kernel pipeline (same kernel name +
+/// same function constants when `q_offset_in_k == 0` && `kv_capacity ==
+/// seq_len_k`); the only host-side difference is the strides written into
+/// `AttnParamsGpu`.
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnPrefillResumeParams {
+    /// Number of query attention heads.
+    pub n_heads: u32,
+    /// Number of key/value attention heads (GQA).
+    pub n_kv_heads: u32,
+    /// Head dimension.  Must be 256 for `dispatch_flash_attn_prefill_bf16_d256_resume`.
+    pub head_dim: u32,
+    /// Query sequence length (chunk Q only).  qL.
+    pub seq_len_q: u32,
+    /// Total key/value sequence length: `q_offset_in_k + seq_len_q`.  kL.
+    pub seq_len_k: u32,
+    /// Batch size.
+    pub batch: u32,
+    /// Attention scale.  Typically `1.0 / sqrt(head_dim)`.  The kernel
+    /// internally multiplies by `log2(e)` before applying to Q.
+    pub scale: f32,
+    /// Whether to apply in-kernel causal masking.  For partial-prefill resume
+    /// this is typically `true` — chunk Q must causally mask K positions
+    /// `> q_offset_in_k + q_pos_within_chunk`.
+    pub do_causal: bool,
+    /// Q offset within the K/V sequence (`qL_off` in the kernel).  Number of
+    /// previous tokens already present in the slot.  Standard append-prefill
+    /// semantics: `q_offset_in_k + seq_len_q == seq_len_k`.
+    pub q_offset_in_k: u32,
+    /// Capacity of the K/V slot — stride between K/V heads in elements.
+    /// Set to `seq_len_k` when K/V are contiguous-packed (equivalent to the
+    /// non-resume dispatcher); set to the slot's allocated capacity to read
+    /// from a slot with unused trailing positions.  Must be `>= seq_len_k`.
+    pub kv_capacity: u32,
+}
+
+/// Dispatch flash-attention prefill for bf16 Q/K/V/O, head_dim=256, with
+/// caller-controlled `qL_off` and slot-capacity-aware K/V strides.
+///
+/// **Use this dispatcher when** `q_offset_in_k > 0` (partial-prefill resume)
+/// OR when the K/V buffers have allocated capacity beyond `seq_len_k` (slot
+/// reads).  For the prefill-from-zero contiguous-packed case prefer
+/// [`dispatch_flash_attn_prefill_bf16_d256`] (functionally equivalent at
+/// `q_offset_in_k=0` && `kv_capacity==seq_len_k`; verified via the parity
+/// unit test in `tests/test_flash_attn_prefill.rs`).
+///
+/// # Buffer layouts
+///
+/// All buffers must be contiguous along the innermost head_dim=256 axis.
+///
+/// - `q`    — `[batch, n_heads,    seq_len_q,    256]`, dtype BF16
+///     * head stride = `seq_len_q * 256`, seq stride = 256, batch stride =
+///       `n_heads * seq_len_q * 256`.
+/// - `k`    — `[batch, n_kv_heads, kv_capacity, 256]`, dtype BF16
+///     * head stride = `kv_capacity * 256`, seq stride = 256, batch stride =
+///       `n_kv_heads * kv_capacity * 256`.
+///     * Only positions `[0..seq_len_k]` are read; positions
+///       `[seq_len_k..kv_capacity]` may be uninitialised — the kernel will
+///       not read past `seq_len_k` thanks to `kL`-aware tile bounds at
+///       `flash_attn_prefill.metal:1322, 1416`.
+/// - `v`    — same layout as `k`.
+/// - `out`  — `[batch, n_heads,    seq_len_q,    256]`, dtype BF16 (output)
+///
+/// # Function constants
+///
+/// Identical pipeline cache key to the non-resume dispatcher: `align_Q`,
+/// `align_K` from sequence lengths; `do_causal` from `params`; `has_mask`
+/// and `has_blk` are both `false` (this resume dispatcher uses pure causal
+/// masking via `qL_off` — no external additive mask is supported.  Add a
+/// resume-with-mask sibling if a future caller needs it).
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` for:
+/// - `head_dim != 256`
+/// - `q_offset_in_k + seq_len_q > seq_len_k` (Q overshoots K)
+/// - `seq_len_k > kv_capacity`               (kL overshoots slot capacity)
+/// - Zero or inconsistent shape fields
+/// - `n_heads` not divisible by `n_kv_heads`
+/// - Buffer too small for declared shape (Q/O against `seq_len_q`,
+///   K/V against `kv_capacity`)
+/// - Any buffer dtype != BF16
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d256_resume(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    out: &mut MlxBuffer,
+    params: &FlashAttnPrefillResumeParams,
+) -> Result<()> {
+    // ── Validate ──────────────────────────────────────────────────────────
+    if params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d256_resume: head_dim must be 256, got {}",
+            params.head_dim
+        )));
+    }
+    if params.n_heads == 0
+        || params.n_kv_heads == 0
+        || params.seq_len_q == 0
+        || params.seq_len_k == 0
+        || params.batch == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_bf16_d256_resume: \
+             n_heads/n_kv_heads/seq_len_q/seq_len_k/batch must all be > 0"
+                .into(),
+        ));
+    }
+    if params.n_heads % params.n_kv_heads != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d256_resume: n_heads ({}) must \
+             be divisible by n_kv_heads ({})",
+            params.n_heads, params.n_kv_heads
+        )));
+    }
+    if params.q_offset_in_k + params.seq_len_q > params.seq_len_k {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d256_resume: q_offset_in_k ({}) \
+             + seq_len_q ({}) > seq_len_k ({}) — Q overshoots K",
+            params.q_offset_in_k, params.seq_len_q, params.seq_len_k
+        )));
+    }
+    if params.seq_len_k > params.kv_capacity {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d256_resume: seq_len_k ({}) > \
+             kv_capacity ({}) — K/V overshoots slot capacity",
+            params.seq_len_k, params.kv_capacity
+        )));
+    }
+
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::BF16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_bf16_d256_resume: {name} buffer \
+                 must be BF16, got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let cap = params.kv_capacity as usize;
+    let d = params.head_dim as usize; // = 256
+
+    validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    // K/V buffers are validated against capacity (slot layout), not seq_len_k.
+    validate_buffer_size(k, "K", batch * h_kv * cap * d)?;
+    validate_buffer_size(v, "V", batch * h_kv * cap * d)?;
+    validate_buffer_size(out, "out", batch * h * ql * d)?;
+
+    // ── Tile geometry (D=256) ─────────────────────────────────────────────
+    let bq = BQ_D256;
+    let bk = BK_D256;
+    let wm = WM_D256;
+    let wn = WN_D256;
+
+    let nq = params.seq_len_q.div_ceil(bq);
+    let nk = params.seq_len_k.div_ceil(bk);
+    let nq_aligned = params.seq_len_q / bq;
+    let nk_aligned = params.seq_len_k / bk;
+    let ql_rem = params.seq_len_q % bq;
+    let kl_rem = params.seq_len_k % bk;
+
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = false; // resume uses pure causal; no external mask
+    let has_blk = false;
+    let do_causal = params.do_causal;
+
+    // Same pipeline cache key as the non-resume dispatcher: when
+    // qL_off=0 && kv_capacity=seq_len_k the two dispatchers compile to the
+    // exact same Metal pipeline (verified at the parity test).
+    let kernel_name = K_BF16_D256;
+    let pipeline = registry.get_pipeline_with_bool_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+    )?;
+
+    // ── Strides ───────────────────────────────────────────────────────────
+    //
+    // Q/O are contiguous-packed (qL is the actual extent — chunk Q has no
+    // tail capacity).  K/V use kv_capacity for head stride (slot layout).
+    // Inner stride (D) is always 1.
+    let q_seq_stride = d as i64;
+    let q_head_stride = (ql * d) as i64;
+    let q_batch_stride = (h * ql * d) as i64;
+
+    // K/V head stride uses kv_capacity (slot stride), NOT seq_len_k.  This is
+    // the only stride that differs from the non-resume dispatcher.
+    let kv_seq_stride = d as i64;
+    let kv_head_stride = (cap * d) as i64;
+    let kv_batch_stride = (h_kv * cap * d) as i64;
+
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: params.q_offset_in_k as i32, // ← THE resume change
+        _pad: 0,
+        q_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+        k_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        v_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+    };
+
+    // ── Grid geometry ─────────────────────────────────────────────────────
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
+    let tg_size = MTLSize::new(32, wm as u64, wn as u64);
+
+    // ── Encode ────────────────────────────────────────────────────────────
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(q)),
+            (1, KernelArg::Buffer(k)),
+            (2, KernelArg::Buffer(v)),
+            (3, KernelArg::Buffer(out)),
+            (4, KernelArg::Bytes(as_bytes(&attn_params))),
+            // buffers 5, 6, 7 intentionally absent — has_mask=false +
+            // has_blk=false function constants dead-code-eliminate the
+            // mask + blk loads.
+        ],
+        grid,
+        tg_size,
+    );
+
+    Ok(())
+}
+
 // ─── bf16 D=64 dispatcher ────────────────────────────────────────────────────
 
 /// Layout selector for [`dispatch_flash_attn_prefill_bf16_d64`].

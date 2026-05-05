@@ -1491,6 +1491,223 @@ fn test_gpu_bf16_d256_determinism() {
     eprintln!("test_gpu_bf16_d256_determinism: PASS — two runs byte-identical");
 }
 
+/// **ADR-017 Phase E.a B.2-fix kernel-level parity test**: the resume
+/// dispatcher (`dispatch_flash_attn_prefill_bf16_d256_resume`, with
+/// `qL_off > 0` and slot-capacity-aware K/V strides) produces
+/// BIT-IDENTICAL output to the non-resume dispatcher
+/// (`dispatch_flash_attn_prefill_bf16_d256`) when the chunk Q corresponds
+/// to the second half of a contiguous-packed full prefill.
+///
+/// # Configuration
+///
+/// - **Run A** (monolithic): `dispatch_flash_attn_prefill_bf16_d256`
+///   with seq_full=64, qL=kL=64.  Output is `[B=1, H=16, qL=64, D=256]`
+///   head-major BF16.
+/// - **Run B** (resume on chunk-2): `dispatch_flash_attn_prefill_bf16_d256_resume`
+///   with chunk-2 Q (rows `[32..64]` of monolithic Q) and slot K/V at
+///   capacity=128 populated `[0..64]` (tail `[64..128]` left zero).
+///   Params: qL=32, kL=64, qL_off=32, kv_capacity=128.  Output is
+///   `[B=1, H=16, qL=32, D=256]` head-major BF16.
+///
+/// # Assertion
+///
+/// `output_A[h, 32..64, :]` BYTE-IDENTICAL to `output_B[h, 0..32, :]`
+/// for all `h ∈ [0..16)`.
+///
+/// # Why byte-identical (not tolerance-bounded)
+///
+/// Both dispatchers compile to the same Metal pipeline (same kernel name,
+/// same function constants under causal=true) — only the host-side stride
+/// math + qL_off in `AttnParamsGpu` differs.  When chunk-2 of monolithic
+/// is computed, the kernel's per-row code path is `row_pos = qL_off +
+/// q_within_chunk`, which is exactly what the resume dispatcher
+/// configures explicitly.  K/V are read from byte-identical underlying
+/// memory.  F32 MMA accumulation is deterministic on Apple Metal at fixed
+/// simdgroup width, so the two paths must produce exactly the same bits.
+///
+/// # If this test fails
+///
+/// Either the kernel's `qL_off` semantics aren't what the comments at
+/// `flash_attn_prefill.metal:1325, 1437, 1445` claim (the kernel reads
+/// past the K stride row, or computes q_pos differently), OR the resume
+/// dispatcher's stride math is wrong (off-by-one on head stride, batch
+/// stride, etc.).  ADR-017 Phase E.a B.2-fix is BLOCKED until this gate
+/// passes — without byte-identity, LCP partial-prefill resume cannot
+/// claim byte-identical output to fresh prefill.
+///
+/// # See also
+///
+/// - hf2q-side falsifier:
+///   `gpu_full_attn.rs::tests::phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence`
+///   (proves the legacy F32 SDPA fallback is byte-different — 131072/131072
+///   elements differ, motivating the resume dispatcher in the first place).
+/// - hf2q-side end-to-end falsifier:
+///   `tests/lcp_qwen35_chunked_prefill.rs::phase_b2a_chunked_vs_monolithic_byte_identity`
+///   (chat-completion API turn-2 vs monolithic — gating test for Phase B.2c).
+#[test]
+fn flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic() {
+    use mlx_native::ops::flash_attn_prefill::{
+        dispatch_flash_attn_prefill_bf16_d256_resume, FlashAttnPrefillResumeParams,
+    };
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let n_heads: u32 = 16;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 256;
+    let seq_full: u32 = 64;
+    let seq_chunk: u32 = 32;
+    let kv_capacity: u32 = 128;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let h = n_heads as usize;
+    let h_kv = n_kv_heads as usize;
+    let d = head_dim as usize;
+
+    // ── Build inputs (head-major BF16) ───────────────────────────────────
+    // pseudo_random_f32 produces deterministic F32; f32_to_bf16 truncates
+    // to BF16.  Head-major layout: [B=1, H, L, D].
+    let q_full_f32 = pseudo_random_f32(SEED + 200, h * seq_full as usize * d);
+    let k_full_f32 = pseudo_random_f32(SEED + 201, h_kv * seq_full as usize * d);
+    let v_full_f32 = pseudo_random_f32(SEED + 202, h_kv * seq_full as usize * d);
+    let q_full_bf16 = f32_to_bf16(&q_full_f32);
+    let k_full_bf16 = f32_to_bf16(&k_full_f32);
+    let v_full_bf16 = f32_to_bf16(&v_full_f32);
+
+    // ── Run A: monolithic full prefill ───────────────────────────────────
+    let q_a = alloc_bf16(&device, h * seq_full as usize * d, "Q_A");
+    let k_a = alloc_bf16(&device, h_kv * seq_full as usize * d, "K_A");
+    let v_a = alloc_bf16(&device, h_kv * seq_full as usize * d, "V_A");
+    fill_bf16_buffer(&q_a, &q_full_bf16);
+    fill_bf16_buffer(&k_a, &k_full_bf16);
+    fill_bf16_buffer(&v_a, &v_full_bf16);
+    let mut out_a = alloc_bf16(&device, h * seq_full as usize * d, "out_A");
+    {
+        let mut enc = device.command_encoder().expect("enc A");
+        dispatch_flash_attn_prefill_bf16_d256(
+            &mut enc, &device, &mut registry,
+            &q_a, &k_a, &v_a, None, &mut out_a,
+            &FlashAttnPrefillParams {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len_q: seq_full,
+                seq_len_k: seq_full,
+                batch: 1,
+                scale,
+                do_causal: true,
+            },
+        ).expect("dispatch A (monolithic)");
+        enc.commit_and_wait().expect("commit A");
+    }
+    let out_a_bf16 = read_bf16_buffer(&out_a, h * seq_full as usize * d);
+
+    // ── Run B: resume on chunk-2 ─────────────────────────────────────────
+    // Build chunk-2 Q: head-major [H, qL_chunk, D] containing rows
+    // [seq_chunk..seq_full] of monolithic Q for each head.
+    let mut q_chunk2_bf16 = vec![bf16::ZERO; h * seq_chunk as usize * d];
+    for head in 0..h {
+        for tok in 0..seq_chunk as usize {
+            let src_off =
+                head * (seq_full as usize) * d + (seq_chunk as usize + tok) * d;
+            let dst_off = head * (seq_chunk as usize) * d + tok * d;
+            q_chunk2_bf16[dst_off..dst_off + d]
+                .copy_from_slice(&q_full_bf16[src_off..src_off + d]);
+        }
+    }
+
+    // Build slot K/V at capacity=128 head-major.  Populate [0..seq_full]
+    // with the same K/V as Run A; tail [seq_full..kv_capacity] is zero.
+    let mut slot_k_bf16 = vec![bf16::ZERO; h_kv * kv_capacity as usize * d];
+    let mut slot_v_bf16 = vec![bf16::ZERO; h_kv * kv_capacity as usize * d];
+    for head in 0..h_kv {
+        for tok in 0..seq_full as usize {
+            let src_off = head * (seq_full as usize) * d + tok * d;
+            let dst_off = head * (kv_capacity as usize) * d + tok * d;
+            slot_k_bf16[dst_off..dst_off + d]
+                .copy_from_slice(&k_full_bf16[src_off..src_off + d]);
+            slot_v_bf16[dst_off..dst_off + d]
+                .copy_from_slice(&v_full_bf16[src_off..src_off + d]);
+        }
+    }
+
+    let q_b = alloc_bf16(&device, h * seq_chunk as usize * d, "Q_B");
+    let k_b = alloc_bf16(&device, h_kv * kv_capacity as usize * d, "K_B");
+    let v_b = alloc_bf16(&device, h_kv * kv_capacity as usize * d, "V_B");
+    fill_bf16_buffer(&q_b, &q_chunk2_bf16);
+    fill_bf16_buffer(&k_b, &slot_k_bf16);
+    fill_bf16_buffer(&v_b, &slot_v_bf16);
+    let mut out_b = alloc_bf16(&device, h * seq_chunk as usize * d, "out_B");
+    {
+        let mut enc = device.command_encoder().expect("enc B");
+        dispatch_flash_attn_prefill_bf16_d256_resume(
+            &mut enc, &device, &mut registry,
+            &q_b, &k_b, &v_b, &mut out_b,
+            &FlashAttnPrefillResumeParams {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len_q: seq_chunk,
+                seq_len_k: seq_full,
+                batch: 1,
+                scale,
+                do_causal: true,
+                q_offset_in_k: seq_chunk, // 32 — chunk-2 starts at position 32
+                kv_capacity,
+            },
+        ).expect("dispatch B (resume)");
+        enc.commit_and_wait().expect("commit B");
+    }
+    let out_b_bf16 = read_bf16_buffer(&out_b, h * seq_chunk as usize * d);
+
+    // ── Compare A[chunk2] (rows [32..64] head-major) vs B (rows [0..32]) ─
+    let mut n_diff = 0usize;
+    let mut first_diffs: Vec<(usize, usize, usize, u16, u16)> = Vec::new();
+    for head in 0..h {
+        for tok in 0..seq_chunk as usize {
+            let a_off =
+                head * (seq_full as usize) * d + (seq_chunk as usize + tok) * d;
+            let b_off = head * (seq_chunk as usize) * d + tok * d;
+            for elem in 0..d {
+                let a_v = out_a_bf16[a_off + elem].to_bits();
+                let b_v = out_b_bf16[b_off + elem].to_bits();
+                if a_v != b_v {
+                    if first_diffs.len() < 5 {
+                        first_diffs.push((head, tok, elem, a_v, b_v));
+                    }
+                    n_diff += 1;
+                }
+            }
+        }
+    }
+
+    let total_elems = h * seq_chunk as usize * d;
+    if n_diff > 0 {
+        for (head, tok, elem, a_v, b_v) in &first_diffs {
+            eprintln!(
+                "  diff[h={head}, t={tok}, e={elem}]: A={a_v:#06x} B={b_v:#06x}"
+            );
+        }
+    }
+    assert_eq!(
+        n_diff, 0,
+        "flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic FAIL: \
+         {n_diff}/{total_elems} BF16 elements differ between monolithic[chunk2] \
+         and resume(qL_off=32, kv_capacity=128). The resume dispatcher's \
+         qL_off + slot-stride math is NOT byte-equivalent to the contiguous \
+         non-resume dispatcher. ADR-017 Phase E.a B.2-fix BLOCKED."
+    );
+
+    eprintln!(
+        "flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic: PASS \
+         — 0/{total_elems} BF16 elements differ \
+         (seq_full=64, seq_chunk=32, qL_off=32, kv_capacity=128, head_dim=256, \
+         n_heads=16, n_kv_heads=2)"
+    );
+}
+
 /// VALUE-DRIVEN REPRO of production dim=10-NaN bug.
 ///
 /// Loads actual layer-3 Q/K/V f32 dumps from /tmp/hf2q-dump/30654/ produced
