@@ -1322,8 +1322,30 @@ template <
   int kb_lim = params->NK;
 
   if (do_causal) {
+    // ADR-017 Phase E.a B.5 Codex Phase-2b fix (HIGH):
+    // clamp the causal kb_lim to params->NK to prevent out-of-bounds K/V
+    // reads when qL_off + BQ extends past the last K tile boundary.
+    //
+    // The bug: when qL_off is large (resume scenarios where the chunk
+    // Q lands far into a populated slot) AND qL is small (partial-tail
+    // chunks), the causal-mask q_max = (tid.x+1)*BQ + qL_off can imply
+    // kb_lim > NK.  The K/V loaders then call load_unsafe at kb in
+    // [NK..kb_lim), reading from offsets beyond the valid kL extent.
+    //
+    // Concrete case (D=256, BQ=32, BK=16): qL_off=1000, qL=1, kL=1001
+    // → NK=63, but unclamped kb_lim = ceil((32+1000)/16) = 65.  Loop
+    // would iterate kb=63 and kb=64, reading 32 elements past kL into
+    // unused slot capacity OR garbage.  At do_causal=true the per-row
+    // mask zeroes out those positions, so the output is still correct
+    // for in-range Q rows — but the OOB reads are undefined behavior
+    // and may trigger Metal validation in debug builds.
+    //
+    // The min() clamp ensures kb in [0, NK) for all do_causal=true
+    // paths.  The row-level causal mask at line 1444+ continues to
+    // mask future positions correctly within each tile.
     int q_max = (tid.x + 1) * BQ + params->qL_off;
-    kb_lim = (q_max + BK - 1) / BK;
+    int causal_kb_lim = (q_max + BK - 1) / BK;
+    kb_lim = min(kb_lim, causal_kb_lim);
   }
 
   // ── Wave 2E tile-skip pre-pass row base ─────────────────────────────────

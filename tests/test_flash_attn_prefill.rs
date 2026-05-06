@@ -1756,8 +1756,12 @@ fn flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe() {
     let n_heads: u32 = 16;
     let n_kv_heads: u32 = 2;
     let head_dim: u32 = 256;
-    let kl_total: u32 = 130;
-    let kv_capacity: u32 = 256;
+    // kl_total=1024 exercises BOTH the original B.5 small-qL multi-K
+    // case AND the kb_lim-overshoot regression class: at qL_off=1023,
+    // qL=1, kL=1024, NK=64, but unclamped kb_lim=ceil((32+1023)/16)=66.
+    // Without the metal min() clamp, the kernel reads OOB at kb=64,65.
+    let kl_total: u32 = 1024;
+    let kv_capacity: u32 = 1280;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
     let h = n_heads as usize;
@@ -1819,7 +1823,11 @@ fn flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe() {
     fill_bf16_buffer(&v_slot, &slot_v_bf16);
 
     let mut all_pass = true;
-    for ql_test in &[2u32, 8u32, 15u32] {
+    // Test cases include the original small-qL trio + a high-qL_off
+    // case (qL=1, qL_off=1023) that exercises the kb_lim-overshoot
+    // regression class fixed by the metal min() clamp at
+    // flash_attn_prefill.metal:1346 (Codex Phase-2b finding).
+    for ql_test in &[2u32, 8u32, 15u32, 1u32] {
         let ql_test = *ql_test;
         let ql_off = kl_total - ql_test;
 
