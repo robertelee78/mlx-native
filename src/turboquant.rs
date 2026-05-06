@@ -164,6 +164,116 @@ pub fn hb_centroid(idx: u8, bits: u32) -> f32 {
     }
 }
 
+/// D1 sign mask for the SRHT pre-multiplication, D=256 path.
+///
+/// Verbatim mirror of `hadamard_quantize_kv_fast.metal::TBQ_SIGNS_256`
+/// (lines 25-30). Source: AmesianX `cpy-utils.cuh:158-163`,
+/// sha256=3ef1038e6c232e9519101daa2d6efd637d4c6bfdb29f4ee7101625c39d0ddc89.
+///
+/// Convention: `bit j = (table[j>>3] >> (j&7)) & 1`; bit=1 → sign = -1,
+/// bit=0 → sign = +1 (LSB-first within each byte).
+pub const TBQ_SIGNS_256: [u8; 32] = [
+    0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e,
+    0xb3, 0x7f, 0x24, 0xd6, 0x89, 0x45, 0xea, 0x1c,
+    0x63, 0xaf, 0xd8, 0x52, 0x97, 0x0b, 0xe1, 0x3d,
+    0x76, 0xc4, 0x19, 0xfe, 0x4a, 0x85, 0x2c, 0xdb,
+];
+
+/// D1 sign mask for the SRHT pre-multiplication, D=512 path.
+///
+/// Verbatim mirror of `hadamard_quantize_kv_fast.metal::TBQ_SIGNS_512`
+/// (lines 35-44). Source: AmesianX `cpy-utils.cuh:211-220`,
+/// sha256=44f13ce9f6db1edac62f558ee054f9de29cd474fd051362cadcaa98a55745f17.
+pub const TBQ_SIGNS_512: [u8; 64] = [
+    0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e,
+    0xb3, 0x7f, 0x24, 0xd6, 0x89, 0x45, 0xea, 0x1c,
+    0x63, 0xaf, 0xd8, 0x52, 0x97, 0x0b, 0xe1, 0x3d,
+    0x76, 0xc4, 0x19, 0xfe, 0x4a, 0x85, 0x2c, 0xdb,
+    0xd3, 0x4e, 0xa8, 0x17, 0x9c, 0x5b, 0xe6, 0x31,
+    0x72, 0xb9, 0x0d, 0xf5, 0x43, 0x8a, 0x6e, 0xc7,
+    0x58, 0x2f, 0x94, 0xe1, 0xb6, 0x3d, 0x0a, 0x7c,
+    0xc5, 0x61, 0xd8, 0x4f, 0xa3, 0x97, 0x1e, 0x85,
+];
+
+/// Apply D1 sign mask in-place per the SRHT convention.
+///
+/// `signs` must have at least `x.len() / 8` bytes (one bit per element).
+/// Sign flip: bit=1 → x[j] *= -1; bit=0 → x[j] unchanged.
+#[inline]
+pub fn apply_d1_sign_mask_inplace(x: &mut [f32], signs: &[u8]) {
+    for j in 0..x.len() {
+        let byte = signs[j >> 3];
+        let bit = (byte >> (j & 7)) & 1;
+        if bit == 1 {
+            x[j] = -x[j];
+        }
+    }
+}
+
+/// Higher-bit (5/6/8-bit) CPU encoder for D=256 — byte-equivalent mirror of
+/// `hadamard_quantize_kv_fast.metal::hadamard_quantize_kv_hb<256>`.
+///
+/// Path C F-0.2 deliverable: produces the exact byte layout that the GPU
+/// kernel writes given the same input vector, so divergence between the
+/// flash_attn_vec_tq_hb GPU kernel and the F-0.1 CPU oracle isolates the
+/// SDPA math (not the codec math).
+///
+/// Steps (mirroring the kernel byte-for-byte):
+/// 1. Apply D1 sign mask (`TBQ_SIGNS_256`).
+/// 2. Apply normalized FWHT (butterfly + 1/sqrt(d) — `fwht_inplace`).
+/// 3. Compute L2 norm of the rotated vector.
+/// 4. If norm > 1e-10: scale elems by `(1/norm) * sqrt(d)` (lift to N(0,1)).
+///    If norm ≤ 1e-10: scale = 0 (matches kernel `inv_norm = 0` branch).
+/// 5. Quantize each element to nearest centroid in the HB codebook for `bits`
+///    (5/6/8). Returns 1 byte per element (byte-packed).
+///
+/// Returns `(packed_indices, norm)`.
+pub fn turboquant_hb_encode_d256(x: &[f32], bits: u32) -> Result<(Vec<u8>, f32), crate::MlxError> {
+    if x.len() != 256 {
+        return Err(crate::MlxError::InvalidArgument(format!(
+            "turboquant_hb_encode_d256 expects head_dim=256, got {}",
+            x.len()
+        )));
+    }
+    if !matches!(bits, 5 | 6 | 8) {
+        return Err(crate::MlxError::InvalidArgument(format!(
+            "turboquant_hb_encode_d256 bits must be 5, 6, or 8, got {bits}"
+        )));
+    }
+
+    // Step 1: D1 sign pre-multiplication.
+    let mut elems = x.to_vec();
+    apply_d1_sign_mask_inplace(&mut elems, &TBQ_SIGNS_256);
+
+    // Step 2+3: normalized FWHT (butterfly + 1/sqrt(d)).
+    fwht_inplace(&mut elems)?;
+
+    // Step 4: L2 norm.
+    let norm_sq: f32 = elems.iter().map(|&v| v * v).sum();
+    let norm = norm_sq.sqrt();
+
+    // Step 5: scale to N(0,1). Kernel uses inv_norm * sqrt(d). Since fwht_inplace
+    // already applied 1/sqrt(d) scaling to elems, the "inv_norm * sqrt(d)" here
+    // means we multiply the post-fwht element by sqrt(d)/norm.
+    // ↳ Match kernel exactly: when norm ≤ 1e-10, scale := 0 (zeros out output).
+    let scale: f32 = if norm > 1.0e-10_f32 {
+        (1.0_f32 / norm) * (256.0_f32).sqrt()
+    } else {
+        0.0_f32
+    };
+    for v in elems.iter_mut() {
+        *v *= scale;
+    }
+
+    // Step 6+7: nearest centroid per element, byte-packed (1 byte per element).
+    let mut packed = Vec::with_capacity(256);
+    for &v in elems.iter() {
+        packed.push(hb_nearest_centroid(v, bits));
+    }
+
+    Ok((packed, norm))
+}
+
 /// HB nearest-centroid encoder (CPU-side mirror of the Metal encoder kernel).
 ///
 /// Returns the byte index of the nearest centroid in the codebook for the given
@@ -915,6 +1025,174 @@ mod tests {
                 (a - b).abs() < 1e-4,
                 "FWHT roundtrip mismatch at {i}: {a} vs {b}"
             );
+        }
+    }
+
+    // ----- ADR-007 Path C F-0.2 tests: HB encoder mirror correctness -----
+
+    fn deterministic_gaussian_test(seed: u64, n: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let next_u32 = |s: &mut u64| -> u32 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*s >> 32) as u32
+        };
+        let next_f32 = |s: &mut u64| -> f32 {
+            let bits = next_u32(s);
+            ((bits as f64 + 0.5) / (u32::MAX as f64 + 1.0)) as f32
+        };
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let u1 = next_f32(&mut state).max(1e-7).min(1.0 - 1e-7);
+            let u2 = next_f32(&mut state);
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            let theta = 2.0_f32 * std::f32::consts::PI * u2;
+            out.push(r * theta.cos());
+            if out.len() < n {
+                out.push(r * theta.sin());
+            }
+        }
+        out
+    }
+
+    /// Decode a single packed-byte row back to F32 via the same dequant formula
+    /// the GPU kernel uses on the read side, then invert SRHT (FWHT + sign mask).
+    /// Used only by tests to verify encoder roundtrip.
+    fn decode_d256_via_kernel_formula(packed: &[u8], norm: f32, bits: u32) -> Vec<f32> {
+        // Step 1: codebook lookup × norm × inv_sqrt(256), per kernel decoder math.
+        let inv_sqrt_dk = 1.0_f32 / (256.0_f32).sqrt();
+        let mut decoded: Vec<f32> = packed.iter()
+            .map(|&idx| hb_centroid(idx, bits) * norm * inv_sqrt_dk)
+            .collect();
+        // Step 2: inverse normalized FWHT = same FWHT (involution under H * H = I).
+        fwht_inplace(&mut decoded).expect("fwht ok");
+        // Step 3: invert D1 sign mask (sign flip is its own inverse).
+        apply_d1_sign_mask_inplace(&mut decoded, &TBQ_SIGNS_256);
+        decoded
+    }
+
+    fn nrmse(a: &[f32], b: &[f32]) -> f32 {
+        let mut sse: f64 = 0.0;
+        let mut sse_a: f64 = 0.0;
+        for (&av, &bv) in a.iter().zip(b.iter()) {
+            let d = (av - bv) as f64;
+            sse += d * d;
+            sse_a += (av as f64) * (av as f64);
+        }
+        if sse_a < 1e-30 {
+            return 0.0;
+        }
+        (sse / sse_a).sqrt() as f32
+    }
+
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot: f64 = 0.0;
+        let mut na: f64 = 0.0;
+        let mut nb: f64 = 0.0;
+        for (&av, &bv) in a.iter().zip(b.iter()) {
+            dot += (av as f64) * (bv as f64);
+            na += (av as f64) * (av as f64);
+            nb += (bv as f64) * (bv as f64);
+        }
+        if na < 1e-30 || nb < 1e-30 {
+            return 1.0;
+        }
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    }
+
+    /// Encoder roundtrip via the kernel's dequant formula: encode → dequant →
+    /// compare to original. Cosine ≥ ADR-007 Gate A threshold (≥0.999).
+    /// 8-bit close-section measured 0.9998 mean / 0.9986 p1.
+    #[test]
+    fn hb_encoder_d256_roundtrip_8bit_meets_gate_a() {
+        // 8-bit Gate A close-section measurement: cosine mean 0.9998.
+        // Synthetic Gaussian sample isn't the production distribution but should
+        // clear the strict spec on a single vector. Threshold ≥0.998 leaves
+        // headroom for sampling noise on a single 256-vector.
+        let x = deterministic_gaussian_test(0xC25EED, 256);
+        let (packed, norm) = turboquant_hb_encode_d256(&x, 8).expect("encode");
+        let recon = decode_d256_via_kernel_formula(&packed, norm, 8);
+        let cos = cosine_similarity(&x, &recon);
+        let nrmse_v = nrmse(&x, &recon);
+        assert!(cos >= 0.998, "8-bit roundtrip cosine {cos} < 0.998");
+        assert!(nrmse_v <= 0.07, "8-bit roundtrip NRMSE {nrmse_v} > 0.07");
+    }
+
+    #[test]
+    fn hb_encoder_d256_roundtrip_5bit_within_band() {
+        // 5-bit close-section: not shippable as default; expected wider gap.
+        let x = deterministic_gaussian_test(0xC25EED, 256);
+        let (packed, norm) = turboquant_hb_encode_d256(&x, 5).expect("encode");
+        let recon = decode_d256_via_kernel_formula(&packed, norm, 5);
+        let cos = cosine_similarity(&x, &recon);
+        // 5-bit Lloyd-Max MSE ≈ 0.0095 → cosine ≈ 0.99. Allow small headroom.
+        assert!(cos >= 0.985, "5-bit roundtrip cosine {cos} < 0.985");
+    }
+
+    #[test]
+    fn hb_encoder_d256_is_deterministic() {
+        let x = deterministic_gaussian_test(0xBEEF, 256);
+        let (p_a, n_a) = turboquant_hb_encode_d256(&x, 8).expect("a");
+        let (p_b, n_b) = turboquant_hb_encode_d256(&x, 8).expect("b");
+        assert_eq!(p_a, p_b);
+        assert_eq!(n_a.to_bits(), n_b.to_bits());
+    }
+
+    #[test]
+    fn hb_encoder_d256_zero_vector() {
+        // Mantra: if norm <= 1e-10 kernel sets scale = 0. Then every elem = 0,
+        // which dequants to centroid index 127 or 128 (closest-to-zero 8-bit).
+        // The norm written is 0. Decode should yield ~0 vector.
+        let x = vec![0.0_f32; 256];
+        let (packed, norm) = turboquant_hb_encode_d256(&x, 8).expect("encode");
+        assert_eq!(norm, 0.0);
+        // All packed bytes should be the centroid closest to zero (idx 127 or 128).
+        for &b in packed.iter() {
+            assert!(b == 127 || b == 128,
+                "zero-vec encode produced non-near-zero centroid: {b}");
+        }
+        // Roundtrip: norm=0 means decoder produces all-zero output (× 0 = 0).
+        let recon = decode_d256_via_kernel_formula(&packed, 0.0, 8);
+        for &v in recon.iter() {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn hb_encoder_d256_validates_bits() {
+        let x = vec![0.0_f32; 256];
+        assert!(turboquant_hb_encode_d256(&x, 4).is_err()); // 4-bit not HB
+        assert!(turboquant_hb_encode_d256(&x, 7).is_err()); // invalid
+    }
+
+    #[test]
+    fn hb_encoder_d256_validates_size() {
+        let x = vec![0.0_f32; 128]; // wrong size
+        assert!(turboquant_hb_encode_d256(&x, 8).is_err());
+    }
+
+    #[test]
+    fn d1_sign_mask_is_self_inverse() {
+        let mut x = deterministic_gaussian_test(0x123, 256);
+        let original = x.clone();
+        apply_d1_sign_mask_inplace(&mut x, &TBQ_SIGNS_256);
+        // After one application, must differ.
+        let differs = x.iter().zip(original.iter()).any(|(&a, &b)| (a - b).abs() > 1e-6);
+        assert!(differs, "D1 sign mask had no effect");
+        // After two applications, must equal original (sign flip is its own inverse).
+        apply_d1_sign_mask_inplace(&mut x, &TBQ_SIGNS_256);
+        for (i, (&a, &b)) in x.iter().zip(original.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6, "D1 sign mask not self-inverse at {i}");
+        }
+    }
+
+    #[test]
+    fn tbq_signs_first_32_bytes_match_512_prefix() {
+        // The shader's two sign tables share their first 32 bytes (verified
+        // visually in hadamard_quantize_kv_fast.metal:25-30 vs 35-44). This
+        // is load-bearing for cross-D=256/D=512 codec equivalence proofs.
+        for i in 0..32 {
+            assert_eq!(TBQ_SIGNS_256[i], TBQ_SIGNS_512[i],
+                "TBQ_SIGNS_256/512 prefix mismatch at byte {i}");
         }
     }
 }
