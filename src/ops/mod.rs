@@ -73,3 +73,5 @@ pub mod softmax_sample;
 pub mod ssm_conv;
 pub mod transpose;
 pub mod tri_solve;
+pub mod im2col_2d_3ch;
+pub mod add_bias_row_2d;
