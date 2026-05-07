@@ -495,6 +495,14 @@ impl KernelRegistry {
         );
         sources.insert("rms_norm_backward_dx_f32".into(), rms_norm_backward_src);
         sources.insert("rms_norm_backward_dw_f32".into(), rms_norm_backward_src);
+        // ADR-020 iter-11a: 2-D row-major slice + concat-by-column kernels.
+        // Used by hf2q's multi-head SDPA on GpuTape (slice Q/K/V into
+        // per-head views, run per-head SDPA, concat per-head contexts
+        // back to full attention output).
+        let slice_concat_2d_src: &'static str =
+            include_str!("shaders/slice_concat_2d.metal");
+        sources.insert("slice_2d_cols_f32".into(), slice_concat_2d_src);
+        sources.insert("copy_2d_cols_into_f32".into(), slice_concat_2d_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
