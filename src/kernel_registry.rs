@@ -543,6 +543,15 @@ impl KernelRegistry {
         let qmm_affine_src: &'static str =
             include_str!("shaders/qmm_affine.metal");
         sources.insert("qmm_affine_t_f32".into(), qmm_affine_src);
+        // ADR-020 iter-15b: tiled variant — 16x16 thread block with
+        // cooperative-load X/W tiles in threadgroup-shared memory for
+        // 2-5x speedup over the per-element kernel.
+        let qmm_affine_tiled_src: &'static str =
+            include_str!("shaders/qmm_affine_tiled.metal");
+        sources.insert(
+            "qmm_affine_t_f32_tiled".into(),
+            qmm_affine_tiled_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
