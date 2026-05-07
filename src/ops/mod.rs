@@ -77,3 +77,4 @@ pub mod im2col_2d_3ch;
 pub mod add_bias_row_2d;
 pub mod bilinear_resize_2d;
 pub mod block_merge_2x2;
+pub mod feature_concat;
