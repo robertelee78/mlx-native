@@ -32,8 +32,8 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 ### Trade-offs to know going in
 
 - **Apple Silicon only.** No CPU, no CUDA, no WASM. If you need to ship cross-platform, this is the wrong layer.
-- **No training.** No autograd, no `Var` / `VarMap`, no optimizers. Forward-pass kernels only.
-- **GGML matmul coverage is the inference subset, not the full set.** Q4_0, Q8_0, Q6_K have full mat-vec / mat-mat / tensor-mm and expert-routed variants. Q5_K has expert-routed mat-vec only. Q4_K, Q4_1, Q5_0, Q5_1, Q8_1, Q2_K, Q3_K, Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
+- **No autograd.** Backward and optimizer kernels exist (SiLU / RMSNorm / softmax / log / row-sum / embedding scatter-add backward, differentiable affine qdq, Adam step) — but you wire the training loop yourself; there is no `Var` / `VarMap` / autodiff / `Module` system.
+- **GGML matmul coverage is the inference subset, not the full set.** Q4_0, Q8_0, Q6_K have full mat-vec / mat-mat / tensor-mm and expert-routed variants. Q4_K and Q5_K have expert-routed mat-vec (`mm_id`) only — no dense matmul. Q4_1, Q5_0, Q5_1, Q8_1, Q2_K, Q3_K, Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
 - **No high-level model code.** This is a kernel library; the consumer (e.g. hf2q) builds the actual transformer forward pass.
 
 ## Status
@@ -134,7 +134,9 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 
 ### Matrix multiplication
 - **GGUF formats**: Q4_0, Q5_K, Q6_K, Q8_0, I16 — mat-vec + mul_mm tensor-core kernels
+- **GGUF expert-routed (`mm_id`)**: Q4_K, Q5_K (top_k>1 MoE mat-vec)
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
+- **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over the non-tiled variant)
 - **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` (top_k=1 tensor-mm fast path)
 - **Dense BF16**: `dense_mm_bf16_tensor`, `dense_gemv_bf16_f32` (M=1 decode)
 - **Dense F16**: `dense_gemm_f16`, `dense_matvec_f16`
@@ -155,7 +157,7 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 
 ### Position encoding
 - `rope` — Standard RoPE
-- `rope_multi` — Multi-axis RoPE with IMROPE mode (Qwen3.5)
+- `rope_multi` — Multi-axis RoPE with IMROPE (Qwen3.5) and Vision (Qwen3-VL ViT 2D positions) modes
 
 ### MoE
 - `moe_gate` — Gate logits → weights
@@ -179,10 +181,28 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 - `copy`, `offset_copy` — Strided copy
 - `argmax`, `argsort`, `top_k` — Reductions
 
+### Vision / ViT (Qwen3-VL prelude)
+- `im2col_2d_3ch_f32` + `add_bias_row_2d_f32` — patch-embed helpers
+- `bilinear_resize_2d_f32` — antialiased 2-D resize
+- `block_merge_2x2_f32` — 2×2 spatial merge / permutation
+- `feature_concat_f32` — strided channel-axis concat
+
 ### Hadamard / TurboQuant
 - `hadamard` — Standalone FWHT (D=128/256/512)
 - `hadamard_quantize_kv` — Fused Hadamard + KV quantization
 - `tq_dequantize_kv` — TurboQuant KV dequantization
+
+### Quantize / dequantize (qdq)
+- `qdq_q4_0_f32`, `qdq_q8_0_f32` — GPU-side dequant for legacy GGUF blocks
+- `qdq_affine_init_f32` / `qdq_affine_forward_f32` — MLX-format affine qdq with differentiable variants
+- `qdq_affine_backward_scales_f32`, `qdq_affine_backward_biases_f32` — backward through quantization parameters
+
+### Backward & training kernels
+- `silu_backward_f32`, `softmax_backward`, `log_backward_f32`, `row_sum_backward_f32`
+- `rms_norm_compute_rms_inv` + `rms_norm_backward_dx` + `rms_norm_backward_dw`
+- `embedding_lookup_f32` + `embedding_scatter_add_f32` (forward + scatter-add backward)
+- `adam_update_f32` — fused Adam optimizer step (m / v moments + bias-correction)
+- `slice_2d_cols_f32` + `copy_2d_cols_into_f32` — strided 2-D slice / scatter for column-major training layouts
 
 ## Weight loading
 
