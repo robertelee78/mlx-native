@@ -478,6 +478,23 @@ impl KernelRegistry {
         let row_sum_src: &'static str = include_str!("shaders/row_sum.metal");
         sources.insert("row_sum_f32".into(), row_sum_src);
         sources.insert("row_sum_backward_f32".into(), row_sum_src);
+        // ADR-020 iter-10a: GGUF-legacy quantize-dequantize round-trip kernels
+        // (Q4_0 + Q8_0).  Used by hf2q's dynamic_quant Track 1 to produce
+        // W_low / W_high for the gradient-Taylor sensitivity formula.
+        let qdq_legacy_src: &'static str = include_str!("shaders/qdq_legacy.metal");
+        sources.insert("qdq_q4_0_f32".into(), qdq_legacy_src);
+        sources.insert("qdq_q8_0_f32".into(), qdq_legacy_src);
+        // ADR-020 iter-10b: RMSNorm reverse-mode autograd kernels.
+        // r_inv helper is reused by both backward kernels; dx and dw cover
+        // the full backward identity for `y = x * rsqrt(mean(x²) + eps) * w`.
+        let rms_norm_backward_src: &'static str =
+            include_str!("shaders/rms_norm_backward.metal");
+        sources.insert(
+            "rms_norm_compute_rms_inv_f32".into(),
+            rms_norm_backward_src,
+        );
+        sources.insert("rms_norm_backward_dx_f32".into(), rms_norm_backward_src);
+        sources.insert("rms_norm_backward_dw_f32".into(), rms_norm_backward_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
