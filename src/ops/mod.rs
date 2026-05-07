@@ -25,6 +25,7 @@ pub mod fused_residual_norm;
 pub mod gelu;
 pub mod kv_cache_copy;
 pub mod l2_norm;
+pub mod log_elementwise;
 pub mod moe_dispatch;
 pub mod moe_gate;
 pub mod moe_softmax_topk;
