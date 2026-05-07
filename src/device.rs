@@ -19,6 +19,16 @@ use crate::residency::{macos_15_or_newer, residency_disabled_by_env, ResidencySe
 ///
 /// `MlxDevice` is `Send + Sync` — you can share it across threads. The
 /// underlying Metal device and command queue are thread-safe on Apple Silicon.
+///
+/// `Clone` is a cheap Arc-bump on the underlying handles: `metal::Device`
+/// + `metal::CommandQueue` wrap NSObject Arc-pointers internally, and
+/// [`ResidencySet`] is `#[derive(Clone)]` over an `Arc<ResidencySetInner>`.
+/// Cloning yields a SECOND handle pointing at the SAME GPU device, command
+/// queue, and residency-set NSObject — multiple owners (e.g. an
+/// `AdamOptimizer` + a per-step `GpuTape`) can register allocations
+/// against the same residency set without double-create.  ADR-020
+/// iter-13b dependency.
+#[derive(Clone)]
 pub struct MlxDevice {
     device: Device,
     queue: CommandQueue,
