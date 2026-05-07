@@ -354,6 +354,36 @@ impl MlxBuffer {
         self.dtype = dtype;
         self.shape = shape;
     }
+
+    /// Produce a zero-copy clone of this buffer with a new logical shape.
+    ///
+    /// The cloned buffer shares the same underlying Metal allocation
+    /// and residency-set guard via `Arc::clone` on the storage; only
+    /// the per-handle `shape` metadata is replaced.  Both handles
+    /// continue to alias the same GPU memory — writes through one are
+    /// observed by the other.
+    ///
+    /// Validates `shape.iter().product() == self.element_count()`
+    /// and `self.dtype == dtype` (dtype unchanged).  Useful for
+    /// implementing zero-copy `view`/`reshape` ops in autograd tapes.
+    ///
+    /// ADR-020 iter-13c: tape `view` op dependency.
+    pub fn with_shape(&self, shape: Vec<usize>) -> std::result::Result<Self, MlxError> {
+        let numel: usize = shape.iter().product();
+        if numel != self.element_count() {
+            return Err(MlxError::InvalidArgument(format!(
+                "with_shape: numel({:?}) = {numel} != element_count = {}",
+                shape,
+                self.element_count(),
+            )));
+        }
+        Ok(Self {
+            storage: self.storage.clone(),
+            dtype: self.dtype,
+            shape,
+            byte_offset: self.byte_offset,
+        })
+    }
 }
 
 impl fmt::Debug for MlxBuffer {
