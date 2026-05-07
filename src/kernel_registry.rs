@@ -509,6 +509,14 @@ impl KernelRegistry {
             include_str!("shaders/silu_backward.metal");
         sources.insert("silu_f32".into(), silu_backward_src);
         sources.insert("silu_backward_f32".into(), silu_backward_src);
+        // ADR-020 iter-11d: FP32 embedding lookup + scatter-add backward.
+        let embedding_autograd_src: &'static str =
+            include_str!("shaders/embedding_autograd.metal");
+        sources.insert("embedding_lookup_f32".into(), embedding_autograd_src);
+        sources.insert(
+            "embedding_scatter_add_f32".into(),
+            embedding_autograd_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);

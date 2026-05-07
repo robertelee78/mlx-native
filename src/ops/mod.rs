@@ -77,3 +77,4 @@ pub mod qdq_legacy;
 pub mod rms_norm_backward;
 pub mod slice_concat_2d;
 pub mod silu_backward;
+pub mod embedding_autograd;
