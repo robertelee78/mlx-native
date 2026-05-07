@@ -66,6 +66,7 @@ pub mod sdpa_decode;
 pub mod sdpa_sliding;
 pub mod softcap;
 pub mod softmax;
+pub mod softmax_backward;
 pub mod softmax_sample;
 pub mod ssm_conv;
 pub mod transpose;

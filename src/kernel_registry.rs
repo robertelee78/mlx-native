@@ -468,6 +468,9 @@ impl KernelRegistry {
         sources.insert("softmax_f32".into(), softmax_src);
         sources.insert("softmax_f16".into(), softmax_src);
         sources.insert("softmax_bf16".into(), softmax_src);
+        let softmax_backward_src: &'static str =
+            include_str!("shaders/softmax_backward.metal");
+        sources.insert("softmax_backward_f32".into(), softmax_backward_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
