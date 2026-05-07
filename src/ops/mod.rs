@@ -80,3 +80,4 @@ pub mod silu_backward;
 pub mod embedding_autograd;
 pub mod adam_update;
 pub mod qdq_affine;
+pub mod qmm_affine;

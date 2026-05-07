@@ -537,6 +537,12 @@ impl KernelRegistry {
             "qdq_affine_backward_biases_f32".into(),
             qdq_affine_src,
         );
+        // ADR-020 iter-15: fused affine quantized matmul for DWQ inference.
+        // Per-element kernel; one thread per (m, n) output element.
+        // Tiled + simdgroup-MMA variant lands in iter-15b.
+        let qmm_affine_src: &'static str =
+            include_str!("shaders/qmm_affine.metal");
+        sources.insert("qmm_affine_t_f32".into(), qmm_affine_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
