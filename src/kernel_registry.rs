@@ -475,6 +475,9 @@ impl KernelRegistry {
             include_str!("shaders/log_elementwise.metal");
         sources.insert("log_f32".into(), log_elementwise_src);
         sources.insert("log_backward_f32".into(), log_elementwise_src);
+        let row_sum_src: &'static str = include_str!("shaders/row_sum.metal");
+        sources.insert("row_sum_f32".into(), row_sum_src);
+        sources.insert("row_sum_backward_f32".into(), row_sum_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
