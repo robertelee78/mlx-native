@@ -75,3 +75,4 @@ pub mod transpose;
 pub mod tri_solve;
 pub mod im2col_2d_3ch;
 pub mod add_bias_row_2d;
+pub mod bilinear_resize_2d;
