@@ -79,3 +79,4 @@ pub mod slice_concat_2d;
 pub mod silu_backward;
 pub mod embedding_autograd;
 pub mod adam_update;
+pub mod qdq_affine;

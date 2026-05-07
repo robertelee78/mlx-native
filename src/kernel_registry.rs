@@ -522,6 +522,21 @@ impl KernelRegistry {
         let adam_update_src: &'static str =
             include_str!("shaders/adam_update.metal");
         sources.insert("adam_update_f32".into(), adam_update_src);
+        // ADR-020 iter-13b: differentiable affine qdq kernels for the
+        // DWQ-proper training loop.  Init + forward + backward (scales,
+        // biases) — q_int is FROZEN, scales+biases learnable.
+        let qdq_affine_src: &'static str =
+            include_str!("shaders/qdq_affine.metal");
+        sources.insert("qdq_affine_init_f32".into(), qdq_affine_src);
+        sources.insert("qdq_affine_forward_f32".into(), qdq_affine_src);
+        sources.insert(
+            "qdq_affine_backward_scales_f32".into(),
+            qdq_affine_src,
+        );
+        sources.insert(
+            "qdq_affine_backward_biases_f32".into(),
+            qdq_affine_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
