@@ -81,3 +81,9 @@ pub mod embedding_autograd;
 pub mod adam_update;
 pub mod qdq_affine;
 pub mod qmm_affine;
+// ADR-021 Qwen3-VL ViT prelude GPU port (5 new kernels):
+pub mod im2col_2d_3ch;
+pub mod add_bias_row_2d;
+pub mod bilinear_resize_2d;
+pub mod block_merge_2x2;
+pub mod feature_concat;
