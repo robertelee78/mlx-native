@@ -251,6 +251,11 @@ impl KernelRegistry {
             "moe_weighted_sum_seq_backward_weights_f32".into(),
             moe_dispatch_src,
         );
+        // ADR-020 iter-11h-e3b: fused backward kernel for moe_swiglu_seq.
+        sources.insert(
+            "moe_swiglu_seq_backward_f32".into(),
+            moe_dispatch_src,
+        );
 
         // Batched KV cache copy kernels
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");

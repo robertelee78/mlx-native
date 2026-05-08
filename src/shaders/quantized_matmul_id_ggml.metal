@@ -94,6 +94,39 @@ typedef struct {
     half    d;
 } block_q6_K;
 
+// Q5_1: 32 values per block, 24 bytes per block.
+// Layout: [half d][half m][uint qh][uint8_t qs[16]]
+// Per-element: x[i]      = (qs[i] & 0x0F) | (((qh >> i) & 1) << 4)
+//              x[i+16]   = (qs[i] >> 4)   | (((qh >> (i+16)) & 1) << 4)
+//              out[i]    = d * x[i]      + m
+//              out[i+16] = d * x[i+16]   + m
+// ADR-022 Phase 1.
+typedef struct {
+    half    d;
+    half    m;
+    uint    qh;
+    uint8_t qs[QK4_0 / 2];  // 16 bytes — same QK as Q4_0
+} block_q5_1;
+
+// IQ4_NL: 32 values per block, 18 bytes per block.
+// Layout: [half d][uint8_t qs[16]]
+// Each qs byte holds 2 4-bit codebook indices into kvalues_iq4nl[16].
+// Per-element: out[i]    = d * kvalues_iq4nl[qs[i] & 0x0F]
+//              out[i+16] = d * kvalues_iq4nl[qs[i] >> 4]
+// ADR-022 Phase 1.
+typedef struct {
+    half    d;
+    uint8_t qs[QK4_0 / 2];  // 16 bytes
+} block_iq4_nl;
+
+// IQ4_NL non-linear codebook (frozen by llama.cpp ggml-common.h:1109-1112).
+// Any drift breaks every IQ4_NL GGUF on disk; do not edit without
+// updating the host-side `KVALUES_IQ4_NL` in src/gguf/mod.rs in lock-step.
+constant int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
 // ---- Q4_0 dot product helper (identical to quantized_matmul_ggml.metal) ----
 
 inline float block_q4_0_dot_y(
