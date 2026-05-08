@@ -89,6 +89,75 @@ typedef struct {
 static_assert(sizeof(block_q4_K) == 2*sizeof(half) + K_SCALE_SIZE + QK_K/2,
               "wrong q4_K block size");
 
+// Q5_1 (ADR-022 Phase 1). 32 values per block, 24 bytes per block.
+typedef struct {
+    half    d;
+    half    m;
+    uint    qh;
+    uint8_t qs[QK4_0 / 2];
+} block_q5_1;
+static_assert(sizeof(block_q5_1) == 2*sizeof(half) + 4 + QK4_0/2,
+              "wrong q5_1 block size");
+
+// IQ4_NL (ADR-022 Phase 1). 32 values per block, 18 bytes per block.
+typedef struct {
+    half    d;
+    uint8_t qs[QK4_0 / 2];
+} block_iq4_nl;
+static_assert(sizeof(block_iq4_nl) == sizeof(half) + QK4_0/2,
+              "wrong iq4_nl block size");
+
+// Frozen IQ4_NL codebook (ggml-common.h:1109-1112). Lock-step with
+// host-side `KVALUES_IQ4_NL` in src/gguf/mod.rs and the duplicate in
+// quantized_matmul_id_ggml.metal.
+constant int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// Q5_1 dot helper — see id_ggml.metal:135-179 for the formula derivation.
+inline float block_q5_1_dot_y(
+    device const block_q5_1 * qb,
+    float sumy,
+    thread float * yl,
+    int il
+) {
+    float d = qb->d;
+    float m = qb->m;
+    float4 acc = 0.f;
+    device const uint16_t * qs = ((device const uint16_t *)qb + 4 + il/2);
+    const uint qh = qb->qh;
+    for (int i = 0; i < 8; i += 2) {
+        acc[0] += yl[i + 0]
+                * (float)((qs[i / 2] & 0x000F) | (((qh >> (i + 0 + il      )) << 4 ) & 0x0010));
+        acc[1] += yl[i + 1]
+                * (float)((qs[i / 2] & 0x0F00) | (((qh >> (i + 1 + il      )) << 12) & 0x1000));
+        acc[2] += yl[i + 8]
+                * (float)((qs[i / 2] & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8 ) & 0x0100));
+        acc[3] += yl[i + 9]
+                * (float)((qs[i / 2] & 0xF000) | (((qh >> (i + 1 + il + 16)) << 16) & 0x10000));
+    }
+    return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
+}
+
+// IQ4_NL dot helper — see id_ggml.metal:181-211 for the codebook-lookup
+// rationale (raw yl[], no pre-scale, non-linear).
+inline float block_iq4_nl_dot_y(
+    device const block_iq4_nl * qb,
+    thread float * yl_raw,
+    int il
+) {
+    float d = qb->d;
+    float acc = 0.f;
+    device const uint8_t * qs = qb->qs + il;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t b = qs[i];
+        acc += yl_raw[i]     * (float)kvalues_iq4nl[b & 0x0F];
+        acc += yl_raw[i + 8] * (float)kvalues_iq4nl[(b >> 4) & 0x0F];
+    }
+    return d * acc;
+}
+
 // ---- Q4_0 mat-vec kernel ----
 //
 // Each SIMD group (32 threads) processes N_DST=4 rows.
@@ -171,6 +240,135 @@ kernel void kernel_mul_mv_q4_0_f32(
 
         for (int row = 0; row < nr; row++) {
             sumf[row] += block_q4_0_dot_y(x + ib + row*nb, sumy[0] + sumy[1], yl, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[im*p.ne0*p.ne1 + r1*p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ---- Q5_1 mat-vec kernel (ADR-022 Phase 1) ----
+//
+// Same dispatch geometry as Q4_0; differs only in (a) block walked and
+// (b) dot helper used. Q5_1 carries an `m` (min) term, contributing
+// `m * sumy` to the dot product, plus the qh 5th-bit injection.
+
+kernel void kernel_mul_mv_q5_1_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_q5_1 * x = (device const block_q5_1 *) src0 + offset0;
+    device const float      * y = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float yl[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        float sumy = 0.f;
+        for (int i = 0; i < 8; i += 2) {
+            sumy += yb[i] + yb[i+1];
+            yl[i+0] = yb[i+0];
+            yl[i+1] = yb[i+1] / 256.f;
+            sumy += yb[i+16] + yb[i+17];
+            yl[i+8] = yb[i+16] / 16.f;
+            yl[i+9] = yb[i+17] / 4096.f;
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_q5_1_dot_y(x + ib + row*nb, sumy, yl, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[im*p.ne0*p.ne1 + r1*p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ---- IQ4_NL mat-vec kernel (ADR-022 Phase 1) ----
+//
+// IQ4_NL's codebook lookup is non-linear; uses raw yl[] (no pre-scale).
+
+kernel void kernel_mul_mv_iq4_nl_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_iq4_nl * x = (device const block_iq4_nl *) src0 + offset0;
+    device const float        * y = (device const float        *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float yl_raw[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        for (int i = 0; i < 8; i++) {
+            yl_raw[i]     = yb[i];
+            yl_raw[i + 8] = yb[i + 16];
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_iq4_nl_dot_y(x + ib + row*nb, yl_raw, il);
         }
 
         yb += QK4_0 * 16;

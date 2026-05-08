@@ -134,22 +134,17 @@ impl GgmlType {
     /// — used for `m <= MM_ROUTING_THRESHOLD`.
     fn kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 in-flight: Q5_1 / IQ4_NL kernels port in P1.5; arm
-            // moves out of "unsupported" when those kernels land. Q5_K /
-            // I16 / F32 / F16 dense mv coverage owned by ADR-022 phase 2-3.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::Q5_K
-            | GgmlType::I16
-            | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => "unsupported",
+            // Q5_K / I16 dense mv coverage owned by ADR-022 phase 2-3.
+            // F32 / F16 are type-not-applicable for this dispatch.
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
-            // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp
-            // (ggml-metal.metal:7715-7821) for dwq46/dwq48 dense
-            // ffn_*_shexp + ffn_gate_inp + ffn_gate_inp_shexp tensors.
+            // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp.
             GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_q6_K_f32",
+            // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL dense mv ports.
+            GgmlType::Q5_1 => "kernel_mul_mv_q5_1_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
         }
     }
 

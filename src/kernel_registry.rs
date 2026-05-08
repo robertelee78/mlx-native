@@ -77,6 +77,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL dense mat-vec.
+        sources.insert("kernel_mul_mv_q5_1_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_iq4_nl_f32".into(), ggml_src);
         // ADR-013 P7 — Q4_K dense decode mat-vec (port of llama.cpp's
         // kernel_mul_mv_q4_K_f32 at ggml-metal.metal:7715-7821).
         sources.insert("kernel_mul_mv_q4_K_f32".into(), ggml_src);
