@@ -259,3 +259,137 @@ pub fn quantized_matmul_id(
 
     Ok(output)
 }
+
+/// ADR-020 AC#5 Iter C2.3 — sibling of [`quantized_matmul_id`] that
+/// writes the matmul result into the caller-supplied `output` buffer
+/// instead of allocating a fresh one.  Required for the hf2q serve
+/// path where output buffers (`pf_moe_gate_up`, `pf_moe_down`) are
+/// pre-allocated at max capacity and reused across decode steps.
+///
+/// Same kernel + dispatch geometry as `quantized_matmul_id`; differs
+/// only in the output-buffer ownership: caller owns + sizes the
+/// output, validation checks `output.byte_len() >= M *
+/// n_expert_used * N * sizeof(f32)`.
+///
+/// Unsupported `bits`/dimension combinations return the same
+/// `MlxError::InvalidArgument` errors as the parent.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_into(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    scales: &MlxBuffer,
+    biases: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &QuantizedMatmulIdParams,
+) -> Result<()> {
+    if params.bits != 4 && params.bits != 6 && params.bits != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: unsupported bits value {}; only 4, 6, and 8 are supported",
+            params.bits
+        )));
+    }
+    if params.m == 0 || params.k == 0 || params.n == 0
+        || params.group_size == 0
+        || params.n_expert_used == 0
+        || params.num_experts == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_into: M, K, N, group_size, n_expert_used, num_experts must all be > 0".into(),
+        ));
+    }
+
+    let expected_input = (params.m as usize) * (params.k as usize) * DType::F32.size_of();
+    if input.byte_len() < expected_input {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: input buffer too small (need >= {expected_input} bytes, got {})",
+            input.byte_len()
+        )));
+    }
+    let per_expert_w = expert_weight_bytes(params.k, params.n, params.bits);
+    let total_w = per_expert_w * (params.num_experts as usize);
+    if weight.byte_len() < total_w {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: weight buffer too small (need >= {total_w} bytes, got {})",
+            weight.byte_len()
+        )));
+    }
+    let per_expert_s = expert_scales_elements(params.k, params.n, params.group_size);
+    let total_s_bytes = per_expert_s * (params.num_experts as usize) * 2; // bf16
+    if scales.byte_len() < total_s_bytes || biases.byte_len() < total_s_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: scales/biases too small (need >= {total_s_bytes} bytes each)"
+        )));
+    }
+    let expected_ids = (params.m as usize) * (params.n_expert_used as usize) * DType::U32.size_of();
+    if ids.byte_len() < expected_ids {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: ids buffer too small (need >= {expected_ids} bytes)"
+        )));
+    }
+    let expected_output = (params.m as usize)
+        * (params.n_expert_used as usize)
+        * (params.n as usize)
+        * DType::F32.size_of();
+    if output.byte_len() < expected_output {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: output buffer too small (need >= {expected_output} bytes, got {})",
+            output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("quantized_matmul_id", device.metal_device())?;
+
+    let gpu_params = QuantizedMatmulIdGpuParams {
+        m: params.m,
+        k: params.k,
+        n: params.n,
+        group_size: params.group_size,
+        bits: params.bits,
+        n_expert_used: params.n_expert_used,
+        num_experts: params.num_experts,
+        expert_weight_stride: per_expert_w as u32,
+        expert_scales_stride: per_expert_s as u32,
+        expert_biases_stride: per_expert_s as u32,
+    };
+    let params_bytes = std::mem::size_of::<QuantizedMatmulIdGpuParams>();
+    let mut params_buf = device.alloc_buffer(params_bytes, DType::U32, vec![10])?;
+    {
+        let slice: &mut [QuantizedMatmulIdGpuParams] = bytemuck::cast_slice_mut(
+            params_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| MlxError::InvalidArgument(format!("params buf write: {e}")))?,
+        );
+        slice[0] = gpu_params;
+    }
+
+    let total_rows = (params.m as u64) * (params.n_expert_used as u64);
+    let tg_x = 16u64.min(params.n as u64);
+    let tg_y = 16u64.min(total_rows);
+    let threadgroup_size = metal::MTLSize::new(tg_x, tg_y, 1);
+    let grid_groups = metal::MTLSize::new(
+        (params.n as u64 + tg_x - 1) / tg_x,
+        (total_rows + tg_y - 1) / tg_y,
+        1,
+    );
+
+    encoder.encode_threadgroups(
+        pipeline,
+        &[
+            (0, input),
+            (1, weight),
+            (2, scales),
+            (3, biases),
+            (4, ids),
+            (5, output),
+            (6, &params_buf),
+        ],
+        grid_groups,
+        threadgroup_size,
+    );
+
+    Ok(())
+}

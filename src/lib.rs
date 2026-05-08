@@ -105,7 +105,9 @@ pub use ops::quantized_matmul_ggml::{
     MM_ROUTING_THRESHOLD,
 };
 pub use ops::mul_mv_ext::{mul_mv_ext_dispatch, MulMvExtParams};
-pub use ops::quantized_matmul_id::{quantized_matmul_id, QuantizedMatmulIdParams};
+pub use ops::quantized_matmul_id::{
+    quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
+};
 pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
     quantized_matmul_id_swiglu_q4_0,
