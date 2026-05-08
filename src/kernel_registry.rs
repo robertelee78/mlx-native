@@ -562,6 +562,16 @@ impl KernelRegistry {
             "qmm_affine_t_f32_simd".into(),
             qmm_affine_simd_src,
         );
+        // ADR-020 iter-15c-2: 4-simdgroup-per-TG variant — 32×32
+        // output tile, 4 simdgroups arranged as 2×2 grid each owning
+        // a 16×16 sub-tile = 4 simdgroup_matrix accumulators.  Same
+        // math as 15c-1, fuller warp-pool exploitation.
+        let qmm_affine_simd4_src: &'static str =
+            include_str!("shaders/qmm_affine_simd4.metal");
+        sources.insert(
+            "qmm_affine_t_f32_simd4".into(),
+            qmm_affine_simd4_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
