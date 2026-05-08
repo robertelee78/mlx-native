@@ -427,3 +427,79 @@ fn adr022_iq4_nl_mm_id_parity_prefill_path() {
         0xAD22_004F_6012,
     );
 }
+
+// ----- Bisect helper: Q4_0 baseline at the same prefill-path shape -----
+//
+// Hypothesis: if Q4_0 (proven correct) passes at n_tokens=64 top_k=8,
+// the test harness + dispatch_id_mm path are both sound, isolating the
+// failure to Q5_1 / IQ4_NL kernel-specific code (most likely the
+// dequantize_q5_1 / dequantize_iq4_nl template bodies in id_mm.metal).
+
+const QK4_0: usize = 32;
+const BLOCK_Q4_0_BYTES: usize = 18;
+
+fn ref_quantize_q4_0(row: &[f32]) -> Vec<u8> {
+    assert_eq!(row.len() % QK4_0, 0);
+    let mut out = Vec::with_capacity((row.len() / QK4_0) * BLOCK_Q4_0_BYTES);
+    for chunk in row.chunks(QK4_0) {
+        let mut absmax = 0.0_f32;
+        let mut max = 0.0_f32;
+        for &v in chunk {
+            if v.abs() > absmax {
+                absmax = v.abs();
+                max = v;
+            }
+        }
+        let d = max / -8.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let mut qs = [0u8; QK4_0 / 2];
+        for j in 0..(QK4_0 / 2) {
+            let q0 = ((chunk[j] * id) + 8.5).clamp(0.0, 15.0) as u32;
+            let q1 = ((chunk[j + QK4_0 / 2] * id) + 8.5).clamp(0.0, 15.0) as u32;
+            qs[j] = ((q0 & 0x0F) | ((q1 & 0x0F) << 4)) as u8;
+        }
+        out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+
+fn dequantize_q4_0_host(data: &[u8], out: &mut [f32]) -> mlx_native::Result<()> {
+    if data.len() % BLOCK_Q4_0_BYTES != 0 {
+        panic!("Q4_0 data not block-aligned");
+    }
+    let n_blocks = data.len() / BLOCK_Q4_0_BYTES;
+    if out.len() < n_blocks * QK4_0 {
+        panic!("Q4_0 output too small");
+    }
+    for ib in 0..n_blocks {
+        let block = &data[ib * BLOCK_Q4_0_BYTES..(ib + 1) * BLOCK_Q4_0_BYTES];
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let qs = &block[2..18];
+        for j in 0..(QK4_0 / 2) {
+            let lo = (qs[j] & 0x0F) as i32 - 8;
+            let hi = ((qs[j] >> 4) & 0x0F) as i32 - 8;
+            out[ib * QK4_0 + j] = (lo as f32) * d;
+            out[ib * QK4_0 + j + QK4_0 / 2] = (hi as f32) * d;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn adr022_bisect_q4_0_mm_id_at_prefill_shape() {
+    // If this PASSES, harness + dispatch are sound; bug is in Q5_1/IQ4_NL
+    // dequant templates. If this FAILS, the harness or dispatch is broken.
+    run_mv_id_parity(
+        GgmlType::Q4_0,
+        BLOCK_Q4_0_BYTES,
+        ref_quantize_q4_0,
+        dequantize_q4_0_host,
+        /*n_tokens=*/ 64,
+        /*top_k=*/ 8,
+        /*n_experts=*/ 8,
+        /*n=*/ 64,
+        /*k=*/ 128,
+        0xAD22_4000_B15E,
+    );
+}
