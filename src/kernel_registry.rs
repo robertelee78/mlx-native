@@ -581,6 +581,24 @@ impl KernelRegistry {
             "qmm_affine_t_f32_simd4_gs64".into(),
             qmm_affine_simd4_gs64_src,
         );
+        // ADR-020 iter-11h-b: training-mode causal depthwise 1D
+        // convolution (forward + backward dx + backward dw).  Used by
+        // GpuTape autograd for differentiable Qwen3.5MoE forward
+        // (GatedDeltaNet's conv1d step).
+        let conv1d_dwc_src: &'static str =
+            include_str!("shaders/conv1d_depthwise_causal.metal");
+        sources.insert(
+            "conv1d_depthwise_causal_forward_f32".into(),
+            conv1d_dwc_src,
+        );
+        sources.insert(
+            "conv1d_depthwise_causal_backward_dx_f32".into(),
+            conv1d_dwc_src,
+        );
+        sources.insert(
+            "conv1d_depthwise_causal_backward_dw_f32".into(),
+            conv1d_dwc_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
