@@ -90,12 +90,10 @@ impl GgmlType {
             // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
             // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32",
-            // ADR-022 phase 1 — Q5_1 / IQ4_NL mm_id port lands in P1.6.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => "unsupported",
+            // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id ported.
+            GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 

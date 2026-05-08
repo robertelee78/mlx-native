@@ -209,6 +209,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
         // ADR-013 P16 — Q4_K mm_id (port of llama.cpp ggml-metal.metal:10169).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
+        // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id template instantiations.
+        sources.insert("kernel_mul_mm_id_q5_1_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_iq4_nl_f32".into(), ggml_id_mm_src);
 
         // MoE-routed quantized matrix-matrix kernels — tensor API variant
         // (ADR-011 Phase 3 Wave P3b-tensor).  Uses the MPP tensor_ops
