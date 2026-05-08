@@ -74,6 +74,7 @@ pub mod ssm_conv;
 pub mod conv1d_depthwise_causal;
 pub mod exp_elementwise;
 pub mod outer_product;
+pub mod take_along_axis;
 pub mod transpose;
 pub mod tri_solve;
 pub mod qdq_legacy;
