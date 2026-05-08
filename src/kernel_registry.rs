@@ -624,6 +624,11 @@ impl KernelRegistry {
             include_str!("shaders/divide_elementwise.metal");
         sources.insert("divide_f32".into(), div_src);
         sources.insert("divide_backward_f32".into(), div_src);
+        // ADR-020 iter-11h-misc-3: elementwise sqrt forward + backward.
+        let sqrt_src: &'static str =
+            include_str!("shaders/sqrt_elementwise.metal");
+        sources.insert("sqrt_f32".into(), sqrt_src);
+        sources.insert("sqrt_backward_f32".into(), sqrt_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);

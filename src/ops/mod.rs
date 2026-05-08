@@ -76,6 +76,7 @@ pub mod exp_elementwise;
 pub mod outer_product;
 pub mod take_along_axis;
 pub mod divide_elementwise;
+pub mod sqrt_elementwise;
 pub mod transpose;
 pub mod tri_solve;
 pub mod qdq_legacy;
