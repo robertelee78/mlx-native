@@ -43,6 +43,8 @@ pub static QMM_AFFINE_SIMD_SHADER_SOURCE: &str =
     include_str!("../shaders/qmm_affine_simd.metal");
 pub static QMM_AFFINE_SIMD4_SHADER_SOURCE: &str =
     include_str!("../shaders/qmm_affine_simd4.metal");
+pub static QMM_AFFINE_SIMD4_GS64_SHADER_SOURCE: &str =
+    include_str!("../shaders/qmm_affine_simd4_gs64.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("qmm_affine_t_f32", QMM_AFFINE_SHADER_SOURCE);
@@ -57,6 +59,10 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(
         "qmm_affine_t_f32_simd4",
         QMM_AFFINE_SIMD4_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "qmm_affine_t_f32_simd4_gs64",
+        QMM_AFFINE_SIMD4_GS64_SHADER_SOURCE,
     );
 }
 
@@ -472,6 +478,98 @@ pub fn dispatch_qmm_affine_t_f32_simd4(
     // a_tile (32*32*4=4096) + b_tile (32*32*4=4096) = 8192 bytes.
     const SHMEM_BYTES: u64 = 8192;
     // 4 simdgroups × 32 threads = 128 threads/TG.
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, x), (1, q_int), (2, scales), (3, biases), (4, y), (5, meta)],
+        &[(0, SHMEM_BYTES)],
+        MTLSize::new(tg_count_x, tg_count_y, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    Ok(())
+}
+
+/// Dispatch the gs=64 variant of `qmm_affine_t_f32_simd4` (ADR-020
+/// iter-15c-2b).  Same 4-simdgroup geometry as `_simd4` but with
+/// `BK = 64` (= mlx-lm `dynamic_quant.py` canonical default group
+/// size).  Required for serving mlx-format DWQ-trained safetensors
+/// that use group_size=64 (vs GGUF Q4_0's group_size=32).
+///
+/// Constraints (host-validated): same as `_simd4` but `group_size`
+/// must equal 64 instead of 32.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qmm_affine_t_f32_simd4_gs64(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    x: &MlxBuffer,
+    q_int: &MlxBuffer,
+    scales: &MlxBuffer,
+    biases: &MlxBuffer,
+    y: &MlxBuffer,
+    meta: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    group_size: u32,
+) -> Result<()> {
+    const OP: &str = "qmm_affine_t_f32_simd4_gs64";
+    const SIMD_BK: u32 = 64;
+    if group_size != SIMD_BK {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: group_size must equal {SIMD_BK} (kernel BK is hard-coded); got {group_size}"
+        )));
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: M, N, K must all be > 0; got ({m}, {n}, {k})"
+        )));
+    }
+    if k % group_size != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: K ({k}) must be divisible by group_size ({group_size})"
+        )));
+    }
+    if x.dtype() != DType::F32 || scales.dtype() != DType::F32
+        || biases.dtype() != DType::F32 || y.dtype() != DType::F32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: x/scales/biases/y must be f32"
+        )));
+    }
+    if q_int.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: q_int dtype {} not u8",
+            q_int.dtype()
+        )));
+    }
+    let m_us = m as usize;
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let gs_us = group_size as usize;
+    if x.element_count() != m_us * k_us
+        || q_int.element_count() != n_us * k_us
+        || scales.element_count() != n_us * (k_us / gs_us)
+        || biases.element_count() != n_us * (k_us / gs_us)
+        || y.element_count() != m_us * n_us
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: buffer element_count mismatch"
+        )));
+    }
+    if meta.byte_len() < 16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: meta < 16 bytes"
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(OP, device)?;
+    const BM: u64 = 32;
+    const BN: u64 = 32;
+    let tg_count_x = (m as u64).div_ceil(BM);
+    let tg_count_y = (n as u64).div_ceil(BN);
+    // a_tile (32*64*4=8192) + b_tile (32*64*4=8192) = 16384 bytes
+    // (well within Apple Metal's 32 KB threadgroup-shared limit).
+    const SHMEM_BYTES: u64 = 16384;
     encoder.encode_threadgroups_with_shared(
         pipeline,
         &[(0, x), (1, q_int), (2, scales), (3, biases), (4, y), (5, meta)],
@@ -1209,6 +1307,131 @@ mod tests {
             &mut encoder, &mut registry, device.metal_device(),
             &x_buf, &q_buf, &s_buf, &b_buf, &y_buf, &meta,
             1, 1, 64, 64,
+        );
+        assert!(res.is_err());
+    }
+
+    /// ADR-020 iter-15c-2b — gs=64 variant byte-parity vs the
+    /// per-element kernel.  Same shape as the gs=32 simd4 parity
+    /// test but with K aligned to gs=64.
+    #[test]
+    fn qmm_affine_simd4_gs64_matches_per_element_kernel() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let m = 32usize;
+        let n = 64usize;
+        let k = 128usize;  // 2 groups of 64
+        let gs = 64usize;
+        let groups_per_row = k / gs;
+
+        let x: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.013 - 0.4).sin() * 0.6)
+            .collect();
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 11 + 3) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.05 + (i as f32) * 0.003)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.2 + (i as f32) * 0.011)
+            .collect();
+
+        let mut x_buf = alloc_f32(&device, m * k, vec![m, k]);
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
+        let mut q_buf = alloc_u8(&device, n * k, vec![n, k]);
+        q_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&q_int);
+        let mut s_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        s_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&scales);
+        let mut b_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        b_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&biases);
+        let y_pe = alloc_f32(&device, m * n, vec![m, n]);
+        let y_simd4 = alloc_f32(&device, m * n, vec![m, n]);
+        let meta = make_meta(&device, m as u32, n as u32, k as u32, gs as u32);
+
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_qmm_affine_t_f32(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_pe, &meta,
+            m as u32, n as u32, k as u32, gs as u32,
+        ).unwrap();
+        dispatch_qmm_affine_t_f32_simd4_gs64(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_simd4, &meta,
+            m as u32, n as u32, k as u32, gs as u32,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        let pe = y_pe.as_slice::<f32>().unwrap();
+        let sm = y_simd4.as_slice::<f32>().unwrap();
+        for i in 0..(m * n) {
+            assert!(
+                (pe[i] - sm[i]).abs() < 1e-4 * pe[i].abs().max(1.0),
+                "simd4_gs64 vs per-elem at i={i}: pe={} simd4_gs64={}",
+                pe[i], sm[i]
+            );
+        }
+    }
+
+    /// gs=64 partial-tile correctness on M=23, N=47, K=128 (multiples of gs=64).
+    #[test]
+    fn qmm_affine_simd4_gs64_handles_unaligned_m_n() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let m = 23usize;
+        let n = 47usize;
+        let k = 128usize;
+        let gs = 64usize;
+        let groups_per_row = k / gs;
+
+        let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.011 - 0.5).collect();
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 7) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row)).map(|i| 0.07 + i as f32 * 0.001).collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row)).map(|i| -0.1 + i as f32 * 0.002).collect();
+
+        let mut x_buf = alloc_f32(&device, m * k, vec![m, k]);
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
+        let mut q_buf = alloc_u8(&device, n * k, vec![n, k]);
+        q_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&q_int);
+        let mut s_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        s_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&scales);
+        let mut b_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        b_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&biases);
+        let y_buf = alloc_f32(&device, m * n, vec![m, n]);
+        let meta = make_meta(&device, m as u32, n as u32, k as u32, gs as u32);
+
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_qmm_affine_t_f32_simd4_gs64(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_buf, &meta,
+            m as u32, n as u32, k as u32, gs as u32,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        let gpu = y_buf.as_slice::<f32>().unwrap();
+        let cpu = qmm_affine_t_cpu(&x, &q_int, &scales, &biases, m, n, k, gs);
+        for i in 0..(m * n) {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 1e-3 * cpu[i].abs().max(1.0),
+                "simd4_gs64 unaligned y[{i}]: gpu={} cpu={}",
+                gpu[i], cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn qmm_affine_simd4_gs64_rejects_non_64_group_size() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let x_buf = alloc_f32(&device, 32, vec![1, 32]);
+        let q_buf = alloc_u8(&device, 32, vec![1, 32]);
+        let s_buf = alloc_f32(&device, 1, vec![1]);
+        let b_buf = alloc_f32(&device, 1, vec![1]);
+        let y_buf = alloc_f32(&device, 1, vec![1, 1]);
+        let meta = make_meta(&device, 1, 1, 32, 32);
+        let mut encoder = device.command_encoder().unwrap();
+        let res = dispatch_qmm_affine_t_f32_simd4_gs64(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_buf, &meta,
+            1, 1, 32, 32,
         );
         assert!(res.is_err());
     }

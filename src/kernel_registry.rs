@@ -572,6 +572,15 @@ impl KernelRegistry {
             "qmm_affine_t_f32_simd4".into(),
             qmm_affine_simd4_src,
         );
+        // ADR-020 iter-15c-2b: gs=64 variant (mlx-lm dynamic_quant
+        // canonical default).  Same 4-simdgroup geometry, BK=64
+        // instead of 32 (= 8 sub-K-tiles per K-step instead of 4).
+        let qmm_affine_simd4_gs64_src: &'static str =
+            include_str!("shaders/qmm_affine_simd4_gs64.metal");
+        sources.insert(
+            "qmm_affine_t_f32_simd4_gs64".into(),
+            qmm_affine_simd4_gs64_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
