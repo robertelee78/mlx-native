@@ -888,6 +888,14 @@ pub fn test_only_kvalues_iq4_nl() -> [i8; 16] {
     KVALUES_IQ4_NL
 }
 
+/// Test-only export of `dequantize_to_f32` for ADR-022 Phase-2 Q5_K
+/// dense parity tests. Routes through the same dispatch as the
+/// production load path. Hidden from rustdoc.
+#[doc(hidden)]
+pub fn test_only_dequantize(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Result<()> {
+    dequantize_to_f32(data, ggml_type, output)
+}
+
 /// Dequantize raw GGML block data to f32.
 fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Result<()> {
     match ggml_type {

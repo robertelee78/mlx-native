@@ -102,6 +102,26 @@ typedef struct {
     uint8_t qs[QK4_0 / 2];
 } block_iq4_nl;
 
+// ADR-022 Phase 2 — Q5_K block typedef for dense mm.
+// Same layout as quantized_matmul_id_mm.metal block_q5_K (lock-step).
+#define K_SCALE_SIZE 12
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K/8];
+    uint8_t qs[QK_K/2];
+} block_q5_K;
+
+// Decode (scale, min) 6-bit pair at index `j` (within sub-block group `k`)
+// from the packed 12-byte `scales` array. Mirrors the helper used by
+// the mv_id Q4_K/Q5_K kernels and quantized_matmul_id_mm.metal:149.
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >> 4)  | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
 // IQ4_NL non-linear codebook (frozen by ggml-common.h:1109-1112).
 // Lock-step duplicate of the values in quantized_matmul_id_mm.metal,
 // quantized_matmul_id_ggml.metal, quantized_matmul_ggml.metal, and the
@@ -224,6 +244,33 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
         reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
         reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
         reg[i][3] = d * (float)kvalues_iq4nl[q8[3]];
+    }
+}
+
+// ADR-022 Phase 2 — Q5_K dequant for dense mm MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+// Identical body to the mm_id variant in quantized_matmul_id_mm.metal —
+// proven against mv_id reference at iter 19 (Phase-2 mm_id parity tests).
+template <typename type4x4>
+void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q  = xb->qs;
+    device const uint8_t * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uint8_t ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.f : 256.f;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
     }
 }
 
@@ -485,5 +532,13 @@ kernel void hf2q_mul_mm_impl<block_q5_1, 2, dequantize_q5_1>(
 
 template [[host_name("kernel_mul_mm_iq4_nl_f32")]]
 kernel void hf2q_mul_mm_impl<block_iq4_nl, 2, dequantize_iq4_nl>(
+    constant GgmlMatmulMmParams &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort);
+
+// ADR-022 Phase 2 — Q5_K dense mm template instantiation. Uses QK_NL=16
+// (= QK_K/16 = 256/16 = 16) like Q6_K — the dequant function reads 16
+// consecutive elements per `il` invocation.
+template [[host_name("kernel_mul_mm_q5_K_f32")]]
+kernel void hf2q_mul_mm_impl<block_q5_K, QK_NL, dequantize_q5_K>(
     constant GgmlMatmulMmParams &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort);

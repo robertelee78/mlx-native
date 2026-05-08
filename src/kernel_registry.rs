@@ -83,6 +83,8 @@ impl KernelRegistry {
         // ADR-013 P7 — Q4_K dense decode mat-vec (port of llama.cpp's
         // kernel_mul_mv_q4_K_f32 at ggml-metal.metal:7715-7821).
         sources.insert("kernel_mul_mv_q4_K_f32".into(), ggml_src);
+        // ADR-022 Phase 2 — Q5_K dense mv kernel.
+        sources.insert("kernel_mul_mv_q5_K_f32".into(), ggml_src);
 
         // GGML block-format quantized matrix-matrix kernels
         // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's kernel_mul_mm_<q>_f32).
@@ -97,6 +99,8 @@ impl KernelRegistry {
         // ADR-022 Phase 1 — dense Q5_1 / IQ4_NL mm.
         sources.insert("kernel_mul_mm_q5_1_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_iq4_nl_f32".into(), ggml_mm_src);
+        // ADR-022 Phase 2 — dense Q5_K mm.
+        sources.insert("kernel_mul_mm_q5_K_f32".into(), ggml_mm_src);
 
         // GGML block-format quantized matrix-matrix kernels — tensor API
         // variant (ADR-011 Phase 3 Wave P3b-tensor: port of llama.cpp's
@@ -118,6 +122,8 @@ impl KernelRegistry {
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL tensor mm.
         sources.insert("kernel_mul_mm_q5_1_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_iq4_nl_tensor_f32".into(), ggml_mm_tensor_src);
+        // ADR-022 Phase 2 — Q5_K tensor mm.
+        sources.insert("kernel_mul_mm_q5_K_tensor_f32".into(), ggml_mm_tensor_src);
 
         // ADR-022 Phase 1 P1.7 — Q5_1 / IQ4_NL mul_mv_ext r1 family.
         // Eight instantiations (2 types × 4 r1ptg widths). Each PSO is

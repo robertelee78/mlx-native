@@ -134,13 +134,14 @@ impl GgmlType {
     /// — used for `m <= MM_ROUTING_THRESHOLD`.
     fn kernel_name(self) -> &'static str {
         match self {
-            // Q5_K / I16 dense mv coverage owned by ADR-022 phase 2-3.
-            // F32 / F16 are type-not-applicable for this dispatch.
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Q5_K | GgmlType::I16 => "unsupported",
+            // F32 / F16 / I16 are type-not-applicable for this dispatch.
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp.
             GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
+            // ADR-022 Phase 2 — Q5_K dense mv ported.
+            GgmlType::Q5_K => "kernel_mul_mv_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_q6_K_f32",
             // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL dense mv ports.
             GgmlType::Q5_1 => "kernel_mul_mv_q5_1_f32",
@@ -153,15 +154,15 @@ impl GgmlType {
     /// llama.cpp's `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
     fn mm_kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 in-flight: Q4_K / Q5_K dense mm coverage owned by
-            // ADR-022 phase 2-3. Q5_1 / IQ4_NL landed in P1.6.
+            // ADR-022 Phase 2 — Q5_K dense mm ported. Q4_K dense mm
+            // coverage remains owned by ADR-022 Phase 3.
             GgmlType::F32
             | GgmlType::F16
             | GgmlType::Q4_K
-            | GgmlType::Q5_K
             | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
+            GgmlType::Q5_K => "kernel_mul_mm_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_f32",
@@ -174,14 +175,15 @@ impl GgmlType {
     /// for 2-3× the FLOP throughput of the simdgroup MMA variant.
     fn mm_tensor_kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 P1.6: Q5_1 / IQ4_NL tensor mm landed.
+            // ADR-022 Phase 2: Q5_K tensor mm landed. Q4_K dense mm_tensor
+            // owned by ADR-022 Phase 3.
             GgmlType::F32
             | GgmlType::F16
             | GgmlType::Q4_K
-            | GgmlType::Q5_K
             | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
+            GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_f32",
@@ -324,9 +326,11 @@ pub fn quantized_matmul_ggml(
     match params.ggml_type {
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL added (mv-only; mm/mm_tensor
         // come in P1.6, dispatcher already routes to mv at m ≤ 8).
+        // ADR-022 Phase 2 — Q5_K added (mv + mm + mm_tensor).
         GgmlType::Q4_0
         | GgmlType::Q8_0
         | GgmlType::Q4_K
+        | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL => {}
@@ -434,6 +438,7 @@ pub fn dispatch_mm_for_test(
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q8_0
+        | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL => {}
@@ -493,8 +498,8 @@ fn dispatch_mv(
         | GgmlType::Q8_0
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL => (8u64, 8u64, 8usize),
-        // Q4_K mirrors Q6_K's 2-row-per-tg geometry.
-        GgmlType::Q4_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        // Q4_K / Q5_K (ADR-022 Phase 2) mirror Q6_K's 2-row-per-tg geometry.
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),
     };
 
