@@ -1237,3 +1237,389 @@ pub fn moe_weighted_sum_seq_bf16_input_encode(
     );
     Ok(())
 }
+
+// ============================================================================
+// ADR-020 iter-11h-e3a — backward kernels for moe_weighted_sum_seq.
+//
+// Forward (existing): output[t, d] = sum_k expert_outputs[t, k, d] * weights[t, k]
+// Backward:
+//   d_expert_outputs[t, k, d] = weights[t, k] * d_output[t, d]            (parallel)
+//   d_weights[t, k]           = sum_d expert_outputs[t, k, d] * d_output  (reduction)
+// ============================================================================
+
+/// Backward of `moe_weighted_sum_seq` w.r.t. `expert_outputs`.
+///
+/// Computes `d_expert_outputs[t, k, d] = weights[t, k] * d_output[t, d]`.
+/// Embarrassingly parallel — one thread writes one output element.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_seq_backward_outputs_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    weights: &MlxBuffer,
+    d_output: &MlxBuffer,
+    d_expert_outputs: &MlxBuffer,
+    hidden_size: usize,
+    top_k: usize,
+    n_tokens: usize,
+) -> Result<()> {
+    if hidden_size == 0 || top_k == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_weighted_sum_seq_backward_outputs_encode: all dims must be > 0".into(),
+        ));
+    }
+    let f32_size = std::mem::size_of::<f32>();
+    let weights_required = n_tokens * top_k * f32_size;
+    if weights.byte_len() < weights_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_backward_outputs_encode: weights too small: need {} bytes, have {}",
+            weights_required,
+            weights.byte_len()
+        )));
+    }
+    let dout_required = n_tokens * hidden_size * f32_size;
+    if d_output.byte_len() < dout_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_backward_outputs_encode: d_output too small: need {} bytes, have {}",
+            dout_required,
+            d_output.byte_len()
+        )));
+    }
+    let dexp_required = n_tokens * top_k * hidden_size * f32_size;
+    if d_expert_outputs.byte_len() < dexp_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_backward_outputs_encode: d_expert_outputs too small: need {} bytes, have {}",
+            dexp_required,
+            d_expert_outputs.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_weighted_sum_seq_backward_outputs_f32", device)?;
+    let gpu_params = GpuMoeWeightedSumSeqParams {
+        hidden_size: hidden_size as u32,
+        top_k: top_k as u32,
+        n_tokens: n_tokens as u32,
+    };
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weights)),
+            (1, KernelArg::Buffer(d_output)),
+            (2, KernelArg::Buffer(d_expert_outputs)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        MTLSize::new(hidden_size as u64, top_k as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, hidden_size as u64), 1, 1),
+    );
+    Ok(())
+}
+
+/// Backward of `moe_weighted_sum_seq` w.r.t. `weights`.
+///
+/// Computes `d_weights[t, k] = sum_d expert_outputs[t, k, d] * d_output[t, d]`.
+/// Grid: 1D over `n_tokens * top_k`; each thread reduces serially across hidden.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_seq_backward_weights_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    expert_outputs: &MlxBuffer,
+    d_output: &MlxBuffer,
+    d_weights: &MlxBuffer,
+    hidden_size: usize,
+    top_k: usize,
+    n_tokens: usize,
+) -> Result<()> {
+    if hidden_size == 0 || top_k == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_weighted_sum_seq_backward_weights_encode: all dims must be > 0".into(),
+        ));
+    }
+    let f32_size = std::mem::size_of::<f32>();
+    let exp_required = n_tokens * top_k * hidden_size * f32_size;
+    if expert_outputs.byte_len() < exp_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_backward_weights_encode: expert_outputs too small: need {} bytes, have {}",
+            exp_required,
+            expert_outputs.byte_len()
+        )));
+    }
+    let dout_required = n_tokens * hidden_size * f32_size;
+    if d_output.byte_len() < dout_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_backward_weights_encode: d_output too small: need {} bytes, have {}",
+            dout_required,
+            d_output.byte_len()
+        )));
+    }
+    let dw_required = n_tokens * top_k * f32_size;
+    if d_weights.byte_len() < dw_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_weighted_sum_seq_backward_weights_encode: d_weights too small: need {} bytes, have {}",
+            dw_required,
+            d_weights.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_weighted_sum_seq_backward_weights_f32", device)?;
+    let gpu_params = GpuMoeWeightedSumSeqParams {
+        hidden_size: hidden_size as u32,
+        top_k: top_k as u32,
+        n_tokens: n_tokens as u32,
+    };
+
+    let total = (n_tokens * top_k) as u64;
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(expert_outputs)),
+            (1, KernelArg::Buffer(d_output)),
+            (2, KernelArg::Buffer(d_weights)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        MTLSize::new(total, 1, 1),
+        MTLSize::new(std::cmp::min(256, total), 1, 1),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod backward_weighted_sum_seq_tests {
+    use super::*;
+    use crate::device::MlxDevice;
+    use crate::dtypes::DType;
+
+    fn alloc_f32(d: &MlxDevice, n: usize) -> MlxBuffer {
+        let mut b = d.alloc_buffer(n * 4, DType::F32, vec![n]).unwrap();
+        b.as_mut_slice::<f32>().unwrap().fill(0.0);
+        b
+    }
+    fn fill_f32(buf: &mut MlxBuffer, vals: &[f32]) {
+        buf.as_mut_slice::<f32>().unwrap()[..vals.len()].copy_from_slice(vals);
+    }
+
+    fn cpu_forward(
+        expert_outs: &[f32],
+        weights: &[f32],
+        n_tokens: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_tokens * hidden];
+        for t in 0..n_tokens {
+            for d in 0..hidden {
+                let mut sum = 0.0f64;
+                for k in 0..top_k {
+                    let exp_ix = (t * top_k + k) * hidden + d;
+                    let w_ix = t * top_k + k;
+                    sum += (expert_outs[exp_ix] as f64) * (weights[w_ix] as f64);
+                }
+                out[t * hidden + d] = sum as f32;
+            }
+        }
+        out
+    }
+
+    /// FD falsifier on d_expert_outputs.
+    /// L = sum(output * d_output_seed); d_expert_outputs[t,k,d] should equal
+    /// weights[t,k] * d_output_seed[t,d].
+    #[test]
+    fn backward_outputs_finite_difference_falsifier() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let n_tokens = 3usize;
+        let top_k = 4usize;
+        let hidden = 7usize;
+
+        let expert_outs: Vec<f32> = (0..n_tokens * top_k * hidden)
+            .map(|i| 0.1 + (i as f32) * 0.013 - (i as f32 * 0.004).sin())
+            .collect();
+        let weights: Vec<f32> = (0..n_tokens * top_k)
+            .map(|i| 0.2 + (i as f32) * 0.07)
+            .collect();
+        let d_output_seed: Vec<f32> = (0..n_tokens * hidden)
+            .map(|i| 0.3 + (i as f32) * 0.05 - (i as f32 * 0.011).cos())
+            .collect();
+
+        let mut exp_buf = alloc_f32(&device, n_tokens * top_k * hidden);
+        fill_f32(&mut exp_buf, &expert_outs);
+        let mut w_buf = alloc_f32(&device, n_tokens * top_k);
+        fill_f32(&mut w_buf, &weights);
+        let mut dout_buf = alloc_f32(&device, n_tokens * hidden);
+        fill_f32(&mut dout_buf, &d_output_seed);
+        let dexp_buf = alloc_f32(&device, n_tokens * top_k * hidden);
+
+        let mut encoder = device.command_encoder().unwrap();
+        moe_weighted_sum_seq_backward_outputs_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &w_buf, &dout_buf, &dexp_buf, hidden, top_k, n_tokens,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+        let analytic = dexp_buf.as_slice::<f32>().unwrap().to_vec();
+
+        let h: f32 = 1e-3;
+        for idx in 0..(n_tokens * top_k * hidden) {
+            let mut ep = expert_outs.clone(); ep[idx] += h;
+            let mut em = expert_outs.clone(); em[idx] -= h;
+            let yp = cpu_forward(&ep, &weights, n_tokens, top_k, hidden);
+            let ym = cpu_forward(&em, &weights, n_tokens, top_k, hidden);
+            let lp: f64 = yp.iter().zip(&d_output_seed).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let lm: f64 = ym.iter().zip(&d_output_seed).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let fd = (lp - lm) / (2.0 * h as f64);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (analytic[idx] as f64 - fd).abs() < tol,
+                "d_expert_outputs[{}]: analytic={} fd={}",
+                idx, analytic[idx], fd
+            );
+        }
+    }
+
+    /// FD falsifier on d_weights.
+    /// d_weights[t,k] should equal sum_d expert_outputs[t,k,d] * d_output[t,d].
+    #[test]
+    fn backward_weights_finite_difference_falsifier() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let n_tokens = 4usize;
+        let top_k = 3usize;
+        let hidden = 11usize;
+
+        let expert_outs: Vec<f32> = (0..n_tokens * top_k * hidden)
+            .map(|i| 0.05 + (i as f32) * 0.017 + (i as f32 * 0.009).sin())
+            .collect();
+        let weights: Vec<f32> = (0..n_tokens * top_k)
+            .map(|i| 0.1 + (i as f32) * 0.05)
+            .collect();
+        let d_output_seed: Vec<f32> = (0..n_tokens * hidden)
+            .map(|i| 0.2 + (i as f32) * 0.03 - (i as f32 * 0.013).cos())
+            .collect();
+
+        let mut exp_buf = alloc_f32(&device, n_tokens * top_k * hidden);
+        fill_f32(&mut exp_buf, &expert_outs);
+        let mut dout_buf = alloc_f32(&device, n_tokens * hidden);
+        fill_f32(&mut dout_buf, &d_output_seed);
+        let dw_buf = alloc_f32(&device, n_tokens * top_k);
+
+        let mut encoder = device.command_encoder().unwrap();
+        moe_weighted_sum_seq_backward_weights_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &exp_buf, &dout_buf, &dw_buf, hidden, top_k, n_tokens,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+        let analytic = dw_buf.as_slice::<f32>().unwrap().to_vec();
+
+        let h: f32 = 1e-3;
+        for idx in 0..(n_tokens * top_k) {
+            let mut wp = weights.clone(); wp[idx] += h;
+            let mut wm = weights.clone(); wm[idx] -= h;
+            let yp = cpu_forward(&expert_outs, &wp, n_tokens, top_k, hidden);
+            let ym = cpu_forward(&expert_outs, &wm, n_tokens, top_k, hidden);
+            let lp: f64 = yp.iter().zip(&d_output_seed).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let lm: f64 = ym.iter().zip(&d_output_seed).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let fd = (lp - lm) / (2.0 * h as f64);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (analytic[idx] as f64 - fd).abs() < tol,
+                "d_weights[{}]: analytic={} fd={}",
+                idx, analytic[idx], fd
+            );
+        }
+    }
+
+    /// CPU oracle round-trip: confirm both kernels match closed-form on a
+    /// small fixture.
+    #[test]
+    fn forward_then_backward_round_trip_matches_cpu_oracle() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let n_tokens = 2usize;
+        let top_k = 2usize;
+        let hidden = 5usize;
+
+        let expert_outs: Vec<f32> = (0..n_tokens * top_k * hidden)
+            .map(|i| (i as f32) * 0.1 - 0.2)
+            .collect();
+        let weights: Vec<f32> = (0..n_tokens * top_k)
+            .map(|i| 0.3 + (i as f32) * 0.1)
+            .collect();
+        let d_output_seed: Vec<f32> = (0..n_tokens * hidden)
+            .map(|i| 1.0 - (i as f32) * 0.05)
+            .collect();
+
+        // CPU oracles
+        let mut cpu_dexp = vec![0.0f32; n_tokens * top_k * hidden];
+        let mut cpu_dw = vec![0.0f32; n_tokens * top_k];
+        for t in 0..n_tokens {
+            for k in 0..top_k {
+                for d in 0..hidden {
+                    let exp_ix = (t * top_k + k) * hidden + d;
+                    let w_ix = t * top_k + k;
+                    let dout_ix = t * hidden + d;
+                    cpu_dexp[exp_ix] = weights[w_ix] * d_output_seed[dout_ix];
+                    cpu_dw[w_ix] += expert_outs[exp_ix] * d_output_seed[dout_ix];
+                }
+            }
+        }
+
+        let mut exp_buf = alloc_f32(&device, n_tokens * top_k * hidden);
+        fill_f32(&mut exp_buf, &expert_outs);
+        let mut w_buf = alloc_f32(&device, n_tokens * top_k);
+        fill_f32(&mut w_buf, &weights);
+        let mut dout_buf = alloc_f32(&device, n_tokens * hidden);
+        fill_f32(&mut dout_buf, &d_output_seed);
+        let dexp_buf = alloc_f32(&device, n_tokens * top_k * hidden);
+        let dw_buf = alloc_f32(&device, n_tokens * top_k);
+
+        let mut encoder = device.command_encoder().unwrap();
+        moe_weighted_sum_seq_backward_outputs_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &w_buf, &dout_buf, &dexp_buf, hidden, top_k, n_tokens,
+        ).unwrap();
+        moe_weighted_sum_seq_backward_weights_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &exp_buf, &dout_buf, &dw_buf, hidden, top_k, n_tokens,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        let gpu_dexp = dexp_buf.as_slice::<f32>().unwrap().to_vec();
+        let gpu_dw = dw_buf.as_slice::<f32>().unwrap().to_vec();
+
+        for i in 0..gpu_dexp.len() {
+            assert!(
+                (gpu_dexp[i] - cpu_dexp[i]).abs() < 1e-5,
+                "d_expert_outputs[{}]: gpu={} cpu={}",
+                i, gpu_dexp[i], cpu_dexp[i]
+            );
+        }
+        for i in 0..gpu_dw.len() {
+            assert!(
+                (gpu_dw[i] - cpu_dw[i]).abs() < 1e-5,
+                "d_weights[{}]: gpu={} cpu={}",
+                i, gpu_dw[i], cpu_dw[i]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_size_mismatch() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let too_small = alloc_f32(&device, 4);
+        let any = alloc_f32(&device, 1024);
+        let mut encoder = device.command_encoder().unwrap();
+        let res = moe_weighted_sum_seq_backward_outputs_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &too_small, &any, &any, 7, 3, 4,
+        );
+        assert!(res.is_err());
+        let res2 = moe_weighted_sum_seq_backward_weights_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &too_small, &any, &any, 11, 3, 4,
+        );
+        assert!(res2.is_err());
+    }
+}

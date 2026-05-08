@@ -430,3 +430,69 @@ kernel void moe_gather_topk_weights(
         out_weights[k] = (top_probs[k] * inv_sum) * per_expert_scale[eid];
     }
 }
+
+// ============================================================================
+// ADR-020 iter-11h-e3a — backward kernels for moe_weighted_sum_seq.
+//
+// Forward (existing kernel above):
+//   output[t, d] = sum_k expert_outputs[t, k, d] * weights[t, k]
+//
+// Backward (this file):
+//   d_expert_outputs[t, k, d] = weights[t, k] * d_output[t, d]      (parallel)
+//   d_weights[t, k]           = sum_d expert_outputs[t, k, d]
+//                                       * d_output[t, d]            (reduction)
+//
+// For DWQ training of MoE with frozen FP16 router, only d_expert_outputs is
+// strictly required (it carries gradient back to per-expert SwiGLU and on into
+// the quantized expert Linears).  d_weights is provided for completeness and
+// for future use cases that train the router.
+// ============================================================================
+
+/// d_expert_outputs[t, k, d] = weights[t, k] * d_output[t, d]
+/// Grid: 3D (hidden_size, top_k, n_tokens) — fully parallel.
+kernel void moe_weighted_sum_seq_backward_outputs_f32(
+    device const float*  weights         [[buffer(0)]],  // [n_tokens, top_k]
+    device const float*  d_output        [[buffer(1)]],  // [n_tokens, hidden_size]
+    device       float*  d_expert_outs   [[buffer(2)]],  // [n_tokens, top_k, hidden_size]
+    constant MoeWeightedSumSeqParams& params [[buffer(3)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    const uint d   = tid.x;
+    const uint k   = tid.y;
+    const uint tok = tid.z;
+    if (tok >= params.n_tokens || k >= params.top_k || d >= params.hidden_size) return;
+
+    const uint w_idx   = tok * params.top_k + k;
+    const uint dout_ix = tok * params.hidden_size + d;
+    const uint dexp_ix = (tok * params.top_k + k) * params.hidden_size + d;
+    d_expert_outs[dexp_ix] = weights[w_idx] * d_output[dout_ix];
+}
+
+/// d_weights[t, k] = sum_d expert_outputs[t, k, d] * d_output[t, d]
+/// Grid: 1D (n_tokens * top_k) — each thread owns one (t, k) pair and
+/// reduces serially across hidden_size.  For typical DWQ shapes
+/// (n_tokens=1..16, top_k=4..8, hidden=2K..6K) this is < 1ms; the
+/// simpler-correctness form is preferred over a threadgroup reduction
+/// at this iter.  Profile and revisit if profiling shows it on the
+/// critical path.
+kernel void moe_weighted_sum_seq_backward_weights_f32(
+    device const float*  expert_outs   [[buffer(0)]],  // [n_tokens, top_k, hidden_size]
+    device const float*  d_output      [[buffer(1)]],  // [n_tokens, hidden_size]
+    device       float*  d_weights     [[buffer(2)]],  // [n_tokens, top_k]
+    constant MoeWeightedSumSeqParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const uint total = params.n_tokens * params.top_k;
+    if (tid >= total) return;
+
+    const uint tok = tid / params.top_k;
+    const uint k   = tid % params.top_k;
+
+    float acc = 0.0f;
+    const uint exp_base  = (tok * params.top_k + k) * params.hidden_size;
+    const uint dout_base = tok * params.hidden_size;
+    for (uint d = 0; d < params.hidden_size; d++) {
+        acc += expert_outs[exp_base + d] * d_output[dout_base + d];
+    }
+    d_weights[tid] = acc;
+}

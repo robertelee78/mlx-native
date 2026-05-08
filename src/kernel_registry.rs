@@ -242,6 +242,15 @@ impl KernelRegistry {
         sources.insert("fused_gelu_mul_bf16".into(), moe_dispatch_src);
         sources.insert("moe_swiglu_seq_bf16".into(), moe_dispatch_src);
         sources.insert("moe_weighted_sum_seq_bf16_input".into(), moe_dispatch_src);
+        // ADR-020 iter-11h-e3a: backward kernels for moe_weighted_sum_seq.
+        sources.insert(
+            "moe_weighted_sum_seq_backward_outputs_f32".into(),
+            moe_dispatch_src,
+        );
+        sources.insert(
+            "moe_weighted_sum_seq_backward_weights_f32".into(),
+            moe_dispatch_src,
+        );
 
         // Batched KV cache copy kernels
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
