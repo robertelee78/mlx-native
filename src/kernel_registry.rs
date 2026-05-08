@@ -650,6 +650,15 @@ impl KernelRegistry {
             "qmm_affine_t_f32_simd4_gs64".into(),
             qmm_affine_simd4_gs64_src,
         );
+        // ADR-020 AC#5 Iter A: packed-U32 dense affine matmul (bits=4,
+        // gs=32) — production decode/prefill kernel for serving DWQ
+        // safetensors directly without a load-time unpack pass.
+        let qmm_affine_t_packed_simd4_b4_src: &'static str =
+            include_str!("shaders/qmm_affine_t_packed_simd4_b4.metal");
+        sources.insert(
+            "qmm_affine_t_packed_simd4_b4".into(),
+            qmm_affine_t_packed_simd4_b4_src,
+        );
         // ADR-020 iter-11h-b: training-mode causal depthwise 1D
         // convolution (forward + backward dx + backward dw).  Used by
         // GpuTape autograd for differentiable Qwen3.5MoE forward
