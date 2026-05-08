@@ -276,6 +276,20 @@ pub fn quantized_matmul_id_ggml(
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
     {
+        // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
+        // engages on prefill. `HF2Q_LOG_MM_ID_ROUTE=1` enables the line.
+        if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
+            eprintln!(
+                "[mlx-native adr-022 AC-4] dispatch_id_mm engaged: type={:?} \
+                 n_tokens={} top_k={} k={} n={} n_experts={}",
+                params.ggml_type,
+                params.n_tokens,
+                params.top_k,
+                params.k,
+                params.n,
+                params.n_experts,
+            );
+        }
         return dispatch_id_mm(
             encoder, registry, device, input, weight, ids, output, params,
         );
@@ -384,10 +398,25 @@ pub fn quantized_matmul_id_ggml_pooled(
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     // ADR-022 Phase 2 — Q5_K mm_id ported; the previous Q5_K bypass here
     // is retired (kernels live in id_mm.metal + id_mm_tensor.metal).
+    // ADR-022 AC-4: env-gated trace (HF2Q_LOG_MM_ID_ROUTE=1) confirms mm_id
+    // engagement on the qwen35 prefill path which goes through this pooled
+    // entry, not the auto entry above.
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
     {
+        if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
+            eprintln!(
+                "[mlx-native adr-022 AC-4 pooled] dispatch_id_mm_pooled engaged: \
+                 type={:?} n_tokens={} top_k={} k={} n={} n_experts={}",
+                params.ggml_type,
+                params.n_tokens,
+                params.top_k,
+                params.k,
+                params.n,
+                params.n_experts,
+            );
+        }
         return dispatch_id_mm_pooled(
             encoder, registry, device, input, weight, ids, output,
             scratch, params,
