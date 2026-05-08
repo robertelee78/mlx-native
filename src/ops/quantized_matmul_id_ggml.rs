@@ -71,7 +71,13 @@ impl GgmlType {
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // ADR-022 in-flight: Q5_1 / IQ4_NL mv_id port in P1.5; arm
+            // moves out of "unsupported" when those kernels land.
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::I16
+            | GgmlType::Q5_1
+            | GgmlType::IQ4_NL => "unsupported",
         }
     }
 
@@ -81,29 +87,38 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
-            // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
+            // ADR-022 phase 2 — Q5_K mm_id port pending.
             GgmlType::Q5_K => "unsupported",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
             // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
             // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // ADR-022 phase 1 — Q5_1 / IQ4_NL mm_id port lands in P1.6.
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::I16
+            | GgmlType::Q5_1
+            | GgmlType::IQ4_NL => "unsupported",
         }
     }
 
     /// Tensor-API variant of the mm_id kernel (ADR-011 Phase 3 Wave
-    /// P3b-tensor).  Dispatcher falls back to `id_mm_kernel_name()` when
-    /// the tensor pipeline probe fails on pre-M3 hardware.
+    /// P3b-tensor).
     fn id_mm_tensor_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
-            // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
+            // ADR-022 phase 2 — Q5_K mm_id_tensor port pending.
             GgmlType::Q5_K => "unsupported",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
             // ADR-013 P16 — Q4_K tensor-API mm_id ported.
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // ADR-022 phase 1 — Q5_1 / IQ4_NL mm_id_tensor port lands in P1.6.
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::I16
+            | GgmlType::Q5_1
+            | GgmlType::IQ4_NL => "unsupported",
         }
     }
 }
@@ -466,7 +481,15 @@ fn dispatch_id_mv(
         // falsified — Metal compiler/scheduler optimizes both layouts
         // similarly, with workload-specific edges that don't match
         // llama.cpp's tuning.
-        GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
+        // ADR-022: Q5_1 and IQ4_NL are 32-element legacy formats; share
+        // the (8, 8) layout with Q4_0 / Q8_0. Confirmed against llama.cpp's
+        // dispatch_id_mv launch geometry for `kernel_mul_mv_id_q5_1_f32`
+        // and `kernel_mul_mv_id_iq4_nl_f32` (both NWG=2, NSIMDGROUP=2,
+        // ngroups along K = nb/4 → 8 thread blocks of 8 rows each).
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => (8u64, 8u64, 8usize),
         // Q4_K, Q5_K, and Q6_K all use the 2-row-per-threadgroup (2, 32)
         // geometry.  ADR-013 P7 — Q4_K added; mirrors Q5_K (NSG=2,
         // 1 row per simdgroup; same kmask scale-decode).

@@ -67,11 +67,20 @@ const GGUF_TYPE_FLOAT64: u32 = 12;
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_I16: u32 = 17;
+const GGML_TYPE_IQ4_NL: u32 = 20;
+
+/// IQ4_NL non-linear codebook constants. 16 signed entries selected by
+/// 4-bit indices in `block_iq4_nl::qs`. Verified byte-equal with
+/// `/opt/llama.cpp/ggml/src/ggml-common.h:1109-1112`. ADR-022 Phase 1.
+const KVALUES_IQ4_NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -302,11 +311,13 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_F32 => Ok(GgmlType::F32),
         GGML_TYPE_F16 => Ok(GgmlType::F16),
         GGML_TYPE_Q4_0 => Ok(GgmlType::Q4_0),
+        GGML_TYPE_Q5_1 => Ok(GgmlType::Q5_1),
         GGML_TYPE_Q8_0 => Ok(GgmlType::Q8_0),
         GGML_TYPE_Q4_K => Ok(GgmlType::Q4_K),
         GGML_TYPE_Q5_K => Ok(GgmlType::Q5_K),
         GGML_TYPE_Q6_K => Ok(GgmlType::Q6_K),
         GGML_TYPE_I16 => Ok(GgmlType::I16),
+        GGML_TYPE_IQ4_NL => Ok(GgmlType::IQ4_NL),
         other => Err(MlxError::GgufParseError(format!(
             "unsupported GGML type ID {other}"
         ))),
@@ -751,6 +762,132 @@ fn copy_f32(data: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Dequantize Q5_1 blocks to f32.
+///
+/// Block layout (24 bytes, 32 elements):
+///   f16 d   — block scale            (offset 0,  2 bytes)
+///   f16 m   — block min term         (offset 2,  2 bytes)
+///   u32 qh  — high-bit pack          (offset 4,  4 bytes)
+///   u8  qs[16] — packed 4-bit lo nibbles (offset 8, 16 bytes)
+///
+/// Per-element: `out[j]      = d * x0 + m`, `out[j + 16] = d * x1 + m`,
+/// where `x0 = (qs[j] & 0x0F) | ((qh >> j) << 4) & 0x10`,
+///       `x1 = (qs[j] >> 4)  | ((qh >> (j + 12)) & 0x10)`.
+///
+/// Reference: `/opt/llama.cpp/ggml/src/ggml-quants.c:464` `dequantize_row_q5_1`.
+/// ADR-022 Phase 1.
+fn dequantize_q5_1(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 24;
+    const BLOCK_ELEMS: usize = 32;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "Q5_1 data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "Q5_1 output buffer too small".into(),
+        ));
+    }
+
+    for i in 0..num_blocks {
+        let block = &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+
+        let d = f16_from_le_bytes([block[0], block[1]]);
+        let m = f16_from_le_bytes([block[2], block[3]]);
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let qs = &block[8..24]; // 16 bytes
+
+        let out = &mut output[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
+
+        for j in 0..(BLOCK_ELEMS / 2) {
+            // High-bit packed: bit j of qh contributes to position j;
+            // bit (j + 16) contributes to position j + 16. Mirrors
+            // `dequantize_row_q5_1` byte-for-byte.
+            let xh_0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh_1 = ((qh >> (j + 12)) & 0x10) as u8;
+            let x0 = ((qs[j] & 0x0F) | xh_0) as i32;
+            let x1 = ((qs[j] >> 4) | xh_1) as i32;
+            out[j] = (x0 as f32) * d + m;
+            out[j + BLOCK_ELEMS / 2] = (x1 as f32) * d + m;
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize IQ4_NL blocks to f32.
+///
+/// Block layout (18 bytes, 32 elements):
+///   f16 d      — block scale                (offset 0,  2 bytes)
+///   u8  qs[16] — 16 × pair of 4-bit indices (offset 2, 16 bytes)
+///
+/// Per-element: `out[j]      = d * KVALUES_IQ4_NL[qs[j] & 0x0F]`,
+///              `out[j + 16] = d * KVALUES_IQ4_NL[qs[j] >> 4]`.
+///
+/// Reference: `/opt/llama.cpp/ggml/src/ggml-quants.c:2649` `dequantize_row_iq4_nl`.
+/// Codebook table verified against `ggml-common.h:1109-1112`. ADR-022 Phase 1.
+fn dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 18;
+    const BLOCK_ELEMS: usize = 32;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "IQ4_NL data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "IQ4_NL output buffer too small".into(),
+        ));
+    }
+
+    for i in 0..num_blocks {
+        let block = &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+
+        let d = f16_from_le_bytes([block[0], block[1]]);
+        let qs = &block[2..18];
+
+        let out = &mut output[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
+
+        for j in 0..(BLOCK_ELEMS / 2) {
+            let lo = (qs[j] & 0x0F) as usize;
+            let hi = (qs[j] >> 4) as usize;
+            out[j] = d * KVALUES_IQ4_NL[lo] as f32;
+            out[j + BLOCK_ELEMS / 2] = d * KVALUES_IQ4_NL[hi] as f32;
+        }
+    }
+    Ok(())
+}
+
+/// Test-only export of `dequantize_q5_1` for ADR-022 parity tests in
+/// `/opt/mlx-native/tests/adr_022_phase1_dequant_parity.rs`. Hidden
+/// behind a doc(hidden) marker so it's not part of the public API but
+/// is accessible from integration tests via crate::gguf.
+#[doc(hidden)]
+pub fn test_only_dequantize_q5_1(data: &[u8], output: &mut [f32]) -> Result<()> {
+    dequantize_q5_1(data, output)
+}
+
+/// Test-only export of `dequantize_iq4_nl` for ADR-022 parity tests.
+#[doc(hidden)]
+pub fn test_only_dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()> {
+    dequantize_iq4_nl(data, output)
+}
+
+/// Test-only accessor for `KVALUES_IQ4_NL` so parity tests can pin the
+/// codebook bytes against the llama.cpp source of truth.
+#[doc(hidden)]
+pub fn test_only_kvalues_iq4_nl() -> [i8; 16] {
+    KVALUES_IQ4_NL
+}
+
 /// Dequantize raw GGML block data to f32.
 fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Result<()> {
     match ggml_type {
@@ -762,6 +899,8 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::Q6_K => dequantize_q6_k(data, output),
         GgmlType::Q5_K => dequantize_q5_k(data, output),
         GgmlType::I16 => dequantize_i16(data, output),
+        GgmlType::Q5_1 => dequantize_q5_1(data, output),
+        GgmlType::IQ4_NL => dequantize_iq4_nl(data, output),
     }
 }
 
@@ -1018,30 +1157,21 @@ impl GgufFile {
             | GgmlType::Q4_K
             | GgmlType::Q5_K
             | GgmlType::Q6_K
-            | GgmlType::I16 => {
+            | GgmlType::I16
+            | GgmlType::Q5_1
+            | GgmlType::IQ4_NL => {
                 // Store raw GGML blocks as a U8 buffer. Where a Metal
                 // quantized-matmul kernel exists for the type, it consumes
                 // these blocks directly without an explicit dequant pass on
                 // the GPU; otherwise the U8 view is opaque on-device storage
                 // pending either a kernel port or a host-side dequant.
                 //
-                // Coverage status (2026-04-25; see also README.md:36):
-                //   * Q4_0 / Q8_0 / Q6_K — full mat-vec + mat-mat + expert-
-                //     routed (mv_id / mm_id / tensor-mm).
-                //   * Q5_K — expert-routed mat-vec (`mv_id`) only. Kernel at
-                //     `src/ops/quantized_matmul_id_ggml.rs:69` and
-                //     `src/shaders/quantized_matmul_id_ggml.metal:250`.
-                //     Host-side dequant-to-F32 implemented in
-                //     `dequantize_q5_k` (`src/gguf/mod.rs:469`), wired into
-                //     `dequantize_to_f32` at `src/gguf/mod.rs:763`. The
-                //     dense `mm_id` (large-batch matmul) variant for Q5_K is
-                //     not yet ported — ADR-013 Decision 12.
-                //   * Q4_K — no Metal matmul kernel; host-side dequant
-                //     available via `dequantize_to_f32`. Use F32 fallback
-                //     for any matmul consumer until the kernel lands.
-                //   * I16 — no Metal matmul kernel; host-side dequant
-                //     available (`dequantize_i16` at `src/gguf/mod.rs:551`,
-                //     wired at `:764`). Same F32-fallback story as Q4_K.
+                // Coverage status (ADR-022 in-flight; see ADR for the live
+                // matrix). Per-type Metal kernel coverage is owned by
+                // `quantized_matmul_ggml.rs` `kernel_name` / `mm_kernel_name`
+                // / `mm_tensor_kernel_name` and the matmul-id counterparts;
+                // host-side dequant for parity / no-kernel-yet paths is
+                // wired into `dequantize_to_f32` directly above.
                 let mut buf =
                     device.alloc_buffer(info.byte_len, DType::U8, info.shape.clone())?;
                 {
