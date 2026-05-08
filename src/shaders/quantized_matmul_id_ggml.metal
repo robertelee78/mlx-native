@@ -509,6 +509,171 @@ kernel void kernel_mul_mv_id_q8_0_f32(
 }
 
 // ====================================================================
+// Q5_1 expert-indexed mat-vec kernel  (ADR-022 Phase 1)
+// ====================================================================
+//
+// Same dispatch geometry as Q4_0 / Q8_0 (legacy 32-element formats):
+//   threadgroups = (ceil(N/8), n_tokens*top_k, 1), tg = (8, 8, 1)
+//   tgpig.x = block-row index
+//   tgpig.y = flat output row (token*top_k + slot)
+//
+// Differs from Q4_0 only in (a) the block-q-n typedef walked, and
+// (b) the dot helper used (`block_q5_1_dot_y` carries the m*sumy term
+// and qh-bit injection; `block_q4_0_dot_y` does not).
+//
+// Reference: llama.cpp `mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>`
+// at ggml-metal.metal:3358-3443 + 3293-3310. Inlined here in mlx-native
+// style (matching the Q4_0 / Q8_0 ports above) rather than templated.
+
+kernel void kernel_mul_mv_id_q5_1_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    // Q5_1 has the same QK as Q4_0 (32 elements per block).
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int output_row = tgpig.y;
+
+    if (output_row >= (int)p.ne1) return;
+
+    const uint token_idx = output_row / p.top_k;
+    const uint expert_id = ids[output_row];
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    // Point to the expert's weight slice. Q5_1 block stride is 24 bytes
+    // (vs 18 for Q4_0); the expert_stride byte offset is honored by the
+    // host-side dispatcher.
+    device const block_q5_1 * x = (device const block_q5_1 *)((device const char *)src0
+                                + expert_id * p.expert_stride) + first_row * nb;
+
+    device const float * y = src1 + token_idx * p.ne10;
+
+    float yl[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        float sumy = 0;
+        // Pre-scale yl[] for the masked-nibble × scaled-input trick
+        // (same as Q4_0 — works because Q5_1's qh-bit injection happens
+        // at bit positions {4, 12, 8, 16} that align with the same
+        // masks 0x000F / 0x0F00 / 0x00F0 / 0xF000).
+        for (int i = 0; i < 8; i += 2) {
+            sumy += yb[i] + yb[i+1];
+            yl[i+0] = yb[i+0];
+            yl[i+1] = yb[i+1] / 256.f;
+            sumy += yb[i+16] + yb[i+17];
+            yl[i+8] = yb[i+16] / 16.f;
+            yl[i+9] = yb[i+17] / 4096.f;
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_q5_1_dot_y(x + ib + row*nb, sumy, yl, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ====================================================================
+// IQ4_NL expert-indexed mat-vec kernel  (ADR-022 Phase 1)
+// ====================================================================
+//
+// Same dispatch geometry as Q4_0. IQ4_NL's codebook lookup is
+// non-linear, so the masked-nibble × pre-scaled-yl trick that Q4_0 /
+// Q5_1 use does not compose. We pass the raw input row to the dot
+// helper, which multiplies element-wise by the looked-up codebook
+// values.
+//
+// Reference: llama.cpp `kernel_mul_mv_iq4_nl_f32_impl` at
+// ggml-metal.metal (template instantiated at line 10359 via
+// kernel_mul_mv_id<mmv_fn<...>>); inlined here in mlx-native style.
+
+kernel void kernel_mul_mv_id_iq4_nl_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int output_row = tgpig.y;
+
+    if (output_row >= (int)p.ne1) return;
+
+    const uint token_idx = output_row / p.top_k;
+    const uint expert_id = ids[output_row];
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    device const block_iq4_nl * x = (device const block_iq4_nl *)((device const char *)src0
+                                  + expert_id * p.expert_stride) + first_row * nb;
+
+    device const float * y = src1 + token_idx * p.ne10;
+
+    float yl_raw[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        // Raw yl[] for IQ4_NL — no pre-scale, codebook lookup is
+        // non-linear and would be polluted by the /256, /16, /4096
+        // divisors used by the linear-quant helpers.
+        for (int i = 0; i < 8; i++) {
+            yl_raw[i]     = yb[i];
+            yl_raw[i + 8] = yb[i + 16];
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_iq4_nl_dot_y(x + ib + row*nb, yl_raw, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ====================================================================
 // Q5_K expert-indexed mat-vec kernel
 // ====================================================================
 //

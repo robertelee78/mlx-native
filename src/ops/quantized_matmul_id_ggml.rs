@@ -71,13 +71,10 @@ impl GgmlType {
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
-            // ADR-022 in-flight: Q5_1 / IQ4_NL mv_id port in P1.5; arm
-            // moves out of "unsupported" when those kernels land.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => "unsupported",
+            // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL mv_id ports.
+            GgmlType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 

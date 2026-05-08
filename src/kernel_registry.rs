@@ -182,6 +182,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL MoE expert-routed mat-vec.
+        sources.insert("kernel_mul_mv_id_q5_1_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_iq4_nl_f32".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
         // in one dispatch — replaces silu_mul + expert_down sequence.
