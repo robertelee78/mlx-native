@@ -77,9 +77,14 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL dense mat-vec.
+        sources.insert("kernel_mul_mv_q5_1_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_iq4_nl_f32".into(), ggml_src);
         // ADR-013 P7 — Q4_K dense decode mat-vec (port of llama.cpp's
         // kernel_mul_mv_q4_K_f32 at ggml-metal.metal:7715-7821).
         sources.insert("kernel_mul_mv_q4_K_f32".into(), ggml_src);
+        // ADR-022 Phase 2 — Q5_K dense mv kernel.
+        sources.insert("kernel_mul_mv_q5_K_f32".into(), ggml_src);
 
         // GGML block-format quantized matrix-matrix kernels
         // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's kernel_mul_mm_<q>_f32).
@@ -91,6 +96,13 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q6_K_f32".into(), ggml_mm_src);
+        // ADR-022 Phase 1 — dense Q5_1 / IQ4_NL mm.
+        sources.insert("kernel_mul_mm_q5_1_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_iq4_nl_f32".into(), ggml_mm_src);
+        // ADR-022 Phase 2 — dense Q5_K mm.
+        sources.insert("kernel_mul_mm_q5_K_f32".into(), ggml_mm_src);
+        // ADR-022 Phase 3 — dense Q4_K mm.
+        sources.insert("kernel_mul_mm_q4_K_f32".into(), ggml_mm_src);
 
         // GGML block-format quantized matrix-matrix kernels — tensor API
         // variant (ADR-011 Phase 3 Wave P3b-tensor: port of llama.cpp's
@@ -109,6 +121,36 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q6_K_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL tensor mm.
+        sources.insert("kernel_mul_mm_q5_1_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_iq4_nl_tensor_f32".into(), ggml_mm_tensor_src);
+        // ADR-022 Phase 2 — Q5_K tensor mm.
+        sources.insert("kernel_mul_mm_q5_K_tensor_f32".into(), ggml_mm_tensor_src);
+        // ADR-022 Phase 3 — Q4_K tensor mm + Q8_0 perm021.
+        sources.insert("kernel_mul_mm_q4_K_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q8_0_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
+
+        // ADR-022 Phase 1 P1.7 — Q5_1 / IQ4_NL mul_mv_ext r1 family.
+        // Eight instantiations (2 types × 4 r1ptg widths). Each PSO is
+        // additionally specialized at PSO-compile time with FC_mul_mv_nsg
+        // (function_constant 600) and FC_mul_mv_nxpsg (function_constant 601).
+        let mul_mv_ext_src: &'static str = include_str!("shaders/mul_mv_ext.metal");
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_2".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_3".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_4".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_5".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_2".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_3".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_4".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_5".into(), mul_mv_ext_src);
+        // ADR-022 Phase 4 — Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K mv_ext.
+        // 5 types × 4 r1ptg widths = 20 instantiations.
+        for r1 in [2, 3, 4, 5].iter() {
+            for ty in ["q4_0", "q8_0", "q4_K", "q5_K", "q6_K"].iter() {
+                let name = format!("kernel_mul_mv_ext_{ty}_f32_r1_{r1}");
+                sources.insert(name, mul_mv_ext_src);
+            }
+        }
 
         // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
         // prefill Q@K^T and scores@V, modeled on llama.cpp's
@@ -182,6 +224,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL MoE expert-routed mat-vec.
+        sources.insert("kernel_mul_mv_id_q5_1_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_iq4_nl_f32".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
         // in one dispatch — replaces silu_mul + expert_down sequence.
@@ -203,6 +248,11 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
         // ADR-013 P16 — Q4_K mm_id (port of llama.cpp ggml-metal.metal:10169).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
+        // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id template instantiations.
+        sources.insert("kernel_mul_mm_id_q5_1_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_iq4_nl_f32".into(), ggml_id_mm_src);
+        // ADR-022 Phase 2 — Q5_K mm_id template instantiation.
+        sources.insert("kernel_mul_mm_id_q5_K_f32".into(), ggml_id_mm_src);
 
         // MoE-routed quantized matrix-matrix kernels — tensor API variant
         // (ADR-011 Phase 3 Wave P3b-tensor).  Uses the MPP tensor_ops
@@ -216,6 +266,11 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q6_K_tensor_f32".into(), ggml_id_mm_tensor_src);
         // ADR-013 P16 — Q4_K tensor-API mm_id.
         sources.insert("kernel_mul_mm_id_q4_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+        // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL tensor-API mm_id.
+        sources.insert("kernel_mul_mm_id_q5_1_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert("kernel_mul_mm_id_iq4_nl_tensor_f32".into(), ggml_id_mm_tensor_src);
+        // ADR-022 Phase 2 — Q5_K tensor-API mm_id.
+        sources.insert("kernel_mul_mm_id_q5_K_tensor_f32".into(), ggml_id_mm_tensor_src);
 
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");

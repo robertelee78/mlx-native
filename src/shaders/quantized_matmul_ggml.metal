@@ -89,6 +89,89 @@ typedef struct {
 static_assert(sizeof(block_q4_K) == 2*sizeof(half) + K_SCALE_SIZE + QK_K/2,
               "wrong q4_K block size");
 
+// ADR-022 Phase 2 — Q5_K block (176 bytes).
+// Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qh[32]][uint8_t qs[128]]
+// Adds a 32-byte qh "high-bit" array vs Q4_K. The high bit OR'd into each
+// dequantized 4-bit nibble lifts the value range from [0,15] to [0,31].
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K/8];
+    uint8_t qs[QK_K/2];
+} block_q5_K;
+static_assert(sizeof(block_q5_K) == 2*sizeof(half) + K_SCALE_SIZE + QK_K/8 + QK_K/2,
+              "wrong q5_K block size");
+
+// Q5_1 (ADR-022 Phase 1). 32 values per block, 24 bytes per block.
+typedef struct {
+    half    d;
+    half    m;
+    uint    qh;
+    uint8_t qs[QK4_0 / 2];
+} block_q5_1;
+static_assert(sizeof(block_q5_1) == 2*sizeof(half) + 4 + QK4_0/2,
+              "wrong q5_1 block size");
+
+// IQ4_NL (ADR-022 Phase 1). 32 values per block, 18 bytes per block.
+typedef struct {
+    half    d;
+    uint8_t qs[QK4_0 / 2];
+} block_iq4_nl;
+static_assert(sizeof(block_iq4_nl) == sizeof(half) + QK4_0/2,
+              "wrong iq4_nl block size");
+
+// Frozen IQ4_NL codebook (ggml-common.h:1109-1112). Lock-step with
+// host-side `KVALUES_IQ4_NL` in src/gguf/mod.rs and the duplicate in
+// quantized_matmul_id_ggml.metal.
+constant int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// Q5_1 dot helper — see id_ggml.metal:135-179 for the formula derivation.
+inline float block_q5_1_dot_y(
+    device const block_q5_1 * qb,
+    float sumy,
+    thread float * yl,
+    int il
+) {
+    float d = qb->d;
+    float m = qb->m;
+    float4 acc = 0.f;
+    device const uint16_t * qs = ((device const uint16_t *)qb + 4 + il/2);
+    const uint qh = qb->qh;
+    for (int i = 0; i < 8; i += 2) {
+        acc[0] += yl[i + 0]
+                * (float)((qs[i / 2] & 0x000F) | (((qh >> (i + 0 + il      )) << 4 ) & 0x0010));
+        acc[1] += yl[i + 1]
+                * (float)((qs[i / 2] & 0x0F00) | (((qh >> (i + 1 + il      )) << 12) & 0x1000));
+        acc[2] += yl[i + 8]
+                * (float)((qs[i / 2] & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8 ) & 0x0100));
+        acc[3] += yl[i + 9]
+                * (float)((qs[i / 2] & 0xF000) | (((qh >> (i + 1 + il + 16)) << 16) & 0x10000));
+    }
+    return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
+}
+
+// IQ4_NL dot helper — see id_ggml.metal:181-211 for the codebook-lookup
+// rationale (raw yl[], no pre-scale, non-linear).
+inline float block_iq4_nl_dot_y(
+    device const block_iq4_nl * qb,
+    thread float * yl_raw,
+    int il
+) {
+    float d = qb->d;
+    float acc = 0.f;
+    device const uint8_t * qs = qb->qs + il;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t b = qs[i];
+        acc += yl_raw[i]     * (float)kvalues_iq4nl[b & 0x0F];
+        acc += yl_raw[i + 8] * (float)kvalues_iq4nl[(b >> 4) & 0x0F];
+    }
+    return d * acc;
+}
+
 // ---- Q4_0 mat-vec kernel ----
 //
 // Each SIMD group (32 threads) processes N_DST=4 rows.
@@ -171,6 +254,135 @@ kernel void kernel_mul_mv_q4_0_f32(
 
         for (int row = 0; row < nr; row++) {
             sumf[row] += block_q4_0_dot_y(x + ib + row*nb, sumy[0] + sumy[1], yl, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[im*p.ne0*p.ne1 + r1*p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ---- Q5_1 mat-vec kernel (ADR-022 Phase 1) ----
+//
+// Same dispatch geometry as Q4_0; differs only in (a) block walked and
+// (b) dot helper used. Q5_1 carries an `m` (min) term, contributing
+// `m * sumy` to the dot product, plus the qh 5th-bit injection.
+
+kernel void kernel_mul_mv_q5_1_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_q5_1 * x = (device const block_q5_1 *) src0 + offset0;
+    device const float      * y = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float yl[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        float sumy = 0.f;
+        for (int i = 0; i < 8; i += 2) {
+            sumy += yb[i] + yb[i+1];
+            yl[i+0] = yb[i+0];
+            yl[i+1] = yb[i+1] / 256.f;
+            sumy += yb[i+16] + yb[i+17];
+            yl[i+8] = yb[i+16] / 16.f;
+            yl[i+9] = yb[i+17] / 4096.f;
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_q5_1_dot_y(x + ib + row*nb, sumy, yl, il);
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[im*p.ne0*p.ne1 + r1*p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ---- IQ4_NL mat-vec kernel (ADR-022 Phase 1) ----
+//
+// IQ4_NL's codebook lookup is non-linear; uses raw yl[] (no pre-scale).
+
+kernel void kernel_mul_mv_iq4_nl_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_iq4_nl * x = (device const block_iq4_nl *) src0 + offset0;
+    device const float        * y = (device const float        *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float yl_raw[16];
+    float sumf[nr] = {0.f};
+
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        for (int i = 0; i < 8; i++) {
+            yl_raw[i]     = yb[i];
+            yl_raw[i + 8] = yb[i + 16];
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_iq4_nl_dot_y(x + ib + row*nb, yl_raw, il);
         }
 
         yb += QK4_0 * 16;
@@ -440,6 +652,119 @@ kernel void kernel_mul_mv_q4_K_f32(
                         (float)sc8[1] * (acc1[1] / 16.f ) +
                         (float)sc8[4] * (acc1[2]        ) +
                         (float)sc8[5] * (acc1[3] / 16.f )) -
+               dmin * (sumy[0] * (float)sc8[2] + sumy[1] * (float)sc8[3] +
+                       sumy[2] * (float)sc8[6] + sumy[3] * (float)sc8[7]);
+
+        y1 += 4 * QK_K;
+    }
+
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0 && row < (int)p.ne01) {
+        dst[r1*p.ne0 + im*p.ne0*p.ne1 + row] = tot;
+    }
+}
+
+// ---- Q5_K dense mat-vec kernel (ADR-022 Phase 2) ----
+//
+// Port of llama.cpp `kernel_mul_mv_q5_K_f32_impl` (ggml-metal.metal:7837).
+// Body is `kernel_mul_mv_q4_K_f32` (above) plus the Q5_K mv_id qh/acc2
+// high-bit accumulation block — the only structural delta between Q4_K
+// and Q5_K. The geometry, scale-decode (kmask1/2/3 + sc16 packing), and
+// final dall/dmin reduction are byte-identical.
+
+kernel void kernel_mul_mv_q5_K_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r0 = tgpig.x;
+    const int64_t r1 = tgpig.y;
+    const int     im = tgpig.z;
+
+    const int row = 2 * (int)r0 + (int)sgitg;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_q5_K * x  = (device const block_q5_K *) src0 + row * nb + offset0;
+    device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float sumf = 0.f;
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const int tid = tiisg / 4;
+    const int ix  = tiisg % 4;
+    const int iq  = tid / 4;
+    const int ir  = tid % 4;
+    const int n   = 8;
+
+    const int l0       = n * ir;
+    const int q_offset = 32 * iq + l0;
+    const int y_offset = 64 * iq + l0;
+
+    const uint8_t hm1 = 1u << (2 * iq);
+    const uint8_t hm2 = hm1 << 1;
+    const uint8_t hm3 = hm1 << 4;
+    const uint8_t hm4 = hm2 << 4;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    device const float * y1 = yy + ix * QK_K + y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uint8_t  * q1 = x[i].qs + q_offset;
+        device const uint8_t  * q2 = q1 + 64;
+        device const uint8_t  * qh = x[i].qh + l0;
+        device const half     * dh = &x[i].d;
+        device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
+
+        device const float * y2 = y1 + 128;
+        float yl[16], yh[16];
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (int l = 0; l < n; ++l) {
+            yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
+            yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
+            yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
+            yh[l+8] = y2[l + 32]; sumy[3] += yh[l+8];
+        }
+
+        sc16[0] = a[0] & kmask1;
+        sc16[1] = a[2] & kmask1;
+        sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+        sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+        float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+        for (int l = 0; l < n; ++l) {
+            uint8_t h = qh[l];
+            acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
+            acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
+            acc1[2] += yh[l+0] * (float)(q2[l] & 0x0F);
+            acc1[3] += yh[l+8] * (float)(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l+0] : 0.f;
+            acc2[1] += (h & hm2) ? yl[l+8] : 0.f;
+            acc2[2] += (h & hm3) ? yh[l+0] : 0.f;
+            acc2[3] += (h & hm4) ? yh[l+8] : 0.f;
+        }
+
+        const float dall = (float)dh[0];
+        const float dmin = (float)dh[1];
+        sumf += dall * ((float)sc8[0] * (acc1[0]        + 16.f * acc2[0]) +
+                        (float)sc8[1] * (acc1[1] / 16.f + 16.f * acc2[1]) +
+                        (float)sc8[4] * (acc1[2]        + 16.f * acc2[2]) +
+                        (float)sc8[5] * (acc1[3] / 16.f + 16.f * acc2[3])) -
                dmin * (sumy[0] * (float)sc8[2] + sumy[1] * (float)sc8[3] +
                        sumy[2] * (float)sc8[6] + sumy[3] * (float)sc8[7]);
 

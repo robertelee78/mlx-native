@@ -121,6 +121,40 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q4_K;
 
+// ADR-022 Phase 2 — Q5_K block (176 bytes) for mm_id port.
+// Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qh[32]][uint8_t qs[128]]
+// Same as Q4_K plus a 32-byte qh "high-bit" array. Mirrors
+// quantized_matmul_id_ggml.metal:75 lock-step.
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K/8];
+    uint8_t qs[QK_K/2];
+} block_q5_K;
+
+// ADR-022 Phase 1 — Q5_1 / IQ4_NL block typedefs for the mm_id port.
+typedef struct {
+    half    d;
+    half    m;
+    uint    qh;
+    uint8_t qs[QK4_0 / 2];
+} block_q5_1;
+
+typedef struct {
+    half    d;
+    uint8_t qs[QK4_0 / 2];
+} block_iq4_nl;
+
+// IQ4_NL non-linear codebook (frozen by ggml-common.h:1109-1112).
+// Lock-step with the duplicates in quantized_matmul_id_ggml.metal,
+// quantized_matmul_ggml.metal, and the host-side `KVALUES_IQ4_NL`
+// in src/gguf/mod.rs.
+constant int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
 // Spec source: llama.cpp ggml-metal.metal:675 — `get_scale_min_k4_just2`.
 // Decodes the (sub-block scale, sub-block min) 6-bit pair at index `j`
 // (within sub-block group `k`) from the packed K_SCALE_SIZE=12 array.
@@ -197,6 +231,52 @@ void dequantize_q6_K(device const block_q6_K * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
+// ADR-022 Phase 1 — Q5_1 dequant for the mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:511-541 (`dequantize_q5_1`).
+// Fills a 4x4 tile (16 values) with positions [16*il .. 16*il+16) of
+// the 32-element block. il=0 fills low half, il=1 fills high half.
+template <typename type4x4>
+void dequantize_q5_1(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 4);
+    const float d = xb->d;
+    const float m = xb->m;
+    const ushort mask = il ? 0x00F0 : 0x000F;
+    const uint32_t qh = xb->qh;
+    const int x_mv = il ? 4 : 0;
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ?  0 : 4;
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i  )) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i+1)) << gh_bk) & 0x10;
+        const int32_t x0 = ((((qs[i]     ) & mask) >> x_mv) | xh_0);
+        const int32_t x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+        reg_f[i/2][2*(i%2) + 0] = d * x0 + m;
+        reg_f[i/2][2*(i%2) + 1] = d * x1 + m;
+    }
+    reg = (type4x4) reg_f;
+}
+
+// ADR-022 Phase 1 — IQ4_NL dequant for the mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:920-933 (`dequantize_iq4_nl`).
+// 16 elements per call addressed by il ∈ {0, 1}; loops over 4 uint16
+// chunks of qs, extracting 4 4-bit indices each via shift+mask, looking
+// up into kvalues_iq4nl per nibble.
+template <typename type4x4>
+void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * q4 = (device const uint16_t *)xb->qs;
+    const float d = xb->d;
+    uint32_t aux32;
+    thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
+    for (int i = 0; i < 4; ++i) {
+        aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
+        reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
+        reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
+        reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
+        reg[i][3] = d * (float)kvalues_iq4nl[q8[3]];
+    }
+}
+
 // ADR-013 P16 — Q4_K dequant for the mm_id MMA-tile path.
 // Spec source: llama.cpp ggml-metal.metal:681. Fills a 4x4 tile with the
 // 16 dequantized values addressed by `il` (which selects sub-block + half
@@ -218,6 +298,34 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     const ushort mask = il < 2 ? 0x0F : 0xF0;
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
+}
+
+// ADR-022 Phase 2 — Q5_K dequant for mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+// Q5_K differs from Q4_K by adding a 32-byte qh "high-bit" array; each
+// of the 16 elements per call OR's an extra 16 (low half) or 256 (high
+// half) into the dequantized value when the corresponding qh bit is set.
+template <typename type4x4>
+void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q  = xb->qs;
+    device const uint8_t * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uint8_t ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.f : 256.f;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
     }
 }
 
@@ -522,6 +630,26 @@ kernel void hf2q_mul_mm_id_impl<block_q6_K, QK_NL, dequantize_q6_K>(
 // ADR-013 P16 — Q4_K mm_id template instantiation.
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]
 kernel void hf2q_mul_mm_id_impl<block_q4_K, QK_NL, dequantize_q4_K>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-022 Phase 2 — Q5_K mm_id template instantiation.
+template [[host_name("kernel_mul_mm_id_q5_K_f32")]]
+kernel void hf2q_mul_mm_id_impl<block_q5_K, QK_NL, dequantize_q5_K>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id template instantiations.
+template [[host_name("kernel_mul_mm_id_q5_1_f32")]]
+kernel void hf2q_mul_mm_id_impl<block_q5_1, 2, dequantize_q5_1>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq4_nl_f32")]]
+kernel void hf2q_mul_mm_id_impl<block_iq4_nl, 2, dequantize_iq4_nl>(
     constant GgmlMatmulIdMm_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

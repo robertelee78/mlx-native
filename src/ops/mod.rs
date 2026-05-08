@@ -30,6 +30,7 @@ pub mod row_sum;
 pub mod moe_dispatch;
 pub mod moe_gate;
 pub mod moe_softmax_topk;
+pub mod mul_mv_ext;
 pub mod moe_weighted_reduce;
 pub mod qkv_split;
 pub mod repeat_tiled;

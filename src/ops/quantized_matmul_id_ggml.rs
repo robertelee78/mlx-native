@@ -71,6 +71,9 @@ impl GgmlType {
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
+            // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL mv_id ports.
+            GgmlType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
@@ -81,28 +84,33 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
-            // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
-            GgmlType::Q5_K => "unsupported",
+            // ADR-022 Phase 2 — Q5_K mm_id ported.
+            GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
             // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
             // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32",
+            // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id ported.
+            GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 
     /// Tensor-API variant of the mm_id kernel (ADR-011 Phase 3 Wave
-    /// P3b-tensor).  Dispatcher falls back to `id_mm_kernel_name()` when
-    /// the tensor pipeline probe fails on pre-M3 hardware.
+    /// P3b-tensor).
     fn id_mm_tensor_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
-            // Q5_K mm_id not yet ported; mv_id fallback is used for all batch sizes.
-            GgmlType::Q5_K => "unsupported",
+            // ADR-022 Phase 2 — Q5_K mm_id_tensor ported.
+            GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
             // ADR-013 P16 — Q4_K tensor-API mm_id ported.
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32",
+            // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL tensor-API mm_id ported.
+            GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
@@ -260,13 +268,28 @@ pub fn quantized_matmul_id_ggml(
     //   * decode (n_tokens <= 8)
     //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
-    //   * Q5_K (mm_id not yet ported — only mv_id kernel exists)
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
+    // ADR-022 Phase 2 — Q5_K mm_id ported; the Q5_K bypass at this site
+    // (and at the pooled entry below) was retained until iter-19's port
+    // closed the gap.
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
-        && params.ggml_type != GgmlType::Q5_K
     {
+        // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
+        // engages on prefill. `HF2Q_LOG_MM_ID_ROUTE=1` enables the line.
+        if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
+            eprintln!(
+                "[mlx-native adr-022 AC-4] dispatch_id_mm engaged: type={:?} \
+                 n_tokens={} top_k={} k={} n={} n_experts={}",
+                params.ggml_type,
+                params.n_tokens,
+                params.top_k,
+                params.k,
+                params.n,
+                params.n_experts,
+            );
+        }
         return dispatch_id_mm(
             encoder, registry, device, input, weight, ids, output, params,
         );
@@ -372,13 +395,28 @@ pub fn quantized_matmul_id_ggml_pooled(
     }
 
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
-    // Q5_K: mm_id not yet ported; always use mv_id.
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
+    // ADR-022 Phase 2 — Q5_K mm_id ported; the previous Q5_K bypass here
+    // is retired (kernels live in id_mm.metal + id_mm_tensor.metal).
+    // ADR-022 AC-4: env-gated trace (HF2Q_LOG_MM_ID_ROUTE=1) confirms mm_id
+    // engagement on the qwen35 prefill path which goes through this pooled
+    // entry, not the auto entry above.
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
-        && params.ggml_type != GgmlType::Q5_K
     {
+        if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
+            eprintln!(
+                "[mlx-native adr-022 AC-4 pooled] dispatch_id_mm_pooled engaged: \
+                 type={:?} n_tokens={} top_k={} k={} n={} n_experts={}",
+                params.ggml_type,
+                params.n_tokens,
+                params.top_k,
+                params.k,
+                params.n,
+                params.n_experts,
+            );
+        }
         return dispatch_id_mm_pooled(
             encoder, registry, device, input, weight, ids, output,
             scratch, params,
@@ -466,7 +504,15 @@ fn dispatch_id_mv(
         // falsified — Metal compiler/scheduler optimizes both layouts
         // similarly, with workload-specific edges that don't match
         // llama.cpp's tuning.
-        GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
+        // ADR-022: Q5_1 and IQ4_NL are 32-element legacy formats; share
+        // the (8, 8) layout with Q4_0 / Q8_0. Confirmed against llama.cpp's
+        // dispatch_id_mv launch geometry for `kernel_mul_mv_id_q5_1_f32`
+        // and `kernel_mul_mv_id_iq4_nl_f32` (both NWG=2, NSIMDGROUP=2,
+        // ngroups along K = nb/4 → 8 thread blocks of 8 rows each).
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => (8u64, 8u64, 8usize),
         // Q4_K, Q5_K, and Q6_K all use the 2-row-per-threadgroup (2, 32)
         // geometry.  ADR-013 P7 — Q4_K added; mirrors Q5_K (NSG=2,
         // 1 row per simdgroup; same kmask scale-decode).
@@ -914,9 +960,16 @@ pub fn dispatch_id_mm_for_test(
     let qk = params.ggml_type.block_values();
 
     // ---- Validate common shapes ----
-    // ADR-013 P16 — Q4_K added.
+    // ADR-013 P16 — Q4_K added. ADR-022 P1.6 — Q5_1 / IQ4_NL added.
+    // ADR-022 Phase 2 — Q5_K added.
     match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K => {}
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm_for_test does not support {:?}", other
