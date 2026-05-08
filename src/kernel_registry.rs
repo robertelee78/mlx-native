@@ -552,6 +552,16 @@ impl KernelRegistry {
             "qmm_affine_t_f32_tiled".into(),
             qmm_affine_tiled_src,
         );
+        // ADR-020 iter-15c: simdgroup-MMA variant — uses Apple GPU
+        // hardware `simdgroup_matrix<float, 8, 8>` MMA for the inner
+        // reduction.  Per-tile algorithmic 8× over scalar tiled, lands
+        // as ~3-4× wall after launch / load amortization.
+        let qmm_affine_simd_src: &'static str =
+            include_str!("shaders/qmm_affine_simd.metal");
+        sources.insert(
+            "qmm_affine_t_f32_simd".into(),
+            qmm_affine_simd_src,
+        );
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);

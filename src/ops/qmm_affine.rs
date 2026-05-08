@@ -39,12 +39,18 @@ use crate::kernel_registry::KernelRegistry;
 pub static QMM_AFFINE_SHADER_SOURCE: &str = include_str!("../shaders/qmm_affine.metal");
 pub static QMM_AFFINE_TILED_SHADER_SOURCE: &str =
     include_str!("../shaders/qmm_affine_tiled.metal");
+pub static QMM_AFFINE_SIMD_SHADER_SOURCE: &str =
+    include_str!("../shaders/qmm_affine_simd.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("qmm_affine_t_f32", QMM_AFFINE_SHADER_SOURCE);
     registry.register_source(
         "qmm_affine_t_f32_tiled",
         QMM_AFFINE_TILED_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "qmm_affine_t_f32_simd",
+        QMM_AFFINE_SIMD_SHADER_SOURCE,
     );
 }
 
@@ -275,6 +281,102 @@ pub fn dispatch_qmm_affine_t_f32_tiled(
         &[(0, SHMEM_BYTES)],
         MTLSize::new(tg_count_x, tg_count_y, 1),
         MTLSize::new(BM, BN, 1),
+    );
+    Ok(())
+}
+
+/// Dispatch the SIMDGROUP-MMA variant of `qmm_affine_t_f32` (ADR-020
+/// iter-15c).  Same I/O contract as
+/// [`dispatch_qmm_affine_t_f32_tiled`] but uses Apple GPU's hardware
+/// `simdgroup_matrix<float, 8, 8>` MMA path for the inner reduction.
+///
+/// Tile geometry: BM = BN = 8, BK = 32 (= group_size); ONE simdgroup
+/// (32 threads) per threadgroup; output 8×8 tile per TG.
+///
+/// Constraints (host-validated):
+///   - `group_size == 32` (kernel BK is hard-coded — same as 15b).
+///   - `K % group_size == 0`.
+///   - All buffers correct dtype + element_count.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qmm_affine_t_f32_simd(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    x: &MlxBuffer,
+    q_int: &MlxBuffer,
+    scales: &MlxBuffer,
+    biases: &MlxBuffer,
+    y: &MlxBuffer,
+    meta: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    group_size: u32,
+) -> Result<()> {
+    const OP: &str = "qmm_affine_t_f32_simd";
+    const SIMD_BK: u32 = 32;
+    if group_size != SIMD_BK {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: group_size must equal {SIMD_BK} (kernel BK is hard-coded); got {group_size}"
+        )));
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: M, N, K must all be > 0; got ({m}, {n}, {k})"
+        )));
+    }
+    if k % group_size != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: K ({k}) must be divisible by group_size ({group_size})"
+        )));
+    }
+    if x.dtype() != DType::F32 || scales.dtype() != DType::F32
+        || biases.dtype() != DType::F32 || y.dtype() != DType::F32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: x/scales/biases/y must be f32"
+        )));
+    }
+    if q_int.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: q_int dtype {} not u8",
+            q_int.dtype()
+        )));
+    }
+    let m_us = m as usize;
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let gs_us = group_size as usize;
+    if x.element_count() != m_us * k_us
+        || q_int.element_count() != n_us * k_us
+        || scales.element_count() != n_us * (k_us / gs_us)
+        || biases.element_count() != n_us * (k_us / gs_us)
+        || y.element_count() != m_us * n_us
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: buffer element_count mismatch"
+        )));
+    }
+    if meta.byte_len() < 16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: meta < 16 bytes"
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(OP, device)?;
+    const BM: u64 = 8;
+    const BN: u64 = 8;
+    let tg_count_x = (m as u64).div_ceil(BM);
+    let tg_count_y = (n as u64).div_ceil(BN);
+    // a_tile (8*32*4=1024) + b_tile (8*32*4=1024) = 2048 bytes.
+    const SHMEM_BYTES: u64 = 2048;
+    // Single simdgroup per TG = 32 threads.
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, x), (1, q_int), (2, scales), (3, biases), (4, y), (5, meta)],
+        &[(0, SHMEM_BYTES)],
+        MTLSize::new(tg_count_x, tg_count_y, 1),
+        MTLSize::new(32, 1, 1),
     );
     Ok(())
 }
@@ -772,6 +874,133 @@ mod tests {
             1,
             32,
             32,
+        );
+        assert!(res.is_err());
+    }
+
+    /// ADR-020 iter-15c — simdgroup-MMA kernel byte-parity vs the
+    /// per-element kernel.  Same inputs, same math, must match within
+    /// FP rounding.  This is the load-bearing correctness test:
+    /// without parity, the perf gain is meaningless.
+    #[test]
+    fn qmm_affine_simd_matches_per_element_kernel() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let m = 32usize;
+        let n = 64usize;
+        let k = 128usize;
+        let gs = 32usize;
+        let groups_per_row = k / gs;
+
+        let x: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.013 - 0.4).sin() * 0.6)
+            .collect();
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 11 + 3) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.05 + (i as f32) * 0.003)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.2 + (i as f32) * 0.011)
+            .collect();
+
+        let mut x_buf = alloc_f32(&device, m * k, vec![m, k]);
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
+        let mut q_buf = alloc_u8(&device, n * k, vec![n, k]);
+        q_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&q_int);
+        let mut s_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        s_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&scales);
+        let mut b_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        b_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&biases);
+        let y_pe = alloc_f32(&device, m * n, vec![m, n]);
+        let y_simd = alloc_f32(&device, m * n, vec![m, n]);
+        let meta = make_meta(&device, m as u32, n as u32, k as u32, gs as u32);
+
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_qmm_affine_t_f32(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_pe, &meta,
+            m as u32, n as u32, k as u32, gs as u32,
+        ).unwrap();
+        dispatch_qmm_affine_t_f32_simd(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_simd, &meta,
+            m as u32, n as u32, k as u32, gs as u32,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        let pe = y_pe.as_slice::<f32>().unwrap();
+        let sm = y_simd.as_slice::<f32>().unwrap();
+        for i in 0..(m * n) {
+            assert!(
+                (pe[i] - sm[i]).abs() < 1e-4 * pe[i].abs().max(1.0),
+                "simd vs per-elem at i={i}: pe={} simd={}",
+                pe[i], sm[i]
+            );
+        }
+    }
+
+    /// Tile-edge correctness: M, N not divisible by 8 (the simd
+    /// kernel's tile size).  Forces the partial-tile staging path.
+    #[test]
+    fn qmm_affine_simd_handles_unaligned_m_n() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let m = 13usize;
+        let n = 21usize;
+        let k = 64usize;
+        let gs = 32usize;
+        let groups_per_row = k / gs;
+
+        let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.011 - 0.5).collect();
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 7) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row)).map(|i| 0.07 + i as f32 * 0.001).collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row)).map(|i| -0.1 + i as f32 * 0.002).collect();
+
+        let mut x_buf = alloc_f32(&device, m * k, vec![m, k]);
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
+        let mut q_buf = alloc_u8(&device, n * k, vec![n, k]);
+        q_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&q_int);
+        let mut s_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        s_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&scales);
+        let mut b_buf = alloc_f32(&device, n * groups_per_row, vec![n, groups_per_row]);
+        b_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&biases);
+        let y_buf = alloc_f32(&device, m * n, vec![m, n]);
+        let meta = make_meta(&device, m as u32, n as u32, k as u32, gs as u32);
+
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_qmm_affine_t_f32_simd(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_buf, &meta,
+            m as u32, n as u32, k as u32, gs as u32,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        let gpu = y_buf.as_slice::<f32>().unwrap();
+        let cpu = qmm_affine_t_cpu(&x, &q_int, &scales, &biases, m, n, k, gs);
+        for i in 0..(m * n) {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 1e-3 * cpu[i].abs().max(1.0),
+                "simd unaligned y[{i}]: gpu={} cpu={}",
+                gpu[i], cpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn qmm_affine_simd_rejects_non_32_group_size() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let x_buf = alloc_f32(&device, 64, vec![1, 64]);
+        let q_buf = alloc_u8(&device, 64, vec![1, 64]);
+        let s_buf = alloc_f32(&device, 1, vec![1]);
+        let b_buf = alloc_f32(&device, 1, vec![1]);
+        let y_buf = alloc_f32(&device, 1, vec![1, 1]);
+        let meta = make_meta(&device, 1, 1, 64, 64);
+        let mut encoder = device.command_encoder().unwrap();
+        let res = dispatch_qmm_affine_t_f32_simd(
+            &mut encoder, &mut registry, device.metal_device(),
+            &x_buf, &q_buf, &s_buf, &b_buf, &y_buf, &meta,
+            1, 1, 64, 64,
         );
         assert!(res.is_err());
     }
