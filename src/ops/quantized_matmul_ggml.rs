@@ -153,19 +153,18 @@ impl GgmlType {
     /// llama.cpp's `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
     fn mm_kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 in-flight: Q5_1 / IQ4_NL kernels port in P1.6; arm
-            // moves out when those instantiations land. Q4_K / Q5_K dense
-            // mm coverage owned by ADR-022 phase 2-3.
+            // ADR-022 in-flight: Q4_K / Q5_K dense mm coverage owned by
+            // ADR-022 phase 2-3. Q5_1 / IQ4_NL landed in P1.6.
             GgmlType::F32
             | GgmlType::F16
             | GgmlType::Q4_K
             | GgmlType::Q5_K
-            | GgmlType::I16
-            | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => "unsupported",
+            | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_f32",
+            GgmlType::Q5_1 => "kernel_mul_mm_q5_1_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_f32",
         }
     }
 
@@ -175,17 +174,17 @@ impl GgmlType {
     /// for 2-3× the FLOP throughput of the simdgroup MMA variant.
     fn mm_tensor_kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 in-flight: Q5_1 / IQ4_NL kernels port in P1.6.
+            // ADR-022 P1.6: Q5_1 / IQ4_NL tensor mm landed.
             GgmlType::F32
             | GgmlType::F16
             | GgmlType::Q4_K
             | GgmlType::Q5_K
-            | GgmlType::I16
-            | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => "unsupported",
+            | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_f32",
+            GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_f32",
         }
     }
 }
@@ -404,10 +403,7 @@ pub fn quantized_matmul_ggml(
     // Q4_K mm/mm_tensor not yet ported (ADR-013 P7); Q5_1 / IQ4_NL mm
     // come in ADR-022 P1.6. All three route to mv on m > threshold for
     // now — correct but slower than a real mm for large m.
-    let mm_supported = !matches!(
-        params.ggml_type,
-        GgmlType::Q4_K | GgmlType::Q5_1 | GgmlType::IQ4_NL
-    );
+    let mm_supported = !matches!(params.ggml_type, GgmlType::Q4_K);
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
         dispatch_mm(encoder, registry, device, input, weight, output, params)
     } else {
@@ -436,7 +432,11 @@ pub fn dispatch_mm_for_test(
     // Re-run common validation so this entry point is safe on its own.
     let qk = params.ggml_type.block_values();
     match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K => {}
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q6_K
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_mm_for_test does not support {:?}", other

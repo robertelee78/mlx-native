@@ -85,6 +85,24 @@ typedef struct {
     half    d;
 } block_q6_K;
 
+// ADR-022 Phase 1 — Q5_1 / IQ4_NL block typedefs for tensor mm.
+typedef struct {
+    half    d;
+    half    m;
+    uint    qh;
+    uint8_t qs[QK4_0 / 2];
+} block_q5_1;
+
+typedef struct {
+    half    d;
+    uint8_t qs[QK4_0 / 2];
+} block_iq4_nl;
+
+constant int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
 // ---- Dequantize helpers (identical to the non-tensor file; duplicated
 //      so this file is self-contained and independently compilable) ----
 
@@ -155,6 +173,45 @@ void dequantize_q6_K_t(device const block_q6_K * xb, short il, thread type4x4 & 
         reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
     }
     reg = (type4x4) reg_f;
+}
+
+// ADR-022 Phase 1 — Q5_1 dequant for tensor mm (identical math to non-tensor).
+template <typename type4x4>
+void dequantize_q5_1_t(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 4);
+    const float d = xb->d;
+    const float m = xb->m;
+    const ushort mask = il ? 0x00F0 : 0x000F;
+    const uint32_t qh = xb->qh;
+    const int x_mv = il ? 4 : 0;
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ?  0 : 4;
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i  )) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i+1)) << gh_bk) & 0x10;
+        const int32_t x0 = ((((qs[i]     ) & mask) >> x_mv) | xh_0);
+        const int32_t x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+        reg_f[i/2][2*(i%2) + 0] = d * x0 + m;
+        reg_f[i/2][2*(i%2) + 1] = d * x1 + m;
+    }
+    reg = (type4x4) reg_f;
+}
+
+// ADR-022 Phase 1 — IQ4_NL dequant for tensor mm.
+template <typename type4x4>
+void dequantize_iq4_nl_t(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * q4 = (device const uint16_t *)xb->qs;
+    const float d = xb->d;
+    uint32_t aux32;
+    thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
+    for (int i = 0; i < 4; ++i) {
+        aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
+        reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
+        reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
+        reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
+        reg[i][3] = d * (float)kvalues_iq4nl[q8[3]];
+    }
 }
 
 // ---- tensor-API mul_mm template ----
@@ -356,6 +413,17 @@ kernel void hf2q_mul_mm_tensor_impl<block_q8_0, 2, dequantize_q8_0_t>(
 
 template [[host_name("kernel_mul_mm_q6_K_tensor_f32")]]
 kernel void hf2q_mul_mm_tensor_impl<block_q6_K, QK_NL, dequantize_q6_K_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+// ADR-022 Phase 1 — Q5_1 / IQ4_NL tensor-mm template instantiations.
+template [[host_name("kernel_mul_mm_q5_1_tensor_f32")]]
+kernel void hf2q_mul_mm_tensor_impl<block_q5_1, 2, dequantize_q5_1_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_iq4_nl_tensor_f32")]]
+kernel void hf2q_mul_mm_tensor_impl<block_iq4_nl, 2, dequantize_iq4_nl_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 

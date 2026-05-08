@@ -94,6 +94,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q6_K_f32".into(), ggml_mm_src);
+        // ADR-022 Phase 1 — dense Q5_1 / IQ4_NL mm.
+        sources.insert("kernel_mul_mm_q5_1_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_iq4_nl_f32".into(), ggml_mm_src);
 
         // GGML block-format quantized matrix-matrix kernels — tensor API
         // variant (ADR-011 Phase 3 Wave P3b-tensor: port of llama.cpp's
@@ -112,6 +115,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q6_K_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL tensor mm.
+        sources.insert("kernel_mul_mm_q5_1_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_iq4_nl_tensor_f32".into(), ggml_mm_tensor_src);
 
         // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
         // prefill Q@K^T and scores@V, modeled on llama.cpp's

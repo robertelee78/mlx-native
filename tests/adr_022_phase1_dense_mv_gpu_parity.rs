@@ -138,6 +138,24 @@ fn run_dense_mv_parity(
     k: usize,
     seed: u64,
 ) {
+    run_dense_mv_parity_tol(
+        ggml_type, qk, block_bytes, quantize, dequantize, m, n, k, seed, 1e-3,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_dense_mv_parity_tol(
+    ggml_type: GgmlType,
+    qk: usize,
+    block_bytes: usize,
+    quantize: impl Fn(&[f32]) -> Vec<u8>,
+    dequantize: impl Fn(&[u8], &mut [f32]) -> mlx_native::Result<()>,
+    m: usize,
+    n: usize,
+    k: usize,
+    seed: u64,
+    tol: f32,
+) {
     assert_eq!(k % qk, 0);
     let blocks_per_row = k / qk;
     let row_bytes = blocks_per_row * block_bytes;
@@ -223,8 +241,8 @@ fn run_dense_mv_parity(
             max_abs_err = abs_err;
         }
         assert!(
-            abs_err <= 1e-3 || rel_err <= 1e-3,
-            "{:?} dense mv mismatch at idx {i}: GPU {g} vs CPU {c} (abs {abs_err}, rel {rel_err})",
+            abs_err <= tol || rel_err <= tol,
+            "{:?} dense mv mismatch at idx {i}: GPU {g} vs CPU {c} (abs {abs_err}, rel {rel_err}, tol {tol})",
             ggml_type
         );
     }
@@ -291,5 +309,45 @@ fn adr022_iq4_nl_dense_mv_parity_realistic() {
         176,
         704,
         0xAD22_004F_D002,
+    );
+}
+
+// ----- ADR-022 P1.6 dense mm path (m > MM_ROUTING_THRESHOLD = 8) -----
+//
+// These tests pass m=64 to `quantized_matmul_ggml` which routes to
+// `dispatch_mm` (and on M3+ tensor variant via probe_tensor_mm). Exercises
+// `kernel_mul_mm_q5_1_f32` / `kernel_mul_mm_iq4_nl_f32` and their tensor
+// siblings. Tolerance bumped to 5e-3 for F32 accumulator reorder across
+// k=128 multiplications.
+
+#[test]
+fn adr022_q5_1_dense_mm_parity_prefill() {
+    run_dense_mv_parity_tol(
+        GgmlType::Q5_1,
+        QK5_1,
+        BLOCK_Q5_1_BYTES,
+        ref_quantize_q5_1,
+        test_only_dequantize_q5_1,
+        /*m=*/ 64,
+        /*n=*/ 64,
+        /*k=*/ 128,
+        0xAD22_0511_D003,
+        /*tol=*/ 5e-3,
+    );
+}
+
+#[test]
+fn adr022_iq4_nl_dense_mm_parity_prefill() {
+    run_dense_mv_parity_tol(
+        GgmlType::IQ4_NL,
+        QK4_NL,
+        BLOCK_IQ4_NL_BYTES,
+        ref_quantize_iq4_nl,
+        test_only_dequantize_iq4_nl,
+        /*m=*/ 64,
+        /*n=*/ 64,
+        /*k=*/ 128,
+        0xAD22_004F_D003,
+        /*tol=*/ 5e-3,
     );
 }

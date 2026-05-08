@@ -405,17 +405,254 @@ fn adr022_iq4_nl_mv_id_parity_realistic_shape() {
 // ----- ADR-022 P1.6 mm_id path coverage -----
 //
 // MM_ID_ROUTING_THRESHOLD = 32 (`quantized_matmul_id_ggml.rs:407`).
-// Setting n_tokens > 32 with top_k ∈ {1, 8} forces dispatch_id_mm
-// instead of dispatch_id_mv, exercising the prefill mm_id template
-// instantiations landed in commit 2137a71.
+// At n_tokens > 32 with top_k ∈ {1, 8} the public dispatcher selects
+// dispatch_id_mm. We bypass the public dispatcher and call
+// `dispatch_id_mm_for_test` directly, then compare its output to a
+// separate mv_id run (proven correct in P1.5). Mirrors the proven
+// pattern from `tests/test_quantized_matmul_id_mm.rs`.
+//
+// Why not CPU reference? mv_id is already CPU-validated in P1.5; using
+// it here removes quantizer-noise floor and isolates this test to
+// "does mm_id agree with mv_id" — exactly the mm template bug surface.
+//
+// IDs distribution: deterministic flat formula `(t*17 + s*13 + 7) % n_experts`
+// — guarantees per-expert routing count ≤ n_tokens (no hids overflow).
+// Random ids give variance that overflows hids[expert][n_tokens] rows.
+
+use mlx_native::ops::quantized_matmul_id_ggml::{
+    dispatch_id_mm_for_test, GgmlIdMmDispatchParams,
+};
+
+#[allow(clippy::too_many_arguments)]
+fn run_mm_id_vs_mv_id(
+    ggml_type: GgmlType,
+    block_bytes: usize,
+    quantize_row: fn(&[f32]) -> Vec<u8>,
+    n_tokens: usize,
+    top_k: usize,
+    n_experts: usize,
+    n: usize,
+    k: usize,
+    seed: u64,
+) {
+    assert_eq!(k % 32, 0);
+    assert!(top_k == 1 || top_k == 8, "shader instantiations limited to {{1,8}}");
+
+    let blocks_per_row = k / 32;
+    let per_expert_bytes = n * blocks_per_row * block_bytes;
+
+    // ---- Synthetic data (deterministic per seed) ----
+    let mut state = seed;
+
+    let mut stacked_bytes = Vec::with_capacity(n_experts * per_expert_bytes);
+    for _expert in 0..n_experts {
+        for _row in 0..n {
+            let mut row_f32 = vec![0.0_f32; k];
+            for v in row_f32.iter_mut() {
+                *v = random_f32_in_pm1(&mut state) * 0.5;
+            }
+            stacked_bytes.extend(quantize_row(&row_f32));
+        }
+    }
+    assert_eq!(stacked_bytes.len(), n_experts * per_expert_bytes);
+
+    let mut input_data = vec![0.0_f32; n_tokens * k];
+    for v in input_data.iter_mut() {
+        *v = random_f32_in_pm1(&mut state);
+    }
+
+    // Deterministic flat-distribution ids — guarantees no hids overflow.
+    let total_rows = n_tokens * top_k;
+    let mut ids = vec![0_u32; total_rows];
+    for t in 0..n_tokens {
+        for s in 0..top_k {
+            ids[t * top_k + s] = ((t * 17 + s * 13 + 7) % n_experts) as u32;
+        }
+    }
+
+    // ---- GPU buffers (shared) ----
+    let device = MlxDevice::new().unwrap();
+    let mut registry = KernelRegistry::new();
+
+    let mut weight_buf = device
+        .alloc_buffer(stacked_bytes.len(), DType::U8, vec![stacked_bytes.len()])
+        .unwrap();
+    weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&stacked_bytes);
+
+    let mut input_buf = device
+        .alloc_buffer(input_data.len() * 4, DType::F32, vec![input_data.len()])
+        .unwrap();
+    input_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&input_data);
+
+    let mut ids_buf = device
+        .alloc_buffer(total_rows * 4, DType::U32, vec![total_rows])
+        .unwrap();
+    ids_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
+
+    // ---- mv_id reference run via public entry (forced via small n_tokens
+    //      pass through public dispatcher's mv path is unreliable here, so
+    //      we run mv_id explicitly via a separate dispatcher call where
+    //      the threshold-based selector picks mv).
+    //      Trick: the public dispatcher selects mv when n_tokens <= 32,
+    //      so we run the same data through with n_tokens chunked into
+    //      groups <= 32 and stitch outputs. Simpler: call the public
+    //      dispatcher with the FULL (n_tokens, top_k) — for top_k=8 and
+    //      n_tokens > 32 it'll pick mm. To get an mv reference at the
+    //      same logical shape, we slice the input/ids by token and call
+    //      mv_id explicitly per chunk.
+    //
+    //      Actually the cleanest path: the existing test_quantized_matmul_id_mm
+    //      works because the public quantized_matmul_id_ggml routes based
+    //      on n_tokens. For our reference, we run with same shape but
+    //      force the input through mv_id by slicing tokens to ≤32.
+    //      This still validates the mm_id template (under test, full shape)
+    //      against mv_id (reference, sliced shape).
+    let mut mv_output = vec![0.0_f32; total_rows * n];
+    let mv_chunk = 32_usize.min(n_tokens);
+    let mut tok_off = 0;
+    while tok_off < n_tokens {
+        let chunk = (n_tokens - tok_off).min(mv_chunk);
+        let mut chunk_in = device
+            .alloc_buffer(chunk * k * 4, DType::F32, vec![chunk * k])
+            .unwrap();
+        chunk_in
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&input_data[tok_off * k..(tok_off + chunk) * k]);
+
+        let mut chunk_ids = device
+            .alloc_buffer(chunk * top_k * 4, DType::U32, vec![chunk * top_k])
+            .unwrap();
+        chunk_ids
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&ids[tok_off * top_k..(tok_off + chunk) * top_k]);
+
+        let mut chunk_out = device
+            .alloc_buffer(chunk * top_k * n * 4, DType::F32, vec![chunk * top_k * n])
+            .unwrap();
+        for v in chunk_out.as_mut_slice::<f32>().unwrap().iter_mut() { *v = 0.0; }
+
+        let chunk_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: chunk as u32,
+            top_k: top_k as u32,
+            n: n as u32,
+            k: k as u32,
+            n_experts: n_experts as u32,
+            expert_stride: per_expert_bytes as u64,
+            ggml_type,
+        };
+        let mut enc = device.command_encoder().unwrap();
+        mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
+            &mut enc,
+            &mut registry,
+            &device,
+            &chunk_in,
+            &weight_buf,
+            &chunk_ids,
+            &mut chunk_out,
+            &chunk_params,
+        )
+        .unwrap();
+        enc.commit_and_wait().unwrap();
+
+        let chunk_slice: &[f32] = chunk_out.as_slice().unwrap();
+        mv_output[tok_off * top_k * n..(tok_off + chunk) * top_k * n]
+            .copy_from_slice(chunk_slice);
+        tok_off += chunk;
+    }
+
+    // ---- mm_id under test ----
+    let dispatch = GgmlIdMmDispatchParams {
+        n_tokens: n_tokens as u32,
+        top_k: top_k as u32,
+        n: n as u32,
+        k: k as u32,
+        n_experts: n_experts as u32,
+        expert_stride: per_expert_bytes as u64,
+        ggml_type,
+    };
+    let mut htpe = device
+        .alloc_buffer(dispatch.htpe_bytes(), DType::U32, vec![n_experts])
+        .unwrap();
+    let mut hids = device
+        .alloc_buffer(dispatch.hids_bytes(), DType::U32, vec![n_experts, n_tokens])
+        .unwrap();
+    for v in htpe.as_mut_slice::<u32>().unwrap().iter_mut() { *v = 0; }
+    for v in hids.as_mut_slice::<u32>().unwrap().iter_mut() { *v = 0; }
+
+    let mut mm_output_buf = device
+        .alloc_buffer(total_rows * n * 4, DType::F32, vec![total_rows * n])
+        .unwrap();
+    for v in mm_output_buf.as_mut_slice::<f32>().unwrap().iter_mut() { *v = 0.0; }
+
+    {
+        let mut enc = device.command_encoder().unwrap();
+        dispatch_id_mm_for_test(
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_buf,
+            &weight_buf,
+            &ids_buf,
+            &mut htpe,
+            &mut hids,
+            &mut mm_output_buf,
+            &dispatch,
+        )
+        .unwrap();
+        enc.commit_and_wait().unwrap();
+    }
+
+    let mm_out: &[f32] = mm_output_buf.as_slice().unwrap();
+
+    // Diagnostic
+    eprintln!(
+        "[adr-022 {:?} mm_id parity diag] first GPU mm_id: {:?}",
+        ggml_type,
+        &mm_out[..mm_out.len().min(8)]
+    );
+    eprintln!(
+        "[adr-022 {:?} mm_id parity diag] first mv_id ref:  {:?}",
+        ggml_type,
+        &mv_output[..mv_output.len().min(8)]
+    );
+
+    let mut max_abs_err = 0.0_f32;
+    let mut first_bad = None;
+    for (i, (mm, mv)) in mm_out.iter().zip(mv_output.iter()).enumerate() {
+        let err = (mm - mv).abs();
+        if err > max_abs_err { max_abs_err = err; }
+        // mm_id and mv_id share the same dequant + ref weights, so accumulator
+        // ordering is the only difference. 5e-3 absorbs F32 reorder ULP
+        // (k=128 multiplications).
+        if err > 5e-3 && first_bad.is_none() {
+            first_bad = Some((i, *mm, *mv, err));
+        }
+    }
+    if let Some((i, mm_v, mv_v, err)) = first_bad {
+        let row = i / n;
+        let col = i % n;
+        let tok = row / top_k;
+        let slot = row % top_k;
+        let expert = ids[row];
+        panic!(
+            "{:?} mm_id vs mv_id mismatch at idx {i} (tok {tok} slot {slot} expert {expert} col {col}): mm {mm_v} vs mv {mv_v} (err {err}, max_abs {max_abs_err})",
+            ggml_type
+        );
+    }
+    eprintln!(
+        "[adr-022 {:?} mm_id parity] PASS max_abs_err={:.6e}",
+        ggml_type, max_abs_err
+    );
+}
 
 #[test]
 fn adr022_q5_1_mm_id_parity_prefill_path() {
-    run_mv_id_parity(
+    run_mm_id_vs_mv_id(
         GgmlType::Q5_1,
         BLOCK_Q5_1_BYTES,
         ref_quantize_q5_1,
-        test_only_dequantize_q5_1,
         /*n_tokens=*/ 64,
         /*top_k=*/ 8,
         /*n_experts=*/ 8,
@@ -427,11 +664,10 @@ fn adr022_q5_1_mm_id_parity_prefill_path() {
 
 #[test]
 fn adr022_iq4_nl_mm_id_parity_prefill_path() {
-    run_mv_id_parity(
+    run_mm_id_vs_mv_id(
         GgmlType::IQ4_NL,
         BLOCK_IQ4_NL_BYTES,
         ref_quantize_iq4_nl,
-        test_only_dequantize_iq4_nl,
         /*n_tokens=*/ 64,
         /*top_k=*/ 8,
         /*n_experts=*/ 8,
@@ -443,10 +679,8 @@ fn adr022_iq4_nl_mm_id_parity_prefill_path() {
 
 // ----- Bisect helper: Q4_0 baseline at the same prefill-path shape -----
 //
-// Hypothesis: if Q4_0 (proven correct) passes at n_tokens=64 top_k=8,
-// the test harness + dispatch_id_mm path are both sound, isolating the
-// failure to Q5_1 / IQ4_NL kernel-specific code (most likely the
-// dequantize_q5_1 / dequantize_iq4_nl template bodies in id_mm.metal).
+// If this PASSES, harness + dispatch are sound; bug is in Q5_1/IQ4_NL
+// dequant templates. If this FAILS, the harness or dispatch is broken.
 
 const QK4_0: usize = 32;
 const BLOCK_Q4_0_BYTES: usize = 18;
@@ -477,37 +711,12 @@ fn ref_quantize_q4_0(row: &[f32]) -> Vec<u8> {
     out
 }
 
-fn dequantize_q4_0_host(data: &[u8], out: &mut [f32]) -> mlx_native::Result<()> {
-    if data.len() % BLOCK_Q4_0_BYTES != 0 {
-        panic!("Q4_0 data not block-aligned");
-    }
-    let n_blocks = data.len() / BLOCK_Q4_0_BYTES;
-    if out.len() < n_blocks * QK4_0 {
-        panic!("Q4_0 output too small");
-    }
-    for ib in 0..n_blocks {
-        let block = &data[ib * BLOCK_Q4_0_BYTES..(ib + 1) * BLOCK_Q4_0_BYTES];
-        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-        let qs = &block[2..18];
-        for j in 0..(QK4_0 / 2) {
-            let lo = (qs[j] & 0x0F) as i32 - 8;
-            let hi = ((qs[j] >> 4) & 0x0F) as i32 - 8;
-            out[ib * QK4_0 + j] = (lo as f32) * d;
-            out[ib * QK4_0 + j + QK4_0 / 2] = (hi as f32) * d;
-        }
-    }
-    Ok(())
-}
-
 #[test]
 fn adr022_bisect_q4_0_mm_id_at_prefill_shape() {
-    // If this PASSES, harness + dispatch are sound; bug is in Q5_1/IQ4_NL
-    // dequant templates. If this FAILS, the harness or dispatch is broken.
-    run_mv_id_parity(
+    run_mm_id_vs_mv_id(
         GgmlType::Q4_0,
         BLOCK_Q4_0_BYTES,
         ref_quantize_q4_0,
-        dequantize_q4_0_host,
         /*n_tokens=*/ 64,
         /*top_k=*/ 8,
         /*n_experts=*/ 8,
