@@ -127,6 +127,96 @@ constant int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113
 };
 
+// ---- Q5_1 dot product helper (ADR-022 Phase 1) ----
+//
+// Mirrors `block_q_n_dot_y<block_q5_1>` from llama.cpp
+// (ggml-metal.metal:3293-3310). Q5_1 differs from Q4_0 by carrying
+// (a) an additional `m` (min) term contributing `m * sumy` to the dot,
+// and (b) a 5th high-bit per element packed in `qh`.
+//
+// `il` is 0 or 8 (mlx-native convention: byte offset within the
+// 16-byte qs array). The yl[] vector is pre-scaled by the caller
+// (yl[i+1] /= 256, yl[i+8] /= 16, yl[i+9] /= 4096) so that masking
+// nibbles via 0x000F / 0x0F00 / 0x00F0 / 0xF000 yields the correct
+// sub-element-weighted partial sums.
+
+inline float block_q5_1_dot_y(
+    device const block_q5_1 * qb,
+    float sumy,
+    thread float * yl,
+    int il
+) {
+    float d = qb->d;
+    float m = qb->m;
+
+    float4 acc = 0.f;
+
+    // qs is 16 bytes starting at offset 8 in the block.
+    // Cast block as uint16_t* to skip d (1 uint16) + m (1 uint16) +
+    // qh (2 uint16) = 4 uint16; then add il/2 to land at the right
+    // qs sub-region.
+    device const uint16_t * qs = ((device const uint16_t *)qb + 4 + il/2);
+    const uint qh = qb->qh;
+
+    for (int i = 0; i < 8; i += 2) {
+        // Low nibbles, sub-positions i + 0 and i + 1 (within block 0..15).
+        // qh bit (i+0+il) contributes the 5th bit, placed at position 4
+        // (mask 0x10) for the 0x000F-masked nibble.
+        // qh bit (i+1+il) contributes the 5th bit, placed at position 12
+        // (mask 0x1000) for the 0x0F00-masked nibble.
+        acc[0] += yl[i + 0]
+                * (float)((qs[i / 2] & 0x000F) | (((qh >> (i + 0 + il      )) << 4 ) & 0x0010));
+        acc[1] += yl[i + 1]
+                * (float)((qs[i / 2] & 0x0F00) | (((qh >> (i + 1 + il      )) << 12) & 0x1000));
+        // High nibbles, sub-positions i + 8 and i + 9 (within block 16..31).
+        // qh bit (i+0+il+16) for nibble at mask 0x00F0 → bit at 0x0100.
+        // qh bit (i+1+il+16) for nibble at mask 0xF000 → bit at 0x10000.
+        acc[2] += yl[i + 8]
+                * (float)((qs[i / 2] & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8 ) & 0x0100));
+        acc[3] += yl[i + 9]
+                * (float)((qs[i / 2] & 0xF000) | (((qh >> (i + 1 + il + 16)) << 16) & 0x10000));
+    }
+
+    return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
+}
+
+// ---- IQ4_NL dot product helper (ADR-022 Phase 1) ----
+//
+// IQ4_NL is a 4-bit codebook quant: each qs nibble selects one of
+// 16 entries from `kvalues_iq4nl`. There is no zero-point bias and no
+// `m` term. The output formula is purely `out[i] = d * kvalues_iq4nl[idx]`.
+//
+// Caller convention is identical to Q4_0 / Q5_1: yl[] holds the
+// pre-scaled input row, but for IQ4_NL the divisors used by Q4_0
+// (`/256`, `/16`, `/4096`) do NOT compose because the codebook lookup
+// is non-linear. This helper therefore reads the raw input via a
+// caller-supplied `yl_raw[]` array of 16 unscaled values, multiplies
+// by the codebook entry directly, and returns `d * sum`.
+
+inline float block_iq4_nl_dot_y(
+    device const block_iq4_nl * qb,
+    thread float * yl_raw,
+    int il
+) {
+    float d = qb->d;
+    float acc = 0.f;
+
+    // qs starts at byte 2 in the block; 16 bytes total.
+    device const uint8_t * qs = qb->qs + il;
+
+    for (int i = 0; i < 8; i++) {
+        const uint8_t b = qs[i];
+        const int lo = b & 0x0F;
+        const int hi = (b >> 4) & 0x0F;
+        // First half: position i within sub-region [il .. il+8).
+        acc += yl_raw[i] * (float)kvalues_iq4nl[lo];
+        // Second half: position i + 16 (the high half of the block).
+        acc += yl_raw[i + 8] * (float)kvalues_iq4nl[hi];
+    }
+
+    return d * acc;
+}
+
 // ---- Q4_0 dot product helper (identical to quantized_matmul_ggml.metal) ----
 
 inline float block_q4_0_dot_y(
