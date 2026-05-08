@@ -119,6 +119,20 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q5_1_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_iq4_nl_tensor_f32".into(), ggml_mm_tensor_src);
 
+        // ADR-022 Phase 1 P1.7 — Q5_1 / IQ4_NL mul_mv_ext r1 family.
+        // Eight instantiations (2 types × 4 r1ptg widths). Each PSO is
+        // additionally specialized at PSO-compile time with FC_mul_mv_nsg
+        // (function_constant 600) and FC_mul_mv_nxpsg (function_constant 601).
+        let mul_mv_ext_src: &'static str = include_str!("shaders/mul_mv_ext.metal");
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_2".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_3".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_4".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_q5_1_f32_r1_5".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_2".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_3".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_4".into(), mul_mv_ext_src);
+        sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_5".into(), mul_mv_ext_src);
+
         // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
         // prefill Q@K^T and scores@V, modeled on llama.cpp's
         // kernel_mul_mm_bf16_f32 with the GGML_METAL_HAS_TENSOR branch
