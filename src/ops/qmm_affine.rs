@@ -665,14 +665,33 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4(
     let gs_us = group_size as usize;
     let pack_factor_us = PACK_FACTOR as usize;
     let k_packed_per_row = k_us / pack_factor_us;
-    if x.element_count() != m_us * k_us
-        || w_packed.element_count() != n_us * k_packed_per_row
-        || scales.element_count() != n_us * (k_us / gs_us)
-        || biases.element_count() != n_us * (k_us / gs_us)
-        || y.element_count() != m_us * n_us
+    // Buffer-size LOWER bound (production pre-allocates `x`/`y` to
+    // max_seq_len; the kernel only reads m*k / writes m*n).  The
+    // weight tensors' buffers were allocated by hf2q at exact size
+    // so their lower-bound check is also their upper-bound; mismatches
+    // here would be a load-time bug.
+    let f32_sz = std::mem::size_of::<f32>();
+    let u32_sz = std::mem::size_of::<u32>();
+    let need_x = m_us * k_us * f32_sz;
+    let need_y = m_us * n_us * f32_sz;
+    let need_w = n_us * k_packed_per_row * u32_sz;
+    let need_sb = n_us * (k_us / gs_us) * f32_sz;
+    if x.byte_len() < need_x
+        || y.byte_len() < need_y
+        || w_packed.byte_len() < need_w
+        || scales.byte_len() < need_sb
+        || biases.byte_len() < need_sb
     {
         return Err(MlxError::InvalidArgument(format!(
-            "{OP}: buffer element_count mismatch (m={m} n={n} k={k} k_packed_per_row={k_packed_per_row})"
+            "{OP}: buffer byte_len underflow (m={m} n={n} k={k} \
+             need_x={need_x} got_x={} need_y={need_y} got_y={} \
+             need_w={need_w} got_w={} need_sb={need_sb} \
+             got_s={} got_b={})",
+            x.byte_len(),
+            y.byte_len(),
+            w_packed.byte_len(),
+            scales.byte_len(),
+            biases.byte_len(),
         )));
     }
     if meta.byte_len() < 16 {
