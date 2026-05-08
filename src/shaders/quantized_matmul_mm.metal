@@ -113,6 +113,15 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q5_K;
 
+// ADR-022 Phase 3 — Q4_K block typedef for dense mm.
+// Q4_K is structurally Q5_K minus the 32-byte qh "high-bit" array.
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K/2];
+} block_q4_K;
+
 // Decode (scale, min) 6-bit pair at index `j` (within sub-block group `k`)
 // from the packed 12-byte `scales` array. Mirrors the helper used by
 // the mv_id Q4_K/Q5_K kernels and quantized_matmul_id_mm.metal:149.
@@ -271,6 +280,29 @@ void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & re
     const float qh_val = il < 2 ? 16.f : 256.f;
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
+    }
+}
+
+// ADR-022 Phase 3 — Q4_K dequant for dense mm MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:681-697 (`dequantize_q4_K`).
+// Body identical to id_mm.metal's dequantize_q4_K (ADR-013 P16 — proven
+// against mv_id reference in tests/test_quantized_matmul_id_mm.rs).
+template <typename type4x4>
+void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+    device const uchar * q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
     }
 }
 
@@ -540,5 +572,11 @@ kernel void hf2q_mul_mm_impl<block_iq4_nl, 2, dequantize_iq4_nl>(
 // consecutive elements per `il` invocation.
 template [[host_name("kernel_mul_mm_q5_K_f32")]]
 kernel void hf2q_mul_mm_impl<block_q5_K, QK_NL, dequantize_q5_K>(
+    constant GgmlMatmulMmParams &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort);
+
+// ADR-022 Phase 3 — Q4_K dense mm template instantiation.
+template [[host_name("kernel_mul_mm_q4_K_f32")]]
+kernel void hf2q_mul_mm_impl<block_q4_K, QK_NL, dequantize_q4_K>(
     constant GgmlMatmulMmParams &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort);

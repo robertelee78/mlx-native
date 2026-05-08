@@ -154,14 +154,14 @@ impl GgmlType {
     /// llama.cpp's `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
     fn mm_kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 Phase 2 — Q5_K dense mm ported. Q4_K dense mm
-            // coverage remains owned by ADR-022 Phase 3.
+            // ADR-022 Phase 2 — Q5_K dense mm ported.
+            // ADR-022 Phase 3 — Q4_K dense mm ported.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::Q4_K
             | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
+            GgmlType::Q4_K => "kernel_mul_mm_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_f32",
@@ -175,14 +175,14 @@ impl GgmlType {
     /// for 2-3× the FLOP throughput of the simdgroup MMA variant.
     fn mm_tensor_kernel_name(self) -> &'static str {
         match self {
-            // ADR-022 Phase 2: Q5_K tensor mm landed. Q4_K dense mm_tensor
-            // owned by ADR-022 Phase 3.
+            // ADR-022 Phase 2: Q5_K tensor mm landed.
+            // ADR-022 Phase 3: Q4_K tensor mm landed.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::Q4_K
             | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
+            GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_f32",
@@ -404,10 +404,10 @@ pub fn quantized_matmul_ggml(
     // mm).  dwq46/dwq48 dense Q4_K shexp/gate_inp tensors are small
     // (router weights with N <= 256), so the perf delta is negligible
     // in practice.  Other ggml types route on m as before.
-    // Q4_K mm/mm_tensor not yet ported (ADR-013 P7); Q5_1 / IQ4_NL mm
-    // come in ADR-022 P1.6. All three route to mv on m > threshold for
-    // now — correct but slower than a real mm for large m.
-    let mm_supported = !matches!(params.ggml_type, GgmlType::Q4_K);
+    // ADR-022 Phase 3 — Q4_K dense mm + mm_tensor ported. All quantized
+    // types now have a real mm path; the mm_supported guard is a
+    // compatibility no-op kept for future "type not yet ported" cases.
+    let mm_supported = true;
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
         dispatch_mm(encoder, registry, device, input, weight, output, params)
     } else {
@@ -438,6 +438,7 @@ pub fn dispatch_mm_for_test(
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q8_0
+        | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_1
@@ -712,11 +713,16 @@ pub fn quantized_matmul_mm_tensor_perm021(
 ) -> Result<()> {
     let kernel_name = match params.ggml_type {
         GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_bf16_perm021",
+        // ADR-022 Phase 3 — Q8_0 perm021 instantiation added so the
+        // Q8_0-quantized attention path (e.g. iter-21 Track B HB-encoded
+        // K cache for Qwen 3.5 / 3.6) can use the same tensor-tile
+        // permuted Q@K^T kernel as Q4_0 / Q6_K.
+        GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_bf16_perm021",
         GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_bf16_perm021",
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_mm_tensor_perm021: unsupported ggml_type {:?} \
-                 (only Q4_0 and Q6_K are instantiated)",
+                 (only Q4_0 / Q8_0 / Q6_K are instantiated)",
                 other
             )));
         }

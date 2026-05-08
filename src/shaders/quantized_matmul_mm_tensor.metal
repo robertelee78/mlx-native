@@ -95,6 +95,14 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q5_K;
 
+// ADR-022 Phase 3 — Q4_K block typedef for tensor mm.
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K/2];
+} block_q4_K;
+
 static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
     return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
@@ -253,6 +261,26 @@ void dequantize_q5_K_t(device const block_q5_K * xb, short il, thread type4x4 & 
     const float qh_val = il < 2 ? 16.f : 256.f;
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
+    }
+}
+
+// ADR-022 Phase 3 — Q4_K dequant for tensor mm.
+template <typename type4x4>
+void dequantize_q4_K_t(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+    device const uchar * q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
     }
 }
 
@@ -467,6 +495,12 @@ kernel void hf2q_mul_mm_tensor_impl<block_q5_1, 2, dequantize_q5_1_t>(
 // ADR-022 Phase 2 — Q5_K tensor-mm template instantiation.
 template [[host_name("kernel_mul_mm_q5_K_tensor_f32")]]
 kernel void hf2q_mul_mm_tensor_impl<block_q5_K, QK_NL, dequantize_q5_K_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+// ADR-022 Phase 3 — Q4_K tensor-mm template instantiation.
+template [[host_name("kernel_mul_mm_q4_K_tensor_f32")]]
+kernel void hf2q_mul_mm_tensor_impl<block_q4_K, QK_NL, dequantize_q4_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
@@ -710,5 +744,15 @@ kernel void hf2q_mul_mm_tensor_perm021_impl<block_q4_0, 2, dequantize_q4_0_t>(
 
 template [[host_name("kernel_mul_mm_q6_K_tensor_bf16_perm021")]]
 kernel void hf2q_mul_mm_tensor_perm021_impl<block_q6_K, QK_NL, dequantize_q6_K_t>(
+    constant GgmlMatmulMmTensorPerm021Params &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+// ADR-022 Phase 3 — Q8_0 perm021 template instantiation. Used by ADR-013
+// P21 attention Q@K^T when the K matrix is stored as Q8_0 (currently
+// only Q4_0 + Q6_K had this kernel). Same impl as the dense tensor mm,
+// only the B-stage reads bf16 from a permuted [n_heads, seq_len, head_dim]
+// layout (see hf2q_mul_mm_tensor_perm021_impl in this file at line 528).
+template [[host_name("kernel_mul_mm_q8_0_tensor_bf16_perm021")]]
+kernel void hf2q_mul_mm_tensor_perm021_impl<block_q8_0, 2, dequantize_q8_0_t>(
     constant GgmlMatmulMmTensorPerm021Params &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
