@@ -84,8 +84,8 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
-            // ADR-022 phase 2 — Q5_K mm_id port pending.
-            GgmlType::Q5_K => "unsupported",
+            // ADR-022 Phase 2 — Q5_K mm_id ported.
+            GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
             // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
             // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
@@ -103,8 +103,8 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
-            // ADR-022 phase 2 — Q5_K mm_id_tensor port pending.
-            GgmlType::Q5_K => "unsupported",
+            // ADR-022 Phase 2 — Q5_K mm_id_tensor ported.
+            GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
             // ADR-013 P16 — Q4_K tensor-API mm_id ported.
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32",
@@ -268,12 +268,13 @@ pub fn quantized_matmul_id_ggml(
     //   * decode (n_tokens <= 8)
     //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
-    //   * Q5_K (mm_id not yet ported — only mv_id kernel exists)
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
+    // ADR-022 Phase 2 — Q5_K mm_id ported; the Q5_K bypass at this site
+    // (and at the pooled entry below) was retained until iter-19's port
+    // closed the gap.
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
-        && params.ggml_type != GgmlType::Q5_K
     {
         return dispatch_id_mm(
             encoder, registry, device, input, weight, ids, output, params,
@@ -380,12 +381,12 @@ pub fn quantized_matmul_id_ggml_pooled(
     }
 
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
-    // Q5_K: mm_id not yet ported; always use mv_id.
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
+    // ADR-022 Phase 2 — Q5_K mm_id ported; the previous Q5_K bypass here
+    // is retired (kernels live in id_mm.metal + id_mm_tensor.metal).
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
-        && params.ggml_type != GgmlType::Q5_K
     {
         return dispatch_id_mm_pooled(
             encoder, registry, device, input, weight, ids, output,
@@ -931,10 +932,12 @@ pub fn dispatch_id_mm_for_test(
 
     // ---- Validate common shapes ----
     // ADR-013 P16 — Q4_K added. ADR-022 P1.6 — Q5_1 / IQ4_NL added.
+    // ADR-022 Phase 2 — Q5_K added.
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q8_0
         | GgmlType::Q4_K
+        | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL => {}

@@ -121,6 +121,18 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q4_K;
 
+// ADR-022 Phase 2 — Q5_K block (176 bytes) for mm_id port.
+// Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qh[32]][uint8_t qs[128]]
+// Same as Q4_K plus a 32-byte qh "high-bit" array. Mirrors
+// quantized_matmul_id_ggml.metal:75 lock-step.
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K/8];
+    uint8_t qs[QK_K/2];
+} block_q5_K;
+
 // ADR-022 Phase 1 — Q5_1 / IQ4_NL block typedefs for the mm_id port.
 typedef struct {
     half    d;
@@ -286,6 +298,34 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     const ushort mask = il < 2 ? 0x0F : 0xF0;
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
+}
+
+// ADR-022 Phase 2 — Q5_K dequant for mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+// Q5_K differs from Q4_K by adding a 32-byte qh "high-bit" array; each
+// of the 16 elements per call OR's an extra 16 (low half) or 256 (high
+// half) into the dequantized value when the corresponding qh bit is set.
+template <typename type4x4>
+void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q  = xb->qs;
+    device const uint8_t * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uint8_t ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.f : 256.f;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
     }
 }
 
@@ -590,6 +630,13 @@ kernel void hf2q_mul_mm_id_impl<block_q6_K, QK_NL, dequantize_q6_K>(
 // ADR-013 P16 — Q4_K mm_id template instantiation.
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]
 kernel void hf2q_mul_mm_id_impl<block_q4_K, QK_NL, dequantize_q4_K>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-022 Phase 2 — Q5_K mm_id template instantiation.
+template [[host_name("kernel_mul_mm_id_q5_K_f32")]]
+kernel void hf2q_mul_mm_id_impl<block_q5_K, QK_NL, dequantize_q5_K>(
     constant GgmlMatmulIdMm_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

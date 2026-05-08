@@ -72,6 +72,15 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q4_K;
 
+// ADR-022 Phase 2 — Q5_K block (176 bytes) for tensor-API mm_id port.
+typedef struct {
+    half    d;
+    half    dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K/8];
+    uint8_t qs[QK_K/2];
+} block_q5_K;
+
 // ADR-022 Phase 1 — Q5_1 / IQ4_NL block typedefs for the tensor-API mm_id port.
 typedef struct {
     half    d;
@@ -221,6 +230,31 @@ void dq_q4_K_id(device const block_q4_K * xb, short il, thread type4x4 & reg) {
     const ushort mask = il < 2 ? 0x0F : 0xF0;
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
+}
+
+// ADR-022 Phase 2 — Q5_K dequant for tensor-API mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+template <typename type4x4>
+void dq_q5_K_id(device const block_q5_K * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q  = xb->qs;
+    device const uint8_t * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uint8_t ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.f : 256.f;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
     }
 }
 
@@ -405,6 +439,12 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_q5_1, 2, dq_q5_1_id>(
 template [[host_name("kernel_mul_mm_id_iq4_nl_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_nl, 2, dq_iq4_nl_id>(
     constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q5_K, QK_NL, dq_q5_K_id>(
+    constant GgmlMatmulIdMm_TensorParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
 
