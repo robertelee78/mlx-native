@@ -1623,3 +1623,251 @@ mod backward_weighted_sum_seq_tests {
         assert!(res2.is_err());
     }
 }
+
+// ============================================================================
+// ADR-020 iter-11h-e3b — fused backward kernel for moe_swiglu_seq.
+//
+// Forward (existing): output[t,k,i] = gelu(gate[t,k,i]) * up[t,k,i] where
+// gate_up is concatenated [t, k, 2*intermediate] (gate at offset 0..I,
+// up at offset I..2I).
+//
+// Backward (this kernel — fused so gelu' intermediates are reused):
+//   ∂L/∂gate[t,k,i] = ∂output[t,k,i] · up · gelu'(gate)
+//   ∂L/∂up[t,k,i]   = ∂output[t,k,i] · gelu(gate)
+// Writes both into a single d_gate_up buffer with the SAME [t,k,2I]
+// layout as the forward gate_up input (gate grad in lower half, up grad
+// in upper half).
+// ============================================================================
+
+/// Backward of `moe_swiglu_seq` — single fused kernel writes both gate
+/// and up gradients into the supplied `d_gate_up` buffer (same layout
+/// as forward `gate_up`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_swiglu_seq_backward_encode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    gate_up: &MlxBuffer,
+    d_output: &MlxBuffer,
+    d_gate_up: &MlxBuffer,
+    intermediate: usize,
+    top_k: usize,
+    n_tokens: usize,
+) -> Result<()> {
+    if intermediate == 0 || top_k == 0 || n_tokens == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_swiglu_seq_backward_encode: all dims must be > 0".into(),
+        ));
+    }
+    let f32_size = std::mem::size_of::<f32>();
+    let gu_required = n_tokens * top_k * 2 * intermediate * f32_size;
+    if gate_up.byte_len() < gu_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_seq_backward_encode: gate_up too small: need {} bytes, have {}",
+            gu_required, gate_up.byte_len()
+        )));
+    }
+    if d_gate_up.byte_len() < gu_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_seq_backward_encode: d_gate_up too small: need {} bytes, have {}",
+            gu_required, d_gate_up.byte_len()
+        )));
+    }
+    let dout_required = n_tokens * top_k * intermediate * f32_size;
+    if d_output.byte_len() < dout_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_swiglu_seq_backward_encode: d_output too small: need {} bytes, have {}",
+            dout_required, d_output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("moe_swiglu_seq_backward_f32", device)?;
+    let gpu_params = GpuMoeSwigluSeqParams {
+        intermediate: intermediate as u32,
+        top_k: top_k as u32,
+        n_tokens: n_tokens as u32,
+    };
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(gate_up)),
+            (1, KernelArg::Buffer(d_output)),
+            (2, KernelArg::Buffer(d_gate_up)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        MTLSize::new(intermediate as u64, top_k as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, intermediate as u64), 1, 1),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod backward_swiglu_seq_tests {
+    use super::*;
+    use crate::device::MlxDevice;
+    use crate::dtypes::DType;
+
+    fn alloc_f32(d: &MlxDevice, n: usize) -> MlxBuffer {
+        let mut b = d.alloc_buffer(n * 4, DType::F32, vec![n]).unwrap();
+        b.as_mut_slice::<f32>().unwrap().fill(0.0);
+        b
+    }
+    fn fill_f32(buf: &mut MlxBuffer, vals: &[f32]) {
+        buf.as_mut_slice::<f32>().unwrap()[..vals.len()].copy_from_slice(vals);
+    }
+
+    /// FP64-precision tanh-approx GELU oracle, matches the .metal kernel.
+    fn cpu_gelu(g: f64) -> f64 {
+        let s = 0.7978845608 * (g + 0.044715 * g * g * g);
+        let t = s.tanh();
+        0.5 * g * (1.0 + t)
+    }
+
+    /// CPU forward replicates `moe_swiglu_seq` exactly.
+    fn cpu_forward(
+        gate_up: &[f32],
+        n_tokens: usize,
+        top_k: usize,
+        intermediate: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_tokens * top_k * intermediate];
+        for t in 0..n_tokens {
+            for k in 0..top_k {
+                let slot_base = (t * top_k + k) * 2 * intermediate;
+                for i in 0..intermediate {
+                    let g = gate_up[slot_base + i] as f64;
+                    let u = gate_up[slot_base + intermediate + i] as f64;
+                    let y = cpu_gelu(g) * u;
+                    out[(t * top_k + k) * intermediate + i] = y as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// FD falsifier on ∂gate AND ∂up.  Loss L = sum(forward_output * d_output_seed).
+    /// Probes every element of gate_up (both halves) at h=1e-3.
+    #[test]
+    fn backward_finite_difference_falsifier_both_gradients() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let n_tokens = 2usize;
+        let top_k = 3usize;
+        let intermediate = 5usize;
+        let gu_n = n_tokens * top_k * 2 * intermediate;
+        let dout_n = n_tokens * top_k * intermediate;
+
+        // Deterministic non-trivial gate values (negative + small + large)
+        // exercise GELU's full domain.
+        let gate_up: Vec<f32> = (0..gu_n)
+            .map(|i| 0.5 + (i as f32) * 0.07 - (i as f32 * 0.013).sin())
+            .collect();
+        let d_output_seed: Vec<f32> = (0..dout_n)
+            .map(|i| 0.3 + (i as f32) * 0.05 - (i as f32 * 0.011).cos())
+            .collect();
+
+        let mut gu_buf = alloc_f32(&device, gu_n);
+        fill_f32(&mut gu_buf, &gate_up);
+        let mut dout_buf = alloc_f32(&device, dout_n);
+        fill_f32(&mut dout_buf, &d_output_seed);
+        let dgu_buf = alloc_f32(&device, gu_n);
+
+        let mut encoder = device.command_encoder().unwrap();
+        moe_swiglu_seq_backward_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &gu_buf, &dout_buf, &dgu_buf,
+            intermediate, top_k, n_tokens,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+        let analytic = dgu_buf.as_slice::<f32>().unwrap().to_vec();
+
+        // Finite difference probe over EVERY element of gate_up.
+        let h: f32 = 1e-3;
+        for idx in 0..gu_n {
+            let mut gp = gate_up.clone();
+            gp[idx] += h;
+            let mut gm = gate_up.clone();
+            gm[idx] -= h;
+            let yp = cpu_forward(&gp, n_tokens, top_k, intermediate);
+            let ym = cpu_forward(&gm, n_tokens, top_k, intermediate);
+            let lp: f64 = yp.iter().zip(&d_output_seed)
+                .map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let lm: f64 = ym.iter().zip(&d_output_seed)
+                .map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let fd = (lp - lm) / (2.0 * h as f64);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (analytic[idx] as f64 - fd).abs() < tol,
+                "d_gate_up[{}]: analytic={} fd={} (gate_up_value={})",
+                idx, analytic[idx], fd, gate_up[idx]
+            );
+        }
+    }
+
+    /// Cross-check: at canonical points (gate=0, gate=large positive,
+    /// gate=large negative) check known gradient asymptotics.
+    /// - At gate=0:    gelu(0)=0, gelu'(0)=0.5  → ∂up=0,             ∂gate=0.5·dy·up
+    /// - At gate=+10:  gelu≈10,    gelu'≈1     → ∂up≈10·dy,           ∂gate≈up·dy
+    /// - At gate=-10:  gelu≈0,     gelu'≈0     → ∂up≈0,               ∂gate≈0
+    #[test]
+    fn backward_canonical_asymptotics_match_expected() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let n_tokens = 1usize;
+        let top_k = 1usize;
+        let intermediate = 3usize;
+        let gu_n = n_tokens * top_k * 2 * intermediate;
+        let dout_n = n_tokens * top_k * intermediate;
+
+        // gate_up layout: [gate0, gate1, gate2, up0, up1, up2]
+        // gate0=0   up0=2.0    dy0=0.5    →  ∂up0=0,        ∂gate0=0.5·0.5·2.0=0.5
+        // gate1=10  up1=3.0    dy1=1.0    →  ∂up1≈10.0,     ∂gate1≈3.0
+        // gate2=-10 up2=4.0    dy2=1.0    →  ∂up2≈0.0,      ∂gate2≈0.0
+        let gate_up = vec![0.0f32, 10.0, -10.0, 2.0, 3.0, 4.0];
+        let d_output_seed = vec![0.5f32, 1.0, 1.0];
+
+        let mut gu_buf = alloc_f32(&device, gu_n);
+        fill_f32(&mut gu_buf, &gate_up);
+        let mut dout_buf = alloc_f32(&device, dout_n);
+        fill_f32(&mut dout_buf, &d_output_seed);
+        let dgu_buf = alloc_f32(&device, gu_n);
+
+        let mut encoder = device.command_encoder().unwrap();
+        moe_swiglu_seq_backward_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &gu_buf, &dout_buf, &dgu_buf,
+            intermediate, top_k, n_tokens,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+        let g = dgu_buf.as_slice::<f32>().unwrap();
+
+        // ∂gate0 = 0.5·dy0·up0 = 0.5·0.5·2.0 = 0.5  (exact)
+        assert!((g[0] - 0.5).abs() < 1e-5, "∂gate0={}", g[0]);
+        // ∂gate1 ≈ up1·dy1 = 3.0  (asymptotic gelu'(10) ≈ 1)
+        assert!((g[1] - 3.0).abs() < 0.05, "∂gate1={}", g[1]);
+        // ∂gate2 ≈ 0  (asymptotic gelu'(-10) ≈ 0)
+        assert!(g[2].abs() < 0.05, "∂gate2={}", g[2]);
+        // ∂up0 = dy0·gelu(0) = 0.5·0 = 0
+        assert!(g[3].abs() < 1e-5, "∂up0={}", g[3]);
+        // ∂up1 ≈ dy1·gelu(10) ≈ 1.0·10 = 10.0
+        assert!((g[4] - 10.0).abs() < 0.05, "∂up1={}", g[4]);
+        // ∂up2 ≈ dy2·gelu(-10) ≈ 0
+        assert!(g[5].abs() < 0.05, "∂up2={}", g[5]);
+    }
+
+    #[test]
+    fn rejects_size_mismatch() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let too_small = alloc_f32(&device, 4);
+        let any = alloc_f32(&device, 1024);
+        let mut encoder = device.command_encoder().unwrap();
+        let res = moe_swiglu_seq_backward_encode(
+            &mut encoder, &mut registry, device.metal_device(),
+            &too_small, &any, &any, 5, 3, 2,
+        );
+        assert!(res.is_err());
+    }
+}

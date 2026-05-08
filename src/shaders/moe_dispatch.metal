@@ -496,3 +496,66 @@ kernel void moe_weighted_sum_seq_backward_weights_f32(
     }
     d_weights[tid] = acc;
 }
+
+// ============================================================================
+// ADR-020 iter-11h-e3b — fused backward kernel for moe_swiglu_seq.
+//
+// Forward (existing kernel above):
+//   gate = gate_up[t, k, 0..I)
+//   up   = gate_up[t, k, I..2I)
+//   T    = tanh(0.7978845608 * (gate + 0.044715 * gate^3))
+//   gelu = 0.5 * gate * (1 + T)
+//   output[t, k, i] = gelu * up
+//
+// Backward (this kernel — fused so gate_prime intermediates are reused):
+//   ∂L/∂up[t,k,i]   = ∂output[t,k,i] · gelu(gate)
+//   ∂L/∂gate[t,k,i] = ∂output[t,k,i] · up · gelu_prime(gate)
+//
+// gelu_prime via tanh-approx chain rule:
+//   s          = 0.7978845608 · (gate + 0.044715·gate^3)
+//   ds/dgate   = 0.7978845608 · (1 + 0.134145·gate^2)        // 0.134145 = 3·0.044715
+//   T          = tanh(s)
+//   dT/dgate   = (1 - T^2) · ds/dgate
+//   dgelu/dgate = 0.5·(1 + T) + 0.5·gate·dT/dgate
+//
+// Output: writes BOTH ∂gate (lower half of d_gate_up) and ∂up (upper half)
+// in a single dispatch.  Caller must pre-zero d_gate_up if accumulating
+// across calls; this kernel writes (not adds).
+// ============================================================================
+
+kernel void moe_swiglu_seq_backward_f32(
+    device const float* gate_up_buf  [[buffer(0)]],   // [n_tokens, top_k, 2*intermediate] forward input
+    device const float* d_output     [[buffer(1)]],   // [n_tokens, top_k, intermediate]
+    device       float* d_gate_up    [[buffer(2)]],   // [n_tokens, top_k, 2*intermediate] output gradient
+    constant MoeSwigluSeqParams& params [[buffer(3)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    const uint i    = tid.x;
+    const uint slot = tid.y;
+    const uint tok  = tid.z;
+    if (tok >= params.n_tokens || slot >= params.top_k || i >= params.intermediate) return;
+
+    const uint slot_base   = (tok * params.top_k + slot) * 2u * params.intermediate;
+    const uint dout_idx    = (tok * params.top_k + slot) * params.intermediate + i;
+    const uint gate_idx    = slot_base + i;
+    const uint up_idx      = slot_base + params.intermediate + i;
+
+    const float gate = gate_up_buf[gate_idx];
+    const float up   = gate_up_buf[up_idx];
+    const float dy   = d_output[dout_idx];
+
+    // Recompute T = tanh(s) and gelu(gate) from scratch.  Avoids an
+    // extra forward-output buffer at the cost of ~10 flops/thread.
+    const float g2   = gate * gate;
+    const float s    = 0.7978845608f * (gate + 0.044715f * gate * g2);
+    const float T    = precise::tanh(s);
+    const float gelu = 0.5f * gate * (1.0f + T);
+
+    // gelu_prime via chain rule.
+    const float dsdg     = 0.7978845608f * (1.0f + 0.134145f * g2);
+    const float dTdg     = (1.0f - T * T) * dsdg;
+    const float gelu_pri = 0.5f * (1.0f + T) + 0.5f * gate * dTdg;
+
+    d_gate_up[gate_idx] = dy * up * gelu_pri;
+    d_gate_up[up_idx]   = dy * gelu;
+}
