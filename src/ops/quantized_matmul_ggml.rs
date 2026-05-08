@@ -323,7 +323,14 @@ pub fn quantized_matmul_ggml(
     // and Q4_K's mm/mm_tensor kernels are not yet ported, so we only allow
     // Q4_K when the dispatcher would route to mv).
     match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K => {}
+        // ADR-022 Phase 1 — Q5_1 / IQ4_NL added (mv-only; mm/mm_tensor
+        // come in P1.6, dispatcher already routes to mv at m ≤ 8).
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q6_K
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_ggml does not support {:?} — use a different dispatch path",
@@ -394,7 +401,13 @@ pub fn quantized_matmul_ggml(
     // mm).  dwq46/dwq48 dense Q4_K shexp/gate_inp tensors are small
     // (router weights with N <= 256), so the perf delta is negligible
     // in practice.  Other ggml types route on m as before.
-    let mm_supported = !matches!(params.ggml_type, GgmlType::Q4_K);
+    // Q4_K mm/mm_tensor not yet ported (ADR-013 P7); Q5_1 / IQ4_NL mm
+    // come in ADR-022 P1.6. All three route to mv on m > threshold for
+    // now — correct but slower than a real mm for large m.
+    let mm_supported = !matches!(
+        params.ggml_type,
+        GgmlType::Q4_K | GgmlType::Q5_1 | GgmlType::IQ4_NL
+    );
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
         dispatch_mm(encoder, registry, device, input, weight, output, params)
     } else {
@@ -473,10 +486,14 @@ fn dispatch_mv(
     let m = params.m as usize;
 
     let (nth0, nth1, align) = match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 => (8u64, 8u64, 8usize),
-        // Q4_K mirrors Q6_K's 2-row-per-tg geometry: 2 simdgroups × 1 row
-        // per simdgroup = 2 rows per threadgroup.  Threads_per_tg=(2, 32)
-        // = 64 threads = 2 simdgroups.
+        // Q4_0 / Q8_0 / Q5_1 / IQ4_NL all use legacy 32-element blocks
+        // and the Q4_0-style (8, 8) threadgroup geometry: 2 simdgroups ×
+        // 4 rows per simdgroup = 8 rows per threadgroup.
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => (8u64, 8u64, 8usize),
+        // Q4_K mirrors Q6_K's 2-row-per-tg geometry.
         GgmlType::Q4_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),
     };
