@@ -599,6 +599,12 @@ impl KernelRegistry {
             "conv1d_depthwise_causal_backward_dw_f32".into(),
             conv1d_dwc_src,
         );
+        // ADR-020 iter-11h-c1: elementwise exp forward + backward.
+        // Building block for GatedDeltaNet's alpha = exp(-g) state-decay.
+        let exp_src: &'static str =
+            include_str!("shaders/exp_elementwise.metal");
+        sources.insert("exp_f32".into(), exp_src);
+        sources.insert("exp_backward_f32".into(), exp_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
