@@ -108,12 +108,10 @@ impl GgmlType {
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
             // ADR-013 P16 — Q4_K tensor-API mm_id ported.
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32",
-            // ADR-022 phase 1 — Q5_1 / IQ4_NL mm_id_tensor port lands in P1.6.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => "unsupported",
+            // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL tensor-API mm_id ported.
+            GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
         }
     }
 }
@@ -932,9 +930,14 @@ pub fn dispatch_id_mm_for_test(
     let qk = params.ggml_type.block_values();
 
     // ---- Validate common shapes ----
-    // ADR-013 P16 — Q4_K added.
+    // ADR-013 P16 — Q4_K added. ADR-022 P1.6 — Q5_1 / IQ4_NL added.
     match params.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K => {}
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q6_K
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm_for_test does not support {:?}", other

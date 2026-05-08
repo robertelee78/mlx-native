@@ -225,6 +225,9 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q6_K_tensor_f32".into(), ggml_id_mm_tensor_src);
         // ADR-013 P16 — Q4_K tensor-API mm_id.
         sources.insert("kernel_mul_mm_id_q4_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+        // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL tensor-API mm_id.
+        sources.insert("kernel_mul_mm_id_q5_1_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert("kernel_mul_mm_id_iq4_nl_tensor_f32".into(), ggml_id_mm_tensor_src);
 
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");

@@ -388,3 +388,42 @@ fn adr022_iq4_nl_mv_id_parity_realistic_shape() {
         0xAD22_004F_0002,
     );
 }
+
+// ----- ADR-022 P1.6 mm_id path coverage -----
+//
+// MM_ID_ROUTING_THRESHOLD = 32 (`quantized_matmul_id_ggml.rs:407`).
+// Setting n_tokens > 32 with top_k ∈ {1, 8} forces dispatch_id_mm
+// instead of dispatch_id_mv, exercising the prefill mm_id template
+// instantiations landed in commit 2137a71.
+
+#[test]
+fn adr022_q5_1_mm_id_parity_prefill_path() {
+    run_mv_id_parity(
+        GgmlType::Q5_1,
+        BLOCK_Q5_1_BYTES,
+        ref_quantize_q5_1,
+        test_only_dequantize_q5_1,
+        /*n_tokens=*/ 64,
+        /*top_k=*/ 8,
+        /*n_experts=*/ 8,
+        /*n=*/ 64,
+        /*k=*/ 128,
+        0xAD22_0511_6011,
+    );
+}
+
+#[test]
+fn adr022_iq4_nl_mm_id_parity_prefill_path() {
+    run_mv_id_parity(
+        GgmlType::IQ4_NL,
+        BLOCK_IQ4_NL_BYTES,
+        ref_quantize_iq4_nl,
+        test_only_dequantize_iq4_nl,
+        /*n_tokens=*/ 64,
+        /*top_k=*/ 8,
+        /*n_experts=*/ 8,
+        /*n=*/ 64,
+        /*k=*/ 128,
+        0xAD22_004F_6012,
+    );
+}
