@@ -73,6 +73,7 @@ pub mod softmax_sample;
 pub mod ssm_conv;
 pub mod conv1d_depthwise_causal;
 pub mod exp_elementwise;
+pub mod outer_product;
 pub mod transpose;
 pub mod tri_solve;
 pub mod qdq_legacy;

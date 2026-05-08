@@ -605,6 +605,14 @@ impl KernelRegistry {
             include_str!("shaders/exp_elementwise.metal");
         sources.insert("exp_f32".into(), exp_src);
         sources.insert("exp_backward_f32".into(), exp_src);
+        // ADR-020 iter-11h-c2: vector outer product (forward + dlhs +
+        // drhs).  Building block for gated_delta_update's
+        // outer(delta, k) state-update term.
+        let outer_src: &'static str =
+            include_str!("shaders/outer_product.metal");
+        sources.insert("outer_product_f32".into(), outer_src);
+        sources.insert("outer_product_backward_lhs_f32".into(), outer_src);
+        sources.insert("outer_product_backward_rhs_f32".into(), outer_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
         sources.insert("softcap_f32".into(), softcap_src);
         sources.insert("softcap_f16".into(), softcap_src);
