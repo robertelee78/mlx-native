@@ -143,6 +143,14 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_3".into(), mul_mv_ext_src);
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_4".into(), mul_mv_ext_src);
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_5".into(), mul_mv_ext_src);
+        // ADR-022 Phase 4 — Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K mv_ext.
+        // 5 types × 4 r1ptg widths = 20 instantiations.
+        for r1 in [2, 3, 4, 5].iter() {
+            for ty in ["q4_0", "q8_0", "q4_K", "q5_K", "q6_K"].iter() {
+                let name = format!("kernel_mul_mv_ext_{ty}_f32_r1_{r1}");
+                sources.insert(name, mul_mv_ext_src);
+            }
+        }
 
         // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
         // prefill Q@K^T and scores@V, modeled on llama.cpp's

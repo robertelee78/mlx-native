@@ -116,6 +116,9 @@ fn pick_r1ptg(m: u32) -> Result<i32> {
 
 /// Compose the kernel name from ggml_type + r1ptg, matching the metal
 /// shader's `[[host_name(...)]]` attributes.
+///
+/// Phase 1 (P1.7): Q5_1 + IQ4_NL × r1∈{2,3,4,5}.
+/// Phase 4: Q4_0, Q8_0, Q4_K, Q5_K, Q6_K × r1∈{2,3,4,5}.
 fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
     Ok(match (ggml_type, r1ptg) {
         (GgmlType::Q5_1, 2) => "kernel_mul_mv_ext_q5_1_f32_r1_2",
@@ -126,9 +129,29 @@ fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
         (GgmlType::IQ4_NL, 3) => "kernel_mul_mv_ext_iq4_nl_f32_r1_3",
         (GgmlType::IQ4_NL, 4) => "kernel_mul_mv_ext_iq4_nl_f32_r1_4",
         (GgmlType::IQ4_NL, 5) => "kernel_mul_mv_ext_iq4_nl_f32_r1_5",
+        (GgmlType::Q4_0, 2) => "kernel_mul_mv_ext_q4_0_f32_r1_2",
+        (GgmlType::Q4_0, 3) => "kernel_mul_mv_ext_q4_0_f32_r1_3",
+        (GgmlType::Q4_0, 4) => "kernel_mul_mv_ext_q4_0_f32_r1_4",
+        (GgmlType::Q4_0, 5) => "kernel_mul_mv_ext_q4_0_f32_r1_5",
+        (GgmlType::Q8_0, 2) => "kernel_mul_mv_ext_q8_0_f32_r1_2",
+        (GgmlType::Q8_0, 3) => "kernel_mul_mv_ext_q8_0_f32_r1_3",
+        (GgmlType::Q8_0, 4) => "kernel_mul_mv_ext_q8_0_f32_r1_4",
+        (GgmlType::Q8_0, 5) => "kernel_mul_mv_ext_q8_0_f32_r1_5",
+        (GgmlType::Q4_K, 2) => "kernel_mul_mv_ext_q4_K_f32_r1_2",
+        (GgmlType::Q4_K, 3) => "kernel_mul_mv_ext_q4_K_f32_r1_3",
+        (GgmlType::Q4_K, 4) => "kernel_mul_mv_ext_q4_K_f32_r1_4",
+        (GgmlType::Q4_K, 5) => "kernel_mul_mv_ext_q4_K_f32_r1_5",
+        (GgmlType::Q5_K, 2) => "kernel_mul_mv_ext_q5_K_f32_r1_2",
+        (GgmlType::Q5_K, 3) => "kernel_mul_mv_ext_q5_K_f32_r1_3",
+        (GgmlType::Q5_K, 4) => "kernel_mul_mv_ext_q5_K_f32_r1_4",
+        (GgmlType::Q5_K, 5) => "kernel_mul_mv_ext_q5_K_f32_r1_5",
+        (GgmlType::Q6_K, 2) => "kernel_mul_mv_ext_q6_K_f32_r1_2",
+        (GgmlType::Q6_K, 3) => "kernel_mul_mv_ext_q6_K_f32_r1_3",
+        (GgmlType::Q6_K, 4) => "kernel_mul_mv_ext_q6_K_f32_r1_4",
+        (GgmlType::Q6_K, 5) => "kernel_mul_mv_ext_q6_K_f32_r1_5",
         (other_type, other_r1) => {
             return Err(MlxError::InvalidArgument(format!(
-                "mul_mv_ext: no kernel for type {:?} × r1ptg {} (Phase 1 ports Q5_1 + IQ4_NL × r1∈{{2,3,4,5}})",
+                "mul_mv_ext: no kernel for type {:?} × r1ptg {} (Phase 1+4 ports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K/Q5_1/IQ4_NL × r1∈{{2,3,4,5}})",
                 other_type, other_r1
             )));
         }
@@ -159,10 +182,14 @@ pub fn mul_mv_ext_dispatch(
             "mul_mv_ext: m, n, k, batch must all be > 0".into(),
         ));
     }
-    if params.k % 32 != 0 {
+    // K must be divisible by the block size of the weight type.
+    // Legacy 32-element types (Q4_0/Q8_0/Q5_1/IQ4_NL): k % 32 == 0.
+    // K-quants (Q4_K/Q5_K/Q6_K): k % 256 == 0.
+    let block_qk = params.ggml_type.block_values();
+    if params.k % block_qk != 0 {
         return Err(MlxError::InvalidArgument(format!(
-            "mul_mv_ext: k ({}) must be divisible by 32 (block size)",
-            params.k
+            "mul_mv_ext: k ({}) must be divisible by block QK ({}) for {:?}",
+            params.k, block_qk, params.ggml_type
         )));
     }
 
@@ -184,9 +211,10 @@ pub fn mul_mv_ext_dispatch(
         )?
         .clone();
 
-    // Buffer-size validation.
+    // Buffer-size validation. Use the block-aware formula so K-quants
+    // (256-element blocks) work alongside legacy 32-element types.
     let block_bytes_per_row =
-        (params.k as usize / 32) * (params.ggml_type.block_bytes() as usize);
+        (params.k as usize / block_qk as usize) * (params.ggml_type.block_bytes() as usize);
     let weight_required = (params.n as usize) * block_bytes_per_row;
     if weight.byte_len() < weight_required {
         return Err(MlxError::InvalidArgument(format!(
