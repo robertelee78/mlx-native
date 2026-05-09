@@ -670,9 +670,14 @@ fn bench_q6_k_mv_id_one_shape(label: &str, n: usize, k: usize) {
         enc.commit_and_wait().unwrap();
     }
 
-    // Measurement.
+    // Measurement: capture BOTH CPU wall-clock (encode + commit + wait) AND
+    // GPU-pure (MTLCommandBuffer.GPUStartTime/GPUEndTime) per call. The
+    // delta isolates encoder + commit overhead from actual kernel compute.
+    // ADR-028 iter-96: separate dispatch overhead from kernel time to test
+    // the "encode-bound" hypothesis.
     const N_TRIALS: usize = 200;
-    let mut times_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    let mut cpu_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    let mut gpu_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
     for _ in 0..N_TRIALS {
         let mut enc = device.command_encoder().unwrap();
         let t0 = Instant::now();
@@ -681,19 +686,38 @@ fn bench_q6_k_mv_id_one_shape(label: &str, n: usize, k: usize) {
             &input_buf, &weight_buf, &ids_buf, &mut output_buf,
             &params,
         ).unwrap();
-        enc.commit_and_wait().unwrap();
+        let (gpu_start_s, gpu_end_s) = enc.commit_wait_with_gpu_time().unwrap();
         let dt = t0.elapsed();
-        times_us.push(dt.as_secs_f64() * 1e6);
+        cpu_us.push(dt.as_secs_f64() * 1e6);
+        gpu_us.push((gpu_end_s - gpu_start_s) * 1e6);
     }
 
-    times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p10 = times_us[N_TRIALS / 10];
-    let p50 = times_us[N_TRIALS / 2];
-    let p90 = times_us[(N_TRIALS * 9) / 10];
+    let pct = |xs: &mut Vec<f64>, q: usize| -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[q]
+    };
+
+    let cpu_p10 = pct(&mut cpu_us, N_TRIALS / 10);
+    let cpu_p50 = pct(&mut cpu_us, N_TRIALS / 2);
+    let cpu_p90 = pct(&mut cpu_us, (N_TRIALS * 9) / 10);
+
+    let gpu_p10 = pct(&mut gpu_us, N_TRIALS / 10);
+    let gpu_p50 = pct(&mut gpu_us, N_TRIALS / 2);
+    let gpu_p90 = pct(&mut gpu_us, (N_TRIALS * 9) / 10);
+
+    let overhead_p50 = cpu_p50 - gpu_p50;
+    let overhead_pct = overhead_p50 / cpu_p50 * 100.0;
 
     eprintln!("[BENCH] {}", label);
-    eprintln!("[BENCH]   p10 = {:7.2} µs  p50 = {:7.2} µs  p90 = {:7.2} µs",
-              p10, p50, p90);
-    eprintln!("[BENCH]   per-token (×60 calls)  median estimate = {:6.2} ms",
-              p50 * 60.0 / 1000.0);
+    eprintln!("[BENCH]   CPU wall-clock  p10 = {:7.2} µs  p50 = {:7.2} µs  p90 = {:7.2} µs",
+              cpu_p10, cpu_p50, cpu_p90);
+    eprintln!("[BENCH]   GPU pure-kernel p10 = {:7.2} µs  p50 = {:7.2} µs  p90 = {:7.2} µs",
+              gpu_p10, gpu_p50, gpu_p90);
+    eprintln!("[BENCH]   Encode+commit overhead p50 = {:6.2} µs ({:.1}% of CPU)",
+              overhead_p50, overhead_pct);
+    eprintln!("[BENCH]   Per-token (×60 calls):");
+    eprintln!("[BENCH]     CPU estimate = {:6.2} ms (production single-session amortizes overhead)",
+              cpu_p50 * 60.0 / 1000.0);
+    eprintln!("[BENCH]     GPU estimate = {:6.2} ms (kernel-only lower bound)",
+              gpu_p50 * 60.0 / 1000.0);
 }
