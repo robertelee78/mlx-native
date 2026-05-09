@@ -32,7 +32,8 @@ already-rotated.
    single named `OpKind` (Matmul, Softmax, Log, RmsNorm, …) with a
    dedicated backward arm at `autograd_gpu_tape.rs:604`.  RoPE
    belongs on that list, not as a sub-feature of an attention op.
-3. **Multi-model reuse.**  Qwen35 uses IMROPE with sections=[24,20,20,0];
+3. **Multi-model reuse.**  Qwen35 uses IMROPE with sections=[11,11,10,0]
+   (verified at `hf2q/src/inference/models/qwen35/mod.rs:235`,`:925`);
    future models may use vanilla RoPE, NTK-scaled RoPE, YaRN, etc.  A
    separate op variant is parametrized by section/freq schedule; a
    fused kernel forks per model.
