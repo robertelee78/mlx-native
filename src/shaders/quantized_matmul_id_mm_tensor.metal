@@ -444,7 +444,7 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_nl, 2, dq_iq4_nl_id>(
 
 template [[host_name("kernel_mul_mm_id_q5_K_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_q5_K, QK_NL, dq_q5_K_id>(
-    constant GgmlMatmulIdMm_TensorParams &,
+    constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
 
