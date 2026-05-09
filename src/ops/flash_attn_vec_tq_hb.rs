@@ -175,11 +175,29 @@ pub fn compute_nsg(kv_seq_len: u32) -> u32 {
             }
         }
     }
-    // ADR-028 iter-127a: scaffold lands with NSG=1 default (byte-identical to
-    // pre-iter-127 behavior). Adaptive policy engages once cross-simdgroup
-    // reduce is verified at NSG=2,4 in subsequent iter-127 substeps.
-    let _ = kv_seq_len;
-    1
+    // ADR-028 iter-127d Path D: adaptive NSG policy from measured bench data.
+    //
+    // bench_fa_vec_tq_hb_gemma_decode (mlx-native commit 5aafd7a, M5 Max, NWG=32):
+    //
+    // | kL    | NSG=1 µs/call | NSG=4 µs/call | speedup |
+    // |-------|---------------|---------------|---------|
+    // | 1024  | 44.21         | 53.59         | 0.83× (overhead dominates) |
+    // | 4096  | 208.71        | 113.32        | **1.84× faster** |
+    // | 8192  | 423.79        | 231.10        | **1.83× faster** |
+    //
+    // Threshold: kL > 1024 (i.e. K_blocks > NWG=32) crosses the K-iter loop
+    // into >1 iter/simdgroup at NSG=1, and NSG=4 splits that work 4-way.
+    // Below threshold, the cross-simdgroup reduce overhead dominates (kL≤1024
+    // is already saturated at NSG=1).
+    //
+    // Why NSG=4 not NSG=2: bench shows NSG=4 strictly beats NSG=2 at all
+    // kL > 1024 (we measured 4096: NSG=2=184µs vs NSG=4=113µs).
+    // Why not NSG > 4: validate_params caps at 4 (kernel NSG_MAX=4 ms_arr).
+    if kv_seq_len > 1024 {
+        4
+    } else {
+        1
+    }
 }
 
 fn compute_nwg(kv_seq_len: u32) -> u32 {
@@ -452,14 +470,18 @@ mod tests {
     static NSG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn test_compute_nsg_default_is_one() {
+    fn test_compute_nsg_adaptive_threshold() {
         let _guard = NSG_ENV_LOCK.lock().unwrap();
-        // iter-127a: scaffold returns 1 for all kL until kernel logic
-        // supports NSG > 1 (iter-127b/c lifts). Clear env to prove default
-        // is hit — the override test otherwise leaves residue.
+        // iter-127d adaptive policy: NSG=1 below threshold, NSG=4 above.
+        // Threshold derived from bench data — see compute_nsg docstring.
         std::env::remove_var("HF2Q_TQ_NSG");
-        for kL in [64u32, 256, 1024, 2048, 4096, 8192, 16384] {
-            assert_eq!(compute_nsg(kL), 1, "compute_nsg({kL}) must default to 1 in iter-127a");
+        // Below threshold: NSG=1 (cross-simdgroup reduce overhead dominates).
+        for kl in [1u32, 64, 256, 1024] {
+            assert_eq!(compute_nsg(kl), 1, "compute_nsg({kl}) must be 1 (kL ≤ 1024)");
+        }
+        // Above threshold: NSG=4 (engaged for ≥1.83× speedup at kL=4096+).
+        for kl in [1025u32, 1536, 2048, 4096, 8192, 16384] {
+            assert_eq!(compute_nsg(kl), 4, "compute_nsg({kl}) must be 4 (kL > 1024)");
         }
     }
 

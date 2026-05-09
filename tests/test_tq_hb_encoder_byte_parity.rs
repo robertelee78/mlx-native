@@ -808,12 +808,20 @@ fn bench_one_kvseqlen(
     let tmp_buf = device.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4]).unwrap();
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    // ADR-028 iter-127d: bench honors HF2Q_TQ_NSG env override so operators
+    // can sweep nsg ∈ {1, 2, 4} at the same kL to measure Path D speedup
+    // without recompiling. Default nsg=1 (matches pre-iter-127 behavior).
+    let nsg_bench: u32 = std::env::var("HF2Q_TQ_NSG")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n == 1 || n == 2 || n == 4)
+        .unwrap_or(1);
     let params = flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
         num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
         scale, mask_type: 0, sliding_window: 0, softcap: 0.0,
         ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
         fuse_fwht_pre: 0,
-        nsg: 1, // ADR-028 iter-127a
+        nsg: nsg_bench,
     };
 
     let dispatch_fa = |encoder: &mut mlx_native::CommandEncoder, registry: &mut KernelRegistry| {
