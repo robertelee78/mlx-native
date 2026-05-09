@@ -50,6 +50,7 @@ pub mod compute_g_beta;
 pub mod ssm_norm_gate;
 pub mod flash_attn_prefill;
 pub mod flash_attn_prefill_blk;
+pub mod flash_attn_train;
 pub mod flash_attn_prefill_d512;
 pub mod flash_attn_prefill_mask;
 pub mod flash_attn_vec;
