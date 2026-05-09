@@ -618,3 +618,154 @@ fn d256_gpu_bytes_roundtrip_via_oracle_meets_gate_a() {
     // Gate A strict spec: ≥ 0.999. Close-section measurement: 0.9998.
     assert!(cos >= 0.998, "GPU encode + oracle decode cosine {cos} < 0.998");
 }
+
+// --------------------------------------------------------------------------
+// ADR-028 iter-103 — FA-vec-tq-hb GPU pure-time bench at gemma decode shape
+// (16 query heads, 8 KV heads, head_dim=256, codebook 8-bit, kL=128/256).
+// Identifies whether attention itself owns the 4.75 ms peer gap or
+// whether it's distributed across other big kernels (mv_id Q6_K already
+// measured at 0.96 ms/token in iter-103a).
+//
+// Run:
+//   cargo test --release --test test_tq_hb_encoder_byte_parity \
+//     bench_fa_vec_tq_hb -- --ignored --nocapture
+// --------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn bench_fa_vec_tq_hb_gemma_decode() {
+    use std::time::Instant;
+
+    // Gemma-4-26b decode shape.
+    let num_heads: u32 = 16;
+    let num_kv_heads: u32 = 8;
+    let head_dim: u32 = 256;
+    let bits: u32 = 8;
+
+    for &kv_seq_len in &[64u32, 128u32, 256u32] {
+        bench_one_kvseqlen(num_heads, num_kv_heads, head_dim, bits, kv_seq_len);
+    }
+}
+
+fn bench_one_kvseqlen(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    bits: u32,
+    kv_seq_len: u32,
+) {
+    use std::time::Instant;
+
+    let nh = num_heads as usize;
+    let nkv = num_kv_heads as usize;
+    let kvl = kv_seq_len as usize;
+    let hd = head_dim as usize;
+    let kv_capacity = kv_seq_len;
+
+    let device = MlxDevice::new().expect("MlxDevice");
+    let mut registry = KernelRegistry::new();
+    hadamard_quantize_kv::register(&mut registry);
+    flash_attn_vec_tq_hb::register(&mut registry);
+    mlx_native::ops::flash_attn_vec::register(&mut registry);
+
+    // Build encoded KV cache once (slow setup, amortized across trials).
+    let (k_packed, k_norms, v_packed, v_norms) =
+        build_gpu_encoded_cache_d256(&device, &mut registry, num_kv_heads, kv_seq_len, bits, 0xBE);
+
+    let mut q_rotated = gaussian_vec(0xBE13, nh * hd);
+    for h in 0..nh {
+        let s = h * hd;
+        fwht_inplace(&mut q_rotated[s..s + hd]).expect("fwht");
+    }
+
+    let mut q_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    q_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&q_rotated);
+    let mut k_packed_buf = device.alloc_buffer(k_packed.len(), DType::U8, vec![nkv, kvl, hd]).unwrap();
+    k_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&k_packed);
+    let mut k_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv * kvl]).unwrap();
+    k_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_norms);
+    let mut v_packed_buf = device.alloc_buffer(v_packed.len(), DType::U8, vec![nkv, kvl, hd]).unwrap();
+    v_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&v_packed);
+    let mut v_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv * kvl]).unwrap();
+    v_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_norms);
+    let output_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    let tmp_bytes = flash_attn_vec_tq_hb::tmp_buffer_bytes(num_heads, head_dim);
+    let tmp_buf = device.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4]).unwrap();
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let params = flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+        num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+        scale, mask_type: 0, sliding_window: 0, softcap: 0.0,
+        ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
+    };
+
+    let dispatch_fa = |encoder: &mut mlx_native::CommandEncoder, registry: &mut KernelRegistry| {
+        flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+            encoder, registry, &device,
+            &q_buf, &k_packed_buf, &k_norms_buf, &v_packed_buf, &v_norms_buf,
+            &output_buf, &tmp_buf, &params,
+        ).unwrap();
+    };
+
+    // Warmup
+    for _ in 0..8 {
+        let mut enc = device.command_encoder().unwrap();
+        dispatch_fa(&mut enc, &mut registry);
+        enc.commit_and_wait().unwrap();
+    }
+
+    let pct = |xs: &mut Vec<f64>, q: usize| -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[q]
+    };
+
+    // Per-call isolated.
+    const N_TRIALS: usize = 50;
+    let mut cpu_us = Vec::with_capacity(N_TRIALS);
+    let mut gpu_us = Vec::with_capacity(N_TRIALS);
+    for _ in 0..N_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        dispatch_fa(&mut enc, &mut registry);
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        cpu_us.push(dt.as_secs_f64() * 1e6);
+        gpu_us.push((ge - gs) * 1e6);
+    }
+
+    let cp50 = pct(&mut cpu_us, N_TRIALS / 2);
+    let gp50 = pct(&mut gpu_us, N_TRIALS / 2);
+
+    // Session-30 (1 FA call/layer × 30 layers).
+    const N_SESS: usize = 30;
+    const N_SESS_TRIALS: usize = 15;
+    for _ in 0..3 {
+        let mut enc = device.command_encoder().unwrap();
+        for _ in 0..N_SESS { dispatch_fa(&mut enc, &mut registry); }
+        enc.commit_and_wait().unwrap();
+    }
+    let mut sess_cpu = Vec::with_capacity(N_SESS_TRIALS);
+    let mut sess_gpu = Vec::with_capacity(N_SESS_TRIALS);
+    for _ in 0..N_SESS_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..N_SESS { dispatch_fa(&mut enc, &mut registry); }
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        sess_cpu.push(dt.as_secs_f64() * 1e6);
+        sess_gpu.push((ge - gs) * 1e6);
+    }
+    let scp50 = pct(&mut sess_cpu, N_SESS_TRIALS / 2);
+    let sgp50 = pct(&mut sess_gpu, N_SESS_TRIALS / 2);
+
+    eprintln!("[BENCH iter-103] FA-vec-tq-hb num_heads={} kv_heads={} head_dim={} kL={}",
+              num_heads, num_kv_heads, head_dim, kv_seq_len);
+    eprintln!("[BENCH iter-103]   PER-CALL ISOLATED: CPU p50={:7.2} µs  GPU p50={:7.2} µs",
+              cp50, gp50);
+    eprintln!("[BENCH iter-103]   SESSION-30:        CPU p50={:7.2} µs ({:5.2} µs/call)",
+              scp50, scp50 / N_SESS as f64);
+    eprintln!("[BENCH iter-103]                      GPU p50={:7.2} µs ({:5.2} µs/call)",
+              sgp50, sgp50 / N_SESS as f64);
+    eprintln!("[BENCH iter-103]   Per-token (30 calls): {:.2} ms = {:.1}% of 15.86 ms decode",
+              scp50 / 1000.0, (scp50 / 1000.0) / 15.86 * 100.0);
+}
