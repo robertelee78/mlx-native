@@ -878,6 +878,32 @@ fn bench_iter109_decode_hot_kernels() {
     bench_one_shape("LM head (Q8_0, m=1 n=262144 k=2816)", 1, 262144, 2816, GgmlType::Q8_0, 1);
 }
 
+// ADR-028 iter-110: dense FFN bench.
+// Dense FFN per-layer: gate (n=2112,k=2816) + up (n=2112,k=2816) + down
+// (n=2816,k=2112) = 3 calls/layer × 30 = 90 calls/token.
+// gemma-4-26b GGUF metadata: gemma4.feed_forward_length=2112,
+// gemma4.expert_feed_forward_length=704. Neither is divisible by 256
+// (Q6_K block size), so dense tensors MUST use block-32 quants
+// (Q4_0/Q5_1/Q8_0/IQ4_NL). Production likely Q5_1 or similar in the
+// Q5_K_M mixed scheme. We bench Q4_0 (4.5 bpw, lower bandwidth bound)
+// and Q8_0 (8.5 bpw, upper bandwidth bound) to bracket actual cost.
+//
+// Run:
+//   cargo test --release --test test_quantized_matmul_ggml \
+//     bench_iter110_dense_ffn -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_iter110_dense_ffn() {
+    eprintln!("[BENCH iter-110] === LOWER BANDWIDTH BOUND (Q4_0, 4.5 bpw) ===");
+    bench_one_shape("Dense gate (Q4_0, m=1 n=2112 k=2816)", 1, 2112, 2816, GgmlType::Q4_0, 30);
+    bench_one_shape("Dense up   (Q4_0, m=1 n=2112 k=2816)", 1, 2112, 2816, GgmlType::Q4_0, 30);
+    bench_one_shape("Dense down (Q4_0, m=1 n=2816 k=2112)", 1, 2816, 2112, GgmlType::Q4_0, 30);
+    bench_one_shape("Router     (Q4_0, m=1 n=128 k=2816)",  1, 128,  2816, GgmlType::Q4_0, 30);
+    eprintln!("[BENCH iter-110] === UPPER BANDWIDTH BOUND (Q8_0, 8.5 bpw) ===");
+    bench_one_shape("Dense gate (Q8_0, m=1 n=2112 k=2816)", 1, 2112, 2816, GgmlType::Q8_0, 30);
+    bench_one_shape("Dense down (Q8_0, m=1 n=2816 k=2112)", 1, 2816, 2112, GgmlType::Q8_0, 30);
+}
+
 fn bench_one_shape(
     label: &str,
     m: usize, n: usize, k: usize,
@@ -898,6 +924,7 @@ fn bench_one_shape(
         match ggml_type {
             GgmlType::Q6_K => weight_bytes.extend_from_slice(&pack_q6_k(row_slice)),
             GgmlType::Q8_0 => weight_bytes.extend_from_slice(&pack_q8_0(row_slice)),
+            GgmlType::Q4_0 => weight_bytes.extend_from_slice(&pack_q4_0(row_slice)),
             _ => panic!("unsupported ggml_type {:?}", ggml_type),
         }
     }
