@@ -503,6 +503,80 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     Ok(())
 }
 
+/// ADR-028 iter-148: fused K+V single-position Hadamard-quantize KV HB encoder.
+///
+/// Combines two `dispatch_hadamard_quantize_kv_hb` calls (one for K, one for V)
+/// into a single dispatch via grid Z-dim. Saves one Apple Metal kernel-launch
+/// floor (~14 µs) per layer per decode token. At gemma4 30 layers, drops
+/// 60→30 HB-encode dispatches/decode-token, saving ~0.4 ms/token (~3% decode).
+///
+/// Result is byte-identical to two `dispatch_hadamard_quantize_kv_hb` calls
+/// at identical params (verified by mlx-native unit test).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_hb_dual(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    packed_k: &MlxBuffer,
+    packed_v: &MlxBuffer,
+    norms_k: &MlxBuffer,
+    norms_v: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_hadamard_quantize_kv_hb_dual: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
+    }
+
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_hb_dual_d256",
+        512 => "hadamard_quantize_kv_hb_dual_d512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_hb_dual: head_dim {} not supported (need 256 or 512)", head_dim))),
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos,
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512,
+        codebook_bits,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src_k)),
+            (1, KA::Buffer(src_v)),
+            (2, KA::Buffer(packed_k)),
+            (3, KA::Buffer(packed_v)),
+            (4, KA::Buffer(norms_k)),
+            (5, KA::Buffer(norms_v)),
+            (6, KA::Bytes(params_bytes)),
+        ],
+        MTLSize::new(num_kv_heads as u64, 1, 2), // x=heads, z=K|V stream
+        MTLSize::new(32, 1, 1),                  // 1 simdgroup (32 threads)
+    );
+
+    Ok(())
+}
+
 /// ADR-027 Phase B iter-14 — multi-token Hadamard-quantize KV (HB) dispatch.
 ///
 /// Mirrors `dispatch_hadamard_quantize_kv_seq` (4-bit) but writes 1 byte
