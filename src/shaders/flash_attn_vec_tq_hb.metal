@@ -302,6 +302,7 @@ kernel void flash_attn_vec_tq_hb_impl(
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
     const uint NWG = params.nwg;
+    const uint NSG = params.nsg;  // ADR-028 iter-127b Path D: simdgroups per workgroup
     const ushort iwg = tgpig[2] % NWG;
     const ushort iq2 = tgpig[1];  // head index
     const ushort iq1 = tgpig[0];  // query index (0 for decode)
@@ -310,13 +311,19 @@ kernel void flash_attn_vec_tq_hb_impl(
     const uint heads_per_kv = params.n_heads / params.n_kv_heads;
     const uint kv_head = iq2 / heads_per_kv;
 
-    // Shared memory layout (same as flash_attn_vec_tq.metal):
-    //   [0, PK)                     — Q as half4 (pre-rotated by caller)
-    //   [PK, PK + SH)               — scratch for attention scores
-    //   [PK + SH, PK + SH + 2*PV)   — output accumulator as float4
+    // Shared memory layout (ADR-028 iter-127b: NSG-aware banks).
+    // Layout:
+    //   [0, PK)                                                     — Q as half4 (shared by all simdgroups)
+    //   [PK + sgitg*SH, PK + (sgitg+1)*SH)                          — per-simdgroup score scratch
+    //   [PK + NSG*SH + sgitg*2*PV, PK + NSG*SH + (sgitg+1)*2*PV)    — per-simdgroup output accumulator
+    //
+    // At NSG=1, sgitg=0:
+    //   ss = shmem + PK            (matches pre-iter-127 layout)
+    //   so4 = shmem + PK + 1*SH    (matches pre-iter-127 layout)
+    // — byte-identical to scaffold/pre-iter-127 dispatch.
     threadgroup half4  *sq4 = (threadgroup half4  *)(shmem);
-    threadgroup float  *ss  = (threadgroup float  *)(shmem + PK);
-    threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + SH);
+    threadgroup float  *ss  = (threadgroup float  *)(shmem + PK + (uint)sgitg * SH);
+    threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + NSG * SH + (uint)sgitg * 2 * PV);
 
     // ADR-028 iter-106: Q-load split between two paths via FUSE_FWHT_PRE
     // function constant. Default path (caller-rotated) preserved unchanged;
@@ -405,7 +412,12 @@ kernel void flash_attn_vec_tq_hb_impl(
     threadgroup const half4 *pq4 = sq4 + tx;
 
     // Main loop over KV cache in chunks of C=32.
-    for (uint ic0 = iwg; ; ic0 += NWG) {
+    // ADR-028 iter-127b: NSG-axis K-stride. Each simdgroup `sgitg` within
+    // workgroup `iwg` strides through K with step `NWG*NSG`. Matches
+    // llama.cpp's flash_attn_vec_ext at ggml-metal.metal:6782.
+    // At NSG=1 (sgitg always 0): `for (ic0 = iwg; ; ic0 += NWG)` — identical
+    // to pre-iter-127 behavior.
+    for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
         uint ic = ic0 * C;
         if (ic >= kv_seq_len) break;
 

@@ -266,7 +266,13 @@ pub fn flash_attn_vec_tq_hb(
     let pk = pad2(head_dim as usize, 128);
     let pv = pad2(head_dim as usize, 128);
     let sh = 4 * 32;
-    let shmem_halfs = pk + sh + 2 * pv;
+    // ADR-028 iter-127b: shmem layout is NSG-aware:
+    //   [0, PK)                                                  — Q (shared)
+    //   [PK, PK + NSG*SH)                                        — per-simdgroup ss
+    //   [PK + NSG*SH, PK + NSG*SH + NSG*2*PV)                    — per-simdgroup so4
+    // At NSG=1 → `pk + sh + 2*pv` (pre-iter-127 layout, byte-identical).
+    let nsg = params.nsg as usize;
+    let shmem_halfs = pk + nsg * (sh + 2 * pv);
     let shmem_bytes = shmem_halfs * 2;
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);
