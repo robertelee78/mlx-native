@@ -193,11 +193,7 @@ pub fn compute_nsg(kv_seq_len: u32) -> u32 {
     // Why NSG=4 not NSG=2: bench shows NSG=4 strictly beats NSG=2 at all
     // kL > 1024 (we measured 4096: NSG=2=184µs vs NSG=4=113µs).
     // Why not NSG > 4: validate_params caps at 4 (kernel NSG_MAX=4 ms_arr).
-    if kv_seq_len > 1024 {
-        4
-    } else {
-        1
-    }
+    if kv_seq_len > 1024 { 4 } else { 1 }
 }
 
 fn compute_nwg(kv_seq_len: u32) -> u32 {
