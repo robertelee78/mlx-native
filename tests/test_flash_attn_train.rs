@@ -37,6 +37,8 @@ use mlx_native::ops::flash_attn_train::{
     FlashAttnTrainParams,
     dispatch_flash_attn_train_fwd_bf16_d64,
     dispatch_flash_attn_train_fwd_bf16_d256,
+    dispatch_flash_attn_train_bwd_bf16_d64,
+    dispatch_flash_attn_train_bwd_bf16_d256,
 };
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 
@@ -696,6 +698,641 @@ fn test_d256_library_compiles_with_l_out() {
         }
         Err(e) => panic!("Unexpected error: {e:?}"),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2 — backward kernel helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// CPU oracle for the FA-2 backward pass.
+///
+/// Given Q/K/V/O (bf16-rounded inputs, f32 values), the forward logsumexp L,
+/// and the upstream gradient dO, computes (dQ, dK, dV) in f32.
+///
+/// Implements FA-2 Algorithm 4 equations:
+///   D[i]      = rowsum(O[i] * dO[i])
+///   S[i,j]    = scale * Q[i] · K[j]^T
+///   P[i,j]    = exp(S[i,j] - L[i])
+///   dV[j]    += P[i,j] * dO[i]
+///   dP[i,j]   = dO[i] · V[j]^T
+///   dS[i,j]   = P[i,j] * (dP[i,j] - D[i])
+///   dS[i,j]   = 0  if causal and j > i  (already 0 through P)
+///   dQ[i]    += scale * dS[i,j] * K[j]
+///   dK[j]    += scale * dS[i,j] * Q[i]
+///
+/// All index conventions: [b * n_heads * seq * d] row-major, GQA via heads_per_kv.
+#[allow(clippy::too_many_arguments)]
+fn sdpa_backward_reference_f32(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    l_nat: &[f32],
+    do_: &[f32],
+    mask: Option<&[f32]>,
+    batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    ql: usize,
+    kl: usize,
+    head_dim: usize,
+    scale: f32,
+    do_causal: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let heads_per_kv = n_heads / n_kv_heads;
+    let mut dq = vec![0.0f32; batch * n_heads * ql * head_dim];
+    let mut dk = vec![0.0f32; batch * n_kv_heads * kl * head_dim];
+    let mut dv = vec![0.0f32; batch * n_kv_heads * kl * head_dim];
+
+    for b in 0..batch {
+        for h in 0..n_heads {
+            let kv_h = h / heads_per_kv;
+            for q_i in 0..ql {
+                let q_base = b * n_heads * ql * head_dim + h * ql * head_dim + q_i * head_dim;
+                let l_i = l_nat[b * n_heads * ql + h * ql + q_i];
+
+                // D[i] = sum_d O[i,d] * dO[i,d]  (O derived from forward; use dO·O trick)
+                // Actually the kernel receives dO (upstream) and O (forward output).
+                // For the oracle we compute D directly from the re-derived P:
+                // D[i] = sum_j P[i,j] * dP[i,j]  — but that's equivalent.
+                // Simpler: just store and reuse P below.
+
+                // Compute raw scores S[i, 0..kl]
+                let mut s = vec![0.0f32; kl];
+                for k_j in 0..kl {
+                    let kv_base = b * n_kv_heads * kl * head_dim
+                        + kv_h * kl * head_dim
+                        + k_j * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_base + d] * k[kv_base + d];
+                    }
+                    s[k_j] = scale * dot;
+
+                    // additive mask
+                    if let Some(m) = mask {
+                        let m_idx = b * n_heads * ql * kl + h * ql * kl + q_i * kl + k_j;
+                        if m[m_idx] == f32::NEG_INFINITY {
+                            s[k_j] = f32::NEG_INFINITY;
+                        } else {
+                            s[k_j] += m[m_idx];
+                        }
+                    }
+                    // causal mask
+                    if do_causal && k_j > q_i {
+                        s[k_j] = f32::NEG_INFINITY;
+                    }
+                }
+
+                // P[i, j] = exp(S[i,j] - L[i])
+                let mut p = vec![0.0f32; kl];
+                for k_j in 0..kl {
+                    p[k_j] = if s[k_j] == f32::NEG_INFINITY {
+                        0.0f32
+                    } else {
+                        (s[k_j] - l_i).exp()
+                    };
+                }
+
+                // D[i] = sum_d dO[i,d] * O[i,d]
+                // Since O[i,d] = sum_j P[i,j] * V[j,d], D[i] = sum_j P[i,j] * dP[i,j]
+                // where dP[i,j] = dO[i] · V[j].  Compute D via sum_j P * dP:
+                let mut d_i = 0.0f32;
+                for k_j in 0..kl {
+                    let kv_base = b * n_kv_heads * kl * head_dim
+                        + kv_h * kl * head_dim
+                        + k_j * head_dim;
+                    let mut dp_j = 0.0f32;
+                    for d in 0..head_dim {
+                        dp_j += do_[q_base + d] * v[kv_base + d];
+                    }
+                    d_i += p[k_j] * dp_j;
+                }
+
+                for k_j in 0..kl {
+                    let kv_base = b * n_kv_heads * kl * head_dim
+                        + kv_h * kl * head_dim
+                        + k_j * head_dim;
+                    let dk_base = b * n_kv_heads * kl * head_dim
+                        + kv_h * kl * head_dim
+                        + k_j * head_dim;
+                    let dv_base = dk_base;
+
+                    // dP[i,j] = sum_d dO[i,d] * V[j,d]
+                    let mut dp_j = 0.0f32;
+                    for d in 0..head_dim {
+                        dp_j += do_[q_base + d] * v[kv_base + d];
+                    }
+
+                    // dS[i,j] = P[i,j] * (dP[i,j] - D[i])
+                    let ds_j = p[k_j] * (dp_j - d_i);
+
+                    // dV[j] += P[i,j] * dO[i]
+                    for d in 0..head_dim {
+                        dv[dv_base + d] += p[k_j] * do_[q_base + d];
+                    }
+
+                    // dQ[i] += scale * dS[i,j] * K[j]
+                    // dK[j] += scale * dS[i,j] * Q[i]
+                    for d in 0..head_dim {
+                        dq[q_base + d] += scale * ds_j * k[kv_base + d];
+                        dk[dk_base + d] += scale * ds_j * q[q_base + d];
+                    }
+                }
+            }
+        }
+    }
+
+    (dq, dk, dv)
+}
+
+/// Run the full backward GPU chain and return (dQ_f32, dK_f32, dV_f32).
+///
+/// Runs forward first to get O and L, then runs backward.
+/// All tensors are bf16-quantized before dispatch to match GPU precision.
+#[allow(clippy::too_many_arguments)]
+fn run_train_bwd(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_bf: &[bf16],
+    k_bf: &[bf16],
+    v_bf: &[bf16],
+    mask_bf: Option<&[bf16]>,
+    do_bf: &[bf16],
+    batch: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    ql: usize,
+    kl: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q_elems = batch * n_q_heads * ql * head_dim;
+    let kv_elems = batch * n_kv_heads * kl * head_dim;
+    let l_elems = batch * n_q_heads * ql;
+
+    // Allocate and fill forward inputs.
+    let q_buf = alloc_bf16(device, q_elems, "Q");
+    let k_buf = alloc_bf16(device, kv_elems, "K");
+    let v_buf = alloc_bf16(device, kv_elems, "V");
+    let mut o_buf = alloc_bf16(device, q_elems, "O");
+    let mut l_buf = alloc_f32(device, l_elems, "L");
+    fill_bf16_buf(&q_buf, q_bf);
+    fill_bf16_buf(&k_buf, k_bf);
+    fill_bf16_buf(&v_buf, v_bf);
+
+    let mask_buf = mask_bf.map(|m| {
+        let mask_elems = batch * n_q_heads * ql * kl;
+        assert_eq!(m.len(), mask_elems);
+        let buf = alloc_bf16(device, mask_elems, "mask");
+        fill_bf16_buf(&buf, m);
+        buf
+    });
+
+    let do_buf = alloc_bf16(device, q_elems, "dO");
+    fill_bf16_buf(&do_buf, do_bf);
+
+    let mut dq_buf = alloc_bf16(device, q_elems, "dQ");
+    let mut dk_buf = alloc_bf16(device, kv_elems, "dK");
+    let mut dv_buf = alloc_bf16(device, kv_elems, "dV");
+
+    let params = FlashAttnTrainParams {
+        batch: batch as u32,
+        n_q_heads: n_q_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        q_seq_len: ql as u32,
+        k_seq_len: kl as u32,
+        scale,
+        causal,
+    };
+
+    let mut encoder = device.command_encoder().expect("command_encoder");
+
+    // Forward pass.
+    if head_dim == 64 {
+        dispatch_flash_attn_train_fwd_bf16_d64(
+            &mut encoder, device, registry,
+            &q_buf, &k_buf, &v_buf, mask_buf.as_ref(), &mut o_buf, &mut l_buf,
+            &params,
+        ).expect("fwd d64");
+    } else {
+        dispatch_flash_attn_train_fwd_bf16_d256(
+            &mut encoder, device, registry,
+            &q_buf, &k_buf, &v_buf, mask_buf.as_ref(), &mut o_buf, &mut l_buf,
+            &params,
+        ).expect("fwd d256");
+    }
+    encoder.memory_barrier();
+
+    // Backward pass.
+    if head_dim == 64 {
+        dispatch_flash_attn_train_bwd_bf16_d64(
+            &mut encoder, device, registry,
+            &q_buf, &k_buf, &v_buf, &o_buf, &l_buf, &do_buf,
+            mask_buf.as_ref(), &mut dq_buf, &mut dk_buf, &mut dv_buf,
+            &params,
+        ).expect("bwd d64");
+    } else {
+        dispatch_flash_attn_train_bwd_bf16_d256(
+            &mut encoder, device, registry,
+            &q_buf, &k_buf, &v_buf, &o_buf, &l_buf, &do_buf,
+            mask_buf.as_ref(), &mut dq_buf, &mut dk_buf, &mut dv_buf,
+            &params,
+        ).expect("bwd d256");
+    }
+
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let dq_f32 = bf16_to_f32(&read_bf16_buf(&dq_buf, q_elems));
+    let dk_f32 = bf16_to_f32(&read_bf16_buf(&dk_buf, kv_elems));
+    let dv_f32 = bf16_to_f32(&read_bf16_buf(&dv_buf, kv_elems));
+    (dq_f32, dk_f32, dv_f32)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 10  BACKWARD — registration and compilation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// All 4 backward kernels compile on Metal (both D=64 and D=256).
+#[test]
+fn test_backward_kernel_names_and_library_compiles() {
+    let device = MlxDevice::new().expect("MlxDevice::new");
+    let mut registry = KernelRegistry::new();
+    flash_attn_train::register(&mut registry);
+    flash_attn_train::register_bwd(&mut registry);
+
+    for &name in flash_attn_train::all_bwd_kernel_names_for_test() {
+        // The two main backward kernels need function constants; others are plain.
+        let result = if name == "flash_attn_train_bwd_bf16_d64"
+            || name == "flash_attn_train_bwd_bf16_d256"
+        {
+            registry.get_pipeline_with_bool_constants(
+                name,
+                device.metal_device(),
+                &[(200, true), (201, true), (300, false), (301, false)],
+            )
+        } else {
+            registry.get_pipeline(name, device.metal_device())
+        };
+        match result {
+            Ok(_) => eprintln!("test_backward_kernel_names_and_library_compiles: {name} OK"),
+            Err(e) => panic!("BWD pipeline compilation failed for {name}: {e:?}"),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 11  BACKWARD PARITY — D=64, no mask
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GPU dQ, dK, dV match CPU oracle for D=64 non-causal.
+///
+/// Shape: B=1, H=1, qL=32, kL=32, D=64.
+/// Tolerance: atol=5e-3 (bf16 I/O, f32 atomic accumulation, non-deterministic
+/// reduction order across threadgroups for dK/dV).
+#[test]
+fn test_backward_no_mask_d64_parity() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1; let ql = 32; let kl = 32; let d = 64;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_f32 = pseudo_random_f32(SEED_VAL + 100, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED_VAL + 101, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED_VAL + 102, batch * kv_h * kl * d);
+    let do_f32 = pseudo_random_f32(SEED_VAL + 103, batch * h * ql * d);
+
+    let q_bf = f32_to_bf16(&q_f32);
+    let k_bf = f32_to_bf16(&k_f32);
+    let v_bf = f32_to_bf16(&v_f32);
+    let do_bf = f32_to_bf16(&do_f32);
+
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None, &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    // CPU oracle on bf16-rounded inputs.
+    let q_rt = bf16_to_f32(&q_bf);
+    let k_rt = bf16_to_f32(&k_bf);
+    let v_rt = bf16_to_f32(&v_bf);
+    let do_rt = bf16_to_f32(&do_bf);
+
+    // Use the GPU L (from the forward pass) by running oracle_for_bf16 to get L.
+    let (_, ref_l) = oracle_for_bf16(&q_bf, &k_bf, &v_bf, None, batch, h, kv_h, ql, kl, d, scale, false);
+
+    let (ref_dq, ref_dk, ref_dv) = sdpa_backward_reference_f32(
+        &q_rt, &k_rt, &v_rt, &ref_l, &do_rt, None,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close(&gpu_dq, &ref_dq, 5e-3, "bwd_d64_no_mask_dQ");
+    assert_close(&gpu_dk, &ref_dk, 5e-3, "bwd_d64_no_mask_dK");
+    assert_close(&gpu_dv, &ref_dv, 5e-3, "bwd_d64_no_mask_dV");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 12  BACKWARD PARITY — D=256, no mask
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GPU dQ, dK, dV match CPU oracle for D=256 non-causal.
+///
+/// Shape: B=1, H=4, qL=128, kL=128, D=256.
+/// D=256 is the Qwen3.6-35B-A3B head dimension.
+#[test]
+fn test_backward_no_mask_d256_parity() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 4; let kv_h = 4; let ql = 128; let kl = 128; let d = 256;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_f32 = pseudo_random_f32(SEED_VAL + 110, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED_VAL + 111, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED_VAL + 112, batch * kv_h * kl * d);
+    let do_f32 = pseudo_random_f32(SEED_VAL + 113, batch * h * ql * d);
+
+    let q_bf = f32_to_bf16(&q_f32);
+    let k_bf = f32_to_bf16(&k_f32);
+    let v_bf = f32_to_bf16(&v_f32);
+    let do_bf = f32_to_bf16(&do_f32);
+
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None, &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    let q_rt = bf16_to_f32(&q_bf);
+    let k_rt = bf16_to_f32(&k_bf);
+    let v_rt = bf16_to_f32(&v_bf);
+    let do_rt = bf16_to_f32(&do_bf);
+    let (_, ref_l) = oracle_for_bf16(&q_bf, &k_bf, &v_bf, None, batch, h, kv_h, ql, kl, d, scale, false);
+
+    let (ref_dq, ref_dk, ref_dv) = sdpa_backward_reference_f32(
+        &q_rt, &k_rt, &v_rt, &ref_l, &do_rt, None,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close(&gpu_dq, &ref_dq, 5e-3, "bwd_d256_no_mask_dQ");
+    assert_close(&gpu_dk, &ref_dk, 5e-3, "bwd_d256_no_mask_dK");
+    assert_close(&gpu_dv, &ref_dv, 5e-3, "bwd_d256_no_mask_dV");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 13  BACKWARD — finite-difference falsifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Finite-difference check: GPU backward gradients match numerical gradients.
+///
+/// For a scalar loss L = sum(O * dO) (i.e. dO is the upstream gradient),
+/// the analytical gradient w.r.t. Q[0,0,0,0] must match (L(Q+h) - L(Q-h)) / 2h.
+///
+/// Shape: B=1, H=1, qL=8, kL=8, D=64 (small, for fast evaluation).
+/// Perturbation step h=1e-2 (larger than bf16 ulp at typical magnitudes).
+/// Tolerance: atol=5e-2 (finite-diff + bf16 rounding combined).
+///
+/// Probes: Q[0,0,0,0], K[0,0,0,0], V[0,0,0,0].
+#[test]
+fn test_backward_finite_diff_falsifier() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1; let ql = 8; let kl = 8; let d = 64;
+    let scale = 1.0 / (d as f32).sqrt();
+    let h_step = 1e-2_f32;
+
+    let q_f32 = pseudo_random_f32(SEED_VAL + 200, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED_VAL + 201, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED_VAL + 202, batch * kv_h * kl * d);
+    // dO is the upstream gradient (acts as the "weight" for the scalar loss).
+    let do_f32 = pseudo_random_f32(SEED_VAL + 203, batch * h * ql * d);
+
+    /// Compute scalar loss L = sum(O * dO) using the CPU forward oracle.
+    fn scalar_loss(
+        q: &[f32], k: &[f32], v: &[f32], do_: &[f32],
+        batch: usize, h: usize, kv_h: usize, ql: usize, kl: usize, d: usize, scale: f32,
+    ) -> f32 {
+        let (o, _) = sdpa_reference_with_logsumexp(
+            q, k, v, None, batch, h, kv_h, ql, kl, d, scale, false,
+        );
+        o.iter().zip(do_.iter()).map(|(o, g)| o * g).sum()
+    }
+
+    // GPU backward gradients at the base point.
+    let q_bf = f32_to_bf16(&q_f32);
+    let k_bf = f32_to_bf16(&k_f32);
+    let v_bf = f32_to_bf16(&v_f32);
+    let do_bf = f32_to_bf16(&do_f32);
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None, &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    // Probe index 0 for Q.
+    {
+        let mut q_plus = q_f32.clone();  q_plus[0]  += h_step;
+        let mut q_minus = q_f32.clone(); q_minus[0] -= h_step;
+        let fd = (scalar_loss(&q_plus, &k_f32, &v_f32, &do_f32, batch, h, kv_h, ql, kl, d, scale)
+                - scalar_loss(&q_minus, &k_f32, &v_f32, &do_f32, batch, h, kv_h, ql, kl, d, scale))
+            / (2.0 * h_step);
+        let analytical = gpu_dq[0];
+        let diff = (fd - analytical).abs();
+        assert!(
+            diff <= 5e-2_f32,
+            "finite_diff_falsifier: dQ[0] fd={fd:.5} analytical={analytical:.5} diff={diff:.5e}"
+        );
+        eprintln!("finite_diff_falsifier: dQ[0] fd={fd:.5} analytical={analytical:.5} diff={diff:.5e} PASS");
+    }
+    // Probe index 0 for K.
+    {
+        let mut k_plus = k_f32.clone();  k_plus[0]  += h_step;
+        let mut k_minus = k_f32.clone(); k_minus[0] -= h_step;
+        let fd = (scalar_loss(&q_f32, &k_plus, &v_f32, &do_f32, batch, h, kv_h, ql, kl, d, scale)
+                - scalar_loss(&q_f32, &k_minus, &v_f32, &do_f32, batch, h, kv_h, ql, kl, d, scale))
+            / (2.0 * h_step);
+        let analytical = gpu_dk[0];
+        let diff = (fd - analytical).abs();
+        assert!(
+            diff <= 5e-2_f32,
+            "finite_diff_falsifier: dK[0] fd={fd:.5} analytical={analytical:.5} diff={diff:.5e}"
+        );
+        eprintln!("finite_diff_falsifier: dK[0] fd={fd:.5} analytical={analytical:.5} diff={diff:.5e} PASS");
+    }
+    // Probe index 0 for V.
+    {
+        let mut v_plus = v_f32.clone();  v_plus[0]  += h_step;
+        let mut v_minus = v_f32.clone(); v_minus[0] -= h_step;
+        let fd = (scalar_loss(&q_f32, &k_f32, &v_plus, &do_f32, batch, h, kv_h, ql, kl, d, scale)
+                - scalar_loss(&q_f32, &k_f32, &v_minus, &do_f32, batch, h, kv_h, ql, kl, d, scale))
+            / (2.0 * h_step);
+        let analytical = gpu_dv[0];
+        let diff = (fd - analytical).abs();
+        assert!(
+            diff <= 5e-2_f32,
+            "finite_diff_falsifier: dV[0] fd={fd:.5} analytical={analytical:.5} diff={diff:.5e}"
+        );
+        eprintln!("finite_diff_falsifier: dV[0] fd={fd:.5} analytical={analytical:.5} diff={diff:.5e} PASS");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 14  BACKWARD — causal mask zeroes dK for future positions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// With causal masking, K[j] contributes to dK[j] only for Q rows i >= j.
+///
+/// Construct two K tensors that differ only at K rows j > q_pos_target.
+/// With causal masking, those K rows should not influence dK for rows <= q_pos_target
+/// relative to dQ.  More directly: dK[j > ql-1] should be ~0 when kl=ql and causal.
+///
+/// Simpler test: run causal backward; verify dK matches the CPU oracle.
+/// The oracle implements causal via P[i,j]=0 for j>i, so dS[i,j]=0 → dK[j] gets
+/// no contribution from Q rows that cannot attend to K[j].
+#[test]
+fn test_backward_causal_mask_parity() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1; let ql = 64; let kl = 64; let d = 64;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_f32 = pseudo_random_f32(SEED_VAL + 300, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED_VAL + 301, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED_VAL + 302, batch * kv_h * kl * d);
+    let do_f32 = pseudo_random_f32(SEED_VAL + 303, batch * h * ql * d);
+
+    let q_bf = f32_to_bf16(&q_f32);
+    let k_bf = f32_to_bf16(&k_f32);
+    let v_bf = f32_to_bf16(&v_f32);
+    let do_bf = f32_to_bf16(&do_f32);
+
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None, &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, true,  // causal=true
+    );
+
+    let q_rt = bf16_to_f32(&q_bf);
+    let k_rt = bf16_to_f32(&k_bf);
+    let v_rt = bf16_to_f32(&v_bf);
+    let do_rt = bf16_to_f32(&do_bf);
+    let (_, ref_l) = oracle_for_bf16(&q_bf, &k_bf, &v_bf, None, batch, h, kv_h, ql, kl, d, scale, true);
+
+    let (ref_dq, ref_dk, ref_dv) = sdpa_backward_reference_f32(
+        &q_rt, &k_rt, &v_rt, &ref_l, &do_rt, None,
+        batch, h, kv_h, ql, kl, d, scale, true,
+    );
+
+    assert_close(&gpu_dq, &ref_dq, 5e-3, "causal_bwd_dQ");
+    assert_close(&gpu_dk, &ref_dk, 5e-3, "causal_bwd_dK");
+    assert_close(&gpu_dv, &ref_dv, 5e-3, "causal_bwd_dV");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 15  BACKWARD — sliding-window mask parity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GPU dQ/dK/dV match CPU oracle with an additive SWA mask.
+///
+/// Shape: B=1, H=1, qL=32, kL=32, D=64, window=8.
+#[test]
+fn test_backward_sliding_window_mask_parity() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1; let ql = 32; let kl = 32; let d = 64;
+    let window = 8usize;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_f32 = pseudo_random_f32(SEED_VAL + 400, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED_VAL + 401, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED_VAL + 402, batch * kv_h * kl * d);
+    let do_f32 = pseudo_random_f32(SEED_VAL + 403, batch * h * ql * d);
+
+    // SWA mask: 0.0 if j <= i && j+window >= i, else -inf.
+    let mut mask_f32 = vec![f32::NEG_INFINITY; batch * h * ql * kl];
+    for b in 0..batch { for hh in 0..h { for i in 0..ql { for j in 0..kl {
+        let in_window = (j <= i) && (j + window >= i);
+        let idx = b * h * ql * kl + hh * ql * kl + i * kl + j;
+        if in_window { mask_f32[idx] = 0.0_f32; }
+    } } } }
+    let mask_bf = f32_to_bf16(&mask_f32);
+
+    let q_bf = f32_to_bf16(&q_f32);
+    let k_bf = f32_to_bf16(&k_f32);
+    let v_bf = f32_to_bf16(&v_f32);
+    let do_bf = f32_to_bf16(&do_f32);
+
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, Some(&mask_bf), &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    let q_rt = bf16_to_f32(&q_bf);
+    let k_rt = bf16_to_f32(&k_bf);
+    let v_rt = bf16_to_f32(&v_bf);
+    let do_rt = bf16_to_f32(&do_bf);
+    let mask_rt = bf16_to_f32(&mask_bf);
+    let (_, ref_l) = oracle_for_bf16(&q_bf, &k_bf, &v_bf, Some(&mask_bf), batch, h, kv_h, ql, kl, d, scale, false);
+
+    let (ref_dq, ref_dk, ref_dv) = sdpa_backward_reference_f32(
+        &q_rt, &k_rt, &v_rt, &ref_l, &do_rt, Some(&mask_rt),
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close(&gpu_dq, &ref_dq, 5e-3, "swa_bwd_dQ");
+    assert_close(&gpu_dk, &ref_dk, 5e-3, "swa_bwd_dK");
+    assert_close(&gpu_dv, &ref_dv, 5e-3, "swa_bwd_dV");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 16  BACKWARD — GQA accumulation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GPU dK/dV accumulate correctly across all Q-heads that share a KV head.
+///
+/// Shape: B=1, H_q=8, H_kv=2, gqa_factor=4, qL=32, kL=32, D=64.
+/// With gqa_factor=4: Q heads {0,1,2,3} share KV head 0; {4,5,6,7} share KV head 1.
+/// dK[0] must accumulate contributions from all 4 Q heads.
+#[test]
+fn test_backward_gqa_accumulation() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 8; let kv_h = 2; let ql = 32; let kl = 32; let d = 64;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_f32 = pseudo_random_f32(SEED_VAL + 500, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED_VAL + 501, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED_VAL + 502, batch * kv_h * kl * d);
+    let do_f32 = pseudo_random_f32(SEED_VAL + 503, batch * h * ql * d);
+
+    let q_bf = f32_to_bf16(&q_f32);
+    let k_bf = f32_to_bf16(&k_f32);
+    let v_bf = f32_to_bf16(&v_f32);
+    let do_bf = f32_to_bf16(&do_f32);
+
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None, &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    let q_rt = bf16_to_f32(&q_bf);
+    let k_rt = bf16_to_f32(&k_bf);
+    let v_rt = bf16_to_f32(&v_bf);
+    let do_rt = bf16_to_f32(&do_bf);
+    let (_, ref_l) = oracle_for_bf16(&q_bf, &k_bf, &v_bf, None, batch, h, kv_h, ql, kl, d, scale, false);
+
+    let (ref_dq, ref_dk, ref_dv) = sdpa_backward_reference_f32(
+        &q_rt, &k_rt, &v_rt, &ref_l, &do_rt, None,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    // GQA: dK has shape [B, H_kv, kL, D]; dQ has shape [B, H_q, qL, D].
+    assert_close(&gpu_dq, &ref_dq, 5e-3, "gqa_bwd_dQ");
+    assert_close(&gpu_dk, &ref_dk, 5e-3, "gqa_bwd_dK");
+    assert_close(&gpu_dv, &ref_dv, 5e-3, "gqa_bwd_dV");
 }
 
 } // mod flash_attn_train_tests
