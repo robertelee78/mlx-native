@@ -771,3 +771,127 @@ fn bench_one_kvseqlen(
     eprintln!("[BENCH iter-103]   Per-token (30 calls): {:.2} ms = {:.1}% of 15.86 ms decode",
               scp50 / 1000.0, (scp50 / 1000.0) / 15.86 * 100.0);
 }
+
+// --------------------------------------------------------------------------
+// ADR-028 iter-107 — byte-parity test for the fused FWHT-pre path.
+//
+// Reference path: dispatch_fwht_sign_premult_f32(Q_raw) → Q_ref + FA(Q_ref,
+// fuse_fwht_pre=0). Mirrors current production exactly.
+//
+// Fused path: FA(Q_raw, fuse_fwht_pre=1). Kernel applies sign-premult +
+// FWHT + 1/sqrt(d) normalize internally before the K-loop.
+//
+// Falsifier: outputs must match within 1e-3 max-abs (allow tiny FP-order
+// noise from the half4 store path) AND NRMSE < 1e-4. If gates trip,
+// iter-106 kernel surgery has a bug — must STOP and localize before
+// iter-108 production flip.
+//
+// Run:
+//   cargo test --release --test test_tq_hb_encoder_byte_parity \
+//     fused_fwht_pre_byte_parity_d256_8bit -- --nocapture
+// --------------------------------------------------------------------------
+
+#[test]
+fn fused_fwht_pre_byte_parity_d256_8bit() {
+    use mlx_native::ops::fwht_standalone;
+
+    let num_heads: u32 = 16;
+    let num_kv_heads: u32 = 8;
+    let head_dim: u32 = 256;
+    let kv_seq_len: u32 = 64;
+    let kv_capacity: u32 = 64;
+    let bits: u32 = 8;
+    let mask_type: u32 = 0;
+    let sliding_window: u32 = 0;
+
+    let nh = num_heads as usize;
+    let nkv = num_kv_heads as usize;
+    let kvl = kv_seq_len as usize;
+    let hd = head_dim as usize;
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    hadamard_quantize_kv::register(&mut registry);
+    flash_attn_vec_tq_hb::register(&mut registry);
+    mlx_native::ops::flash_attn_vec::register(&mut registry);
+
+    let (k_packed, k_norms, v_packed, v_norms) =
+        build_gpu_encoded_cache_d256(&device, &mut registry, num_kv_heads, kv_seq_len, bits, 0xFEED);
+
+    let q_raw = gaussian_vec(0xFEED_BEEF, nh * hd);
+
+    let alloc_q = |data: &[f32]| -> mlx_native::MlxBuffer {
+        let mut q = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+        q.as_mut_slice::<f32>().unwrap().copy_from_slice(data);
+        q
+    };
+    let mut k_packed_buf = device.alloc_buffer(k_packed.len(), DType::U8, vec![nkv, kvl, hd]).unwrap();
+    k_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&k_packed);
+    let mut k_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv * kvl]).unwrap();
+    k_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_norms);
+    let mut v_packed_buf = device.alloc_buffer(v_packed.len(), DType::U8, vec![nkv, kvl, hd]).unwrap();
+    v_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&v_packed);
+    let mut v_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv * kvl]).unwrap();
+    v_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_norms);
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let tmp_bytes = flash_attn_vec_tq_hb::tmp_buffer_bytes(num_heads, head_dim);
+
+    // ---- REFERENCE PATH: caller-rotates via GPU dispatch, FA fuse_fwht_pre=0 ----
+    let q_ref_buf = alloc_q(&q_raw);
+    let output_ref = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    let tmp_ref = device.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4]).unwrap();
+    {
+        let mut enc = device.command_encoder().unwrap();
+        fwht_standalone::dispatch_fwht_sign_premult_f32(
+            &mut enc, &mut registry, device.metal_device(),
+            &q_ref_buf, num_heads, head_dim,
+        ).unwrap();
+        enc.memory_barrier();
+        let params = flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+            num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+            scale, mask_type, sliding_window, softcap: 0.0,
+            ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
+            fuse_fwht_pre: 0,
+        };
+        flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+            &mut enc, &mut registry, &device,
+            &q_ref_buf, &k_packed_buf, &k_norms_buf, &v_packed_buf, &v_norms_buf,
+            &output_ref, &tmp_ref, &params,
+        ).unwrap();
+        enc.commit_and_wait().unwrap();
+    }
+    let ref_out: Vec<f32> = output_ref.as_slice::<f32>().unwrap().to_vec();
+
+    // ---- FUSED PATH: FA fuse_fwht_pre=1 reads un-rotated Q ----
+    let q_fused_buf = alloc_q(&q_raw);
+    let output_fused = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    let tmp_fused = device.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4]).unwrap();
+    {
+        let mut enc = device.command_encoder().unwrap();
+        let params = flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+            num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+            scale, mask_type, sliding_window, softcap: 0.0,
+            ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
+            fuse_fwht_pre: 1,
+        };
+        flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+            &mut enc, &mut registry, &device,
+            &q_fused_buf, &k_packed_buf, &k_norms_buf, &v_packed_buf, &v_norms_buf,
+            &output_fused, &tmp_fused, &params,
+        ).unwrap();
+        enc.commit_and_wait().unwrap();
+    }
+    let fused_out: Vec<f32> = output_fused.as_slice::<f32>().unwrap().to_vec();
+
+    let max_diff = max_abs_diff_f32(&ref_out, &fused_out);
+    let nrmse = nrmse_f32(&ref_out, &fused_out);
+    eprintln!("[iter-107] fused vs ref: max_abs_diff={:.6e}  NRMSE={:.6e}", max_diff, nrmse);
+
+    // Falsifier gates. Q is loaded as half4 in shared memory in BOTH paths,
+    // so half-precision rounding is identical → expect very tight match.
+    assert!(max_diff < 1e-3,
+        "fused FWHT-pre path diverges from caller-rotated reference: max_abs_diff={max_diff} (gate 1e-3)");
+    assert!(nrmse < 1e-4,
+        "fused FWHT-pre path NRMSE {nrmse} exceeds gate 1e-4");
+}
