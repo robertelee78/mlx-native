@@ -502,3 +502,142 @@ pub fn dispatch_hadamard_quantize_kv_hb(
 
     Ok(())
 }
+
+/// ADR-027 Phase B iter-14 — multi-token Hadamard-quantize KV (HB) dispatch.
+///
+/// Mirrors `dispatch_hadamard_quantize_kv_seq` (4-bit) but writes 1 byte
+/// per element via the 5/6/8-bit codebook used by `flash_attn_vec_tq_hb`.
+/// Walks `n_tokens` positions starting at `write_pos_start`, dispatching
+/// the per-position HB encode kernel with successive `src_offset`
+/// values (via `KernelArg::BufferWithOffset`).
+///
+/// Used by qwen35's prefill TQ encode loop in `gpu_full_attn::full_attn_
+/// layer_gpu` (ADR-027 Phase B iter-15) to populate `FullAttnKvSlot.tq`
+/// at all prefill positions before the first decode SDPA reads them.
+///
+/// # Arguments
+///
+/// - `src`: F32 buffer holding ≥ `(src_tok_offset + n_tokens) ×
+///   num_kv_heads × head_dim` elements (multi-token K or V, seq-major
+///   layout `[seq_len, num_kv_heads, head_dim]`).
+/// - `packed`: U8 destination, `[num_kv_heads, cache_capacity, head_dim]`.
+/// - `norms`: F32 destination, `[num_kv_heads, cache_capacity,
+///   norms_per_pos]`.
+/// - `n_tokens`: number of source tokens to encode.
+/// - `src_tok_offset`: index in `src` at which to begin reading
+///   (allows callers to encode a sub-range).
+/// - `write_pos_start`: cache slot index of the first encoded token.
+///
+/// # Errors
+///
+/// - `n_tokens == 0` → no-op (returns `Ok(())`; mirrors the 4-bit `_seq`).
+/// - `src` too small to cover `[src_tok_offset, src_tok_offset + n_tokens)`.
+/// - `head_dim` not in {256, 512}.
+/// - `codebook_bits` not in {5, 6, 8}.
+/// - For non-sliding caches: `write_pos_start + n_tokens > cache_capacity`
+///   detected per-position (matches the 4-bit `_seq` semantics).
+///
+/// # Performance notes
+///
+/// Correctness-first: dispatches one kernel launch per token. At pp2455
+/// with 30 layers this is on the order of 147k launches per prefill
+/// (mirrors the 4-bit `_seq` rationale). Promote to a 2-D dispatch
+/// shader if measured to be the bottleneck.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_hb_seq(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,
+    norms: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    if n_tokens == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_hadamard_quantize_kv_hb_seq: codebook_bits must be \
+             5, 6, or 8, got {}",
+            codebook_bits
+        )));
+    }
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_hb_d256",
+        512 => "hadamard_quantize_kv_hb_d512",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_hb_seq: head_dim {} not supported \
+                 (need 256 or 512)",
+                head_dim
+            )))
+        }
+    };
+
+    // Validate src has enough bytes to cover the requested slice.
+    let required_src = (src_tok_offset as u64 + n_tokens as u64)
+        * (num_kv_heads as u64)
+        * (head_dim as u64);
+    if (src.element_count() as u64) < required_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_hb_seq: src has {} elements but need {} \
+             (src_tok_offset={} + n_tokens={} * num_kv_heads={} * head_dim={})",
+            src.element_count(),
+            required_src,
+            src_tok_offset,
+            n_tokens,
+            num_kv_heads,
+            head_dim,
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let bytes_per_token = (num_kv_heads as u64) * (head_dim as u64) * 4; // f32
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    for i in 0..n_tokens {
+        let write_pos = write_pos_start + i;
+        if !is_sliding && write_pos >= cache_capacity {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_hb_seq: global cache write_pos({}) >= \
+                 cache_capacity({}) at seq idx {}",
+                write_pos, cache_capacity, i
+            )));
+        }
+        let params = HadamardQuantizeHbParams {
+            head_dim,
+            num_kv_heads,
+            write_pos,
+            cache_capacity,
+            is_sliding: if is_sliding { 1 } else { 0 },
+            scale_factor_d512,
+            codebook_bits,
+        };
+        let params_bytes = bytemuck::bytes_of(&params);
+        let src_offset = ((src_tok_offset + i) as u64) * bytes_per_token;
+
+        encode_threadgroups_with_args(
+            encoder,
+            pipeline,
+            &[
+                (0, KA::BufferWithOffset(src, src_offset)),
+                (1, KA::Buffer(packed)),
+                (2, KA::Buffer(norms)),
+                (3, KA::Bytes(params_bytes)),
+            ],
+            MTLSize::new(num_kv_heads as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
+    }
+
+    Ok(())
+}
