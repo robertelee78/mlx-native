@@ -323,6 +323,139 @@ pub fn dispatch_kv_cache_copy_batch_f32_to_f16(
     Ok(())
 }
 
+/// Fused single-position K + V cache copy (F32 source → F32 cache) — DECODE shape.
+///
+/// ADR-028 iter-145: collapses the 2-dispatch pattern (1× K, 1× V) into a single
+/// dispatch. Saves one kernel launch floor (~14 µs/Apple GPU) per layer per token.
+/// At gemma4 30 layers, drops 60→30 KV-copy dispatches/decode-token.
+///
+/// Source layouts: `[n_heads * head_dim]` flat F32 each (one token, all heads).
+/// Cache layouts:  `[n_heads, capacity, head_dim]` head-major F32 each.
+///
+/// Each thread copies one (K, V) element pair at the same coords; results are
+/// byte-identical to two `dispatch_kv_cache_copy_batch_f32` calls.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_batch_f32_kv_dual(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    cache_k: &MlxBuffer,
+    cache_v: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+
+    let total_src = (n_heads as u64) * (head_dim as u64);
+    if (src_k.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_batch_f32_kv_dual: src_k has {} elements but need {} (n_heads={} * head_dim={})",
+            src_k.element_count(), total_src, n_heads, head_dim
+        )));
+    }
+    if (src_v.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_batch_f32_kv_dual: src_v has {} elements but need {} (n_heads={} * head_dim={})",
+            src_v.element_count(), total_src, n_heads, head_dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_batch_f32_kv_dual", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_bytes = seq_pos.to_ne_bytes();
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src_k)),
+            (1, KernelArg::Buffer(src_v)),
+            (2, KernelArg::Buffer(cache_k)),
+            (3, KernelArg::Buffer(cache_v)),
+            (4, KernelArg::Bytes(&n_heads_bytes)),
+            (5, KernelArg::Bytes(&head_dim_bytes)),
+            (6, KernelArg::Bytes(&capacity_bytes)),
+            (7, KernelArg::Bytes(&seq_pos_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, 1),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Fused single-position K + V cache copy (F32 source → F16 cache) — DECODE shape.
+///
+/// Same as `dispatch_kv_cache_copy_batch_f32_kv_dual` but casts F32→F16 on write
+/// for the use_f16_kv branch. Halves SDPA-read bandwidth post-write.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_batch_f32_to_f16_kv_dual(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    cache_k: &MlxBuffer,
+    cache_v: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+
+    let total_src = (n_heads as u64) * (head_dim as u64);
+    if (src_k.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_batch_f32_to_f16_kv_dual: src_k has {} elements but need {} (n_heads={} * head_dim={})",
+            src_k.element_count(), total_src, n_heads, head_dim
+        )));
+    }
+    if (src_v.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_batch_f32_to_f16_kv_dual: src_v has {} elements but need {} (n_heads={} * head_dim={})",
+            src_v.element_count(), total_src, n_heads, head_dim
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_batch_f32_to_f16_kv_dual", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_bytes = seq_pos.to_ne_bytes();
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src_k)),
+            (1, KernelArg::Buffer(src_v)),
+            (2, KernelArg::Buffer(cache_k)),
+            (3, KernelArg::Buffer(cache_v)),
+            (4, KernelArg::Bytes(&n_heads_bytes)),
+            (5, KernelArg::Bytes(&head_dim_bytes)),
+            (6, KernelArg::Bytes(&capacity_bytes)),
+            (7, KernelArg::Bytes(&seq_pos_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, 1),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Multi-position, all-heads KV cache copy (F32 → F32 cache, batched prefill).
 ///
 /// Source layout: `[n_src_tokens, n_heads, head_dim]` (token-major). The

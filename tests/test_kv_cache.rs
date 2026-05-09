@@ -443,3 +443,174 @@ fn test_kv_cache_copy_seq_f32_no_wrap() {
         }
     }
 }
+
+/// ADR-028 iter-145: byte-identity test for fused single-position K+V dual.
+///
+/// Runs the new fused dispatch and the legacy 2-dispatch path on identical
+/// inputs into separate cache buffers; asserts every byte matches.
+#[test]
+fn test_kv_cache_copy_batch_f32_kv_dual_byte_identity() {
+    let (device, mut registry) = setup();
+
+    // Gemma4 decode shape: 8 KV heads × 256 head_dim, capacity=1024 (sliding).
+    let n_heads: u32 = 8;
+    let head_dim: u32 = 256;
+    let capacity: u32 = 1024;
+    let seq_pos: u32 = 333; // arbitrary slot inside capacity.
+
+    let total_src = (n_heads * head_dim) as usize;
+    let total_cache = (n_heads * capacity * head_dim) as usize;
+
+    // Generate distinct K and V source patterns.
+    let src_k_data: Vec<f32> = (0..total_src).map(|i| 1.0 + (i as f32) * 0.0011).collect();
+    let src_v_data: Vec<f32> = (0..total_src).map(|i| -2.0 - (i as f32) * 0.0017).collect();
+
+    // Allocate src + 4 caches: 2 for fused result, 2 for legacy reference.
+    let mut src_k = device
+        .alloc_buffer(total_src * 4, DType::F32, vec![total_src])
+        .expect("alloc src_k");
+    let mut src_v = device
+        .alloc_buffer(total_src * 4, DType::F32, vec![total_src])
+        .expect("alloc src_v");
+    src_k.as_mut_slice::<f32>().expect("src_k").copy_from_slice(&src_k_data);
+    src_v.as_mut_slice::<f32>().expect("src_v").copy_from_slice(&src_v_data);
+
+    let mut cache_k_fused = device
+        .alloc_buffer(total_cache * 4, DType::F32, vec![total_cache])
+        .expect("alloc cache_k_fused");
+    let mut cache_v_fused = device
+        .alloc_buffer(total_cache * 4, DType::F32, vec![total_cache])
+        .expect("alloc cache_v_fused");
+    let mut cache_k_legacy = device
+        .alloc_buffer(total_cache * 4, DType::F32, vec![total_cache])
+        .expect("alloc cache_k_legacy");
+    let mut cache_v_legacy = device
+        .alloc_buffer(total_cache * 4, DType::F32, vec![total_cache])
+        .expect("alloc cache_v_legacy");
+    // Zero all caches.
+    for buf in [&mut cache_k_fused, &mut cache_v_fused, &mut cache_k_legacy, &mut cache_v_legacy] {
+        for v in buf.as_mut_slice::<f32>().expect("zero").iter_mut() {
+            *v = 0.0;
+        }
+    }
+
+    // Fused dispatch.
+    {
+        let mut enc = device.command_encoder().expect("encoder fused");
+        kv_cache_copy::dispatch_kv_cache_copy_batch_f32_kv_dual(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &src_v, &cache_k_fused, &cache_v_fused,
+            n_heads, head_dim, capacity, seq_pos,
+        ).expect("fused");
+        enc.commit_and_wait().expect("commit fused");
+    }
+
+    // Legacy 2-dispatch reference.
+    {
+        let mut enc = device.command_encoder().expect("encoder legacy");
+        kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &cache_k_legacy,
+            n_heads, head_dim, capacity, seq_pos,
+        ).expect("legacy K");
+        kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_v, &cache_v_legacy,
+            n_heads, head_dim, capacity, seq_pos,
+        ).expect("legacy V");
+        enc.commit_and_wait().expect("commit legacy");
+    }
+
+    // Byte-identity assertion via to_bits().
+    let kf: &[f32] = cache_k_fused.as_slice::<f32>().expect("read kf");
+    let vf: &[f32] = cache_v_fused.as_slice::<f32>().expect("read vf");
+    let kl: &[f32] = cache_k_legacy.as_slice::<f32>().expect("read kl");
+    let vl: &[f32] = cache_v_legacy.as_slice::<f32>().expect("read vl");
+
+    for i in 0..total_cache {
+        assert_eq!(kf[i].to_bits(), kl[i].to_bits(),
+            "K byte mismatch at idx {}: fused={} legacy={}", i, kf[i], kl[i]);
+        assert_eq!(vf[i].to_bits(), vl[i].to_bits(),
+            "V byte mismatch at idx {}: fused={} legacy={}", i, vf[i], vl[i]);
+    }
+}
+
+/// ADR-028 iter-145: byte-identity test for fused F32→F16 single-position K+V dual.
+#[test]
+fn test_kv_cache_copy_batch_f32_to_f16_kv_dual_byte_identity() {
+    let (device, mut registry) = setup();
+
+    let n_heads: u32 = 8;
+    let head_dim: u32 = 256;
+    let capacity: u32 = 1024;
+    let seq_pos: u32 = 511;
+
+    let total_src = (n_heads * head_dim) as usize;
+    let total_cache = (n_heads * capacity * head_dim) as usize;
+
+    let src_k_data: Vec<f32> = (0..total_src).map(|i| 0.5 + (i as f32) * 0.0009).collect();
+    let src_v_data: Vec<f32> = (0..total_src).map(|i| -1.5 - (i as f32) * 0.0013).collect();
+
+    let mut src_k = device
+        .alloc_buffer(total_src * 4, DType::F32, vec![total_src])
+        .expect("alloc src_k");
+    let mut src_v = device
+        .alloc_buffer(total_src * 4, DType::F32, vec![total_src])
+        .expect("alloc src_v");
+    src_k.as_mut_slice::<f32>().expect("src_k").copy_from_slice(&src_k_data);
+    src_v.as_mut_slice::<f32>().expect("src_v").copy_from_slice(&src_v_data);
+
+    let mut cache_k_fused = device
+        .alloc_buffer(total_cache * 2, DType::F16, vec![total_cache])
+        .expect("alloc cache_k_fused");
+    let mut cache_v_fused = device
+        .alloc_buffer(total_cache * 2, DType::F16, vec![total_cache])
+        .expect("alloc cache_v_fused");
+    let mut cache_k_legacy = device
+        .alloc_buffer(total_cache * 2, DType::F16, vec![total_cache])
+        .expect("alloc cache_k_legacy");
+    let mut cache_v_legacy = device
+        .alloc_buffer(total_cache * 2, DType::F16, vec![total_cache])
+        .expect("alloc cache_v_legacy");
+    for buf in [&mut cache_k_fused, &mut cache_v_fused, &mut cache_k_legacy, &mut cache_v_legacy] {
+        for v in buf.as_mut_slice::<u16>().expect("zero").iter_mut() {
+            *v = 0;
+        }
+    }
+
+    {
+        let mut enc = device.command_encoder().expect("encoder fused");
+        kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_kv_dual(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &src_v, &cache_k_fused, &cache_v_fused,
+            n_heads, head_dim, capacity, seq_pos,
+        ).expect("fused F16");
+        enc.commit_and_wait().expect("commit fused F16");
+    }
+    {
+        let mut enc = device.command_encoder().expect("encoder legacy");
+        kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &cache_k_legacy,
+            n_heads, head_dim, capacity, seq_pos,
+        ).expect("legacy K F16");
+        kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_v, &cache_v_legacy,
+            n_heads, head_dim, capacity, seq_pos,
+        ).expect("legacy V F16");
+        enc.commit_and_wait().expect("commit legacy F16");
+    }
+
+    let kf: &[u16] = cache_k_fused.as_slice::<u16>().expect("read kf");
+    let vf: &[u16] = cache_v_fused.as_slice::<u16>().expect("read vf");
+    let kl: &[u16] = cache_k_legacy.as_slice::<u16>().expect("read kl");
+    let vl: &[u16] = cache_v_legacy.as_slice::<u16>().expect("read vl");
+
+    for i in 0..total_cache {
+        assert_eq!(kf[i], kl[i],
+            "K F16 byte mismatch at idx {}: fused=0x{:04x} legacy=0x{:04x}", i, kf[i], kl[i]);
+        assert_eq!(vf[i], vl[i],
+            "V F16 byte mismatch at idx {}: fused=0x{:04x} legacy=0x{:04x}", i, vf[i], vl[i]);
+    }
+}

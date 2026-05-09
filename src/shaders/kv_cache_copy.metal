@@ -109,6 +109,65 @@ kernel void kv_cache_copy_batch_f32_to_f16(
     cache[dst_idx] = half(src[src_idx]);
 }
 
+/// Fused K + V single-position cache copy (F32 source → F32 cache) — DECODE shape.
+///
+/// Combines two kv_cache_copy_batch_f32 dispatches (one for K, one for V) into a
+/// single kernel. Each thread copies one (K, V) element pair at the same coords.
+///
+/// Source layout: [n_heads * head_dim] flat F32 each (one token, all heads).
+/// Cache layout: [n_heads, capacity, head_dim] head-major F32 each.
+///
+/// ADR-028 iter-145: drops 2 dispatches/layer to 1 (60→30 dispatches/decode-token
+/// at gemma4 30 layers). Same shape and writes as the 2-dispatch reference;
+/// byte-identical results by construction.
+///
+/// Grid: 2D — x=element within head (head_dim), y=head index (n_heads).
+kernel void kv_cache_copy_batch_f32_kv_dual(
+    device const float* src_k     [[buffer(0)]],   // [n_heads * head_dim] flat F32 (K)
+    device const float* src_v     [[buffer(1)]],   // [n_heads * head_dim] flat F32 (V)
+    device float*       cache_k   [[buffer(2)]],   // [n_heads, capacity, head_dim] F32
+    device float*       cache_v   [[buffer(3)]],   // [n_heads, capacity, head_dim] F32
+    constant uint&     n_heads    [[buffer(4)]],
+    constant uint&     head_dim   [[buffer(5)]],
+    constant uint&     capacity   [[buffer(6)]],
+    constant uint&     seq_pos    [[buffer(7)]],   // write position (already wrapped)
+    uint2 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    if (head >= n_heads || elem >= head_dim) return;
+
+    uint src_idx = head * head_dim + elem;
+    uint dst_idx = head * capacity * head_dim + seq_pos * head_dim + elem;
+    cache_k[dst_idx] = src_k[src_idx];
+    cache_v[dst_idx] = src_v[src_idx];
+}
+
+/// Fused K + V single-position cache copy (F32 source → F16 cache) — DECODE shape.
+///
+/// Same as kv_cache_copy_batch_f32_kv_dual but casts F32→F16 on write —
+/// for the use_f16_kv branch.
+kernel void kv_cache_copy_batch_f32_to_f16_kv_dual(
+    device const float* src_k     [[buffer(0)]],
+    device const float* src_v     [[buffer(1)]],
+    device half*        cache_k   [[buffer(2)]],
+    device half*        cache_v   [[buffer(3)]],
+    constant uint&     n_heads    [[buffer(4)]],
+    constant uint&     head_dim   [[buffer(5)]],
+    constant uint&     capacity   [[buffer(6)]],
+    constant uint&     seq_pos    [[buffer(7)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    if (head >= n_heads || elem >= head_dim) return;
+
+    uint src_idx = head * head_dim + elem;
+    uint dst_idx = head * capacity * head_dim + seq_pos * head_dim + elem;
+    cache_k[dst_idx] = half(src_k[src_idx]);
+    cache_v[dst_idx] = half(src_v[src_idx]);
+}
+
 /// Multi-position, all-heads KV cache copy (F32 source → F32 cache).
 ///
 /// Source layout: [n_src_tokens, n_heads, head_dim] — token-major, from
