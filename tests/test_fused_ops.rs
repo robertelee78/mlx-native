@@ -666,3 +666,123 @@ fn bench_fused_norm_add_f32_gemma_decode() {
     eprintln!("[BENCH iter-101]     If GPU pure/call <1 µs: dispatch-bound, vec4 cannot help.");
     eprintln!("[BENCH iter-101]     If GPU pure/call >5 µs: vec4 ROI test needed.");
 }
+
+// --------------------------------------------------------------------------
+// ADR-028 iter-102 — FWHT pre/undo GPU pure-kernel time at gemma decode
+// shape (num_heads=16, head_dim=256). Hypothesis: 16 simdgroups × 256 floats
+// is dispatch-bound (well below the 16 µs GPU pipelined floor per iter-90).
+// Confirms the ROI ceiling for fusing FWHTs into FA-vec-tq-hb (item #19,
+// iter-98 #1, projected ~6% decode = 60 dispatches/token saved).
+//
+// Run:
+//   cargo test --release --test test_fused_ops \
+//     bench_fwht_sign_premult_gemma_decode -- --ignored --nocapture
+// --------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn bench_fwht_sign_premult_gemma_decode() {
+    use mlx_native::ops::fwht_standalone as fwht;
+    use std::time::Instant;
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+
+    let num_heads: u32 = 16; // gemma-4-26b
+    let head_dim: u32 = 256; // gemma-4-26b
+    let n = (num_heads * head_dim) as usize;
+    let f32_sz = std::mem::size_of::<f32>();
+
+    let q_data = pseudo_random_f32(0xF1, n);
+    let mut q_buf = device.alloc_buffer(n * f32_sz, DType::F32, vec![n]).unwrap();
+    q_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&q_data);
+
+    // Warmup — both pre+undo to populate Metal pipeline cache.
+    for _ in 0..16 {
+        let mut enc = device.command_encoder().unwrap();
+        fwht::dispatch_fwht_sign_premult_f32(&mut enc, &mut registry, device.metal_device(),
+            &q_buf, num_heads, head_dim).unwrap();
+        fwht::dispatch_fwht_sign_undo_f32(&mut enc, &mut registry, device.metal_device(),
+            &q_buf, num_heads, head_dim).unwrap();
+        enc.commit_and_wait().unwrap();
+    }
+
+    let pct = |xs: &mut Vec<f64>, q: usize| -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[q]
+    };
+
+    // Per-call isolated for sign_premult.
+    const N_TRIALS: usize = 100;
+    let mut cpu_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    let mut gpu_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    for _ in 0..N_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        fwht::dispatch_fwht_sign_premult_f32(&mut enc, &mut registry, device.metal_device(),
+            &q_buf, num_heads, head_dim).unwrap();
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        cpu_us.push(dt.as_secs_f64() * 1e6);
+        gpu_us.push((ge - gs) * 1e6);
+    }
+
+    eprintln!("[BENCH iter-102] fwht_sign_premult_f32 num_heads=16 head_dim=256");
+    eprintln!("[BENCH iter-102]   PER-CALL ISOLATED ({} trials):", N_TRIALS);
+    let cp50 = pct(&mut cpu_us, N_TRIALS / 2);
+    let gp50 = pct(&mut gpu_us, N_TRIALS / 2);
+    eprintln!("[BENCH iter-102]     CPU wall p50 = {:7.2} µs", cp50);
+    eprintln!("[BENCH iter-102]     GPU pure p50 = {:7.2} µs", gp50);
+
+    // Session-60: 60 FWHT calls (30 layers × 2 = pre+undo) in ONE encoder.
+    const N_SESSION_CALLS: usize = 60;
+    const N_SESSION_TRIALS: usize = 20;
+
+    for _ in 0..3 { // warmup
+        let mut enc = device.command_encoder().unwrap();
+        for i in 0..N_SESSION_CALLS {
+            if i % 2 == 0 {
+                fwht::dispatch_fwht_sign_premult_f32(&mut enc, &mut registry,
+                    device.metal_device(), &q_buf, num_heads, head_dim).unwrap();
+            } else {
+                fwht::dispatch_fwht_sign_undo_f32(&mut enc, &mut registry,
+                    device.metal_device(), &q_buf, num_heads, head_dim).unwrap();
+            }
+        }
+        enc.commit_and_wait().unwrap();
+    }
+
+    let mut sess_cpu: Vec<f64> = Vec::with_capacity(N_SESSION_TRIALS);
+    let mut sess_gpu: Vec<f64> = Vec::with_capacity(N_SESSION_TRIALS);
+    for _ in 0..N_SESSION_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        for i in 0..N_SESSION_CALLS {
+            if i % 2 == 0 {
+                fwht::dispatch_fwht_sign_premult_f32(&mut enc, &mut registry,
+                    device.metal_device(), &q_buf, num_heads, head_dim).unwrap();
+            } else {
+                fwht::dispatch_fwht_sign_undo_f32(&mut enc, &mut registry,
+                    device.metal_device(), &q_buf, num_heads, head_dim).unwrap();
+            }
+        }
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        sess_cpu.push(dt.as_secs_f64() * 1e6);
+        sess_gpu.push((ge - gs) * 1e6);
+    }
+
+    let scp50 = pct(&mut sess_cpu, N_SESSION_TRIALS / 2);
+    let sgp50 = pct(&mut sess_gpu, N_SESSION_TRIALS / 2);
+    eprintln!("[BENCH iter-102]   SESSION-60 ({} trials, 60 dispatches/encoder):", N_SESSION_TRIALS);
+    eprintln!("[BENCH iter-102]     CPU wall p50 = {:7.2} µs ({:5.2} µs/call)",
+              scp50, scp50 / N_SESSION_CALLS as f64);
+    eprintln!("[BENCH iter-102]     GPU pure p50 = {:7.2} µs ({:5.2} µs/call)",
+              sgp50, sgp50 / N_SESSION_CALLS as f64);
+    eprintln!("[BENCH iter-102]     Per-token contribution (60 calls): {:.2} ms",
+              scp50 / 1000.0);
+    eprintln!("[BENCH iter-102]   ROI ceiling (item #19 fuse-FWHT-into-FA):");
+    eprintln!("[BENCH iter-102]     If session GPU pure/call >0.5 µs: full 6% achievable");
+    eprintln!("[BENCH iter-102]     If session GPU pure/call <0.1 µs: kernel work itself");
+    eprintln!("[BENCH iter-102]     is at floor; saved time = (16 µs floor) × 60 = 960 µs.");
+}
