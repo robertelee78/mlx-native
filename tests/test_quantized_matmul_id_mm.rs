@@ -561,3 +561,139 @@ fn test_q4_0_mm_id_sparse_experts() {
         "Q4_0 mm_id sparse experts, 16 tokens x 64 experts top_k=8",
     );
 }
+
+// ==========================================================================
+// ADR-028 iter-94 — per-call timing harness for Q6_K mv_id at gemma decode
+// shape (n_tokens=1, top_k=8). Establishes baseline for kernel-level
+// optimization A/B testing in iter-95+.
+//
+// Hypothesis: per iter-90, hf2q decode = 15.86 µs/dispatch, llama.cpp
+// decode (FA=1, gemma APEX-Q5_K_M) = 11.22 µs/dispatch — 30% slower per
+// dispatch. Per-call instrumentation here measures Q6_K mv_id specifically
+// (the dominant gemma-MoE matmul kernel).
+//
+// Shape derivation (from /opt/hf2q/src/serve/config.rs:100):
+//   gemma-4-26b-A4B-IT defaults: hidden=2816, moe_intermediate=704,
+//   n_experts=128, top_k=8.
+//
+// Run with:
+//   cargo test --release --test test_quantized_matmul_id_mm \
+//     -- --ignored bench_q6_k_mv_id_gemma_decode --nocapture
+//
+// Reports median + p10/p50/p90 ms/call over N=200 trials with 20 warmup.
+// Uses commit_and_wait for hard sync per-iteration (matches per-dispatch
+// overhead measurement; not amortized over a session).
+
+#[test]
+#[ignore]
+fn bench_q6_k_mv_id_gemma_decode_gate_up() {
+    bench_q6_k_mv_id_one_shape(
+        /* label = */ "Q6_K mv_id gemma decode gate_up: n=704, k=2816, n_experts=128, top_k=8",
+        /* n     = */ 704,
+        /* k     = */ 2816,
+    );
+}
+
+// Note: gemma's down projection has K=moe_intermediate=704 which is NOT
+// divisible by Q6_K block size (QK_K=256). Real gemma down_exps may be
+// stored as Q5_1/Q4_K with different block size, or padded — needs
+// model inspection. Iter-95+ candidate.
+
+fn bench_q6_k_mv_id_one_shape(label: &str, n: usize, k: usize) {
+    use std::time::Instant;
+
+    let n_tokens: usize = 1;
+    let top_k: usize = 8;
+    let n_experts: usize = 128;
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let f32_sz = std::mem::size_of::<f32>();
+    let u32_sz = std::mem::size_of::<u32>();
+
+    // Inputs.
+    let input_data = pseudo_random_f32(0x5E5EED, n_tokens * k);
+    let mut expert_packed = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let w = pseudo_random_f32(1000 + e as u64, n * k);
+        expert_packed.push(pack_q6_k(&w));
+    }
+    let (stacked_bytes, per_expert_bytes) = stack_expert_weights(&expert_packed);
+
+    // Routing: top_k=8 distinct experts.
+    let mut ids: Vec<u32> = Vec::with_capacity(n_tokens * top_k);
+    for s in 0..top_k {
+        ids.push(((s * 17 + 7) % n_experts) as u32);
+    }
+
+    let total_rows = n_tokens * top_k;
+
+    let mut input_buf = device
+        .alloc_buffer(n_tokens * k * f32_sz, DType::F32, vec![n_tokens, k])
+        .unwrap();
+    input_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&input_data);
+
+    let mut weight_buf = device
+        .alloc_buffer(stacked_bytes.len(), DType::U8, vec![stacked_bytes.len()])
+        .unwrap();
+    weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&stacked_bytes);
+
+    let mut ids_buf = device
+        .alloc_buffer(ids.len() * u32_sz, DType::U32, vec![ids.len()])
+        .unwrap();
+    ids_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
+
+    let mut output_buf = device
+        .alloc_buffer(total_rows * n * f32_sz, DType::F32, vec![total_rows, n])
+        .unwrap();
+
+    let params = GgmlQuantizedMatmulIdParams {
+        n_tokens: n_tokens as u32,
+        top_k: top_k as u32,
+        n: n as u32,
+        k: k as u32,
+        n_experts: n_experts as u32,
+        expert_stride: per_expert_bytes as u64,
+        ggml_type: GgmlType::Q6_K,
+    };
+
+    // Warmup (compile pipeline + warm caches).
+    const WARMUP: usize = 20;
+    for _ in 0..WARMUP {
+        let mut enc = device.command_encoder().unwrap();
+        mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
+            &mut enc, &mut registry, &device,
+            &input_buf, &weight_buf, &ids_buf, &mut output_buf,
+            &params,
+        ).unwrap();
+        enc.commit_and_wait().unwrap();
+    }
+
+    // Measurement.
+    const N_TRIALS: usize = 200;
+    let mut times_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    for _ in 0..N_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
+            &mut enc, &mut registry, &device,
+            &input_buf, &weight_buf, &ids_buf, &mut output_buf,
+            &params,
+        ).unwrap();
+        enc.commit_and_wait().unwrap();
+        let dt = t0.elapsed();
+        times_us.push(dt.as_secs_f64() * 1e6);
+    }
+
+    times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p10 = times_us[N_TRIALS / 10];
+    let p50 = times_us[N_TRIALS / 2];
+    let p90 = times_us[(N_TRIALS * 9) / 10];
+
+    eprintln!("[BENCH] {}", label);
+    eprintln!("[BENCH]   p10 = {:7.2} µs  p50 = {:7.2} µs  p90 = {:7.2} µs",
+              p10, p50, p90);
+    eprintln!("[BENCH]   per-token (×60 calls)  median estimate = {:6.2} ms",
+              p50 * 60.0 / 1000.0);
+}
