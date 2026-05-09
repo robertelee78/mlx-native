@@ -44,6 +44,13 @@ pub struct FlashAttnVecTqHbParams {
     pub scale_factor_d512: f32,
     /// Codebook bit-width: 5, 6, or 8.
     pub codebook_bits: u32,
+    /// ADR-028 iter-106: when 1, the kernel applies FWHT-pre internally on Q
+    /// (sign-premult + simd-shuffle butterfly + 1/sqrt(d) normalize). When 0
+    /// (default — production-byte-identical), the caller must pre-rotate Q
+    /// via `dispatch_fwht_sign_premult_f32` before this call.
+    /// Setting this to 1 eliminates one dispatch + one forced memory_barrier
+    /// per layer (~9% decode lever per ADR-028 iter-104).
+    pub fuse_fwht_pre: u32,
 }
 
 /// GPU-side parameter struct. Must match `FlashAttnVecTqHbParams` in the MSL exactly.
@@ -63,6 +70,7 @@ struct FlashAttnVecTqHbParamsGpu {
     ring_start: u32,
     scale_factor_d512: f32,
     codebook_bits: u32,
+    fuse_fwht_pre: u32,
 }
 
 /// GPU-side reduce params. Reuses the same reduce kernel as flash_attn_vec_tq.
@@ -161,6 +169,7 @@ pub fn flash_attn_vec_tq_hb(
         ring_start: params.ring_start,
         scale_factor_d512: params.scale_factor_d512,
         codebook_bits: params.codebook_bits,
+        fuse_fwht_pre: params.fuse_fwht_pre,
     };
 
     let kernel_name = match head_dim {
@@ -251,8 +260,8 @@ mod tests {
 
     #[test]
     fn test_gpu_params_size() {
-        // 13 fields × 4 bytes = 52 bytes
-        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 52);
+        // ADR-028 iter-106: 14 fields × 4 bytes = 56 bytes (added fuse_fwht_pre)
+        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 56);
     }
 
     #[test]

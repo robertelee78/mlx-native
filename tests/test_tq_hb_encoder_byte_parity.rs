@@ -497,6 +497,7 @@ fn run_sdpa_kernel_vs_oracle(
         ring_start: 0,
         scale_factor_d512: 1.0,
         codebook_bits: bits,
+        fuse_fwht_pre: 0, // ADR-028 iter-106: caller-rotated Q (oracle expects rotated)
     };
 
     let mut encoder = device.command_encoder().expect("encoder");
@@ -697,6 +698,7 @@ fn bench_one_kvseqlen(
         num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
         scale, mask_type: 0, sliding_window: 0, softcap: 0.0,
         ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
+        fuse_fwht_pre: 0,
     };
 
     let dispatch_fa = |encoder: &mut mlx_native::CommandEncoder, registry: &mut KernelRegistry| {

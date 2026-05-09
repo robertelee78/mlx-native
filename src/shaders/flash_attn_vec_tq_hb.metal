@@ -39,6 +39,7 @@ struct FlashAttnVecTqHbParams {
     uint  ring_start;
     float scale_factor_d512;  // for D=512 norm dequant
     uint  codebook_bits;      // 5, 6, or 8 (runtime selector)
+    uint  fuse_fwht_pre;      // ADR-028 iter-106: 0=caller-rotated Q, 1=kernel applies FWHT-pre
 };
 
 // Reduce params — shared with flash_attn_vec.
@@ -202,6 +203,65 @@ inline float4 dequant_hb_float4(
 }
 
 // ---------------------------------------------------------------------------
+// ADR-028 iter-106 FWHT-pre fusion helpers (Prong A of item #19).
+// Inlined from fwht_standalone.metal so the FA kernel can apply Q rotation
+// in-kernel and eliminate the 30-call FWHT-pre dispatch + its forced
+// memory_barrier per layer (~1.44 ms/token = 9% of decode).
+// Tables MUST match fwht_standalone.metal byte-for-byte.
+// ---------------------------------------------------------------------------
+constant uint8_t TBQ_SIGNS_256_FA[32] = {
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+};
+constant uint8_t TBQ_SIGNS_512_FA[64] = {
+    0xa7,0x3b,0x91,0xf4,0x6d,0xc2,0x58,0x0e,
+    0xb3,0x7f,0x24,0xd6,0x89,0x45,0xea,0x1c,
+    0x63,0xaf,0xd8,0x52,0x97,0x0b,0xe1,0x3d,
+    0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
+    0xd3,0x4e,0xa8,0x17,0x9c,0x5b,0xe6,0x31,
+    0x72,0xb9,0x0d,0xf5,0x43,0x8a,0x6e,0xc7,
+    0x58,0x2f,0x94,0xe1,0xb6,0x3d,0x0a,0x7c,
+    0xc5,0x61,0xd8,0x4f,0xa3,0x97,0x1e,0x85,
+};
+
+inline void butterfly_local_fa(thread float &a, thread float &b) {
+    float sum = a + b;
+    float diff = a - b;
+    a = sum;
+    b = diff;
+}
+
+template<ushort EPT>
+inline void fwht_simd_fa(thread float *elems, uint lane) {
+    for (ushort h = 1; h < EPT; h <<= 1) {
+        for (ushort i = 0; i < EPT; i++) {
+            ushort partner = i ^ h;
+            if (partner > i) {
+                butterfly_local_fa(elems[i], elems[partner]);
+            }
+        }
+    }
+    for (ushort delta = 1; delta < 32; delta <<= 1) {
+        for (ushort i = 0; i < EPT; i++) {
+            float partner_val = simd_shuffle_xor(elems[i], delta);
+            if (lane & delta) {
+                elems[i] = partner_val - elems[i];
+            } else {
+                elems[i] = elems[i] + partner_val;
+            }
+        }
+    }
+}
+
+// Runtime selector via params field (added in iter-106): 0 = caller-rotated Q
+// (production default, byte-identical to pre-iter-106), 1 = kernel applies
+// FWHT-pre internally. Branch is uniform across the WG (all threads see the
+// same params.fuse_fwht_pre); the Metal compiler hoists it out of the
+// per-thread loop so cost is ~zero runtime overhead.
+
+// ---------------------------------------------------------------------------
 // Main kernel: native HB (higher-bit) TQ flash attention vector.
 //
 // Same structure as flash_attn_vec_tq_impl but reads from byte-packed K/V.
@@ -257,13 +317,57 @@ kernel void flash_attn_vec_tq_hb_impl(
     threadgroup float  *ss  = (threadgroup float  *)(shmem + PK);
     threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + SH);
 
-    // Load pre-rotated Q into shared memory as half4.
-    for (ushort i = tiisg; i < PK4; i += NW) {
-        if (i < DK4) {
-            float4 qval = *((device const float4 *)(Q + iq2 * DK + i * 4));
-            sq4[i] = half4(qval);
-        } else {
+    // ADR-028 iter-106: Q-load split between two paths via FUSE_FWHT_PRE
+    // function constant. Default path (caller-rotated) preserved unchanged;
+    // fused path (kernel applies FWHT-pre internally) eliminates the
+    // standalone fwht_sign_premult_f32 dispatch + its forced barrier.
+    if (params.fuse_fwht_pre != 0u) {
+        // Each thread loads EPT contiguous elements, applies sign-premult +
+        // FWHT (simd-shuffle butterfly) + 1/sqrt(d) normalization, then
+        // stores 2 half4 cells in the strided shared-memory layout the
+        // K-loop expects. Matches fwht_sign_premult_fast<DK> byte-for-byte.
+        constexpr ushort EPT = DK / 32;  // 8 for D=256, 16 for D=512
+        const uint base = iq2 * DK + tiisg * EPT;
+        float elems[EPT];
+        for (ushort i = 0; i < EPT; i++) {
+            elems[i] = Q[base + i];
+        }
+        // D1 sign pre-mult (BEFORE FWHT).
+        for (ushort i = 0; i < EPT; i++) {
+            ushort j = tiisg * EPT + i;
+            uint8_t sign_byte = (DK == 256) ? TBQ_SIGNS_256_FA[j >> 3] : TBQ_SIGNS_512_FA[j >> 3];
+            float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+            elems[i] *= sign_val;
+        }
+        // FWHT + normalize.
+        fwht_simd_fa<EPT>(elems, (uint)tiisg);
+        const float inv_sqrt_d = rsqrt(float(DK));
+        for (ushort i = 0; i < EPT; i++) {
+            elems[i] *= inv_sqrt_d;
+        }
+        // Store as half4 in strided layout: thread tiisg writes sq4 indices
+        // [tiisg * (EPT/4), tiisg * (EPT/4) + 1, ...]. For EPT=8 that's 2
+        // contiguous cells per thread covering sq4[0..63] for D=256.
+        constexpr ushort SQ4_PER_THREAD = EPT / 4;
+        for (ushort q = 0; q < SQ4_PER_THREAD; q++) {
+            ushort sq_idx = tiisg * SQ4_PER_THREAD + q;
+            sq4[sq_idx] = half4(elems[q*4 + 0], elems[q*4 + 1],
+                                elems[q*4 + 2], elems[q*4 + 3]);
+        }
+        // Zero-pad if PK4 > DK4 (only for non-power-of-2 DK; not hit at
+        // DK=256 or DK=512 today, but guard preserved for future shapes).
+        for (ushort i = tiisg + DK4; i < PK4; i += NW) {
             sq4[i] = half4(0.0h);
+        }
+    } else {
+        // Caller-rotated path (production default — Q already FWHT'd).
+        for (ushort i = tiisg; i < PK4; i += NW) {
+            if (i < DK4) {
+                float4 qval = *((device const float4 *)(Q + iq2 * DK + i * 4));
+                sq4[i] = half4(qval);
+            } else {
+                sq4[i] = half4(0.0h);
+            }
         }
     }
 
