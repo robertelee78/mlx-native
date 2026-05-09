@@ -598,6 +598,117 @@ fn sdpa_kernel_vs_oracle_d256_production_shape_gemma4_26b() {
         "F-0 falsifier TRIPPED (Gemma 4 production shape): NRMSE {nrmse} > {FALSIFIER_NRMSE_GATE}");
 }
 
+/// ADR-028 iter-127c Path D — NSG ∈ {1, 2, 4} mathematical equivalence.
+///
+/// Online softmax merge across simdgroups is mathematically associative:
+/// the combined (S, M, so) of NSG simdgroups, each owning a strided slice
+/// of K-blocks, must equal the single-simdgroup (NSG=1) result up to
+/// floating-point summation-order epsilon.
+///
+/// Tolerance: 5e-4 max_abs_diff at the kernel output. Float summation
+/// order changes contribute ~ulp × num_terms = 1.19e-7 × 32 K-positions
+/// ≈ 4e-6 worst case per output element; we set the gate at 5e-4 to be
+/// generous (TQ codebook quantization is the dominant noise source, not
+/// summation order, so the budget is permissive).
+fn run_nsg_equivalence(
+    bits: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    kv_seq_len: u32,
+    seed: u64,
+) {
+    use mlx_native::DType;
+    use mlx_native::ops::{flash_attn_vec_tq_hb, hadamard_quantize_kv, flash_attn_vec};
+
+    let head_dim = 256u32;
+    let nh = num_heads as usize;
+    let nkv = num_kv_heads as usize;
+    let kvl = kv_seq_len as usize;
+    let hd = head_dim as usize;
+    let kv_capacity = kv_seq_len;
+
+    let device = MlxDevice::new().expect("MlxDevice");
+    let mut registry = KernelRegistry::new();
+    hadamard_quantize_kv::register(&mut registry);
+    flash_attn_vec_tq_hb::register(&mut registry);
+    flash_attn_vec::register(&mut registry);
+
+    let (k_packed, k_norms, v_packed, v_norms) =
+        build_gpu_encoded_cache_d256(&device, &mut registry, num_kv_heads, kv_seq_len, bits, seed);
+
+    let mut q_rotated = gaussian_vec(seed.wrapping_mul(13), nh * hd);
+    for h in 0..nh {
+        let s = h * hd;
+        fwht_inplace(&mut q_rotated[s..s + hd]).expect("fwht");
+    }
+
+    let mut q_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+    q_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&q_rotated);
+
+    let mut k_packed_buf = device.alloc_buffer(k_packed.len(), DType::U8, vec![nkv, kvl, hd]).unwrap();
+    k_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&k_packed);
+    let mut k_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv * kvl]).unwrap();
+    k_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_norms);
+    let mut v_packed_buf = device.alloc_buffer(v_packed.len(), DType::U8, vec![nkv, kvl, hd]).unwrap();
+    v_packed_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&v_packed);
+    let mut v_norms_buf = device.alloc_buffer(nkv * kvl * 4, DType::F32, vec![nkv * kvl]).unwrap();
+    v_norms_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_norms);
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let tmp_bytes = flash_attn_vec_tq_hb::tmp_buffer_bytes(num_heads, head_dim);
+
+    let mut run_at_nsg = |nsg: u32| -> Vec<f32> {
+        let output_buf = device.alloc_buffer(nh * hd * 4, DType::F32, vec![nh, 1, hd]).unwrap();
+        let tmp_buf = device.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4]).unwrap();
+        let params = flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+            num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+            scale, mask_type: 0, sliding_window: 0, softcap: 0.0,
+            ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
+            fuse_fwht_pre: 0,
+            nsg,
+        };
+        let mut encoder = device.command_encoder().unwrap();
+        flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+            &mut encoder, &mut registry, &device,
+            &q_buf, &k_packed_buf, &k_norms_buf, &v_packed_buf, &v_norms_buf,
+            &output_buf, &tmp_buf, &params,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+        output_buf.as_slice::<f32>().unwrap().to_vec()
+    };
+
+    let ref_nsg1 = run_at_nsg(1);
+
+    for nsg in [2u32, 4u32] {
+        let out = run_at_nsg(nsg);
+        let max_abs_diff = ref_nsg1.iter().zip(out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_abs_diff < 5e-4,
+            "NSG={nsg} vs NSG=1 differ by {max_abs_diff} (kL={kv_seq_len}, bits={bits}, heads={num_heads})");
+    }
+}
+
+#[test]
+fn nsg_equivalence_kL64_8bit_simple() {
+    // K_blocks=2 at kL=64 (C=32). NSG=2 → 1 K-block each, NSG=4 → 0.5 each
+    // (some simdgroups idle). Smallest meaningful test.
+    run_nsg_equivalence(8, 4, 2, 64, 0xC0DE_BA51);
+}
+
+#[test]
+fn nsg_equivalence_kL128_8bit() {
+    // K_blocks=4. NSG=4 → 1 K-block each. Clean divide.
+    run_nsg_equivalence(8, 4, 2, 128, 0xC0DE_BA52);
+}
+
+#[test]
+fn nsg_equivalence_kL1024_8bit_gemma_shape() {
+    // Gemma sliding-window upper bound. K_blocks=32. NSG=2 → 16 K-blocks/sg,
+    // NSG=4 → 8. Production-relevant scaling.
+    run_nsg_equivalence(8, 16, 8, 1024, 0xC0DE_BA53);
+}
+
 #[test]
 fn d256_gpu_bytes_roundtrip_via_oracle_meets_gate_a() {
     let (device, mut registry) = setup();

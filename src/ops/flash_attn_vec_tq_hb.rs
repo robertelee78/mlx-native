@@ -141,9 +141,12 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
             params.nsg
         )));
     }
-    if params.nsg > 32 {
+    // ADR-028 iter-127c: kernel reduce uses a fixed-size NSG_MAX=4 stack array
+    // for per-simdgroup rescale factors. Tighten validation to match the
+    // kernel-side cap. llama.cpp also caps at nsg=4 (`ggml-metal-ops.cpp:2954`).
+    if params.nsg > 4 {
         return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_tq_hb: nsg must be ≤ 32 (Apple Metal threadgroup-size cap), got {}",
+            "flash_attn_vec_tq_hb: nsg must be ≤ 4 (kernel reduce cap), got {}",
             params.nsg
         )));
     }
@@ -414,7 +417,9 @@ mod tests {
 
     #[test]
     fn test_validate_nsg_non_pow2_rejected() {
-        for nsg in [3u32, 5, 6, 7, 9, 31, 33] {
+        // ADR-028 iter-127c: cap tightened to ≤ 4 (kernel NSG_MAX). Test
+        // covers non-pow2 in [1, 4], plus the > 4 cap rejection.
+        for nsg in [3u32, 5, 6, 7, 9, 16, 31, 33] {
             let p = FlashAttnVecTqHbParams {
                 num_heads: 8, num_kv_heads: 4, head_dim: 256,
                 kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
@@ -422,13 +427,14 @@ mod tests {
                 scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
                 nsg,
             };
-            assert!(validate_params(&p).is_err(), "nsg={nsg} must reject (not pow-2 or > 32)");
+            assert!(validate_params(&p).is_err(), "nsg={nsg} must reject (not pow-2 or > 4)");
         }
     }
 
     #[test]
     fn test_validate_nsg_pow2_accepted() {
-        for nsg in [1u32, 2, 4, 8, 16, 32] {
+        // ADR-028 iter-127c: only {1, 2, 4} accepted (matches kernel cap).
+        for nsg in [1u32, 2, 4] {
             let p = FlashAttnVecTqHbParams {
                 num_heads: 8, num_kv_heads: 4, head_dim: 256,
                 kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
@@ -436,7 +442,7 @@ mod tests {
                 scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
                 nsg,
             };
-            assert!(validate_params(&p).is_ok(), "nsg={nsg} (pow-2 ≤ 32) must accept");
+            assert!(validate_params(&p).is_ok(), "nsg={nsg} (pow-2 ≤ 4) must accept");
         }
     }
 

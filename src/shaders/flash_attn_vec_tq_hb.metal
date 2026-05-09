@@ -575,7 +575,7 @@ kernel void flash_attn_vec_tq_hb_impl(
         }
     }
 
-    // Store M and S for the reduce kernel.
+    // Store M and S for the reduce kernel (each simdgroup writes to its own bank).
     if (tiisg == 0) {
         ss[0] = S;
         ss[1] = M;
@@ -583,6 +583,59 @@ kernel void flash_attn_vec_tq_hb_impl(
 
     so4 -= tiisg;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Cross-simdgroup online-softmax reduce (ADR-028 iter-127c Path D) ----
+    //
+    // At NSG=1: skipped — sgitg=0 has the only (S, M, so), write proceeds.
+    // At NSG>1: simdgroup 0 reads all NSG banks of (S_j, M_j, so_j), computes
+    //   M_global = max(M_j)
+    //   ms_j     = exp(M_j - M_global)
+    //   S_total  = Σ S_j * ms_j
+    //   so_total = Σ so_j * ms_j
+    // Then overwrites simdgroup 0's bank (S, M, so4) with the merged values.
+    // Existing per-WG write below uses the merged values.
+    //
+    // NSG_MAX=4 to bound the per-thread `ms_arr` static array (matches
+    // llama.cpp's policy `nsg ∈ {1, 2, 4}` capped at 4).
+    if (NSG > 1u && sgitg == 0) {
+        constexpr ushort NSG_MAX = 4;
+        float ms_arr[NSG_MAX];
+        float M_global = -FLT_MAX / 2;
+        // Pass 1: compute M_global across NSG simdgroups.
+        for (ushort j = 0; j < NSG; ++j) {
+            threadgroup const float *ssj = (threadgroup const float *)(shmem + PK + (uint)j * SH);
+            M_global = max(M_global, ssj[1]);
+        }
+        // Pass 2: compute per-simdgroup rescale + accumulate S_total.
+        float S_total = 0.0f;
+        for (ushort j = 0; j < NSG; ++j) {
+            threadgroup const float *ssj = (threadgroup const float *)(shmem + PK + (uint)j * SH);
+            const float M_j = ssj[1];
+            const float S_j = ssj[0];
+            ms_arr[j] = exp(M_j - M_global);
+            S_total += S_j * ms_arr[j];
+        }
+        // Pass 3: accumulate so banks into simdgroup 0's so4. Each thread of
+        // simdgroup 0 strides DV4 with step NW=32 (matches the existing write
+        // loop pattern below).
+        for (ushort i = tiisg; i < DV4; i += NW) {
+            float4 acc = float4(0.0f);
+            for (ushort j = 0; j < NSG; ++j) {
+                threadgroup const float4 *so4_j = (threadgroup const float4 *)(shmem + PK + NSG * SH + (uint)j * 2u * PV);
+                acc += so4_j[i] * ms_arr[j];
+            }
+            so4[i] = acc;
+        }
+        // Update local S, M scalars for the write logic below. Only thread 0
+        // commits to ss[0..2]; sgitg==0 already gates this whole block.
+        if (tiisg == 0) {
+            ss[0] = S_total;
+            ss[1] = M_global;
+        }
+        S = S_total;
+        M = M_global;
+        // No barrier needed — only simdgroup 0 reads so4 below.
+    }
 
     // ---- Write output ----
     if (sgitg == 0) {
