@@ -895,3 +895,119 @@ fn fused_fwht_pre_byte_parity_d256_8bit() {
     assert!(nrmse < 1e-4,
         "fused FWHT-pre path NRMSE {nrmse} exceeds gate 1e-4");
 }
+
+// --------------------------------------------------------------------------
+// ADR-028 iter-111 — KV TQ-HB encode bench at gemma-4-26b decode shape.
+//
+// Closes the per-token decode budget. Per iter-98 dispatch breakdown:
+//   KV TQ-HB encode = 4 calls/layer × 30 = 120 calls/token
+//
+// Each call runs 1 simdgroup per KV head: at decode num_kv_heads=8, that's
+// 8 simdgroups in 8 threadgroups doing sign + FWHT + 8-bit codebook on
+// 1 row of K (or V) per call.
+//
+// Run:
+//   cargo test --release --test test_tq_hb_encoder_byte_parity \
+//     bench_iter111_kv_tq_hb_encode -- --ignored --nocapture
+// --------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn bench_iter111_kv_tq_hb_encode() {
+    use std::time::Instant;
+
+    let num_kv_heads: u32 = 8;
+    let head_dim: u32 = 256;
+    let cache_capacity: u32 = 1024;
+    let codebook_bits: u32 = 8;
+
+    let nkv = num_kv_heads as usize;
+    let cap = cache_capacity as usize;
+    let hd = head_dim as usize;
+    let f32_sz = std::mem::size_of::<f32>();
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    hadamard_quantize_kv::register(&mut registry);
+
+    // Source: 1 token × num_kv_heads × head_dim (decode-shape input).
+    let src_data = gaussian_vec(0xCAFEBEEF, nkv * hd);
+    let mut src_buf = device.alloc_buffer(nkv * hd * f32_sz, DType::F32, vec![nkv, hd]).unwrap();
+    src_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&src_data);
+
+    // Output buffers sized to fit the cache.
+    let packed_buf = device.alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd]).unwrap();
+    let norms_buf = device.alloc_buffer(nkv * cap * f32_sz, DType::F32, vec![nkv * cap]).unwrap();
+
+    let dispatch_one = |encoder: &mut mlx_native::CommandEncoder,
+                        registry: &mut KernelRegistry,
+                        write_pos: u32| {
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+            encoder, registry, device.metal_device(),
+            &src_buf, &packed_buf, &norms_buf,
+            num_kv_heads, head_dim, cache_capacity,
+            write_pos, false, 1.0, codebook_bits,
+        ).unwrap();
+    };
+
+    // Warmup
+    for i in 0..8 {
+        let mut enc = device.command_encoder().unwrap();
+        dispatch_one(&mut enc, &mut registry, i);
+        enc.commit_and_wait().unwrap();
+    }
+
+    let pct = |xs: &mut Vec<f64>, q: usize| -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[q]
+    };
+
+    // Per-call isolated.
+    const N_TRIALS: usize = 100;
+    let mut cpu_us = Vec::with_capacity(N_TRIALS);
+    let mut gpu_us = Vec::with_capacity(N_TRIALS);
+    for i in 0..N_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        dispatch_one(&mut enc, &mut registry, (i + 100) as u32);
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        cpu_us.push(dt.as_secs_f64() * 1e6);
+        gpu_us.push((ge - gs) * 1e6);
+    }
+    let cp50 = pct(&mut cpu_us, N_TRIALS / 2);
+    let gp50 = pct(&mut gpu_us, N_TRIALS / 2);
+
+    // Session-120: 120 dispatches in ONE encoder (mirrors 4 calls/layer × 30 layers).
+    const N_SESS: usize = 120;
+    const N_SESS_TRIALS: usize = 20;
+    for _ in 0..3 {
+        let mut enc = device.command_encoder().unwrap();
+        for i in 0..N_SESS { dispatch_one(&mut enc, &mut registry, (200 + i) as u32); }
+        enc.commit_and_wait().unwrap();
+    }
+    let mut sess_cpu = Vec::with_capacity(N_SESS_TRIALS);
+    let mut sess_gpu = Vec::with_capacity(N_SESS_TRIALS);
+    for trial in 0..N_SESS_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        for i in 0..N_SESS { dispatch_one(&mut enc, &mut registry, (400 + trial * N_SESS + i) as u32); }
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        sess_cpu.push(dt.as_secs_f64() * 1e6);
+        sess_gpu.push((ge - gs) * 1e6);
+    }
+    let scp50 = pct(&mut sess_cpu, N_SESS_TRIALS / 2);
+    let sgp50 = pct(&mut sess_gpu, N_SESS_TRIALS / 2);
+
+    eprintln!("[BENCH iter-111] KV TQ-HB encode num_kv_heads={} head_dim={} bits={}",
+              num_kv_heads, head_dim, codebook_bits);
+    eprintln!("[BENCH iter-111]   PER-CALL ISOLATED: CPU p50={:7.2} µs  GPU p50={:7.2} µs",
+              cp50, gp50);
+    eprintln!("[BENCH iter-111]   SESSION-120:       CPU p50={:7.2} µs ({:5.2} µs/call)",
+              scp50, scp50 / N_SESS as f64);
+    eprintln!("[BENCH iter-111]                      GPU p50={:7.2} µs ({:5.2} µs/call)",
+              sgp50, sgp50 / N_SESS as f64);
+    eprintln!("[BENCH iter-111]   Per-token (120 calls): {:.2} ms = {:.1}% of 15.86 ms decode",
+              scp50 / 1000.0, (scp50 / 1000.0) / 15.86 * 100.0);
+}
