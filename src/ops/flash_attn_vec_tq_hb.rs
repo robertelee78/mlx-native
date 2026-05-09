@@ -51,6 +51,21 @@ pub struct FlashAttnVecTqHbParams {
     /// Setting this to 1 eliminates one dispatch + one forced memory_barrier
     /// per layer (~9% decode lever per ADR-028 iter-104).
     pub fuse_fwht_pre: u32,
+    /// ADR-028 iter-127 Path D: number of simdgroups per workgroup (NSG axis).
+    ///
+    /// llama.cpp's K-loop uses `for (ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`
+    /// to split K-blocks across NSG simdgroups within each workgroup, on top
+    /// of NWG workgroups. At qwen-realistic kL=4096, NSG=4 cuts per-WG K-iters
+    /// from 4 to 1 (predicted ~4× FA speedup, ~28% decode at qwen production).
+    ///
+    /// Constraints:
+    /// - Must be ≥ 1.
+    /// - Must be a power of 2 (1, 2, 4, ...) — required for clean cross-
+    ///   simdgroup reduce + threadgroup memory layout.
+    /// - threadgroup_size = (32, nsg, 1) → 32*nsg threads/workgroup.
+    ///   Apple Metal max threads/threadgroup is 1024 → nsg ≤ 32. Practically
+    ///   capped at 4 (matches llama.cpp).
+    pub nsg: u32,
 }
 
 /// GPU-side parameter struct. Must match `FlashAttnVecTqHbParams` in the MSL exactly.
@@ -71,6 +86,8 @@ struct FlashAttnVecTqHbParamsGpu {
     scale_factor_d512: f32,
     codebook_bits: u32,
     fuse_fwht_pre: u32,
+    /// ADR-028 iter-127 Path D: NSG axis. See `FlashAttnVecTqHbParams::nsg`.
+    nsg: u32,
 }
 
 /// GPU-side reduce params. Reuses the same reduce kernel as flash_attn_vec_tq.
@@ -115,7 +132,51 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
             params.codebook_bits
         )));
     }
+    // ADR-028 iter-127 Path D: NSG must be a power of 2 in [1, 32].
+    // 32 is Apple Metal's max threads/threadgroup divided by simdgroup-width
+    // (1024 / 32). Practically capped at 4 (matches llama.cpp policy).
+    if params.nsg == 0 || (params.nsg & (params.nsg - 1)) != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_tq_hb: nsg must be a power of 2 (1, 2, 4, ...), got {}",
+            params.nsg
+        )));
+    }
+    if params.nsg > 32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_tq_hb: nsg must be ≤ 32 (Apple Metal threadgroup-size cap), got {}",
+            params.nsg
+        )));
+    }
     Ok(())
+}
+
+/// ADR-028 iter-127 Path D: select NSG (simdgroups per workgroup) from kv_seq_len.
+///
+/// Mirrors llama.cpp's policy at `ggml-metal-ops.cpp:2953`:
+/// `while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) { nsg *= 2; }`
+///
+/// With our nwg=32 (computed by `compute_nwg`) and ncpsg=32 (C in the metal
+/// shader), the NSG schedule becomes:
+/// - kL ≤ 2048 — nsg=1 (32 simdgroups suffice for 64 K-blocks at most)
+/// - 2049 ≤ kL ≤ 4096 — nsg=2
+/// - kL > 4096 — nsg=4 (cap, matches llama.cpp)
+///
+/// Override via `HF2Q_TQ_NSG` env var (1, 2, or 4 only). Default policy
+/// keeps short-context behavior byte-identical (nsg=1) per
+/// `feedback_metal_compiler_auto_optimizes_static_levers`.
+pub fn compute_nsg(kv_seq_len: u32) -> u32 {
+    if let Ok(v) = std::env::var("HF2Q_TQ_NSG") {
+        if let Ok(n) = v.parse::<u32>() {
+            if n == 1 || n == 2 || n == 4 {
+                return n;
+            }
+        }
+    }
+    // ADR-028 iter-127a: scaffold lands with NSG=1 default (byte-identical to
+    // pre-iter-127 behavior). Adaptive policy engages once cross-simdgroup
+    // reduce is verified at NSG=2,4 in subsequent iter-127 substeps.
+    let _ = kv_seq_len;
+    1
 }
 
 fn compute_nwg(kv_seq_len: u32) -> u32 {
@@ -190,6 +251,7 @@ pub fn flash_attn_vec_tq_hb(
         scale_factor_d512: params.scale_factor_d512,
         codebook_bits: params.codebook_bits,
         fuse_fwht_pre: params.fuse_fwht_pre,
+        nsg: params.nsg,
     };
 
     let kernel_name = match head_dim {
@@ -209,8 +271,11 @@ pub fn flash_attn_vec_tq_hb(
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);
 
+    // ADR-028 iter-127a Path D: threadgroup is `(simdgroup_width=32, NSG, 1)`.
+    // At NSG=1 (default), this is `(32, 1, 1)` — byte-identical to pre-iter-127
+    // dispatch shape. The NSG axis is read by the kernel via `params.nsg`.
     let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
-    let threadgroup_size = MTLSize::new(32, 1, 1);
+    let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
 
     let dst_buf = if nwg == 1 { output } else { tmp };
 
@@ -280,8 +345,9 @@ mod tests {
 
     #[test]
     fn test_gpu_params_size() {
-        // ADR-028 iter-106: 14 fields × 4 bytes = 56 bytes (added fuse_fwht_pre)
-        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 56);
+        // ADR-028 iter-127a: 15 fields × 4 bytes = 60 bytes (added nsg).
+        // iter-106 was 14 (added fuse_fwht_pre); iter-127a adds nsg.
+        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 60);
     }
 
     #[test]
@@ -299,6 +365,8 @@ mod tests {
             ring_start: 0,
             scale_factor_d512: 1.0,
             codebook_bits: 4,  // invalid
+            fuse_fwht_pre: 0,
+            nsg: 1,
         };
         assert!(validate_params(&p).is_err());
     }
@@ -318,7 +386,83 @@ mod tests {
             ring_start: 0,
             scale_factor_d512: 1.0,
             codebook_bits: 8,
+            fuse_fwht_pre: 0,
+            nsg: 1,
         };
         assert!(validate_params(&p).is_ok());
+    }
+
+    // ADR-028 iter-127a — NSG-axis validation tests.
+
+    #[test]
+    fn test_validate_nsg_zero_rejected() {
+        let p = FlashAttnVecTqHbParams {
+            num_heads: 8, num_kv_heads: 4, head_dim: 256,
+            kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
+            sliding_window: 0, softcap: 0.0, ring_start: 0,
+            scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
+            nsg: 0,
+        };
+        assert!(validate_params(&p).is_err(), "nsg=0 must reject");
+    }
+
+    #[test]
+    fn test_validate_nsg_non_pow2_rejected() {
+        for nsg in [3u32, 5, 6, 7, 9, 31, 33] {
+            let p = FlashAttnVecTqHbParams {
+                num_heads: 8, num_kv_heads: 4, head_dim: 256,
+                kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
+                sliding_window: 0, softcap: 0.0, ring_start: 0,
+                scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
+                nsg,
+            };
+            assert!(validate_params(&p).is_err(), "nsg={nsg} must reject (not pow-2 or > 32)");
+        }
+    }
+
+    #[test]
+    fn test_validate_nsg_pow2_accepted() {
+        for nsg in [1u32, 2, 4, 8, 16, 32] {
+            let p = FlashAttnVecTqHbParams {
+                num_heads: 8, num_kv_heads: 4, head_dim: 256,
+                kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
+                sliding_window: 0, softcap: 0.0, ring_start: 0,
+                scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
+                nsg,
+            };
+            assert!(validate_params(&p).is_ok(), "nsg={nsg} (pow-2 ≤ 32) must accept");
+        }
+    }
+
+    /// ADR-028 iter-127a: env-var-mutating tests serialize through a mutex to
+    /// avoid races on parallel unit-test execution. `test_compute_nsg_default`
+    /// and `test_compute_nsg_env_override` both touch `HF2Q_TQ_NSG`.
+    static NSG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_compute_nsg_default_is_one() {
+        let _guard = NSG_ENV_LOCK.lock().unwrap();
+        // iter-127a: scaffold returns 1 for all kL until kernel logic
+        // supports NSG > 1 (iter-127b/c lifts). Clear env to prove default
+        // is hit — the override test otherwise leaves residue.
+        std::env::remove_var("HF2Q_TQ_NSG");
+        for kL in [64u32, 256, 1024, 2048, 4096, 8192, 16384] {
+            assert_eq!(compute_nsg(kL), 1, "compute_nsg({kL}) must default to 1 in iter-127a");
+        }
+    }
+
+    #[test]
+    fn test_compute_nsg_env_override() {
+        let _guard = NSG_ENV_LOCK.lock().unwrap();
+        std::env::set_var("HF2Q_TQ_NSG", "4");
+        assert_eq!(compute_nsg(64), 4);
+        std::env::set_var("HF2Q_TQ_NSG", "2");
+        assert_eq!(compute_nsg(64), 2);
+        std::env::set_var("HF2Q_TQ_NSG", "1");
+        assert_eq!(compute_nsg(64), 1);
+        // Invalid values fall through to default.
+        std::env::set_var("HF2Q_TQ_NSG", "3");
+        assert_eq!(compute_nsg(64), 1);
+        std::env::remove_var("HF2Q_TQ_NSG");
     }
 }

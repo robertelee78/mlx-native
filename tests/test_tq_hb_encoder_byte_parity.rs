@@ -498,6 +498,7 @@ fn run_sdpa_kernel_vs_oracle(
         scale_factor_d512: 1.0,
         codebook_bits: bits,
         fuse_fwht_pre: 0, // ADR-028 iter-106: caller-rotated Q (oracle expects rotated)
+        nsg: 1, // ADR-028 iter-127a: scaffold default (byte-identical)
     };
 
     let mut encoder = device.command_encoder().expect("encoder");
@@ -701,6 +702,7 @@ fn bench_one_kvseqlen(
         scale, mask_type: 0, sliding_window: 0, softcap: 0.0,
         ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
         fuse_fwht_pre: 0,
+        nsg: 1, // ADR-028 iter-127a
     };
 
     let dispatch_fa = |encoder: &mut mlx_native::CommandEncoder, registry: &mut KernelRegistry| {
@@ -855,6 +857,7 @@ fn fused_fwht_pre_byte_parity_d256_8bit() {
             scale, mask_type, sliding_window, softcap: 0.0,
             ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
             fuse_fwht_pre: 0,
+            nsg: 1, // ADR-028 iter-127a
         };
         flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
             &mut enc, &mut registry, &device,
@@ -876,6 +879,7 @@ fn fused_fwht_pre_byte_parity_d256_8bit() {
             scale, mask_type, sliding_window, softcap: 0.0,
             ring_start: 0, scale_factor_d512: 1.0, codebook_bits: bits,
             fuse_fwht_pre: 1,
+            nsg: 1, // ADR-028 iter-127a
         };
         flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
             &mut enc, &mut registry, &device,

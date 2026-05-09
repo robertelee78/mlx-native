@@ -40,6 +40,7 @@ struct FlashAttnVecTqHbParams {
     float scale_factor_d512;  // for D=512 norm dequant
     uint  codebook_bits;      // 5, 6, or 8 (runtime selector)
     uint  fuse_fwht_pre;      // ADR-028 iter-106: 0=caller-rotated Q, 1=kernel applies FWHT-pre
+    uint  nsg;                // ADR-028 iter-127 Path D: simdgroups per workgroup (power-of-2 in [1, 32], practically capped at 4)
 };
 
 // Reduce params — shared with flash_attn_vec.
