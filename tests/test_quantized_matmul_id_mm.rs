@@ -721,3 +721,133 @@ fn bench_q6_k_mv_id_one_shape(label: &str, n: usize, k: usize) {
     eprintln!("[BENCH]     GPU estimate = {:6.2} ms (kernel-only lower bound)",
               gpu_p50 * 60.0 / 1000.0);
 }
+
+// ADR-028 iter-97 — multi-dispatch session bench. Mirrors PRODUCTION
+// single-session amortization: 60 mv_id Q6_K dispatches in ONE encoder,
+// ONE commit_wait_with_gpu_time at the end. Per-call cost = total / 60.
+//
+// Compares against the per-call isolated bench above to quantify how
+// much encode overhead is amortized in production.
+//
+// Run:
+//   cargo test --release --test test_quantized_matmul_id_mm \
+//     bench_q6_k_mv_id_session60 -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_q6_k_mv_id_session60_gemma_decode() {
+    use std::time::Instant;
+
+    let n_tokens: usize = 1;
+    let top_k: usize = 8;
+    let n_experts: usize = 128;
+    let n: usize = 704;
+    let k: usize = 2816;
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let f32_sz = std::mem::size_of::<f32>();
+    let u32_sz = std::mem::size_of::<u32>();
+
+    let input_data = pseudo_random_f32(0x5E5EED, n_tokens * k);
+    let mut expert_packed = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let w = pseudo_random_f32(1000 + e as u64, n * k);
+        expert_packed.push(pack_q6_k(&w));
+    }
+    let (stacked_bytes, per_expert_bytes) = stack_expert_weights(&expert_packed);
+
+    let mut ids: Vec<u32> = Vec::with_capacity(n_tokens * top_k);
+    for s in 0..top_k {
+        ids.push(((s * 17 + 7) % n_experts) as u32);
+    }
+
+    let total_rows = n_tokens * top_k;
+
+    let mut input_buf = device
+        .alloc_buffer(n_tokens * k * f32_sz, DType::F32, vec![n_tokens, k])
+        .unwrap();
+    input_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&input_data);
+
+    let mut weight_buf = device
+        .alloc_buffer(stacked_bytes.len(), DType::U8, vec![stacked_bytes.len()])
+        .unwrap();
+    weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&stacked_bytes);
+
+    let mut ids_buf = device
+        .alloc_buffer(ids.len() * u32_sz, DType::U32, vec![ids.len()])
+        .unwrap();
+    ids_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
+
+    // Allocate 60 distinct output buffers so dispatches don't false-share
+    // in a way the dependency tracker would block.
+    const N_DISPATCHES_PER_TOKEN: usize = 60;
+    let mut output_bufs: Vec<_> = (0..N_DISPATCHES_PER_TOKEN)
+        .map(|_| {
+            device
+                .alloc_buffer(total_rows * n * f32_sz, DType::F32, vec![total_rows, n])
+                .unwrap()
+        })
+        .collect();
+
+    let params = GgmlQuantizedMatmulIdParams {
+        n_tokens: n_tokens as u32,
+        top_k: top_k as u32,
+        n: n as u32,
+        k: k as u32,
+        n_experts: n_experts as u32,
+        expert_stride: per_expert_bytes as u64,
+        ggml_type: GgmlType::Q6_K,
+    };
+
+    // Warmup.
+    const WARMUP: usize = 3;
+    for _ in 0..WARMUP {
+        let mut enc = device.command_encoder().unwrap();
+        for d in 0..N_DISPATCHES_PER_TOKEN {
+            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
+                &mut enc, &mut registry, &device,
+                &input_buf, &weight_buf, &ids_buf, &mut output_bufs[d],
+                &params,
+            ).unwrap();
+        }
+        enc.commit_and_wait().unwrap();
+    }
+
+    // Measurement: one encoder per trial, 60 dispatches, one wait.
+    const N_TRIALS: usize = 30;
+    let mut cpu_total_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    let mut gpu_total_us: Vec<f64> = Vec::with_capacity(N_TRIALS);
+    for _ in 0..N_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        for d in 0..N_DISPATCHES_PER_TOKEN {
+            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
+                &mut enc, &mut registry, &device,
+                &input_buf, &weight_buf, &ids_buf, &mut output_bufs[d],
+                &params,
+            ).unwrap();
+        }
+        let (gpu_start_s, gpu_end_s) = enc.commit_wait_with_gpu_time().unwrap();
+        let cpu_dt = t0.elapsed();
+        cpu_total_us.push(cpu_dt.as_secs_f64() * 1e6);
+        gpu_total_us.push((gpu_end_s - gpu_start_s) * 1e6);
+    }
+
+    cpu_total_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    gpu_total_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cpu_p50 = cpu_total_us[N_TRIALS / 2];
+    let gpu_p50 = gpu_total_us[N_TRIALS / 2];
+
+    let cpu_per_call = cpu_p50 / N_DISPATCHES_PER_TOKEN as f64;
+    let gpu_per_call = gpu_p50 / N_DISPATCHES_PER_TOKEN as f64;
+    let overhead_per_call = cpu_per_call - gpu_per_call;
+
+    eprintln!("[BENCH] Q6_K mv_id session60 (60 dispatches in 1 encoder, gemma decode shape)");
+    eprintln!("[BENCH]   per-token total: CPU = {:6.2} ms, GPU = {:6.2} ms",
+              cpu_p50 / 1000.0, gpu_p50 / 1000.0);
+    eprintln!("[BENCH]   per-call avg:    CPU = {:6.2} µs, GPU = {:6.2} µs",
+              cpu_per_call, gpu_per_call);
+    eprintln!("[BENCH]   amortized encode overhead per call = {:5.2} µs ({:.1}% of CPU)",
+              overhead_per_call, overhead_per_call / cpu_per_call * 100.0);
+}
