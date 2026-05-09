@@ -808,6 +808,13 @@ impl KernelRegistry {
         sources.insert("tq_dequantize_kv".into(), tq_dq_src);
         // Track B (iter-21): higher-bit dequantize kernel (byte-packed indices)
         sources.insert("tq_dequantize_hb_kv".into(), tq_dq_src);
+        // ADR-027 Phase B iter-30 (hf2q sub-sub-iter 23c-β.1): sequence-batch
+        // dequant variant. Same MSL source; new kernel entry point
+        // `tq_dequantize_hb_kv_seq` reads positions [start_pos..start_pos+n_tokens)
+        // in one dispatch (one threadgroup per (kv_head, position)). Unblocks
+        // hf2q's TQ-aware prefill SDPA path (current per-position kernel
+        // requires cur_len separate dispatches).
+        sources.insert("tq_dequantize_hb_kv_seq".into(), tq_dq_src);
 
         // iter-24: native higher-bit (5/6/8-bit) TQ SDPA kernel (byte-packed K/V)
         let tq_hb_src: &'static str = include_str!("shaders/flash_attn_vec_tq_hb.metal");

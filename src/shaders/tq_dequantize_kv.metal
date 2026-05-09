@@ -300,3 +300,82 @@ kernel void tq_dequantize_hb_kv(
         dst_head[coord] = centroid * scale_norm;
     }
 }
+
+// ============================================================================
+// ADR-027 Phase B iter-30 (hf2q sub-sub-iter 23c-β.1): sequence-batch dequant.
+//
+// Reads byte-packed 5/6/8-bit indices for n_tokens consecutive positions
+// `[start_pos..start_pos+n_tokens)` from the higher-bit KV cache and writes
+// dense F32 values in the FWHT-rotated domain (same dequant formula as
+// `tq_dequantize_hb_kv`). Output layout
+// `[num_kv_heads, n_tokens, head_dim]` (head-major) matches the layout
+// hf2q's full-attn KV cache uses, so the caller can dispatch a dense SDPA
+// kernel directly against the dequanted buffer with no permute.
+//
+// Threadgroup grid: (num_kv_heads, n_tokens, 1). Each (kv_head, token)
+// pair gets one threadgroup of `head_dim` threads (capped at 1024 for
+// d=512 paths). Per-thread work is identical to `tq_dequantize_hb_kv`
+// — only the position offset differs.
+//
+// Parity contract with `tq_dequantize_hb_kv`:
+//   for any `read_pos`, `dispatch_tq_dequantize_hb_kv_seq(.., start_pos=read_pos, n_tokens=1, ..)`
+//   produces byte-identical output to `dispatch_tq_dequantize_hb_kv(.., read_pos, ..)`.
+// ============================================================================
+
+struct TqDequantizeHbKvSeqParams {
+    uint head_dim;          // 256 or 512
+    uint num_kv_heads;
+    uint start_pos;         // first cache position (inclusive)
+    uint n_tokens;          // number of consecutive positions to dequant
+    uint cache_capacity;    // stride in packed/norms (per-head)
+    uint norms_per_pos;     // 1 for D=256, 2 for D=512
+    float scale_factor_d512;
+    uint codebook_bits;     // 5, 6, or 8
+};
+
+kernel void tq_dequantize_hb_kv_seq(
+    device const uint8_t              *packed [[buffer(0)]], // [nkv, capacity, hd] u8
+    device const float                *norms  [[buffer(1)]],
+    device       float                *dst    [[buffer(2)]], // [nkv, n_tokens, hd] f32
+    constant TqDequantizeHbKvSeqParams &params [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    uint   tiitg [[thread_index_in_threadgroup]])
+{
+    const uint kv_head  = tgpig[0];
+    const uint tok_idx  = tgpig[1];
+    if (kv_head >= params.num_kv_heads) return;
+    if (tok_idx >= params.n_tokens) return;
+
+    const uint pos      = params.start_pos + tok_idx;
+    const uint hd       = params.head_dim;
+    const uint cap      = params.cache_capacity;
+    const float inv_sqrt_hd = rsqrt(float(hd));
+    const float sf      = params.scale_factor_d512;
+    const bool is_d512  = (hd > 256);
+
+    // Packed base: [kv_head, pos, 0..hd]
+    device const uint8_t *packed_pos = packed + kv_head * cap * hd + pos * hd;
+
+    const uint npp = params.norms_per_pos;
+    device const float *norms_pos = norms + kv_head * cap * npp + pos * npp;
+    // dst layout: [kv_head, tok_idx, 0..hd]
+    device float *dst_pos = dst + kv_head * params.n_tokens * hd + tok_idx * hd;
+
+    if (tiitg < hd) {
+        uint block_idx = is_d512 ? (tiitg / 256u) : 0u;
+        block_idx = min(block_idx, npp - 1u);
+        float norm = norms_pos[block_idx];
+        float scale_norm = is_d512 ? (norm / sf) : (norm * inv_sqrt_hd);
+
+        uint idx = packed_pos[tiitg];
+        float centroid;
+        if (params.codebook_bits == 5u) {
+            centroid = CODEBOOK_5BIT_DQ[idx & 0x1Fu];
+        } else if (params.codebook_bits == 6u) {
+            centroid = CODEBOOK_6BIT_DQ[idx & 0x3Fu];
+        } else {
+            centroid = CODEBOOK_8BIT_DQ[idx];
+        }
+        dst_pos[tiitg] = centroid * scale_norm;
+    }
+}
