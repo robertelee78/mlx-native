@@ -643,7 +643,7 @@ fn bench_fa_vec_tq_hb_gemma_decode() {
     let head_dim: u32 = 256;
     let bits: u32 = 8;
 
-    for &kv_seq_len in &[64u32, 128u32, 256u32] {
+    for &kv_seq_len in &[64u32, 128u32, 256u32, 512u32, 1024u32, 1536u32] {
         bench_one_kvseqlen(num_heads, num_kv_heads, head_dim, bits, kv_seq_len);
     }
 }
