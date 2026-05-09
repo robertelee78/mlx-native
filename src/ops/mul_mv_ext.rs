@@ -346,6 +346,44 @@ mod tests {
             assert!(kernel_name(GgmlType::Q5_1, r1).is_ok());
             assert!(kernel_name(GgmlType::IQ4_NL, r1).is_ok());
         }
-        assert!(kernel_name(GgmlType::Q4_0, 2).is_err());
+        // Note: Q4_0 was Phase 1's "no kernel" canary — but Phase 4
+        // (commit `9ee8a28`) added Q4_0/Q8_0/Q4_K/Q5_K/Q6_K coverage,
+        // so Q4_0 is now a hit, not a miss. See sibling test
+        // `kernel_name_covers_all_phase4_combinations` for the Phase 4
+        // coverage assertion + `kernel_name_rejects_unsupported_types`
+        // for the new "no kernel" canary.
+    }
+
+    #[test]
+    fn kernel_name_covers_all_phase4_combinations() {
+        // Phase 4 (commit `9ee8a28`): Q4_0, Q8_0, Q4_K, Q5_K, Q6_K
+        // × r1 ∈ {2, 3, 4, 5}. Pin coverage so future GgmlType
+        // additions don't silently drop Phase 4 wires.
+        for r1 in 2..=5 {
+            assert!(kernel_name(GgmlType::Q4_0, r1).is_ok(),
+                "Phase 4 Q4_0 r1={r1} must have a kernel");
+            assert!(kernel_name(GgmlType::Q8_0, r1).is_ok(),
+                "Phase 4 Q8_0 r1={r1} must have a kernel");
+            assert!(kernel_name(GgmlType::Q4_K, r1).is_ok(),
+                "Phase 4 Q4_K r1={r1} must have a kernel");
+            assert!(kernel_name(GgmlType::Q5_K, r1).is_ok(),
+                "Phase 4 Q5_K r1={r1} must have a kernel");
+            assert!(kernel_name(GgmlType::Q6_K, r1).is_ok(),
+                "Phase 4 Q6_K r1={r1} must have a kernel");
+        }
+    }
+
+    #[test]
+    fn kernel_name_rejects_unsupported_combinations() {
+        // r1 outside [2, 5] is rejected for ALL types (including
+        // Phase 1 + Phase 4 covered ones).
+        assert!(kernel_name(GgmlType::Q5_1, 1).is_err(),
+            "r1=1 not supported by any phase");
+        assert!(kernel_name(GgmlType::Q5_1, 6).is_err(),
+            "r1=6 not supported by any phase");
+        assert!(kernel_name(GgmlType::Q4_0, 0).is_err(),
+            "r1=0 not supported");
+        assert!(kernel_name(GgmlType::Q4_0, -1).is_err(),
+            "r1=-1 not supported");
     }
 }
