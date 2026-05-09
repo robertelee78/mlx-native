@@ -118,7 +118,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
     Ok(())
 }
 
-fn compute_nwg(_kv_seq_len: u32) -> u32 {
+fn compute_nwg(kv_seq_len: u32) -> u32 {
     if let Ok(v) = std::env::var("HF2Q_TQ_NWG") {
         if let Ok(n) = v.parse::<u32>() {
             if n >= 1 && n <= 32 {
@@ -126,7 +126,27 @@ fn compute_nwg(_kv_seq_len: u32) -> u32 {
             }
         }
     }
-    16
+    // ADR-028 iter-119 kL-adaptive nwg.
+    //
+    // iter-103 measured FA-vec-tq-hb GPU pure-time at gemma decode shape
+    // (16 query heads, head_dim=256): 40 µs/call FLAT for kL ∈ [64, 512],
+    // then linear (78 µs at kL=1024, 115 µs at kL=1536). Past 512 the
+    // 16 simdgroups split-K saturate before kL is consumed, so each WG
+    // does multiple outer-loop iterations.
+    //
+    // iter-100 measured nwg ∈ {16, 32} at short kL (≤170): identical
+    // throughput (GPU-saturated, doubling parallelism doesn't help).
+    // iter-118 measured at long kL (~860 with 800-token decode): nwg=32
+    // gave +4.7% production decode (62.4 vs 59.6 t/s). Threshold around
+    // 512: short kL prefers 16 (less reduce overhead), long kL prefers
+    // 32 (more parallelism for the longer K-dim).
+    //
+    // Per `feedback_metal_compiler_auto_optimizes_static_levers`, this
+    // is the FIRST positive lever after 11 falsifications; verified
+    // empirically with HF2Q_TQ_NWG=32 vs default at long-context production
+    // bench, NOT static-analysis-derived. No coherence change (FA-vec-tq-hb
+    // produces byte-identical output regardless of nwg).
+    if kv_seq_len > 512 { 32 } else { 16 }
 }
 
 /// Dispatch HB TQ flash attention vector kernel (5/6/8-bit byte-packed K/V).
