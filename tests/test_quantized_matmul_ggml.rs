@@ -841,3 +841,144 @@ fn test_q6_k_production_shape() {
         "Q6_K production 4096x4096",
     );
 }
+
+// --------------------------------------------------------------------------
+// ADR-028 iter-109 — localize the 13 ms unaccounted decode bucket.
+//
+// Per iter-103 inventory:
+//   FA-vec-tq-hb (30 calls):   1.43 ms = 9.0%
+//   mv_id Q6_K (60 calls):     0.96 ms = 6.0%
+//   norm fused (120 calls):    0.27 ms = 1.7%
+//   FWHT (60 calls):           0.22 ms = 1.4%
+//   Subtotal:                  2.88 ms = 18%
+//   Unaccounted:              13.00 ms = 82%
+//
+// This bench measures the regular mv (not mv_id) hot kernels at
+// gemma-4-26b decode shapes:
+//   - Q proj  (m=1, n=4096, k=2816)  × 30 calls/token
+//   - K proj  (m=1, n=2048, k=2816)  × 30 calls/token
+//   - V proj  (m=1, n=2048, k=2816)  × 30 calls/token
+//   - O proj  (m=1, n=2816, k=4096)  × 30 calls/token
+//   - LM head (m=1, n=262144, k=2816, Q8_0) × 1 call/token
+//
+// Run:
+//   cargo test --release --test test_quantized_matmul_ggml \
+//     bench_iter109_decode_hot_kernels -- --ignored --nocapture
+// --------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn bench_iter109_decode_hot_kernels() {
+    use std::time::Instant;
+
+    bench_one_shape("Q proj  (Q6_K, m=1 n=4096 k=2816)", 1, 4096, 2816, GgmlType::Q6_K, 30);
+    bench_one_shape("K proj  (Q6_K, m=1 n=2048 k=2816)", 1, 2048, 2816, GgmlType::Q6_K, 30);
+    bench_one_shape("V proj  (Q6_K, m=1 n=2048 k=2816)", 1, 2048, 2816, GgmlType::Q6_K, 30);
+    bench_one_shape("O proj  (Q6_K, m=1 n=2816 k=4096)", 1, 2816, 4096, GgmlType::Q6_K, 30);
+    bench_one_shape("LM head (Q8_0, m=1 n=262144 k=2816)", 1, 262144, 2816, GgmlType::Q8_0, 1);
+}
+
+fn bench_one_shape(
+    label: &str,
+    m: usize, n: usize, k: usize,
+    ggml_type: GgmlType,
+    calls_per_token: usize,
+) {
+    use std::time::Instant;
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+
+    let weights_f32 = pseudo_random_f32(0xCAFE_F00D, n * k);
+    let input_data = pseudo_random_f32(0xDEAD_BEEF, m * k);
+
+    let mut weight_bytes = Vec::new();
+    for row in 0..n {
+        let row_slice = &weights_f32[row * k..(row + 1) * k];
+        match ggml_type {
+            GgmlType::Q6_K => weight_bytes.extend_from_slice(&pack_q6_k(row_slice)),
+            GgmlType::Q8_0 => weight_bytes.extend_from_slice(&pack_q8_0(row_slice)),
+            _ => panic!("unsupported ggml_type {:?}", ggml_type),
+        }
+    }
+
+    let f32_sz = std::mem::size_of::<f32>();
+    let mut input_buf = device.alloc_buffer(m * k * f32_sz, DType::F32, vec![m, k]).unwrap();
+    input_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&input_data);
+
+    let mut weight_buf = device.alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()]).unwrap();
+    weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&weight_bytes);
+
+    let mut output_buf = device.alloc_buffer(m * n * f32_sz, DType::F32, vec![m, n]).unwrap();
+
+    let params = GgmlQuantizedMatmulParams {
+        m: m as u32, n: n as u32, k: k as u32, ggml_type,
+    };
+
+    let dispatch_one = |encoder: &mut mlx_native::CommandEncoder, registry: &mut KernelRegistry, output: &mut mlx_native::MlxBuffer| {
+        mlx_native::quantized_matmul_ggml(
+            encoder, registry, &device, &input_buf, &weight_buf, output, &params,
+        ).unwrap();
+    };
+
+    // Warmup
+    for _ in 0..3 {
+        let mut enc = device.command_encoder().unwrap();
+        dispatch_one(&mut enc, &mut registry, &mut output_buf);
+        enc.commit_and_wait().unwrap();
+    }
+
+    let pct = |xs: &mut Vec<f64>, q: usize| -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[q]
+    };
+
+    // Per-call isolated.
+    const N_TRIALS: usize = 50;
+    let mut cpu_us = Vec::with_capacity(N_TRIALS);
+    let mut gpu_us = Vec::with_capacity(N_TRIALS);
+    for _ in 0..N_TRIALS {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        dispatch_one(&mut enc, &mut registry, &mut output_buf);
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        cpu_us.push(dt.as_secs_f64() * 1e6);
+        gpu_us.push((ge - gs) * 1e6);
+    }
+    let cp50 = pct(&mut cpu_us, N_TRIALS / 2);
+    let gp50 = pct(&mut gpu_us, N_TRIALS / 2);
+
+    // Session-N (calls_per_token dispatches per encoder).
+    let n_sess = calls_per_token.max(1);
+    let n_sess_trials: usize = if n_sess >= 30 { 15 } else { 30 };
+    for _ in 0..3 {
+        let mut enc = device.command_encoder().unwrap();
+        for _ in 0..n_sess { dispatch_one(&mut enc, &mut registry, &mut output_buf); }
+        enc.commit_and_wait().unwrap();
+    }
+    let mut sess_cpu = Vec::with_capacity(n_sess_trials);
+    let mut sess_gpu = Vec::with_capacity(n_sess_trials);
+    for _ in 0..n_sess_trials {
+        let mut enc = device.command_encoder().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..n_sess { dispatch_one(&mut enc, &mut registry, &mut output_buf); }
+        let (gs, ge) = enc.commit_wait_with_gpu_time().unwrap();
+        let dt = t0.elapsed();
+        sess_cpu.push(dt.as_secs_f64() * 1e6);
+        sess_gpu.push((ge - gs) * 1e6);
+    }
+    let scp50 = pct(&mut sess_cpu, n_sess_trials / 2);
+    let sgp50 = pct(&mut sess_gpu, n_sess_trials / 2);
+
+    eprintln!("[BENCH iter-109] {}", label);
+    eprintln!("[BENCH iter-109]   PER-CALL ISOLATED: CPU p50={:8.2} µs  GPU p50={:8.2} µs",
+              cp50, gp50);
+    eprintln!("[BENCH iter-109]   SESSION-{}:        CPU p50={:8.2} µs ({:7.2} µs/call)",
+              n_sess, scp50, scp50 / n_sess as f64);
+    eprintln!("[BENCH iter-109]                      GPU p50={:8.2} µs ({:7.2} µs/call)",
+              sgp50, sgp50 / n_sess as f64);
+    eprintln!("[BENCH iter-109]   Per-token ({} calls): {:.2} ms = {:.1}% of 15.86 ms decode",
+              calls_per_token, scp50 * (calls_per_token as f64 / n_sess as f64) / 1000.0,
+              (scp50 * (calls_per_token as f64 / n_sess as f64) / 1000.0) / 15.86 * 100.0);
+}
