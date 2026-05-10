@@ -77,6 +77,11 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+        // ADR-028 iter-309 — q6_K mat-vec with nr0=2 + cached yl[16]
+        // (peer-pattern port of llama.cpp's `kernel_mul_mv_q6_K_f32_impl`
+        // with N_R0_Q6_K=2; 4 rows/TG vs baseline's 2).  Env-gated via
+        // `HF2Q_Q6K_MV_NR2=1` in the dispatcher.
+        sources.insert("kernel_mul_mv_q6_K_f32_nr2".into(), ggml_src);
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL dense mat-vec.
         sources.insert("kernel_mul_mv_q5_1_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_iq4_nl_f32".into(), ggml_src);

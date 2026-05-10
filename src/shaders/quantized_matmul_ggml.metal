@@ -541,6 +541,108 @@ kernel void kernel_mul_mv_q6_K_f32(
     }
 }
 
+// ---- Q6_K mat-vec kernel, nr0=2 variant (ADR-028 iter-309) ----
+//
+// Ported from llama.cpp `kernel_mul_mv_q6_K_f32_impl` with N_R0_Q6_K=2.
+// Doubles rows per simdgroup vs the baseline q6_K mv (1 row → 2) and
+// caches `yl[16]` once per QK_K block, re-using it across both rows so
+// the dequant unpack work amortizes.  4 rows per threadgroup (2 SGs ×
+// 2 rows) vs 2 in the baseline.
+//
+// Dispatch: threadgroups=(ceil(N/4), M, B), threads_per_tg=(2, 32, 1).
+// Each SIMD group handles 2 consecutive rows.
+//
+// Hypothesis (ADR-028 iter-308): cuts per-dispatch time on the biggest
+// gemma4 APEX-Q5_K_M decode kernel (17.91% of dispatches) by closing
+// the row-amortization gap with peer llama.cpp.
+kernel void kernel_mul_mv_q6_K_f32_nr2(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NSG = 2;   // simdgroups per threadgroup
+    constexpr int nr0 = 2;   // rows per simdgroup
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r0 = tgpig.x;
+    const int64_t r1 = tgpig.y;
+    const int     im = tgpig.z;
+
+    const int first_row = (int)((r0 * NSG + sgitg) * nr0);
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+
+    device const block_q6_K * x_base = (device const block_q6_K *) src0 + first_row * nb + offset0;
+    device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float sumf[nr0] = {0.f, 0.f};
+    float yl[16];
+
+    const int tid  = tiisg / 2;
+    const int ix   = tiisg % 2;
+    const int ip   = tid / 8;
+    const int il   = tid % 8;
+    const int n    = 4;
+    const int l0   = n * il;
+    const int is   = 8*ip + l0/16;
+
+    const int y_offset   = 128*ip + l0;
+    const int q_offset_l = 64*ip + l0;
+    const int q_offset_h = 32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        // Y vector cached once per block, reused across nr0 rows.
+        device const float * y = yy + i * QK_K + y_offset;
+        for (int l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (int row = 0; row < nr0; ++row) {
+            device const block_q6_K * xr = x_base + row * nb;
+            device const uint8_t * q1 = xr[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xr[i].qh + q_offset_h;
+            device const int8_t  * sc = xr[i].scales + is;
+
+            const float dall = xr[i].d;
+
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[row] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+
+    device float * dst_f32 = dst + im*p.ne0*p.ne1 + r1*p.ne0;
+    for (int row = 0; row < nr0; ++row) {
+        const int out_row = first_row + row;
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && out_row < p.ne01) {
+            dst_f32[out_row] = tot;
+        }
+    }
+}
+
 // ---- Q4_K mat-vec kernel ----
 //
 // ADR-013 P7 — port of llama.cpp `kernel_mul_mv_q4_K_f32_impl`

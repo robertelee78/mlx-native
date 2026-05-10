@@ -473,7 +473,22 @@ fn dispatch_mv(
     output: &mut MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    let kernel_name = params.ggml_type.kernel_name();
+    // ADR-028 iter-309 — opt-in nr0=2 variant for q6_K mat-vec.  Peer
+    // pattern: 4 rows/TG (vs baseline's 2) + cached `yl[16]` (vs no
+    // cache + device re-reads).  Env-gated A/B because the speed win
+    // depends on shapes hitting the new geometry; the kernel is
+    // bit-exact-equivalent to the baseline at HEAD (parity test in
+    // tests/adr_028_iter309_q6k_mv_nr2_parity.rs).
+    let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
+        && std::env::var("HF2Q_Q6K_MV_NR2")
+            .ok()
+            .as_deref()
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let kernel_name = if use_q6k_nr2 {
+        "kernel_mul_mv_q6_K_f32_nr2"
+    } else {
+        params.ggml_type.kernel_name()
+    };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
     let gpu_params = GgmlMatvecGpuParams {
@@ -503,6 +518,9 @@ fn dispatch_mv(
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),
     };
+    // ADR-028 iter-309 — nr0=2 variant doubles rows-per-TG to 4.  Same
+    // 2 SGs × 32 threads layout, but each SG handles 2 rows so align=4.
+    let align = if use_q6k_nr2 { 4usize } else { align };
 
     let threadgroups = metal::MTLSize::new(
         div_ceil(n, align) as u64,
