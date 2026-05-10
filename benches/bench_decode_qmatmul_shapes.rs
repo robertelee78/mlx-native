@@ -67,6 +67,21 @@ const SHAPES: &[DecodeShape] = &[
     // Measure both qtypes to size the "Q6_K direct" lever vs current Q8_0 path.
     DecodeShape { label: "lmhead_Q6_K", n: 262144, k: 2816, qtype: GgmlType::Q6_K, per_token: 1 },
     DecodeShape { label: "lmhead_Q8_0", n: 262144, k: 2816, qtype: GgmlType::Q8_0, per_token: 1 },
+
+    // ADR-028 iter-255: parameterized sweep around Q_sliding (4096×2816 Q5_K).
+    // Iter-253 saw 47.8% peak vs O_sliding 91.6% (transposed shape, same bytes).
+    // Sweep n at fixed k=2816 to locate the inflection on the n axis.
+    DecodeShape { label: "sweep_n2816", n: 2816, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_n3072", n: 3072, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_n3584", n: 3584, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_n4096", n: 4096, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_n4608", n: 4608, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_n5120", n: 5120, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    // Sweep k at fixed n=4096 to test whether smaller-k = more launch-overhead-bound.
+    DecodeShape { label: "sweep_k2048", n: 4096, k: 2048, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_k2816", n: 4096, k: 2816, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_k4096", n: 4096, k: 4096, qtype: GgmlType::Q5_K, per_token: 0 },
+    DecodeShape { label: "sweep_k5120", n: 4096, k: 5120, qtype: GgmlType::Q5_K, per_token: 0 },
 ];
 
 const WARMUP: usize = 5;
