@@ -9,6 +9,8 @@
 .mcp.json
 .claude/
 .claude-flow/
+.swarm/
+ruvector.db
 CLAUDE.md
 
 # BMAD session research artifacts (transient — distilled into ADRs/docs)
