@@ -61,6 +61,12 @@ const SHAPES: &[DecodeShape] = &[
     DecodeShape { label: "O_global",   n: 2816, k: 4096, qtype: GgmlType::Q5_K, per_token: 6 },
     // Router (1 per layer, all 30): n=128.
     DecodeShape { label: "Router",     n:  128, k: 2816, qtype: GgmlType::Q5_K, per_token: 30 },
+
+    // ADR-028 iter-187: gemma4 lm_head (token_embd tied) — vocab=262144, hidden=2816.
+    // Currently re-quantized at load to Q8_0 (~784 MB).  GGUF stores Q6_K (~605 MB).
+    // Measure both qtypes to size the "Q6_K direct" lever vs current Q8_0 path.
+    DecodeShape { label: "lmhead_Q6_K", n: 262144, k: 2816, qtype: GgmlType::Q6_K, per_token: 1 },
+    DecodeShape { label: "lmhead_Q8_0", n: 262144, k: 2816, qtype: GgmlType::Q8_0, per_token: 1 },
 ];
 
 const WARMUP: usize = 5;
