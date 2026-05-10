@@ -746,3 +746,93 @@ kernel void fused_post_attn_triple_norm_f32(
         output_c[base + i] = vn * weight_c[i];
     }
 }
+
+// ---------------------------------------------------------------------------
+// fused_post_ff_norm2_endlayer_f32 — fuse the gemma4 layer-end pair:
+//   (a) mlp_down = attn_out + norm(moe_accum, w2)
+//   (b) hidden   = (residual + norm(mlp_down, w3)) * layer_scalar
+// into a single dispatch.  ADR-028 iter-217 — bisect-confirmed +2.7%
+// throughput on gemma4 default path (saves the (b) launch ≈ 0.34 ms).
+//
+// Structural template: `fused_post_attn_triple_norm_f32` above (also
+// 2 RMS reductions in 1 kernel).  Difference: scalar mul at the end.
+//
+// ⚠ Risk: iter-186's fused_post_attn_triple_norm REGRESSED on decode
+// (-1.0%) because it forced 3 CONCURRENT norms into 1 sequential kernel.
+// This kernel fuses 2 SEQUENTIAL norms (different scenario); fusion
+// eliminates the second dispatch's launch latency.  iter-218+ will
+// bench-validate before shipping default-on.
+// ---------------------------------------------------------------------------
+
+struct FusedPostFFNorm2EndlayerParams {
+    float eps;
+    uint  dim;
+    uint  scalar_is_vector;  // 0 = broadcast scalar[0], 1 = per-channel scalar[i]
+};
+
+kernel void fused_post_ff_norm2_endlayer_f32(
+    device const float* attn_out      [[buffer(0)]],
+    device const float* moe_accum     [[buffer(1)]],
+    device const float* residual      [[buffer(2)]],
+    device const float* w2            [[buffer(3)]],
+    device const float* w3            [[buffer(4)]],
+    device const float* layer_scalar  [[buffer(5)]],
+    device float*       mlp_down      [[buffer(6)]],
+    device float*       hidden        [[buffer(7)]],
+    constant FusedPostFFNorm2EndlayerParams& params [[buffer(8)]],
+    uint row_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const float eps = params.eps;
+    const uint  dim = params.dim;
+    const bool  scalar_is_vec = (params.scalar_is_vector != 0u);
+    const uint  base = row_id * dim;
+
+    // Phase 1: sum of squares over moe_accum (FIRST RMS norm).
+    float partial_moe_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float v = moe_accum[base + i];
+        partial_moe_sq += v * v;
+    }
+    shared[tid] = partial_moe_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float rms_inv_moe = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 2: mlp_down[i] = attn_out + moe_accum * rms_inv_moe * w2[i],
+    // write, accumulate sum(mlp_down^2) for SECOND RMS.
+    float partial_mlp_sq = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float m = moe_accum[base + i];
+        const float a = attn_out[base + i];
+        const float v = a + m * rms_inv_moe * w2[i];
+        mlp_down[base + i] = v;
+        partial_mlp_sq += v * v;
+    }
+    shared[tid] = partial_mlp_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float rms_inv_mlp = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 3: hidden[i] = (residual + mlp_down * rms_inv_mlp * w3[i]) * scalar
+    for (uint i = tid; i < dim; i += tg_size) {
+        const float m = mlp_down[base + i];
+        const float r = residual[base + i];
+        const float vn = m * rms_inv_mlp;
+        const float h = r + vn * w3[i];
+        const float s = scalar_is_vec ? layer_scalar[i] : layer_scalar[0];
+        hidden[base + i] = h * s;
+    }
+}

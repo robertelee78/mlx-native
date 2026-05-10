@@ -438,6 +438,9 @@ impl KernelRegistry {
         sources.insert("rms_norm_no_scale_f32_dual".into(), rms_norm_src);
         sources.insert("rms_norm_f32_triple".into(), rms_norm_src);
         sources.insert("fused_post_attn_triple_norm_f32".into(), rms_norm_src);
+        // ADR-028 iter-217: fused post-FF norm 2 + end-of-layer FINAL
+        // (combines 2 sequential fused_norm_add dispatches into 1 kernel).
+        sources.insert("fused_post_ff_norm2_endlayer_f32".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_f32_dual_perm".into(), rms_norm_src);
         // Fused RMS norm + elementwise multiply kernels (Phase 4e.2)
         sources.insert("rms_norm_mul_f32".into(), rms_norm_src);
