@@ -853,6 +853,13 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_tq_hb_dk256".into(), tq_hb_src);
         sources.insert("flash_attn_vec_tq_hb_dk512".into(), tq_hb_src);
 
+        // ADR-028 Phase 10d (iter-349): hybrid F16-K + TQ-HB-V SDPA kernel.
+        // Same V-side codebook as flash_attn_vec_tq_hb (5/6/8-bit Lloyd-Max);
+        // K-side reads F16 dense — peer-equivalent layout, no codebook lookup.
+        let hybrid_src: &'static str = include_str!("shaders/flash_attn_vec_hybrid.metal");
+        sources.insert("flash_attn_vec_hybrid_dk256".into(), hybrid_src);
+        sources.insert("flash_attn_vec_hybrid_dk512".into(), hybrid_src);
+
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);
