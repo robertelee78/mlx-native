@@ -82,6 +82,10 @@ name = "bench_prefill_qmatmul_shapes"
 harness = false
 
 [[bench]]
+name = "bench_decode_qmatmul_shapes"
+harness = false
+
+[[bench]]
 name = "bench_moe_q_qwen36_shape"
 harness = false
 
