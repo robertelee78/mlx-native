@@ -187,6 +187,21 @@ inline float dequant_hb_single(
     return centroid * scale_norm;
 }
 
+// ADR-028 iter-197: function-constant cbits specialization.
+// Compile-time-known cbits value via Metal function constant — eliminates
+// the per-call branch entirely for the kernel (compiler dead-code-eliminates
+// the unused codebook paths).  iter-196 bisect measured +8.5% gemma4 throughput
+// from removing this branch (vs runtime-branched iter-195 vectorized form).
+//
+// `function_constant(50)` is the index used by the dispatcher
+// (ops/flash_attn_vec_tq_hb.rs).  Default = 8 if not set so the kernel still
+// compiles when invoked via the legacy non-specialized path.
+constant int CBITS_FC [[function_constant(50)]];
+// Workaround: Metal requires a default to compile when the constant isn't set,
+// but [[function_constant(N)]] with no initializer is a "must-be-set" declaration.
+// Provide a fallback via is_function_constant_defined().
+constant int cbits_effective = is_function_constant_defined(CBITS_FC) ? CBITS_FC : 8;
+
 // Reconstruct float4 from 4 consecutive byte-packed elements.
 // coord_base must be a multiple of 4.
 //
@@ -196,6 +211,11 @@ inline float dequant_hb_single(
 // better than 4 separate 1-byte reads.  Also hoists the cbits branch
 // out of the per-element loop (one branch decides for all 4 indices).
 //
+// ADR-028 iter-197: cbits is now read from the compile-time
+// function-constant `cbits_effective` (constant-folded by the compiler).
+// The runtime `cbits` parameter is preserved for ABI compat but is
+// asserted to match cbits_effective at validate time.
+//
 // Alignment requirement: caller must pass coord_base divisible by 4.
 // All call sites in this kernel pass coord_base = (anything)*4 — verified.
 inline float4 dequant_hb_float4(
@@ -204,6 +224,9 @@ inline float4 dequant_hb_float4(
     float scale_norm,
     uint cbits
 ) {
+    // iter-197: shadow the runtime parameter with the compile-time constant.
+    // The compiler folds the if-else chain to a single codebook lookup path.
+    cbits = (uint)cbits_effective;
     // Vectorized 4-byte load.  packed_pos + coord_base is 4-byte aligned
     // because (a) packed_pos is from MlxBuffer (≥16-byte aligned) and
     // (b) coord_base is always a multiple of 4 at every call site.

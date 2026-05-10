@@ -278,7 +278,18 @@ pub fn flash_attn_vec_tq_hb(
             "flash_attn_vec_tq_hb: unsupported head_dim {head_dim}"
         ))),
     };
-    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    // ADR-028 iter-197: pass cbits as a Metal function constant for
+    // compile-time specialization (eliminates the per-element if-else
+    // chain in dequant_hb_float4 — measured +8.5% in iter-196 bisect).
+    // Index 50 must match `[[function_constant(50)]]` in the shader.
+    let cbits_const = (params.codebook_bits as i32, 50usize);
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            kernel_name,
+            device.metal_device(),
+            &[],
+            &[(cbits_const.1, cbits_const.0)],
+        )?;
 
     let pk = pad2(head_dim as usize, 128);
     let pv = pad2(head_dim as usize, 128);
