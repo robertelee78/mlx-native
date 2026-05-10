@@ -474,7 +474,18 @@ fn dispatch_id_mv(
 ) -> Result<()> {
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
 
-    let kernel_name = params.ggml_type.id_kernel_name();
+    // ADR-028 iter-321 — env-gated nr0=2 variant for q6_K _id mat-vec.
+    // Mirrors iter-309's non-_id work. Same env flag covers both.
+    let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
+        && std::env::var("HF2Q_Q6K_ID_MV_NR2")
+            .ok()
+            .as_deref()
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let kernel_name = if use_q6k_id_nr2 {
+        "kernel_mul_mv_id_q6_K_f32_nr2"
+    } else {
+        params.ggml_type.id_kernel_name()
+    };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
     let gpu_params = GgmlMatvecIdGpuParams {
@@ -526,6 +537,9 @@ fn dispatch_id_mv(
             )));
         }
     };
+    // ADR-028 iter-321 — nr0=2 doubles rows-per-TG to 4. Same 2 SGs × 32
+    // threads, but each SG handles 2 rows so align=4.
+    let align = if use_q6k_id_nr2 { 4usize } else { align };
 
     let n = params.n as usize;
     let m = total_rows;

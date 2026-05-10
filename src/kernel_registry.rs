@@ -229,6 +229,10 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
+        // ADR-028 iter-321 — q6_K _id with nr0=2 + cached yl[16]
+        // (peer-pattern port mirroring iter-309's non-_id variant).
+        // Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
+        sources.insert("kernel_mul_mv_id_q6_K_f32_nr2".into(), ggml_id_src);
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL MoE expert-routed mat-vec.
         sources.insert("kernel_mul_mv_id_q5_1_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_iq4_nl_f32".into(), ggml_id_src);

@@ -886,6 +886,105 @@ kernel void kernel_mul_mv_id_q6_K_f32(
 }
 
 // ====================================================================
+// Q6_K _id expert-indexed mat-vec kernel — nr0=2 variant (ADR-028 iter-321)
+// ====================================================================
+//
+// Same as `kernel_mul_mv_id_q6_K_f32` above but processes nr0=2 rows
+// per simdgroup with cached yl[16].  4 rows/TG (2 SGs × 2 rows) vs
+// baseline 2 rows/TG.  Mirrors peer's
+// `template kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K>>>`
+// (ggml-metal.metal:10351).
+//
+// Dispatch: threadgroups=(ceil(N/4), n_tokens*top_k, 1), threads=(2, 32, 1).
+// Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
+kernel void kernel_mul_mv_id_q6_K_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NSG = 2;
+    constexpr int nr0 = 2;
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r0 = tgpig.x;
+    const int output_row_base = tgpig.y;
+
+    if (output_row_base >= (int)p.ne1) return;
+
+    const uint token_idx = output_row_base / p.top_k;
+    const uint expert_id = ids[output_row_base];
+
+    const int first_row = (int)((r0 * NSG + sgitg) * nr0);
+
+    device const block_q6_K * x_base = (device const block_q6_K *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
+    device const float      * yy = src1 + token_idx * p.ne10;
+
+    float sumf[nr0] = {0.f, 0.f};
+    float yl[16];
+
+    const int tid  = tiisg / 2;
+    const int ix   = tiisg % 2;
+    const int ip   = tid / 8;
+    const int il   = tid % 8;
+    const int n    = 4;
+    const int l0   = n * il;
+    const int is   = 8*ip + l0/16;
+
+    const int y_offset   = 128*ip + l0;
+    const int q_offset_l = 64*ip + l0;
+    const int q_offset_h = 32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        // Cache Y vector once per block, reuse across both rows.
+        device const float * y = yy + i * QK_K + y_offset;
+        for (int l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (int row = 0; row < nr0; ++row) {
+            device const block_q6_K * xr = x_base + row * nb;
+            device const uint8_t * q1 = xr[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xr[i].qh + q_offset_h;
+            device const int8_t  * sc = xr[i].scales + is;
+
+            const float dall = xr[i].d;
+
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[row] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+
+    for (int row = 0; row < nr0; ++row) {
+        const int out_row = first_row + row;
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && out_row < (int)p.ne01) {
+            dst[output_row_base * p.ne0 + out_row] = tot;
+        }
+    }
+}
+
+// ====================================================================
 // Q4_K expert-indexed mat-vec kernel
 // ====================================================================
 //
