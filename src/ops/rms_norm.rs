@@ -378,6 +378,132 @@ pub fn dispatch_fused_post_attn_triple_norm_f32(
     Ok(())
 }
 
+/// ADR-028 iter-218 — Dispatch fused post-FF norm 2 + end-of-layer FINAL.
+///
+/// Fuses the gemma4 layer-end pair into a single kernel:
+///   (a) mlp_down = attn_out + norm(moe_accum, w2)
+///   (b) hidden   = (residual + norm(mlp_down, w3)) * layer_scalar
+///
+/// Bisect-confirmed +2.7% throughput on gemma4 default (iter-208 measured
+/// 0.34 ms savings from eliminating the (b) launch).
+///
+/// # Arguments
+/// * `encoder`      - Command encoder.
+/// * `registry`     - Must have `fused_post_ff_norm2_endlayer_f32` registered.
+/// * `device`       - Metal device.
+/// * `attn_out`     - Post-attention residual stream, f32 [rows, dim].
+/// * `moe_accum`    - MoE expert weighted sum, f32 [rows, dim].
+/// * `residual`     - Pre-attention residual, f32 [rows, dim].
+/// * `w2`           - post_feedforward_layernorm_2 weight, f32 [dim].
+/// * `w3`           - post_feedforward_layernorm weight, f32 [dim].
+/// * `layer_scalar` - Layer-scaling factor, f32 [1] (broadcast) or [dim] (per-channel).
+/// * `mlp_down`     - Output: intermediate (also written for downstream compat), f32 [rows, dim].
+/// * `hidden`       - Output: final layer output, f32 [rows, dim].
+/// * `eps`          - RMS epsilon.
+/// * `rows`         - Number of rows.
+/// * `dim`          - Model hidden size.
+/// * `scalar_is_vector` - True iff layer_scalar has dim elements (not 1).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    attn_out:     &MlxBuffer,
+    moe_accum:    &MlxBuffer,
+    residual:     &MlxBuffer,
+    w2:           &MlxBuffer,
+    w3:           &MlxBuffer,
+    layer_scalar: &MlxBuffer,
+    mlp_down:     &MlxBuffer,
+    hidden:       &MlxBuffer,
+    eps:          f32,
+    rows:         u32,
+    dim:          u32,
+    scalar_is_vector: bool,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_post_ff_norm2_endlayer_f32: rows and dim must be > 0".into(),
+        ));
+    }
+    let expected = (rows as usize) * (dim as usize);
+    for (name, buf) in [
+        ("attn_out",  attn_out),
+        ("moe_accum", moe_accum),
+        ("residual",  residual),
+        ("mlp_down",  mlp_down),
+        ("hidden",    hidden),
+    ] {
+        if buf.element_count() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_post_ff_norm2_endlayer_f32: {} size {} < rows({}) * dim({})",
+                name, buf.element_count(), rows, dim
+            )));
+        }
+        if buf.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_post_ff_norm2_endlayer_f32: {} must be f32, got {}",
+                name, buf.dtype()
+            )));
+        }
+    }
+    for (name, buf) in [("w2", w2), ("w3", w3)] {
+        if buf.element_count() != dim as usize {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused_post_ff_norm2_endlayer_f32: {} size {} != dim({})",
+                name, buf.element_count(), dim
+            )));
+        }
+    }
+    let expected_scalar = if scalar_is_vector { dim as usize } else { 1 };
+    if layer_scalar.element_count() < expected_scalar {
+        return Err(MlxError::InvalidArgument(format!(
+            "fused_post_ff_norm2_endlayer_f32: layer_scalar size {} < expected {}",
+            layer_scalar.element_count(), expected_scalar
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("fused_post_ff_norm2_endlayer_f32", device)?;
+
+    let tg_size = std::cmp::min(256u32, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Params {
+        eps: f32,
+        dim: u32,
+        scalar_is_vector: u32,
+    }
+    let params = Params {
+        eps,
+        dim,
+        scalar_is_vector: if scalar_is_vector { 1 } else { 0 },
+    };
+
+    use super::encode_helpers::{as_bytes, KernelArg};
+    encoder.set_op_kind(CapturedOpKind::Other);
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(attn_out)),
+            (1, KernelArg::Buffer(moe_accum)),
+            (2, KernelArg::Buffer(residual)),
+            (3, KernelArg::Buffer(w2)),
+            (4, KernelArg::Buffer(w3)),
+            (5, KernelArg::Buffer(layer_scalar)),
+            (6, KernelArg::Buffer(mlp_down)),
+            (7, KernelArg::Buffer(hidden)),
+            (8, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Dispatch an RMS normalization without learned scale (bf16 only).
 ///
 /// Computes: `output = x * rsqrt(mean(x^2) + eps)` — no weight multiplication.
