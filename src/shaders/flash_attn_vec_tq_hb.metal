@@ -189,18 +189,49 @@ inline float dequant_hb_single(
 
 // Reconstruct float4 from 4 consecutive byte-packed elements.
 // coord_base must be a multiple of 4.
+//
+// ADR-028 iter-195: vectorized byte load.  Replaces 4 sequential
+// `packed_pos[coord+i]` reads with 1 uint32 load + 4 bit-shift+mask
+// extracts.  Apple Metal coalesces a single 4-byte aligned uint load
+// better than 4 separate 1-byte reads.  Also hoists the cbits branch
+// out of the per-element loop (one branch decides for all 4 indices).
+//
+// Alignment requirement: caller must pass coord_base divisible by 4.
+// All call sites in this kernel pass coord_base = (anything)*4 — verified.
 inline float4 dequant_hb_float4(
     device const uint8_t *packed_pos,
     uint coord_base,
     float scale_norm,
     uint cbits
 ) {
-    return float4(
-        dequant_hb_single(packed_pos, coord_base + 0, scale_norm, cbits),
-        dequant_hb_single(packed_pos, coord_base + 1, scale_norm, cbits),
-        dequant_hb_single(packed_pos, coord_base + 2, scale_norm, cbits),
-        dequant_hb_single(packed_pos, coord_base + 3, scale_norm, cbits)
-    );
+    // Vectorized 4-byte load.  packed_pos + coord_base is 4-byte aligned
+    // because (a) packed_pos is from MlxBuffer (≥16-byte aligned) and
+    // (b) coord_base is always a multiple of 4 at every call site.
+    uint k_packed = ((device const uint *)(packed_pos + coord_base))[0];
+    uint idx0 = (k_packed >>  0) & 0xFFu;
+    uint idx1 = (k_packed >>  8) & 0xFFu;
+    uint idx2 = (k_packed >> 16) & 0xFFu;
+    uint idx3 = (k_packed >> 24) & 0xFFu;
+
+    float c0, c1, c2, c3;
+    if (cbits == 5u) {
+        c0 = CODEBOOK_HB_5BIT[idx0 & 0x1Fu];
+        c1 = CODEBOOK_HB_5BIT[idx1 & 0x1Fu];
+        c2 = CODEBOOK_HB_5BIT[idx2 & 0x1Fu];
+        c3 = CODEBOOK_HB_5BIT[idx3 & 0x1Fu];
+    } else if (cbits == 6u) {
+        c0 = CODEBOOK_HB_6BIT[idx0 & 0x3Fu];
+        c1 = CODEBOOK_HB_6BIT[idx1 & 0x3Fu];
+        c2 = CODEBOOK_HB_6BIT[idx2 & 0x3Fu];
+        c3 = CODEBOOK_HB_6BIT[idx3 & 0x3Fu];
+    } else {
+        // 8-bit: full byte index, no mask (matches dequant_hb_single).
+        c0 = CODEBOOK_HB_8BIT[idx0];
+        c1 = CODEBOOK_HB_8BIT[idx1];
+        c2 = CODEBOOK_HB_8BIT[idx2];
+        c3 = CODEBOOK_HB_8BIT[idx3];
+    }
+    return float4(c0, c1, c2, c3) * scale_norm;
 }
 
 // ---------------------------------------------------------------------------
