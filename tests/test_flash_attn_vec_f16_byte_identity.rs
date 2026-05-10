@@ -175,18 +175,21 @@ fn round_to_f16(buf: &[f32]) -> Vec<f32> {
     buf.iter().map(|&x| f16::from_f32(x).to_f32()).collect()
 }
 
-/// dk256: gemma4 production head dim, sliding-window layer geometry.
-#[test]
-fn test_flash_attn_vec_dk256_f32_vs_f16_rel_rms() {
-    let num_heads = 16u32;
-    let num_kv_heads = 8u32;
-    let head_dim = 256u32;
-    let kv_seq_len = 240u32; // ADR-009's measured sliding regime
-    let kv_capacity = 1024u32; // gemma4 sliding window
+/// Three-axis A/B helper: F32 baseline vs F32-with-F16-inputs vs F16-kernel.
+/// Asserts F16 kernel is byte-identical (or within 1e-2) to F32-with-F16-inputs,
+/// proving the F16 kernel adds no math error beyond F16 storage precision.
+fn run_byte_identity_case(
+    label: &str,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    mask_type: u32,
+    sliding_window: u32,
+    seed: u64,
+) {
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mask_type = 2u32; // sliding window
-    let sliding_window = 1024u32;
-    let seed = 42u64;
 
     let q_elems = num_heads as usize * head_dim as usize;
     let kv_elems = num_kv_heads as usize * kv_capacity as usize * head_dim as usize;
@@ -198,83 +201,102 @@ fn test_flash_attn_vec_dk256_f32_vs_f16_rel_rms() {
     fill_random(&mut k_data, seed + 10000);
     fill_random(&mut v_data, seed + 20000);
 
-    // F32 path: full precision baseline.
+    // F32 baseline.
     let f32_output = run_kernel(
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        kv_seq_len,
-        kv_capacity,
-        scale,
-        mask_type,
-        sliding_window,
-        &q_data,
-        &k_data,
-        &v_data,
-        DType::F32,
+        num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+        scale, mask_type, sliding_window,
+        &q_data, &k_data, &v_data, DType::F32,
     );
 
-    // F32 path with F16-rounded inputs: this is the BEST-CASE F16 baseline.
-    // If the F16 kernel matches THIS, the kernel is correct (precision-only
-    // difference comes from the F16 storage, not the kernel math).
+    // F32 kernel with F16-rounded inputs (best-case F16 baseline).
     let k_f16_rounded = round_to_f16(&k_data);
     let v_f16_rounded = round_to_f16(&v_data);
     let f32_with_f16_inputs_output = run_kernel(
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        kv_seq_len,
-        kv_capacity,
-        scale,
-        mask_type,
-        sliding_window,
-        &q_data,
-        &k_f16_rounded,
-        &v_f16_rounded,
-        DType::F32,
+        num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+        scale, mask_type, sliding_window,
+        &q_data, &k_f16_rounded, &v_f16_rounded, DType::F32,
     );
 
-    // F16 path: actual kernel under test.
+    // F16 kernel (actual path under test).
     let f16_output = run_kernel(
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        kv_seq_len,
-        kv_capacity,
-        scale,
-        mask_type,
-        sliding_window,
-        &q_data,
-        &k_data,
-        &v_data,
-        DType::F16,
+        num_heads, num_kv_heads, head_dim, kv_seq_len, kv_capacity,
+        scale, mask_type, sliding_window,
+        &q_data, &k_data, &v_data, DType::F16,
     );
 
     let rms_f32_vs_f16inputs = rel_rms(&f32_with_f16_inputs_output, &f32_output);
     let rms_f16_vs_f32 = rel_rms(&f16_output, &f32_output);
     let rms_f16_vs_f32inputs = rel_rms(&f16_output, &f32_with_f16_inputs_output);
 
-    eprintln!("F32 baseline ←→ F32-with-F16-inputs rel_rms: {rms_f32_vs_f16inputs:.6e}");
-    eprintln!("F32 baseline ←→ F16-kernel rel_rms:          {rms_f16_vs_f32:.6e}");
-    eprintln!("F32-with-F16-inputs ←→ F16-kernel rel_rms:   {rms_f16_vs_f32inputs:.6e}");
-
-    // Diagnostic only (no assert): print the ratio.
+    eprintln!("[{label}] F32 ←→ F32-with-F16-inputs rel_rms:   {rms_f32_vs_f16inputs:.6e}");
+    eprintln!("[{label}] F32 ←→ F16-kernel rel_rms:            {rms_f16_vs_f32:.6e}");
+    eprintln!("[{label}] F32-with-F16-inputs ←→ F16 rel_rms:   {rms_f16_vs_f32inputs:.6e}");
     if rms_f32_vs_f16inputs > 0.0 {
         let amplification = rms_f16_vs_f32 / rms_f32_vs_f16inputs;
-        eprintln!("F16-kernel amplification over F16-inputs: {amplification:.2}×");
+        eprintln!("[{label}] F16-kernel amplification:                {amplification:.2}×");
     }
 
-    // Pass condition: F16 kernel output should match F32-with-F16-inputs
-    // baseline within F16 ULP × accumulation. A ratio < 5× means kernel
-    // is correct; > 19× would reproduce ADR-009's reported amplification.
     assert!(
         rms_f16_vs_f32inputs < 1e-2,
-        "F16 kernel diverges from F32-with-F16-inputs by {rms_f16_vs_f32inputs:.6e} \
-         (threshold 1e-2). Amplification = {:.2}×",
-        if rms_f32_vs_f16inputs > 0.0 {
-            rms_f16_vs_f32inputs / rms_f32_vs_f16inputs
-        } else {
-            f32::INFINITY
-        }
+        "[{label}] F16 kernel diverges from F32-with-F16-inputs by \
+         {rms_f16_vs_f32inputs:.6e} (threshold 1e-2)"
+    );
+}
+
+/// dk256 sliding-window: ADR-009's specific failure regime.
+#[test]
+fn test_dk256_sliding_window_kvlen_240() {
+    run_byte_identity_case(
+        "dk256-sliding-kv240",
+        16, 8, 256, 240, 1024,
+        2, 1024, // sliding window
+        42,
+    );
+}
+
+/// dk256 causal layer: gemma4 has full_attn_every=6 (5 of 30 layers).
+#[test]
+fn test_dk256_causal_kvlen_512() {
+    run_byte_identity_case(
+        "dk256-causal-kv512",
+        16, 8, 256, 512, 4096,
+        1, 0, // causal mask, no sliding
+        43,
+    );
+}
+
+/// dk256 long context: stress-test mask + softmax tail.
+#[test]
+fn test_dk256_causal_kvlen_2048() {
+    run_byte_identity_case(
+        "dk256-causal-kv2048",
+        16, 8, 256, 2048, 4096,
+        1, 0,
+        44,
+    );
+}
+
+/// dk256 full sliding window: kvlen == capacity (saturated ring buffer).
+/// The kernel's contract: `kv_seq_len <= kv_capacity`; wrap-around is
+/// handled by the caller writing modular slots. ADR-009 reported -125
+/// byte sliding-wrap drift; we test the saturated steady state here.
+#[test]
+fn test_dk256_sliding_window_full_capacity() {
+    run_byte_identity_case(
+        "dk256-sliding-saturated-kv1024",
+        16, 8, 256, 1024, 1024,
+        2, 1024,
+        45,
+    );
+}
+
+/// dk512: qwen35/36 head dim — same kernel template, different DK.
+#[test]
+fn test_dk512_causal_kvlen_512() {
+    run_byte_identity_case(
+        "dk512-causal-kv512",
+        16, 4, 512, 512, 1024,
+        1, 0,
+        46,
     );
 }
