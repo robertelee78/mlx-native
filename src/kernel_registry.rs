@@ -755,6 +755,11 @@ impl KernelRegistry {
         let fused_norm_add_f32_src: &'static str =
             include_str!("shaders/fused_norm_add_f32.metal");
         sources.insert("fused_norm_add_f32".into(), fused_norm_add_f32_src);
+        // ADR-028 iter-331 — float4 + simd_sum variant (peer-pattern,
+        // ported from llama.cpp kernel_rms_norm_fuse_impl<float4, 3>).
+        // Env-gated via HF2Q_FUSED_NORM_ADD_V2=1 in the dispatcher
+        // (default ON since iter-331; opt-out via =0/false/off).
+        sources.insert("fused_norm_add_f32_v2".into(), fused_norm_add_f32_src);
         sources.insert("fused_residual_norm_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_residual_norm_scalar_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_routing_f32".into(), fused_norm_add_f32_src);

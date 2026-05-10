@@ -273,6 +273,89 @@ kernel void fused_norm_add_f32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// fused_norm_add_f32_v2 (ADR-028 iter-331) — peer-pattern port mirroring
+// llama.cpp `kernel_rms_norm_fuse_impl<float4, 3>` (ggml-metal.metal:2989+).
+//
+// Replaces our scalar + threadgroup tree-reduction `fused_norm_add_f32`
+// with:
+//   1. float4 vector loads (4× memory throughput per thread)
+//   2. simd_sum() in-simdgroup reduction (1 HW op, no barrier)
+//   3. inter-simdgroup shuffle via shared memory (just 2 barriers total)
+//
+// Numerically equivalent to `fused_norm_add_f32` (same algebra, same f32
+// accumulation), structurally faster on the same input.  Same threadgroup
+// geometry (one TG per row, `min(256, dim.next_power_of_two())` threads).
+// Shared memory now only needs one float per simdgroup (32 floats max for
+// 1024 threads), vs `tg_size * 4` bytes in scalar.
+//
+// REQUIREMENT: `dim % 4 == 0`.  All hf2q gemma4 production shapes meet
+// this (gemma4 hidden=2816, head_dim=256).  Dispatcher must guard or
+// fall back to scalar.
+//
+// Buffer layout matches the scalar `fused_norm_add_f32` kernel above —
+// the `setBytes` params (dim, rows, eps) and the four buffers
+// (residual, input, weight, output) are unchanged at the dispatcher
+// level.  Only the kernel re-interprets the four data buffers as float4.
+kernel void fused_norm_add_f32_v2(
+    device const float4* residual [[buffer(0)]],
+    device const float4* input    [[buffer(1)]],
+    device const float4* weight   [[buffer(2)]],
+    device float4*       output   [[buffer(3)]],
+    constant uint&       dim      [[buffer(4)]],
+    constant uint&       rows     [[buffer(5)]],
+    constant float&      eps      [[buffer(6)]],
+    uint row_id  [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    if (row_id >= rows) { return; }
+
+    const uint dim4  = dim / 4u;
+    const uint base4 = row_id * dim4;
+
+    // Phase 1: sum of squares using float4 vector loads + dot()
+    // (1 dot op = 4 multiply-add for the float4).
+    float sumf = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 v = input[base4 + i];
+        sumf += dot(v, v);
+    }
+
+    // In-simdgroup reduction (1 HW op, no barrier).
+    sumf = simd_sum(sumf);
+
+    // Stage per-simdgroup partial sums via threadgroup memory.
+    if (tiisg == 0) {
+        shared[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across simdgroups in the first simdgroup.
+    // Number of active SGs = tg_size / 32 (≤ 32 for tg_size ≤ 1024).
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // rms_inv = rsqrt(mean(input^2) + eps)
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 2: float4 normalize + weight + add residual + store.
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 normed = (input[base4 + i] * rms_inv) * weight[i];
+        output[base4 + i] = residual[base4 + i] + normed;
+    }
+}
+
 /// Fused residual addition + RMS normalization (float32).
 ///
 /// Computes:

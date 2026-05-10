@@ -271,10 +271,26 @@ pub fn dispatch_fused_norm_add_f32(
         ));
     }
 
-    let pipeline = registry.get_pipeline("fused_norm_add_f32", device)?;
+    // ADR-028 iter-331 — float4 + simd_sum variant.  Default-ON since
+    // iter-331 (operator REFRAME #2 pattern matching iter-326).  Opt
+    // out with `HF2Q_FUSED_NORM_ADD_V2=0` / `=false` / `=off`.
+    // Requires `dim % 4 == 0`; falls back to scalar when not.
+    let use_v2 = (dim % 4 == 0) && crate::env_flags::env_default_true("HF2Q_FUSED_NORM_ADD_V2");
+    let kernel_name = if use_v2 { "fused_norm_add_f32_v2" } else { "fused_norm_add_f32" };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let tg_size = tg_size_for_dim(dim);
-    let shared_mem_bytes = tg_size * 4;
+    // v2 only needs 1 float per simdgroup; scalar needs tg_size floats.
+    let shared_mem_bytes = if use_v2 {
+        // n_sg = tg_size / 32; allocate at least 32 floats so simd_sum's
+        // sgitg-indexed write at line `shared[sgitg]` is never OOB even
+        // for partial-warp tg_sizes < 32 (rms_norm_v2 uses same minimum).
+        let n_sg = std::cmp::max(1u64, tg_size / 32);
+        std::cmp::max(32, n_sg) * 4
+    } else {
+        tg_size * 4
+    };
 
     encode_threadgroups_with_args_and_shared(
         encoder,
