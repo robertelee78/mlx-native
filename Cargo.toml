@@ -104,3 +104,7 @@ harness = false
 [[bench]]
 name = "bench_mtl_event_cost"
 harness = false
+
+[[bench]]
+name = "bench_dispatch_overhead"
+harness = false
