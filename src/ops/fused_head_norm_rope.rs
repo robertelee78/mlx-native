@@ -256,7 +256,19 @@ pub fn dispatch_fused_head_norm_rope_f32(
         )));
     }
 
-    let pipeline = registry.get_pipeline("fused_head_norm_rope_f32", device)?;
+    // ADR-028 iter-337 — float4 + simd_sum Phase 1 variant.  Default-ON
+    // (operator REFRAME #2 pattern matching iter-326).  Opt out with
+    // `HF2Q_FUSED_HEAD_NORM_ROPE_V2=0` / `=false` / `=off`.
+    // Requires `head_dim % 4 == 0`; falls back to scalar v1 when not.
+    // Phases 2-4 byte-identical to v1; race-fix barrier preserved.
+    let use_v2 = (head_dim % 4 == 0)
+        && crate::env_flags::env_default_true("HF2Q_FUSED_HEAD_NORM_ROPE_V2");
+    let kernel_name = if use_v2 {
+        "fused_head_norm_rope_f32_v2"
+    } else {
+        "fused_head_norm_rope_f32"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     // Threadgroup must accommodate head_dim elements for shared memory caching.
     // Use next_power_of_two of head_dim, capped at 256.

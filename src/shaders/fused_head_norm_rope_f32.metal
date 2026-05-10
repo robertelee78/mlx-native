@@ -211,3 +211,166 @@ kernel void fused_head_norm_rope_f32(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// fused_head_norm_rope_f32_v2 (ADR-028 iter-337) — peer-pattern Phase 1 port.
+//
+// Replaces v1's scalar + threadgroup tree-reduction Phase 1 with:
+//   1. float4 vector loads (4× memory throughput per thread)
+//   2. simd_sum() in-simdgroup reduction (1 HW op, no barrier)
+//   3. inter-simdgroup shuffle via shared memory (2 barriers total)
+//
+// Phases 2-4 (normalize+store_to_shared, NeoX RoPE rotation, pass-through
+// non-rotated dims) are BYTE-IDENTICAL to v1 — RoPE is pair-wise on
+// `shared[i]` / `shared[i + half_dim]` and not float4-friendly; the
+// load-bearing race-fix barrier at the Phase 1→Phase 2 transition is
+// preserved exactly per docs/spike-batched-prefill-race-rootcause.md.
+//
+// REQUIREMENT: `head_dim % 4 == 0`.  All hf2q production shapes meet this
+// (gemma4 head_dim=256, qwen3.6 head_dim=128).  Dispatcher must guard or
+// fall back to scalar.
+//
+// Numerically equivalent to `fused_head_norm_rope_f32` within f32
+// accumulation tolerance (~1e-4).  Not bit-exact due to simd_sum vs
+// tree-reduce non-associativity.
+kernel void fused_head_norm_rope_f32_v2(
+    device const float*                      input            [[buffer(0)]],
+    device float*                            output           [[buffer(1)]],
+    device const float*                      norm_weight      [[buffer(2)]],
+    constant FusedHeadNormRopeF32Params&     params           [[buffer(3)]],
+    device const uint*                       positions        [[buffer(4)]],
+    device const float*                      freq_factors     [[buffer(5)]],
+    device bfloat*                           output_bf16      [[buffer(6)]],
+    device float*                            output_f32_perm  [[buffer(7)]],
+    uint head_id  [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    threadgroup float* shared             [[threadgroup(0)]]
+) {
+    const bool has_bf16 = (params.has_bf16_output != 0u);
+    const bool has_f32_perm = (params.has_f32_perm_output != 0u);
+    const uint head_dim     = params.head_dim;
+    const uint half_rope    = params.half_rope_dim;
+    const uint half_dim     = head_dim / 2;
+    const float eps         = params.eps;
+    const bool has_weight   = (params.has_weight != 0u);
+    const float theta       = params.theta;
+    const bool has_ff       = (params.has_freq_factors != 0u);
+    const uint n_heads      = params.n_heads;
+    const bool bf16_perm    = (params.bf16_permuted != 0u);
+    const uint seq_len_v    = params.seq_len;
+
+    const uint seq_idx = head_id / n_heads;
+    const uint pos = positions[seq_idx];
+
+    const uint base = head_id * head_dim;
+    const uint head_within_token = head_id % n_heads;
+    const uint base_bf16 = bf16_perm
+        ? (head_within_token * seq_len_v * head_dim + seq_idx * head_dim)
+        : base;
+
+    // -------------------------------------------------------------------------
+    // Phase 1 (V2): float4 sum-of-squares + simd_sum + 2-barrier inter-SG
+    // -------------------------------------------------------------------------
+    const uint head_dim4 = head_dim / 4u;
+    device const float4* input4 = (device const float4*)(input + base);
+
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < head_dim4; i += tg_size) {
+        const float4 v = input4[i];
+        partial_sq += dot(v, v);
+    }
+
+    // In-simdgroup reduction (1 HW op).
+    float sumf = simd_sum(partial_sq);
+
+    // Stage per-simdgroup partial sums via threadgroup memory.
+    if (tiisg == 0) {
+        shared[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across simdgroups in the first simdgroup.
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float vsg = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(vsg);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms_inv = rsqrt(shared[0] / float(head_dim) + eps);
+
+    // CRITICAL: load-bearing race-fix barrier (preserved from v1 line 148).
+    // All threads must complete the broadcast-read of shared[0] for rms_inv
+    // BEFORE any thread overwrites shared[0] in Phase 2's `shared[i] = val`
+    // write.  Removing this causes ~80% broken at head_dim=256, n_tokens*
+    // n_heads >= 2000 threadgroups on Apple Silicon (per v1 line 135-147).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Phase 2 (UNCHANGED from v1): normalize, optional weight, store in shared
+    // -------------------------------------------------------------------------
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float val = input[base + i] * rms_inv;
+        if (has_weight) {
+            val *= norm_weight[i];
+        }
+        shared[i] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Phase 3 (UNCHANGED from v1): NeoX rotation on first 2*half_rope dims
+    // -------------------------------------------------------------------------
+    for (uint i = tid; i < half_rope; i += tg_size) {
+        const float x0 = shared[i];
+        const float x1 = shared[i + half_dim];
+
+        const float dim_ratio = float(2 * i) / float(head_dim);
+        float freq = float(pos) / pow(theta, dim_ratio);
+
+        if (has_ff) {
+            freq /= freq_factors[i];
+        }
+
+        const float cos_a = cos(freq);
+        const float sin_a = sin(freq);
+
+        const float o0 = x0 * cos_a - x1 * sin_a;
+        const float o1 = x1 * cos_a + x0 * sin_a;
+        output[base + i]            = o0;
+        output[base + i + half_dim] = o1;
+        if (has_bf16) {
+            output_bf16[base_bf16 + i]            = bfloat(o0);
+            output_bf16[base_bf16 + i + half_dim] = bfloat(o1);
+        }
+        if (has_f32_perm) {
+            output_f32_perm[base_bf16 + i]            = o0;
+            output_f32_perm[base_bf16 + i + half_dim] = o1;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4 (UNCHANGED from v1): pass-through non-rotated dims
+    // -------------------------------------------------------------------------
+    for (uint i = tid; i < half_dim - half_rope; i += tg_size) {
+        uint src = half_rope + i;
+        const float o0 = shared[src];
+        const float o1 = shared[src + half_dim];
+        output[base + src]            = o0;
+        output[base + src + half_dim] = o1;
+        if (has_bf16) {
+            output_bf16[base_bf16 + src]            = bfloat(o0);
+            output_bf16[base_bf16 + src + half_dim] = bfloat(o1);
+        }
+        if (has_f32_perm) {
+            output_f32_perm[base_bf16 + src]            = o0;
+            output_f32_perm[base_bf16 + src + half_dim] = o1;
+        }
+    }
+}

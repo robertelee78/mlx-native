@@ -743,6 +743,10 @@ impl KernelRegistry {
         let fused_hnr_f32_src: &'static str =
             include_str!("shaders/fused_head_norm_rope_f32.metal");
         sources.insert("fused_head_norm_rope_f32".into(), fused_hnr_f32_src);
+        // ADR-028 iter-337 — float4 + simd_sum Phase 1 variant.  Phases
+        // 2-4 byte-identical to v1; race-fix barrier preserved.  Env-gated
+        // via HF2Q_FUSED_HEAD_NORM_ROPE_V2 (default ON, opt-out via =0).
+        sources.insert("fused_head_norm_rope_f32_v2".into(), fused_hnr_f32_src);
 
         // Fused head-norm + RoPE bf16 kernels (single-token + batch prefill)
         // Both entry points live in the same .metal file.
