@@ -71,7 +71,8 @@ pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{
     auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
-    cmd_buf_count, dispatch_count, reset_counters, sync_count, CapturedNode, CapturedOpKind,
+    cmd_buf_count, dispatch_count, pipeline_dispatch_buckets, reset_counters,
+    reset_pipeline_dispatch_buckets, sync_count, CapturedNode, CapturedOpKind,
     CommandEncoder, DispatchKind, KernelArg, RecordedBinding,
 };
 pub use encoder_session::EncoderSession;

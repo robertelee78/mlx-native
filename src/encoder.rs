@@ -19,7 +19,7 @@
 //! records a barrier sentinel.  Call `take_capture()` to extract the recorded
 //! graph for later replay via `ComputeGraph::encode_sequential()`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
 use metal::{
     CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
@@ -291,6 +291,70 @@ pub fn sync_count() -> u64 {
 /// `encode_threadgroups_with_shared()` increments this counter.
 pub fn dispatch_count() -> u64 {
     DISPATCH_COUNT.load(Ordering::Relaxed)
+}
+
+/// Per-pipeline dispatch bucket support (ADR-028 iter-284).
+///
+/// Env-gated via `MLX_DISP_BUCKET=1`.  When enabled, every
+/// `encode*` call records its pipeline's label in a global hash map.
+/// This gives a per-kernel breakdown comparable to llama.cpp's
+/// instrumented dispatch site for finding *which* kernels make up
+/// the per-token dispatch budget.
+fn pipeline_buckets()
+    -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static BUCKETS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    > = std::sync::OnceLock::new();
+    BUCKETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cached env-flag check — single load on the hot path.
+fn pipeline_bucket_enabled() -> bool {
+    static CACHED: AtomicI8 = AtomicI8::new(-1);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v == 1;
+    }
+    let on = std::env::var("MLX_DISP_BUCKET").as_deref() == Ok("1");
+    CACHED.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    on
+}
+
+/// Record a dispatch into the per-pipeline bucket if the env-flag is on.
+/// Called from every `encode*` site alongside the `DISPATCH_COUNT` bump.
+#[inline]
+pub(crate) fn bucket_dispatch(pipeline: &ComputePipelineStateRef) {
+    if !pipeline_bucket_enabled() {
+        return;
+    }
+    let label = pipeline.label();
+    if label.is_empty() {
+        return;
+    }
+    if let Ok(mut t) = pipeline_buckets().lock() {
+        *t.entry(label.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Public dump of `MLX_DISP_BUCKET` data: `Vec<(label, count)>` sorted
+/// descending by count.  Returns empty when env-flag is off / never
+/// recorded.
+pub fn pipeline_dispatch_buckets() -> Vec<(String, u64)> {
+    let mut v: Vec<(String, u64)> = if let Ok(t) = pipeline_buckets().lock() {
+        t.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    } else {
+        Vec::new()
+    };
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
+}
+
+/// Reset the per-pipeline dispatch buckets (typically called at decode
+/// start to ignore prefill / warmup contributions).
+pub fn reset_pipeline_dispatch_buckets() {
+    if let Ok(mut t) = pipeline_buckets().lock() {
+        t.clear();
+    }
 }
 
 /// Read the current value of `CMD_BUF_COUNT`.
@@ -944,6 +1008,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
         let op_kind = self.take_pending_op_kind();
         let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
         if let Some(ref mut nodes) = self.capture {
@@ -988,6 +1053,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
         let op_kind = self.take_pending_op_kind();
         let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
         if let Some(ref mut nodes) = self.capture {
@@ -1041,6 +1107,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
         let op_kind = self.take_pending_op_kind();
         let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
         if let Some(ref mut nodes) = self.capture {
@@ -1085,6 +1152,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
         let op_kind = self.take_pending_op_kind();
         let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
         if let Some(ref mut nodes) = self.capture {
@@ -1124,6 +1192,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
         let op_kind = self.take_pending_op_kind();
         let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
         if let Some(ref mut nodes) = self.capture {
@@ -1164,6 +1233,7 @@ impl CommandEncoder {
         threadgroup_size: MTLSize,
     ) {
         DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
         let op_kind = self.take_pending_op_kind();
         let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
         if let Some(ref mut nodes) = self.capture {
