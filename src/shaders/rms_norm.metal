@@ -58,6 +58,131 @@ kernel void rms_norm_f32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// rms_norm_f32_v2 (ADR-028 iter-310) — peer-pattern port.
+//
+// Replaces our scalar + threadgroup tree-reduction `rms_norm_f32` with:
+//   1. float4 vector loads (4× memory throughput per thread)
+//   2. simd_sum() in-simdgroup reduction (1 HW op, no barrier)
+//   3. inter-simdgroup shuffle via shared memory (just 2 barriers total)
+//
+// Numerically equivalent to `rms_norm_f32` (same algebra, same f32
+// accumulation), but ~2× faster in our hot path per peer's
+// `kernel_rms_norm_fuse_impl<float4, 1>` benchmarks.
+//
+// REQUIREMENT: `dim % 4 == 0`.  All hf2q production shapes meet this
+// (gemma4 hidden=3584, qwen3.6 hidden=2048).  Dispatcher must guard
+// or fall back to scalar.
+//
+// Threadgroup geometry: same as scalar rms_norm_f32 — one TG per row,
+// `min(256, dim.next_power_of_two())` threads.  Shared memory now
+// only needs one float per simdgroup (32 floats max for 1024 threads),
+// vs `tg_size * 4` bytes in scalar.
+kernel void rms_norm_f32_v2(
+    device const float4 *input  [[buffer(0)]],
+    device const float4 *weight [[buffer(1)]],
+    device float4       *output [[buffer(2)]],
+    device const float  *params [[buffer(3)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    threadgroup float *shared [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+    const uint dim4 = dim / 4u;
+
+    const uint base4 = row_idx * dim4;
+
+    // Phase 1: sum of squares using float4 vector loads.
+    float sumf = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 v = input[base4 + i];
+        sumf += dot(v, v);
+    }
+
+    // In-simdgroup reduction (1 HW op).
+    sumf = simd_sum(sumf);
+
+    // Stage per-simdgroup partial sums via threadgroup memory.
+    if (tiisg == 0) {
+        shared[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across simdgroups in the first simdgroup.
+    // Number of active SGs = tg_size / 32 (≤ 32 for tg_size ≤ 1024).
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    // Phase 2: normalize and apply weight, float4 vector store.
+    for (uint i = tid; i < dim4; i += tg_size) {
+        output[base4 + i] = (input[base4 + i] * rms_inv) * weight[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rms_norm_no_scale_f32_v2 (ADR-028 iter-310) — peer-pattern port,
+// no-weight variant.  Same math as rms_norm_no_scale_f32, but float4 +
+// simd_sum.  Used for the V-rms-norm site (no learnable weight).
+kernel void rms_norm_no_scale_f32_v2(
+    device const float4 *input  [[buffer(0)]],
+    device float4       *output [[buffer(1)]],
+    device const float  *params [[buffer(2)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    threadgroup float *shared [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+    const uint dim4 = dim / 4u;
+
+    const uint base4 = row_idx * dim4;
+
+    float sumf = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 v = input[base4 + i];
+        sumf += dot(v, v);
+    }
+
+    sumf = simd_sum(sumf);
+
+    if (tiisg == 0) {
+        shared[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    for (uint i = tid; i < dim4; i += tg_size) {
+        output[base4 + i] = input[base4 + i] * rms_inv;
+    }
+}
+
 kernel void rms_norm_f16(
     device const half  *input     [[buffer(0)]],
     device const float *weight    [[buffer(1)]],

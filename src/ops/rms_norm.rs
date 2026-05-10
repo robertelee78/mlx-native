@@ -96,26 +96,50 @@ pub fn dispatch_rms_norm(
         )));
     }
 
-    let kernel_name = match input.dtype() {
-        DType::F32 => "rms_norm_f32",
-        DType::F16 => "rms_norm_f16",
-        DType::BF16 => "rms_norm_bf16",
-        _ => {
-            return Err(MlxError::InvalidArgument(format!(
-                "RMS norm unsupported dtype: {}",
-                input.dtype()
-            )));
+    // ADR-028 iter-310 — opt-in float4 + simd_sum variant for F32 path.
+    // Requires `dim % 4 == 0`; falls back to scalar when not.
+    let use_v2 = matches!(input.dtype(), DType::F32)
+        && (dim % 4 == 0)
+        && std::env::var("HF2Q_RMS_NORM_V2")
+            .ok()
+            .as_deref()
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    let kernel_name = if use_v2 {
+        "rms_norm_f32_v2"
+    } else {
+        match input.dtype() {
+            DType::F32 => "rms_norm_f32",
+            DType::F16 => "rms_norm_f16",
+            DType::BF16 => "rms_norm_bf16",
+            _ => {
+                return Err(MlxError::InvalidArgument(format!(
+                    "RMS norm unsupported dtype: {}",
+                    input.dtype()
+                )));
+            }
         }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
-    // One threadgroup per row.  Threadgroup size must be a power of 2
-    // for the tree reduction to work correctly.
-    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    // One threadgroup per row.  Threadgroup size must be a power of 2.
+    let mut tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    // v2 uses simd_sum reduction which requires at least one full
+    // simdgroup (32 lanes).  Smaller dims still work — extra threads
+    // just sit idle in the load loop.
+    if use_v2 && tg_size < 32 {
+        tg_size = 32;
+    }
 
-    // Threadgroup shared memory: tg_size floats for the reduction.
-    let shared_mem_bytes = tg_size * 4; // sizeof(float) = 4
+    // Threadgroup shared memory: v2 only needs one float per simdgroup
+    // (≤ 32 SGs for tg_size ≤ 1024 → ≤ 128 bytes).  Scalar path uses
+    // tg_size floats for the tree reduction.
+    let shared_mem_bytes = if use_v2 {
+        (tg_size / 32).max(1) * 4
+    } else {
+        tg_size * 4
+    };
 
     // Tag for the fusion pass (Phase 4e.2): RMS norm can fuse with a
     // subsequent elementwise multiply.
@@ -634,10 +658,29 @@ pub fn dispatch_rms_norm_no_scale_f32(
         )));
     }
 
-    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32", device)?;
+    // ADR-028 iter-310 — env-gated float4 + simd_sum variant.
+    let use_v2 = (dim % 4 == 0)
+        && std::env::var("HF2Q_RMS_NORM_V2")
+            .ok()
+            .as_deref()
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let kernel_name = if use_v2 {
+        "rms_norm_no_scale_f32_v2"
+    } else {
+        "rms_norm_no_scale_f32"
+    };
 
-    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
-    let shared_mem_bytes = tg_size * 4;
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let mut tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    if use_v2 && tg_size < 32 {
+        tg_size = 32;
+    }
+    let shared_mem_bytes = if use_v2 {
+        (tg_size / 32).max(1) * 4
+    } else {
+        tg_size * 4
+    };
 
     encoder.encode_threadgroups_with_shared(
         pipeline,

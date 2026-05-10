@@ -436,6 +436,11 @@ impl KernelRegistry {
         sources.insert("rope_neox_f32".into(), rope_src);
         let rms_norm_src: &'static str = include_str!("shaders/rms_norm.metal");
         sources.insert("rms_norm_f32".into(), rms_norm_src);
+        // ADR-028 iter-310 — float4 + simd_sum variants (peer-pattern,
+        // ported from llama.cpp kernel_rms_norm_fuse_impl<float4, 1>).
+        // Env-gated via HF2Q_RMS_NORM_V2=1 in the dispatchers.
+        sources.insert("rms_norm_f32_v2".into(), rms_norm_src);
+        sources.insert("rms_norm_no_scale_f32_v2".into(), rms_norm_src);
         sources.insert("rms_norm_f16".into(), rms_norm_src);
         sources.insert("rms_norm_bf16".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_bf16".into(), rms_norm_src);
