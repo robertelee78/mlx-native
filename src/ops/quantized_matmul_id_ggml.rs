@@ -14,6 +14,7 @@ use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
 use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
+use crate::env_flags::env_default_true;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::quantized_matmul_ggml::GgmlType;
@@ -474,13 +475,13 @@ fn dispatch_id_mv(
 ) -> Result<()> {
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
 
-    // ADR-028 iter-321 — env-gated nr0=2 variant for q6_K _id mat-vec.
-    // Mirrors iter-309's non-_id work. Same env flag covers both.
+    // ADR-028 iter-321 — nr0=2 variant for q6_K _id mat-vec.  Mirrors
+    // iter-309's non-_id work.
+    //
+    // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2).
+    // Opt out with `HF2Q_Q6K_ID_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
-        && std::env::var("HF2Q_Q6K_ID_MV_NR2")
-            .ok()
-            .as_deref()
-            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+        && env_default_true("HF2Q_Q6K_ID_MV_NR2");
     let kernel_name = if use_q6k_id_nr2 {
         "kernel_mul_mv_id_q6_K_f32_nr2"
     } else {

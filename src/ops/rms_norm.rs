@@ -10,6 +10,7 @@ use metal::MTLSize;
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
 use crate::encoder::{CapturedOpKind, CommandEncoder};
+use crate::env_flags::env_default_true;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -96,14 +97,14 @@ pub fn dispatch_rms_norm(
         )));
     }
 
-    // ADR-028 iter-310 — opt-in float4 + simd_sum variant for F32 path.
+    // ADR-028 iter-310 — float4 + simd_sum variant for F32 path.
     // Requires `dim % 4 == 0`; falls back to scalar when not.
+    //
+    // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2).
+    // Opt out with `HF2Q_RMS_NORM_V2=0` / `=false` / `=off`.
     let use_v2 = matches!(input.dtype(), DType::F32)
         && (dim % 4 == 0)
-        && std::env::var("HF2Q_RMS_NORM_V2")
-            .ok()
-            .as_deref()
-            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+        && env_default_true("HF2Q_RMS_NORM_V2");
 
     let kernel_name = if use_v2 {
         "rms_norm_f32_v2"
@@ -658,12 +659,10 @@ pub fn dispatch_rms_norm_no_scale_f32(
         )));
     }
 
-    // ADR-028 iter-310 — env-gated float4 + simd_sum variant.
-    let use_v2 = (dim % 4 == 0)
-        && std::env::var("HF2Q_RMS_NORM_V2")
-            .ok()
-            .as_deref()
-            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // ADR-028 iter-310 — float4 + simd_sum variant.  Default-ON since
+    // iter-326 (operator REFRAME #2).  Opt out with
+    // `HF2Q_RMS_NORM_V2=0` / `=false` / `=off`.
+    let use_v2 = (dim % 4 == 0) && env_default_true("HF2Q_RMS_NORM_V2");
     let kernel_name = if use_v2 {
         "rms_norm_no_scale_f32_v2"
     } else {

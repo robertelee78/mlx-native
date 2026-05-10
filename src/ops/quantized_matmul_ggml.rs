@@ -16,6 +16,7 @@ use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
 use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
+use crate::env_flags::env_default_true;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -473,17 +474,17 @@ fn dispatch_mv(
     output: &mut MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    // ADR-028 iter-309 — opt-in nr0=2 variant for q6_K mat-vec.  Peer
-    // pattern: 4 rows/TG (vs baseline's 2) + cached `yl[16]` (vs no
-    // cache + device re-reads).  Env-gated A/B because the speed win
-    // depends on shapes hitting the new geometry; the kernel is
-    // bit-exact-equivalent to the baseline at HEAD (parity test in
-    // tests/adr_028_iter309_q6k_mv_nr2_parity.rs).
+    // ADR-028 iter-309 — nr0=2 variant for q6_K mat-vec.  Peer pattern:
+    // 4 rows/TG (vs baseline's 2) + cached `yl[16]` (vs no cache + device
+    // re-reads).  Bit-exact-equivalent to the baseline at HEAD (parity
+    // test in tests/adr_028_iter309_q6k_mv_nr2_parity.rs).
+    //
+    // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2:
+    // "default should have the best things on that provide the best
+    // mantra-aligned outcome for users").  Opt out with
+    // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
-        && std::env::var("HF2Q_Q6K_MV_NR2")
-            .ok()
-            .as_deref()
-            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+        && env_default_true("HF2Q_Q6K_MV_NR2");
     let kernel_name = if use_q6k_nr2 {
         "kernel_mul_mv_q6_K_f32_nr2"
     } else {

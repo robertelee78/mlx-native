@@ -52,6 +52,7 @@ mod device;
 mod dtypes;
 mod encoder;
 mod encoder_session;
+mod env_flags;
 mod kernel_registry;
 mod mem_ranges;
 mod residency;
