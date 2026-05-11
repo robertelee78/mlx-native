@@ -1004,3 +1004,172 @@ kernel void hadamard_quantize_kv_hb_dual<512>(
     device uint8_t *, device uint8_t *,
     device float *, device float *,
     constant HadamardQuantizeHbParams &, uint3, uint);
+
+// ============================================================================
+// ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy + V-no-FWHT-encode kernel.
+//
+// Combines the two hf2q hybrid-path decode dispatches into one:
+//   * z=0 (K stream): F32 src_k → F16 cache write.  Same effect as
+//     `kv_cache_copy_batch_f32_to_f16` from the hybrid encode site (Phase 10c).
+//   * z=1 (V stream): F32 src_v → byte-packed Lloyd-Max codebook + L2 norm.
+//     Same effect as `kv_quantize_v_no_fwht` from Phase 10e.5.
+//
+// Saves ONE Apple Metal kernel-launch floor (~14 µs) per layer per decode
+// token.  At gemma4 30 layers, drops 60→30 KV-write dispatches/decode-token,
+// saving ~0.4 ms/token ≈ ~3% theoretical (per iter-351 measured ~1/3 realizes
+// → expected +1% decode).
+//
+// Result is byte-identical to:
+//   `dispatch_kv_cache_copy_batch_f32_to_f16(src_k, k_f16)` +
+//   `dispatch_kv_quantize_v_no_fwht(src_v, v_packed, v_norms)`
+// at identical params.  Each Z-stream takes the SAME math path as its
+// stand-alone counterpart (no fused-arithmetic shortcuts).
+//
+// Threadgroup geometry: (32, 1, 2) = 1 simdgroup × 2 streams = 64 threads.
+// Grid: (num_kv_heads, 1, 2).  Same K and V code paths as their respective
+// stand-alone kernels above.
+// ============================================================================
+template<ushort HEAD_DIM>
+kernel void kv_copy_kf16_quantize_v_no_fwht(
+    device const float                    *src_k    [[buffer(0)]],
+    device const float                    *src_v    [[buffer(1)]],
+    device       half                     *cache_k  [[buffer(2)]],
+    device       uint8_t                  *packed_v [[buffer(3)]],
+    device       float                    *norms_v  [[buffer(4)]],
+    constant HadamardQuantizeHbParams     &params   [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    constexpr ushort EPT = HEAD_DIM / 32;
+    const uint head_idx = tgpig.x;
+    const uint kv_sel   = tgpig.z; // 0 = K (F16 copy), 1 = V (no-FWHT quantize)
+    const uint lane     = tiisg;
+
+    if (head_idx >= params.num_kv_heads) return;
+
+    // Common: compute write position (same convention as kv_cache_copy +
+    // kv_quantize_v_no_fwht).
+    uint actual_pos = (params.is_sliding != 0u)
+        ? (params.write_pos % params.cache_capacity)
+        : params.write_pos;
+
+    if (kv_sel == 0u) {
+        // ============================================================
+        // K stream — F32 → F16 dense copy.
+        // Mirrors `kernel_cpy_f32_f16` semantics; layout matches what the
+        // hybrid SDPA kernel reads (`device const half *K_f16` at offset
+        // [head_idx, actual_pos, 0..HEAD_DIM]).
+        // ============================================================
+        const uint src_base   = head_idx * HEAD_DIM + lane * EPT;
+        const uint cache_base = head_idx * params.cache_capacity * HEAD_DIM
+                              + actual_pos * HEAD_DIM
+                              + lane * EPT;
+        for (ushort i = 0; i < EPT; i++) {
+            cache_k[cache_base + i] = (half) src_k[src_base + i];
+        }
+    } else {
+        // ============================================================
+        // V stream — Lloyd-Max codebook quantize without Hadamard rotation.
+        // Byte-identical math to `kv_quantize_v_no_fwht_d{256,512}` above.
+        // ============================================================
+        const uint src_base = head_idx * HEAD_DIM + lane * EPT;
+        float elems[EPT];
+        for (ushort i = 0; i < EPT; i++) elems[i] = src_v[src_base + i];
+
+        // Compute norm — see kv_quantize_v_no_fwht for derivation.
+        float local_sq_sum = 0.0f;
+        for (ushort i = 0; i < EPT; i++) local_sq_sum += elems[i] * elems[i];
+
+        float norm0, norm1;
+        if (HEAD_DIM == 256) {
+            norm0 = sqrt(simd_sum(local_sq_sum));
+            norm1 = 0.0f;
+        } else {
+            float blk0_sq = (lane < 16u) ? simd_sum(local_sq_sum) : 0.0f;
+            float blk1_sq = (lane >= 16u) ? simd_sum(local_sq_sum) : 0.0f;
+            blk0_sq = simd_broadcast(blk0_sq, 0u);
+            blk1_sq = simd_broadcast(blk1_sq, 16u);
+            norm0 = sqrt(blk0_sq / 256.0f);
+            norm1 = sqrt(blk1_sq / 256.0f);
+        }
+
+        // Scale to N(0,1) range for codebook lookup.
+        if (HEAD_DIM == 256) {
+            float inv_norm = (norm0 > 1.0e-10f) ? (1.0f / norm0) : 0.0f;
+            float scale = inv_norm * sqrt(float(HEAD_DIM));
+            for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+        } else {
+            float blk_norm = (lane < 16u) ? norm0 : norm1;
+            float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
+            float scale = inv_blk_norm * params.scale_factor_d512;
+            for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+        }
+
+        // Quantize.
+        const uint cbits = params.codebook_bits;
+        uint8_t indices[EPT];
+        for (ushort i = 0; i < EPT; i++) {
+            float v = elems[i];
+            uint8_t idx;
+            if (cbits == 5u) {
+                idx = (v > BOUNDARIES_5BIT[15]) ? 16 : 0;
+                idx += (v > BOUNDARIES_5BIT[idx + 7]) ? 8 : 0;
+                idx += (v > BOUNDARIES_5BIT[idx + 3]) ? 4 : 0;
+                idx += (v > BOUNDARIES_5BIT[idx + 1]) ? 2 : 0;
+                idx += (v > BOUNDARIES_5BIT[idx]) ? 1 : 0;
+            } else if (cbits == 6u) {
+                idx = (v > BOUNDARIES_6BIT[31]) ? 32 : 0;
+                idx += (v > BOUNDARIES_6BIT[idx + 15]) ? 16 : 0;
+                idx += (v > BOUNDARIES_6BIT[idx + 7]) ? 8 : 0;
+                idx += (v > BOUNDARIES_6BIT[idx + 3]) ? 4 : 0;
+                idx += (v > BOUNDARIES_6BIT[idx + 1]) ? 2 : 0;
+                idx += (v > BOUNDARIES_6BIT[idx]) ? 1 : 0;
+            } else {
+                idx = (v > BOUNDARIES_8BIT[127]) ? 128 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx + 63]) ? 64 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx + 31]) ? 32 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx + 15]) ? 16 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx + 7])  ?  8 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx + 3])  ?  4 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx + 1])  ?  2 : 0;
+                idx += (v > BOUNDARIES_8BIT[idx])      ?  1 : 0;
+            }
+            indices[i] = idx;
+        }
+
+        // Write packed bytes.
+        const uint packed_base = head_idx * params.cache_capacity * HEAD_DIM
+                               + actual_pos * HEAD_DIM;
+        const uint elem_base = packed_base + lane * EPT;
+        for (ushort i = 0; i < EPT; i++) {
+            packed_v[elem_base + i] = indices[i];
+        }
+
+        // Store norm.
+        if (HEAD_DIM == 256) {
+            if (lane == 0) {
+                norms_v[head_idx * params.cache_capacity + actual_pos] = norm0;
+            }
+        } else {
+            if (lane == 0u) {
+                uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+                norms_v[norm_base + 0u] = norm0;
+            } else if (lane == 16u) {
+                uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+                norms_v[norm_base + 1u] = norm1;
+            }
+        }
+    }
+}
+
+template [[host_name("kv_copy_kf16_quantize_v_no_fwht_d256")]]
+kernel void kv_copy_kf16_quantize_v_no_fwht<256>(
+    device const float *, device const float *,
+    device half *, device uint8_t *, device float *,
+    constant HadamardQuantizeHbParams &, uint3, uint);
+
+template [[host_name("kv_copy_kf16_quantize_v_no_fwht_d512")]]
+kernel void kv_copy_kf16_quantize_v_no_fwht<512>(
+    device const float *, device const float *,
+    device half *, device uint8_t *, device float *,
+    constant HadamardQuantizeHbParams &, uint3, uint);

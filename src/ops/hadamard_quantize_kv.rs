@@ -576,6 +576,93 @@ pub fn dispatch_kv_quantize_v_no_fwht(
     Ok(())
 }
 
+/// ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy + V-no-FWHT-encode for the
+/// hybrid path.
+///
+/// Combines the two hf2q hybrid-path decode dispatches into a single dispatch
+/// via grid Z-dim:
+///   * z=0 K stream: F32 src_k → F16 cache (mirrors `dispatch_kv_cache_copy_batch_f32_to_f16`)
+///   * z=1 V stream: F32 src_v → byte-packed Lloyd-Max + L2 norm
+///                    (mirrors `dispatch_kv_quantize_v_no_fwht`)
+///
+/// Result is byte-identical to the two stand-alone calls at identical params;
+/// each stream takes the SAME math path as its stand-alone counterpart.
+///
+/// Saves one Apple Metal kernel-launch floor (~14 µs) per layer per decode
+/// token.  At gemma4 30L: drops 60 → 30 KV-write dispatches/decode-token,
+/// expected ~+1% decode (per iter-351 measurement of dispatch-floor savings).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_copy_kf16_quantize_v_no_fwht(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    cache_k: &MlxBuffer,    // F16 cache
+    packed_v: &MlxBuffer,   // U8 byte-packed
+    norms_v: &MlxBuffer,    // F32 norms
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_kv_copy_kf16_quantize_v_no_fwht: codebook_bits must be 5, 6, or 8, got {}",
+            codebook_bits)));
+    }
+    if cache_k.dtype() != crate::DType::F16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_kv_copy_kf16_quantize_v_no_fwht: cache_k must be DType::F16, got {:?}",
+            cache_k.dtype())));
+    }
+
+    let kernel_name = match head_dim {
+        256 => "kv_copy_kf16_quantize_v_no_fwht_d256",
+        512 => "kv_copy_kf16_quantize_v_no_fwht_d512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "kv_copy_kf16_quantize_v_no_fwht: head_dim {} not supported (need 256 or 512)",
+            head_dim))),
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos,
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512,
+        codebook_bits,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src_k)),
+            (1, KA::Buffer(src_v)),
+            (2, KA::Buffer(cache_k)),
+            (3, KA::Buffer(packed_v)),
+            (4, KA::Buffer(norms_v)),
+            (5, KA::Bytes(params_bytes)),
+        ],
+        // Grid: (num_kv_heads, 1, 2) — Z=2 for K + V streams.
+        MTLSize::new(num_kv_heads as u64, 1, 2),
+        // Threadgroup: (32, 1, 1) — single simdgroup per stream.
+        MTLSize::new(32, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// ADR-028 iter-148: fused K+V single-position Hadamard-quantize KV HB encoder.
 ///
 /// Combines two `dispatch_hadamard_quantize_kv_hb` calls (one for K, one for V)

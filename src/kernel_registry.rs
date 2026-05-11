@@ -839,6 +839,11 @@ impl KernelRegistry {
         // rotation so dequant in SDPA recovers raw V (no FWHT-undo needed).
         sources.insert("kv_quantize_v_no_fwht_d256".into(), hq_fast_src);
         sources.insert("kv_quantize_v_no_fwht_d512".into(), hq_fast_src);
+        // ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy + V-no-FWHT-encode.
+        // Saves 30 KV-write dispatches/decode-token at gemma4 30L by combining
+        // the per-layer K-cast and V-encode into a single dispatch (Z-dim).
+        sources.insert("kv_copy_kf16_quantize_v_no_fwht_d256".into(), hq_fast_src);
+        sources.insert("kv_copy_kf16_quantize_v_no_fwht_d512".into(), hq_fast_src);
 
         // iter-20 Leg F: TQ KV dequantize kernel (nibbles+norms → F32)
         let tq_dq_src: &'static str = include_str!("shaders/tq_dequantize_kv.metal");
