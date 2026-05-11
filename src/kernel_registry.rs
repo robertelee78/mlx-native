@@ -842,6 +842,9 @@ impl KernelRegistry {
         let hq_fast_src: &'static str = include_str!("shaders/hadamard_quantize_kv_fast.metal");
         sources.insert("hadamard_quantize_kv_fast_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_fast_d512".into(), hq_fast_src);
+        // ADR-028 iter-485 (Phase 7d / H4): fused K+V single-position 4-bit encoder.
+        sources.insert("hadamard_quantize_kv_fast_dual_d256".into(), hq_fast_src);
+        sources.insert("hadamard_quantize_kv_fast_dual_d512".into(), hq_fast_src);
         // Track B (iter-21): higher-bit (5/6-bit) quantize kernels (byte-packed)
         sources.insert("hadamard_quantize_kv_hb_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_hb_d512".into(), hq_fast_src);
@@ -876,6 +879,14 @@ impl KernelRegistry {
         let tq_hb_src: &'static str = include_str!("shaders/flash_attn_vec_tq_hb.metal");
         sources.insert("flash_attn_vec_tq_hb_dk256".into(), tq_hb_src);
         sources.insert("flash_attn_vec_tq_hb_dk512".into(), tq_hb_src);
+
+        // ADR-028 §iter-485 (Phase 7d H3): fused TQ-HB reduce + FWHT-sign-undo.
+        // Combines flash_attn_vec_reduce + fwht_sign_undo_f32 into a single
+        // dispatch, saving 1 dispatch + 1 forced barrier per layer per decode
+        // token. Gated by env flag `HF2Q_TQ_HB_OUT_FUSED=1` in forward_mlx.rs.
+        let reduce_undo_src: &'static str = include_str!("shaders/flash_attn_vec_reduce_tq_hb_undo.metal");
+        sources.insert("flash_attn_vec_reduce_tq_hb_undo_dk256".into(), reduce_undo_src);
+        sources.insert("flash_attn_vec_reduce_tq_hb_undo_dk512".into(), reduce_undo_src);
 
         // ADR-028 Phase 10d (iter-349): hybrid F16-K + TQ-HB-V SDPA kernel.
         // Same V-side codebook as flash_attn_vec_tq_hb (5/6/8-bit Lloyd-Max);

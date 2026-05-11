@@ -420,6 +420,146 @@ pub fn dispatch_hadamard_quantize_kv_seq(
 }
 
 // ============================================================================
+// ADR-028 iter-485 (Phase 7d / H4): fused K+V single-position 4-bit dispatch.
+// ============================================================================
+
+/// Dispatch the fused 4-bit Hadamard-quantize KV kernel.
+///
+/// Combines TWO consecutive `dispatch_hadamard_quantize_kv` calls (K then V
+/// into the F32 shadow TQ-packed cache) into a single Metal dispatch via the
+/// Z-dim split (`tgpig.z=0` → K stream, `tgpig.z=1` → V stream).
+///
+/// Saves one Apple Metal kernel-launch floor (~14 µs) per layer per decode
+/// token. At gemma4 30 layers this drops 60→30 KV-write dispatches/decode-
+/// token (~0.4 ms/token, ~3% theoretical). Result is byte-identical to the
+/// 2-dispatch sequence at identical params — verified by
+/// `test_hadamard_quantize_kv_fast_dual_byte_identity_d256`.
+///
+/// The RMS scratch probe path (HF2Q_DEBUG_TQ_RMS) is NOT supported by the
+/// fused variant; it routes through the unmodified single-stream kernel.
+///
+/// * `src_k`, `src_v` — F32 `[num_kv_heads, head_dim]` per stream.
+/// * `packed_k`, `packed_v` — u8 nibble-packed `[num_kv_heads, cache_capacity, head_dim/2]`.
+/// * `norms_k`, `norms_v` — F32 `[num_kv_heads, cache_capacity (* norms_per_pos for d=512)]`.
+/// * Other params mirror `dispatch_hadamard_quantize_kv` exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_fast_dual(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src_k: &MlxBuffer,
+    src_v: &MlxBuffer,
+    packed_k: &MlxBuffer,
+    packed_v: &MlxBuffer,
+    norms_k: &MlxBuffer,
+    norms_v: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos: u32,
+    is_sliding: bool,
+    scale_factor_d512: Option<f32>,
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_fast_dual_d256",
+        512 => "hadamard_quantize_kv_fast_dual_d512",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_fast_dual: head_dim {} not supported (need 256 or 512)",
+                head_dim
+            )));
+        }
+    };
+
+    if !is_sliding && write_pos >= cache_capacity {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: global cache write_pos({}) >= cache_capacity({})",
+            write_pos, cache_capacity
+        )));
+    }
+
+    let required_src = (num_kv_heads as u64) * (head_dim as u64);
+    if (src_k.element_count() as u64) < required_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: src_k has {} elements but need {}",
+            src_k.element_count(), required_src
+        )));
+    }
+    if (src_v.element_count() as u64) < required_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: src_v has {} elements but need {}",
+            src_v.element_count(), required_src
+        )));
+    }
+
+    let required_packed_bytes =
+        (num_kv_heads as u64) * (cache_capacity as u64) * (head_dim as u64 / 2);
+    if (packed_k.byte_len() as u64) < required_packed_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: packed_k has {} bytes but need {}",
+            packed_k.byte_len(), required_packed_bytes
+        )));
+    }
+    if (packed_v.byte_len() as u64) < required_packed_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: packed_v has {} bytes but need {}",
+            packed_v.byte_len(), required_packed_bytes
+        )));
+    }
+
+    let norms_per_pos = (head_dim / 256).max(1) as u64;
+    let required_norms = (num_kv_heads as u64) * (cache_capacity as u64) * norms_per_pos;
+    if (norms_k.element_count() as u64) < required_norms {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: norms_k has {} elements but need {}",
+            norms_k.element_count(), required_norms
+        )));
+    }
+    if (norms_v.element_count() as u64) < required_norms {
+        return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_fast_dual: norms_v has {} elements but need {}",
+            norms_v.element_count(), required_norms
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let params = HadamardQuantizeParams {
+        head_dim,
+        num_kv_heads,
+        write_pos,
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512: scale_factor_d512.unwrap_or(1.0_f32),
+        rms_probe_enabled: 0, // probe not supported in fused variant
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src_k)),
+            (1, KA::Buffer(src_v)),
+            (2, KA::Buffer(packed_k)),
+            (3, KA::Buffer(packed_v)),
+            (4, KA::Buffer(norms_k)),
+            (5, KA::Buffer(norms_v)),
+            (6, KA::Bytes(params_bytes)),
+        ],
+        MTLSize::new(num_kv_heads as u64, 1, 2), // x=heads, z=K|V stream
+        MTLSize::new(32, 1, 1),                  // 1 simdgroup
+    );
+
+    Ok(())
+}
+
+// ============================================================================
 // Track B (iter-21): higher-bit dispatch (5-bit or 6-bit, byte-packed).
 // ============================================================================
 

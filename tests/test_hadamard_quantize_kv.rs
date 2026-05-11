@@ -765,3 +765,199 @@ fn test_hadamard_quantize_kv_hb_dual_byte_identity_d256() {
             "V norm mismatch at {}: fused={} legacy={}", i, nvf[i], nvl[i]);
     }
 }
+
+/// ADR-028 iter-485 (Phase 7d / H4): byte-identity test for the fused 4-bit K+V
+/// single-position TQ encoder. Asserts `dispatch_hadamard_quantize_kv_fast_dual`
+/// produces the same packed-nibble and norm output as two consecutive
+/// `dispatch_hadamard_quantize_kv` calls (K then V) at identical params —
+/// gemma4 decode shape: 8 KV heads × 256 head_dim, sw=1024.
+#[test]
+fn test_hadamard_quantize_kv_fast_dual_byte_identity_d256() {
+    let (device, mut registry) = setup();
+
+    let n_heads: u32 = 8;
+    let head_dim: u32 = 256;
+    let cap: u32 = 1024;
+    let pos: u32 = 333;
+    let sliding: bool = true;
+    let scale: Option<f32> = Some(1.0);
+
+    let total_src = (n_heads * head_dim) as usize;
+    // 4-bit nibble pack: head_dim/2 bytes per slot.
+    let packed_bytes = (n_heads * cap * head_dim / 2) as usize;
+    let norms_elems = (n_heads * cap) as usize; // d256 → 1 norm/pos
+
+    // Distinct K vs V data so K↔V swap bugs are caught.
+    let src_k_data: Vec<f32> = (0..total_src).map(|i| 0.1 + (i as f32) * 0.0007).collect();
+    let src_v_data: Vec<f32> = (0..total_src).map(|i| -0.3 - (i as f32) * 0.0011).collect();
+
+    let mut src_k = device.alloc_buffer(total_src * 4, DType::F32, vec![total_src]).expect("alloc sk");
+    let mut src_v = device.alloc_buffer(total_src * 4, DType::F32, vec![total_src]).expect("alloc sv");
+    src_k.as_mut_slice::<f32>().expect("sk").copy_from_slice(&src_k_data);
+    src_v.as_mut_slice::<f32>().expect("sv").copy_from_slice(&src_v_data);
+
+    let alloc_packed = |label: &str| {
+        let mut b = device.alloc_buffer(packed_bytes, DType::U8, vec![packed_bytes])
+            .unwrap_or_else(|_| panic!("alloc packed {}", label));
+        for x in b.as_mut_slice::<u8>().expect("zero").iter_mut() { *x = 0; }
+        b
+    };
+    let alloc_norms = |label: &str| {
+        let mut b = device.alloc_buffer(norms_elems * 4, DType::F32, vec![norms_elems])
+            .unwrap_or_else(|_| panic!("alloc norms {}", label));
+        for x in b.as_mut_slice::<f32>().expect("zero").iter_mut() { *x = 0.0; }
+        b
+    };
+    let mut pk_fused = alloc_packed("pk_f");
+    let mut pv_fused = alloc_packed("pv_f");
+    let mut nk_fused = alloc_norms("nk_f");
+    let mut nv_fused = alloc_norms("nv_f");
+    let mut pk_legacy = alloc_packed("pk_l");
+    let mut pv_legacy = alloc_packed("pv_l");
+    let mut nk_legacy = alloc_norms("nk_l");
+    let mut nv_legacy = alloc_norms("nv_l");
+
+    // Fused dispatch — Z-dim split handles K and V in one launch.
+    {
+        let mut enc = device.command_encoder().expect("enc fused");
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv_fast_dual(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &src_v, &pk_fused, &pv_fused, &nk_fused, &nv_fused,
+            n_heads, head_dim, cap, pos, sliding, scale,
+        ).expect("fused 4-bit dual");
+        enc.commit_and_wait().expect("commit fused");
+    }
+
+    // Legacy 2-dispatch reference (the path landed at forward_mlx.rs L3116/3127).
+    {
+        let mut enc = device.command_encoder().expect("enc legacy");
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &pk_legacy, &nk_legacy,
+            n_heads, head_dim, cap, pos, sliding, scale, None,
+        ).expect("legacy 4-bit K");
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_v, &pv_legacy, &nv_legacy,
+            n_heads, head_dim, cap, pos, sliding, scale, None,
+        ).expect("legacy 4-bit V");
+        enc.commit_and_wait().expect("commit legacy");
+    }
+
+    // Full byte-identity over the entire packed cache (untouched cells must
+    // remain zero on both sides — assertion catches stride/offset bugs too).
+    let pkf: &[u8] = pk_fused.as_slice::<u8>().expect("pkf");
+    let pkl: &[u8] = pk_legacy.as_slice::<u8>().expect("pkl");
+    let pvf: &[u8] = pv_fused.as_slice::<u8>().expect("pvf");
+    let pvl: &[u8] = pv_legacy.as_slice::<u8>().expect("pvl");
+    for i in 0..packed_bytes {
+        assert_eq!(pkf[i], pkl[i],
+            "K packed mismatch at byte {}: fused=0x{:02x} legacy=0x{:02x}", i, pkf[i], pkl[i]);
+        assert_eq!(pvf[i], pvl[i],
+            "V packed mismatch at byte {}: fused=0x{:02x} legacy=0x{:02x}", i, pvf[i], pvl[i]);
+    }
+    // Norms: bit-identity (F32 reduction order must be deterministic).
+    let nkf: &[f32] = nk_fused.as_slice::<f32>().expect("nkf");
+    let nkl: &[f32] = nk_legacy.as_slice::<f32>().expect("nkl");
+    let nvf: &[f32] = nv_fused.as_slice::<f32>().expect("nvf");
+    let nvl: &[f32] = nv_legacy.as_slice::<f32>().expect("nvl");
+    for i in 0..norms_elems {
+        assert_eq!(nkf[i].to_bits(), nkl[i].to_bits(),
+            "K norm mismatch at {}: fused={} legacy={}", i, nkf[i], nkl[i]);
+        assert_eq!(nvf[i].to_bits(), nvl[i].to_bits(),
+            "V norm mismatch at {}: fused={} legacy={}", i, nvf[i], nvl[i]);
+    }
+}
+
+/// ADR-028 iter-485: D=512 parity for the fused 4-bit K+V encoder. Same
+/// shape used by gemma4 global layers (8 KV heads × 512 head_dim).
+#[test]
+fn test_hadamard_quantize_kv_fast_dual_byte_identity_d512() {
+    let (device, mut registry) = setup();
+
+    let n_heads: u32 = 8;
+    let head_dim: u32 = 512;
+    let cap: u32 = 1024;
+    let pos: u32 = 77;
+    let sliding: bool = false;
+    let scale: Option<f32> = Some(1.0);
+
+    let total_src = (n_heads * head_dim) as usize;
+    let packed_bytes = (n_heads * cap * head_dim / 2) as usize;
+    let norms_per_pos = 2_u32; // d=512 → 2 norms per slot
+    let norms_elems = (n_heads * cap * norms_per_pos) as usize;
+
+    let src_k_data: Vec<f32> = (0..total_src).map(|i| 0.05 + (i as f32) * 0.0003).collect();
+    let src_v_data: Vec<f32> = (0..total_src).map(|i| -0.17 + (i as f32) * 0.00025).collect();
+
+    let mut src_k = device.alloc_buffer(total_src * 4, DType::F32, vec![total_src]).expect("alloc sk");
+    let mut src_v = device.alloc_buffer(total_src * 4, DType::F32, vec![total_src]).expect("alloc sv");
+    src_k.as_mut_slice::<f32>().expect("sk").copy_from_slice(&src_k_data);
+    src_v.as_mut_slice::<f32>().expect("sv").copy_from_slice(&src_v_data);
+
+    let alloc_packed = |label: &str| {
+        let mut b = device.alloc_buffer(packed_bytes, DType::U8, vec![packed_bytes])
+            .unwrap_or_else(|_| panic!("alloc packed {}", label));
+        for x in b.as_mut_slice::<u8>().expect("zero").iter_mut() { *x = 0; }
+        b
+    };
+    let alloc_norms = |label: &str| {
+        let mut b = device.alloc_buffer(norms_elems * 4, DType::F32, vec![norms_elems])
+            .unwrap_or_else(|_| panic!("alloc norms {}", label));
+        for x in b.as_mut_slice::<f32>().expect("zero").iter_mut() { *x = 0.0; }
+        b
+    };
+    let mut pk_fused = alloc_packed("pk_f");
+    let mut pv_fused = alloc_packed("pv_f");
+    let mut nk_fused = alloc_norms("nk_f");
+    let mut nv_fused = alloc_norms("nv_f");
+    let mut pk_legacy = alloc_packed("pk_l");
+    let mut pv_legacy = alloc_packed("pv_l");
+    let mut nk_legacy = alloc_norms("nk_l");
+    let mut nv_legacy = alloc_norms("nv_l");
+
+    {
+        let mut enc = device.command_encoder().expect("enc fused");
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv_fast_dual(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &src_v, &pk_fused, &pv_fused, &nk_fused, &nv_fused,
+            n_heads, head_dim, cap, pos, sliding, scale,
+        ).expect("fused 4-bit dual d512");
+        enc.commit_and_wait().expect("commit fused");
+    }
+    {
+        let mut enc = device.command_encoder().expect("enc legacy");
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_k, &pk_legacy, &nk_legacy,
+            n_heads, head_dim, cap, pos, sliding, scale, None,
+        ).expect("legacy 4-bit K d512");
+        hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+            &mut enc, &mut registry, device.metal_device(),
+            &src_v, &pv_legacy, &nv_legacy,
+            n_heads, head_dim, cap, pos, sliding, scale, None,
+        ).expect("legacy 4-bit V d512");
+        enc.commit_and_wait().expect("commit legacy");
+    }
+
+    let pkf: &[u8] = pk_fused.as_slice::<u8>().expect("pkf");
+    let pkl: &[u8] = pk_legacy.as_slice::<u8>().expect("pkl");
+    let pvf: &[u8] = pv_fused.as_slice::<u8>().expect("pvf");
+    let pvl: &[u8] = pv_legacy.as_slice::<u8>().expect("pvl");
+    for i in 0..packed_bytes {
+        assert_eq!(pkf[i], pkl[i], "d512 K packed mismatch at byte {}: fused=0x{:02x} legacy=0x{:02x}",
+            i, pkf[i], pkl[i]);
+        assert_eq!(pvf[i], pvl[i], "d512 V packed mismatch at byte {}: fused=0x{:02x} legacy=0x{:02x}",
+            i, pvf[i], pvl[i]);
+    }
+    let nkf: &[f32] = nk_fused.as_slice::<f32>().expect("nkf");
+    let nkl: &[f32] = nk_legacy.as_slice::<f32>().expect("nkl");
+    let nvf: &[f32] = nv_fused.as_slice::<f32>().expect("nvf");
+    let nvl: &[f32] = nv_legacy.as_slice::<f32>().expect("nvl");
+    for i in 0..norms_elems {
+        assert_eq!(nkf[i].to_bits(), nkl[i].to_bits(),
+            "d512 K norm mismatch at {}: fused={} legacy={}", i, nkf[i], nkl[i]);
+        assert_eq!(nvf[i].to_bits(), nvl[i].to_bits(),
+            "d512 V norm mismatch at {}: fused={} legacy={}", i, nvf[i], nvl[i]);
+    }
+}

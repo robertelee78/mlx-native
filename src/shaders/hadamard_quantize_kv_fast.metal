@@ -335,6 +335,165 @@ kernel void hadamard_quantize_kv_fast<512>(
     constant HadamardQuantizeParams &, device float *, uint, uint);
 
 // ============================================================================
+// ADR-028 iter-485 (Phase 7d / H4): fused K+V single-position 4-bit encoder.
+//
+// Combines the two `hadamard_quantize_kv_fast` dispatches (lines 3116/3127 in
+// forward_mlx.rs) that write the F32 shadow TQ-packed K/V caches at every
+// gemma4 decode-layer-token boundary. Grid is `(num_kv_heads, 1, 2)` with
+// `tgpig.z = 0` selecting the K stream and `tgpig.z = 1` selecting the V
+// stream — exactly the same Z-dim pattern as `hadamard_quantize_kv_hb_dual`,
+// but emits 4-bit nibble-packed output (head_dim/2 bytes/pos) and reads the
+// single-norm `HadamardQuantizeParams` struct (no `codebook_bits` field).
+//
+// Saves ONE Apple Metal kernel-launch floor (~14 µs) per layer per decode
+// token. At gemma4 30 layers that drops 60→30 KV-write dispatches/decode-
+// token, ~0.4 ms/token (~3% theoretical).
+//
+// Result is byte-identical to two `hadamard_quantize_kv_fast` dispatches at
+// identical params (verified by mlx-native unit test
+// `test_hadamard_quantize_kv_fast_dual_byte_identity_d256`). The RMS scratch
+// probe path is intentionally NOT carried into the fused variant — that
+// debug-only probe (HF2Q_DEBUG_TQ_RMS) still routes through the single-
+// stream kernel, which is unmodified.
+template<ushort HEAD_DIM>
+kernel void hadamard_quantize_kv_fast_dual(
+    device const float              *src_k    [[buffer(0)]],
+    device const float              *src_v    [[buffer(1)]],
+    device       uint8_t            *packed_k [[buffer(2)]],
+    device       uint8_t            *packed_v [[buffer(3)]],
+    device       float              *norms_k  [[buffer(4)]],
+    device       float              *norms_v  [[buffer(5)]],
+    constant HadamardQuantizeParams &params   [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    constexpr ushort EPT = HEAD_DIM / 32;
+    const uint head_idx = tgpig.x;
+    const uint kv_sel   = tgpig.z; // 0 = K stream, 1 = V stream
+    const uint lane     = tiisg;
+
+    if (head_idx >= params.num_kv_heads) return;
+
+    device const float   *src    = (kv_sel == 0u) ? src_k    : src_v;
+    device       uint8_t *packed = (kv_sel == 0u) ? packed_k : packed_v;
+    device       float   *norms  = (kv_sel == 0u) ? norms_k  : norms_v;
+
+    // 1. Load elements.
+    const uint src_base = head_idx * HEAD_DIM + lane * EPT;
+    float elems[EPT];
+    for (ushort i = 0; i < EPT; i++) {
+        elems[i] = src[src_base + i];
+    }
+
+    // 1b. D1 sign pre-multiplication (SRHT).
+    for (ushort i = 0; i < EPT; i++) {
+        ushort j = lane * EPT + i;
+        uint8_t sign_byte = (HEAD_DIM == 256) ? TBQ_SIGNS_256[j >> 3] : TBQ_SIGNS_512[j >> 3];
+        float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+        elems[i] *= sign_val;
+    }
+
+    // 2. FWHT via SIMD shuffle.
+    fwht_simd<EPT>(elems, lane);
+
+    // 3. Normalize by 1/sqrt(head_dim).
+    const float inv_sqrt_d = rsqrt(float(HEAD_DIM));
+    for (ushort i = 0; i < EPT; i++) {
+        elems[i] *= inv_sqrt_d;
+    }
+
+    // 4. Compute norm(s).
+    float local_sq_sum = 0.0f;
+    for (ushort i = 0; i < EPT; i++) {
+        local_sq_sum += elems[i] * elems[i];
+    }
+
+    float norm0, norm1;
+    if (HEAD_DIM == 256) {
+        norm0 = sqrt(simd_sum(local_sq_sum));
+        norm1 = 0.0f;
+    } else {
+        // D=512: per-block RMS norms. Mirror single-stream pattern at line 216-222
+        // (mask-then-sum; broadcast not needed because `simd_sum` is already
+        // uniform across the simdgroup).
+        float blk0_contribution = (lane < 16u) ? local_sq_sum : 0.0f;
+        float blk1_contribution = (lane >= 16u) ? local_sq_sum : 0.0f;
+        float blk0_sq = simd_sum(blk0_contribution);
+        float blk1_sq = simd_sum(blk1_contribution);
+        norm0 = sqrt(blk0_sq / 256.0f);
+        norm1 = sqrt(blk1_sq / 256.0f);
+    }
+
+    // 5. Scale to N(0,1) — mirrors `hadamard_quantize_kv_fast`.
+    if (HEAD_DIM == 256) {
+        float inv_norm = (norm0 > 1.0e-10f) ? (1.0f / norm0) : 0.0f;
+        float scale = inv_norm * sqrt(float(HEAD_DIM));
+        for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+    } else {
+        float blk_norm = (lane < 16u) ? norm0 : norm1;
+        float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
+        float scale = inv_blk_norm * params.scale_factor_d512;
+        for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+    }
+
+    // 6. Quantize each element: 4-bit Lloyd-Max via unrolled binary search
+    //    over BOUNDARIES_4BIT[15] (4 comparisons for 16 centroids).
+    uint8_t indices[EPT];
+    for (ushort i = 0; i < EPT; i++) {
+        float v = elems[i];
+        uint8_t idx = 0;
+        idx = (v > BOUNDARIES_4BIT[7]) ? 8 : 0;
+        idx += (v > BOUNDARIES_4BIT[idx + 3]) ? 4 : 0;
+        idx += (v > BOUNDARIES_4BIT[idx + 1]) ? 2 : 0;
+        idx += (v > BOUNDARIES_4BIT[idx]) ? 1 : 0;
+        indices[i] = idx;
+    }
+
+    // 7. Pack nibbles and write.
+    uint actual_pos = (params.is_sliding != 0u)
+        ? (params.write_pos % params.cache_capacity)
+        : params.write_pos;
+    const uint packed_row_stride = HEAD_DIM / 2;
+    const uint packed_base = head_idx * params.cache_capacity * packed_row_stride
+                           + actual_pos * packed_row_stride;
+    const uint byte_base = packed_base + lane * (EPT / 2);
+    for (ushort i = 0; i < EPT; i += 2) {
+        uint8_t lo = indices[i] & 0xFu;
+        uint8_t hi = (indices[i + 1] & 0xFu) << 4;
+        packed[byte_base + i / 2] = lo | hi;
+    }
+
+    // 8. Store norm(s).
+    if (HEAD_DIM == 256) {
+        if (lane == 0u) {
+            norms[head_idx * params.cache_capacity + actual_pos] = norm0;
+        }
+    } else {
+        if (lane == 0u) {
+            uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 0u] = norm0;
+        } else if (lane == 16u) {
+            uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 1u] = norm1;
+        }
+    }
+}
+
+template [[host_name("hadamard_quantize_kv_fast_dual_d256")]]
+kernel void hadamard_quantize_kv_fast_dual<256>(
+    device const float *, device const float *,
+    device uint8_t *, device uint8_t *,
+    device float *, device float *,
+    constant HadamardQuantizeParams &, uint3, uint);
+
+template [[host_name("hadamard_quantize_kv_fast_dual_d512")]]
+kernel void hadamard_quantize_kv_fast_dual<512>(
+    device const float *, device const float *,
+    device uint8_t *, device uint8_t *,
+    device float *, device float *,
+    constant HadamardQuantizeParams &, uint3, uint);
+
+// ============================================================================
 // Track B (iter-21): higher-bit codebooks for ablation.
 // 5-bit (32 centroids) and 6-bit (64 centroids) Lloyd-Max codebooks for N(0,1).
 // Byte-packed: 1 byte per element (upper 3 or 2 bits zeroed).
