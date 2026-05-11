@@ -1051,3 +1051,171 @@ template [[host_name("kernel_mul_mm_q8_0_tensor_bf16_perm021")]]
 kernel void hf2q_mul_mm_tensor_perm021_impl<block_q8_0, 2, dequantize_q8_0_t>(
     constant GgmlMatmulMmTensorPerm021Params &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
+
+// ===========================================================================
+// ADR-029 iter-36 H28-D: F16-shadow variant of the bf16-input perm021 mm.
+//
+// Identical geometry and B-stage to `hf2q_mul_mm_tensor_perm021_impl`, with
+// the per-K-tile quantized dequant replaced by a direct half load from the
+// F16 shadow buffer.  Used when `MlxQWeight.f16_shadow` is `Some` and the
+// caller routes through `dispatch_mm_perm021_f16` (m > threshold).
+//
+// Layout invariants (must match the F16 shadow caller):
+//   - src0 is `half [n_out, k]` row-major, nb01 = k * 2 bytes.
+//   - src1 is bfloat at physical `[n_heads, seq_len, head_dim]`, same as
+//     the quantized variant (B-stage logic is byte-identical).
+//   - dst is f32 `[n_batch, m, n_out]` row-major, output layout unchanged.
+//
+// Byte-exact equivalence with quantized perm021 path: half values dequant'd
+// from block_q at load time (H29) match the per-call dequantize_func output
+// up to the same round-half-even truncation.  Verified at integration via
+// first-decode-token byte-identity on gemma4 4K prefill.
+// ===========================================================================
+
+[[host_name("kernel_mul_mm_f16_tensor_bf16_perm021")]]
+kernel void hf2q_mul_mm_tensor_perm021_f16_impl(
+        constant GgmlMatmulMmTensorPerm021Params & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half  * sa = (threadgroup half  *)(shmem);
+    threadgroup half  * sb = (threadgroup half  *)(shmem + 4096);
+    threadgroup float * sc = (threadgroup float *)(shmem);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;  // 2
+    constexpr int NL1 = NK/8;   // 4
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    // F16 src0 row pointer for output-row (r0 + lr0).
+    // nb01 (caller-set) is the byte stride between weight rows in the F16
+    // shadow buffer = k * sizeof(half) = 2*k.
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    device const half * x_f16 =
+        (device const half *)(src0 + args.nb01*(r0 + lr0) + offset0);
+
+    // B-stage address (unchanged from quantized variant).
+    const short iy = 8 * (tiitg % NL1);
+    const int t = r1 + lr1;
+    device const bfloat * y_base_bf16 = (device const bfloat *)
+        (src1 + args.nb13*i13 + args.nb12*i12);
+
+    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
+    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
+
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // ---- Stage A tile: 16 halves directly from F16 weight at
+        //      K-position loop_k + il0*16, no dequant. ----
+        {
+            const int k_start = loop_k + (int)il0 * 16;
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+
+                const short lx = i%8;
+                const short ly = (tiitg/NL0)%8;
+
+                *(sa + NK*(8*sy + ly) + 8*sx + lx) = x_f16[k_start + i];
+            }
+        }
+
+        // ---- Stage B tile (bfloat permuted -> half) — unchanged from quantized variant ----
+        {
+            const int k      = loop_k + (int)iy;
+            const int h      = k / args.head_dim;
+            const int f      = k - h * args.head_dim;
+
+            device const bfloat * y_b =
+                y_base_bf16 + ((long)h * args.seq_len + (long)t) * args.head_dim + f;
+
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+
+            threadgroup half * sb_ptr = sb + NK*(8*sy + ly) + 8*sx;
+
+            sb_ptr[0] = (half)(float)y_b[0];
+            sb_ptr[1] = (half)(float)y_b[1];
+            sb_ptr[2] = (half)(float)y_b[2];
+            sb_ptr[3] = (half)(float)y_b[3];
+            sb_ptr[4] = (half)(float)y_b[4];
+            sb_ptr[5] = (half)(float)y_b[5];
+            sb_ptr[6] = (half)(float)y_b[6];
+            sb_ptr[7] = (half)(float)y_b[7];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto sA = tA.slice(0, 0);
+        auto sB = tB.slice(0, 0);
+        mm.run(sB, sA, cT);
+    }
+
+    // ---- Write-back (identical to quantized variant) ----
+    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+        device float * C = (device float *) dst +
+            r0 +
+            r1 * args.ne0 + im*args.ne1*args.ne0;
+
+        auto tC = tensor<device float, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(args.ne0, NR1));
+        cT.store(tC);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(NR0, NR1));
+        cT.store(tC);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = sc + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}

@@ -1003,3 +1003,122 @@ pub fn quantized_matmul_mm_tensor_perm021(
 
     Ok(())
 }
+
+/// ADR-029 iter-36 H28-D — F16-shadow variant of the perm021 tensor-mm.
+///
+/// Same contract as `quantized_matmul_mm_tensor_perm021`, but reads weights
+/// from a caller-supplied F16 shadow buffer instead of dequantizing the
+/// quantized weight in the kernel.  Mirrors the H29-speed pattern (iter-30)
+/// applied to the perm021 layout — used for the O-projection prefill matmul
+/// when `MlxQWeight.f16_shadow` is populated.
+///
+/// # Arguments
+///
+/// * `input_bf16` — bf16 input at physical layout `[n_heads, seq_len, head_dim]`
+///   (same as the quantized perm021 variant; produced by flash-attention).
+/// * `weight_f16` — F16 weight buffer at row-major `[n, k]`, `nb01 = 2*k` bytes
+///   per row.  Caller is responsible for ensuring the shadow was populated.
+/// * `output` — f32 `[m, n]` O-proj result.
+/// * `params` — Same dimensions as `quantized_matmul_mm_tensor_perm021`; the
+///   `ggml_type` field is ignored on this path (F16 has no GGML type).
+///
+/// # Errors
+/// Same as `quantized_matmul_mm_tensor_perm021` minus the per-type kernel
+/// resolution (this fn uses a single `kernel_mul_mm_f16_tensor_bf16_perm021`).
+pub fn quantized_matmul_mm_tensor_perm021_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight_f16: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulPerm021Params,
+) -> Result<()> {
+    if params.head_dim == 0 || params.head_dim % 32 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021_f16: head_dim {} must be a positive \
+             multiple of 32 (NK tile width)",
+            params.head_dim
+        )));
+    }
+    if params.k % params.head_dim != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021_f16: k ({}) must be divisible by \
+             head_dim ({})",
+            params.k, params.head_dim
+        )));
+    }
+
+    let n_heads = params.k / params.head_dim;
+    let expected_input_bytes = (n_heads as usize) * (params.m as usize)
+        * (params.head_dim as usize) * 2;
+    if input_bf16.byte_len() < expected_input_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021_f16: input_bf16 buffer too small \
+             (have {}, need {})",
+            input_bf16.byte_len(), expected_input_bytes
+        )));
+    }
+    let expected_weight_bytes = (params.n as usize) * (params.k as usize) * 2;
+    if weight_f16.byte_len() < expected_weight_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021_f16: weight_f16 buffer too small \
+             (have {}, need {} bytes for [n={}, k={}] half)",
+            weight_f16.byte_len(), expected_weight_bytes, params.n, params.k
+        )));
+    }
+
+    let pipeline =
+        registry.get_pipeline("kernel_mul_mm_f16_tensor_bf16_perm021", device.metal_device())?;
+
+    // nb01 = bytes per F16 weight row = k * sizeof(half)
+    let nb01: u64 = (params.k as u64) * 2;
+
+    let gpu_params = GgmlMatmulMmTensorPerm021GpuParams {
+        ne00: params.k as i32,
+        ne02: 1,
+        nb01,
+        nb02: nb01 * (params.n as u64),
+        nb03: 0,
+        ne12: 1,
+        _pad0: 0,
+        nb10: 2, // sizeof(bfloat)
+        nb11: 0,
+        nb12: 0,
+        nb13: 0,
+        ne0: params.n as i32,
+        ne1: params.m as i32,
+        r2: 1,
+        r3: 1,
+        head_dim: params.head_dim as i32,
+        seq_len: params.m as i32,
+        _pad_trailing: 0,
+    };
+
+    const NR0: u64 = 64;
+    const NR1: u64 = 32;
+    const THREADS_PER_TG: u64 = 128;
+    const SHMEM_BYTES: u64 = 8192;
+
+    let threadgroups = metal::MTLSize::new(
+        (params.m as u64 + NR1 - 1) / NR1,
+        (params.n as u64 + NR0 - 1) / NR0,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(weight_f16)),
+            (2, KernelArg::Buffer(input_bf16)),
+            (3, KernelArg::Buffer(output)),
+        ],
+        &[(0, SHMEM_BYTES)],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}

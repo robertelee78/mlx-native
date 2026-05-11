@@ -141,6 +141,12 @@ impl KernelRegistry {
         // directly from device memory (no per-call dequant).  Used when
         // MlxQWeight.f16_shadow is populated and m > MM_ROUTING_THRESHOLD.
         sources.insert("hf2q_mul_mm_tensor_v2_f16".into(), ggml_mm_tensor_src);
+        // ADR-029 iter-36 H28-D — F16-weight perm021 mm for O-projection.
+        // Same source file; reads F16 weight from MlxQWeight.f16_shadow when
+        // populated, bypassing the per-call quantized dequant.  B-stage
+        // (bfloat permuted [n_heads, seq_len, head_dim] input) is byte-
+        // identical to the quantized variant.
+        sources.insert("kernel_mul_mm_f16_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
         // ADR-029 iter-23 H28-A — V2 large-tile tensor mm (NRA=64 M, NRB=128 N).
         // Same source file as V1 tensor mm; distinct kernel host names so the
         // dispatcher can pick V1 vs V2 at runtime via HF2Q_LARGE_TILE_MM.
