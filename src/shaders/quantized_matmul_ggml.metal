@@ -824,15 +824,15 @@ kernel void kernel_mul_mv_q4_K_f32(
     //   ix  = tiisg%4 (0..3)  → block stride = 4
     //   iq  = tid/4    (0..1) → which half of the super-block (low/high)
     //   ir  = tid%4    (0..3) → which 8-element slice within iq's half
-    const int tid = tiisg / 4;
-    const int ix  = tiisg % 4;
-    const int iq  = tid / 4;
-    const int ir  = tid % 4;
-    const int n   = 8;
+    // ADR-028 iter-406: short indexing matches peer Q4_K mv pattern.
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
 
-    const int l0       = n * ir;
-    const int q_offset = 32 * iq + l0;
-    const int y_offset = 64 * iq + l0;
+    const short l0       = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -863,7 +863,7 @@ kernel void kernel_mul_mv_q4_K_f32(
         sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
 
         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-        for (int l = 0; l < n; ++l) {
+        for (int l = 0; l < 8; ++l) {
             // Low/high nibble pairs from q1 (first 32 vals) and q2 (third 32 vals).
             // No qh: Q4_K has no high-bit array, so the Q5_K formula's
             // acc2 (high-bit) accumulators collapse to zero; only the
