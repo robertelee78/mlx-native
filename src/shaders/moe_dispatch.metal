@@ -191,6 +191,13 @@ kernel void moe_weighted_sum(
     output[tid] = sum;
 }
 
+// ADR-028 iter-365 (FALSIFIED): a `moe_weighted_sum_f32_v2` float4-vectorized
+// kernel was prototyped (parity byte-identical at gemma4+qwen35 shapes) but
+// produced -0.04% (noise) at gemma4 200-tok decode (3-run mean 74.73→74.70).
+// Apple Metal compiler auto-coalesces consecutive scalar loads into the same
+// cache line, so manual float4 packing provides no measurable benefit on
+// already-coalesced memory-bound kernels.  Removed per "no unused code" rule.
+
 // --------------------------------------------------------------------------
 // fused_gelu_mul_bf16 — bf16 variant of fused_gelu_mul.
 //
