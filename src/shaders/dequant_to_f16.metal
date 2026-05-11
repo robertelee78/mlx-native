@@ -201,43 +201,95 @@ void dq_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
     reg = (type4x4) reg_f;
 }
 
+// ADR-029 iter-29 — Q6_K dequant in LINEAR K-order, byte-identical to the
+// CPU reference at /opt/mlx-native/src/gguf/mod.rs:667-720.
+//
+// Layout per Q6_K block (210 bytes, 256 elements):
+//   ql[0..128]     — low nibbles
+//   qh[0..64]      — high 2-bit pairs
+//   sc[0..16] i8   — 16 sub-scales
+//   d:half          — block scale
+//
+// Each `il ∈ [0, 16)` here covers a CONTIGUOUS 16-element K-strip,
+// in linear K-position order.  Writing `*(half4x4 *)dst + tid = reg` then
+// produces a row-major linear-K F16 tensor that matches what
+// `dense_matmul_f16_f32_tensor` expects (peer's `kernel_get_rows_q6_K`
+// pattern would re-pack at runtime; we do it once at load).
+//
+// Math is the CPU dequantize_q6_k code restructured to emit exactly the
+// 16 elements at K-positions [il*16 .. il*16 + 16).  Index map (matches
+// CPU loops at gguf/mod.rs:702-715):
+//   block of 256 elements = 2 halves × 128 elements
+//   half h ∈ {0, 1}: ql_base = ql + 64*h, qh_base = qh + 32*h,
+//                    sc_base = sc + 8*h, out_base offset = 128*h
+//   within a half, 32 'l' values (l ∈ [0, 32)) produce 4 elements each
+//   at K-positions {l, l+32, l+64, l+96}.
+//
+// For il=0..15, the linear K-range is [il*16, il*16+16).
+//   half h          = il / 8
+//   within-half pos = il % 8 * 16 → 16-element strip starts at this
+//
+// Each strip's 16 elements are at K-positions s..s+15 where s = (il%8)*16.
+// Within the strip's [0, 16) sub-index i, the CPU code maps to specific
+// (l, group, q-index).  Reconstruct here:
+//   If s + i < 32 (group 0 = q1):  l = s + i,        out_pos = l
+//   If s + i < 64 (group 1 = q2):  l = (s + i) - 32, out_pos = l + 32
+//   If s + i < 96 (group 2 = q3):  l = (s + i) - 64, out_pos = l + 64
+//   If s + i < 128 (group 3 = q4): l = (s + i) - 96, out_pos = l + 96
 template <typename type4x4>
 void dq_q6_K(device const block_q6_K * xb, short il, thread type4x4 & reg) {
-    const half d_all = xb->d;
+    const float d_all = (float)xb->d;
     device const uint8_t * ql = (device const uint8_t *)xb->ql;
     device const uint8_t * qh = (device const uint8_t *)xb->qh;
     device const int8_t  * sc = (device const int8_t  *)xb->scales;
 
-    ql = ql + 64*(il/8) + 32*((il/2)&1) + 16*(il&1);
-    qh = qh + 32*(il/8)                  + 16*(il&1);
-    sc = sc + 8*(il/8);
+    const short h     = il / 8;          // 0 or 1
+    const short s     = (il % 8) * 16;   // 16-element strip start within half
 
-    // (matches dq_q6_K body in quantized_matmul_mm_tensor.metal — unused
-    // local consts dropped to satisfy Metal -Werror unused-variable.)
-    const short sh = (il & 2) ? 2 : 0;
-
-    const float dl0 = d_all * sc[0] / 32.f;
-    const float dl1 = d_all * sc[2] / 32.f;
-    const float dl2 = d_all * sc[4] / 32.f;
-    const float dl3 = d_all * sc[6] / 32.f;
-    const float ml  = 32.f * d_all;
-
-    const uint32_t kmask1 = 0x0F0F0F0F;
-    const uint32_t kmask2 = 0xC0C0C0C0 >> (sh*8);
-
-    const uchar shr_h = il & 4 ? 0 : 2;
-    const uchar shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
-    const uchar shr_l = il>1 ? 4 : 0;
+    device const uint8_t * ql_base = ql + 64 * h;
+    device const uint8_t * qh_base = qh + 32 * h;
+    device const int8_t  * sc_base = sc + 8  * h;
 
     float4x4 reg_f;
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
-        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
-        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
-        reg_f[i][0] = dl0 *  ((half)(q & 0xFF))      - ml;
-        reg_f[i][1] = dl1 * ((float)(q & 0xFF00))    - ml;
-        reg_f[i][2] = dl2 * ((float)(q & 0xFF0000))  - ml;
-        reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
+    for (short i = 0; i < 16; ++i) {
+        const short k_in_half = s + i;            // 0..127
+        const short group = k_in_half / 32;       // 0..3
+        const short l = k_in_half - group * 32;   // 0..31
+        const short is = l / 16;                  // 0 for l<16, 1 for l>=16
+
+        // Extract the 6-bit value for this position.  Matches CPU code:
+        //   group 0: q1 = (ql_base[l]   & 0xF) | ((qh_base[l] & 3) << 4) - 32
+        //   group 1: q2 = (ql_base[l+32]& 0xF) | ((qh_base[l]>>2 & 3) << 4) - 32
+        //   group 2: q3 = (ql_base[l]   >> 4)  | ((qh_base[l]>>4 & 3) << 4) - 32
+        //   group 3: q4 = (ql_base[l+32]>> 4)  | ((qh_base[l]>>6 & 3) << 4) - 32
+        // CPU reference (gguf/mod.rs:705-710):
+        //   group 0 (q1): ql_base[l]    & 0xF    | (qh_base[l] & 3)        << 4
+        //   group 1 (q2): ql_base[l+32] & 0xF    | ((qh_base[l] >> 2) & 3) << 4
+        //   group 2 (q3): ql_base[l]    >> 4     | ((qh_base[l] >> 4) & 3) << 4
+        //   group 3 (q4): ql_base[l+32] >> 4     | ((qh_base[l] >> 6) & 3) << 4
+        //   Then cast to i8 and subtract 32 to get signed [-32, 31].
+        //
+        // Mapping: groups 0,1 use LOW nibble of ql; groups 2,3 use HIGH nibble.
+        //          groups 0,2 use ql_base[l]; groups 1,3 use ql_base[l+32].
+        uint8_t ql_byte;
+        uint8_t shift_h;
+        switch (group) {
+            case 0: ql_byte = ql_base[l];      shift_h = 0; break;
+            case 1: ql_byte = ql_base[l + 32]; shift_h = 2; break;
+            case 2: ql_byte = ql_base[l];      shift_h = 4; break;
+            default: /* 3 */ ql_byte = ql_base[l + 32]; shift_h = 6; break;
+        }
+        const uint8_t high_bits = (qh_base[l] >> shift_h) & 0x3;
+        // group < 2 → low nibble; group >= 2 → high nibble (>> 4).
+        const uint8_t low_bits = (group < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+        // Final 6-bit value: subtract 32 in i8 space → [-32, 31].
+        const int q = (int)((int8_t)((low_bits | (high_bits << 4)) - 32));
+
+        // Sub-scale: each group has 4 scales, indexed by `is` (l/16).
+        const float scale = d_all * (float)(sc_base[group * 2 + is]);
+
+        const float val = scale * (float)q;
+        reg_f[i / 4][i % 4] = val;
     }
     reg = (type4x4) reg_f;
 }
