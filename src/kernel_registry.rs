@@ -136,6 +136,16 @@ impl KernelRegistry {
         // ADR-022 Phase 3 — Q4_K tensor mm + Q8_0 perm021.
         sources.insert("kernel_mul_mm_q4_K_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q8_0_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
+        // ADR-029 iter-23 H28-A — V2 large-tile tensor mm (NRA=64 M, NRB=128 N).
+        // Same source file as V1 tensor mm; distinct kernel host names so the
+        // dispatcher can pick V1 vs V2 at runtime via HF2Q_LARGE_TILE_MM.
+        sources.insert("kernel_mul_mm_q4_0_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q8_0_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q6_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q5_1_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_iq4_nl_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q5_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q4_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
 
         // ADR-022 Phase 1 P1.7 — Q5_1 / IQ4_NL mul_mv_ext r1 family.
         // Eight instantiations (2 types × 4 r1ptg widths). Each PSO is

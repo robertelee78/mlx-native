@@ -469,7 +469,201 @@ kernel void hf2q_mul_mm_tensor_impl(
     }
 }
 
-// ---- Kernel instantiations ----
+// ===========================================================================
+// ADR-029 iter-23 H28-A: large-tile v2 mm-tensor — 4× threadgroup reduction
+// at gemma4 prefill shapes vs the legacy 32×64 tile.
+//
+// Geometry (ports llama.cpp ggml-metal.metal:9309-9431 line-for-line, with
+// the type-template params collapsed to gemma4's fixed F32-in / F32-out /
+// F16-shmem case):
+//   NRA = SZ_SIMDGROUP × N_MM_BLOCK_Y × N_MM_SIMD_GROUP_Y = 16 × 2 × 2 = 64
+//                                                          (peer-name "M tile")
+//   NRB = SZ_SIMDGROUP × N_MM_BLOCK_X × N_MM_SIMD_GROUP_X = 16 × 4 × 2 = 128
+//                                                          (peer-name "N tile")
+//   NK_TOTAL = SZ_SIMDGROUP × N_MM_NK = 16 × 2 = 32
+//   simdgroups/tg = N_MM_SIMD_GROUP_X × N_MM_SIMD_GROUP_Y = 2 × 2 = 4
+//   threads/tg    = N_SIMDWIDTH × 4 = 128
+//
+// Notes on hf2q convention vs peer:
+//   * hf2q dispatch passes args.ne0 = N (cols of output), ne1 = M (rows).
+//     Peer passes ne0 = M, ne1 = N.  The kernel's internal ra/rb naming
+//     matches peer (ra = M-axis offset, rb = N-axis offset) — the Rust
+//     dispatcher uses peer-equivalent geometry so callers stay unchanged.
+//   * No threadgroup B-staging.  Peer reads B (input activations, F32)
+//     directly from device memory through an mpp `tensor` view (line
+//     9358-9360 of ggml-metal.metal).  This eliminates the per-loop B
+//     copy-into-shmem (lines 408-414 of the V1 kernel) and frees the
+//     2-4 KB of shared memory it consumed.
+//   * Output store uses mpp `cT.store(tD.slice(ra, rb))`.  The destination
+//     tensor wraps the device buffer with the same column-major-over-M
+//     stride peer uses (`array<2>({1, M})`); the data layout that hf2q's
+//     downstream consumers see is unchanged — the kernel's M/N internal
+//     naming differs from V1's r0/r1 but the bytes on the wire match.
+//
+// At prefill shape m=4213, n=5760:
+//   V1 dispatches 132 × 90 = 11,880 threadgroups (NR0=64, NR1=32 tile)
+//   V2 dispatches  66 × 45 =  2,970 threadgroups (NRA=64, NRB=128 tile)
+//
+// Gated at the Rust side by `HF2Q_LARGE_TILE_MM=1` (env opt-in).  Default
+// OFF until coherence + multi-regime bench parity proven.
+// ===========================================================================
+
+template<typename block_q, short nl,
+         void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void hf2q_mul_mm_tensor_v2_impl(
+        constant GgmlMatmulMmTensorParams & args,
+        device const char * srcA,
+        device const char * srcB,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    // Peer's ggml convention has src0=[K, M_peer, batch], src1=[K, N_peer, batch],
+    // output=[M_peer, N_peer] with column-major-over-M_peer storage.
+    // hf2q's dispatch SWAPS M/N at the params layer (ne0 = hf2q N = peer M,
+    // ne1 = hf2q M = peer N) so the downstream V1 store `dst + r0 + r1*ne0`
+    // writes row-major-over-(hf2q-N) ≡ column-major-over-(peer-M).  V2 keeps
+    // peer's internal naming (M_peer / N_peer) so the kernel body mirrors
+    // ggml-metal.metal:9326-9329 line-for-line; the dispatcher accounts
+    // for the hf2q axis swap.
+    const int K      = args.ne00;
+    const int M_peer = args.ne0;   // hf2q ne0 = hf2q-N = peer M
+    const int N_peer = args.ne1;   // hf2q ne1 = hf2q-M = peer N
+
+    const int im = tgpig.z;
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    const uint64_t offset0 = (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+
+    // Tile constants — peer's ggml-metal-impl.h.
+    constexpr int SZ_SIMDGROUP        = 16;
+    constexpr int N_MM_BLOCK_X        = 4;
+    constexpr int N_MM_BLOCK_Y        = 2;
+    constexpr int N_MM_SIMD_GROUP_X   = 2;
+    constexpr int N_MM_SIMD_GROUP_Y   = 2;
+    constexpr int N_MM_NK             = 2;
+    constexpr int N_MM_NK_TOTAL       = SZ_SIMDGROUP * N_MM_NK;          // 32
+    constexpr int N_SIMDWIDTH         = 32;
+
+    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y; // 64 = M tile
+    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X; // 128 = N tile
+
+    const int ra = tgpig.y * NRA;   // M_peer offset (gy covers M_peer = hf2q-N)
+    const int rb = tgpig.x * NRB;   // N_peer offset (gx covers N_peer = hf2q-M)
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+
+    constexpr int A_WORK_ITEMS = NRA * N_MM_NK;                              // 128
+    constexpr int NUM_THREADS  = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y; // 128
+
+    auto tA = tensor(sa, dextents<int32_t, 2>(N_MM_NK_TOTAL, NRA));
+
+    // B is F32, read directly from device memory (peer ggml-metal.metal:9358-9360).
+    // B has hf2q layout `B[N_peer_idx, K_idx] = base + N_peer_idx*K + K_idx`
+    // (slow axis = N_peer = hf2q-M = tokens, fast axis = K).
+    device float * ptrB = (device float *)(srcB + args.nb12 * i12 + args.nb13 * i13);
+    const int strideB = (int)(args.nb11 / sizeof(float));   // = K floats per N_peer row
+    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N_peer), array<int, 2>({1, strideB}));
+
+    matmul2d<
+        matmul2d_descriptor(NRB, NRA, N_MM_NK_TOTAL, false, true, true,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
+        // PHASE 1: dequantize A tile into sa.
+        for (int work = tiitg; work < A_WORK_ITEMS; work += NUM_THREADS) {
+            const int row     = work / N_MM_NK;
+            const int k_chunk = work % N_MM_NK;
+            const int k_pos   = loop_k + k_chunk * 16;
+            const short k_base = k_chunk * 16;
+
+            if (ra + row < M_peer) {
+                const int block_idx = k_pos / (16 * nl);
+                const short il      = (k_pos / 16) % nl;
+
+                device const block_q * row_ptr =
+                    (device const block_q *)(srcA + args.nb01 * (ra + row) + offset0);
+
+                half4x4 temp_a;
+                dequantize_func(row_ptr + block_idx, il, temp_a);
+
+                for (short i = 0; i < 16; i++) {
+                    sa[row * N_MM_NK_TOTAL + (k_base + i)] =
+                        (k_pos + i < K) ? temp_a[i / 4][i % 4] : (half)0;
+                }
+            } else {
+                for (short i = 0; i < 16; i++) {
+                    sa[row * N_MM_NK_TOTAL + (k_base + i)] = (half)0;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // PHASE 2: tensor matmul.
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+
+        mm.run(mB, mA, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store cooperative tensor to device output.
+    // Output shape (peer convention): [M_peer, N_peer], column-major-over-M_peer.
+    // In hf2q-equivalent terms: [hf2q-N, hf2q-M] column-major-over-N — i.e.,
+    // `out[N_idx, M_idx] = base + N_idx + M_idx*N` (V1 layout exactly).
+    device float * dstBatch = (device float *)dst +
+        im * (uint64_t)M_peer * (uint64_t)N_peer;
+    auto tD = tensor(dstBatch, dextents<int32_t, 2>(M_peer, N_peer),
+                     array<int, 2>({1, M_peer}));
+    cT.store(tD.slice(ra, rb));
+}
+
+// ---- V2 kernel instantiations (env-gated via HF2Q_LARGE_TILE_MM=1) ----
+template [[host_name("kernel_mul_mm_q4_0_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, dequantize_q4_0_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_q8_0_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q8_0, 2, dequantize_q8_0_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_q6_K_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q6_K, QK_NL, dequantize_q6_K_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_q5_1_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q5_1, 2, dequantize_q5_1_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_q5_K_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q5_K, QK_NL, dequantize_q5_K_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_q4_K_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_K, QK_NL, dequantize_q4_K_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_iq4_nl_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_iq4_nl, 2, dequantize_iq4_nl_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+// ---- Kernel instantiations (legacy V1, NR0=64 × NR1=32) ----
 
 template [[host_name("kernel_mul_mm_q4_0_tensor_f32")]]
 kernel void hf2q_mul_mm_tensor_impl<block_q4_0, 2, dequantize_q4_0_t>(

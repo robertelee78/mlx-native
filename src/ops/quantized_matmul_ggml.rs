@@ -190,6 +190,26 @@ impl GgmlType {
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_f32",
         }
     }
+
+    /// ADR-029 iter-23 H28-A — V2 large-tile tensor mm-kernel names.
+    /// 64 (M tile) × 128 (N tile) output tile, direct-device B-read (no
+    /// shmem staging), 4 simdgroups.  Ports llama.cpp's modern tensor
+    /// kernel layout at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:
+    /// 9309-9431 (the GGML_METAL_HAS_TENSOR branch).
+    fn mm_tensor_v2_kernel_name(self) -> &'static str {
+        match self {
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::I16 => "unsupported",
+            GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
+            GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
+            GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_v2_f32",
+            GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_v2_f32",
+            GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_v2_f32",
+            GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_v2_f32",
+            GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_v2_f32",
+        }
+    }
 }
 
 /// Cached tensor-API availability — `None` until the first mm dispatch,
@@ -605,7 +625,15 @@ fn dispatch_mm(
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
     let use_tensor = probe_tensor_mm(registry, device);
-    let kernel_name = if use_tensor {
+    // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
+    // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
+    // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).  Default OFF
+    // until coherence + bench parity proven; opt-in via HF2Q_LARGE_TILE_MM=1.
+    let use_v2_large_tile = use_tensor
+        && std::env::var("HF2Q_LARGE_TILE_MM").as_deref() == Ok("1");
+    let kernel_name = if use_v2_large_tile {
+        params.ggml_type.mm_tensor_v2_kernel_name()
+    } else if use_tensor {
         params.ggml_type.mm_tensor_kernel_name()
     } else {
         params.ggml_type.mm_kernel_name()
@@ -637,24 +665,40 @@ fn dispatch_mm(
         _pad1: 0,
     };
 
-    // Tile geometry from llama.cpp: NR0=64 (output-N per tg), NR1=32 (M per tg),
-    // 4 simdgroups/tg -> 128 threads/tg.
-    const NR0: u64 = 64;
-    const NR1: u64 = 32;
+    // V1 tile geometry: NR0=64 (output-N per tg), NR1=32 (M per tg).
+    // V2 tile geometry: NRA=64 (M per tg), NRB=128 (N per tg).
+    // Both use 4 simdgroups / 128 threads per threadgroup.
     const THREADS_PER_TG: u64 = 128;
 
-    let threadgroups = metal::MTLSize::new(
-        (params.m as u64 + NR1 - 1) / NR1,
-        (params.n as u64 + NR0 - 1) / NR0,
-        1,
-    );
-    let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+    let (tg_x, tg_y, shmem_bytes) = if use_v2_large_tile {
+        // V2 in peer-convention coordinates:
+        //   gx covers N_peer with stride NRB=128 → N_peer is the SLOWER axis
+        //     (hf2q-M = tokens = params.m).
+        //   gy covers M_peer with stride NRA=64  → M_peer is the FASTER axis
+        //     (hf2q-N = output features = params.n).
+        // Only A goes through shmem: 64 × 32 halfs = 4096 B.  B is read
+        // directly from device via the tensor view (no shmem staging).
+        let nra: u64 = 64;  // M_peer = hf2q-N
+        let nrb: u64 = 128; // N_peer = hf2q-M
+        (
+            (params.m as u64 + nrb - 1) / nrb,   // gx → N_peer = hf2q-M tiles
+            (params.n as u64 + nra - 1) / nra,   // gy → M_peer = hf2q-N tiles
+            4096u64,
+        )
+    } else {
+        // V1: gx = M tiles (NR1=32), gy = N tiles (NR0=64).  sa (A tile
+        // 4096 B) + sb (B tile 4096 B as f32 → half cast) = 8192 B.
+        let nr0: u64 = 64;
+        let nr1: u64 = 32;
+        (
+            (params.m as u64 + nr1 - 1) / nr1,
+            (params.n as u64 + nr0 - 1) / nr0,
+            8192u64,
+        )
+    };
 
-    // Threadgroup shared memory: sa (A tile half, 64*32 = 2048 halfs = 4096 B)
-    // + sb (B tile float, 32*32 = 1024 floats = 4096 B) = 8192 bytes.
-    // llama.cpp allocates identical 8192 bytes; the partial-tile write-back
-    // path reuses the same region (so no extra allocation needed).
-    const SHMEM_BYTES: u64 = 8192;
+    let threadgroups = metal::MTLSize::new(tg_x, tg_y, 1);
+    let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
@@ -664,7 +708,7 @@ fn dispatch_mm(
             (2, KernelArg::Buffer(input)),
             (3, KernelArg::Buffer(output)),
         ],
-        &[(0, SHMEM_BYTES)],
+        &[(0, shmem_bytes)],
         threadgroups,
         threads_per_tg,
     );
