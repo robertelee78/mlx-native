@@ -509,6 +509,121 @@ kernel void kernel_mul_mv_id_q8_0_f32(
 }
 
 // ====================================================================
+// Q8_0 _id expert-indexed mat-vec kernel — NR0=2 NSG=4 variant
+// (ADR-029 iter-6 port; peer N_R0_Q8_0=2 + N_SG_Q8_0=4 in
+//  /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:27,40)
+// ====================================================================
+//
+// Same row coverage as `kernel_mul_mv_id_q8_0_f32` (8 rows/TG) but
+// distributes the K-dim across 4 simdgroups with shmem cross-SG reduce
+// instead of 2 SGs each independently handling 4 rows.  Better latency
+// hiding when memory-bandwidth-bound, which the gemma4 MoE down_exps
+// Q8_0 mat-vec hits at hidden_size=2816, top_k=8.
+//
+// Dispatch geometry:
+//   threadgroups = (ceil(N/N_R0_Q8_0=2), n_tokens*top_k, 1)
+//   threads_per_tg = (32, 4, 1) = 128 threads = 4 simdgroups × 32
+//   shmem = N_R0_Q8_0 * N_SIMDWIDTH * sizeof(float) = 256 bytes
+//
+// Env-gated via HF2Q_Q8_0_ID_MV_NR2=1 in dispatch_id_mv.
+
+#define N_R0_Q8_0_ID 2
+#define N_SG_Q8_0_ID 4
+#define NQ_Q8_0_ID   8
+
+kernel void kernel_mul_mv_id_q8_0_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    threadgroup float   * shmem  [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NR0 = N_R0_Q8_0_ID;   // 2
+    constexpr int NSG = N_SG_Q8_0_ID;   // 4
+    constexpr int NW  = N_SIMDWIDTH;    // 32
+    constexpr int NQ  = NQ_Q8_0_ID;     // 8
+
+    const int nb = p.ne00 / QK8_0;
+    const int r0 = tgpig.x;
+    const int output_row_base = tgpig.y;
+
+    if (output_row_base >= (int)p.ne1) return;
+
+    const uint token_idx = output_row_base / p.top_k;
+    const uint expert_id = ids[output_row_base];
+
+    const int first_row = r0 * NR0;
+
+    // Per-row src0 pointers (unrolled NR0=2 iterations), with expert offset.
+    device const block_q8_0 * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *)((device const char *)src0 + expert_id * p.expert_stride) + (first_row + row) * nb;
+    }
+
+    device const float * y = src1 + token_idx * p.ne10;
+
+    float sumf[NR0] = { 0.f };
+
+    const int ix = tiisg / (NW / NQ);  // 0..3
+    const int il = tiisg % (NW / NQ);  // 0..3
+
+    const int ib0 = sgitg * NQ + ix;
+
+    float yl[NQ];
+    device const float * yb = y + ib0 * QK8_0 + il * NQ;
+
+    // Each thread covers NQ quants per iteration; SGs interleave across
+    // ib by stride NSG*NQ. Mirrors kernel_mul_mv_q8_0_f32_nr2 (regular).
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        for (int i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (int row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.f;
+            for (int iq = 0; iq < NQ; ++iq) {
+                sumq += qs[iq] * yl[iq];
+            }
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+
+        yb += NSG * NQ * QK8_0;
+    }
+
+    // Cross-simdgroup reduction (peer's helper_mv_reduce_and_write pattern).
+    threadgroup float * shmem_rows[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        shmem_rows[row] = shmem + NW * row;
+        if (sgitg == 0) {
+            shmem_rows[row][tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_rows[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int row = 0; row < NR0 && first_row + row < (int)p.ne01; ++row) {
+        const float tot = simd_sum(shmem_rows[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            dst[output_row_base * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ====================================================================
 // Q5_1 expert-indexed mat-vec kernel  (ADR-022 Phase 1)
 // ====================================================================
 //

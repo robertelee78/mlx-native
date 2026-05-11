@@ -482,8 +482,17 @@ fn dispatch_id_mv(
     // Opt out with `HF2Q_Q6K_ID_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
         && env_default_true("HF2Q_Q6K_ID_MV_NR2");
+    // ADR-029 iter-6 — nr0=2 nsg=4 variant for q8_0 _id mat-vec.
+    // Matches peer's N_R0_Q8_0=2 + N_SG_Q8_0=4 in ggml-metal-impl.h:27,40.
+    // gemma4 APEX-Q5_K_M MoE down_exps is Q8_0 → 30 dispatches/decode-tok
+    // on this path.  Opt-in via `HF2Q_Q8_0_ID_MV_NR2=1`; default-off
+    // until coherence + bench validation.
+    let use_q8_0_id_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
+        && std::env::var("HF2Q_Q8_0_ID_MV_NR2").ok().as_deref() == Some("1");
     let kernel_name = if use_q6k_id_nr2 {
         "kernel_mul_mv_id_q6_K_f32_nr2"
+    } else if use_q8_0_id_nr2 {
+        "kernel_mul_mv_id_q8_0_f32_nr2"
     } else {
         params.ggml_type.id_kernel_name()
     };
@@ -541,6 +550,14 @@ fn dispatch_id_mv(
     // ADR-028 iter-321 — nr0=2 doubles rows-per-TG to 4. Same 2 SGs × 32
     // threads, but each SG handles 2 rows so align=4.
     let align = if use_q6k_id_nr2 { 4usize } else { align };
+    // ADR-029 iter-6 — Q8_0 _id NR2 NSG=4: threads_per_tg=(32, 4), align=2
+    // (each TG covers NR0=2 rows; all 4 SGs collaborate on K-dim).
+    // Override geometry AFTER the Q4_0/Q8_0/Q5_1/IQ4_NL match arm above.
+    let (nth0, nth1, align) = if use_q8_0_id_nr2 {
+        (32u64, 4u64, 2usize)
+    } else {
+        (nth0, nth1, align)
+    };
 
     let n = params.n as usize;
     let m = total_rows;
@@ -559,18 +576,37 @@ fn dispatch_id_mv(
     );
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
-    encoder.encode_threadgroups_with_args(
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(weight)),
-            (1, KernelArg::Buffer(input)),
-            (2, KernelArg::Buffer(output)),
-            (3, KernelArg::Buffer(ids)),
-            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
-        ],
-        threadgroups,
-        threads_per_tg,
-    );
+    if use_q8_0_id_nr2 {
+        // ADR-029 iter-6: cross-SG reduction needs threadgroup memory:
+        // NR0 * NW * sizeof(float) = 2 * 32 * 4 = 256 bytes.
+        let smem_bytes: u64 = 2 * 32 * std::mem::size_of::<f32>() as u64;
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(weight)),
+                (1, KernelArg::Buffer(input)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Buffer(ids)),
+                (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            &[(0, smem_bytes)],
+            threadgroups,
+            threads_per_tg,
+        );
+    } else {
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(weight)),
+                (1, KernelArg::Buffer(input)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Buffer(ids)),
+                (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            threadgroups,
+            threads_per_tg,
+        );
+    }
 
     Ok(())
 }

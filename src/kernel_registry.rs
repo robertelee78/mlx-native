@@ -235,6 +235,11 @@ impl KernelRegistry {
         // (peer-pattern port mirroring iter-309's non-_id variant).
         // Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
         sources.insert("kernel_mul_mv_id_q6_K_f32_nr2".into(), ggml_id_src);
+        // ADR-029 iter-6 — q8_0 _id with nr0=2 + nsg=4 cross-SG reduce
+        // (peer-pattern port; peer N_R0_Q8_0=2 + N_SG_Q8_0=4 in
+        //  /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:27,40).
+        // Env-gated via HF2Q_Q8_0_ID_MV_NR2=1 in dispatch_id_mv.
+        sources.insert("kernel_mul_mv_id_q8_0_f32_nr2".into(), ggml_id_src);
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL MoE expert-routed mat-vec.
         sources.insert("kernel_mul_mv_id_q5_1_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_iq4_nl_f32".into(), ggml_id_src);
