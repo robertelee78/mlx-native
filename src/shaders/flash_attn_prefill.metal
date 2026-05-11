@@ -1692,6 +1692,12 @@ instantiate_flash_attn_prefill("flash_attn_prefill_f16_d256_boolmask",  half,   
 // BQ=8, BK=8, WM=1, WN=1 → 32 threads / threadgroup, 1 simdgroup.
 // Smaller tiles than D=256 because Qs (BQ * BD * sizeof(T)) scales with
 // BQ * BD; the BQ=32 geometry would exceed 32 KB at BD=512.
+//
+// NOTE (ADR-029 iter-37): these D=512 instantiations are NOT on the production
+// path.  The production d=512 prefill uses
+// `flash_attn_prefill_d512.metal` (llamacpp port) with NSG=8 — already 8x
+// the simdgroup-level parallelism.  Kept here for ABI compatibility with
+// pre-llamacpp test fixtures.
 instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d512",          bfloat16_t, 8, 8, 512, 1, 1, bfloat16_t)
 instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d512_boolmask", bfloat16_t, 8, 8, 512, 1, 1, bool)
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d512",           half,       8, 8, 512, 1, 1, half)
