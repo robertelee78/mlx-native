@@ -3,9 +3,13 @@
 // ADR-028 Phase 10d (iter-349): structural close on the 1.81× per-dispatch K-side
 // gap measured iter-326..342.  Reads K as F16 (peer-equivalent layout) — direct
 // half-to-float cast, NO codebook lookup, NO per-position norm.  V stays
-// byte-packed TQ-HB (1 byte/elem + per-pos F32 norm + Lloyd-Max codebook lookup),
-// preserving 81% of TQ-HB's 3.94× memory savings (3.19× total vs raw F32; see
-// ADR-028 §iter-346 for memory math).
+// byte-packed TQ-HB (1 byte/elem + per-pos F32 norm + Lloyd-Max codebook lookup).
+// ADR-028 iter-447 corrected memory math: hybrid yields **2.65× total vs raw F32**
+// (per-slot: 32,768 B F32 → 12,352 B hybrid).  iter-346's "3.19× savings (81%
+// preserved)" was a math error using F16_K_size as V's baseline instead of
+// F32_V_size — V_hybrid is the SAME TQ-HB-V as the all-TQ-HB case (4,160 B),
+// not half of it.  Hybrid preserves ~83% of TQ-HB's per-byte savings ratio,
+// but absolute ratio is 2.65× vs raw F32, NOT 3.19×.
 //
 // Why hybrid wins on speed (per peer source read iter-349):
 //   * Peer's F16-K SDPA at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6837
