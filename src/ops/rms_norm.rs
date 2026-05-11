@@ -126,13 +126,14 @@ pub fn dispatch_rms_norm(
 
     // One threadgroup per row.  Threadgroup size must be a power of 2.
     //
-    // ADR-028 iter-360 — tested raising cap from 256 to 1024 (matching peer's
-    // `pipeline.max_threads_per_threadgroup` heuristic at llama.cpp
-    // ggml-metal-ops.cpp:3452-3459).  Result: -0.5 to -0.7% regression on
-    // gemma4 decode (legacy 73.7 → 73.0; hybrid 75.5 → 75.0).  Cap=256 is
-    // already well-tuned: at decode (1 row per dispatch), wider TGs reduce
-    // concurrent-TG-per-SM count which hurts more than the per-TG load-time
-    // saving.  FALSIFIED — keep cap=256.
+    // ADR-028 iter-360 — tested raising cap from 256 to 1024 (peer pattern):
+    //   FALSIFIED at -0.5 to -0.7%.  Wider TG hurts concurrent-TG-per-SM count.
+    // ADR-028 iter-361 — tested right-sizing tg to float4 elem count for V2
+    //   (so dim=256 per-head norms get tg=64 instead of 256, no idle threads):
+    //   FALSIFIED at -0.4%.  Apple Metal compiler must already dedup idle
+    //   threads OR per-thread launch overhead amortizes better at tg=256.
+    // Production: tg = min(256, dim.next_power_of_two()) — both falsifications
+    // documented; future iters skip both directions.
     let mut tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
     if use_v2 && tg_size < 32 {
         tg_size = 32;
@@ -676,6 +677,9 @@ pub fn dispatch_rms_norm_no_scale_f32(
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
+    // ADR-028 iter-361 — see `dispatch_rms_norm` comment above; right-sizing
+    // tg to float4 element count was FALSIFIED at -0.4%.  Keep tg = min(256,
+    // dim.next_power_of_two()) — same as the legacy path.
     let mut tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
     if use_v2 && tg_size < 32 {
         tg_size = 32;
