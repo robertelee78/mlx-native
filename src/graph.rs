@@ -1138,7 +1138,7 @@ impl<'a> GraphSession<'a> {
         device: &MlxDevice,
         input: &MlxBuffer,
         weight: &MlxBuffer,
-        output: &mut MlxBuffer,
+        output: &MlxBuffer,
         params: &ops::quantized_matmul_ggml::GgmlQuantizedMatmulParams,
     ) -> Result<()> {
         ops::quantized_matmul_ggml::quantized_matmul_ggml(
@@ -1163,7 +1163,7 @@ impl<'a> GraphSession<'a> {
         input: &MlxBuffer,
         weight: &MlxBuffer,
         ids: &MlxBuffer,
-        output: &mut MlxBuffer,
+        output: &MlxBuffer,
         params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
     ) -> Result<()> {
         ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml(
@@ -1190,7 +1190,7 @@ impl<'a> GraphSession<'a> {
         input: &MlxBuffer,
         weight: &MlxBuffer,
         ids: &MlxBuffer,
-        output: &mut MlxBuffer,
+        output: &MlxBuffer,
         scratch: &mut ops::quantized_matmul_id_ggml::IdMmScratch,
         params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
     ) -> Result<()> {
