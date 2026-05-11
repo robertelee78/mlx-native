@@ -770,6 +770,8 @@ impl KernelRegistry {
         sources.insert("fused_residual_norm_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_residual_norm_scalar_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_routing_f32".into(), fused_norm_add_f32_src);
+        // ADR-028 iter-363: V2 (simd_max + simd_sum) variant of MoE routing.
+        sources.insert("fused_moe_routing_f32_v2".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_routing_batch_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_norm_add_scalar_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_wsum_norm_add_f32".into(), fused_norm_add_f32_src);

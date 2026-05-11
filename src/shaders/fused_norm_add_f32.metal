@@ -632,6 +632,121 @@ kernel void fused_moe_routing_f32(
     }
 }
 
+// ============================================================================
+// fused_moe_routing_f32_v2 (ADR-028 iter-363) — simd_max + simd_sum rewrite of
+// fused_moe_routing_f32 above.
+//
+// Same math, same buffer layout, same `FusedMoeRoutingParams`.  Only the
+// reductions change: scalar tree reduction → simd_max/simd_sum + per-simdgroup
+// partial-result staging (mirrors rms_norm_f32_v2 / fused_post_ff_norm2_v2).
+//
+// Per-dispatch barrier count: V1 = 2 * log2(tg_size) + 2 = 16 (at tg=128);
+// V2 = 4 (2 simd_max + 2 cross-SG broadcast barriers).  At gemma4 30 layers
+// × 1/layer = 30 dispatches/decode-token: saves ~360 barriers/decode-token.
+//
+// Top-K step (phase 4) is unchanged — already serial in a single thread.
+// ============================================================================
+kernel void fused_moe_routing_f32_v2(
+    device const float*               logits          [[buffer(0)]],
+    device uint*                      expert_ids      [[buffer(1)]],
+    device float*                     routing_weights [[buffer(2)]],
+    device const float*               per_expert_scale [[buffer(3)]],
+    constant FusedMoeRoutingParams&   params          [[buffer(4)]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const uint num_experts = params.num_experts;
+    const uint top_k       = params.top_k;
+    const uint n_sg        = tg_size / 32u;
+
+    // --- Step 1: find max for numerical stability (softmax) ---
+    float local_max = -INFINITY;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        local_max = max(local_max, logits[i]);
+    }
+    // Cross-SG max via simd_max + shared scratch.
+    local_max = simd_max(local_max);
+    if (tiisg == 0) {
+        shared[num_experts + sgitg] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // SG0 finishes the cross-SG reduction; broadcast result back via shared[num_experts + 0].
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[num_experts + tiisg] : -INFINITY;
+        const float total = simd_max(v);
+        if (tiisg == 0) {
+            shared[num_experts + 0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float max_val = shared[num_experts + 0];
+
+    // --- Step 2: compute exp(x - max) and sum ---
+    float local_sum = 0.0f;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        const float e = exp(logits[i] - max_val);
+        shared[num_experts + i] = e;  // store exp values for step 3
+        local_sum += e;
+    }
+    local_sum = simd_sum(local_sum);
+    if (tiisg == 0) {
+        // Store per-SG partial sums in shmem[2*num_experts + sgitg] (after the exp buffer).
+        shared[2u * num_experts + sgitg] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[2u * num_experts + tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[2u * num_experts + 0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sum_exp = shared[2u * num_experts + 0];
+
+    // --- Step 3: write softmax probabilities to shared[0..num_experts) ---
+    // (overwrites the original logits slot, leaving exp values in shared[num_experts..])
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        shared[i] = shared[num_experts + i] / sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Step 4: top-K selection (single-thread serial, same as V1) ---
+    if (tid == 0) {
+        for (uint k = 0; k < top_k; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint i = 0; i < num_experts; i++) {
+                if (shared[i] > best_val) {
+                    best_val = shared[i];
+                    best_idx = i;
+                }
+            }
+            expert_ids[k] = best_idx;
+            routing_weights[k] = best_val;
+            shared[best_idx] = -1.0f;
+        }
+
+        float topk_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            topk_sum += routing_weights[k];
+        }
+        if (topk_sum > 0.0f) {
+            for (uint k = 0; k < top_k; k++) {
+                const uint eid = expert_ids[k];
+                routing_weights[k] = (routing_weights[k] / topk_sum) * per_expert_scale[eid];
+            }
+        } else {
+            for (uint k = 0; k < top_k; k++) {
+                routing_weights[k] = 0.0f;
+            }
+        }
+    }
+}
+
 /// Batched fused MoE routing for prefill (float32).
 ///
 /// Same semantics as fused_moe_routing_f32, but processes n_tokens at once.

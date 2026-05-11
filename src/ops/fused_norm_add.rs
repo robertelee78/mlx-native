@@ -608,7 +608,25 @@ pub fn dispatch_fused_moe_routing_f32(
         ));
     }
 
-    let pipeline = registry.get_pipeline("fused_moe_routing_f32", device)?;
+    // ADR-028 iter-363: V2 path uses simd_max + simd_sum (mirrors V2 rms_norm
+    // pattern from iter-310/iter-362).  Same math, ~75% fewer barriers per
+    // dispatch (4 vs 14 at tg=64).  Default-ON since parity-tested
+    // byte-identical (max_abs=0.0 on both gemma4 fixtures + per-expert-scale
+    // case — see test_fused_moe_routing_v2_parity.rs) AND measured +0.3% on
+    // gemma4 hybrid decode (76.2 → 76.4).  Opt-out via
+    // HF2Q_FUSED_MOE_ROUTING_V2=0.
+    let use_v2 = !matches!(
+        std::env::var("HF2Q_FUSED_MOE_ROUTING_V2").ok().as_deref(),
+        Some(v) if v.eq_ignore_ascii_case("0")
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+    );
+    let kernel_name = if use_v2 {
+        "fused_moe_routing_f32_v2"
+    } else {
+        "fused_moe_routing_f32"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let gpu_params = GpuFusedMoeRoutingParams {
         num_experts,
@@ -616,7 +634,18 @@ pub fn dispatch_fused_moe_routing_f32(
     };
 
     let tg_size = std::cmp::min(64, num_experts.next_power_of_two()) as u64;
-    let shared_slots = 2 * num_experts + tg_size as u32;
+    // V1: shared = num_experts (softmax scratch) + num_experts (exp values) + tg_size (tree reduction).
+    // V2: shared = num_experts (softmax) + num_experts (exp values) + 2*n_sg (per-SG max + per-SG sum).
+    // V2 storage: indices [0, num_experts) softmax, [num_experts, 2*num_experts) exp,
+    //             [2*num_experts, 2*num_experts + n_sg) max scratch,
+    //             starting at 2*num_experts ALSO sum scratch (overlaps max scratch — different phases).
+    // For safety, allocate `2*num_experts + n_sg` floats (V2 reuses the max-scratch slot for sum-scratch).
+    let n_sg = ((tg_size + 31) / 32) as u32;
+    let shared_slots = if use_v2 {
+        2 * num_experts + n_sg
+    } else {
+        2 * num_experts + tg_size as u32
+    };
     let shared_mem_bytes = (shared_slots as u64) * 4;
 
     encode_threadgroups_with_args_and_shared(
