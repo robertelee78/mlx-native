@@ -627,10 +627,19 @@ fn dispatch_mm(
     let use_tensor = probe_tensor_mm(registry, device);
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
-    // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).  Default OFF
-    // until coherence + bench parity proven; opt-in via HF2Q_LARGE_TILE_MM=1.
+    // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).
+    //
+    // ADR-029 iter-26 default-flip: validated across regimes —
+    //   gemma4-APEX-Q5_K_M (2K/4K/8K prefill): +6–7% byte-identical
+    //   qwen3.6-APEX-Q5_K_M (4K prefill): +0–2% byte-identical
+    //   decode m=1 unaffected (V2 only fires at m > MM_ROUTING_THRESHOLD=8)
+    // 3457/0/11 unit tests pass.  Default ON; opt-out via
+    // `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
     let use_v2_large_tile = use_tensor
-        && std::env::var("HF2Q_LARGE_TILE_MM").as_deref() == Ok("1");
+        && match std::env::var("HF2Q_LARGE_TILE_MM").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        };
     let kernel_name = if use_v2_large_tile {
         params.ggml_type.mm_tensor_v2_kernel_name()
     } else if use_tensor {
