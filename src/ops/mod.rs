@@ -57,6 +57,7 @@ pub mod flash_attn_vec;
 pub mod flash_attn_vec_tq;
 pub mod flash_attn_vec_tq_hb;
 pub mod flash_attn_vec_hybrid;
+pub mod flash_attn_vec_reduce_tq_hb_undo;
 pub mod fwht_standalone;
 pub mod chunk_gated_delta_rule;
 pub mod chunk_gated_delta_rule_tri_solve_invert;

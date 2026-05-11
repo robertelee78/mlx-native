@@ -369,6 +369,134 @@ pub fn tmp_buffer_bytes(num_heads: u32, head_dim: u32) -> usize {
     (nrows * max_nwg * (dv + 2)) * std::mem::size_of::<f32>()
 }
 
+/// ADR-028 §iter-485 (Phase 7d H3) — fused-undo variant.
+///
+/// Same as [`flash_attn_vec_tq_hb`], but the reduce step is replaced with
+/// `flash_attn_vec_reduce_tq_hb_undo`, which performs the cross-WG online-
+/// softmax reduce AND the FWHT-sign-undo of the output in one dispatch.
+///
+/// This saves 1 dispatch + 1 forced memory_barrier per decode-attention call
+/// (versus the caller dispatching `fwht_sign_undo_f32` after the reduce).
+/// At gemma4 30 layers × 100 decode tokens that is 3000 dispatch+barrier
+/// pairs eliminated per 100-token decode.
+///
+/// CALLER CONTRACT: do NOT dispatch `fwht_sign_undo_f32` on `output` after
+/// this call — it is already done by the fused reduce.
+///
+/// Requires `nwg > 1` (the multi-WG reduce path). At `nwg == 1` the SDPA
+/// kernel writes the final output directly and the fused reduce is not
+/// invoked; the caller falls back to applying `fwht_sign_undo` on the
+/// output. The `kv_seq_len > 16` decode case always picks `nwg >= 16` per
+/// [`compute_nwg`], so this branch is the production hot path.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_tq_hb_with_fused_undo(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+) -> Result<()> {
+    validate_params(params)?;
+
+    let head_dim = params.head_dim;
+    let nwg = compute_nwg(params.kv_seq_len);
+
+    let gpu_params = FlashAttnVecTqHbParamsGpu {
+        n_heads: params.num_heads,
+        n_kv_heads: params.num_kv_heads,
+        head_dim: params.head_dim,
+        kv_seq_len: params.kv_seq_len,
+        kv_capacity: params.kv_capacity,
+        scale: params.scale,
+        mask_type: params.mask_type,
+        sliding_window: params.sliding_window,
+        softcap: params.softcap,
+        nwg,
+        ring_start: params.ring_start,
+        scale_factor_d512: params.scale_factor_d512,
+        codebook_bits: params.codebook_bits,
+        fuse_fwht_pre: params.fuse_fwht_pre,
+        nsg: params.nsg,
+    };
+
+    let kernel_name = match head_dim {
+        256 => "flash_attn_vec_tq_hb_dk256",
+        512 => "flash_attn_vec_tq_hb_dk512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_tq_hb_with_fused_undo: unsupported head_dim {head_dim}"
+        ))),
+    };
+    let cbits_const = (params.codebook_bits as i32, 50usize);
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            kernel_name,
+            device.metal_device(),
+            &[],
+            &[(cbits_const.1, cbits_const.0)],
+        )?;
+
+    let pk = pad2(head_dim as usize, 128);
+    let pv = pad2(head_dim as usize, 128);
+    let sh = 4 * 32;
+    let nsg = params.nsg as usize;
+    let shmem_halfs = pk + nsg * (sh + 2 * pv);
+    let shmem_bytes = shmem_halfs * 2;
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+
+    let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
+    let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
+
+    let dst_buf = if nwg == 1 { output } else { tmp };
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(q)),
+            (2, KernelArg::Buffer(k_packed)),
+            (3, KernelArg::Buffer(k_norms)),
+            (4, KernelArg::Buffer(v_packed)),
+            (5, KernelArg::Buffer(v_norms)),
+            (6, KernelArg::Buffer(dst_buf)),
+        ],
+        &[(0, shmem_bytes as u64)],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    if nwg > 1 {
+        encoder.memory_barrier();
+
+        // H3 fusion: use reduce_tq_hb_undo (writes inverse-rotated output
+        // directly to `output`).
+        crate::ops::flash_attn_vec_reduce_tq_hb_undo::dispatch_flash_attn_vec_reduce_tq_hb_undo(
+            encoder, registry, device,
+            tmp, output,
+            params.num_heads, head_dim, nwg,
+        )?;
+    } else {
+        // NWG=1 path: SDPA wrote final output directly to `output` in the
+        // ROTATED domain. To preserve the H3 caller contract (no trailing
+        // fwht_sign_undo dispatch needed), apply the in-place undo here.
+        // Production decode hits nwg=16 or nwg=32, so this branch is rare;
+        // mirror the legacy behavior for safety.
+        encoder.memory_barrier();
+        crate::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+            encoder, registry, device.metal_device(),
+            output, params.num_heads, head_dim,
+        )?;
+    }
+
+    Ok(())
+}
+
 fn pad2(x: usize, n: usize) -> usize {
     (x + n - 1) & !(n - 1)
 }
