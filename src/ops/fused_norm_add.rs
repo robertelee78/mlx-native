@@ -323,6 +323,16 @@ pub fn dispatch_fused_norm_add_f32(
 /// Eliminates one global write+read of the [rows * dim] intermediate sum
 /// buffer (~5 MB at pp2455 × 30 = 150 MB of read+write traffic).
 ///
+/// ⚠ ADR-028 iter-366 (FALSIFIED for decode wiring): tested wiring this kernel
+/// into gemma4 decode Path B replacing the chain (moe_weighted_sum +
+/// fused_norm_add_f32_v2).  Parity passed (gemma4 byte-identical, qwen35
+/// max_rel < 1e-4) but bench REGRESSED 4.8% (73.83 → 70.30 tok/s, 3-run mean).
+/// Root cause: this kernel uses V1 scalar tree-reduce (16 barriers/dispatch);
+/// the chain uses V2 simd_sum (4 barriers/dispatch).  Per-dispatch GPU savings
+/// from V2 outweigh the dispatch-count savings from fusion.  To win at decode
+/// would require a V2-port (`fused_moe_wsum_norm_add_f32_v2`) using simd_sum +
+/// per-SG staging.  Untouched here pending iter-367+ scope decision.
+///
 /// # Arguments
 ///
 /// * `expert_outputs` - MoE down outputs `[rows * top_k * dim]` (f32).
