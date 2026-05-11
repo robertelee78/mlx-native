@@ -850,7 +850,7 @@ kernel void kernel_mul_mv_q4_K_f32(
         device const float * y2 = y1 + 128;
         float yl[16], yh[16];
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (int l = 0; l < n; ++l) {
+        for (int l = 0; l < 8; ++l) {
             yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
             yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
             yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
@@ -931,15 +931,15 @@ kernel void kernel_mul_mv_q5_K_f32(
     const uint16_t kmask2 = 0x0f0f;
     const uint16_t kmask3 = 0xc0c0;
 
-    const int tid = tiisg / 4;
-    const int ix  = tiisg % 4;
-    const int iq  = tid / 4;
-    const int ir  = tid % 4;
-    const int n   = 8;
+    // ADR-028 iter-403: short indexing matches peer Q5_K mv (ggml-metal.metal:7873-7880).
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
 
-    const int l0       = n * ir;
-    const int q_offset = 32 * iq + l0;
-    const int y_offset = 64 * iq + l0;
+    const short l0       = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
 
     const uint8_t hm1 = 1u << (2 * iq);
     const uint8_t hm2 = hm1 << 1;
@@ -961,7 +961,7 @@ kernel void kernel_mul_mv_q5_K_f32(
         device const float * y2 = y1 + 128;
         float yl[16], yh[16];
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (int l = 0; l < n; ++l) {
+        for (int l = 0; l < 8; ++l) {
             yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
             yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
             yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
@@ -975,7 +975,7 @@ kernel void kernel_mul_mv_q5_K_f32(
 
         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
         float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-        for (int l = 0; l < n; ++l) {
+        for (int l = 0; l < 8; ++l) {
             uint8_t h = qh[l];
             acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
             acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
