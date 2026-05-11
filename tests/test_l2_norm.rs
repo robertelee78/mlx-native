@@ -424,3 +424,378 @@ fn test_l2_norm_rejects_mismatched_dtype() {
     );
     assert!(res.is_err(), "dtype mismatch should error");
 }
+
+// =====================================================================
+// ADR-015 iter59a — fused L2 norm + scalar multiply (l2_norm_scale_f32)
+// =====================================================================
+
+fn alloc_scale_params(device: &MlxDevice, eps: f32, dim: u32, scale: f32) -> mlx_native::MlxBuffer {
+    let mut buf = device
+        .alloc_buffer(3 * 4, DType::F32, vec![3])
+        .expect("alloc scale params");
+    {
+        let s = buf.as_mut_slice::<f32>().expect("mut scale params");
+        s[0] = eps;
+        s[1] = dim as f32;
+        s[2] = scale;
+    }
+    buf
+}
+
+/// Fused l2_norm + scale on the 3-4-5 triangle with scale=10:
+///   x = [3, 4]; sum_sq=25; inv = 1/5; output = [3*0.2*10, 4*0.2*10] = [6.0, 8.0].
+#[test]
+fn test_l2_norm_scale_f32_3_4_5_triangle() {
+    let (device, mut registry) = setup();
+    let eps = 0.0f32;
+    let dim = 2u32;
+    let rows = 1u32;
+    let scale = 10.0f32;
+
+    let input_data = [3.0f32, 4.0f32];
+    let mut input = device
+        .alloc_buffer(8, DType::F32, vec![dim as usize])
+        .expect("alloc input");
+    input
+        .as_mut_slice::<f32>()
+        .expect("mut input")
+        .copy_from_slice(&input_data);
+    let output = device
+        .alloc_buffer(8, DType::F32, vec![dim as usize])
+        .expect("alloc output");
+    let params = alloc_scale_params(&device, eps, dim, scale);
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    mlx_native::ops::l2_norm::dispatch_l2_norm_scale_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input,
+        &output,
+        &params,
+        rows,
+        dim,
+    )
+    .expect("dispatch");
+    encoder.commit_and_wait().expect("commit");
+
+    let got: &[f32] = output.as_slice().expect("read");
+    let expected = [6.0f32, 8.0f32];
+    for i in 0..2 {
+        let diff = (got[i] - expected[i]).abs();
+        assert!(
+            diff < 1e-5,
+            "fused 3-4-5 mismatch at {}: got {}, expected {}, diff {}",
+            i, got[i], expected[i], diff
+        );
+    }
+}
+
+/// Cross-check: fused l2_norm_scale_f32 must match the unfused
+/// (l2_norm_f32 + scalar_mul_f32) sequence to <= 1e-5 max-abs.
+#[test]
+fn test_l2_norm_scale_f32_parity_vs_unfused() {
+    let (device, mut registry) = setup();
+    let eps = 1e-6f32;
+    let dim = 128u32;
+    let rows = 32u32;
+    let scale = 0.123456f32; // arbitrary non-trivial scalar
+    let n = (rows * dim) as usize;
+
+    let mut input_data = vec![0.0f32; n];
+    let mut seed: u32 = 0xCAFEBABE;
+    for v in input_data.iter_mut() {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        *v = (seed as i32 as f32) / (i32::MAX as f32);
+    }
+
+    let mut input = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("input");
+    input
+        .as_mut_slice::<f32>()
+        .expect("mut")
+        .copy_from_slice(&input_data);
+
+    // Fused output.
+    let fused_out = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("fused out");
+    let fused_params = alloc_scale_params(&device, eps, dim, scale);
+    {
+        let mut enc = device.command_encoder().expect("enc fused");
+        mlx_native::ops::l2_norm::dispatch_l2_norm_scale_f32(
+            &mut enc,
+            &mut registry,
+            device.metal_device(),
+            &input,
+            &fused_out,
+            &fused_params,
+            rows,
+            dim,
+        )
+        .expect("dispatch fused");
+        enc.commit_and_wait().expect("commit fused");
+    }
+
+    // Unfused: l2_norm_f32 -> scalar_mul_f32.
+    let unfused_l2 = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("unfused l2");
+    let unfused_out = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("unfused out");
+    let unfused_params = alloc_params(&device, eps, dim);
+    {
+        let mut enc = device.command_encoder().expect("enc unfused");
+        mlx_native::ops::l2_norm::dispatch_l2_norm(
+            &mut enc,
+            &mut registry,
+            device.metal_device(),
+            &input,
+            &unfused_l2,
+            &unfused_params,
+            rows,
+            dim,
+        )
+        .expect("dispatch l2 unfused");
+        enc.memory_barrier();
+        mlx_native::ops::elementwise::scalar_mul_f32(
+            &mut enc,
+            &mut registry,
+            device.metal_device(),
+            &unfused_l2,
+            &unfused_out,
+            n,
+            scale,
+        )
+        .expect("dispatch scalar_mul unfused");
+        enc.commit_and_wait().expect("commit unfused");
+    }
+
+    let got_fused: &[f32] = fused_out.as_slice().expect("read fused");
+    let got_unfused: &[f32] = unfused_out.as_slice().expect("read unfused");
+    // Bit-identity required: the fused kernel mirrors the unfused
+    // `(input * inv)` then `* scale` ordering by writing the intermediate
+    // to device memory between the two multiplies (with a device-memory
+    // barrier to prevent compiler FMA fusion).  This contract lets
+    // ADR-015 iter59a swap the kernel without perturbing greedy-T=0
+    // token cliffs in the GDN delta-rule recurrence (a 1-ulp drift in
+    // q_scaled was empirically observed to flip 3/16 prompts in the
+    // 32-tok smoke at near-tied logit cliffs).
+    let mut max_abs = 0.0f32;
+    let mut mismatches = 0usize;
+    for i in 0..n {
+        if got_fused[i].to_bits() != got_unfused[i].to_bits() {
+            mismatches += 1;
+            let diff = (got_fused[i] - got_unfused[i]).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "fused vs unfused bit-identity violated: {} mismatches, max_abs={}",
+        mismatches, max_abs
+    );
+}
+
+/// Multi-row fused: each row normalized + scaled independently.
+#[test]
+fn test_l2_norm_scale_f32_multirow() {
+    let (device, mut registry) = setup();
+    let eps = 0.0f32;
+    let dim = 4u32;
+    let rows = 3u32;
+    let scale = 2.5f32;
+    let n = (rows * dim) as usize;
+
+    // Row sums-of-squares: 1, 4, 0.25 -> invs: 1, 0.5, 2.
+    // Output rows scaled by 2.5:
+    //   row0: [2.5, 0, 0, 0]
+    //   row1: [1.25, 1.25, 1.25, 1.25]
+    //   row2: [1.5, 2.0, 0, 0]
+    let input_data: [f32; 12] = [
+        1.0, 0.0, 0.0, 0.0,
+        1.0, 1.0, 1.0, 1.0,
+        0.3, 0.4, 0.0, 0.0,
+    ];
+
+    let mut input = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("input");
+    input
+        .as_mut_slice::<f32>()
+        .expect("mut")
+        .copy_from_slice(&input_data);
+    let output = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("output");
+    let params = alloc_scale_params(&device, eps, dim, scale);
+
+    let mut encoder = device.command_encoder().expect("enc");
+    mlx_native::ops::l2_norm::dispatch_l2_norm_scale_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input,
+        &output,
+        &params,
+        rows,
+        dim,
+    )
+    .expect("dispatch");
+    encoder.commit_and_wait().expect("commit");
+
+    let got: &[f32] = output.as_slice().expect("read");
+    let expected: [f32; 12] = [
+        2.5, 0.0, 0.0, 0.0,
+        1.25, 1.25, 1.25, 1.25,
+        1.5, 2.0, 0.0, 0.0,
+    ];
+    for i in 0..12 {
+        let diff = (got[i] - expected[i]).abs();
+        assert!(
+            diff < 1e-5,
+            "fused multirow mismatch at {}: got {}, expected {}, diff {}",
+            i, got[i], expected[i], diff
+        );
+    }
+}
+
+/// Spec-driven: scale=1 must be bit-equivalent to plain l2_norm_f32.
+#[test]
+fn test_l2_norm_scale_f32_unit_scale_matches_plain() {
+    let (device, mut registry) = setup();
+    let eps = 1e-6f32;
+    let dim = 96u32;
+    let rows = 16u32;
+    let n = (rows * dim) as usize;
+
+    let mut input_data = vec![0.0f32; n];
+    let mut seed: u32 = 0xDEADBEEF;
+    for v in input_data.iter_mut() {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        *v = (seed as i32 as f32) / (i32::MAX as f32);
+    }
+
+    let mut input = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("input");
+    input
+        .as_mut_slice::<f32>()
+        .expect("mut")
+        .copy_from_slice(&input_data);
+
+    let plain_out = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("plain out");
+    let plain_params = alloc_params(&device, eps, dim);
+    {
+        let mut enc = device.command_encoder().expect("enc plain");
+        mlx_native::ops::l2_norm::dispatch_l2_norm(
+            &mut enc,
+            &mut registry,
+            device.metal_device(),
+            &input,
+            &plain_out,
+            &plain_params,
+            rows,
+            dim,
+        )
+        .expect("dispatch plain");
+        enc.commit_and_wait().expect("commit plain");
+    }
+
+    let scale_out = device
+        .alloc_buffer(n * 4, DType::F32, vec![rows as usize, dim as usize])
+        .expect("scale out");
+    let scale_params = alloc_scale_params(&device, eps, dim, 1.0);
+    {
+        let mut enc = device.command_encoder().expect("enc scale");
+        mlx_native::ops::l2_norm::dispatch_l2_norm_scale_f32(
+            &mut enc,
+            &mut registry,
+            device.metal_device(),
+            &input,
+            &scale_out,
+            &scale_params,
+            rows,
+            dim,
+        )
+        .expect("dispatch scale");
+        enc.commit_and_wait().expect("commit scale");
+    }
+
+    let plain: &[f32] = plain_out.as_slice().expect("read plain");
+    let scale: &[f32] = scale_out.as_slice().expect("read scale");
+    for i in 0..n {
+        let diff = (plain[i] - scale[i]).abs();
+        assert!(
+            diff < 1e-6,
+            "scale=1 vs plain mismatch at {}: plain={}, scale={}, diff {}",
+            i, plain[i], scale[i], diff
+        );
+    }
+}
+
+#[test]
+fn test_l2_norm_scale_f32_rejects_mismatched_dtype() {
+    use half::bf16;
+    let _ = bf16::from_f32(0.0);
+
+    let (device, mut registry) = setup();
+    let dim = 4u32;
+    let rows = 1u32;
+    let input = device
+        .alloc_buffer(16, DType::F32, vec![dim as usize])
+        .expect("input");
+    let output = device
+        .alloc_buffer(8, DType::BF16, vec![dim as usize])
+        .expect("output");
+    let params = alloc_scale_params(&device, 0.0, dim, 1.0);
+
+    let mut encoder = device.command_encoder().expect("enc");
+    let res = mlx_native::ops::l2_norm::dispatch_l2_norm_scale_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input,
+        &output,
+        &params,
+        rows,
+        dim,
+    );
+    assert!(res.is_err(), "dtype mismatch should error");
+}
+
+#[test]
+fn test_l2_norm_scale_f32_rejects_non_f32() {
+    use half::bf16;
+    let _ = bf16::from_f32(0.0);
+
+    let (device, mut registry) = setup();
+    let dim = 4u32;
+    let rows = 1u32;
+    let input = device
+        .alloc_buffer(8, DType::BF16, vec![dim as usize])
+        .expect("input");
+    let output = device
+        .alloc_buffer(8, DType::BF16, vec![dim as usize])
+        .expect("output");
+    let params = alloc_scale_params(&device, 0.0, dim, 1.0);
+
+    let mut encoder = device.command_encoder().expect("enc");
+    let res = mlx_native::ops::l2_norm::dispatch_l2_norm_scale_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input,
+        &output,
+        &params,
+        rows,
+        dim,
+    );
+    assert!(res.is_err(), "non-f32 dtype should error");
+}

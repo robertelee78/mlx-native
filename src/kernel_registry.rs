@@ -475,6 +475,8 @@ impl KernelRegistry {
         sources.insert("l2_norm_f32".into(), l2_norm_src);
         sources.insert("l2_norm_f16".into(), l2_norm_src);
         sources.insert("l2_norm_bf16".into(), l2_norm_src);
+        // ADR-015 iter59a — fused L2 norm + scalar multiply (DN q-path).
+        sources.insert("l2_norm_scale_f32".into(), l2_norm_src);
         // Cumulative-sum kernels (ADR-013 Decision 4 — DeltaNet decay-mask base)
         let cumsum_src: &'static str = include_str!("shaders/cumsum.metal");
         sources.insert("cumsum_f32".into(), cumsum_src);

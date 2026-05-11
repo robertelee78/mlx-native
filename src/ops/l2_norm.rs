@@ -39,6 +39,8 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("l2_norm_f32", L2_NORM_SHADER_SOURCE);
     registry.register_source("l2_norm_f16", L2_NORM_SHADER_SOURCE);
     registry.register_source("l2_norm_bf16", L2_NORM_SHADER_SOURCE);
+    // ADR-015 iter59a — fused L2 norm + scalar multiply.
+    registry.register_source("l2_norm_scale_f32", L2_NORM_SHADER_SOURCE);
 }
 
 /// Dispatch an L2 normalization operation on the GPU.
@@ -116,6 +118,100 @@ pub fn dispatch_l2_norm(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4; // sizeof(float) = 4
+
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, input), (1, output), (2, params_buf)],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Dispatch a fused L2 normalization + scalar multiply on the GPU.
+///
+/// Computes `output = (input / sqrt(sum(input^2) + eps)) * scale` over the
+/// last dimension, in a single kernel pass.
+///
+/// ADR-015 iter59a — fuses the post-conv1d Q-path's `dispatch_l2_norm` +
+/// `scalar_mul_f32` pair on Qwen3.5/3.6 DeltaNet into one dispatch,
+/// eliminating one dispatch per DN layer per prefill chunk and per decode
+/// token.  Bit-equivalent to the unfused sequence (same f32 accumulation,
+/// same `rsqrt`; the scalar is multiplied into `rsqrt(...)` once per row
+/// instead of into every element after the fact, which is associative-real
+/// equivalent).
+///
+/// # Arguments
+///
+/// * `encoder`    - Command encoder to record the dispatch into.
+/// * `registry`   - Kernel registry (must have `l2_norm_scale_f32` registered).
+/// * `device`     - Metal device for pipeline compilation.
+/// * `input`      - Input buffer of shape `[rows, dim]` (f32).
+/// * `output`     - Output buffer (f32, same shape as input).
+/// * `params_buf` - Params buffer holding `[eps, dim as f32, scale]` (3 × f32).
+/// * `rows`       - Number of rows to normalize.
+/// * `dim`        - Dimension of the last axis.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if:
+/// - `rows == 0` or `dim == 0`.
+/// - `input.element_count() != rows * dim`.
+/// - `output.element_count() != rows * dim`.
+/// - Input and output dtypes differ or are not f32.
+pub fn dispatch_l2_norm_scale_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "L2 norm scale rows and dim must be > 0".into(),
+        ));
+    }
+
+    let expected = (rows as usize) * (dim as usize);
+    if input.element_count() != expected {
+        return Err(MlxError::InvalidArgument(format!(
+            "L2 norm scale input element count {} != rows({}) * dim({})",
+            input.element_count(),
+            rows,
+            dim
+        )));
+    }
+    if output.element_count() != expected {
+        return Err(MlxError::InvalidArgument(format!(
+            "L2 norm scale output element count {} != rows({}) * dim({})",
+            output.element_count(),
+            rows,
+            dim
+        )));
+    }
+    if input.dtype() != output.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "L2 norm scale input/output dtype mismatch: {} vs {}",
+            input.dtype(),
+            output.dtype()
+        )));
+    }
+    if input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "L2 norm scale only supports f32 (got {})",
+            input.dtype()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("l2_norm_scale_f32", device)?;
 
     let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
     let shared_mem_bytes = tg_size * 4; // sizeof(float) = 4
