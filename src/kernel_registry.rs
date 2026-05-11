@@ -968,6 +968,15 @@ impl KernelRegistry {
             let descriptor = ComputePipelineDescriptor::new();
             descriptor.set_compute_function(Some(&function));
             descriptor.set_label(name);
+            // ADR-028 iter-376: threadGroupSizeIsMultipleOfThreadExecutionWidth
+            // hint allows the Metal compiler to skip bounds checks and use more
+            // aggressive codegen.  Opt-in via HF2Q_PIPELINE_TG_MULT_HINT=1.
+            // SAFETY: every dispatched threadgroup MUST be a multiple of 32 at
+            // runtime — Apple specifies undefined behavior otherwise.  Our hot
+            // kernels use tg_size ∈ {32, 64, 256, 1024} (all multiples of 32).
+            if std::env::var("HF2Q_PIPELINE_TG_MULT_HINT").ok().as_deref() == Some("1") {
+                descriptor.set_thread_group_size_is_multiple_of_thread_execution_width(true);
+            }
 
             let pipeline = device
                 .new_compute_pipeline_state(&descriptor)
@@ -1090,6 +1099,10 @@ impl KernelRegistry {
             let descriptor = ComputePipelineDescriptor::new();
             descriptor.set_compute_function(Some(&function));
             descriptor.set_label(&cache_key);
+            // ADR-028 iter-376: same hint as primary pipeline path.
+            if std::env::var("HF2Q_PIPELINE_TG_MULT_HINT").ok().as_deref() == Some("1") {
+                descriptor.set_thread_group_size_is_multiple_of_thread_execution_width(true);
+            }
 
             let pipeline = device
                 .new_compute_pipeline_state(&descriptor)
