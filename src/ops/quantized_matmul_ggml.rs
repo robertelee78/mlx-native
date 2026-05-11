@@ -314,9 +314,13 @@ pub fn quantized_matmul_ggml(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    // ADR-028 iter-384: output: &MlxBuffer (was &mut).  Encoders never mutate
+    // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
+    // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
+    // for the multi-thread encoding port (peer's n_cb=2 pattern).
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
 
@@ -471,7 +475,7 @@ fn dispatch_mv(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer, // ADR-028 iter-384: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     // ADR-028 iter-309 — nr0=2 variant for q6_K mat-vec.  Peer pattern:
@@ -584,7 +588,7 @@ fn dispatch_mm(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer, // ADR-028 iter-384: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
