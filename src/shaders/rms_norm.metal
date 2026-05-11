@@ -961,3 +961,113 @@ kernel void fused_post_ff_norm2_endlayer_f32(
         hidden[base + i] = h * s;
     }
 }
+
+// ---------------------------------------------------------------------------
+// fused_post_ff_norm2_endlayer_f32_v2 (ADR-028 iter-362) — float4 + simd_sum
+// rewrite of fused_post_ff_norm2_endlayer_f32 above.
+//
+// Same math, same buffer layout, same FusedPostFFNorm2EndlayerParams.  Only
+// the reductions change: scalar tree reduction → simd_sum + per-simdgroup
+// partial sum staging (mirrors rms_norm_f32_v2 structural pattern).
+//
+// Why this matters: original kernel does TWO tree reductions per dispatch,
+// each with `log2(tg_size)` barriers (8 barriers at tg=256 → 16 barriers per
+// dispatch).  V2 does 2 simd_sum reductions, each with 1 threadgroup_barrier
+// for cross-SG broadcast (4 barriers per dispatch, 75% reduction).
+//
+// Dispatcher must guard `dim % 4 == 0`; gemma4 hidden=3584 (=896 × 4) ✓.
+// At dim=3584 with tg=256 = 8 SGs, each SG processes 896/8 = 112 float4s.
+// ---------------------------------------------------------------------------
+kernel void fused_post_ff_norm2_endlayer_f32_v2(
+    device const float4* attn_out      [[buffer(0)]],
+    device const float4* moe_accum     [[buffer(1)]],
+    device const float4* residual      [[buffer(2)]],
+    device const float4* w2            [[buffer(3)]],
+    device const float4* w3            [[buffer(4)]],
+    device const float*  layer_scalar  [[buffer(5)]],
+    device float4*       mlp_down      [[buffer(6)]],
+    device float4*       hidden        [[buffer(7)]],
+    constant FusedPostFFNorm2EndlayerParams& params [[buffer(8)]],
+    uint row_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const float eps  = params.eps;
+    const uint  dim  = params.dim;
+    const uint  dim4 = dim / 4u;
+    const bool  scalar_is_vec = (params.scalar_is_vector != 0u);
+    const uint  base4 = row_id * dim4;
+
+    // --- Phase 1: sum of squares over moe_accum (FIRST RMS norm) ---
+    float sumf_moe = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 v = moe_accum[base4 + i];
+        sumf_moe += dot(v, v);
+    }
+    sumf_moe = simd_sum(sumf_moe);
+    if (tiisg == 0) {
+        shared[sgitg] = sumf_moe;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv_moe = rsqrt(shared[0] / float(dim) + eps);
+
+    // --- Phase 2: write mlp_down + accumulate sum(mlp_down^2) for SECOND RMS ---
+    float sumf_mlp = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 m = moe_accum[base4 + i];
+        const float4 a = attn_out[base4 + i];
+        const float4 v = a + (m * rms_inv_moe) * w2[i];
+        mlp_down[base4 + i] = v;
+        sumf_mlp += dot(v, v);
+    }
+    sumf_mlp = simd_sum(sumf_mlp);
+    if (tiisg == 0) {
+        shared[sgitg] = sumf_mlp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv_mlp = rsqrt(shared[0] / float(dim) + eps);
+
+    // --- Phase 3: hidden[i] = (residual + mlp_down * rms_inv_mlp * w3[i]) * scalar ---
+    if (scalar_is_vec) {
+        // layer_scalar is a per-channel vector — read as float4 to vectorize.
+        device const float4* layer_scalar4 = (device const float4*)layer_scalar;
+        for (uint i = tid; i < dim4; i += tg_size) {
+            const float4 m = mlp_down[base4 + i];
+            const float4 r = residual[base4 + i];
+            const float4 vn = m * rms_inv_mlp;
+            const float4 h = r + vn * w3[i];
+            hidden[base4 + i] = h * layer_scalar4[i];
+        }
+    } else {
+        const float s = layer_scalar[0];
+        for (uint i = tid; i < dim4; i += tg_size) {
+            const float4 m = mlp_down[base4 + i];
+            const float4 r = residual[base4 + i];
+            const float4 vn = m * rms_inv_mlp;
+            const float4 h = r + vn * w3[i];
+            hidden[base4 + i] = h * s;
+        }
+    }
+}

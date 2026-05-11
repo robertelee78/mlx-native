@@ -494,10 +494,31 @@ pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
         )));
     }
 
-    let pipeline = registry.get_pipeline("fused_post_ff_norm2_endlayer_f32", device)?;
+    // ADR-028 iter-362: V2 path (float4 + simd_sum) — same math, 75% fewer
+    // barriers per dispatch (4 vs 16 at tg=256).  Requires `dim % 4 == 0`
+    // (gemma4 hidden=3584 ✓).  Default-ON since parity-tested byte-identical
+    // (max_abs=0, max_rel=0 at gemma4 hidden_dim across both scalar_is_vector
+    // modes — see test_fused_post_ff_norm2_endlayer_v2_parity.rs) AND
+    // measured +1.5% on gemma4 hybrid decode (74.9 → 76.0) + +0.7-1.0% on
+    // legacy decode (73.7 → 74.2).  Opt-out via
+    // `HF2Q_FUSED_POST_FF_NORM2_V2=0` / `=false` / `=off`.
+    let use_v2 = (dim % 4 == 0) && env_default_true("HF2Q_FUSED_POST_FF_NORM2_V2");
+    let kernel_name = if use_v2 {
+        "fused_post_ff_norm2_endlayer_f32_v2"
+    } else {
+        "fused_post_ff_norm2_endlayer_f32"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let tg_size = std::cmp::min(256u32, dim.next_power_of_two()) as u64;
-    let shared_mem_bytes = tg_size * 4;
+    // V2 needs only one float per simdgroup for cross-SG reduction
+    // (≤ 32 SGs at tg ≤ 1024 → ≤ 128 bytes).  V1 uses tg_size floats for
+    // the tree reduction.
+    let shared_mem_bytes = if use_v2 {
+        (tg_size / 32).max(1) * 4
+    } else {
+        tg_size * 4
+    };
 
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

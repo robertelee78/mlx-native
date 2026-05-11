@@ -455,6 +455,9 @@ impl KernelRegistry {
         // ADR-028 iter-217: fused post-FF norm 2 + end-of-layer FINAL
         // (combines 2 sequential fused_norm_add dispatches into 1 kernel).
         sources.insert("fused_post_ff_norm2_endlayer_f32".into(), rms_norm_src);
+        // ADR-028 iter-362: V2 (float4 + simd_sum) variant of the above.
+        // Same math, 75% fewer barriers per dispatch (4 vs 16 at tg=256).
+        sources.insert("fused_post_ff_norm2_endlayer_f32_v2".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_f32_dual_perm".into(), rms_norm_src);
         // Fused RMS norm + elementwise multiply kernels (Phase 4e.2)
         sources.insert("rms_norm_mul_f32".into(), rms_norm_src);
