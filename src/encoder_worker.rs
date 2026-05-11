@@ -195,4 +195,89 @@ mod tests {
         worker.shutdown();
         assert!(worker.submit(|| {}).is_err());
     }
+
+    // ---------------------------------------------------------------------
+    // Metal-dispatch integration tests (ADR-028 iter-381)
+    // ---------------------------------------------------------------------
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn worker_can_create_metal_encoder_and_commit() {
+        // Validates: MlxDevice can be cloned + Arc'd + sent to worker thread,
+        // CommandEncoder can be created from worker thread, commit_and_wait
+        // works from worker thread.
+        let device = crate::MlxDevice::new().expect("MlxDevice");
+        let device_arc = Arc::new(device);
+        let worker = EncoderWorker::spawn();
+
+        let device_clone = Arc::clone(&device_arc);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        worker.submit(move || {
+            let result = (|| -> Result<(), String> {
+                let mut enc = device_clone.command_encoder()
+                    .map_err(|e| format!("enc create: {e}"))?;
+                enc.commit_and_wait()
+                    .map_err(|e| format!("commit_and_wait: {e}"))?;
+                Ok(())
+            })();
+            done_tx.send(result).ok();
+        }).expect("submit");
+
+        let result = done_rx.recv().expect("worker died");
+        assert!(result.is_ok(), "worker Metal encoder failed: {:?}", result);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn worker_can_dispatch_real_kernel_zero_buffer() {
+        // Validates: worker thread can register a kernel, allocate a buffer,
+        // dispatch a real Metal compute kernel, commit + wait, and the host
+        // sees the GPU-modified buffer contents after worker completion.
+        use crate::DType;
+        use crate::ops::moe_dispatch::moe_zero_buffer_encode;
+
+        let device = crate::MlxDevice::new().expect("MlxDevice");
+        let device_arc = Arc::new(device);
+        let worker = EncoderWorker::spawn();
+
+        // Allocate a buffer initialized to 1.0; worker should zero it via GPU.
+        const N: usize = 1024;
+        let mut buf = device_arc
+            .alloc_buffer(N * 4, DType::F32, vec![N])
+            .expect("alloc");
+        for v in buf.as_mut_slice::<f32>().expect("init slice").iter_mut() {
+            *v = 1.0;
+        }
+
+        // Wrap buffer in Arc<Mutex> so worker can mutate via &mut.
+        let buf_arc = Arc::new(std::sync::Mutex::new(buf));
+        let device_clone = Arc::clone(&device_arc);
+        let buf_clone = Arc::clone(&buf_arc);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        worker.submit(move || {
+            let result = (|| -> Result<(), String> {
+                let mut registry = crate::KernelRegistry::new();
+                let mut enc = device_clone.command_encoder()
+                    .map_err(|e| format!("enc: {e}"))?;
+                let buf_guard = buf_clone.lock().expect("lock");
+                moe_zero_buffer_encode(
+                    &mut enc, &mut registry, device_clone.metal_device(),
+                    &buf_guard, N,
+                ).map_err(|e| format!("zero_buffer: {e}"))?;
+                drop(buf_guard); // release before commit so commit doesn't deadlock on a re-lock
+                enc.commit_and_wait().map_err(|e| format!("commit: {e}"))?;
+                Ok(())
+            })();
+            done_tx.send(result).ok();
+        }).expect("submit");
+
+        done_rx.recv().expect("worker died").expect("worker error");
+
+        let buf_guard = buf_arc.lock().expect("lock");
+        let slice = buf_guard.as_slice::<f32>().expect("read");
+        for (i, &v) in slice.iter().enumerate() {
+            assert_eq!(v, 0.0, "element {i} not zeroed: {v}");
+        }
+    }
 }
