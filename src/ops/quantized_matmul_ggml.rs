@@ -201,6 +201,15 @@ static TENSOR_MM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new
 
 fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     *TENSOR_MM_AVAILABLE.get_or_init(|| {
+        // ADR-029 iter-21 H28 probe: HF2Q_DISABLE_TENSOR_MM=1 forces the
+        // simdgroup-MMA fallback so we can A/B test whether the tensor
+        // variant is the source of the 2× prefill gap vs peer.
+        if std::env::var("HF2Q_DISABLE_TENSOR_MM").as_deref() == Ok("1") {
+            if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+                eprintln!("[mlx-native] tensor_mm probe: DISABLED via HF2Q_DISABLE_TENSOR_MM=1");
+            }
+            return false;
+        }
         // Attempt to compile one tensor-mm pipeline; success means the
         // Metal runtime has `<metal_tensor>` +
         // `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>`
