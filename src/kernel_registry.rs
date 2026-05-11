@@ -834,6 +834,11 @@ impl KernelRegistry {
         // ADR-028 iter-148: fused K+V single-position HB encoder
         sources.insert("hadamard_quantize_kv_hb_dual_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_hb_dual_d512".into(), hq_fast_src);
+        // ADR-028 Phase 10e.5 (iter-351): no-FWHT V quantize for hybrid path.
+        // Same byte-packed Lloyd-Max codebook output, but skips the Hadamard
+        // rotation so dequant in SDPA recovers raw V (no FWHT-undo needed).
+        sources.insert("kv_quantize_v_no_fwht_d256".into(), hq_fast_src);
+        sources.insert("kv_quantize_v_no_fwht_d512".into(), hq_fast_src);
 
         // iter-20 Leg F: TQ KV dequantize kernel (nibbles+norms → F32)
         let tq_dq_src: &'static str = include_str!("shaders/tq_dequantize_kv.metal");

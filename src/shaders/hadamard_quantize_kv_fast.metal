@@ -690,6 +690,169 @@ kernel void hadamard_quantize_kv_hb<512>(
     device const float *, device uint8_t *, device float *,
     constant HadamardQuantizeHbParams &, uint, uint);
 
+// ============================================================================
+// ADR-028 Phase 10e.5 (iter-351): no-FWHT V quantize kernel for the hybrid path.
+//
+// Same byte-packed Lloyd-Max quantization as `hadamard_quantize_kv_hb` BUT:
+//   * NO D1 sign pre-multiply
+//   * NO FWHT
+//   * NO 1/sqrt(d) post-FWHT normalize
+//   * Norm = RMS(raw) computed directly: `sqrt(simd_sum(raw²) / D)`
+//
+// Result: dequant in SDPA recovers raw V values (not FWHT-rotated).  Combined
+// with hybrid F16-K (raw), the entire FWHT chain in attention can be eliminated
+// (saves 60 dispatches/decode-token at gemma4 30L: 30 FWHT-pre on Q + 30
+// FWHT-undo on output).
+//
+// Parity hypothesis: V coming into this kernel is already RMS-normalized via
+// the layer's pre-attention `dispatch_rms_norm_unit_perhead` → distribution is
+// approximately N(0, 1) per head per position. The Lloyd-Max codebook (designed
+// for N(0,1)) should achieve quantization NRMSE comparable to the FWHT path
+// (~8e-3 at 8-bit), provided V is well-conditioned.  Falsifier: parity test in
+// /opt/mlx-native/tests/test_kv_quantize_v_no_fwht.rs measures NRMSE vs raw V;
+// if > 5e-2 at 8-bit, hypothesis is FALSIFIED and we must keep FWHT-undo path.
+//
+// Kernel is V-only (no K variant) because the hybrid path stores K as F16 dense
+// — only V needs quantization.  Same byte-packed buffer layout + same norm
+// storage layout as `hadamard_quantize_kv_hb` so the dequant side of the SDPA
+// kernel doesn't need ANY changes.
+// ============================================================================
+template<ushort HEAD_DIM>
+kernel void kv_quantize_v_no_fwht(
+    device const float                    *src    [[buffer(0)]],
+    device       uint8_t                  *packed [[buffer(1)]],
+    device       float                    *norms  [[buffer(2)]],
+    constant HadamardQuantizeHbParams     &params [[buffer(3)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    constexpr ushort EPT = HEAD_DIM / 32;
+    const uint head_idx = tgid;
+    const uint lane = tiisg;
+
+    if (head_idx >= params.num_kv_heads) return;
+
+    // 1. Load raw elements.
+    const uint src_base = head_idx * HEAD_DIM + lane * EPT;
+    float elems[EPT];
+    for (ushort i = 0; i < EPT; i++) elems[i] = src[src_base + i];
+
+    // 2. Compute L2 norm directly from raw elements (no FWHT, no /sqrt(d)).
+    //
+    //    Math contract with the SDPA dequant formula
+    //    `recovered = centroid * (norm0 * 1/sqrt(d))`:
+    //
+    //    FWHT path uses `sqrt(simd_sum)` AFTER `/sqrt(d)` normalize → norm0 = 1
+    //    for RMS-1 input → dequant scale = 1/sqrt(d) → recovers post-FWHT elem
+    //    of magnitude 1/sqrt(d).
+    //
+    //    No-FWHT path uses `sqrt(simd_sum)` WITHOUT `/sqrt(d)` → norm0 = sqrt(d)
+    //    for RMS-1 input → dequant scale = sqrt(d)/sqrt(d) = 1 → recovers raw
+    //    elem of magnitude 1.  Same dequant formula in both paths ✓.
+    //
+    //    For D=512: per-block — block 0 = lanes 0..15, block 1 = lanes 16..31.
+    float local_sq_sum = 0.0f;
+    for (ushort i = 0; i < EPT; i++) local_sq_sum += elems[i] * elems[i];
+
+    float norm0, norm1;
+    if (HEAD_DIM == 256) {
+        norm0 = sqrt(simd_sum(local_sq_sum));
+        norm1 = 0.0f;
+    } else {
+        // D=512: split into two 256-element blocks (lanes 0..15 = blk0, lanes 16..31 = blk1).
+        float blk0_sq = (lane < 16u) ? simd_sum(local_sq_sum) : 0.0f;
+        float blk1_sq = (lane >= 16u) ? simd_sum(local_sq_sum) : 0.0f;
+        blk0_sq = simd_broadcast(blk0_sq, 0u);
+        blk1_sq = simd_broadcast(blk1_sq, 16u);
+        norm0 = sqrt(blk0_sq / 256.0f);
+        norm1 = sqrt(blk1_sq / 256.0f);
+    }
+
+    // 3. Scale raw elements to N(0,1) range for quantization.
+    //    Same formula as FWHT path step 5 — only the input differs (raw vs rotated).
+    //    quant_value = raw * (sqrt(d) / norm) → unit-variance if raw ~ N(0, norm²/d).
+    if (HEAD_DIM == 256) {
+        float inv_norm = (norm0 > 1.0e-10f) ? (1.0f / norm0) : 0.0f;
+        float scale = inv_norm * sqrt(float(HEAD_DIM));
+        for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+    } else {
+        float blk_norm = (lane < 16u) ? norm0 : norm1;
+        float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
+        float scale = inv_blk_norm * params.scale_factor_d512;
+        for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+    }
+
+    // 4. Quantize via Lloyd-Max codebook (5/6/8-bit).
+    //    Identical binary-search logic to `hadamard_quantize_kv_hb` step 6.
+    const uint cbits = params.codebook_bits;
+    uint8_t indices[EPT];
+    for (ushort i = 0; i < EPT; i++) {
+        float v = elems[i];
+        uint8_t idx;
+        if (cbits == 5u) {
+            idx = (v > BOUNDARIES_5BIT[15]) ? 16 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx + 7]) ? 8 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx + 3]) ? 4 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx + 1]) ? 2 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx]) ? 1 : 0;
+        } else if (cbits == 6u) {
+            idx = (v > BOUNDARIES_6BIT[31]) ? 32 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 15]) ? 16 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 7]) ? 8 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 3]) ? 4 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 1]) ? 2 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx]) ? 1 : 0;
+        } else {
+            // 8-bit
+            idx = (v > BOUNDARIES_8BIT[127]) ? 128 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 63]) ? 64 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 31]) ? 32 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 15]) ? 16 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 7])  ?  8 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 3])  ?  4 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 1])  ?  2 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx])      ?  1 : 0;
+        }
+        indices[i] = idx;
+    }
+
+    // 5. Write byte-packed output (1 byte/elem) — same layout as FWHT path.
+    uint actual_pos = (params.is_sliding != 0u)
+        ? (params.write_pos % params.cache_capacity)
+        : params.write_pos;
+    const uint packed_base = head_idx * params.cache_capacity * HEAD_DIM
+                           + actual_pos * HEAD_DIM;
+    const uint elem_base = packed_base + lane * EPT;
+    for (ushort i = 0; i < EPT; i++) {
+        packed[elem_base + i] = indices[i];
+    }
+
+    // 6. Store norm(s) — same layout as FWHT path so SDPA dequant is unchanged.
+    if (HEAD_DIM == 256) {
+        if (lane == 0) {
+            norms[head_idx * params.cache_capacity + actual_pos] = norm0;
+        }
+    } else {
+        if (lane == 0u) {
+            uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 0u] = norm0;
+        } else if (lane == 16u) {
+            uint norm_base = head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 1u] = norm1;
+        }
+    }
+}
+
+template [[host_name("kv_quantize_v_no_fwht_d256")]]
+kernel void kv_quantize_v_no_fwht<256>(
+    device const float *, device uint8_t *, device float *,
+    constant HadamardQuantizeHbParams &, uint, uint);
+
+template [[host_name("kv_quantize_v_no_fwht_d512")]]
+kernel void kv_quantize_v_no_fwht<512>(
+    device const float *, device uint8_t *, device float *,
+    constant HadamardQuantizeHbParams &, uint, uint);
+
 // ADR-028 iter-148: fused K+V dual single-position HB encoder.
 // Saves one kernel-launch floor (~14 µs/Apple GPU) per layer per
 // decode token. Grid Z-dim selects K (z=0) or V (z=1); each

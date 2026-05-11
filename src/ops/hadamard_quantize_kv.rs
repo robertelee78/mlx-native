@@ -503,6 +503,79 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     Ok(())
 }
 
+/// ADR-028 Phase 10e.5 (iter-351): no-FWHT V quantize for the hybrid path.
+///
+/// Same byte-packed Lloyd-Max output (5/6/8-bit) and same norm storage layout
+/// as `dispatch_hadamard_quantize_kv_hb`, but skips the Hadamard rotation so
+/// the SDPA dequant recovers raw V values (not FWHT-rotated).  Combined with
+/// hybrid F16-K, this lets the SDPA dispatcher in hf2q drop BOTH the
+/// `fwht_sign_premult` (Q) and `fwht_sign_undo` (output) dispatches per layer
+/// — saves 60 dispatches/decode-token at gemma4 30L on top of the K-side
+/// codebook elimination.
+///
+/// V-only by design — the hybrid path stores K as F16 dense, only V needs
+/// quantization.  K-side encoder is `kv_cache_copy_batch_f32_to_f16` (already
+/// in mlx-native).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_quantize_v_no_fwht(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,      // byte-packed: [nkv, capacity, head_dim] u8
+    norms: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,      // 5, 6, or 8
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_kv_quantize_v_no_fwht: codebook_bits must be 5, 6, or 8, got {}",
+            codebook_bits)));
+    }
+
+    let kernel_name = match head_dim {
+        256 => "kv_quantize_v_no_fwht_d256",
+        512 => "kv_quantize_v_no_fwht_d512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "kv_quantize_v_no_fwht: head_dim {} not supported (need 256 or 512)", head_dim))),
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos,
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512,
+        codebook_bits,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src)),
+            (1, KA::Buffer(packed)),
+            (2, KA::Buffer(norms)),
+            (3, KA::Bytes(params_bytes)),
+        ],
+        MTLSize::new(num_kv_heads as u64, 1, 1),
+        MTLSize::new(32, 1, 1), // 1 simdgroup (32 threads)
+    );
+
+    Ok(())
+}
+
 /// ADR-028 iter-148: fused K+V single-position Hadamard-quantize KV HB encoder.
 ///
 /// Combines two `dispatch_hadamard_quantize_kv_hb` calls (one for K, one for V)
@@ -618,6 +691,107 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
 /// (mirrors the 4-bit `_seq` rationale). Promote to a 2-D dispatch
 /// shader if measured to be the bottleneck.
 #[allow(clippy::too_many_arguments)]
+/// ADR-028 Phase 10e.5 (iter-351): no-FWHT V seq variant for batched prefill.
+///
+/// Dispatches `kv_quantize_v_no_fwht_d{256,512}` once per token in `[write_pos_start
+/// .. write_pos_start+n_tokens)` from `src + src_tok_offset` rows.  Mirrors
+/// `dispatch_hadamard_quantize_kv_hb_seq` exactly except the underlying kernel
+/// is the no-FWHT variant.
+///
+/// Required so the batched-prefill V-encode and decode V-encode produce
+/// CONSISTENT byte layout — without this, prefill stores FWHT-rotated V and
+/// decode stores raw V, the SDPA dequant reads mixed-domain bytes, and output
+/// is garbage.  Phase 10c established the V-encode site routing; Phase 10e.5
+/// makes both sides use the no-FWHT path.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_quantize_v_no_fwht_seq(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,
+    norms: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    if n_tokens == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_kv_quantize_v_no_fwht_seq: codebook_bits must be \
+             5, 6, or 8, got {}",
+            codebook_bits
+        )));
+    }
+    let kernel_name = match head_dim {
+        256 => "kv_quantize_v_no_fwht_d256",
+        512 => "kv_quantize_v_no_fwht_d512",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "kv_quantize_v_no_fwht_seq: head_dim {} not supported \
+                 (need 256 or 512)",
+                head_dim
+            )))
+        }
+    };
+
+    let required_src = (src_tok_offset as u64 + n_tokens as u64)
+        * (num_kv_heads as u64)
+        * (head_dim as u64);
+    if (src.element_count() as u64) < required_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_quantize_v_no_fwht_seq: src has {} elements but need {} \
+             (src_tok_offset={} + n_tokens={} * num_kv_heads={} * head_dim={})",
+            src.element_count(), required_src,
+            src_tok_offset, n_tokens, num_kv_heads, head_dim,
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let bytes_per_token = (num_kv_heads as u64) * (head_dim as u64) * 4;
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    for i in 0..n_tokens {
+        let write_pos = write_pos_start + i;
+        if !is_sliding && write_pos >= cache_capacity {
+            return Err(MlxError::InvalidArgument(format!(
+                "kv_quantize_v_no_fwht_seq: global cache write_pos({}) >= \
+                 cache_capacity({}) at seq idx {}",
+                write_pos, cache_capacity, i
+            )));
+        }
+        let params = HadamardQuantizeHbParams {
+            head_dim, num_kv_heads, write_pos, cache_capacity,
+            is_sliding: if is_sliding { 1 } else { 0 },
+            scale_factor_d512, codebook_bits,
+        };
+        let params_bytes = bytemuck::bytes_of(&params);
+        let src_offset = ((src_tok_offset + i) as u64) * bytes_per_token;
+
+        encode_threadgroups_with_args(
+            encoder, pipeline,
+            &[
+                (0, KA::BufferWithOffset(src, src_offset)),
+                (1, KA::Buffer(packed)),
+                (2, KA::Buffer(norms)),
+                (3, KA::Bytes(params_bytes)),
+            ],
+            MTLSize::new(num_kv_heads as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
+    }
+
+    Ok(())
+}
+
 pub fn dispatch_hadamard_quantize_kv_hb_seq(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
