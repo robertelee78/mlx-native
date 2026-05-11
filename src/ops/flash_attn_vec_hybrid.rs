@@ -201,12 +201,20 @@ pub fn flash_attn_vec_hybrid(
     // V codebook function constant (same as TQ-HB at index 50). Hybrid path's
     // K-side ignores this; only the V dequant inner loop honors it.
     let cbits_const = (params.codebook_bits as i32, 50usize);
+    // ADR-029 iter-20 H27: V-dtype function constant (slot 51).  When V buffer
+    // is F16-typed (caller has allocated full F16 KV cache via HF2Q_FULL_F16_KV),
+    // the kernel takes the F16-V direct-read branch.  When U8-typed (legacy
+    // TQ-HB byte-packed V), the kernel takes the dequant_hb_float4 branch.
+    let v_is_f16: i32 = match v_packed.dtype() {
+        crate::DType::F16 => 1,
+        _ => 0,
+    };
     let pipeline = registry
         .get_pipeline_with_constants(
             kernel_name,
             device.metal_device(),
             &[],
-            &[(cbits_const.1, cbits_const.0)],
+            &[(cbits_const.1, cbits_const.0), (51usize, v_is_f16)],
         )?;
 
     let pk = pad2(head_dim as usize, 128);

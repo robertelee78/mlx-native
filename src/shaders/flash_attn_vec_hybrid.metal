@@ -218,6 +218,17 @@ constant int CBITS_FC [[function_constant(50)]];
 // Provide a fallback via is_function_constant_defined().
 constant int cbits_effective = is_function_constant_defined(CBITS_FC) ? CBITS_FC : 8;
 
+// ADR-029 iter-20 H27: V-side dtype switch.  When `V_IS_F16_FC` is set to 1,
+// the V buffer is allocated as F16 [nkv, capacity, head_dim] (2 bytes/elem)
+// and read via direct half4 load — no dequant, no V_norms.  Eliminates the
+// per-position TQ-HB V dequant cost that scales with kv_seq_len and dominates
+// long-context decode.  When unset (default 0), the legacy TQ-HB V-read path
+// runs unchanged.  The runtime caller passes V_packed but typed as either
+// uint8_t* (TQ-HB) or half* (F16); pointer cast in the kernel handles both.
+constant int V_IS_F16_FC [[function_constant(51)]];
+constant bool v_is_f16_effective =
+    is_function_constant_defined(V_IS_F16_FC) ? (V_IS_F16_FC != 0) : false;
+
 // Reconstruct float4 from 4 consecutive byte-packed elements.
 // coord_base must be a multiple of 4.
 //
@@ -601,7 +612,32 @@ kernel void flash_attn_vec_hybrid_impl(
                 uint kv_pos = ic + cc;
                 if (kv_pos >= kv_seq_len) continue;
 
-                if (is_d512) {
+                if (v_is_f16_effective) {
+                    // ADR-029 iter-20 H27: F16-V direct read.  Pointer cast
+                    // from V_packed (uint8_t*) to half*; row-stride arithmetic
+                    // is the same in elements (DV halfs per row), and Metal
+                    // handles the 2-byte alignment.  No V_norms needed.
+                    device const half *v_h = (device const half *)V_packed
+                        + (kv_head * kv_capacity + kv_pos) * DV;
+                    float w = ss[cc];
+                    if (is_d512) {
+                        // Block 0: coords 0..255  Block 1: coords 256..511
+                        for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                            uint coord = (uint)(tx + ii * NL) * 4u;
+                            half4 v0 = *((device const half4 *)(v_h + coord));
+                            lo[ii] += float4(v0) * w;
+                            uint coord1 = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
+                            half4 v1 = *((device const half4 *)(v_h + coord1));
+                            lo[DV4/2/NL + ii] += float4(v1) * w;
+                        }
+                    } else {
+                        device const half *v_base = v_h + tx * 4u;
+                        for (short ii = 0; ii < DV4 / NL; ++ii) {
+                            half4 v4 = *((device const half4 *)(v_base + ii * NL * 4u));
+                            lo[ii] += float4(v4) * w;
+                        }
+                    }
+                } else if (is_d512) {
                     device const float *vnorm = V_norms + (kv_head * kv_capacity + kv_pos) * 2u;
                     device const uint8_t *v_base =
                         V_packed + (kv_head * kv_capacity + kv_pos) * DV;
