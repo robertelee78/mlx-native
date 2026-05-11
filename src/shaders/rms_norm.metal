@@ -1071,3 +1071,147 @@ kernel void fused_post_ff_norm2_endlayer_f32_v2(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// fused_moe_wsum_post_ff_norm2_endlayer_f32_v2 (ADR-028 iter-367)
+//
+// Fuses moe_weighted_sum INTO the production-default Path A end-of-layer
+// kernel (fused_post_ff_norm2_endlayer_f32_v2 above).  Eliminates one dispatch
+// per layer (30 dispatches/decode-token on gemma4) and one full memory
+// round-trip on the moe_accum buffer.
+//
+// Replaces the dispatch chain:
+//   1. moe_weighted_sum: moe_down_id_out × routing_weights → moe_accum
+//   2. fused_post_ff_norm2_endlayer_v2: attn_out + moe_accum + residual + ...
+//                                       → mlp_down + hidden
+//
+// With a single dispatch that:
+//   Phase 1: per-thread float4 weighted_sum from experts + routing weights,
+//            stash in threadgroup `sum_buf`, accumulate dot(v,v) for first
+//            RMS, simd_sum + per-SG reduce → rms_inv_moe.
+//   Phase 2: read sum_buf (instead of moe_accum), write mlp_down, accumulate
+//            second RMS as before.
+//   Phase 3: hidden = (residual + mlp_down * rms_inv_mlp * w3) * scalar.
+//
+// Threadgroup memory: max(32, n_sg) + dim floats (~14.5 KB at gemma4 dim=3584).
+// Under 32 KB Apple budget.
+//
+// Dispatcher must guard `dim % 4 == 0`; gemma4 hidden=3584 (=896 × 4) ✓.
+// Parity tolerance: max_rel < 1e-4 (V2 simd_sum reduction order vs chain's
+//                   V2 reduction order — small f32 rounding deltas).
+// ---------------------------------------------------------------------------
+struct FusedMoeWsumPostFFNorm2EndlayerParams {
+    float eps;
+    uint  dim;
+    uint  top_k;
+    uint  scalar_is_vector;
+};
+
+kernel void fused_moe_wsum_post_ff_norm2_endlayer_f32_v2(
+    device const float4* expert_outputs   [[buffer(0)]],  // [top_k, dim/4] (per-row)
+    device const float*  routing_weights  [[buffer(1)]],  // [top_k]
+    device const float4* attn_out         [[buffer(2)]],  // [dim/4]
+    device const float4* residual         [[buffer(3)]],  // [dim/4]
+    device const float4* w2               [[buffer(4)]],  // [dim/4]
+    device const float4* w3               [[buffer(5)]],  // [dim/4]
+    device const float*  layer_scalar     [[buffer(6)]],  // [1] or [dim]
+    device float4*       mlp_down         [[buffer(7)]],  // [dim/4]
+    device float4*       hidden           [[buffer(8)]],  // [dim/4]
+    constant FusedMoeWsumPostFFNorm2EndlayerParams& params [[buffer(9)]],
+    uint row_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const float eps    = params.eps;
+    const uint  dim    = params.dim;
+    const uint  top_k  = params.top_k;
+    const uint  dim4   = dim / 4u;
+    const bool  scalar_is_vec = (params.scalar_is_vector != 0u);
+    const uint  base4_row = row_id * dim4;
+    const uint  base_eo4  = row_id * top_k * dim4;
+    const uint  base_w    = row_id * top_k;
+
+    // Threadgroup memory layout:
+    //   shared[0 .. max(32, n_sg))      = SG reduction scratch
+    //   shared[max(32, n_sg) .. +dim)   = sum_buf (per-element weighted_sum)
+    // Use max(32, n_sg) so simd_sum's sgitg-indexed write is never OOB even
+    // for partial-warp tg_sizes (mirrors fused_norm_add_f32_v2 pattern).
+    const uint n_sg = tg_size / 32u;
+    const uint sg_scratch_floats = max(32u, n_sg);
+    threadgroup float* sg_scratch = shared;
+    threadgroup float4* sum_buf4  = (threadgroup float4*)(shared + sg_scratch_floats);
+
+    // --- Phase 1: weighted_sum + sum-of-squares for FIRST RMS ---
+    float sumf_moe = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        float4 v = float4(0.0f);
+        for (uint k = 0; k < top_k; ++k) {
+            const float w = routing_weights[base_w + k];
+            v += expert_outputs[base_eo4 + k * dim4 + i] * w;
+        }
+        sum_buf4[i] = v;
+        sumf_moe += dot(v, v);
+    }
+    sumf_moe = simd_sum(sumf_moe);
+    if (tiisg == 0) {
+        sg_scratch[sgitg] = sumf_moe;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? sg_scratch[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            sg_scratch[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv_moe = rsqrt(sg_scratch[0] / float(dim) + eps);
+
+    // --- Phase 2: write mlp_down + sum-of-squares for SECOND RMS ---
+    float sumf_mlp = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 m = sum_buf4[i];
+        const float4 a = attn_out[base4_row + i];
+        const float4 v = a + (m * rms_inv_moe) * w2[i];
+        mlp_down[base4_row + i] = v;
+        sumf_mlp += dot(v, v);
+    }
+    sumf_mlp = simd_sum(sumf_mlp);
+    if (tiisg == 0) {
+        sg_scratch[sgitg] = sumf_mlp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? sg_scratch[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            sg_scratch[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv_mlp = rsqrt(sg_scratch[0] / float(dim) + eps);
+
+    // --- Phase 3: hidden = (residual + mlp_down * rms_inv_mlp * w3) * scalar ---
+    if (scalar_is_vec) {
+        device const float4* layer_scalar4 = (device const float4*)layer_scalar;
+        for (uint i = tid; i < dim4; i += tg_size) {
+            const float4 m = mlp_down[base4_row + i];
+            const float4 r = residual[base4_row + i];
+            const float4 vn = m * rms_inv_mlp;
+            const float4 h = r + vn * w3[i];
+            hidden[base4_row + i] = h * layer_scalar4[i];
+        }
+    } else {
+        const float s = layer_scalar[0];
+        for (uint i = tid; i < dim4; i += tg_size) {
+            const float4 m = mlp_down[base4_row + i];
+            const float4 r = residual[base4_row + i];
+            const float4 vn = m * rms_inv_mlp;
+            const float4 h = r + vn * w3[i];
+            hidden[base4_row + i] = h * s;
+        }
+    }
+}

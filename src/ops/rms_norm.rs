@@ -556,6 +556,154 @@ pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
     Ok(())
 }
 
+/// Dispatch the iter-367 fully-fused MoE-wsum + Path A end-of-layer kernel.
+///
+/// Replaces the dispatch chain:
+///   1. moe_weighted_sum: moe_down_id_out × routing_weights → moe_accum
+///   2. fused_post_ff_norm2_endlayer_v2: attn_out + moe_accum + residual + ...
+///                                       → mlp_down + hidden
+///
+/// With ONE dispatch using V2 (float4 + simd_sum) reduction pattern.
+/// Saves 1 dispatch/layer + 1 moe_accum global memory round-trip.
+///
+/// # Arguments
+/// * `expert_outputs`  - MoE down outputs, f32 [rows, top_k, dim].
+/// * `routing_weights` - Routing weights, f32 [rows, top_k].
+/// * `attn_out`        - Post-attention residual stream, f32 [rows, dim].
+/// * `residual`        - Pre-attention residual, f32 [rows, dim].
+/// * `w2`              - post_feedforward_layernorm_2 weight, f32 [dim].
+/// * `w3`              - post_feedforward_layernorm weight, f32 [dim].
+/// * `layer_scalar`    - Layer scaling, f32 [1] or [dim].
+/// * `mlp_down`        - Output: combined MLP+MoE post-norm, f32 [rows, dim].
+/// * `hidden`          - Output: final layer hidden, f32 [rows, dim].
+/// * `eps`             - RMS epsilon.
+/// * `rows`            - Number of rows.
+/// * `dim`             - Hidden size (must be % 4 == 0 for V2).
+/// * `top_k`           - MoE top-K.
+/// * `scalar_is_vector`- True iff layer_scalar is per-channel.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_fused_moe_wsum_post_ff_norm2_endlayer_f32_v2(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    expert_outputs:  &MlxBuffer,
+    routing_weights: &MlxBuffer,
+    attn_out:        &MlxBuffer,
+    residual:        &MlxBuffer,
+    w2:              &MlxBuffer,
+    w3:              &MlxBuffer,
+    layer_scalar:    &MlxBuffer,
+    mlp_down:        &MlxBuffer,
+    hidden:          &MlxBuffer,
+    eps:             f32,
+    rows:            u32,
+    dim:             u32,
+    top_k:           u32,
+    scalar_is_vector: bool,
+) -> Result<()> {
+    if rows == 0 || dim == 0 || top_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "fused_moe_wsum_post_ff_norm2_endlayer_v2: rows, dim, top_k must be > 0".into(),
+        ));
+    }
+    if dim % 4 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "fused_moe_wsum_post_ff_norm2_endlayer_v2: dim {} must be % 4 == 0", dim
+        )));
+    }
+    let row_elems = (rows as usize) * (dim as usize);
+    for (name, buf) in [
+        ("attn_out", attn_out),
+        ("residual", residual),
+        ("mlp_down", mlp_down),
+        ("hidden",   hidden),
+    ] {
+        if buf.element_count() < row_elems {
+            return Err(MlxError::InvalidArgument(format!(
+                "{}: size {} < rows({}) * dim({})", name, buf.element_count(), rows, dim
+            )));
+        }
+        if buf.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{}: must be f32, got {}", name, buf.dtype()
+            )));
+        }
+    }
+    let exp_required = (rows as usize) * (top_k as usize) * (dim as usize);
+    if expert_outputs.element_count() < exp_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "expert_outputs: size {} < rows({}) * top_k({}) * dim({})",
+            expert_outputs.element_count(), rows, top_k, dim
+        )));
+    }
+    let w_required = (rows as usize) * (top_k as usize);
+    if routing_weights.element_count() < w_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "routing_weights: size {} < rows({}) * top_k({})",
+            routing_weights.element_count(), rows, top_k
+        )));
+    }
+    for (name, buf) in [("w2", w2), ("w3", w3)] {
+        if buf.element_count() != dim as usize {
+            return Err(MlxError::InvalidArgument(format!(
+                "{}: size {} != dim({})", name, buf.element_count(), dim
+            )));
+        }
+    }
+    let expected_scalar = if scalar_is_vector { dim as usize } else { 1 };
+    if layer_scalar.element_count() < expected_scalar {
+        return Err(MlxError::InvalidArgument(format!(
+            "layer_scalar: size {} < expected {}",
+            layer_scalar.element_count(), expected_scalar
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("fused_moe_wsum_post_ff_norm2_endlayer_f32_v2", device)?;
+
+    let tg_size = std::cmp::min(256u32, dim.next_power_of_two()) as u64;
+    // Threadgroup memory: max(32, n_sg) (SG scratch) + dim (sum_buf) floats.
+    let n_sg = (tg_size / 32).max(1);
+    let sg_scratch_floats = n_sg.max(32);
+    let shared_mem_bytes = (sg_scratch_floats + dim as u64) * 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Params {
+        eps: f32,
+        dim: u32,
+        top_k: u32,
+        scalar_is_vector: u32,
+    }
+    let params = Params {
+        eps,
+        dim,
+        top_k,
+        scalar_is_vector: if scalar_is_vector { 1 } else { 0 },
+    };
+
+    use super::encode_helpers::{as_bytes, KernelArg};
+    encoder.set_op_kind(CapturedOpKind::Other);
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(expert_outputs)),
+            (1, KernelArg::Buffer(routing_weights)),
+            (2, KernelArg::Buffer(attn_out)),
+            (3, KernelArg::Buffer(residual)),
+            (4, KernelArg::Buffer(w2)),
+            (5, KernelArg::Buffer(w3)),
+            (6, KernelArg::Buffer(layer_scalar)),
+            (7, KernelArg::Buffer(mlp_down)),
+            (8, KernelArg::Buffer(hidden)),
+            (9, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    Ok(())
+}
+
 /// Dispatch an RMS normalization without learned scale (bf16 only).
 ///
 /// Computes: `output = x * rsqrt(mean(x^2) + eps)` — no weight multiplication.
