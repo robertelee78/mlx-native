@@ -174,7 +174,7 @@ pub fn mul_mv_ext_dispatch(
     device: &MlxDevice,
     weight: &MlxBuffer,
     input: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &MulMvExtParams,
 ) -> Result<()> {
     if params.m == 0 || params.n == 0 || params.k == 0 || params.batch == 0 {

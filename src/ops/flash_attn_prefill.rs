@@ -492,7 +492,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d256(
     k: &MlxBuffer,
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
 ) -> Result<()> {
     // Delegate to the blk-aware dispatcher with blk=None.  Because
@@ -556,7 +556,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_with_blk(
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
     blk: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
 ) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
@@ -975,7 +975,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_resume(
     q: &MlxBuffer,
     k: &MlxBuffer,
     v: &MlxBuffer,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillResumeParams,
 ) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
@@ -1250,7 +1250,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     k: &MlxBuffer,
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     layout: FlashAttnPrefillLayout,
 ) -> Result<()> {

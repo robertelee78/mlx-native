@@ -202,8 +202,8 @@ fn dispatch_inner(
     k_buf: &MlxBuffer,
     v_buf: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    o_buf: &mut MlxBuffer,
-    l_buf: &mut MlxBuffer,
+    o_buf: &MlxBuffer,
+    l_buf: &MlxBuffer,
     params: &FlashAttnTrainParams,
     kernel_name: &str,
     head_dim_expected: u32,
@@ -401,8 +401,8 @@ pub fn dispatch_flash_attn_train_fwd_bf16_d64(
     k_buf: &MlxBuffer,
     v_buf: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    o_buf: &mut MlxBuffer,
-    l_buf: &mut MlxBuffer,
+    o_buf: &MlxBuffer,
+    l_buf: &MlxBuffer,
     params: &FlashAttnTrainParams,
 ) -> Result<()> {
     dispatch_inner(
@@ -429,8 +429,8 @@ pub fn dispatch_flash_attn_train_fwd_bf16_d256(
     k_buf: &MlxBuffer,
     v_buf: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    o_buf: &mut MlxBuffer,
-    l_buf: &mut MlxBuffer,
+    o_buf: &MlxBuffer,
+    l_buf: &MlxBuffer,
     params: &FlashAttnTrainParams,
 ) -> Result<()> {
     dispatch_inner(
@@ -623,9 +623,9 @@ fn dispatch_bwd_inner(
     l_buf: &MlxBuffer,
     do_buf: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    dq_buf: &mut MlxBuffer,
-    dk_buf: &mut MlxBuffer,
-    dv_buf: &mut MlxBuffer,
+    dq_buf: &MlxBuffer,
+    dk_buf: &MlxBuffer,
+    dv_buf: &MlxBuffer,
     params: &FlashAttnTrainParams,
     bwd_kernel_name: &str,
     head_dim_expected: u32,
@@ -898,9 +898,9 @@ pub fn dispatch_flash_attn_train_bwd_bf16_d64(
     l_buf: &MlxBuffer,
     do_buf: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    dq_buf: &mut MlxBuffer,
-    dk_buf: &mut MlxBuffer,
-    dv_buf: &mut MlxBuffer,
+    dq_buf: &MlxBuffer,
+    dk_buf: &MlxBuffer,
+    dv_buf: &MlxBuffer,
     params: &FlashAttnTrainParams,
 ) -> Result<()> {
     dispatch_bwd_inner(
@@ -931,9 +931,9 @@ pub fn dispatch_flash_attn_train_bwd_bf16_d256(
     l_buf: &MlxBuffer,
     do_buf: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    dq_buf: &mut MlxBuffer,
-    dk_buf: &mut MlxBuffer,
-    dv_buf: &mut MlxBuffer,
+    dq_buf: &MlxBuffer,
+    dk_buf: &MlxBuffer,
+    dv_buf: &MlxBuffer,
     params: &FlashAttnTrainParams,
 ) -> Result<()> {
     dispatch_bwd_inner(

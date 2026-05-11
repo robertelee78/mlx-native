@@ -84,7 +84,7 @@ pub fn dense_gemv_bf16_f32(
     device: &MlxDevice,
     src0: &MlxBuffer,    // BF16 weight [src0_batch, N, K]
     src1: &MlxBuffer,    // F32  input  [src1_batch, M, K]
-    dst: &mut MlxBuffer, // F32  output [src1_batch, M, N]
+    dst: &MlxBuffer, // F32  output [src1_batch, M, N]
     params: &DenseMmBf16F32Params,
 ) -> Result<()> {
     let bf16_sz = DType::BF16.size_of();

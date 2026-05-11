@@ -435,7 +435,7 @@ pub fn dispatch_mm_for_test(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     // Re-run common validation so this entry point is safe on its own.
@@ -760,7 +760,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
     device: &MlxDevice,
     input_bf16: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulPerm021Params,
 ) -> Result<()> {
     let kernel_name = match params.ggml_type {

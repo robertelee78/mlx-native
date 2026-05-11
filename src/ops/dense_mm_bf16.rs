@@ -80,7 +80,7 @@ pub fn dense_matmul_bf16_f32_tensor(
     device: &MlxDevice,
     src0: &MlxBuffer,
     src1: &MlxBuffer,
-    dst: &mut MlxBuffer,
+    dst: &MlxBuffer,
     params: &DenseMmBf16F32Params,
 ) -> Result<()> {
     if params.m == 0 || params.n == 0 || params.k == 0 {

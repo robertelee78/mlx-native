@@ -176,7 +176,7 @@ pub fn quantized_matmul_id_ggml(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     let qk = params.ggml_type.block_values();
@@ -316,7 +316,7 @@ pub fn quantized_matmul_id_ggml_pooled(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
@@ -470,7 +470,7 @@ fn dispatch_id_mv(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
@@ -617,7 +617,7 @@ pub fn quantized_matmul_id_swiglu_q4_0(
     up: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     if params.ggml_type != GgmlType::Q4_0 {
@@ -789,7 +789,7 @@ fn dispatch_id_mm_pooled(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
@@ -828,7 +828,7 @@ fn dispatch_id_mm(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     let mut scratch = IdMmScratch::alloc(device, params.n_experts, params.n_tokens)?;
@@ -967,9 +967,9 @@ pub fn dispatch_id_mm_for_test(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    htpe: &mut MlxBuffer,
-    hids: &mut MlxBuffer,
-    output: &mut MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
 ) -> Result<()> {
     let qk = params.ggml_type.block_values();

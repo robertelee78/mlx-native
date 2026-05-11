@@ -284,7 +284,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512(
     k: &MlxBuffer,
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
 ) -> Result<()> {
     // Delegate to the blk-aware dispatcher with blk=None.  Because
@@ -314,7 +314,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_blk(
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
     blk: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
 ) -> Result<()> {
     dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
@@ -333,7 +333,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg(
     k: &MlxBuffer,
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     nsg: u32,
 ) -> Result<()> {
@@ -355,7 +355,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
     blk: Option<&MlxBuffer>,
-    out: &mut MlxBuffer,
+    out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     nsg: u32,
 ) -> Result<()>
