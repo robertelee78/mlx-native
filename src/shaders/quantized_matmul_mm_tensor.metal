@@ -627,6 +627,107 @@ kernel void hf2q_mul_mm_tensor_v2_impl(
     cT.store(tD.slice(ra, rb));
 }
 
+// ===========================================================================
+// ADR-029 iter-30 H29-speed: F16-weight variant of the V2 large-tile mm.
+//
+// Identical geometry / semantics to `hf2q_mul_mm_tensor_v2_impl`, with
+// the per-call dequantize_func replaced by a direct half load from the
+// F16 weight shadow buffer.  Used when MlxQWeight.f16_shadow is Some.
+// ===========================================================================
+
+[[host_name("hf2q_mul_mm_tensor_v2_f16")]]
+kernel void hf2q_mul_mm_tensor_v2_f16_impl(
+        constant GgmlMatmulMmTensorParams & args,
+        device const char * srcA,    // F16 weight [M_peer × K], nb01 = 2K bytes/row
+        device const char * srcB,    // F32 input  [K × N_peer]
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    const int K      = args.ne00;
+    const int M_peer = args.ne0;
+    const int N_peer = args.ne1;
+
+    const int im = tgpig.z;
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+    const uint64_t offset0 = (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+
+    constexpr int SZ_SIMDGROUP        = 16;
+    constexpr int N_MM_BLOCK_X        = 4;
+    constexpr int N_MM_BLOCK_Y        = 2;
+    constexpr int N_MM_SIMD_GROUP_X   = 2;
+    constexpr int N_MM_SIMD_GROUP_Y   = 2;
+    constexpr int N_MM_NK             = 2;
+    constexpr int N_MM_NK_TOTAL       = SZ_SIMDGROUP * N_MM_NK;
+    constexpr int N_SIMDWIDTH         = 32;
+
+    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;   // 64
+    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;   // 128
+
+    const int ra = tgpig.y * NRA;
+    const int rb = tgpig.x * NRB;
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+
+    constexpr int A_WORK_ITEMS = NRA * N_MM_NK;
+    constexpr int NUM_THREADS  = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+
+    auto tA = tensor(sa, dextents<int32_t, 2>(N_MM_NK_TOTAL, NRA));
+
+    device float * ptrB = (device float *)(srcB + args.nb12 * i12 + args.nb13 * i13);
+    const int strideB = (int)(args.nb11 / sizeof(float));
+    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N_peer), array<int, 2>({1, strideB}));
+
+    matmul2d<
+        matmul2d_descriptor(NRB, NRA, N_MM_NK_TOTAL, false, true, true,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
+        for (int work = tiitg; work < A_WORK_ITEMS; work += NUM_THREADS) {
+            const int row     = work / N_MM_NK;
+            const int k_chunk = work % N_MM_NK;
+            const int k_pos   = loop_k + k_chunk * 16;
+            const short k_base = k_chunk * 16;
+
+            if (ra + row < M_peer) {
+                device const half * row_ptr =
+                    (device const half *)(srcA + args.nb01 * (ra + row) + offset0);
+                for (short i = 0; i < 16; i++) {
+                    sa[row * N_MM_NK_TOTAL + (k_base + i)] =
+                        (k_pos + i < K) ? row_ptr[k_pos + i] : (half)0;
+                }
+            } else {
+                for (short i = 0; i < 16; i++) {
+                    sa[row * N_MM_NK_TOTAL + (k_base + i)] = (half)0;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float * dstBatch = (device float *)dst +
+        im * (uint64_t)M_peer * (uint64_t)N_peer;
+    auto tD = tensor(dstBatch, dextents<int32_t, 2>(M_peer, N_peer),
+                     array<int, 2>({1, M_peer}));
+    cT.store(tD.slice(ra, rb));
+}
+
+// (host_name set inline on the kernel above — non-template, no instantiation here)
+
 // ---- V2 kernel instantiations (env-gated via HF2Q_LARGE_TILE_MM=1) ----
 template [[host_name("kernel_mul_mm_q4_0_tensor_v2_f32")]]
 kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, dequantize_q4_0_t>(

@@ -136,6 +136,11 @@ impl KernelRegistry {
         // ADR-022 Phase 3 — Q4_K tensor mm + Q8_0 perm021.
         sources.insert("kernel_mul_mm_q4_K_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q8_0_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
+        // ADR-029 iter-30 H29-speed — F16-weight V2 large-tile mm.
+        // Same source file as the V2 quantized variants; reads F16 weight
+        // directly from device memory (no per-call dequant).  Used when
+        // MlxQWeight.f16_shadow is populated and m > MM_ROUTING_THRESHOLD.
+        sources.insert("hf2q_mul_mm_tensor_v2_f16".into(), ggml_mm_tensor_src);
         // ADR-029 iter-23 H28-A — V2 large-tile tensor mm (NRA=64 M, NRB=128 N).
         // Same source file as V1 tensor mm; distinct kernel host names so the
         // dispatcher can pick V1 vs V2 at runtime via HF2Q_LARGE_TILE_MM.

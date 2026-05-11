@@ -449,6 +449,85 @@ pub fn quantized_matmul_ggml(
     }
 }
 
+/// ADR-029 iter-30 H29-speed: dispatch the V2 64×128 large-tile mm-tensor
+/// kernel with F16 weight input (no dequant — reads from a pre-materialized
+/// F16 shadow buffer).  Mirrors `dispatch_mm` geometry / shmem / dispatch
+/// for the V2 path but skips the per-call dequantize_func work.
+///
+/// `f16_weight` is the F16-typed MlxBuffer (per-row stride = K halfs =
+/// 2K bytes).  `input` is F32 [m, k].  `output` is F32 [m, n].
+pub fn dispatch_mm_v2_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    f16_weight: &MlxBuffer,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    if f16_weight.dtype() != DType::F16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mm_v2_f16: f16_weight must be F16, got {:?}",
+            f16_weight.dtype()
+        )));
+    }
+    if m == 0 || k == 0 || n == 0 {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_mm_v2_f16: M, K, N must all be > 0".into(),
+        ));
+    }
+    // F16 weight row stride (per-row bytes) = 2K.
+    let nb01 = (k as u64) * (DType::F16.size_of() as u64);
+    let nb11 = (k as u64) * (DType::F32.size_of() as u64);
+
+    let gpu_params = GgmlMatmulMmGpuParams {
+        ne00: k as i32,
+        ne02: 1,
+        nb01,
+        nb02: nb01 * (n as u64),
+        nb03: 0,
+        ne12: 1,
+        _pad0: 0,
+        nb10: DType::F32.size_of() as u64,
+        nb11,
+        nb12: nb11 * (m as u64),
+        nb13: 0,
+        ne0: n as i32,
+        ne1: m as i32,
+        r2: 1,
+        r3: 1,
+        _pad1: 0,
+    };
+
+    let pipeline = registry.get_pipeline("hf2q_mul_mm_tensor_v2_f16", device.metal_device())?;
+
+    const THREADS_PER_TG: u64 = 128;
+    let nra: u64 = 64;  // M_peer tile
+    let nrb: u64 = 128; // N_peer tile
+    let tg_x = (m as u64 + nrb - 1) / nrb;
+    let tg_y = (n as u64 + nra - 1) / nra;
+    let threadgroups = metal::MTLSize::new(tg_x, tg_y, 1);
+    let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+    const SHMEM_BYTES: u64 = 4096;  // only A tile in shmem
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(f16_weight)),
+            (2, KernelArg::Buffer(input)),
+            (3, KernelArg::Buffer(output)),
+        ],
+        &[(0, SHMEM_BYTES)],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
 /// Test-only helper: force the mm dispatch path.  Used by the mm parity
 /// tests (`tests/test_quantized_matmul_mm.rs`).  This entry point
 /// intentionally bypasses the public dispatcher's routing decision so
