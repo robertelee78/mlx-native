@@ -146,6 +146,20 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_iq4_nl_tensor_v2_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q5_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q4_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        // ADR-029 iter-28 H29 — whole-tensor dequant from block_q → F16.
+        // Used at model load to materialize an F16 shadow of attn/dense MLP
+        // weights so the runtime dispatch can use kernel_mul_mm_f16_f32_*
+        // (peer's gemma4 pattern).  Trades ~1 GB resident memory for 2-3×
+        // faster per-call dense matmul at prefill.
+        let dequant_to_f16_src: &'static str =
+            include_str!("shaders/dequant_to_f16.metal");
+        sources.insert("hf2q_dequant_q4_0_to_f16".into(), dequant_to_f16_src);
+        sources.insert("hf2q_dequant_q8_0_to_f16".into(), dequant_to_f16_src);
+        sources.insert("hf2q_dequant_q5_1_to_f16".into(), dequant_to_f16_src);
+        sources.insert("hf2q_dequant_iq4_nl_to_f16".into(), dequant_to_f16_src);
+        sources.insert("hf2q_dequant_q4_K_to_f16".into(), dequant_to_f16_src);
+        sources.insert("hf2q_dequant_q5_K_to_f16".into(), dequant_to_f16_src);
+        sources.insert("hf2q_dequant_q6_K_to_f16".into(), dequant_to_f16_src);
 
         // ADR-022 Phase 1 P1.7 — Q5_1 / IQ4_NL mul_mv_ext r1 family.
         // Eight instantiations (2 types × 4 r1ptg widths). Each PSO is

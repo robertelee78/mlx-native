@@ -12,6 +12,7 @@ pub mod dense_gemv_bf16;
 pub mod dense_mm_bf16;
 pub mod dense_mm_f16;
 pub mod dense_mm_f32_f32;
+pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
