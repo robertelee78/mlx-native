@@ -374,10 +374,27 @@ pub fn dispatch_fused_post_attn_triple_norm_f32(
         }
     }
 
-    let pipeline = registry.get_pipeline("fused_post_attn_triple_norm_f32", device)?;
+    // ADR-028 iter-370: V2 (float4 + simd_sum) variant when dim % 4 == 0.
+    // Default-OFF; opt-in via HF2Q_FUSED_TRIPLE_NORM_V2=1.  V1 was iter-186
+    // (regressed -1.0% on decode); V2 saves 12 barriers/dispatch.
+    let use_v2 = (dim % 4 == 0)
+        && std::env::var("HF2Q_FUSED_TRIPLE_NORM_V2").ok().as_deref() == Some("1");
+    let kernel_name = if use_v2 {
+        "fused_post_attn_triple_norm_f32_v2"
+    } else {
+        "fused_post_attn_triple_norm_f32"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let tg_size = std::cmp::min(256u32, dim.next_power_of_two()) as u64;
-    let shared_mem_bytes = tg_size * 4;
+    let shared_mem_bytes = if use_v2 {
+        // V2: 1 float per simdgroup (max 32 SGs at tg=1024).  Min 32 floats
+        // so simd_sum's sgitg-indexed write is never OOB at partial-warp tgs.
+        let n_sg = std::cmp::max(1u64, tg_size / 32);
+        std::cmp::max(32, n_sg) * 4
+    } else {
+        tg_size * 4
+    };
 
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

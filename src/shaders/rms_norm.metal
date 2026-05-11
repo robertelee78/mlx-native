@@ -873,6 +873,101 @@ kernel void fused_post_attn_triple_norm_f32(
 }
 
 // ---------------------------------------------------------------------------
+// fused_post_attn_triple_norm_f32_v2 (ADR-028 iter-370) — float4 + simd_sum
+// rewrite of fused_post_attn_triple_norm_f32 above.
+//
+// Same math, same buffer layout, same FusedPostAttnTripleNormParams.  Only
+// the reductions change: 2 scalar tree reductions (16 barriers at tg=256)
+// → 2 simd_sum reductions (4 barriers, 75% reduction).  iter-186 V1
+// regressed -1.0% on decode because parallelism loss outweighed dispatch
+// savings.  V2 saves 12 barriers/dispatch which might flip the verdict.
+//
+// Dispatcher must guard `dim % 4 == 0`; gemma4 hidden=2816 (=704 × 4) ✓.
+// ---------------------------------------------------------------------------
+kernel void fused_post_attn_triple_norm_f32_v2(
+    device const float4* hidden       [[buffer(0)]],
+    device const float4* attn_out     [[buffer(1)]],
+    device const float4* post_attn_w  [[buffer(2)]],
+    device const float4* weight_a     [[buffer(3)]],
+    device const float4* weight_b     [[buffer(4)]],
+    device const float4* weight_c     [[buffer(5)]],
+    device float4*       residual_out [[buffer(6)]],
+    device float4*       output_a     [[buffer(7)]],
+    device float4*       output_b     [[buffer(8)]],
+    device float4*       output_c     [[buffer(9)]],
+    constant FusedPostAttnTripleNormParams& params [[buffer(10)]],
+    uint row_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const float eps  = params.eps;
+    const uint  dim  = params.dim;
+    const uint  dim4 = dim / 4u;
+    const uint  base4 = row_id * dim4;
+
+    // --- Phase 1: sum of squares over attn_out (FIRST RMS) ---
+    float sumf_attn = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 v = attn_out[base4 + i];
+        sumf_attn += dot(v, v);
+    }
+    sumf_attn = simd_sum(sumf_attn);
+    if (tiisg == 0) {
+        shared[sgitg] = sumf_attn;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv_attn = rsqrt(shared[0] / float(dim) + eps);
+
+    // --- Phase 2: residual_new = hidden + attn*rms_attn*post_attn_w; write
+    //              + accumulate sum(residual_new^2) for SECOND RMS ---
+    float sumf_res = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 a = attn_out[base4 + i];
+        const float4 normed_attn = (a * rms_inv_attn) * post_attn_w[i];
+        const float4 r = hidden[base4 + i] + normed_attn;
+        residual_out[base4 + i] = r;
+        sumf_res += dot(r, r);
+    }
+    sumf_res = simd_sum(sumf_res);
+    if (tiisg == 0) {
+        shared[sgitg] = sumf_res;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv_res = rsqrt(shared[0] / float(dim) + eps);
+
+    // --- Phase 3: re-read residual_out, apply 3 weight vectors ---
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 r = residual_out[base4 + i];
+        const float4 vn = r * rms_inv_res;
+        output_a[base4 + i] = vn * weight_a[i];
+        output_b[base4 + i] = vn * weight_b[i];
+        output_c[base4 + i] = vn * weight_c[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fused_post_ff_norm2_endlayer_f32 — fuse the gemma4 layer-end pair:
 //   (a) mlp_down = attn_out + norm(moe_accum, w2)
 //   (b) hidden   = (residual + norm(mlp_down, w3)) * layer_scalar
