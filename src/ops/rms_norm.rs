@@ -125,10 +125,15 @@ pub fn dispatch_rms_norm(
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     // One threadgroup per row.  Threadgroup size must be a power of 2.
+    //
+    // ADR-028 iter-360 — tested raising cap from 256 to 1024 (matching peer's
+    // `pipeline.max_threads_per_threadgroup` heuristic at llama.cpp
+    // ggml-metal-ops.cpp:3452-3459).  Result: -0.5 to -0.7% regression on
+    // gemma4 decode (legacy 73.7 → 73.0; hybrid 75.5 → 75.0).  Cap=256 is
+    // already well-tuned: at decode (1 row per dispatch), wider TGs reduce
+    // concurrent-TG-per-SM count which hurts more than the per-TG load-time
+    // saving.  FALSIFIED — keep cap=256.
     let mut tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
-    // v2 uses simd_sum reduction which requires at least one full
-    // simdgroup (32 lanes).  Smaller dims still work — extra threads
-    // just sit idle in the load loop.
     if use_v2 && tg_size < 32 {
         tg_size = 32;
     }
