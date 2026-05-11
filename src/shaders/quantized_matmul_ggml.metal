@@ -708,17 +708,19 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
     float sumf[nr0] = {0.f, 0.f};
     float yl[16];
 
-    const int tid  = tiisg / 2;
-    const int ix   = tiisg % 2;
-    const int ip   = tid / 8;
-    const int il   = tid % 8;
-    const int n    = 4;
-    const int l0   = n * il;
-    const int is   = 8*ip + l0/16;
+    // ADR-028 iter-401: use `short` (16-bit) for indexing to match peer's
+    // ggml-metal.metal:8005-8014. Apple Metal compiler may emit more compact
+    // 16-bit ALU ops; per peer's pattern.
+    const short tid  = tiisg / 2;
+    const short ix   = tiisg % 2;
+    const short ip   = tid / 8;
+    const short il   = tid % 8;
+    const short l0   = 4 * il;
+    const short is   = 8*ip + l0/16;
 
-    const int y_offset   = 128*ip + l0;
-    const int q_offset_l = 64*ip + l0;
-    const int q_offset_h = 32*ip + l0;
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l = 64*ip + l0;
+    const short q_offset_h = 32*ip + l0;
 
     for (int i = ix; i < nb; i += 2) {
         // Y vector cached once per block, reused across nr0 rows.
