@@ -945,7 +945,9 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
     const int q_offset_h = 32*ip + l0;
 
     for (int i = ix; i < nb; i += 2) {
-        // Cache Y vector once per block, reuse across both rows.
+        // ADR-028 iter-352: explicit FOR_UNROLL pragma test FALSIFIED here too;
+        // see non-_id variant (kernel_mul_mv_q6_K_f32_nr2) for the bench data.
+        // Apple Metal's auto-unroll is already optimal; explicit hint is removed.
         device const float * y = yy + i * QK_K + y_offset;
         for (int l = 0; l < 4; ++l) {
             yl[4*l + 0] = y[l +  0];

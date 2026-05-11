@@ -604,6 +604,12 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 
     for (int i = ix; i < nb; i += 2) {
         // Y vector cached once per block, reused across nr0 rows.
+        // ADR-028 iter-352: explicit `clang loop unroll(full)` (mirroring peer's
+        // FOR_UNROLL macro at llama.cpp ggml-metal.metal:8035) was tested here
+        // and FALSIFIED — measured -0.2-0.4 tok/s vs Apple Metal's auto-unroll.
+        // Compiler was already doing the optimal thing without the hint, and the
+        // explicit pragma may have hurt register allocation.  Removed; auto-unroll
+        // retained as the production choice.
         device const float * y = yy + i * QK_K + y_offset;
         for (int l = 0; l < 4; ++l) {
             yl[4*l + 0] = y[l +  0];
