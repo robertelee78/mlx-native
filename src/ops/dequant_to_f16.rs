@@ -137,6 +137,47 @@ pub fn dispatch_dequant_to_f16(
     Ok(())
 }
 
+/// One-shot helper: allocate an F16 shadow buffer + dispatch + commit-and-wait.
+///
+/// Intended for use at model load — caller has the source quantized buffer
+/// already on GPU and wants a paired F16 shadow.  Returns the new F16
+/// buffer.  Performs a `commit_and_wait` so the buffer is ready for
+/// downstream use by the time this function returns.
+pub fn materialize_f16_shadow(
+    device: &crate::MlxDevice,
+    registry: &mut KernelRegistry,
+    weight: &MlxBuffer,
+    n_rows: u32,
+    n_cols: u32,
+    ggml_type: GgmlType,
+) -> Result<MlxBuffer> {
+    let n_elements = (n_rows as usize) * (n_cols as usize);
+    let f16_shadow = device
+        .alloc_buffer(n_elements * 2, DType::F16, vec![n_rows as usize, n_cols as usize])
+        .map_err(|e| MlxError::InvalidArgument(format!("materialize_f16_shadow alloc: {e}")))?;
+
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| MlxError::InvalidArgument(format!("materialize_f16_shadow encoder: {e}")))?;
+
+    dispatch_dequant_to_f16(
+        &mut encoder,
+        registry,
+        device.metal_device(),
+        weight,
+        &f16_shadow,
+        n_rows,
+        n_cols,
+        ggml_type,
+    )?;
+
+    encoder
+        .commit_and_wait()
+        .map_err(|e| MlxError::InvalidArgument(format!("materialize_f16_shadow commit: {e}")))?;
+
+    Ok(f16_shadow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

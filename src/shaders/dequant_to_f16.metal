@@ -125,9 +125,11 @@ template <typename type4x4>
 void dq_q8_0(device const block_q8_0 * xb, short il, thread type4x4 & reg) {
     device const int8_t * qs = ((device const int8_t *)xb->qs);
     const half d = xb->d;
+    float4x4 reg_f;
     for (int i = 0; i < 16; i++) {
-        reg[i/4][i%4] = (type4x4::elem_type)(d * qs[16*il + i]);
+        reg_f[i/4][i%4] = (float)(d * qs[16*il + i]);
     }
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4x4>
@@ -210,11 +212,9 @@ void dq_q6_K(device const block_q6_K * xb, short il, thread type4x4 & reg) {
     qh = qh + 32*(il/8)                  + 16*(il&1);
     sc = sc + 8*(il/8);
 
-    const uchar mask    = il & 1 ? 0xF0    : 0x0F;
-    const uchar mask_qh = il & 4 ? 0xC0    : 0x30;
-    const short shift_l = (il & 2) ? 4 : 0;
-    const short shift_h = il & 4 ? 0 : 2;
-    const short sh      = (il & 2) ? 2 : 0;
+    // (matches dq_q6_K body in quantized_matmul_mm_tensor.metal — unused
+    // local consts dropped to satisfy Metal -Werror unused-variable.)
+    const short sh = (il & 2) ? 2 : 0;
 
     const float dl0 = d_all * sc[0] / 32.f;
     const float dl1 = d_all * sc[2] / 32.f;
