@@ -485,8 +485,14 @@ fn dispatch_mv(
     // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
         && env_default_true("HF2Q_Q6K_MV_NR2");
+    // ADR-028 iter-368 — Q8_0 NSG=4 NR=2 (peer-style port).  Default-OFF
+    // until parity + bench validation; opt-in via `HF2Q_Q8_0_MV_NR2=1`.
+    let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
+        && std::env::var("HF2Q_Q8_0_MV_NR2").ok().as_deref() == Some("1");
     let kernel_name = if use_q6k_nr2 {
         "kernel_mul_mv_q6_K_f32_nr2"
+    } else if use_q8_0_nr2 {
+        "kernel_mul_mv_q8_0_f32_nr2"
     } else {
         params.ggml_type.kernel_name()
     };
@@ -522,6 +528,12 @@ fn dispatch_mv(
     // ADR-028 iter-309 — nr0=2 variant doubles rows-per-TG to 4.  Same
     // 2 SGs × 32 threads layout, but each SG handles 2 rows so align=4.
     let align = if use_q6k_nr2 { 4usize } else { align };
+    // ADR-028 iter-368 — Q8_0 NR2 uses 32×4=128 threads/TG, 2 rows/TG.
+    let (nth0, nth1, align) = if use_q8_0_nr2 {
+        (32u64, 4u64, 2usize)
+    } else {
+        (nth0, nth1, align)
+    };
 
     let threadgroups = metal::MTLSize::new(
         div_ceil(n, align) as u64,
@@ -530,17 +542,34 @@ fn dispatch_mv(
     );
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
-    encoder.encode_threadgroups_with_args(
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(weight)),
-            (1, KernelArg::Buffer(input)),
-            (2, KernelArg::Buffer(output)),
-            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
-        ],
-        threadgroups,
-        threads_per_tg,
-    );
+    if use_q8_0_nr2 {
+        // Cross-SG reduction needs threadgroup memory: NR0 * NW * sizeof(float).
+        let smem_bytes: u64 = 2 * 32 * std::mem::size_of::<f32>() as u64;
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(weight)),
+                (1, KernelArg::Buffer(input)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            &[(0, smem_bytes)],
+            threadgroups,
+            threads_per_tg,
+        );
+    } else {
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(weight)),
+                (1, KernelArg::Buffer(input)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            threadgroups,
+            threads_per_tg,
+        );
+    }
 
     Ok(())
 }

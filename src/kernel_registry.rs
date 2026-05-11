@@ -76,6 +76,8 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_ggml.metal");
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
+        // ADR-028 iter-368: peer-style NSG=4 NR=2 variant (128 threads/TG).
+        sources.insert("kernel_mul_mv_q8_0_f32_nr2".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
         // ADR-028 iter-309 — q6_K mat-vec with nr0=2 + cached yl[16]
         // (peer-pattern port of llama.cpp's `kernel_mul_mv_q6_K_f32_impl`

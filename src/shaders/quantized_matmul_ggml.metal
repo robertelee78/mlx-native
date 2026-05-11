@@ -465,6 +465,124 @@ kernel void kernel_mul_mv_q8_0_f32(
     }
 }
 
+// ---- Q8_0 mat-vec kernel — peer-style NSG=4 NR=2 (ADR-028 iter-368) ----
+//
+// Port of llama.cpp's `kernel_mul_mv_q8_0_f32_impl` with N_R0_Q8_0=2 and
+// N_SG_Q8_0=4 (functional constant equivalent).  Each TG covers 2 rows;
+// 4 simdgroups collaborate on those 2 rows with cross-SG reduction via
+// threadgroup memory.  Uses 128 threads/TG vs the existing kernel's 64 →
+// better latency hiding on Apple Silicon.
+//
+// Math is mathematically equivalent to `kernel_mul_mv_q8_0_f32` (same
+// row × col F32 dot products with identical accumulator order).  Difference
+// is parallelism / dispatch geometry.
+//
+// Dispatch (host-side):
+//   threadgroups   = (ceil(N/NR0), M, B)
+//   threads_per_tg = (NW, NSG, 1) = (32, 4, 1)
+//   shared memory  = NR0 * NW * sizeof(float) = 2 * 32 * 4 = 256 bytes
+//
+// Reference: /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:3572 (MIT).
+
+#define N_R0_Q8_0 2
+#define N_SG_Q8_0 4
+#define NQ_Q8_0   8
+
+kernel void kernel_mul_mv_q8_0_f32_nr2(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    threadgroup float   * shmem  [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NR0 = N_R0_Q8_0;   // 2
+    constexpr int NSG = N_SG_Q8_0;   // 4
+    constexpr int NW  = N_SIMDWIDTH; // 32
+    constexpr int NQ  = NQ_Q8_0;     // 8
+
+    const int nb = p.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % p.ne12;
+    const uint i13 = im / p.ne12;
+
+    // Per-row src0 pointers (unrolled NR0 iterations).
+    device const block_q8_0 * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        const uint offset0 = (r0 + row) * nb
+            + (i12 / p.r2) * (nb * p.ne01)
+            + (i13 / p.r3) * (nb * p.ne01 * p.ne02);
+        ax[row] = (device const block_q8_0 *) src0 + offset0;
+    }
+
+    device const float * y = (device const float *) src1
+        + r1 * p.ne10
+        + im * p.ne00 * p.ne1;
+
+    float sumf[NR0] = { 0.f };
+
+    const int ix = tiisg / (NW / NQ);  // 0..3
+    const int il = tiisg % (NW / NQ);  // 0..3
+
+    const int ib0 = sgitg * NQ + ix;
+
+    float yl[NQ];
+    device const float * yb = y + ib0 * QK8_0 + il * NQ;
+
+    // Each thread covers NQ quants per iteration; SGs interleave across
+    // ib by stride NSG*NQ.
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        for (int i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (int row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.f;
+            for (int iq = 0; iq < NQ; ++iq) {
+                sumq += qs[iq] * yl[iq];
+            }
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+
+        yb += NSG * NQ * QK8_0;
+    }
+
+    // Cross-simdgroup reduction (peer's helper_mv_reduce_and_write pattern).
+    threadgroup float * shmem_rows[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        shmem_rows[row] = shmem + NW * row;
+        // Pre-zero shmem for the final simd_sum read below.  Only sgitg==0
+        // initializes; barrier serializes init+writes across SGs.
+        if (sgitg == 0) {
+            shmem_rows[row][tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_rows[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int row = 0; row < NR0 && r0 + row < p.ne01; ++row) {
+        const float tot = simd_sum(shmem_rows[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            dst[r1 * p.ne0 + im * p.ne0 * p.ne1 + r0 + row] = tot;
+        }
+    }
+}
+
 // ---- Q6_K mat-vec kernel ----
 //
 // Dispatch: threadgroups=(ceil(N/2), M, B), threads_per_tg=(2, 32, 1)
