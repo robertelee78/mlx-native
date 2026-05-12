@@ -944,6 +944,11 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_hybrid_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_dk512".into(), hybrid_src);
 
+        // ADR-029 CFA cfa-20260512-fa-peer-port (iter-122): verbatim llama.cpp peer port.
+        // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.
+        let peer_port_src: &'static str = include_str!("shaders/flash_attn_vec_peer_port_f16.metal");
+        sources.insert("flash_attn_vec_peer_port_f16_dk256_dv256".into(), peer_port_src);
+
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);
