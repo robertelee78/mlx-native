@@ -138,8 +138,22 @@ pub fn dense_matmul_bf16_f32_tensor(
         )));
     }
 
-    let pipeline = registry
-        .get_pipeline("hf2q_dense_mm_bf16_f32_tensor", device.metal_device())?;
+    // ADR-029 iter-80 H60: V2 large-tile (NRA=64, NRB=128) variant
+    // env-gated by HF2Q_LARGE_TILE_MM.  Default OFF until coherence +
+    // thermal-fair bench parity proven.  Treated as a fan-out shim: V1
+    // pipeline + grid (NR0=64, NR1=32) when off, V2 pipeline + grid
+    // (NRA=64, NRB=128) when on.  Truthy: "1", "true", "yes" (case-
+    // insensitive); anything else → V1.
+    let use_v2_large_tile = match std::env::var("HF2Q_LARGE_TILE_MM").as_deref() {
+        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("yes") | Ok("YES") => true,
+        _ => false,
+    };
+    let kernel_name = if use_v2_large_tile {
+        "hf2q_dense_mm_bf16_f32_tensor_v2"
+    } else {
+        "hf2q_dense_mm_bf16_f32_tensor"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
     let nb01 = (params.k as u64) * (bf16_sz as u64);                 // src0 row
     let nb02 = (params.n as u64) * nb01;                             // src0 batch
@@ -166,16 +180,30 @@ pub fn dense_matmul_bf16_f32_tensor(
         _pad1: 0,
     };
 
-    // Same tile geometry / shmem as the quantized tensor kernel.
+    // V1 tile: NR0=64 (M_peer axis = hf2q-N), NR1=32 (N_peer axis = hf2q-M).
+    // V2 tile: NRA=64 (M_peer = hf2q-N), NRB=128 (N_peer = hf2q-M).
+    // Note hf2q axis swap: ne0 = hf2q-N (M_peer), ne1 = hf2q-M (N_peer);
+    // tgpig.y covers M_peer-axis (NRA/NR0), tgpig.x covers N_peer-axis
+    // (NRB/NR1).  Threads-per-TG = NUM_THREADS = 128 in both (4 simdgroups
+    // × 32 lanes).  V2 shmem: A-tile only (NRA × NK = 64 × 32 × 2 B =
+    // 4096 B), B read direct from device → halved shmem budget vs V1.
     const NR0: u64 = 64;
-    const NR1: u64 = 32;
+    const NR1_V1: u64 = 32;
+    const NRB_V2: u64 = 128;
     const THREADS_PER_TG: u64 = 128;
-    const SHMEM_BYTES: u64 = 8192;
+    const SHMEM_V1: u64 = 8192;
+    const SHMEM_V2: u64 = 4096;
 
-    // Grid: (ceil(M/32), ceil(N/64), src1_batch).  Note M -> x-axis,
-    // N -> y-axis, im -> z-axis (matches the kernel's tgpig unpacking).
+    let (nr1, shmem_bytes) = if use_v2_large_tile {
+        (NRB_V2, SHMEM_V2)
+    } else {
+        (NR1_V1, SHMEM_V1)
+    };
+
+    // Grid: (ceil(M/nr1), ceil(N/NR0), src1_batch).  M → tgpig.x (covers
+    // N_peer = hf2q-M), N → tgpig.y (covers M_peer = hf2q-N), batch → z.
     let threadgroups = metal::MTLSize::new(
-        (params.m as u64 + NR1 - 1) / NR1,
+        (params.m as u64 + nr1 - 1) / nr1,
         (params.n as u64 + NR0 - 1) / NR0,
         params.src1_batch as u64,
     );
@@ -189,7 +217,7 @@ pub fn dense_matmul_bf16_f32_tensor(
             (2, KernelArg::Buffer(src1)),
             (3, KernelArg::Buffer(dst)),
         ],
-        &[(0, SHMEM_BYTES)],
+        &[(0, shmem_bytes)],
         threadgroups,
         threads_per_tg,
     );

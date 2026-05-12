@@ -203,6 +203,11 @@ impl KernelRegistry {
         let dense_mm_bf16_tensor_src: &'static str =
             include_str!("shaders/dense_mm_bf16_tensor.metal");
         sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
+        // ADR-029 iter-80 H60: V2 large-tile variant (NRA=64, NRB=128).
+        // Same source file (`dense_mm_bf16_tensor.metal`) — second host_name
+        // entry resolves to the V2 kernel appended at the bottom of that
+        // file. Picked at dispatch time when HF2Q_LARGE_TILE_MM=1.
+        sources.insert("hf2q_dense_mm_bf16_f32_tensor_v2".into(), dense_mm_bf16_tensor_src);
 
         // Dense f32×f32 → f32 tensor-API matmul (F32-everywhere
         // sibling of dense_mm_bf16_tensor).  Used by hf2q's ADR-005
