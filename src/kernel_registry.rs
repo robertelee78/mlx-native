@@ -949,6 +949,15 @@ impl KernelRegistry {
         let peer_port_src: &'static str = include_str!("shaders/flash_attn_vec_peer_port_f16.metal");
         sources.insert("flash_attn_vec_peer_port_f16_dk256_dv256".into(), peer_port_src);
 
+        // ADR-029 iter-134: peer reduce kernel (verbatim port of ggml-metal.metal 7235-7275).
+        // Pairs with a future NWG=32 vec kernel to match peer's actual runtime dispatch.
+        let peer_port_reduce_src: &'static str =
+            include_str!("shaders/flash_attn_vec_peer_port_f16_reduce.metal");
+        sources.insert(
+            "flash_attn_vec_peer_port_f16_reduce_dv256_nwg32".into(),
+            peer_port_reduce_src,
+        );
+
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);
