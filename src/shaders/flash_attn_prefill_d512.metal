@@ -670,17 +670,19 @@ void flash_attn_prefill_d512_impl(
         // DK=512 → DK8=64, DK8/2=32 matmul iterations.  Mirrors
         // ggml-metal.metal:6040-6058 (DK%16==0 path).
         //
-        // ADR-029 iter-44 (H41) FALSIFIED 2026-05-11: tried
-        // `#pragma unroll (MIN(DK8/2, 4*NSG))` to mirror peer's adaptive
-        // full-unroll at NSG=8 — regressed +6.7% at 4K and +10.2% at
-        // 8K per FA_GL call.  Register pressure from full unroll dropped
-        // occupancy at our `so` = f32 accumulator (we keep f32 for byte-
-        // ident output; peer's bf16-FA_TYPES_BF route uses half so).
-        // Per-iter-44 `#pragma unroll(4)` stays — it is empirically the
-        // best partial unroll factor for our register budget at
-        // (DK=512, NSG=8, so=f32).  Peer's pattern doesn't directly
-        // transfer because the o_t dtype delta changes register usage.
-        // See ADR-029 iter-44 for measured numbers.
+        // ADR-029 iter-44 (H41) FALSIFIED + iter-47 (H43) sweep falsified:
+        // tested unroll factors {4, 8, 16, 32} at 4K thermal-stable bench.
+        // FA_GL ms/call at 4K:
+        //   unroll(4)  = 34.30 (baseline)
+        //   unroll(8)  = 34.11 (-0.6%, within sigma — not worth defaulting)
+        //   unroll(16) = 35.85 (+4.5% regression)
+        //   unroll(32) = 36.64 (+6.7% regression, full unroll = peer's MIN(DK8/2, 4*NSG))
+        // Beyond 8 the register pressure rises and FA_GL slows monotonically.
+        // unroll(4) stays as the empirical sweet spot for our register budget
+        // at (DK=512, NSG=8, so=f32). Peer's MIN(...) formula does NOT
+        // transfer because their FA_TYPES_BF uses half-o_t (lower register
+        // pressure); the FA_TYPES f32-o_t path on peer at NSG=8 isn't
+        // benchmarked separately. See ADR-029 iters 44 and 47 for details.
         #pragma unroll(4)
         for (short i = 0; i < DK8 / 2; ++i) {
           simdgroup_barrier(mem_flags::mem_none);
