@@ -902,6 +902,18 @@ void flash_attn_prefill_d512_impl(
 
         constexpr short NC = (C / 8) / 2;  // 4
 
+        // ADR-029 iter-49 H45 FALSIFIED: tried `#pragma unroll(2)` on this
+        // outer cc loop to mirror iter-44's reduced-register-pressure win
+        // on the QK loop.  Bench: FA_GL 33.74 → 35.01 ms/call at 4K =
+        // +3.8% regression.  Mechanism: unlike QK where unroll(4) lets
+        // the compiler schedule 4 inner iterations as ILP groups, the OV
+        // outer cc loop's 4 iterations × 4 inner ii × 4 MMAs/inner = 64
+        // simdgroup MMA ops per chunk benefit from FULL unroll because
+        // they share the same `lo[NO]` accumulator registers — Metal's
+        // compiler hoists the lo[] live-range across the entire chunk
+        // and schedules MMAs/loads bidirectionally.  Partial unroll
+        // breaks that hoist + forces lo[] register refills at each outer
+        // boundary.  FOR_UNROLL stays.
         FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
           simdgroup_matrix<float, 8, 8> vs[2];
           simdgroup_load(vs[0], ss + 16 * cc + 0, SH, 0, false);
