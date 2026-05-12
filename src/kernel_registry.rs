@@ -254,6 +254,10 @@ impl KernelRegistry {
         let scale_mask_softmax_src: &'static str =
             include_str!("shaders/scale_mask_softmax.metal");
         sources.insert("scale_mask_softmax_f32".into(), scale_mask_softmax_src);
+        // ADR-029 iter-93 H71: float4-vectorized variant for peer parity
+        // with kernel_soft_max_f32_4. Same source file; v4 host_name resolves
+        // to the second kernel appended at the bottom of scale_mask_softmax.metal.
+        sources.insert("scale_mask_softmax_f32_v4".into(), scale_mask_softmax_src);
 
         // Expert-routed (MoE) quantized matmul kernel (Story 2.1)
         sources.insert(

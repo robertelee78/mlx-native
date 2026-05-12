@@ -93,8 +93,20 @@ pub fn dispatch_scale_mask_softmax_f32(
         )));
     }
 
+    // ADR-029 iter-93 H71: route to float4-vectorized v4 kernel when env
+    // HF2Q_SOFTMAX_V4=1 AND cols % 4 == 0 (vector alignment requirement).
+    // Default OFF until coherence + thermal-fair bench parity proven.
+    let use_v4 = (params.cols % 4 == 0) && match std::env::var("HF2Q_SOFTMAX_V4").as_deref() {
+        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("yes") | Ok("YES") => true,
+        _ => false,
+    };
+    let kernel_name = if use_v4 {
+        "scale_mask_softmax_f32_v4"
+    } else {
+        "scale_mask_softmax_f32"
+    };
     let pipeline = registry
-        .get_pipeline("scale_mask_softmax_f32", device.metal_device())?;
+        .get_pipeline(kernel_name, device.metal_device())?;
 
     let gpu_params = ScaleMaskSoftmaxGpuParams {
         cols: params.cols,
