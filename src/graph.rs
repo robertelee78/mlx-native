@@ -1746,6 +1746,45 @@ impl<'a> GraphSession<'a> {
         Ok(fusions)
     }
 
+    /// Async-commit variant of `finish_with_fusion`.
+    ///
+    /// Runs the fusion pass on the captured graph, replays the fused
+    /// graph into a fresh command buffer, then commits *without waiting*
+    /// (fire-and-forget — GPU executes asynchronously while CPU returns).
+    /// Mirrors `commit()` semantics, plus the fusion optimization pass.
+    ///
+    /// Used by the prefill per-layer pattern where the next layer's CPU
+    /// encoding should overlap with this layer's GPU execution — peer's
+    /// llama.cpp Metal backend uses the same async-commit-with-graph-opt
+    /// pattern at `ggml-metal-context.m:617-621`.
+    ///
+    /// In direct-dispatch mode (recording=false), behaves identically to
+    /// `commit()`: no fusion happens, just an async commit.
+    ///
+    /// Consumes the session.  Returns `(encoder, fusions_applied)`.
+    ///
+    /// ADR-029 iter-39 H40 — first step of graph_opt port to prefill.
+    pub fn commit_with_fusion(
+        mut self,
+        registry: &mut KernelRegistry,
+        device: &metal::DeviceRef,
+    ) -> Result<(CommandEncoder, u32)> {
+        let mut fusions = 0;
+        if self.recording {
+            if let Some(nodes) = self.encoder.take_capture() {
+                let mut graph = ComputeGraph::from_nodes(nodes);
+                fusions = graph.fuse(registry, device)?;
+                graph.encode_sequential(&mut self.encoder);
+            }
+        }
+        self.encoder.commit();
+        // Close the metal_capture window after commit (same pattern as `commit`).
+        if let Some(mut cap) = self.metal_capture.take() {
+            cap.end();
+        }
+        Ok((self.encoder, fusions))
+    }
+
     /// Finish with fusion and split timing.
     ///
     /// Like `finish_with_timing` but runs the fusion pass first.
