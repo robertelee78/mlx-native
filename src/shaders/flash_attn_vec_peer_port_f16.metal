@@ -25,7 +25,9 @@ using namespace metal;
 #define C           32
 #define PAD2(x, n)  (((x) + (n) - 1) & ~((n) - 1))
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-#define MAXHALF 65504.0h
+// MAXHALF: Metal stdlib defines __HALF_MAX__ (= 65504.0h) in metal_types.h.
+// Use it directly to avoid redefinition warning.
+#define MAXHALF __HALF_MAX__
 
 // FA_TYPES expansion for f16/f16 (peer ggml-metal.metal line 7101-7107):
 //   q_t=half4, k_t=half4, v_t=half4, qk_t=float, s_t=float, s4_t=float4, o4_t=float4.
@@ -41,9 +43,11 @@ typedef float  s_t;
 typedef float4 s4_t;
 typedef float4 o4_t;
 
-// is_same<T,U>::value — compile-time type equality (used verbatim in peer body).
-template<typename T, typename U> struct is_same       { static constexpr bool value = false; };
-template<typename T>             struct is_same<T, T> { static constexpr bool value = true;  };
+// is_same<T,U>::value — peer uses this construct verbatim (peer ggml-metal.metal uses
+// its own definition; Metal stdlib provides metal::is_same via <metal_stdlib> +
+// `using namespace metal`. We use the stdlib version directly — equivalent semantics,
+// avoids ambiguity with the global-scope redeclaration that conflicts in Metal 32023+.)
+// No local redefinition needed: metal::is_same<T,U>::value is already in scope.
 
 // Params struct — GPU layout matches FlashAttnVecPeerPortParamsGpu in Rust dispatcher.
 // 9 fields × 4 bytes = 36 bytes.

@@ -208,7 +208,7 @@ mod tests {
             }
         }
 
-        let weight = device
+        let mut weight = device
             .alloc_buffer(src.len(), DType::U8, vec![src.len()])
             .expect("alloc src");
         weight
