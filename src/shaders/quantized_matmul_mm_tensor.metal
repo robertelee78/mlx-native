@@ -594,11 +594,20 @@ kernel void hf2q_mul_mm_tensor_v2_impl(
                 half4x4 temp_a;
                 dequantize_func(row_ptr + block_idx, il, temp_a);
 
+                // ADR-029 iter-61 H50: add #pragma unroll(full) to mirror peer's
+                // FOR_UNROLL at ggml-metal.metal:9403.  iter-34 H36 + iter-55 H47
+                // tested this on mm_id (FALSIFIED both times — Metal compiler
+                // auto-unrolls there).  This is the FIRST test on V2 dense
+                // mm-tensor.  Falsifier: bench HF2Q_F16_SHADOW=0 at pp4096
+                // (exercises the direct-Q6_K V2 path); expected if real, delta
+                // ≥ +5% t/s vs baseline 2607.4.
+                #pragma clang loop unroll(full)
                 for (short i = 0; i < 16; i++) {
                     sa[row * N_MM_NK_TOTAL + (k_base + i)] =
                         (k_pos + i < K) ? temp_a[i / 4][i % 4] : (half)0;
                 }
             } else {
+                #pragma clang loop unroll(full)
                 for (short i = 0; i < 16; i++) {
                     sa[row * N_MM_NK_TOTAL + (k_base + i)] = (half)0;
                 }
@@ -699,11 +708,14 @@ kernel void hf2q_mul_mm_tensor_v2_f16_impl(
             if (ra + row < M_peer) {
                 device const half * row_ptr =
                     (device const half *)(srcA + args.nb01 * (ra + row) + offset0);
+                // ADR-029 iter-61 H50 (F16-shadow variant): same FOR_UNROLL fix
+                #pragma clang loop unroll(full)
                 for (short i = 0; i < 16; i++) {
                     sa[row * N_MM_NK_TOTAL + (k_base + i)] =
                         (k_pos + i < K) ? row_ptr[k_pos + i] : (half)0;
                 }
             } else {
+                #pragma clang loop unroll(full)
                 for (short i = 0; i < 16; i++) {
                     sa[row * N_MM_NK_TOTAL + (k_base + i)] = (half)0;
                 }
