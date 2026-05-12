@@ -331,9 +331,26 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        // Stage A.  See dense mm_tensor kernel preamble for the
-        // explanation of why we DO NOT add llama.cpp's FOR_UNROLL pragma
-        // here on M5 — null measured effect, P4.8 attempt 2026-04-19.
+        // Stage A.
+        //
+        // ADR-029 iter-55 H47 FALSIFIED 2026-05-11: tested adding
+        // `#pragma clang loop unroll(full)` here to mirror peer's
+        // FOR_UNROLL at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9903.
+        // Bench (post-H44+H46 baseline, 4K + 8K warmup-then-real):
+        //   4K MOE_GATE_UP: 10.61 → 10.65 ms/call (+0.4%, σ)
+        //   4K MOE_DOWN:    9.82  → 9.83  ms/call (+0.1%, σ)
+        //   8K MOE_GATE_UP: 20.58 → 20.56 ms/call (-0.1%, σ)
+        //   8K MOE_DOWN:    19.08 → 19.09 ms/call (+0.1%, σ)
+        //   4K wall:        1549  → 1551 ms (+0.1%, σ)
+        //   8K wall:        3307  → 3307 ms (0%, σ)
+        // ALL WITHIN σ on both regimes.  Deep-research hypothesis was
+        // that mm_id's extra pre-loop live registers (id, i11, i12,
+        // offset0, offset1, ids_i32) inhibit Metal's auto-unroll
+        // heuristic — measurement falsifies this.  Metal compiler
+        // already auto-unrolls regardless of register pressure here.
+        // The original P4.8-null-effect comment direction was correct
+        // even though the cited measurement was on the dense path;
+        // iter-55 confirms mm_id has the same null effect.
         {
             half4x4 temp_a;
             dequantize_func(x, il, temp_a);
