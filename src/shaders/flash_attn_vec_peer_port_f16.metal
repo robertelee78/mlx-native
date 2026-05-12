@@ -44,6 +44,11 @@ using namespace metal;
 #define FC_flash_attn_ext_vec_has_scap  0
 #define FC_flash_attn_ext_vec_has_kvpad 0
 
+// Peer NS10/NS20 element-strides (peer FA_TYPES: NS10=nb11/nb10, NS20=nb21/nb20).
+// For f16-K + f16-V at DK=DV=256: NS10 = DK, NS20 = DV. Preserved symbolically per RULE-1.
+#define NS10 DK
+#define NS20 DV
+
 // No-op stub helpers for dead else-branches under is_same<kd4_t,k4_t> guards.
 // The compiler DCEs these when the f16 fast-path branch is taken (is_same resolves true).
 // Stubs keep the call sites lexically valid so the source remains structurally identical to peer.
@@ -155,8 +160,8 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
 
         // Peer lines 6728-6729: k += ikv2*nb12 + ikv3*nb13; v += ikv2*nb22 + ikv3*nb23
         // nb12 = kv_capacity*DK*sizeof(half) bytes; our k is half* so offset = ikv2*kv_capacity*DK halfs.
-        k += (uint)ikv2 * params.kv_capacity * DK;
-        v += (uint)ikv2 * params.kv_capacity * DV;
+        k += (uint)ikv2 * params.kv_capacity * NS10;
+        v += (uint)ikv2 * params.kv_capacity * NS20;
     }
 
     // load heads from Q to shared memory — verbatim peer lines 6733-6743.
@@ -238,15 +243,11 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                 continue;
             }
 
-            // Q*K^T — verbatim peer lines 6824-6900
             {
-                // Peer: pk4 = (device const k4_t *) (k + ic*args.nb11)
-                // k is half*, ic*nb11 bytes = ic*DK halfs → ic*DK/4 half4 elements.
-                device      const k4_t * pk4 = (device const k4_t *) (k + (uint)ic*DK);
+                device      const k4_t * pk4 = (device const k4_t *) (k + (uint)ic*NS10);
                 threadgroup const q4_t * pq4 = sq4;
 
-                // Peer: pk4 += ty*NS10/4 + tx; NS10=DK → ty*DK/4 + tx
-                pk4 += ty*(DK/4) + tx;
+                pk4 += ty*NS10/4 + tx;
                 pq4 += tx;
 
                 qk_t mqk[C/NE] = { [0 ... C/NE - 1] = 0.0f };
@@ -255,13 +256,10 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     if (is_same<kd4_t, k4_t>::value) {
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            // Peer: pk4[cc*NE*NS10/4 + ii*NL]; NS10=DK, NE=1 → pk4[cc*DK4 + ii*NL]
-                            mqk[cc] += dot((float4) pk4[cc*NE*(DK/4) + ii*NL], (float4) pq4[ii*NL]);
+                            mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 + ii*NL], (float4) pq4[ii*NL]);
                         }
                     } else {
-                        // Dead else-branch (kd4_t==k4_t==half4 at f16): structurally identical
-                        // to peer source per spec note 3. Compiler DCEs via is_same fold.
-                        device const kd4_t * pk = (device const kd4_t *) (k + ((uint)(ic + NE*cc + ty)*DK));
+                        device const kd4_t * pk = (device const kd4_t *) (k + ((uint)(ic + NE*cc + ty)*NS10));
 
                         k4_t mk;
 
@@ -277,7 +275,7 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                     if (NE == 1) {
                         mqk[cc] = simd_sum(mqk[cc]);
                     } else {
-                        // simdgroup reduce (NE=4) — dead at NE=1, kept verbatim
+                        // simdgroup reduce
                         // [ 0 ..  7] -> [ 0]
                         // [ 8 .. 15] -> [ 8]
                         // [16 .. 23] -> [16]
@@ -303,7 +301,6 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                     }
                 }
 
-                // verbatim peer lines 6882-6900: FC macros resolve at file header.
                 if (FC_flash_attn_ext_vec_has_mask &&
                    !FC_flash_attn_ext_vec_has_scap &&
                    !FC_flash_attn_ext_vec_has_bias) {
@@ -312,7 +309,7 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                     mqk[tx] *= params.scale;
 
                     if (FC_flash_attn_ext_vec_has_scap) {
-                        mqk[tx] = params.scale*precise::tanh(mqk[tx]); // args.logit_softcap→params.scale (dead branch: has_scap=0)
+                        mqk[tx] = params.scale*precise::tanh(mqk[tx]);
                     }
 
                     if (FC_flash_attn_ext_vec_has_bias) {
@@ -327,7 +324,6 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
 
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
-            // online softmax — verbatim peer lines 6906-6926
             {
                 const float m = M;
                 const float s = ss[tiisg];
@@ -352,7 +348,6 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
 
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
-            // O = O + (Q*K^T)*V — verbatim peer lines 6930-7006
             {
                 o4_t lo[DV4/NL];
                 FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
@@ -360,26 +355,20 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                 }
 
                 if (is_same<vd4_t, v4_t>::value) {
-                    // Peer: pv4 = (device const v4_t *) (v + ic*args.nb21)
-                    // v is half*, ic*nb21 bytes = ic*DV halfs → ic*DV/4 v4_t elements.
-                    device const v4_t * pv4 = (device const v4_t *) (v + (uint)ic*DV);
+                    device const v4_t * pv4 = (device const v4_t *) (v + (uint)ic*NS20);
 
-                    // Peer: pv4 += ty*NS20/4 + tx; NS20=DV → ty*DV/4 + tx
-                    pv4 += ty*(DV/4) + tx;
+                    pv4 += ty*NS20/4 + tx;
 
                     const auto sst = ss + ty;
 
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
-                            // Peer: pv4[cc*NE*NS20/4 + ii*NL]; NS20=DV, NE=1 → pv4[cc*DV4 + ii*NL]
-                            lo[ii] += o4_t(float4(pv4[cc*NE*(DV/4) + ii*NL])*float4(sst[cc*NE]));
+                            lo[ii] += o4_t(float4(pv4[cc*NE*NS20/4 + ii*NL])*float4(sst[cc*NE]));
                         }
                     }
                 } else {
-                    // Dead else-branch (vd4_t==v4_t==half4 at f16): structurally identical
-                    // to peer source per spec note 3. Compiler DCEs via is_same fold.
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((uint)(ic + NE*cc + ty)*DV));
+                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((uint)(ic + NE*cc + ty)*NS20));
 
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                             const short i = ii*NL + tx;
