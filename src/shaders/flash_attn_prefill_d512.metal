@@ -78,10 +78,38 @@
 //     approach via `align_K=false` + `kL_rem`).  llama.cpp `:5725, :5914-5949`.
 //   - Broadcast mask (`FC_flash_attn_ext_bc_mask`): mask broadcast across
 //     Q-rows.  Not used by our dispatcher.  llama.cpp `:5727, :5969-5970`.
-//   - Per-tile pre-pass skip (`blk`): llama.cpp's `flash_attn_ext_blk`
-//     writes a `{0,1,2}` bitmap per KV chunk letting the prefill skip
-//     all-masked or pass-through chunks.  Deferred to Phase 4.  We treat
-//     every chunk as `blk_cur = 1` (full mask).  llama.cpp `:5775, :5951-6005`.
+//   (no exclusions remain in this list — all Phase-2..4 deltas have landed)
+//
+// ## Tile-skip pre-pass (`blk`) — LANDED Wave 2E (Phase 4)
+//
+// llama.cpp's `flash_attn_ext_blk` writes a `{0,1,2}` bitmap per KV chunk
+// letting the prefill skip all-masked or pass-through chunks.  The port
+// for D=256 (sliding) and D=512 (global) is wired and unconditional in
+// production:
+//
+//   - Pre-pass kernel: `/opt/mlx-native/src/shaders/flash_attn_prefill_blk.metal`
+//     (267 LOC, faithful port of llama.cpp `kernel_flash_attn_ext_blk`).
+//   - Pre-pass dispatcher: `/opt/mlx-native/src/ops/flash_attn_prefill_blk.rs`
+//     (505 LOC, `dispatch_flash_attn_prefill_blk`).
+//   - Main-kernel consumption: this file lines 546-552 (`continue` on
+//     `blk_cur == 0`) + line 566 (skip mask load on `blk_cur == 2`) +
+//     line 726 (skip mask-add inside softmax on `blk_cur == 2`).
+//   - Production wiring (hf2q): `forward_prefill_batched.rs:679-702`
+//     dispatches the blk pre-pass for both sliding + global masks every
+//     prefill setup; the D=512 FA call at `:1247-1264` passes
+//     `Some(&blk_global)` unconditionally.
+//   - Dispatcher fc-gate: `flash_attn_prefill_d512.rs:443,498` reads
+//     `has_blk = blk.is_some()` and sets function constant 303.
+//
+// The earlier "Deferred to Phase 4" note that lived here was stale
+// (Phase 4 landed during the 2026-04 Wave 2E push; the file-level
+// comment was never refreshed).  Tile-skip is part of the production
+// hot path measured by `HF2Q_PROFILE_BUCKETS=1`.  ADR-029 iter-44
+// (2026-05-11) refreshed this comment after the operator surfaced the
+// stale claim during the FA_GL super-linear smoking-gun investigation.
+//
+// References: llama.cpp `ggml-metal.metal:5700-5752, 5985-6015`;
+// ADR-011-phase2-port-tile-skip.md; ADR-011-phase2-wave2e-tile-skip-verification.md.
 //
 // ## Numerical regime — identical to the D=256 kernel
 //
@@ -140,6 +168,13 @@ using namespace metal;
 
 // `FOR_UNROLL` mirrors llama.cpp's macro at ggml-metal.metal:26.
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+
+// `MIN` matches llama.cpp's macro at ggml-metal.metal:21 — used to mirror
+// peer's adaptive unroll count for the QK inner loop (see line near
+// "#pragma unroll (MIN(DK8 / 2, 4 * NSG))" below).  Compile-time eval'd.
+#ifndef MIN
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#endif
 
 // ──────────────────────────────────────────────────────────────────────────
 // Common structs (same ABI as flash_attn_prefill.metal)
@@ -634,6 +669,18 @@ void flash_attn_prefill_d512_impl(
 
         // DK=512 → DK8=64, DK8/2=32 matmul iterations.  Mirrors
         // ggml-metal.metal:6040-6058 (DK%16==0 path).
+        //
+        // ADR-029 iter-44 (H41) FALSIFIED 2026-05-11: tried
+        // `#pragma unroll (MIN(DK8/2, 4*NSG))` to mirror peer's adaptive
+        // full-unroll at NSG=8 — regressed +6.7% at 4K and +10.2% at
+        // 8K per FA_GL call.  Register pressure from full unroll dropped
+        // occupancy at our `so` = f32 accumulator (we keep f32 for byte-
+        // ident output; peer's bf16-FA_TYPES_BF route uses half so).
+        // Per-iter-44 `#pragma unroll(4)` stays — it is empirically the
+        // best partial unroll factor for our register budget at
+        // (DK=512, NSG=8, so=f32).  Peer's pattern doesn't directly
+        // transfer because the o_t dtype delta changes register usage.
+        // See ADR-029 iter-44 for measured numbers.
         #pragma unroll(4)
         for (short i = 0; i < DK8 / 2; ++i) {
           simdgroup_barrier(mem_flags::mem_none);
