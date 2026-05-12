@@ -1,7 +1,7 @@
 // flash_attn_vec_peer_port_f16.metal — Verbatim port of llama.cpp kernel_flash_attn_ext_vec
 // for f16-K / f16-V, DK=DV=256, NWG=1, NSG=1, NE=1.
 //
-// ADR-029 CFA cfa-20260512-fa-peer-port (iter-122).
+// ADR-029 CFA cfa-20260512-fa-peer-port (iter-125 redo).
 // Peer source: /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal lines 6666-7096.
 // Hypothesis: verbatim peer source body produces peer-equivalent PSO from Apple compiler.
 //
@@ -13,8 +13,10 @@
 //       writing to same slot sm[tiisg]; skip block verbatim.
 //   (c) Buffer slots: 0=params, 1=Q(float*), 2=K_f16(half*), 3=V_f16(half*), 4=dst(float*)
 //       k/v buffers typed as half* so byte arithmetic converted to element arithmetic.
-//   (d) FC flags baked: NWG=1, NSG=1, NE=1, has_mask=1(inline), has_sinks=0,
-//       has_bias=0, has_scap=0, has_kvpad=0 — unreachable branches physically deleted.
+//   (d) FC flags baked via file-header constexpr/defines (RULE-1: preserve symbolic names
+//       in live expressions): NWG=1, NSG=1, NE=1, has_mask=1(inline), has_sinks=0,
+//       has_bias=0, has_scap=0, has_kvpad=0. Unreachable branches physically deleted;
+//       symbolic names kept in live expressions per standing rule.
 // Kernel body VERBATIM otherwise: loop structure, FOR_UNROLL, simd_shuffle_down
 // ladder, online-softmax, V-loop, store formula all unchanged.
 
@@ -28,6 +30,25 @@ using namespace metal;
 // MAXHALF: Metal stdlib defines __HALF_MAX__ (= 65504.0h) in metal_types.h.
 // Use it directly to avoid redefinition warning.
 #define MAXHALF __HALF_MAX__
+
+// FC-bake constants — preserve symbolic names in live expressions per RULE-1.
+// MSL does not allow program-scope constexpr short; use #define macros so the body
+// source remains lexically identical to peer's symbolic references.
+#define NWG 1
+#define NSG 1
+#define nl_k 1      // peer FA_TYPES for f16/f16: nl_k template param = 1
+#define nl_v 1      // peer FA_TYPES for f16/f16: nl_v template param = 1
+#define FC_flash_attn_ext_vec_has_mask  1
+#define FC_flash_attn_ext_vec_has_sinks 0
+#define FC_flash_attn_ext_vec_has_bias  0
+#define FC_flash_attn_ext_vec_has_scap  0
+#define FC_flash_attn_ext_vec_has_kvpad 0
+
+// No-op stub helpers for dead else-branches under is_same<kd4_t,k4_t> guards.
+// The compiler DCEs these when the f16 fast-path branch is taken (is_same resolves true).
+// Stubs keep the call sites lexically valid so the source remains structurally identical to peer.
+template <typename T> inline void deq_k_t4(device const T*, short, thread half4& out) { out = half4(0); }
+template <typename T> inline void deq_v_t4(device const T*, short, thread half4& out) { out = half4(0); }
 
 // FA_TYPES expansion for f16/f16 (peer ggml-metal.metal line 7101-7107):
 //   q_t=half4, k_t=half4, v_t=half4, qk_t=float, s_t=float, s4_t=float4, o4_t=float4.
@@ -81,12 +102,11 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
     static_assert(DK % 32 == 0, "DK must be divisible by 32");
     static_assert(DV % 32 == 0, "DV must be divisible by 32");
 
-    // NWG=1, NSG=1, NE=1 baked in (FC flags).
-    // Peer line 6688: iwg = tgpig[2]%NWG — at NWG=1, iwg=0.
-    const short iwg = 0;
+    // Peer line 6688: iwg = tgpig[2]%NWG. NWG constexpr=1 at file header.
+    const short iwg = tgpig[2]%NWG;
 
     // Peer lines 6690-6692.
-    const ushort iq3 = tgpig[2]; // /NWG = /1
+    const ushort iq3 = tgpig[2]/NWG;
     const ushort iq2 = tgpig[1];
     const ushort iq1 = tgpig[0];
 
@@ -100,23 +120,19 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
     constexpr short PV4 = PV/4;            // = 64
 
     constexpr short NW  = N_SIMDWIDTH;     // = 32
-    constexpr short NE  = 1;              // baked
-    constexpr short NL  = NW/NE;          // = 32
-    constexpr short SH  = 4*C;            // = 128 (shared memory per simdgroup)
+    constexpr short NE  = 1;               // baked (NE_FC at file header; NE local for body expressions)
+    constexpr short NL  = NW/NE;           // = 32
+    constexpr short SH  = 4*C;             // = 128 (shared memory per simdgroup)
 
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
-    // Shared memory layout — verbatim peer lines 6713-6717, with NSG=1 baked.
-    // sq4: [0, PK)          — query as q4_t (half4)
-    // ss:  [PK, PK+SH)      — score scratch (sgitg=0 only, NSG=1)
-    // sm:  [PK+2*C, PK+SH)  — mask scratch (within ss, offset 2*C halfs)
-    // so4: [PK+SH, PK+SH+2*PV) — output accumulator (sgitg=0 only, NSG=1)
+    // Shared memory layout — verbatim peer lines 6713-6717, with NSG constexpr=1.
     threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK);
-    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + 1*PK);
-    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + 1*PK);
-    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + 1*PK);
-    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + 1*PK + 1*SH);
+    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK);
+    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK);
+    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK);
+    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH);
 
     // store the result for all queries in shared memory (the O matrix from the paper)
     // verbatim peer line 6720
@@ -176,7 +192,6 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
         const short tx = tiisg%NL;
         const short ty = tiisg/NL;
 
-        // Peer line 6766: pm pointer — replaced by inline mask (adaptation b).
         // Peer line 6768: slope=1.0f (has_bias=0 baked).
         float slope = 1.0f;
         (void)slope;  // unused at has_bias=0; kept for structural parity
@@ -189,14 +204,9 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
             window_start_logical = params.kv_seq_len - params.sliding_window;
         }
 
-        // NS10: strides-in-elements for K. Peer: NS10 = nb11/nb10 = (DK*2)/2 = DK.
-        // NS20: strides-in-elements for V. Peer: NS20 = nb21/nb20 = (DV*2)/2 = DV.
-        // These drive pk4/pv4 pointer arithmetic inside the loop (verbatim peer).
-
-        // loop over the KV cache — verbatim peer line 6782, NWG=1/NSG=1 baked.
-        // Peer: for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)
-        // At NWG=1, NSG=1: for (int ic0 = 0; ; ic0 += 1)
-        for (int ic0 = 0; ; ic0 += 1) {
+        // loop over the KV cache — verbatim peer line 6782.
+        // NWG/NSG/iwg/sgitg all resolve from file-header constexpr declarations.
+        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
             int ic = ic0*C;
             if (ic >= (int)params.kv_seq_len) {   // args.ne11 = kv_seq_len
                 break;
@@ -207,7 +217,7 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
             // Adaptation (b): inline mask writing to sm[tiisg].
             // Replaces peer lines 6814-6816 (has_mask=1 external load).
             // Sliding-window ring-buffer logic from flash_attn_vec_hybrid.metal:506-519.
-            {
+            if (FC_flash_attn_ext_vec_has_mask) {
                 uint k_pos = (uint)ic + (uint)tiisg;
                 half mask_val = (half)0.0f;
                 if (k_pos >= params.kv_seq_len) {
@@ -249,17 +259,16 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                             mqk[cc] += dot((float4) pk4[cc*NE*(DK/4) + ii*NL], (float4) pq4[ii*NL]);
                         }
                     } else {
-                        // Dead branch at compile time (kd4_t==k4_t==half4) — kept verbatim
-                        // per RULE-1 (compiler dead-code-eliminates this path).
+                        // Dead else-branch (kd4_t==k4_t==half4 at f16): structurally identical
+                        // to peer source per spec note 3. Compiler DCEs via is_same fold.
                         device const kd4_t * pk = (device const kd4_t *) (k + ((uint)(ic + NE*cc + ty)*DK));
 
                         k4_t mk;
-                        const short nl_k = 1;
 
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             const short i = ii*NL + tx;
 
-                            (void)mk; (void)pk; (void)nl_k; (void)i;
+                            deq_k_t4(pk + i/nl_k, i%nl_k, mk);
 
                             mqk[cc] += dot((float4) mk, (float4) sq4[i]);
                         }
@@ -269,6 +278,10 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                         mqk[cc] = simd_sum(mqk[cc]);
                     } else {
                         // simdgroup reduce (NE=4) — dead at NE=1, kept verbatim
+                        // [ 0 ..  7] -> [ 0]
+                        // [ 8 .. 15] -> [ 8]
+                        // [16 .. 23] -> [16]
+                        // [24 .. 31] -> [24]
                         if (NE <= 1) {
                             mqk[cc] += simd_shuffle_down(mqk[cc], 16);
                         }
@@ -290,11 +303,25 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                     }
                 }
 
-                // has_mask=1, has_scap=0, has_bias=0 → fast path — verbatim peer lines 6882-6885.
-                if (true &&
-                   true &&
-                   true) {
+                // verbatim peer lines 6882-6900: FC macros resolve at file header.
+                if (FC_flash_attn_ext_vec_has_mask &&
+                   !FC_flash_attn_ext_vec_has_scap &&
+                   !FC_flash_attn_ext_vec_has_bias) {
                     ss[NE*tx + ty] = fma(mqk[tx], params.scale, (qk_t) sm[NE*tx + ty]);
+                } else {
+                    mqk[tx] *= params.scale;
+
+                    if (FC_flash_attn_ext_vec_has_scap) {
+                        mqk[tx] = params.scale*precise::tanh(mqk[tx]); // args.logit_softcap→params.scale (dead branch: has_scap=0)
+                    }
+
+                    if (FC_flash_attn_ext_vec_has_bias) {
+                        mqk[tx] += (qk_t) sm[NE*tx + ty]*slope;
+                    } else {
+                        mqk[tx] += (qk_t) sm[NE*tx + ty];
+                    }
+
+                    ss[NE*tx + ty] = mqk[tx];
                 }
             }
 
@@ -349,7 +376,8 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                         }
                     }
                 } else {
-                    // Dead branch at compile time (vd4_t==v4_t==half4) — kept verbatim.
+                    // Dead else-branch (vd4_t==v4_t==half4 at f16): structurally identical
+                    // to peer source per spec note 3. Compiler DCEs via is_same fold.
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         device const vd4_t * pv4 = (device const vd4_t *) (v + ((uint)(ic + NE*cc + ty)*DV));
 
@@ -357,9 +385,7 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
                             const short i = ii*NL + tx;
 
                             v4_t mv;
-                            const short nl_v = 1;
-
-                            (void)mv; (void)pv4; (void)nl_v; (void)i;
+                            deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
 
                             lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
                         }
@@ -424,37 +450,9 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // parallel reduce — verbatim peer lines 7039-7066, NSG=1 baked.
-    // At NSG=1: r starts at 0, loop body never executes (dead code).
-    // Kept verbatim per RULE-1 (compiler eliminates at NSG=1).
-    for (short r = 1/2; r > 0; r >>= 1) {
-        if (sgitg < r) {
-            const float S0 = ss[           0];
-            const float S1 = ss[r*(SH/2) + 0];
-
-            const float M0 = ss[           1];
-            const float M1 = ss[r*(SH/2) + 1];
-
-            const float M = max(M0, M1);
-
-            const float ms0 = exp(M0 - M);
-            const float ms1 = exp(M1 - M);
-
-            const float S = S0*ms0 + S1*ms1;
-
-            if (tiisg == 0) {
-                ss[0] = S;
-                ss[1] = M;
-            }
-
-            // O_0 = diag(ms0)*O_0 + diag(ms1)*O_1
-            for (short i = tiisg; i < DV4; i += NW) {
-                so4[i] = so4[i]*ms0 + so4[i + r*PV4]*ms1;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    // parallel reduce block (peer lines 7039-7066) PHYSICALLY OMITTED per spec notes 1 + invariant 9:
+    // NSG=1 makes the block dead code; spec requires physical deletion, not dead-code retention.
+    // After deletion, kernel goes directly to the final rescale + store block.
 
     // final rescale with 1/S and store to global memory — verbatim peer lines 7069-7090
     if (sgitg == 0) {
@@ -464,21 +462,22 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
         const int64_t rid   = iq3*params.num_heads*1 + iq2 + iq1*1;
 
         device float4 * dst4 = (device float4 *) dst;
-        device float  * dst1 = (device float  *) dst + nrows*DV*1; // NWG=1
+        device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
 
-        // NWG=1: 1/ss[0] (peer line 7076)
-        const float S = (1 == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f);
+        // verbatim peer line 7076: NWG constexpr=1 at file header; expression preserved.
+        const float S = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
 
-        // interleave the workgroup data — verbatim peer line 7080; NWG=1, iwg=0 baked.
+        // interleave the workgroup data — verbatim peer line 7080.
+        // NWG/iwg constexpr at file header; expression preserved per spec store_lines.
         for (short i = tiisg; i < DV4; i += NW) {
-            dst4[rid*DV4*1 + 1*i + 0] = (float4) so4[i]*S;
+            dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
         }
 
-        // store S and M — verbatim peer lines 7084-7089; NWG=1 → if (1>1) never taken.
-        if (1 > 1) {
+        // store S and M — verbatim peer lines 7084-7089; NWG constexpr=1 → compiler DCEs.
+        if (NWG > 1) {
             if (tiisg == 0) {
-                dst1[rid*(2*1) + 2*0 + 0] = ss[0];
-                dst1[rid*(2*1) + 2*0 + 1] = ss[1];
+                dst1[rid*(2*NWG) + 2*iwg + 0] = ss[0];
+                dst1[rid*(2*NWG) + 2*iwg + 1] = ss[1];
             }
         }
     }
