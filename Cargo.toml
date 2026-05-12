@@ -86,6 +86,10 @@ name = "bench_dense_mm_bf16_nofa_shapes"
 harness = false
 
 [[bench]]
+name = "bench_dense_mm_f16_nofa_shapes"
+harness = false
+
+[[bench]]
 name = "bench_decode_qmatmul_shapes"
 harness = false
 
