@@ -608,19 +608,35 @@ void flash_attn_prefill_d512_impl(
         // slab width.  We match that pattern: each lane writes 2 halves
         // into sm2[j*SH + lane].
         if (!is_bool_mask) {
-          // Additive mask in I/O dtype — cast to half2 via two reads.
-          // Mask stride for kL dim is 1 (contiguous).
+          // Additive mask in I/O dtype.
+          //
+          // ADR-029 iter-50 H46: vectorize via bfloat2 read on the FAST
+          // PATH where chunk is fully within kL.  Pre-iter-50 we did 2x
+          // scalar bfloat reads + 2x per-element bounds check + 2x
+          // bfloat→half conversion.  Post-iter-50 fast path does 1x
+          // bfloat2 read + 1x packed conversion.  Mask is contiguous in
+          // kL (stride 1), so col0 = ic + 2*tiisg is always 2-aligned
+          // (tiisg ∈ [0,32), step 2 in col0).  Byte offset col0 *
+          // sizeof(bfloat) = col0*2 is 4-aligned for any tiisg.  bfloat2
+          // reinterpret-cast is safe.
+          //
+          // Slow path (last chunk straddling args.kL): falls back to
+          // per-element bounds check.  Branch predictability is high
+          // because chunk_in_bounds is identical across all lanes in
+          // a chunk.
           const int col0 = ic + 2 * (int)tiisg;
-          const int col1 = col0 + 1;
-
-          half v0 = (col0 < args.kL) ? (half)(float)(pm[jj][col0])
-                                     : (half)(-FLT_MAX / 2.0f);
-          half v1 = (col1 < args.kL) ? (half)(float)(pm[jj][col1])
-                                     : (half)(-FLT_MAX / 2.0f);
-          // Write into row j's mask sub-region: base ss + row-j-offset
-          // + (C float2-slots past the score region) + tiisg.
-          // See sm2 layout note at declaration.
-          sm2[j * SH + C + tiisg] = half2(v0, v1);
+          if (col0 + 1 < args.kL) {
+            // FAST: bfloat2 vectorized read
+            bfloat2 b = *(device const bfloat2*)(pm[jj] + col0);
+            sm2[j * SH + C + tiisg] = half2((half)(float)b.x, (half)(float)b.y);
+          } else {
+            // SLOW: trailing-chunk boundary
+            half v0 = (col0     < args.kL) ? (half)(float)(pm[jj][col0])
+                                           : (half)(-FLT_MAX / 2.0f);
+            half v1 = (col0 + 1 < args.kL) ? (half)(float)(pm[jj][col0 + 1])
+                                           : (half)(-FLT_MAX / 2.0f);
+            sm2[j * SH + C + tiisg] = half2(v0, v1);
+          }
         } else {
           // Boolean mask — false → -FLT_MAX/2 (finite sentinel),
           //                true  → 0.0 (additive identity).
