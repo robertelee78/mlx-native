@@ -824,12 +824,23 @@ void flash_attn_prefill_d512_impl(
       // Rescale O for this row by `ms`.  Only this simdgroup touches its
       // owned Q row, so no cross-simdgroup synchronisation needed here
       // (barrier at end of outer loop covers the so write-back).
-      // DV = 512; 512 / NW = 16 iterations per lane.  so is f32, so no
-      // precision loss on rescale (unlike llama.cpp's half so4[i] *= ms
-      // which rounds through half at every chunk).
-      FOR_UNROLL (short ii = 0; ii < DV / NW; ++ii) {
-        const short i = ii * NW + tiisg;
-        so[j * PV + i] = so[j * PV + i] * ms;
+      //
+      // ADR-029 iter-48 H44: float4-vectorized rescale.  Pre-iter-48 we
+      // did 16 scalar f32 ops per lane (4B reads/writes).  Peer
+      // (`ggml-metal.metal:6197-6207`) uses `o4_t *= ms` per lane which
+      // at FA_TYPES_F32 is `float4` = 4 ops × 16B reads/writes.  Same
+      // total bytes (128 B per lane × 32 lanes × 8 simdgroups), but
+      // fewer instructions → tighter scheduling on Apple Metal's wider
+      // TG memory paths.  Alignment audit: `so` starts at
+      // `shmem_f16 + Q*DK` = byte offset 8192, mod 16 = 0 ✓;
+      // PV*4 = 2048 B per row, mod 16 = 0 ✓ (row stride divides
+      // float4 alignment).  Safe cast.
+      threadgroup float4* so4 = (threadgroup float4*)(so);
+      constexpr short PV4 = PV / 4;
+      constexpr short DV4 = DV / 4;
+      FOR_UNROLL (short ii = 0; ii < DV4 / NW; ++ii) {
+        const short i4 = ii * NW + tiisg;
+        so4[j * PV4 + i4] = so4[j * PV4 + i4] * ms;
       }
     }
 
