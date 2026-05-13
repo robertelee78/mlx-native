@@ -43,6 +43,43 @@ struct GgmlMatvecParams {
     uint    r3;   // ne13 / ne03 (always 1 for non-batched)
 };
 
+// ADR-029 iter-162 H93: peer-grounded port of llama.cpp commit da4495332
+// ("metal : promote mul_mv/mul_mm batch divisors to function constants").
+//
+// `ne12`, `r2`, `r3` appear in offset arithmetic as integer divisors:
+//   const uint i12 = im % p.ne12;
+//   const uint offset0 = ... (i12/p.r2)*... + (i13/p.r3)*...;
+//
+// Integer division on Apple Silicon is expensive (~10-15 cycles, can't be
+// pipelined). When the divisor is a function constant, the Metal compiler
+// specializes the PSO with magic-number multiplication at compile time,
+// reducing the cost to ~1-2 cycles. Hot path: ~210 matvec dispatches per
+// decode token; each dispatch executes the div/mod per thread.
+//
+// Sentinel `-1` means "FC not set; fall back to runtime p.ne12 / p.r2 / p.r3
+// from the args buffer" (backwards-compat — any dispatcher that hasn't yet
+// been updated to set these FCs continues to work, just without the speedup).
+// Production dispatchers should always set them.
+//
+// FC slot allocation: 700/701/702 — clear of all existing mlx-native FCs
+// (highest currently used is 601 in mul_mv_ext).
+constant int FC_qmatmul_ne12 [[function_constant(700)]];
+constant int FC_qmatmul_r2   [[function_constant(701)]];
+constant int FC_qmatmul_r3   [[function_constant(702)]];
+constant int qmatmul_ne12_effective =
+    is_function_constant_defined(FC_qmatmul_ne12) ? FC_qmatmul_ne12 : -1;
+constant int qmatmul_r2_effective =
+    is_function_constant_defined(FC_qmatmul_r2) ? FC_qmatmul_r2 : -1;
+constant int qmatmul_r3_effective =
+    is_function_constant_defined(FC_qmatmul_r3) ? FC_qmatmul_r3 : -1;
+
+// Helper macros: return FC value if set, else the runtime arg. The branch
+// is on a `constant` expression so the compiler DCEs the unused arm at PSO
+// compile (once FCs are set, only the FC arm survives → no runtime branch).
+#define QMM_NE12(p) ((qmatmul_ne12_effective >= 0) ? (uint)qmatmul_ne12_effective : (uint)(p).ne12)
+#define QMM_R2(p)   ((qmatmul_r2_effective   >= 0) ? (uint)qmatmul_r2_effective   : (uint)(p).r2)
+#define QMM_R3(p)   ((qmatmul_r3_effective   >= 0) ? (uint)qmatmul_r3_effective   : (uint)(p).r3)
+
 // ---- GGML block struct definitions ----
 // Byte-for-byte compatible with GGUF on-disk format.
 
@@ -222,10 +259,10 @@ kernel void kernel_mul_mv_q4_0_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = first_row * nb + (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_q4_0 * x = (device const block_q4_0 *) src0 + offset0;
     device const float      * y = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
@@ -293,10 +330,10 @@ kernel void kernel_mul_mv_q5_1_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = first_row * nb + (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_q5_1 * x = (device const block_q5_1 *) src0 + offset0;
     device const float      * y = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
@@ -359,10 +396,10 @@ kernel void kernel_mul_mv_iq4_nl_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = first_row * nb + (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_iq4_nl * x = (device const block_iq4_nl *) src0 + offset0;
     device const float        * y = (device const float        *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
@@ -424,10 +461,10 @@ kernel void kernel_mul_mv_q8_0_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = first_row * nb + (i12 / p.r2) * (nb * p.ne01) + (i13 / p.r3) * (nb * p.ne01 * p.ne02);
+    const uint offset0 = first_row * nb + (i12 / QMM_R2(p)) * (nb * p.ne01) + (i13 / QMM_R3(p)) * (nb * p.ne01 * p.ne02);
 
     device const block_q8_0 * x = (device const block_q8_0 *) src0 + offset0;
     device const float      * y = (device const float      *) src1 + r1 * p.ne10 + im * p.ne00 * p.ne1;
@@ -508,15 +545,15 @@ kernel void kernel_mul_mv_q8_0_f32_nr2(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
     // Per-row src0 pointers (unrolled NR0 iterations).
     device const block_q8_0 * ax[NR0];
     for (int row = 0; row < NR0; ++row) {
         const uint offset0 = (r0 + row) * nb
-            + (i12 / p.r2) * (nb * p.ne01)
-            + (i13 / p.r3) * (nb * p.ne01 * p.ne02);
+            + (i12 / QMM_R2(p)) * (nb * p.ne01)
+            + (i13 / QMM_R3(p)) * (nb * p.ne01 * p.ne02);
         ax[row] = (device const block_q8_0 *) src0 + offset0;
     }
 
@@ -610,10 +647,10 @@ kernel void kernel_mul_mv_q6_K_f32(
 
     const int row = 2 * r0 + sgitg;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_q6_K * x  = (device const block_q6_K *) src0 + row * nb + offset0;
     device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
@@ -697,10 +734,10 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 
     const int first_row = (int)((r0 * NSG + sgitg) * nr0);
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_q6_K * x_base = (device const block_q6_K *) src0 + first_row * nb + offset0;
     device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
@@ -805,10 +842,10 @@ kernel void kernel_mul_mv_q4_K_f32(
 
     const int row = 2 * (int)r0 + (int)sgitg;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_q4_K * x  = (device const block_q4_K *) src0 + row * nb + offset0;
     device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
@@ -917,10 +954,10 @@ kernel void kernel_mul_mv_q5_K_f32(
 
     const int row = 2 * (int)r0 + (int)sgitg;
 
-    const uint i12 = im % p.ne12;
-    const uint i13 = im / p.ne12;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
 
-    const uint offset0 = (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+    const uint offset0 = (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
 
     device const block_q5_K * x  = (device const block_q5_K *) src0 + row * nb + offset0;
     device const float      * yy = (device const float      *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;

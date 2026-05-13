@@ -236,7 +236,12 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
         // available on this device (M3+).  Probing via Q4_0 is sufficient
         // — all three qtype variants share the same tensor_ops surface.
         let ok = registry
-            .get_pipeline("kernel_mul_mm_q4_0_tensor_f32", device.metal_device())
+            .get_pipeline_with_constants(
+                "kernel_mul_mm_q4_0_tensor_f32",
+                device.metal_device(),
+                &[],
+                &[(700, 1), (701, 1), (702, 1)],
+            )
             .is_ok();
         if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
             eprintln!("[mlx-native] tensor_mm probe: {}", if ok { "OK (using tensor variant)" } else { "FAILED (falling back to simdgroup MMA)" });
@@ -501,7 +506,14 @@ pub fn dispatch_mm_v2_f16(
         _pad1: 0,
     };
 
-    let pipeline = registry.get_pipeline("hf2q_mul_mm_tensor_v2_f16", device.metal_device())?;
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            "hf2q_mul_mm_tensor_v2_f16",
+            device.metal_device(),
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?
+        .clone();
 
     const THREADS_PER_TG: u64 = 128;
     let nra: u64 = 64;  // M_peer tile
@@ -513,7 +525,7 @@ pub fn dispatch_mm_v2_f16(
     const SHMEM_BYTES: u64 = 4096;  // only A tile in shmem
 
     encoder.encode_threadgroups_with_args_and_shared(
-        pipeline,
+        &pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&gpu_params))),
             (1, KernelArg::Buffer(f16_weight)),
@@ -608,7 +620,20 @@ fn dispatch_mv(
     } else {
         params.ggml_type.kernel_name()
     };
-    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    // ADR-029 iter-162 H93: PSO-specialize batch divisors (ne12/r2/r3) at
+    // function-constant slots 700/701/702. Peer-grounded port of llama.cpp
+    // commit da4495332. Hardcoded =1 here matches the gpu_params below
+    // (current mlx-native usage is always single-batch); compiler folds
+    // `im % 1 → 0` and `i12 / 1 → i12` at PSO compile, eliminating
+    // ~3 expensive integer divisions per thread per dispatch.
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            kernel_name,
+            device.metal_device(),
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?
+        .clone();
 
     let gpu_params = GgmlMatvecGpuParams {
         ne00: params.k as i64,
@@ -658,7 +683,7 @@ fn dispatch_mv(
         // Cross-SG reduction needs threadgroup memory: NR0 * NW * sizeof(float).
         let smem_bytes: u64 = 2 * 32 * std::mem::size_of::<f32>() as u64;
         encoder.encode_threadgroups_with_args_and_shared(
-            pipeline,
+            &pipeline,
             &[
                 (0, KernelArg::Buffer(weight)),
                 (1, KernelArg::Buffer(input)),
@@ -671,7 +696,7 @@ fn dispatch_mv(
         );
     } else {
         encoder.encode_threadgroups_with_args(
-            pipeline,
+            &pipeline,
             &[
                 (0, KernelArg::Buffer(weight)),
                 (1, KernelArg::Buffer(input)),
@@ -726,7 +751,14 @@ fn dispatch_mm(
     } else {
         params.ggml_type.mm_kernel_name()
     };
-    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            kernel_name,
+            device.metal_device(),
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?
+        .clone();
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -789,7 +821,7 @@ fn dispatch_mm(
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(
-        pipeline,
+        &pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&gpu_params))),
             (1, KernelArg::Buffer(weight)),
@@ -948,7 +980,14 @@ pub fn quantized_matmul_mm_tensor_perm021(
         )));
     }
 
-    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            kernel_name,
+            device.metal_device(),
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?
+        .clone();
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -989,7 +1028,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(
-        pipeline,
+        &pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&gpu_params))),
             (1, KernelArg::Buffer(weight)),
@@ -1068,8 +1107,14 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
         )));
     }
 
-    let pipeline =
-        registry.get_pipeline("kernel_mul_mm_f16_tensor_bf16_perm021", device.metal_device())?;
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            "kernel_mul_mm_f16_tensor_bf16_perm021",
+            device.metal_device(),
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?
+        .clone();
 
     // nb01 = bytes per F16 weight row = k * sizeof(half)
     let nb01: u64 = (params.k as u64) * 2;
@@ -1108,7 +1153,7 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(
-        pipeline,
+        &pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&gpu_params))),
             (1, KernelArg::Buffer(weight_f16)),
