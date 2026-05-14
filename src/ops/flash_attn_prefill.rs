@@ -1142,6 +1142,190 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_resume(
     Ok(())
 }
 
+// ─── f16 D=256 RESUME dispatcher (qL_off > 0 + slot-capacity strides) ──────
+//
+// F16 variant of `dispatch_flash_attn_prefill_bf16_d256_resume` added for
+// ADR-030 iter-74 (hf2q DFlash spec-decode).  The hf2q hybrid KV cache
+// stores K and V in F16 (`hybrid_kv.k` shape `[H_kv, capacity, D]` F16
+// after iter-348 Phase 10c).  For spec-decode verify, the orchestrator
+// needs cross-length attention against the F16 hybrid_kv slot without
+// the F16→BF16 cast overhead.
+//
+// Bit-identical port of the BF16 dispatcher with:
+//   * dtype check BF16 → F16
+//   * kernel name K_BF16_D256 → K_F16_D256
+//
+// Everything else identical: same strides, same params layout, same
+// causal `qL_off` semantics, same pipeline-cache key shape.  The Metal
+// kernel is templated on dtype; the F16 instance is registered in
+// `register()` at the top of this file.
+
+/// F16 sibling of [`dispatch_flash_attn_prefill_bf16_d256_resume`].  Same
+/// semantics, F16 dtype throughout.  See the BF16 doc-comment for the
+/// resume-mode contract, buffer layouts, function constants, and error
+/// conditions — they all apply here verbatim except every "BF16" reads
+/// as "F16".
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d256_resume(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillResumeParams,
+) -> Result<()> {
+    // ── Validate ──────────────────────────────────────────────────────────
+    if params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d256_resume: head_dim must be 256, got {}",
+            params.head_dim
+        )));
+    }
+    if params.n_heads == 0
+        || params.n_kv_heads == 0
+        || params.seq_len_q == 0
+        || params.seq_len_k == 0
+        || params.batch == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_f16_d256_resume: \
+             n_heads/n_kv_heads/seq_len_q/seq_len_k/batch must all be > 0"
+                .into(),
+        ));
+    }
+    if params.n_heads % params.n_kv_heads != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d256_resume: n_heads ({}) must \
+             be divisible by n_kv_heads ({})",
+            params.n_heads, params.n_kv_heads
+        )));
+    }
+    if params.q_offset_in_k + params.seq_len_q > params.seq_len_k {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d256_resume: q_offset_in_k ({}) \
+             + seq_len_q ({}) > seq_len_k ({}) — Q overshoots K",
+            params.q_offset_in_k, params.seq_len_q, params.seq_len_k
+        )));
+    }
+    if params.seq_len_k > params.kv_capacity {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d256_resume: seq_len_k ({}) > \
+             kv_capacity ({}) — K/V overshoots slot capacity",
+            params.seq_len_k, params.kv_capacity
+        )));
+    }
+
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::F16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d256_resume: {name} buffer \
+                 must be F16, got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let cap = params.kv_capacity as usize;
+    let d = params.head_dim as usize; // = 256
+
+    validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    validate_buffer_size(k, "K", batch * h_kv * cap * d)?;
+    validate_buffer_size(v, "V", batch * h_kv * cap * d)?;
+    validate_buffer_size(out, "out", batch * h * ql * d)?;
+
+    // ── Tile geometry (D=256) ─ same as BF16 path ─────────────────────────
+    let bq = BQ_D256;
+    let bk = BK_D256;
+    let wm = WM_D256;
+    let wn = WN_D256;
+
+    let nq = params.seq_len_q.div_ceil(bq);
+    let nk = params.seq_len_k.div_ceil(bk);
+    let nq_aligned = params.seq_len_q / bq;
+    let nk_aligned = params.seq_len_k / bk;
+    let ql_rem = params.seq_len_q % bq;
+    let kl_rem = params.seq_len_k % bk;
+
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = false;
+    let has_blk = false;
+    let do_causal = params.do_causal;
+
+    // ── Pipeline lookup — F16 kernel ──────────────────────────────────────
+    let kernel_name = K_F16_D256;
+    let pipeline = registry.get_pipeline_with_bool_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+    )?;
+
+    // ── Strides ─ identical to BF16 (kernel reads via integer strides) ────
+    let q_seq_stride = d as i64;
+    let q_head_stride = (ql * d) as i64;
+    let q_batch_stride = (h * ql * d) as i64;
+
+    let kv_seq_stride = d as i64;
+    let kv_head_stride = (cap * d) as i64;
+    let kv_batch_stride = (h_kv * cap * d) as i64;
+
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: params.q_offset_in_k as i32,
+        _pad: 0,
+        q_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+        k_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        v_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+    };
+
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
+    let tg_size = MTLSize::new(32, wm as u64, wn as u64);
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(q)),
+            (1, KernelArg::Buffer(k)),
+            (2, KernelArg::Buffer(v)),
+            (3, KernelArg::Buffer(out)),
+            (4, KernelArg::Bytes(as_bytes(&attn_params))),
+        ],
+        grid,
+        tg_size,
+    );
+
+    Ok(())
+}
+
 // ─── bf16 D=64 dispatcher ────────────────────────────────────────────────────
 
 /// Layout selector for [`dispatch_flash_attn_prefill_bf16_d64`].
