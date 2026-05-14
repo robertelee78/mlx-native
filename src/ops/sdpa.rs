@@ -310,7 +310,9 @@ mod tests {
 
     #[test]
     fn test_gpu_params_layout() {
-        // Ensure SdpaParamsGpu is exactly 28 bytes (6 x u32 + 1 x f32 + kv_capacity u32 = 28).
-        assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 28);
+        // ADR-030 iter-87: SdpaParamsGpu grew from 28 bytes (7 fields)
+        // to 32 bytes (8 fields) when `do_causal: u32` was added for
+        // the DFlash drafter bidirectional path.  Match MSL struct layout.
+        assert_eq!(std::mem::size_of::<SdpaParamsGpu>(), 32);
     }
 }
