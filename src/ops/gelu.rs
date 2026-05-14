@@ -60,6 +60,14 @@ pub fn dispatch_gelu(
             n
         )));
     }
+    // hf2q ADR-030 iter-113 — defense-in-depth: kernel selected by
+    // input.dtype() writes output at the same stride.  See iter-110/etc.
+    if input.dtype() != output.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "GELU dtype mismatch: input={} != output={}",
+            input.dtype(), output.dtype(),
+        )));
+    }
 
     let kernel_name = match input.dtype() {
         DType::F32 => "gelu_f32",

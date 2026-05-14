@@ -84,6 +84,13 @@ pub fn dispatch_rope(
             head_dim
         )));
     }
+    // hf2q ADR-030 iter-113 — defense-in-depth dtype-coherence check.
+    if input.dtype() != output.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "RoPE dtype mismatch: input={} != output={}",
+            input.dtype(), output.dtype(),
+        )));
+    }
 
     let kernel_name = match input.dtype() {
         DType::F32 => "rope_f32",

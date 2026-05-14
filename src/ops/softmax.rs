@@ -73,6 +73,15 @@ pub fn dispatch_softmax(
             cols
         )));
     }
+    // hf2q ADR-030 iter-113 — defense-in-depth: kernel selected by
+    // input.dtype() writes output at the same stride.  Mismatched output
+    // dtype would mis-stride writes.  See ADR-030 iter-110/111/112.
+    if input.dtype() != output.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "Softmax dtype mismatch: input={} != output={}",
+            input.dtype(), output.dtype(),
+        )));
+    }
 
     let kernel_name = match input.dtype() {
         DType::F32 => "softmax_f32",

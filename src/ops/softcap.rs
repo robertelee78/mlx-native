@@ -70,6 +70,13 @@ pub fn dispatch_softcap(
             n
         )));
     }
+    // hf2q ADR-030 iter-113 — defense-in-depth dtype-coherence check.
+    if input.dtype() != output.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "Softcap dtype mismatch: input={} != output={}",
+            input.dtype(), output.dtype(),
+        )));
+    }
 
     let _ = cap; // cap value is passed via params_buf
 
