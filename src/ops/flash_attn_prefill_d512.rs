@@ -963,3 +963,166 @@ pub fn dispatch_flash_attn_prefill_f16_d512_resume(
 
     Ok(())
 }
+
+// ─── BF16 D=512 RESUME dispatcher (ADR-030 iter-83) ───────────────────────────
+//
+// BF16 sibling of [`dispatch_flash_attn_prefill_f16_d512_resume`].  Required
+// because F16's 5-bit exponent (max ≈ 65504) overflows attention scores at
+// gemma-4's final layer (L29) where Q magnitudes reach ~3-4× per element.
+// BF16's 8-bit exponent (max ≈ 3.4e38, same as F32) eliminates this overflow.
+//
+// Same semantics, BF16 dtype throughout.  See the F16 sibling's doc-comment
+// for resume-mode contract.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d512_resume(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillResumeParams,
+) -> Result<()> {
+    if params.head_dim != 512 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d512_resume: head_dim must be 512, got {}",
+            params.head_dim
+        )));
+    }
+    if params.n_heads == 0
+        || params.n_kv_heads == 0
+        || params.seq_len_q == 0
+        || params.seq_len_k == 0
+        || params.batch == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_bf16_d512_resume: \
+             n_heads/n_kv_heads/seq_len_q/seq_len_k/batch must all be > 0"
+                .into(),
+        ));
+    }
+    if params.n_heads % params.n_kv_heads != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d512_resume: n_heads ({}) must \
+             be divisible by n_kv_heads ({})",
+            params.n_heads, params.n_kv_heads
+        )));
+    }
+    if params.q_offset_in_k + params.seq_len_q > params.seq_len_k {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d512_resume: q_offset_in_k ({}) \
+             + seq_len_q ({}) > seq_len_k ({}) — Q overshoots K",
+            params.q_offset_in_k, params.seq_len_q, params.seq_len_k
+        )));
+    }
+    if params.seq_len_k > params.kv_capacity {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_bf16_d512_resume: seq_len_k ({}) > \
+             kv_capacity ({}) — K/V overshoots slot capacity",
+            params.seq_len_k, params.kv_capacity
+        )));
+    }
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::BF16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_bf16_d512_resume: {name} buffer \
+                 must be BF16, got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let cap = params.kv_capacity as usize;
+    let d = params.head_dim as usize;
+
+    crate::ops::flash_attn_prefill::validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    crate::ops::flash_attn_prefill::validate_buffer_size(k, "K", batch * h_kv * cap * d)?;
+    crate::ops::flash_attn_prefill::validate_buffer_size(v, "V", batch * h_kv * cap * d)?;
+    crate::ops::flash_attn_prefill::validate_buffer_size(out, "out", batch * h * ql * d)?;
+
+    let nqpsg = NQPSG_D512;
+    let ncpsg = NCPSG_D512;
+    let nsg = NSG_D512;
+    let nq = params.seq_len_q.div_ceil(nqpsg);
+    let nk = params.seq_len_k.div_ceil(ncpsg);
+    let nq_aligned = params.seq_len_q / nqpsg;
+    let nk_aligned = params.seq_len_k / ncpsg;
+    let ql_rem = params.seq_len_q % nqpsg;
+    let kl_rem = params.seq_len_k % ncpsg;
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = false;
+    let has_blk = false;
+    let do_causal = params.do_causal;
+
+    let kernel_name = K_LLAMACPP_BF16_D512;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+        &[(FC_IDX_NSG, nsg as i32)],
+    )?;
+
+    let q_seq_stride = d as i64;
+    let q_head_stride = (ql * d) as i64;
+    let q_batch_stride = (h * ql * d) as i64;
+    let kv_seq_stride = d as i64;
+    let kv_head_stride = (cap * d) as i64;
+    let kv_batch_stride = (h_kv * cap * d) as i64;
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: params.q_offset_in_k as i32,
+        _pad: 0,
+        q_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+        k_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        v_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+    };
+
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
+    let tg_size = MTLSize::new(32, nsg as u64, 1);
+    let tgmem = TGMEM_BYTES_D512 as u64;
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(q)),
+            (1, KernelArg::Buffer(k)),
+            (2, KernelArg::Buffer(v)),
+            (3, KernelArg::Buffer(out)),
+            (4, KernelArg::Bytes(as_bytes(&attn_params))),
+        ],
+        &[(0, tgmem)],
+        grid,
+        tg_size,
+    );
+
+    Ok(())
+}

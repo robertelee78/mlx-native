@@ -5239,6 +5239,214 @@ fn flash_attn_prefill_f16_d256_resume_qL_off_align_k_false_byte_identity() {
     );
 }
 
+// ─── ADR-030 iter-82: F16 D=512 resume parity at qL_off>0 + align_k=false ─────
+//
+// Mirror of the D=256 test above (iter-81) for the D=512 (full-attn) kernel.
+// hf2q DFlash spec-decode verify at L29 (gemma-4 final full-attn layer)
+// produces ALL-NaN pf_hidden, while the D=256 (sliding) xlen wiring produces
+// correct output.  Hypothesis: the F16 D=512 resume kernel has a bug at the
+// failing regime (qL_off=12, kL=20, kl_rem=20, align_q=true, align_k=false).
+//
+// Regime mismatch with D=256:
+//   - NQPSG_D512=8, NCPSG_D512=64 (vs BQ_D256=32, BK_D256=16)
+//   - qL=8 → ql_rem = 8 % 8 = 0 → align_q = TRUE (D=256: align_q=false)
+//   - kL=20 → kl_rem = 20 % 64 = 20 → align_k = FALSE (same as D=256)
+//   - kb_lim = 1 (single K tile of 64 positions)
+//
+// If this test PASSES: kernel correct, bug is in hf2q D=512 xlen wiring.
+// If this test FAILS: kernel has a bug at qL_off>0 + align_k=false for D=512.
+#[cfg(target_os = "macos")]
+#[test]
+fn flash_attn_prefill_f16_d512_resume_qL_off_align_k_false_byte_identity() {
+    use mlx_native::ops::flash_attn_prefill::FlashAttnPrefillResumeParams;
+    use mlx_native::ops::flash_attn_prefill_d512::{
+        dispatch_flash_attn_prefill_f16_d512_resume,
+    };
+    use mlx_native::{KernelRegistry, MlxDevice, DType};
+
+    fn f32_to_f16_d512(xs: &[f32]) -> Vec<half::f16> {
+        xs.iter().map(|&x| half::f16::from_f32(x)).collect()
+    }
+    fn alloc_f16_d512(device: &MlxDevice, elems: usize, name: &str) -> mlx_native::MlxBuffer {
+        device
+            .alloc_buffer(elems * 2, DType::F16, vec![elems])
+            .unwrap_or_else(|e| panic!("alloc_buffer({name}, {elems}) failed: {e:?}"))
+    }
+    fn fill_f16_d512(buf: &mlx_native::MlxBuffer, data: &[half::f16]) {
+        let ptr = buf.contents_ptr() as *mut half::f16;
+        assert!(!ptr.is_null());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()); }
+    }
+    fn read_f16_d512(buf: &mlx_native::MlxBuffer, elems: usize) -> Vec<half::f16> {
+        let ptr = buf.contents_ptr() as *const half::f16;
+        assert!(!ptr.is_null());
+        let slice = unsafe { std::slice::from_raw_parts(ptr, elems) };
+        slice.to_vec()
+    }
+    fn pseudo_random_f32_d512(seed: u64, n: usize) -> Vec<f32> {
+        // Same xorshift-based PRNG as the existing tests' pseudo_random_f32.
+        let mut state = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let u = (state as u32) >> 9;
+            let f = (u as f32) / ((1u32 << 23) as f32) - 0.5_f32;
+            out.push(f);
+        }
+        out
+    }
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    mlx_native::ops::flash_attn_prefill::register(&mut registry);
+    mlx_native::ops::flash_attn_prefill_d512::register(&mut registry);
+
+    let n_heads: u32 = 16;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 512;
+    let seq_full: u32 = 20;
+    let seq_chunk: u32 = 8;
+    let qL_off: u32 = 12;
+    let kv_capacity_ref: u32 = seq_full;
+    let kv_capacity_b: u32 = 64;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let h = n_heads as usize;
+    let h_kv = n_kv_heads as usize;
+    let d = head_dim as usize;
+
+    let q_full_f32 = pseudo_random_f32_d512(0x00AD_0011 + 600, h * seq_full as usize * d);
+    let k_full_f32 = pseudo_random_f32_d512(0x00AD_0011 + 601, h_kv * seq_full as usize * d);
+    let v_full_f32 = pseudo_random_f32_d512(0x00AD_0011 + 602, h_kv * seq_full as usize * d);
+    let q_full_f16 = f32_to_f16_d512(&q_full_f32);
+    let k_full_f16 = f32_to_f16_d512(&k_full_f32);
+    let v_full_f16 = f32_to_f16_d512(&v_full_f32);
+
+    // Run A: F16 D=512 resume at qL_off=0, kv_capacity=20 (monolithic-equivalent).
+    let q_a = alloc_f16_d512(&device, h * seq_full as usize * d, "Q_A");
+    let k_a = alloc_f16_d512(&device, h_kv * seq_full as usize * d, "K_A");
+    let v_a = alloc_f16_d512(&device, h_kv * seq_full as usize * d, "V_A");
+    fill_f16_d512(&q_a, &q_full_f16);
+    fill_f16_d512(&k_a, &k_full_f16);
+    fill_f16_d512(&v_a, &v_full_f16);
+    let out_a = alloc_f16_d512(&device, h * seq_full as usize * d, "out_A");
+    {
+        let mut enc = device.command_encoder().expect("enc A");
+        dispatch_flash_attn_prefill_f16_d512_resume(
+            &mut enc, &device, &mut registry,
+            &q_a, &k_a, &v_a, &out_a,
+            &FlashAttnPrefillResumeParams {
+                n_heads, n_kv_heads, head_dim,
+                seq_len_q: seq_full,
+                seq_len_k: seq_full,
+                batch: 1,
+                scale,
+                do_causal: true,
+                q_offset_in_k: 0,
+                kv_capacity: kv_capacity_ref,
+            },
+        ).expect("dispatch A (qL_off=0)");
+        enc.commit_and_wait().expect("commit A");
+    }
+    let out_a_f16 = read_f16_d512(&out_a, h * seq_full as usize * d);
+
+    // Run B: F16 D=512 resume at qL_off=12, kv_capacity=64, qL=8.
+    let mut q_chunk_f16 = vec![half::f16::ZERO; h * seq_chunk as usize * d];
+    for head in 0..h {
+        for tok in 0..seq_chunk as usize {
+            let src_off = head * (seq_full as usize) * d + (qL_off as usize + tok) * d;
+            let dst_off = head * (seq_chunk as usize) * d + tok * d;
+            q_chunk_f16[dst_off..dst_off + d]
+                .copy_from_slice(&q_full_f16[src_off..src_off + d]);
+        }
+    }
+    let mut slot_k_f16 = vec![half::f16::ZERO; h_kv * kv_capacity_b as usize * d];
+    let mut slot_v_f16 = vec![half::f16::ZERO; h_kv * kv_capacity_b as usize * d];
+    for head in 0..h_kv {
+        for tok in 0..seq_full as usize {
+            let src_off = head * (seq_full as usize) * d + tok * d;
+            let dst_off = head * (kv_capacity_b as usize) * d + tok * d;
+            slot_k_f16[dst_off..dst_off + d]
+                .copy_from_slice(&k_full_f16[src_off..src_off + d]);
+            slot_v_f16[dst_off..dst_off + d]
+                .copy_from_slice(&v_full_f16[src_off..src_off + d]);
+        }
+    }
+
+    let q_b = alloc_f16_d512(&device, h * seq_chunk as usize * d, "Q_B");
+    let k_b = alloc_f16_d512(&device, h_kv * kv_capacity_b as usize * d, "K_B");
+    let v_b = alloc_f16_d512(&device, h_kv * kv_capacity_b as usize * d, "V_B");
+    fill_f16_d512(&q_b, &q_chunk_f16);
+    fill_f16_d512(&k_b, &slot_k_f16);
+    fill_f16_d512(&v_b, &slot_v_f16);
+    let out_b = alloc_f16_d512(&device, h * seq_chunk as usize * d, "out_B");
+    {
+        let mut enc = device.command_encoder().expect("enc B");
+        dispatch_flash_attn_prefill_f16_d512_resume(
+            &mut enc, &device, &mut registry,
+            &q_b, &k_b, &v_b, &out_b,
+            &FlashAttnPrefillResumeParams {
+                n_heads, n_kv_heads, head_dim,
+                seq_len_q: seq_chunk,
+                seq_len_k: seq_full,
+                batch: 1,
+                scale,
+                do_causal: true,
+                q_offset_in_k: qL_off,
+                kv_capacity: kv_capacity_b,
+            },
+        ).expect("dispatch B (qL_off=12, kv_capacity=64)");
+        enc.commit_and_wait().expect("commit B");
+    }
+    let out_b_f16 = read_f16_d512(&out_b, h * seq_chunk as usize * d);
+
+    // Compare A[chunk=12..20] vs B[0..8].
+    let mut n_diff = 0usize;
+    let mut a_nan = 0usize;
+    let mut b_nan = 0usize;
+    let mut first_diffs: Vec<(usize, usize, usize, u16, u16)> = Vec::new();
+    for head in 0..h {
+        for tok in 0..seq_chunk as usize {
+            let a_off = head * (seq_full as usize) * d + (qL_off as usize + tok) * d;
+            let b_off = head * (seq_chunk as usize) * d + tok * d;
+            for elem in 0..d {
+                let a_v = out_a_f16[a_off + elem];
+                let b_v = out_b_f16[b_off + elem];
+                if a_v.is_nan() { a_nan += 1; }
+                if b_v.is_nan() { b_nan += 1; }
+                if a_v.to_bits() != b_v.to_bits() {
+                    if first_diffs.len() < 5 {
+                        first_diffs.push((head, tok, elem, a_v.to_bits(), b_v.to_bits()));
+                    }
+                    n_diff += 1;
+                }
+            }
+        }
+    }
+
+    let total_elems = h * seq_chunk as usize * d;
+    if n_diff > 0 || a_nan > 0 || b_nan > 0 {
+        eprintln!("a_nan={a_nan} b_nan={b_nan} n_diff={n_diff} / {total_elems}");
+        for (head, tok, elem, a_v, b_v) in &first_diffs {
+            eprintln!("  diff[h={head}, t={tok}, e={elem}]: A={a_v:#06x} B={b_v:#06x}");
+        }
+    }
+    assert_eq!(
+        n_diff, 0,
+        "ADR-030 iter-82: F16 D=512 resume FAIL: {n_diff}/{total_elems} F16 \
+         elements differ between resume(qL_off=0) and resume(qL_off={qL_off}) \
+         at align_k=false (kL_rem=20, qL_rem=0).  Kernel has an edge-case bug \
+         in the failing regime.  hf2q L29 dflash verify NaN explained: \
+         it hits this exact kernel regime."
+    );
+    eprintln!(
+        "ADR-030 iter-82 D=512 byte-identity PASS — kernel correct at \
+         qL_off={qL_off} + align_k=false; iter-78 L29 NaN is in hf2q wiring."
+    );
+}
+
 } // mod flash_attn_prefill_tests
 
 // ─── Non-macOS stub ───────────────────────────────────────────────────────────
