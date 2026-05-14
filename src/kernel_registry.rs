@@ -386,6 +386,9 @@ impl KernelRegistry {
         sources.insert("kv_cache_copy_batch_f32_to_f16_kv_dual".into(), kv_cache_src);
         // bf16-source KV cache copy (Phase 2 bf16 activation path)
         sources.insert("kv_cache_copy_seq_bf16".into(), kv_cache_src);
+        // ADR-030 iter-95 — bit-exact BF16→BF16 head-major cache copy for
+        // Option A xlen verify (avoids F16 round-trip precision drift).
+        sources.insert("kv_cache_copy_seq_bf16_to_bf16_head_major".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");

@@ -347,3 +347,44 @@ kernel void kv_cache_copy_seq_f32_to_f16(
     uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
     cache[dst_idx] = half(src[src_idx]);
 }
+
+/// ADR-030 iter-95: Multi-position, all-heads BF16→BF16 strided cache copy.
+///
+/// Source layout: [n_heads, n_src_tokens, head_dim] HEAD-MAJOR BF16 (matches
+/// pf_k_perm / pf_v_perm after fused_head_norm_rope's permuted bf16 output).
+/// Cache layout: [n_heads, capacity, head_dim] HEAD-MAJOR BF16.
+///
+/// Bit-identical copy — no precision loss.  Used by the DFlash spec-decode
+/// xlen verify path to persist BF16 K/V across rounds without the
+/// F16-intermediate precision drift that iter-92/93 root-caused for Option A's
+/// non-toy coherence failures.
+///
+/// Sliding-window contract: capacity = sliding_window, dst_pos % capacity for
+/// ring-wrap.  For global layers: capacity = linear_capacity, no wrap (caller
+/// guarantees seq_pos_start + n_tokens <= capacity).
+kernel void kv_cache_copy_seq_bf16_to_bf16_head_major(
+    device const bfloat* src             [[buffer(0)]],   // [n_heads, n_src_tokens, head_dim] BF16 HEAD-MAJOR
+    device bfloat*       cache           [[buffer(1)]],   // [n_heads, capacity, head_dim] BF16 HEAD-MAJOR
+    constant uint&       n_heads         [[buffer(2)]],
+    constant uint&       head_dim        [[buffer(3)]],
+    constant uint&       capacity        [[buffer(4)]],
+    constant uint&       seq_pos_start   [[buffer(5)]],
+    constant uint&       n_tokens        [[buffer(6)]],
+    constant uint&       src_tok_offset  [[buffer(7)]],
+    constant uint&       src_seq_len     [[buffer(8)]],   // n_src_tokens (= seq_len of pf_k_perm)
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    uint tok  = tid.z;
+    if (head >= n_heads || elem >= head_dim || tok >= n_tokens) return;
+
+    uint src_tok = src_tok_offset + tok;
+    // pf_k_perm head-major: src[h, t, d] at h*src_seq_len*head_dim + t*head_dim + d.
+    uint src_idx = head * src_seq_len * head_dim + src_tok * head_dim + elem;
+    uint dst_pos = seq_pos_start + tok;
+    uint slot    = dst_pos % capacity;
+    uint dst_idx = head * capacity * head_dim + slot * head_dim + elem;
+    // BF16 → BF16: bit-exact copy.  No rounding.
+    cache[dst_idx] = src[src_idx];
+}

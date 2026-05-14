@@ -798,3 +798,88 @@ pub fn dispatch_kv_cache_copy_seq_f32_to_f16(
 
     Ok(())
 }
+
+/// ADR-030 iter-95: bit-exact BF16→BF16 strided cache copy from pf_k_perm
+/// (head-major BF16) to bf16_xlen_cache (head-major BF16).
+///
+/// Used by the DFlash spec-decode xlen verify path to persist BF16 K/V
+/// across rounds without the F16-intermediate precision drift that
+/// iter-92/93 root-caused for Option A's non-toy coherence failures.
+/// Bit-identical to what Option C reads from pf_k_perm in the same call
+/// (single rounding at head_norm_rope's F32→BF16 output).
+///
+/// `src` layout: `[n_heads, src_seq_len, head_dim]` BF16 head-major
+/// (matches fused_head_norm_rope's bf16 permuted output `pf_k_perm` /
+/// `pf_v_perm`).
+/// `cache` layout: `[n_heads, capacity, head_dim]` BF16 head-major.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    cache: &MlxBuffer,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    seq_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+    src_seq_len: u32,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_tokens == 0 {
+        return Ok(());
+    }
+    let total_src = (n_heads as u64) * (src_seq_len as u64) * (head_dim as u64);
+    if (src.element_count() as u64) < total_src {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_seq_bf16_to_bf16_head_major: src has {} elements, need {} \
+             ({} heads × {} src_seq_len × {} head_dim)",
+            src.element_count(), total_src, n_heads, src_seq_len, head_dim
+        )));
+    }
+    if src.dtype() != crate::DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_seq_bf16_to_bf16_head_major: src must be BF16, got {:?}",
+            src.dtype()
+        )));
+    }
+    if cache.dtype() != crate::DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy_seq_bf16_to_bf16_head_major: cache must be BF16, got {:?}",
+            cache.dtype()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_seq_bf16_to_bf16_head_major", device)?;
+
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let seq_pos_start_bytes = seq_pos_start.to_ne_bytes();
+    let n_tokens_bytes = n_tokens.to_ne_bytes();
+    let src_tok_offset_bytes = src_tok_offset.to_ne_bytes();
+    let src_seq_len_bytes = src_seq_len.to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(cache)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&head_dim_bytes)),
+            (4, KernelArg::Bytes(&capacity_bytes)),
+            (5, KernelArg::Bytes(&seq_pos_start_bytes)),
+            (6, KernelArg::Bytes(&n_tokens_bytes)),
+            (7, KernelArg::Bytes(&src_tok_offset_bytes)),
+            (8, KernelArg::Bytes(&src_seq_len_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_tokens as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
