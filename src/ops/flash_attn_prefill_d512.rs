@@ -111,7 +111,7 @@ use crate::DType;
 // Re-export the shared struct definitions so callers don't need to import
 // both modules.  These are the SAME types used by the D=256 dispatcher.
 pub use super::flash_attn_prefill::{
-    AttnMaskParamsGpu, AttnParamsGpu, FlashAttnPrefillParams,
+    AttnMaskParamsGpu, AttnParamsGpu, FlashAttnPrefillParams, FlashAttnPrefillResumeParams,
 };
 
 // ─── Shader source ───────────────────────────────────────────────────────────
@@ -749,4 +749,217 @@ mod tests {
             Err(MlxError::InvalidArgument(_))
         ));
     }
+}
+
+// ─── f16 D=512 RESUME dispatcher (qL_off > 0 + slot-capacity strides) ──────
+//
+// F16 D=512 sibling of `dispatch_flash_attn_prefill_bf16_d256_resume`
+// (see `flash_attn_prefill.rs:971`).  Added for hf2q ADR-030 iter-75
+// (DFlash spec-decode Option A): gemma-4 full-attention layers use
+// head_dim=512 and the hybrid_kv slot is F16 (iter-348 Phase 10c).
+//
+// Differs from the existing `dispatch_flash_attn_prefill_bf16_d512_*`
+// family in two ways:
+//
+// 1. `q_offset_in_k` (= `qL_off` in the kernel, `flash_attn_prefill_d512.metal:206, 528, 801`):
+//    when > 0, the chunk Q is being attended against a slot already
+//    holding `q_offset_in_k` previous tokens.  Causal mask uses
+//    `qL_off + (int)iq1 + (int)j` as the absolute query position.
+// 2. `kv_capacity` (slot stride): K and V buffers live in a slot of
+//    capacity ≥ `seq_len_k`; head_stride is `kv_capacity * D` so the
+//    kernel skips unused trailing slot positions between heads.
+//
+// Pure causal — no external mask buffer.  The kernel's in-kernel
+// causal masking (function constant 301 `do_causal`) handles
+// truncation of positions beyond `qL_off + chunk_q_pos`.
+//
+// # Use case
+//
+// hf2q DFlash spec-decode verify against the F16 hybrid_kv slot.
+// Mirrors the bf16/D=256 resume semantics in spec; refer to
+// `flash_attn_prefill.rs:856-922` for the field-level contract on
+// `FlashAttnPrefillResumeParams`.
+//
+// # Errors
+//
+// Returns `MlxError::InvalidArgument` for:
+// - `head_dim != 512`
+// - `q_offset_in_k + seq_len_q > seq_len_k` (Q overshoots K)
+// - `seq_len_k > kv_capacity`               (kL overshoots slot capacity)
+// - Zero or inconsistent shape fields
+// - `n_heads` not divisible by `n_kv_heads`
+// - Buffer too small for declared shape (Q/O against `seq_len_q`,
+//   K/V against `kv_capacity`)
+// - Any buffer dtype != F16
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d512_resume(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillResumeParams,
+) -> Result<()> {
+    // ── Validate ──────────────────────────────────────────────────────────
+    if params.head_dim != 512 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d512_resume: head_dim must be 512, got {}",
+            params.head_dim
+        )));
+    }
+    if params.n_heads == 0
+        || params.n_kv_heads == 0
+        || params.seq_len_q == 0
+        || params.seq_len_k == 0
+        || params.batch == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_f16_d512_resume: \
+             n_heads/n_kv_heads/seq_len_q/seq_len_k/batch must all be > 0"
+                .into(),
+        ));
+    }
+    if params.n_heads % params.n_kv_heads != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d512_resume: n_heads ({}) must \
+             be divisible by n_kv_heads ({})",
+            params.n_heads, params.n_kv_heads
+        )));
+    }
+    if params.q_offset_in_k + params.seq_len_q > params.seq_len_k {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d512_resume: q_offset_in_k ({}) \
+             + seq_len_q ({}) > seq_len_k ({}) — Q overshoots K",
+            params.q_offset_in_k, params.seq_len_q, params.seq_len_k
+        )));
+    }
+    if params.seq_len_k > params.kv_capacity {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d512_resume: seq_len_k ({}) > \
+             kv_capacity ({}) — K/V overshoots slot capacity",
+            params.seq_len_k, params.kv_capacity
+        )));
+    }
+
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::F16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d512_resume: {name} buffer \
+                 must be F16, got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let cap = params.kv_capacity as usize;
+    let d = params.head_dim as usize; // = 512
+
+    crate::ops::flash_attn_prefill::validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    // K/V buffers are validated against capacity (slot layout), not seq_len_k.
+    crate::ops::flash_attn_prefill::validate_buffer_size(k, "K", batch * h_kv * cap * d)?;
+    crate::ops::flash_attn_prefill::validate_buffer_size(v, "V", batch * h_kv * cap * d)?;
+    crate::ops::flash_attn_prefill::validate_buffer_size(out, "out", batch * h * ql * d)?;
+
+    // ── Tile geometry (D=512) ─────────────────────────────────────────────
+    let nqpsg = NQPSG_D512;
+    let ncpsg = NCPSG_D512;
+    let nsg = NSG_D512;
+
+    let nq = params.seq_len_q.div_ceil(nqpsg);
+    let nk = params.seq_len_k.div_ceil(ncpsg);
+    let nq_aligned = params.seq_len_q / nqpsg;
+    let nk_aligned = params.seq_len_k / ncpsg;
+    let ql_rem = params.seq_len_q % nqpsg;
+    let kl_rem = params.seq_len_k % ncpsg;
+
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = false; // resume uses pure causal; no external mask
+    let has_blk = false;
+    let do_causal = params.do_causal;
+
+    // ── Pipeline lookup (F16 kernel, NSG fc) ──────────────────────────────
+    let kernel_name = K_LLAMACPP_F16_D512;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+        &[(FC_IDX_NSG, nsg as i32)],
+    )?;
+
+    // ── Strides ─ Q/O contiguous-packed (qL is exact extent);
+    //   K/V use kv_capacity for head stride (slot layout).
+    let q_seq_stride = d as i64;
+    let q_head_stride = (ql * d) as i64;
+    let q_batch_stride = (h * ql * d) as i64;
+
+    let kv_seq_stride = d as i64;
+    let kv_head_stride = (cap * d) as i64; // ← slot stride
+    let kv_batch_stride = (h_kv * cap * d) as i64;
+
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: params.q_offset_in_k as i32, // ← the resume change
+        _pad: 0,
+        q_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+        k_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        v_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+    };
+
+    // ── Grid geometry ─────────────────────────────────────────────────────
+    // Matches llama.cpp ggml-metal-ops.cpp:2861:
+    //   grid = ((ne01 + nqptg - 1)/nqptg, ne02, ne03)
+    //   threads / TG = (32, nsg, 1)
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
+    let tg_size = MTLSize::new(32, nsg as u64, 1);
+    let tgmem = TGMEM_BYTES_D512 as u64;
+
+    // ── Encode ────────────────────────────────────────────────────────────
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(q)),
+            (1, KernelArg::Buffer(k)),
+            (2, KernelArg::Buffer(v)),
+            (3, KernelArg::Buffer(out)),
+            (4, KernelArg::Bytes(as_bytes(&attn_params))),
+            // buffers 5/6 (mask) and 7 (blk) intentionally absent —
+            // has_mask=false + has_blk=false function constants
+            // dead-code-eliminate the mask + blk loads.
+        ],
+        &[(0, tgmem)],
+        grid,
+        tg_size,
+    );
+
+    Ok(())
 }

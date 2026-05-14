@@ -420,7 +420,7 @@ fn validate_params(params: &FlashAttnPrefillParams) -> Result<()> {
     Ok(())
 }
 
-fn validate_buffer_size(buf: &MlxBuffer, name: &str, expected_elements: usize) -> Result<()> {
+pub(crate) fn validate_buffer_size(buf: &MlxBuffer, name: &str, expected_elements: usize) -> Result<()> {
     let expected_bytes = expected_elements * buf.dtype().size_of();
     if buf.byte_len() < expected_bytes {
         return Err(MlxError::InvalidArgument(format!(
