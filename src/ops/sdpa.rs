@@ -50,10 +50,15 @@ pub struct SdpaParams {
     /// extra capacity), set equal to `kv_seq_len`.  Default: 0 means "use
     /// kv_seq_len as capacity" for backwards compatibility.
     pub kv_capacity: u32,
+    /// Whether to apply a causal mask.  `true` (default) = causal; matches
+    /// previous behavior.  `false` = bidirectional (required by DFlash drafter
+    /// full_attention layer for block-diffusion to produce different
+    /// predictions at each mask position).
+    pub do_causal: bool,
 }
 
 /// GPU-side parameter struct layout.  Must match the MSL `SdpaParams` struct
-/// exactly (6 × u32 + 1 × f32 = 28 bytes, no padding).
+/// exactly (7 × u32 + 1 × f32 = 32 bytes, no padding).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SdpaParamsGpu {
@@ -64,6 +69,25 @@ struct SdpaParamsGpu {
     kv_seq_len: u32,
     scale: f32,
     kv_capacity: u32,
+    do_causal: u32,
+}
+
+impl Default for SdpaParams {
+    /// Defaults: zeros + causal=true (matches pre-iter-87 behavior).  All
+    /// existing call sites that built `SdpaParams { ... }` without
+    /// `do_causal` get the historical causal behavior via `..Default::default()`.
+    fn default() -> Self {
+        Self {
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            seq_len: 0,
+            kv_seq_len: 0,
+            scale: 1.0,
+            kv_capacity: 0,
+            do_causal: true,
+        }
+    }
 }
 
 /// Tile size for query positions per threadgroup.  Must match `TILE_Q` in the
@@ -180,6 +204,7 @@ pub fn sdpa(
         kv_seq_len: params.kv_seq_len,
         scale: params.scale,
         kv_capacity: kv_cap,
+        do_causal: if params.do_causal { 1 } else { 0 },
     };
     let params_bytes = bytemuck::bytes_of(&params_gpu);
     let mut params_buf = device.alloc_buffer(
@@ -242,6 +267,7 @@ mod tests {
             kv_seq_len: 128,
             scale: 1.0 / (256.0_f32).sqrt(),
             kv_capacity: 128,
+            do_causal: true,
         };
         assert!(validate_params(&p).is_ok());
     }
@@ -256,6 +282,7 @@ mod tests {
             kv_seq_len: 128,
             scale: 1.0,
             kv_capacity: 128,
+            do_causal: true,
         };
         assert!(matches!(
             validate_params(&p),
@@ -273,6 +300,7 @@ mod tests {
             kv_seq_len: 128,
             scale: 1.0,
             kv_capacity: 128,
+            do_causal: true,
         };
         assert!(matches!(
             validate_params(&p),

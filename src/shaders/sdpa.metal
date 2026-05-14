@@ -32,6 +32,7 @@ struct SdpaParams {
     uint kv_seq_len;    // key/value sequence length (valid positions)
     float scale;        // attention score scaling factor (e.g. 1/sqrt(head_dim) or 1.0)
     uint kv_capacity;   // stride between KV heads (in positions); >= kv_seq_len
+    uint do_causal;     // 1 = causal (max_k = abs_pos+1); 0 = bidirectional (max_k = kv_seq_len)
 };
 
 // Tile size: number of query positions per threadgroup.
@@ -89,12 +90,18 @@ kernel void sdpa(
     // Attention score scaling factor (caller-provided, e.g. 1/sqrt(head_dim) or 1.0).
     const float scale = params->scale;
 
-    // Causal mask bounds.
-    // When seq_len < kv_seq_len (decode mode with KV cache), the query positions
-    // map to the END of the full sequence. q_pos=0 corresponds to absolute
-    // position (kv_seq_len - seq_len). The causal constraint: attend to k_pos <= abs_pos.
+    // Causal mask bounds (gated on do_causal).
+    // When do_causal=1 and seq_len < kv_seq_len (decode mode with KV cache), the
+    // query positions map to the END of the full sequence. q_pos=0 corresponds
+    // to absolute position (kv_seq_len - seq_len). The causal constraint:
+    // attend to k_pos <= abs_pos.
+    // When do_causal=0 (DFlash full_attention drafter layer), attend to all kv
+    // positions — block-diffusion requires bidirectional attention within the
+    // block so each mask position sees all the others.
     const uint abs_pos = kv_seq_len - seq_len + q_pos;
-    const uint max_k = min(abs_pos + 1, kv_seq_len);
+    const uint max_k = params->do_causal != 0
+        ? min(abs_pos + 1, kv_seq_len)
+        : kv_seq_len;
 
     // ---- Single-pass online softmax (Milakov & Gimelshein 2018) ----
     //
