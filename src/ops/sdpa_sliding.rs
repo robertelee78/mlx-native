@@ -212,6 +212,26 @@ pub fn sdpa_sliding(
     validate_buffer(v, "V", kv_elements)?;
     validate_buffer(output, "output", q_elements)?;
 
+    // hf2q ADR-030 iter-111 — defense-in-depth dtype-coherence check
+    // (mirrors the SDPA + rms_norm guards landed at iter-110/111).  The
+    // pipeline below is selected by q.dtype() ONLY; mismatched K, V, or
+    // output dtype would silently mis-stride the buffer reads/writes.
+    if k.dtype() != q.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "SDPA sliding dtype mismatch: Q={} != K={}", q.dtype(), k.dtype(),
+        )));
+    }
+    if v.dtype() != q.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "SDPA sliding dtype mismatch: Q={} != V={}", q.dtype(), v.dtype(),
+        )));
+    }
+    if output.dtype() != q.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "SDPA sliding dtype mismatch: Q={} != output={}", q.dtype(), output.dtype(),
+        )));
+    }
+
     // Allocate params buffer.
     let params_gpu = SdpaSlidingParamsGpu {
         n_heads: params.n_heads,

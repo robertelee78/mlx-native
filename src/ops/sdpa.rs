@@ -190,6 +190,32 @@ pub fn sdpa(
         * kv_cap as usize
         * params.head_dim as usize;
 
+    // hf2q ADR-030 iter-111 — defense-in-depth: kernel selection below
+    // gates on q.dtype() ONLY, and the chosen kernel declares K, V, and
+    // output at the matching dtype.  Validate all four buffers share
+    // the same dtype so mismatched bindings (e.g. F32 Q + BF16 K) raise
+    // a clear error instead of silently mis-striding K/V reads and
+    // overrunning the buffer.  Same pattern as the rms_norm guard
+    // landed in hf2q ADR-030 iter-110.
+    if k.dtype() != q.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "SDPA dtype mismatch: Q={} != K={} (kernel reads K at Q-dtype stride)",
+            q.dtype(), k.dtype(),
+        )));
+    }
+    if v.dtype() != q.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "SDPA dtype mismatch: Q={} != V={} (kernel reads V at Q-dtype stride)",
+            q.dtype(), v.dtype(),
+        )));
+    }
+    if output.dtype() != q.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "SDPA dtype mismatch: Q={} != output={} (kernel writes output at Q-dtype stride)",
+            q.dtype(), output.dtype(),
+        )));
+    }
+
     validate_buffer(q, "Q", q_elements)?;
     validate_buffer(k, "K", kv_elements)?;
     validate_buffer(v, "V", kv_elements)?;
