@@ -659,3 +659,93 @@ fn test_moe_weighted_sum_seq_bf16_input_basic() {
     // Output is f32 accumulation; atol is slightly relaxed due to bf16 input rounding.
     assert_allclose(&got, &cpu_ref, 5e-3, 2e-2, "moe_weighted_sum_seq_bf16_input");
 }
+
+// ---------------------------------------------------------------------------
+// ADR-030 iter-97: kv_cache_copy_seq_bf16_to_bf16_head_major
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_kv_cache_copy_seq_bf16_to_bf16_head_major_basic() {
+    // Verify head-major BF16 src → head-major BF16 cache produces bit-exact
+    // copy at seq_pos_start offset.  Specifically tests the layout used by
+    // pf_k_perm (fused_head_norm_rope's bf16 permuted output: [n_heads,
+    // seq_len, head_dim]) into a [n_heads, capacity, head_dim] cache.
+    use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major;
+
+    let device = MlxDevice::new().expect("MlxDevice::new");
+    let mut registry = KernelRegistry::new();
+
+    let n_heads: usize = 4;
+    let head_dim: usize = 16;
+    let n_tokens: usize = 6;
+    let src_seq_len: usize = 6;
+    let capacity: usize = 32;
+    let src_tok_offset: usize = 0;
+    let seq_pos_start: usize = 10; // non-zero start
+
+    let total_src = n_heads * src_seq_len * head_dim;
+    let total_cache = n_heads * capacity * head_dim;
+
+    let src_f32: Vec<f32> = pseudo_rand(7, total_src)
+        .into_iter()
+        .map(f32_to_bf16_round)
+        .collect();
+
+    let src_buf = alloc_bf16(&device, &src_f32);
+    let cache_buf = alloc_zeroed(&device, total_cache * 2, DType::BF16, total_cache);
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &src_buf,
+        &cache_buf,
+        n_heads as u32,
+        head_dim as u32,
+        capacity as u32,
+        seq_pos_start as u32,
+        n_tokens as u32,
+        src_tok_offset as u32,
+        src_seq_len as u32,
+    )
+    .expect("dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let cache_bytes = cache_buf.as_slice::<u8>().expect("read cache");
+    let cache_vals = read_bf16(cache_bytes, total_cache);
+
+    // Verify each written element is bit-exact copy from src at correct slot.
+    for tok in 0..n_tokens {
+        for head in 0..n_heads {
+            for elem in 0..head_dim {
+                let src_idx = head * src_seq_len * head_dim + tok * head_dim + elem;
+                let dst_pos = seq_pos_start + tok;
+                let dst_idx = head * capacity * head_dim + dst_pos * head_dim + elem;
+                let expected = src_f32[src_idx];
+                let got = cache_vals[dst_idx];
+                assert!(
+                    (got - expected).abs() < 1e-7,
+                    "bf16_to_bf16_head_major mismatch at tok={} head={} elem={}: \
+                     got={} want={}",
+                    tok, head, elem, got, expected
+                );
+            }
+        }
+    }
+
+    // Verify positions NOT written remain zero (cache was zero-initialized).
+    for head in 0..n_heads {
+        for pos in 0..capacity {
+            if pos >= seq_pos_start && pos < seq_pos_start + n_tokens {
+                continue; // skip the written range
+            }
+            for elem in 0..head_dim {
+                let idx = head * capacity * head_dim + pos * head_dim + elem;
+                assert_eq!(cache_vals[idx], 0.0,
+                    "cache should be zero at unwritten position head={} pos={} elem={}",
+                    head, pos, elem);
+            }
+        }
+    }
+}
