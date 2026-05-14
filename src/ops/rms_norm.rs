@@ -97,6 +97,38 @@ pub fn dispatch_rms_norm(
         )));
     }
 
+    // hf2q ADR-030 iter-110 — defense-in-depth: kernel selection below
+    // gates on input.dtype() ONLY, and each rms_norm_{f32,f16,bf16}
+    // Metal kernel declares its weight buffer with the matching dtype
+    // (`device const float*`, `half*`, or `bfloat*`).  Passing a weight
+    // buffer of a DIFFERENT dtype than input silently mis-strides the
+    // weight reads + over-reads past the buffer end (iter-106 bug
+    // signature: BF16 buffer read as F32 → bit-misinterpretation +
+    // OOB).  Validate up front so callers see a clear error instead
+    // of corrupted hidden states downstream.  Allow input.dtype() ==
+    // weight.dtype() == output.dtype() invariant (matches sigmoid_mul
+    // and silu_mul's existing dtype-coherence checks).
+    if input.dtype() != weight.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm dtype mismatch: input={} != weight={} (kernel rms_norm_{} \
+             reads weight at input-dtype stride; mismatched buffer dtypes cause \
+             silent bit-misinterpretation + OOB reads — see hf2q ADR-030 iter-106)",
+            input.dtype(), weight.dtype(),
+            match input.dtype() {
+                DType::F32 => "f32",
+                DType::F16 => "f16",
+                DType::BF16 => "bf16",
+                _ => "?",
+            },
+        )));
+    }
+    if input.dtype() != output.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm dtype mismatch: input={} != output={}",
+            input.dtype(), output.dtype(),
+        )));
+    }
+
     // ADR-028 iter-310 — float4 + simd_sum variant for F32 path.
     // Requires `dim % 4 == 0`; falls back to scalar when not.
     //
