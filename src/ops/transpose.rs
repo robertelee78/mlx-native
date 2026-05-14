@@ -68,6 +68,23 @@ pub fn transpose_2d(
         }
     };
 
+    // hf2q ADR-030 iter-117 — defense-in-depth dtype check.  The caller-
+    // supplied `dtype` parameter selects the kernel pipeline; passing
+    // buffers of a DIFFERENT dtype would silently mis-stride.  Mirrors
+    // the pattern landed at hf2q ADR-030 iter-110→113.
+    if input.dtype() != dtype {
+        return Err(MlxError::InvalidArgument(format!(
+            "transpose_2d: input dtype {} != dtype param {}",
+            input.dtype(), dtype,
+        )));
+    }
+    if output.dtype() != dtype {
+        return Err(MlxError::InvalidArgument(format!(
+            "transpose_2d: output dtype {} != dtype param {}",
+            output.dtype(), dtype,
+        )));
+    }
+
     let elem_bytes = rows * cols * dtype.size_of();
     if input.byte_len() < elem_bytes {
         return Err(MlxError::InvalidArgument(format!(
