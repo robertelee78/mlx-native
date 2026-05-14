@@ -806,6 +806,22 @@ pub fn dispatch_rms_norm_no_scale_bf16(
         )));
     }
 
+    // hf2q ADR-030 iter-112 — defense-in-depth dtype check.  This
+    // dispatcher hardcodes the BF16 kernel; passing F32 buffers would
+    // mis-stride reads/writes.
+    if input.dtype() != DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "rms_norm_no_scale_bf16: input must be BF16, got {}",
+            input.dtype(),
+        )));
+    }
+    if output.dtype() != DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "rms_norm_no_scale_bf16: output must be BF16, got {}",
+            output.dtype(),
+        )));
+    }
+
     let pipeline = registry.get_pipeline("rms_norm_no_scale_bf16", device)?;
 
     // One threadgroup per row.  Threadgroup size must be a power of 2
@@ -880,6 +896,22 @@ pub fn dispatch_rms_norm_no_scale_f32(
             output.element_count(),
             rows,
             dim
+        )));
+    }
+
+    // hf2q ADR-030 iter-112 — defense-in-depth dtype check.  This
+    // dispatcher hardcodes the F32 kernel; passing BF16/F16 buffers
+    // would mis-stride reads/writes.
+    if input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "rms_norm_no_scale_f32: input must be F32, got {}",
+            input.dtype(),
+        )));
+    }
+    if output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "rms_norm_no_scale_f32: output must be F32, got {}",
+            output.dtype(),
         )));
     }
 
@@ -972,6 +1004,37 @@ pub fn dispatch_rms_norm_mul(
             input.element_count(),
             rows,
             dim
+        )));
+    }
+
+    // hf2q ADR-030 iter-112 — defense-in-depth dtype-coherence check.
+    // fused_rms_norm_mul_{f32,bf16} kernels declare norm_weight, scale,
+    // and output at the input-dtype stride.  Mismatched buffers would
+    // silently mis-stride (iter-106 signature).  Same pattern as the
+    // iter-110 dispatch_rms_norm guard.
+    if norm_weight.dtype() != input.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "Fused RMS norm+mul dtype mismatch: input={} != norm_weight={} \
+             (kernel rms_norm_mul_{} reads norm_weight at input-dtype stride)",
+            input.dtype(), norm_weight.dtype(),
+            match input.dtype() {
+                DType::F32 => "f32",
+                DType::F16 => "f16",
+                DType::BF16 => "bf16",
+                _ => "?",
+            },
+        )));
+    }
+    if scale_weight.dtype() != input.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "Fused RMS norm+mul dtype mismatch: input={} != scale={}",
+            input.dtype(), scale_weight.dtype(),
+        )));
+    }
+    if output.dtype() != input.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "Fused RMS norm+mul dtype mismatch: input={} != output={}",
+            input.dtype(), output.dtype(),
         )));
     }
 
