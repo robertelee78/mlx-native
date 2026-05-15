@@ -627,12 +627,10 @@ pub fn dispatch_fused_moe_routing_f32(
     // case — see test_fused_moe_routing_v2_parity.rs) AND measured +0.3% on
     // gemma4 hybrid decode (76.2 → 76.4).  Opt-out via
     // HF2Q_FUSED_MOE_ROUTING_V2=0.
-    let use_v2 = !matches!(
-        std::env::var("HF2Q_FUSED_MOE_ROUTING_V2").ok().as_deref(),
-        Some(v) if v.eq_ignore_ascii_case("0")
-            || v.eq_ignore_ascii_case("false")
-            || v.eq_ignore_ascii_case("off")
-    );
+    // ADR-029 iter-175 Step 1az: cache the env-flag (default-true semantics).
+    // fused_moe_routing fires once per layer per token in gemma4 MoE path.
+    static CACHED_MOE_ROUTING_V2: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let use_v2 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V2, "HF2Q_FUSED_MOE_ROUTING_V2");
     let kernel_name = if use_v2 {
         "fused_moe_routing_f32_v2"
     } else {

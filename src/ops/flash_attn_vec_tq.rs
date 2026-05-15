@@ -135,14 +135,23 @@ fn validate_params(params: &FlashAttnVecTqParams) -> Result<()> {
 ///
 /// Override: set HF2Q_TQ_NWG=N to force a specific value (for benchmarking).
 fn compute_nwg(_kv_seq_len: u32) -> u32 {
-    if let Ok(v) = std::env::var("HF2Q_TQ_NWG") {
-        if let Ok(n) = v.parse::<u32>() {
-            if n >= 1 && n <= 32 {
-                return n;
-            }
-        }
+    // ADR-029 iter-175 Step 1az: cached parsed override (same pattern as
+    // flash_attn_vec_tq_hb::compute_nwg from Step 1at).  This 4-bit TQ path
+    // is NOT in production gemma4 (default codebook is 8-bit), but caching
+    // here is consistent + benign + protects against future codebook flip.
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static CACHED_TQ_NWG_4BIT: AtomicI32 = AtomicI32::new(-1);
+    let mut v = CACHED_TQ_NWG_4BIT.load(Ordering::Relaxed);
+    if v < 0 {
+        let parsed = std::env::var("HF2Q_TQ_NWG")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1 && n <= 32)
+            .unwrap_or(0);
+        CACHED_TQ_NWG_4BIT.store(parsed as i32, Ordering::Relaxed);
+        v = parsed as i32;
     }
-    16
+    if v > 0 { v as u32 } else { 16 }
 }
 
 /// Dispatch TQ flash attention vector kernel on the GPU.
