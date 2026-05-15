@@ -168,12 +168,23 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 /// keeps short-context behavior byte-identical (nsg=1) per
 /// `feedback_metal_compiler_auto_optimizes_static_levers`.
 pub fn compute_nsg(kv_seq_len: u32) -> u32 {
-    if let Ok(v) = std::env::var("HF2Q_TQ_NSG") {
-        if let Ok(n) = v.parse::<u32>() {
-            if n == 1 || n == 2 || n == 4 {
-                return n;
-            }
-        }
+    // ADR-029 iter-175 Step 1at: cache parsed override.
+    // TQ-HB FA fires ~26-30 calls/token at gemma4 decode (TQ-HB-V is default V-KV).
+    // Uncached env::var was ~70 ns/call (H-N bench).
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static CACHED_TQ_NSG: AtomicI32 = AtomicI32::new(-1);
+    let mut v = CACHED_TQ_NSG.load(Ordering::Relaxed);
+    if v < 0 {
+        let parsed = std::env::var("HF2Q_TQ_NSG")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n == 1 || n == 2 || n == 4)
+            .unwrap_or(0);
+        CACHED_TQ_NSG.store(parsed as i32, Ordering::Relaxed);
+        v = parsed as i32;
+    }
+    if v > 0 {
+        return v as u32;
     }
     // ADR-028 iter-127d Path D: adaptive NSG policy from measured bench data.
     //
@@ -197,12 +208,21 @@ pub fn compute_nsg(kv_seq_len: u32) -> u32 {
 }
 
 fn compute_nwg(kv_seq_len: u32) -> u32 {
-    if let Ok(v) = std::env::var("HF2Q_TQ_NWG") {
-        if let Ok(n) = v.parse::<u32>() {
-            if n >= 1 && n <= 32 {
-                return n;
-            }
-        }
+    // ADR-029 iter-175 Step 1at: cache parsed override (same pattern as compute_nsg).
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static CACHED_TQ_NWG: AtomicI32 = AtomicI32::new(-1);
+    let mut v = CACHED_TQ_NWG.load(Ordering::Relaxed);
+    if v < 0 {
+        let parsed = std::env::var("HF2Q_TQ_NWG")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1 && n <= 32)
+            .unwrap_or(0);
+        CACHED_TQ_NWG.store(parsed as i32, Ordering::Relaxed);
+        v = parsed as i32;
+    }
+    if v > 0 {
+        return v as u32;
     }
     // ADR-028 iter-119 kL-adaptive nwg.
     //
