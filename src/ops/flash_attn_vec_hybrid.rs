@@ -123,6 +123,15 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 
 /// Mirror of `flash_attn_vec_tq_hb::compute_nwg`. Hybrid uses the same kL
 /// adaptive policy because the workgroup-axis split is independent of K dtype.
+///
+/// ADR-029 iter-175 Step 1v (2026-05-15) NWG sweep at HEAD (gemma4-APEX-Q5_K_M, M5 Max, tg100):
+///   default (NWG=16 at kv≤512):  95.5 / 92.9 (range 2.6 — thermal-affected)
+///   NWG=32 forced (`HF2Q_HYBRID_NWG=32`): 95.6 / 95.6 (tight, range 0.0)
+///   NWG=8  forced (`HF2Q_HYBRID_NWG=8`):  95.4
+/// At tg100 the FA contribution is only ~0.34% of decode wall (kv mean=50,
+/// ~1.2 µs/call × 30 calls/layer × 1 layer = small).  NWG=32 forced is
+/// marginally tighter (less variance) but mean delta within bench noise.
+/// Threshold kept at 512 because no measurable wall-level gain crossing it.
 fn compute_nwg(kv_seq_len: u32) -> u32 {
     if let Ok(v) = std::env::var("HF2Q_HYBRID_NWG") {
         if let Ok(n) = v.parse::<u32>() {
