@@ -14,7 +14,15 @@ use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
 use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
-use crate::env_flags::env_default_true;
+use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
+use std::sync::atomic::AtomicI8;
+
+// ADR-029 iter-175 Step 1an: cached hot-path env-flag gates for dispatch_id_mv.
+// Uncached env::var costs ~70 ns/call (H-N microbench); cached AtomicI8 ~2 ns.
+// dispatch_id_mv is called ~150 times/token; 2 env reads × 150 = 300 × 68 ns
+// = 20 µs/tok ≈ 0.2% wall just from these 2 sites.
+static CACHED_Q6K_ID_MV_NR2: AtomicI8 = AtomicI8::new(-1);
+static CACHED_Q8_0_ID_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::quantized_matmul_ggml::GgmlType;
@@ -481,14 +489,15 @@ fn dispatch_id_mv(
     // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2).
     // Opt out with `HF2Q_Q6K_ID_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
-        && env_default_true("HF2Q_Q6K_ID_MV_NR2");
+        && cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2");
     // ADR-029 iter-6 — nr0=2 nsg=4 variant for q8_0 _id mat-vec.
     // Matches peer's N_R0_Q8_0=2 + N_SG_Q8_0=4 in ggml-metal-impl.h:27,40.
     // gemma4 APEX-Q5_K_M MoE down_exps is Q8_0 → 30 dispatches/decode-tok
     // on this path.  Opt-in via `HF2Q_Q8_0_ID_MV_NR2=1`; default-off
-    // until coherence + bench validation.
+    // until coherence + bench validation.  ADR-029 iter-175 Step 1an:
+    // cached via AtomicI8.
     let use_q8_0_id_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
-        && std::env::var("HF2Q_Q8_0_ID_MV_NR2").ok().as_deref() == Some("1");
+        && cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2");
     let kernel_name = if use_q6k_id_nr2 {
         "kernel_mul_mv_id_q6_K_f32_nr2"
     } else if use_q8_0_id_nr2 {
