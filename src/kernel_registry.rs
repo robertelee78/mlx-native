@@ -4,12 +4,49 @@
 //! access, the source is compiled into a Metal library, the named function is
 //! extracted, and a `ComputePipelineState` is created and cached.  Subsequent
 //! calls return the cached pipeline.
+//!
+//! ## ADR-029 iter-175 Step 1l: precompiled `.metallib` fast path
+//!
+//! `build.rs` runs `xcrun metal -O3` on every `.metal` file under
+//! `src/shaders/` and links the results into a single `default.metallib`
+//! placed in `OUT_DIR`.  We embed the bytes via `include_bytes!`.
+//!
+//! When `MLX_PRECOMPILED_METALLIB=1` is set, `get_pipeline` and
+//! `get_pipeline_with_constants` first try to resolve the kernel function
+//! against this precompiled library; if found, build the pipeline from it
+//! (saves Apple's runtime source-compile pass).  On any failure (function
+//! missing, empty embedded blob, load error) the code transparently falls
+//! back to the original source-compile path — byte-identical behavior.
+//!
+//! Empirical motivation (iter 1k test
+//! `tests/iter175_h_e_metallib_perf.rs`): on M5 Max at the gemma4 Q_sliding
+//! decode shape, precompiled is **+5.89% faster** than runtime-source
+//! (median 18.35 µs vs 19.49 µs) with a tighter p90 (19.54 vs 70.11) —
+//! Apple's runtime compile chain has occasional jitter outliers.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use metal::{ComputePipelineDescriptor, ComputePipelineState, FunctionConstantValues, MTLDataType};
 
 use crate::error::{MlxError, Result};
+
+/// Bytes of the precompiled `default.metallib` produced by `build.rs` from
+/// every `src/shaders/*.metal` file.  Empty when `MLX_NATIVE_SKIP_METALLIB`
+/// was set at build time or xcrun was unavailable.
+const EMBEDDED_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/default.metallib"));
+
+/// Returns `true` when `MLX_PRECOMPILED_METALLIB=1` is set in the process
+/// environment.  Cached on first read.  Default-OFF until A/B-bench
+/// validates the H-E lever at the full-decode level.
+fn precompiled_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("MLX_PRECOMPILED_METALLIB")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 
 // MTLDataType numeric values (from metal-rs argument.rs, confirmed in Apple Metal spec):
 //   Int  = 29
@@ -40,6 +77,20 @@ pub struct KernelRegistry {
     ///
     /// Populated at construction time with all embedded shader sources.
     sources: HashMap<String, &'static str>,
+    /// ADR-029 iter-175 Step 1l: precompiled `default.metallib` (lazy).
+    ///
+    /// `None` initially.  On first `get_pipeline*` call under
+    /// `MLX_PRECOMPILED_METALLIB=1`, populated via
+    /// `device.new_library_with_data(EMBEDDED_METALLIB)` — or set to a
+    /// sentinel "load-failed" marker (still `None`) so we don't retry.
+    /// Set to `Some(library)` on success.
+    ///
+    /// Lazily filled because we need a `&metal::DeviceRef` to load it
+    /// and `KernelRegistry::new()` does not have one.
+    precompiled_lib: Option<metal::Library>,
+    /// Whether we've already attempted to load the precompiled library.
+    /// Prevents repeated load attempts on failure.
+    precompiled_load_attempted: bool,
 }
 
 impl KernelRegistry {
@@ -995,7 +1046,38 @@ impl KernelRegistry {
         Self {
             cache: HashMap::new(),
             sources,
+            precompiled_lib: None,
+            precompiled_load_attempted: false,
         }
+    }
+
+    /// Try to obtain the precompiled `default.metallib` Library, loading it
+    /// lazily on first call.  Returns `None` when:
+    /// - `MLX_PRECOMPILED_METALLIB` is unset (default)
+    /// - The embedded blob is empty (build.rs skipped metallib build)
+    /// - `device.new_library_with_data` failed previously
+    /// - The previous load attempt already failed (no retry)
+    fn try_precompiled_lib(
+        &mut self,
+        device: &metal::DeviceRef,
+    ) -> Option<&metal::LibraryRef> {
+        if !precompiled_enabled() {
+            return None;
+        }
+        if !self.precompiled_load_attempted {
+            self.precompiled_load_attempted = true;
+            if EMBEDDED_METALLIB.is_empty() {
+                return None;
+            }
+            // Apple's `newLibraryWithData:` expects a dispatch_data_t.
+            // metal-rs wraps this via `new_library_with_data` which takes
+            // a `&[u8]`.
+            match device.new_library_with_data(EMBEDDED_METALLIB) {
+                Ok(lib) => self.precompiled_lib = Some(lib),
+                Err(_) => self.precompiled_lib = None,
+            }
+        }
+        self.precompiled_lib.as_deref()
     }
 
     /// Register a shader source at runtime (useful for testing and dynamic
@@ -1024,25 +1106,39 @@ impl KernelRegistry {
         device: &metal::DeviceRef,
     ) -> Result<&ComputePipelineState> {
         if !self.cache.contains_key(name) {
-            // Slow path: compile the shader.
-            let source = self.sources.get(name).ok_or_else(|| {
-                MlxError::KernelNotFound(name.to_string())
-            })?;
+            // ADR-029 iter-175 Step 1l: precompiled .metallib fast path.
+            // When MLX_PRECOMPILED_METALLIB=1 AND the kernel exists in the
+            // embedded library, use it.  Otherwise fall through to runtime
+            // source compile.  Empirically ~+5.89% faster on q6_K matvec
+            // (iter 1k bench).
+            let precompiled_function = self
+                .try_precompiled_lib(device)
+                .and_then(|lib| lib.get_function(name, None).ok());
 
-            let compile_opts = metal::CompileOptions::new();
-            let library = device
-                .new_library_with_source(source, &compile_opts)
-                .map_err(|msg| MlxError::ShaderCompilationError {
-                    name: name.to_string(),
-                    message: msg,
-                })?;
+            let function = match precompiled_function {
+                Some(f) => f,
+                None => {
+                    // Slow path: compile the shader.
+                    let source = self.sources.get(name).ok_or_else(|| {
+                        MlxError::KernelNotFound(name.to_string())
+                    })?;
 
-            let function = library
-                .get_function(name, None)
-                .map_err(|msg| MlxError::ShaderCompilationError {
-                    name: name.to_string(),
-                    message: msg,
-                })?;
+                    let compile_opts = metal::CompileOptions::new();
+                    let library = device
+                        .new_library_with_source(source, &compile_opts)
+                        .map_err(|msg| MlxError::ShaderCompilationError {
+                            name: name.to_string(),
+                            message: msg,
+                        })?;
+
+                    library
+                        .get_function(name, None)
+                        .map_err(|msg| MlxError::ShaderCompilationError {
+                            name: name.to_string(),
+                            message: msg,
+                        })?
+                }
+            };
 
             // Build the pipeline through a descriptor so we can attach a
             // human-readable label.  The label propagates into Instruments /
@@ -1130,19 +1226,6 @@ impl KernelRegistry {
         }
 
         if !self.cache.contains_key(&cache_key) {
-            // Slow path: compile the shader with function constant specialisation.
-            let source = self.sources.get(name).ok_or_else(|| {
-                MlxError::KernelNotFound(name.to_string())
-            })?;
-
-            let compile_opts = metal::CompileOptions::new();
-            let library = device
-                .new_library_with_source(source, &compile_opts)
-                .map_err(|msg| MlxError::ShaderCompilationError {
-                    name: name.to_string(),
-                    message: msg,
-                })?;
-
             // Build the FunctionConstantValues object with all bool and i32
             // constants.  Metal's set_constant_value_at_index reads the value
             // through a raw pointer; the pointed-to bytes must match the size
@@ -1171,12 +1254,54 @@ impl KernelRegistry {
                 );
             }
 
-            let function = library
-                .get_function(name, Some(fcv))
-                .map_err(|msg| MlxError::ShaderCompilationError {
-                    name: name.to_string(),
-                    message: msg,
-                })?;
+            // ADR-029 iter-175 Step 1l: try precompiled .metallib first.
+            // get_function with FCV takes ownership of the FCV, so we
+            // build a separate one for the precompiled probe.
+            let precompiled_function = {
+                let probe_fcv = FunctionConstantValues::new();
+                for &(index, value) in bool_constants {
+                    let v: u8 = if value { 1 } else { 0 };
+                    probe_fcv.set_constant_value_at_index(
+                        (&v as *const u8).cast::<std::ffi::c_void>(),
+                        MTLDataType::Bool,
+                        index as u64,
+                    );
+                }
+                for &(index, value) in int_constants {
+                    probe_fcv.set_constant_value_at_index(
+                        (&value as *const i32).cast::<std::ffi::c_void>(),
+                        MTLDataType::Int,
+                        index as u64,
+                    );
+                }
+                self.try_precompiled_lib(device)
+                    .and_then(|lib| lib.get_function(name, Some(probe_fcv)).ok())
+            };
+
+            let function = match precompiled_function {
+                Some(f) => f,
+                None => {
+                    // Slow path: compile the shader with function constant specialisation.
+                    let source = self.sources.get(name).ok_or_else(|| {
+                        MlxError::KernelNotFound(name.to_string())
+                    })?;
+
+                    let compile_opts = metal::CompileOptions::new();
+                    let library = device
+                        .new_library_with_source(source, &compile_opts)
+                        .map_err(|msg| MlxError::ShaderCompilationError {
+                            name: name.to_string(),
+                            message: msg,
+                        })?;
+
+                    library
+                        .get_function(name, Some(fcv))
+                        .map_err(|msg| MlxError::ShaderCompilationError {
+                            name: name.to_string(),
+                            message: msg,
+                        })?
+                }
+            };
 
             // Label this specialisation with the full composite cache key
             // (e.g. `kernel_mul_mv_q4_0_f32|0:b1|3:i32`) so xctrace Metal
