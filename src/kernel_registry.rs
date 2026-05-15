@@ -36,15 +36,42 @@ use crate::error::{MlxError, Result};
 /// was set at build time or xcrun was unavailable.
 const EMBEDDED_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/default.metallib"));
 
-/// Returns `true` when `MLX_PRECOMPILED_METALLIB=1` is set in the process
-/// environment.  Cached on first read.  Default-OFF until A/B-bench
-/// validates the H-E lever at the full-decode level.
+/// Returns `true` when the precompiled `.metallib` fast path is enabled
+/// (default-ON since Step 1m validation).  Set `MLX_PRECOMPILED_METALLIB=0`
+/// (or `false`, `off`) to opt out — useful for diagnosing kernel-compile
+/// regressions or A/B benching.
+///
+/// Step 1m multi-regime validation at HEAD (gemma4-APEX-Q5_K_M, M5 Max):
+/// - tg100 alt-pair 2-cycle: decode 95.5 → 95.9 t/s (+0.42%), prefill
+///   179 → 185 t/s (+3.3%)
+/// - tg2000 alt-pair 1-cycle: decode 93.1 → 92.8 t/s (−0.32%, within σ),
+///   prefill 171 → 178.5 t/s (+4.4%)
+/// - coherence_smoke: 2/2 PASS both configs
+///
+/// The Step 1l initial smoke (`tg50 95.4 → 62.1`) did NOT reproduce on
+/// rebuild — most likely a cold-PSO-cache or first-run-of-rebuilt-binary
+/// artifact rather than a real perf regression.
 fn precompiled_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("MLX_PRECOMPILED_METALLIB")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        match std::env::var("MLX_PRECOMPILED_METALLIB").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        }
+    })
+}
+
+/// Returns `true` when the precompiled `.metallib` is consulted for
+/// `get_pipeline_with_constants` (FCV-specialized) kernels.  Inherits
+/// the master gate [`precompiled_enabled`]; both must be ON for the
+/// FCV path to use precompiled.  Default-ON since Step 1m validation.
+fn precompiled_fcv_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        match std::env::var("MLX_PRECOMPILED_METALLIB_FCV").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        }
     })
 }
 
@@ -1255,9 +1282,14 @@ impl KernelRegistry {
             }
 
             // ADR-029 iter-175 Step 1l: try precompiled .metallib first.
+            // Step 1m: gated separately on MLX_PRECOMPILED_METALLIB_FCV=1
+            // so we can isolate whether the integration regression at
+            // Step 1l (tg50 95.4 → 62.1) lives in this FCV path vs the
+            // no-FCV path in `get_pipeline`.
+            //
             // get_function with FCV takes ownership of the FCV, so we
             // build a separate one for the precompiled probe.
-            let precompiled_function = {
+            let precompiled_function = if precompiled_fcv_enabled() {
                 let probe_fcv = FunctionConstantValues::new();
                 for &(index, value) in bool_constants {
                     let v: u8 = if value { 1 } else { 0 };
@@ -1276,6 +1308,8 @@ impl KernelRegistry {
                 }
                 self.try_precompiled_lib(device)
                     .and_then(|lib| lib.get_function(name, Some(probe_fcv)).ok())
+            } else {
+                None
             };
 
             let function = match precompiled_function {
