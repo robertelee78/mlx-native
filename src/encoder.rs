@@ -468,21 +468,29 @@ fn pipeline_tg_mult_hint_enabled() -> bool {
 /// This function panics with a clear message before dispatching so an
 /// offending site is caught immediately instead of silently corrupting
 /// output.  Returns immediately (one atomic-load cost) when the env
-/// flag is OFF.
+/// flag is OFF.  Includes the pipeline's label in the panic message
+/// (Step 1r) so the offending kernel can be identified without a
+/// debugger.
 #[inline]
-fn assert_tg_size_multiple_of_32_if_hinted(tg: MTLSize) {
+fn assert_tg_size_multiple_of_32_if_hinted(
+    tg: MTLSize,
+    pipeline: &ComputePipelineStateRef,
+) {
     if !pipeline_tg_mult_hint_enabled() {
         return;
     }
     let total = tg.width.saturating_mul(tg.height).saturating_mul(tg.depth);
     if total % 32 != 0 {
+        let label = pipeline.label();
         panic!(
             "ADR-029 Step 1q safety: HF2Q_PIPELINE_TG_MULT_HINT=1 requires \
              threadgroup_size.x * y * z to be a multiple of 32 (Apple's \
              threadExecutionWidth).  Got tg=({}, {}, {}) → total={} → \
-             {} mod 32 = {}.  Either fix the dispatch site to use a \
-             multiple-of-32 threadgroup, or unset HF2Q_PIPELINE_TG_MULT_HINT.",
-            tg.width, tg.height, tg.depth, total, total, total % 32
+             {} mod 32 = {}.  Pipeline label: \"{}\".  Either fix the \
+             dispatch site to use a multiple-of-32 threadgroup, or unset \
+             HF2Q_PIPELINE_TG_MULT_HINT.",
+            tg.width, tg.height, tg.depth, total, total, total % 32,
+            label
         );
     }
 }
@@ -1098,7 +1106,7 @@ impl CommandEncoder {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
-        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
     }
@@ -1142,7 +1150,7 @@ impl CommandEncoder {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
         }
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
-        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
     }
@@ -1200,7 +1208,7 @@ impl CommandEncoder {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
-        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
     }
@@ -1241,7 +1249,7 @@ impl CommandEncoder {
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
-        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
     }
@@ -1282,7 +1290,7 @@ impl CommandEncoder {
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
-        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
     }
@@ -1327,7 +1335,7 @@ impl CommandEncoder {
             encoder.set_threadgroup_memory_length(index, byte_length);
         }
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
-        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
     }
@@ -1695,11 +1703,11 @@ impl CommandEncoder {
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
         match dispatch_kind {
             DispatchKind::Threads => {
-                assert_tg_size_multiple_of_32_if_hinted(threads_per_threadgroup);
+                assert_tg_size_multiple_of_32_if_hinted(threads_per_threadgroup, pipeline);
                 encoder.dispatch_threads(threads_per_grid, threads_per_threadgroup);
             }
             DispatchKind::ThreadGroups => {
-                assert_tg_size_multiple_of_32_if_hinted(threads_per_threadgroup);
+                assert_tg_size_multiple_of_32_if_hinted(threads_per_threadgroup, pipeline);
                 encoder.dispatch_thread_groups(threads_per_grid, threads_per_threadgroup);
             }
         }

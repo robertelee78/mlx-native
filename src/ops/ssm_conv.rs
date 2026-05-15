@@ -224,7 +224,37 @@ pub fn dispatch_ssm_conv(
     );
     let su_tg_i = (params.k_width - 1).max(1);
     let su_remain = (256u32 / su_tg_i).max(1);
-    let su_tg_c = std::cmp::min(params.channels, su_remain).max(1);
+    let su_tg_c_raw = std::cmp::min(params.channels, su_remain).max(1);
+    // ADR-029 iter-175 Step 1r: ensure su_tg_i * su_tg_c is a multiple of
+    // 32 (Apple's threadExecutionWidth).  Pre-fix this site computed
+    // (3, 85, 1) → 255 threads per TG when k_width=4 and channels≥85,
+    // which is NOT a multiple of 32 and causes UB under
+    // HF2Q_PIPELINE_TG_MULT_HINT=1.  Coherence_smoke
+    // apex-q5km/{the-quick-brown-fox, what-is-22, hello-my-name-is}
+    // caught this via the Step 1q safety assertion.
+    //
+    // Strategy: shrink su_tg_c to the largest multiple of (32 / gcd(su_tg_i, 32))
+    // that still respects the channel/256 limit.  gcd(3, 32) = 1 → step = 32,
+    // so su_tg_c rounds DOWN to a multiple of 32 (85 → 64).  gcd(2, 32) = 2 →
+    // step = 16; gcd(4, 32) = 4 → step = 8; gcd(8, 32) = 8 → step = 4; etc.
+    // When su_tg_i is itself a multiple of 32 (rare for SSM conv), step = 1
+    // and any su_tg_c works — leaves the original value.
+    fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+        while b != 0 { let t = b; b = a % b; a = t; }
+        a
+    }
+    let step = 32u32 / gcd_u32(su_tg_i, 32);
+    let su_tg_c = if step <= 1 {
+        su_tg_c_raw
+    } else if su_tg_c_raw >= step {
+        (su_tg_c_raw / step) * step  // round DOWN to multiple of step
+    } else {
+        // su_tg_c_raw < step: can't satisfy multiple-of-32 with this su_tg_i.
+        // Leave su_tg_c_raw alone; safety check will fire under
+        // HF2Q_PIPELINE_TG_MULT_HINT=1 (correct behavior — this case
+        // means the kernel inherently can't satisfy the constraint).
+        su_tg_c_raw
+    };
     let su_remain2 = (256u32 / (su_tg_i * su_tg_c)).max(1);
     let su_tg_s = std::cmp::min(params.n_seqs, su_remain2).max(1);
     let state_tg = MTLSize::new(su_tg_i as u64, su_tg_c as u64, su_tg_s as u64);
