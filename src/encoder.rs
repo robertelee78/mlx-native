@@ -956,6 +956,16 @@ impl CommandEncoder {
             return;
         }
         BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
+        // ADR-029 iter-175 Step 1e: when HF2Q_AUTO_BARRIER=1, hand-placed
+        // barriers must reset the MemRanges tracker so partial migration to
+        // `dispatch_tracked_*` stays correct.  A hand-placed `memory_barrier()`
+        // drains the GPU at this point; any tracked dispatch after it
+        // should start with a fresh cumulative state instead of false-
+        // conflicting against ranges recorded before this barrier.
+        // No-op under default HF2Q_AUTO_BARRIER=0 (tracker is empty).
+        if auto_barrier_enabled() {
+            self.mem_ranges.reset();
+        }
         // SAFETY: active_encoder is non-null and valid.
         let encoder = unsafe { &*self.active_encoder };
         if barrier_profile_enabled() {

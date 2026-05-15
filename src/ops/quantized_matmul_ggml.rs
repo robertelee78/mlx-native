@@ -695,7 +695,13 @@ fn dispatch_mv(
             threads_per_tg,
         );
     } else {
-        encoder.encode_threadgroups_with_args(
+        // ADR-029 iter-175 Step 1e: dataflow-tracked dispatch.  When
+        // HF2Q_AUTO_BARRIER=1, the MemRanges tracker checks weight/input
+        // against the cumulative state and auto-emits a barrier on RAW.
+        // When HF2Q_AUTO_BARRIER=0 (default), this is identical to the
+        // prior `encode_threadgroups_with_args` call (zero behavioral
+        // diff in production until the env-flag default flips).
+        encoder.dispatch_tracked_threadgroups_with_args(
             &pipeline,
             &[
                 (0, KernelArg::Buffer(weight)),
@@ -703,6 +709,8 @@ fn dispatch_mv(
                 (2, KernelArg::Buffer(output)),
                 (3, KernelArg::Bytes(as_bytes(&gpu_params))),
             ],
+            &[weight, input],
+            &[output],
             threadgroups,
             threads_per_tg,
         );
