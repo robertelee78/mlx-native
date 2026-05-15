@@ -133,12 +133,25 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 /// marginally tighter (less variance) but mean delta within bench noise.
 /// Threshold kept at 512 because no measurable wall-level gain crossing it.
 fn compute_nwg(kv_seq_len: u32) -> u32 {
-    if let Ok(v) = std::env::var("HF2Q_HYBRID_NWG") {
-        if let Ok(n) = v.parse::<u32>() {
-            if (1..=32).contains(&n) {
-                return n;
-            }
-        }
+    // ADR-029 iter-175 Step 1as: cache parsed override.
+    // Sliding-attn (this kernel) fires ~26 times/token at gemma4 decode;
+    // uncached env::var is ~70 ns/call (H-N bench).  Cached read is ~2 ns.
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static CACHED_HYBRID_NWG: AtomicI32 = AtomicI32::new(-1);
+    // -1 = uninitialized; 0 = no override (use kv_seq_len heuristic);
+    //  1..=32 = forced override.
+    let mut v = CACHED_HYBRID_NWG.load(Ordering::Relaxed);
+    if v < 0 {
+        let parsed = std::env::var("HF2Q_HYBRID_NWG")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| (1..=32).contains(n))
+            .unwrap_or(0);
+        CACHED_HYBRID_NWG.store(parsed as i32, Ordering::Relaxed);
+        v = parsed as i32;
+    }
+    if v > 0 {
+        return v as u32;
     }
     if kv_seq_len > 512 { 32 } else { 16 }
 }
