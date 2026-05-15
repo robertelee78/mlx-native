@@ -275,7 +275,9 @@ pub fn dispatch_fused_norm_add_f32(
     // iter-331 (operator REFRAME #2 pattern matching iter-326).  Opt
     // out with `HF2Q_FUSED_NORM_ADD_V2=0` / `=false` / `=off`.
     // Requires `dim % 4 == 0`; falls back to scalar when not.
-    let use_v2 = (dim % 4 == 0) && crate::env_flags::env_default_true("HF2Q_FUSED_NORM_ADD_V2");
+    // ADR-029 iter-175 Step 1ao: cached env-flag gate.
+    static CACHED_FUSED_NORM_ADD_V2: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let use_v2 = (dim % 4 == 0) && crate::env_flags::cached_env_default_true(&CACHED_FUSED_NORM_ADD_V2, "HF2Q_FUSED_NORM_ADD_V2");
     let kernel_name = if use_v2 { "fused_norm_add_f32_v2" } else { "fused_norm_add_f32" };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;

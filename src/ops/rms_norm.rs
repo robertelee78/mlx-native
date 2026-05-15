@@ -10,7 +10,14 @@ use metal::MTLSize;
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
 use crate::encoder::{CapturedOpKind, CommandEncoder};
-use crate::env_flags::env_default_true;
+use crate::env_flags::cached_env_default_true;
+use std::sync::atomic::AtomicI8;
+
+// ADR-029 iter-175 Step 1ao: cached hot-path env-flag gates for rms_norm
+// dispatchers. rms_norm is called multiple times per layer (attn_norm,
+// ffn_norm, post-attn-norm, post-ffn-norm, final norm) — many hits per token.
+static CACHED_RMS_NORM_V2: AtomicI8 = AtomicI8::new(-1);
+static CACHED_FUSED_POST_FF_NORM2_V2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -136,7 +143,7 @@ pub fn dispatch_rms_norm(
     // Opt out with `HF2Q_RMS_NORM_V2=0` / `=false` / `=off`.
     let use_v2 = matches!(input.dtype(), DType::F32)
         && (dim % 4 == 0)
-        && env_default_true("HF2Q_RMS_NORM_V2");
+        && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2");
 
     let kernel_name = if use_v2 {
         "rms_norm_f32_v2"
@@ -551,7 +558,7 @@ pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
     // measured +1.5% on gemma4 hybrid decode (74.9 → 76.0) + +0.7-1.0% on
     // legacy decode (73.7 → 74.2).  Opt-out via
     // `HF2Q_FUSED_POST_FF_NORM2_V2=0` / `=false` / `=off`.
-    let use_v2 = (dim % 4 == 0) && env_default_true("HF2Q_FUSED_POST_FF_NORM2_V2");
+    let use_v2 = (dim % 4 == 0) && cached_env_default_true(&CACHED_FUSED_POST_FF_NORM2_V2, "HF2Q_FUSED_POST_FF_NORM2_V2");
     let kernel_name = if use_v2 {
         "fused_post_ff_norm2_endlayer_f32_v2"
     } else {
@@ -918,7 +925,7 @@ pub fn dispatch_rms_norm_no_scale_f32(
     // ADR-028 iter-310 — float4 + simd_sum variant.  Default-ON since
     // iter-326 (operator REFRAME #2).  Opt out with
     // `HF2Q_RMS_NORM_V2=0` / `=false` / `=off`.
-    let use_v2 = (dim % 4 == 0) && env_default_true("HF2Q_RMS_NORM_V2");
+    let use_v2 = (dim % 4 == 0) && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2");
     let kernel_name = if use_v2 {
         "rms_norm_no_scale_f32_v2"
     } else {

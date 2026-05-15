@@ -16,7 +16,14 @@ use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
 use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
-use crate::env_flags::env_default_true;
+use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
+use std::sync::atomic::AtomicI8;
+
+// ADR-029 iter-175 Step 1ao: cached hot-path env-flag gates for dispatch_mv.
+// Same pattern as Step 1an (dispatch_id_mv). ~120 attn dispatches per token
+// each hitting these 2 env reads.
+static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
+static CACHED_Q8_0_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -608,11 +615,12 @@ fn dispatch_mv(
     // mantra-aligned outcome for users").  Opt out with
     // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
-        && env_default_true("HF2Q_Q6K_MV_NR2");
+        && cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2");
     // ADR-028 iter-368 — Q8_0 NSG=4 NR=2 (peer-style port).  Default-OFF
     // until parity + bench validation; opt-in via `HF2Q_Q8_0_MV_NR2=1`.
+    // ADR-029 iter-175 Step 1ao: cached via AtomicI8.
     let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
-        && std::env::var("HF2Q_Q8_0_MV_NR2").ok().as_deref() == Some("1");
+        && cached_env_eq_one(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2");
     let kernel_name = if use_q6k_nr2 {
         "kernel_mul_mv_q6_K_f32_nr2"
     } else if use_q8_0_nr2 {

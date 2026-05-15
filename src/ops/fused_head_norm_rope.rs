@@ -261,8 +261,10 @@ pub fn dispatch_fused_head_norm_rope_f32(
     // `HF2Q_FUSED_HEAD_NORM_ROPE_V2=0` / `=false` / `=off`.
     // Requires `head_dim % 4 == 0`; falls back to scalar v1 when not.
     // Phases 2-4 byte-identical to v1; race-fix barrier preserved.
+    // ADR-029 iter-175 Step 1ao: cached env-flag gate.
+    static CACHED_FUSED_HEAD_NORM_ROPE_V2: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
     let use_v2 = (head_dim % 4 == 0)
-        && crate::env_flags::env_default_true("HF2Q_FUSED_HEAD_NORM_ROPE_V2");
+        && crate::env_flags::cached_env_default_true(&CACHED_FUSED_HEAD_NORM_ROPE_V2, "HF2Q_FUSED_HEAD_NORM_ROPE_V2");
     let kernel_name = if use_v2 {
         "fused_head_norm_rope_f32_v2"
     } else {
