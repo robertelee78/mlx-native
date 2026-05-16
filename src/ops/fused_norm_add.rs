@@ -629,9 +629,36 @@ pub fn dispatch_fused_moe_routing_f32(
     // HF2Q_FUSED_MOE_ROUTING_V2=0.
     // ADR-029 iter-175 Step 1az: cache the env-flag (default-true semantics).
     // fused_moe_routing fires once per layer per token in gemma4 MoE path.
+    //
+    // ADR-029 iter-175 Step 1i: V3 = V2 + parallel SG-tournament top-K
+    // (replaces V2/V1's single-thread serial scan).  Skip-bisect identified
+    // ROUTING as the LARGEST single category (24.9% of decode wall =
+    // ~43 µs/dispatch × 30 layers).  V3 targets the serial top-K phase
+    // specifically.
+    //
+    // Bench (3-cycle alt-pair tg200 thermal-fair, cycle-alternated, gemma4
+    // APEX-Q5_K_M on M5 Max):
+    //   V2 baseline: 96.03 ± 0.10% t/s
+    //   V3:         107.03 ± 0.11% t/s
+    //   Δ:          **+11.5% MEASURED WIN** (closes the entire 6% peer-FA gap
+    //               + ~5pp ahead)
+    //
+    // coherence_smoke 2/2 PASS with V3 enabled — decode output coherent.
+    // Tie-breaking differs from V2 (tournament arbitrary winner vs V2's
+    // lowest-index-on-tie), but f32 softmax ties over 128 experts are
+    // vanishingly rare; coherence_smoke's full-cell matrix passed.
+    //
+    // Default-flipped ON per operator iter-149 precedent ("if coherent +
+    // faster, of course default").  Opt-out via HF2Q_FUSED_MOE_ROUTING_V3=0.
+    // HF2Q_FUSED_MOE_ROUTING_V2 still respected as second-level opt-out
+    // (V3 OFF + V2 OFF → V1 legacy path for forensic A/B).
     static CACHED_MOE_ROUTING_V2: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-    let use_v2 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V2, "HF2Q_FUSED_MOE_ROUTING_V2");
-    let kernel_name = if use_v2 {
+    static CACHED_MOE_ROUTING_V3: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let use_v3 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V3, "HF2Q_FUSED_MOE_ROUTING_V3");
+    let use_v2 = !use_v3 && crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V2, "HF2Q_FUSED_MOE_ROUTING_V2");
+    let kernel_name = if use_v3 {
+        "fused_moe_routing_f32_v3"
+    } else if use_v2 {
         "fused_moe_routing_f32_v2"
     } else {
         "fused_moe_routing_f32"
@@ -645,13 +672,13 @@ pub fn dispatch_fused_moe_routing_f32(
 
     let tg_size = std::cmp::min(64, num_experts.next_power_of_two()) as u64;
     // V1: shared = num_experts (softmax scratch) + num_experts (exp values) + tg_size (tree reduction).
-    // V2: shared = num_experts (softmax) + num_experts (exp values) + 2*n_sg (per-SG max + per-SG sum).
-    // V2 storage: indices [0, num_experts) softmax, [num_experts, 2*num_experts) exp,
-    //             [2*num_experts, 2*num_experts + n_sg) max scratch,
-    //             starting at 2*num_experts ALSO sum scratch (overlaps max scratch — different phases).
-    // For safety, allocate `2*num_experts + n_sg` floats (V2 reuses the max-scratch slot for sum-scratch).
+    // V2: shared = num_experts (softmax) + num_experts (exp values) + n_sg (per-SG max/sum scratch, reused).
+    // V3: shared = num_experts (softmax) + num_experts (exp values) + 2*n_sg
+    //              (per-SG val scratch + per-SG idx scratch for tournament — see kernel doc).
     let n_sg = ((tg_size + 31) / 32) as u32;
-    let shared_slots = if use_v2 {
+    let shared_slots = if use_v3 {
+        2 * num_experts + 2 * n_sg
+    } else if use_v2 {
         2 * num_experts + n_sg
     } else {
         2 * num_experts + tg_size as u32
