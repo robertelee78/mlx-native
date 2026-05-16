@@ -190,8 +190,8 @@ pub fn flash_attn_vec_peer_port_f16(
 }
 
 // ============================================================================
-// iter-135/136: NWG=32 variant (peer's actual runtime config).
-// Pairs with the reduce kernel from iter-134.
+// NWG=32 variant (peer's actual runtime config).
+// Pairs with the reduce kernel.
 // ============================================================================
 
 /// Reduce-kernel host params. Matches `FlashAttnVecPeerPortReduceParams` in MSL.
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn reduce_pipeline_registers_and_compiles() {
-        // ADR-029 iter-134: peer reduce kernel (paired with iter-135 NWG=32 vec kernel).
+        // ADR-029: peer reduce kernel (paired with the NWG=32 vec kernel).
         let device = match crate::device::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn nwg32_pipeline_registers_and_compiles() {
-        // ADR-029 iter-135: NWG=32 vec kernel (peer's actual runtime config).
+        // ADR-029: NWG=32 vec kernel (peer's actual runtime config).
         let device = match crate::device::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
