@@ -1145,9 +1145,9 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_resume(
 // ─── f16 D=256 RESUME dispatcher (qL_off > 0 + slot-capacity strides) ──────
 //
 // F16 variant of `dispatch_flash_attn_prefill_bf16_d256_resume` added for
-// ADR-030 iter-74 (hf2q DFlash spec-decode).  The hf2q hybrid KV cache
-// stores K and V in F16 (`hybrid_kv.k` shape `[H_kv, capacity, D]` F16
-// after iter-348 Phase 10c).  For spec-decode verify, the orchestrator
+// ADR-030 (hf2q DFlash spec-decode).  The hf2q hybrid KV cache
+// stores K and V in F16 (`hybrid_kv.k` shape `[H_kv, capacity, D]`).
+// For spec-decode verify, the orchestrator
 // needs cross-length attention against the F16 hybrid_kv slot without
 // the F16→BF16 cast overhead.
 //
