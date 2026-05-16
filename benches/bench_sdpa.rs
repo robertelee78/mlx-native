@@ -101,6 +101,7 @@ fn bench_sdpa_gemma4_decode(c: &mut Criterion) {
         kv_seq_len,
         scale: 1.0 / (head_dim as f32).sqrt(),
         kv_capacity: kv_seq_len,
+        ..Default::default()
     };
 
     // Warm up: compile the pipeline.

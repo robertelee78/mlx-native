@@ -289,6 +289,7 @@ fn run_sdpa_test(
         kv_seq_len,
         scale: 1.0 / (head_dim as f32).sqrt(),
         kv_capacity: kv_seq_len,
+        ..Default::default()
     };
     sdpa::sdpa(
         &mut encoder,
@@ -514,6 +515,7 @@ fn test_invalid_head_ratio() {
         kv_seq_len: 32,
         scale: 1.0 / (64.0_f32).sqrt(),
         kv_capacity: 32,
+        ..Default::default()
     };
 
     // Allocate minimal buffers (they won't actually be used).
@@ -551,6 +553,7 @@ fn test_zero_head_dim() {
         kv_seq_len: 32,
         scale: 1.0,
         kv_capacity: 32,
+        ..Default::default()
     };
 
     let buf = device.alloc_buffer(4, DType::F32, vec![1]).expect("buf");
