@@ -1,10 +1,9 @@
-//! [`EncoderSession`] — D3 Per-Stage Fence encoder abstraction (ADR-019 Phase 0b).
+//! [`EncoderSession`] — D3 Per-Stage Fence encoder abstraction (ADR-019).
 //!
 //! `EncoderSession` lifts [`CommandEncoder`] into a session-aware shell that
 //! carries semantic *stage* metadata across the lifetime of one or more
 //! logical transformer stages (e.g. `"layer.full_attn.stage1"` →
-//! `"layer.full_attn.stage2"`). Phase 0b-A delivered the bare struct +
-//! single-stage lifecycle methods. Phase 0b-B (this file) adds the
+//! `"layer.full_attn.stage2"`). Adds the
 //! [`MTLSharedEvent`](metal::SharedEvent) inter-CB ordering primitives D3
 //! needs:
 //!
@@ -19,17 +18,13 @@
 //!   separate set; it routes calls through the Arc clone the inner
 //!   [`CommandEncoder`] already holds.
 //!
-//! Phase 0b-C will broaden label propagation (per-substage labels +
-//! xctrace MST round-trip). iter89e2-B leaves Phase 0b-A's existing
-//! per-session label semantics intact.
-//!
-//! Production callers MUST stay on [`crate::CommandEncoder`] until Phase
-//! 2 (FA-path D3 stage migration) wires `forward_gpu.rs` to consume
-//! `EncoderSession`. The struct is feature-flagged behind
-//! `HF2Q_ENCODER_SESSION=1` (default OFF) and is constructed only via
+//! Production callers stay on [`crate::CommandEncoder`] until the FA-path
+//! D3 stage migration wires `forward_gpu.rs` to consume `EncoderSession`.
+//! The struct is feature-flagged behind `HF2Q_ENCODER_SESSION=1`
+//! (default OFF) and is constructed only via
 //! [`MlxDevice::encoder_session`](crate::MlxDevice::encoder_session).
 //!
-//! # Lifecycle (iter89e2-B — multi-stage chaining)
+//! # Lifecycle (multi-stage chaining)
 //!
 //! ```text
 //!                   MlxDevice::encoder_session()
@@ -80,7 +75,7 @@
 //!   `EncoderSession` borrows `&mut CommandEncoder` via [`Self::encoder`];
 //!   every dispatch reuses the same lazy-opened encoder per CB. Each
 //!   stage CB still has exactly one persistent compute encoder.
-//! - **F2 — iter58b residency-rescission**: PRESERVED. `commit_stage`,
+//! - **F2 — residency-rescission**: PRESERVED. `commit_stage`,
 //!   `commit_and_wait`, and `fence_stage` all delegate to the inner
 //!   encoder, which calls `flush_residency_pending()` at every commit
 //!   boundary (`encoder.rs:1842, 2004`). `reset_for_next_stage` does NOT
@@ -93,10 +88,10 @@
 //!   stage 2's commit, while stage 1's CB may still be GPU-pipelined.
 //!   Under retained-refs (default), the prior CB's ARC retains keep the
 //!   underlying Metal buffer alive across the residency-set demotion;
-//!   the GPU completes safely. Under `MLX_UNRETAINED_REFS=1` (NOT
-//!   enabled in Phase 0b), caller-owned arenas remain the only
-//!   structural mitigation — same contract as the existing async-commit
-//!   path. The adversarial F2 test (see
+//!   the GPU completes safely. Under `MLX_UNRETAINED_REFS=1`,
+//!   caller-owned arenas remain the only structural mitigation —
+//!   same contract as the existing async-commit path. The adversarial
+//!   F2 test (see
 //!   `/opt/mlx-native/tests/encoder_session_multistage.rs`) explicitly
 //!   exercises this window.
 //! - **F11 — zero-init alloc_buffer**: INVARIANT. `EncoderSession` does
@@ -107,9 +102,8 @@
 //!   re-read every time a fresh CB lazily opens its compute encoder
 //!   (every `reset_for_next_stage` rotation). Both pre- and post-fence
 //!   CBs honor the env var.
-//! - F3, F4, F5, F6, F7, F8, F9, F10 are out of scope for iter89e2-B
-//!   (forward-path phases 1-4 territory) — `EncoderSession` is purely
-//!   structural and does not touch any forward path.
+//! - F3-F10 are out of scope — `EncoderSession` is purely structural
+//!   and does not touch any forward path.
 //!
 //! # Feature gate
 //!
@@ -164,7 +158,7 @@ pub struct EncoderSession {
     /// `active_encoder`, the `queue` clone (read by
     /// [`CommandEncoder::reset_command_buffer`]), the residency-set
     /// flush hook, capture-mode IR, the auto-barrier `MemRanges`
-    /// tracker, the iter63 sample buffer, and the iter16 `last_label`
+    /// tracker, the per-dispatch sample buffer, and the `last_label`
     /// history. All dispatch operations flow through here.
     ///
     /// INVARIANT: `inner` is in a consistent state at every public API
@@ -175,7 +169,7 @@ pub struct EncoderSession {
 
     /// Owned clone of the originating [`metal::Device`].
     ///
-    /// iter89e2-B: held so [`Self::fence_stage`] can lazily allocate an
+    /// Held so [`Self::fence_stage`] can lazily allocate an
     /// [`metal::SharedEvent`] on first call without threading a
     /// `&MlxDevice` through every call site. metal-rs 0.33's `Device`
     /// is `Send + Sync` (foreign_obj_type! lib.rs:179), so adding this
@@ -248,9 +242,9 @@ pub struct EncoderSession {
     /// [`Self::wait_count`]; never mutated by control flow (introspection
     /// only — does NOT widen F1/F2/F11/F12 windows).
     ///
-    /// iter90b §2 H1b proof: the multi-stage chain test asserts this
-    /// equals `(num_stages - 1)` for an N-stage chain (one wait per
-    /// reset; the first stage's CB never had a prior signal to wait on).
+    /// Test invariant: the multi-stage chain test asserts this equals
+    /// `(num_stages - 1)` for an N-stage chain (one wait per reset;
+    /// the first stage's CB never had a prior signal to wait on).
     wait_count: u64,
 
     /// Value of the most recent `encodeWaitForEvent` actually emitted
@@ -262,7 +256,7 @@ pub struct EncoderSession {
     /// `value` argument. Read-only via [`Self::wait_value`]; pure
     /// introspection (does NOT widen F1/F2/F11/F12 windows).
     ///
-    /// iter90b §2 H1b proof: after a `fence_stage(N)` followed by
+    /// Test invariant: after a `fence_stage(N)` followed by
     /// `reset_for_next_stage()`, this MUST equal N (the wait-side
     /// matches the signal we just signaled).
     last_wait_value: u64,
@@ -278,9 +272,9 @@ pub struct EncoderSession {
 //    (same site — the macro emits `unsafe type ...: Sync + Send`
 //    for every type, including SharedEvent in sync.rs:36-40).
 // 4. `String`, `u64`, `bool` are `Send`.
-// All five hold. `EncoderSession` does NOT add any non-Send fields in
-// iter89e2-B beyond `metal::Device` + `Option<metal::SharedEvent>` +
-// `u64` + `bool`, all already validated.
+// All five hold. `EncoderSession` does NOT add any non-Send fields
+// beyond `metal::Device` + `Option<metal::SharedEvent>` + `u64` +
+// `bool`, all already validated.
 unsafe impl Send for EncoderSession {}
 
 impl EncoderSession {
@@ -676,12 +670,11 @@ impl EncoderSession {
     /// # F2 caveat
     ///
     /// Removing a buffer that the in-flight CB still references is the
-    /// iter58b residency-rescission class. Under retained-refs
-    /// (default), the CB's ARC retain keeps the underlying Metal page
-    /// alive; the residency-set demotion only affects the resident-hint
-    /// (a perf knob, not a safety knob). Under `MLX_UNRETAINED_REFS=1`
-    /// (NOT enabled in Phase 0b), the caller-owned arena contract is
-    /// the only structural mitigation.
+    /// residency-rescission class. Under retained-refs (default), the
+    /// CB's ARC retain keeps the underlying Metal page alive; the
+    /// residency-set demotion only affects the resident-hint (a perf
+    /// knob, not a safety knob). Under `MLX_UNRETAINED_REFS=1`, the
+    /// caller-owned arena contract is the only structural mitigation.
     pub fn remove_from_residency_set(&self, buffer: &MlxBuffer) -> bool {
         match self.inner.residency_set() {
             Some(set) => {
@@ -820,9 +813,9 @@ impl Drop for EncoderSession {
     ///    end_active_encoder is a no-op (encoder was ended inside
     ///    `fence_signal_and_commit`). The submitted CB executes on the
     ///    GPU normally — the signal lands, the value is observable to
-    ///    any external `waitUntilSignaledValue:` consumer (none in
-    ///    iter89e2-B), and the next allocation/CB on the same residency
-    ///    set will see the bumped pending flag flushed at its commit
+    ///    any external `waitUntilSignaledValue:` consumer (currently
+    ///    none), and the next allocation/CB on the same residency set
+    ///    will see the bumped pending flag flushed at its commit
     ///    boundary. The fence event itself is dropped with `event` (an
     ///    Option<SharedEvent>); ARC drop releases it.
     ///
@@ -847,10 +840,10 @@ impl Drop for EncoderSession {
     /// or 2 with `fence_stage`). Under retained-refs mode (default —
     /// `MLX_UNRETAINED_REFS=0`), the in-flight CB holds ARC retains on
     /// every bound buffer, so the GPU completes safely after the
-    /// session drops. Under `MLX_UNRETAINED_REFS=1` (NOT enabled in
-    /// Phase 0b), the caller-owned-arena contract is the only
-    /// structural mitigation — same as the existing async-`commit()`
-    /// path at `encoder.rs:2014-2022`.
+    /// session drops. Under `MLX_UNRETAINED_REFS=1`, the
+    /// caller-owned-arena contract is the only structural mitigation —
+    /// same as the existing async-`commit()` path at
+    /// `encoder.rs:2014-2022`.
     ///
     /// In short: `Drop` does no extra work; the inner `CommandEncoder`'s
     /// own Drop is the entire safety story. `metal::SharedEvent` drops
