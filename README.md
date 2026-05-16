@@ -32,8 +32,8 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 ### Trade-offs to know going in
 
 - **Apple Silicon only.** No CPU, no CUDA, no WASM. If you need to ship cross-platform, this is the wrong layer.
-- **No autograd.** Backward and optimizer kernels exist (SiLU / RMSNorm / softmax / log / row-sum / embedding scatter-add backward, differentiable affine qdq, Adam step) — but you wire the training loop yourself; there is no `Var` / `VarMap` / autodiff / `Module` system.
-- **GGML matmul coverage is the inference subset, not the full set.** Q4_0, Q8_0, Q6_K have full mat-vec / mat-mat / tensor-mm and expert-routed variants. Q4_K and Q5_K have expert-routed mat-vec (`mm_id`) only — no dense matmul. Q4_1, Q5_0, Q5_1, Q8_1, Q2_K, Q3_K, Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
+- **No autograd.** A growing set of backward + optimizer kernels exists — SiLU / RMSNorm / softmax / log / row-sum / embedding-scatter / exp / divide / sqrt / outer-product / conv1d-depthwise-causal / MoE-weighted-sum / MoE-SwiGLU backward, differentiable affine qdq, Adam step, and `flash_attn_train` (forward + backward through attention with dQ/dK/dV) — but you wire the training loop yourself; there is no `Var` / `VarMap` / autodiff / `Module` system.
+- **GGML matmul coverage is the inference subset, not the full set.** Q4_0, Q8_0, Q6_K have full mat-vec / mat-mat / tensor-mm and expert-routed variants. Q4_K and Q5_K have dense mat-vec / mat-mat plus expert-routed (`mm_id`) variants. Q5_1 and IQ4_NL have dense and expert-routed variants. Q4_1, Q5_0, Q8_1, Q2_K, Q3_K, Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
 - **No high-level model code.** This is a kernel library; the consumer (e.g. hf2q) builds the actual transformer forward pass.
 
 ## Status
@@ -128,16 +128,19 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 ### Attention
 - `flash_attn_vec` — SIMD-vectorized decode-path SDPA (NWG-parallel, llama.cpp port)
 - `flash_attn_vec_tq` / `flash_attn_vec_tq_hb` — TurboQuant-quantized KV variants (Lloyd-Max + Hadamard)
-- `flash_attn_prefill` (D=256, D=512) — Tiled prefill with bf16 kernels, SWA mask, sentinel handling
-- `sdpa` / `sdpa_sliding` — Reference SDPA with optional sliding window
+- `flash_attn_vec_hybrid` — F16-K + TQ-HB-V SDPA (memory savings without full KV quant cost)
+- `flash_attn_vec_peer_port_f16` (+ `_nwg32` NWG=32 variant with reduce dispatcher) — verbatim peer kernel port for F16 decode
+- `flash_attn_prefill` (D=256, D=512) — Tiled prefill with bf16 kernels, SWA mask, sentinel handling — plus F16/BF16 `_resume` dispatchers for restart from arbitrary `qL` offset
+- `flash_attn_train` — forward + backward (`dQ` / `dK` / `dV` via FA-2 Algorithm 4) bf16 kernels at D=64 / D=256, the missing piece for transformer training on this backend
+- `sdpa` / `sdpa_sliding` — Reference SDPA with optional sliding window; `do_causal` flag toggles causal vs bidirectional (DFlash drafter block-diffusion)
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
 
 ### Matrix multiplication
-- **GGUF formats**: Q4_0, Q5_K, Q6_K, Q8_0, I16 — mat-vec + mul_mm tensor-core kernels
-- **GGUF expert-routed (`mm_id`)**: Q4_K, Q5_K (top_k>1 MoE mat-vec)
+- **GGUF formats**: Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, I16 — mat-vec + mul_mm tensor-core kernels (peer-parity with llama.cpp inference subset)
+- **GGUF expert-routed (`mm_id`)**: Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL (top_k>1 MoE mat-vec + tensor-mm)
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
-- **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over the non-tiled variant)
-- **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` (top_k=1 tensor-mm fast path)
+- **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`
+- **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` / `_id_into` (top_k=1 tensor-mm fast path; `_into` accepts caller-provided output buffer)
 - **Dense BF16**: `dense_mm_bf16_tensor`, `dense_gemv_bf16_f32` (M=1 decode)
 - **Dense F16**: `dense_gemm_f16`, `dense_matvec_f16`
 
@@ -175,11 +178,19 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 
 ### Memory & layout
 - `kv_cache_copy` — Linear + sliding-window KV cache copy (with ring-wrap)
+- `kv_cache_copy_seq_bf16` / `_seq_bf16_to_bf16_head_major` — BF16 sequence-batched cache copies (incl. head-major layout for prefill)
 - `embedding` — Embedding lookup
 - `gather` — Indexed gather (F16, nibble-packed)
 - `transpose`, `permute_021` — Layout conversions
 - `copy`, `offset_copy` — Strided copy
 - `argmax`, `argsort`, `top_k` — Reductions
+
+### Dispatch pre-bake (ADR-029)
+Pre-baked `DispatchRecord` objects skip per-dispatch pipeline lookups, env-var reads, and parameter packing — meaningful on short-prompt decode hot paths.
+- `build_q6k_nr2_m1_record` — dense Q6_K mv NR2 m=1
+- `build_q6k_id_nr2_m1_record` — MoE Q6_K_ID NR2 m=1
+- `build_q8_0_id_decode_record` — MoE Q8_0_ID regular decode
+- `build_rms_norm_decode_record` — per-(dtype, rows, dim) RMSNorm decode
 
 ### Vision / ViT (Qwen3-VL prelude)
 - `im2col_2d_3ch_f32` + `add_bias_row_2d_f32` — patch-embed helpers
@@ -198,8 +209,13 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 - `qdq_affine_backward_scales_f32`, `qdq_affine_backward_biases_f32` — backward through quantization parameters
 
 ### Backward & training kernels
-- `silu_backward_f32`, `softmax_backward`, `log_backward_f32`, `row_sum_backward_f32`
+- `flash_attn_train_fwd_bf16_{d64,d256}` + `flash_attn_train_bwd_bf16_{d64,d256}` — attention forward (with logsumexp output) and backward (dQ / dK / dV via FA-2 Algorithm 4)
+- `silu_backward_f32`, `softmax_backward`, `log_backward_f32`, `row_sum_backward_f32`, `exp_backward_f32`, `divide_backward_f32`, `sqrt_backward_f32`
 - `rms_norm_compute_rms_inv` + `rms_norm_backward_dx` + `rms_norm_backward_dw`
+- `outer_product` forward + backward
+- `conv1d_depthwise_causal` forward + backward
+- `take_along_axis` (gather + scatter-backward)
+- `moe_weighted_sum_seq` backward; `moe_swiglu_seq` fused backward
 - `embedding_lookup_f32` + `embedding_scatter_add_f32` (forward + scatter-add backward)
 - `adam_update_f32` — fused Adam optimizer step (m / v moments + bias-correction)
 - `slice_2d_cols_f32` + `copy_2d_cols_into_f32` — strided 2-D slice / scatter for column-major training layouts
