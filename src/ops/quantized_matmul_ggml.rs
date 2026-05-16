@@ -15,7 +15,7 @@
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
+use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg, as_bytes};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use std::sync::atomic::AtomicI8;
 
@@ -728,6 +728,86 @@ fn dispatch_mv(
     }
 
     Ok(())
+}
+
+/// Build a pre-baked `DispatchRecord` for the Q6_K NR2 mat-vec
+/// decode-m=1 path.
+///
+/// ADR-029 iter-175 Step 1d — first concrete consumer of
+/// [`DispatchRecord`].  The Q6_K NR2 path is the hottest single
+/// per-token dispatch shape on gemma4-APEX-Q5_K_M decode
+/// (Q/K/V proj × 30 layers + lm_head Q6_K = up to 91 dispatches/tok
+/// at this kernel, plus an additional ~240 for MoE expert variants —
+/// see `quantized_matmul_id_ggml::build_q6k_id_nr2_m1_record` once
+/// that variant lands in Step 1e).
+///
+/// Pre-bakes:
+///   - Pipeline reference (skips registry HashMap lookup per call)
+///   - MTLSize threadgroups + threads_per_tg (skips MTLSize::new + match)
+///   - GgmlMatvecGpuParams bytes (skips struct construction + bytemuck)
+///   - Binding slot order: weight=0, input=1, output=2, params=3
+///
+/// Returns `None` if `HF2Q_Q6K_MV_NR2` is set to off (in which case
+/// the legacy NR1 kernel is selected at dispatch_mv time and this
+/// record would be wrong); the caller must fall back to the unbaked
+/// path.
+///
+/// Bake-time validation: pipeline lookup must succeed; threadgroup
+/// size is hard-coded to the Q6_K NR2 contract (2 × 32 = 64 threads,
+/// align=4 rows/TG).
+pub fn build_q6k_nr2_m1_record(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    n: u32,
+    k: u32,
+) -> Result<Option<DispatchRecord>> {
+    // Only bakeable when the NR2 variant is the selected one.
+    // (Matches the `use_q6k_nr2` decision in dispatch_mv.)
+    if !cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2") {
+        return Ok(None);
+    }
+
+    // Pipeline lookup — same constants as the dispatch_mv hot path.
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            "kernel_mul_mv_q6_K_f32_nr2",
+            device,
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?
+        .clone();
+
+    // GgmlMatvecGpuParams for m=1.
+    let gpu_params = GgmlMatvecGpuParams {
+        ne00: k as i64,
+        ne01: n as i64,
+        ne02: 1,
+        ne10: k as i64,
+        ne12: 1,
+        ne0: n as i64,
+        ne1: 1,
+        r2: 1,
+        r3: 1,
+    };
+    let params_bytes = as_bytes(&gpu_params).to_vec();
+
+    // Q6_K NR2: align=4 rows per TG, threads = (nth0=2, nth1=32, 1)
+    // (matches dispatch_mv's Q6_K NR2 branch).
+    const ALIGN: u32 = 4;
+    let threadgroups = metal::MTLSize::new(div_ceil(n as usize, ALIGN as usize) as u64, 1, 1);
+    let threads_per_tg = metal::MTLSize::new(2, 32, 1);
+
+    Ok(Some(DispatchRecord {
+        pipeline,
+        threadgroups,
+        threads_per_tg,
+        threadgroup_mem: Vec::new(),  // NR2 path doesn't use shmem
+        params_bytes,
+        params_slot: 3,
+        buffer_slots: vec![0, 1, 2],  // weight, input, output
+        op_kind: CapturedOpKind::Other,
+        kernel_name: "kernel_mul_mv_q6_K_f32_nr2".to_string(),
+    }))
 }
 
 /// Matrix-matrix (mm) dispatch.  ADR-011 Phase 3 Wave P3a: port of

@@ -46,6 +46,71 @@ pub enum KernelArg<'a> {
     Bytes(&'a [u8]),
 }
 
+/// Pre-baked dispatch record for hot decode paths.
+///
+/// ADR-029 iter-175 Step 1d — first piece of the multi-week
+/// "Option A" refactor that the gemma4 decode gap analysis localized
+/// to per-dispatch CPU orchestration (forward_mlx::forward_decode →
+/// encode_one_layer → dispatch_qmatmul → quantized_matmul_ggml →
+/// dispatch_mv → encoder.encode_threadgroups_with_args).
+///
+/// At gemma4 decode m=1, every dispatch within the inner loop has
+/// load-time-immutable shape: the kernel pipeline, threadgroup
+/// geometry, params struct bytes, and binding-slot layout are fully
+/// determined by the weight + ggml_type and never change across the
+/// thousands of decode tokens that follow.  `DispatchRecord` captures
+/// that state once at model-load (or on first-call lazy-init) so the
+/// hot path skips:
+///   - `KernelRegistry::get_pipeline*` HashMap lookups
+///   - match expressions over `ggml_type` for kernel-name + geometry
+///   - `MTLSize::new` construction (already-known values)
+///   - param-struct field stores + bytemuck::bytes_of conversion
+///
+/// Only the runtime-varying buffers (input, output) need to be passed
+/// to [`CommandEncoder::dispatch_record`].  Weight buffers are baked
+/// inline via the `bake_buffers` slot list.
+///
+/// # Bake-time invariants
+///
+/// - `buffer_slots.len() == bake_buffers.len() + runtime_buffer_count`
+///   for the call site contract; the call site documents
+///   `runtime_buffer_count` and the order of runtime buffers.
+/// - `params_bytes.len()` is whatever the kernel's `KernelArg::Bytes`
+///   expects (typically 8-byte aligned per Metal struct layout).
+/// - `threadgroup_mem` is `(slot, byte_length)` pairs; empty when the
+///   kernel doesn't request `[[threadgroup]]` memory.
+///
+/// # Coherence
+///
+/// `dispatch_record` produces a byte-identical Metal command stream
+/// to the equivalent `encode_threadgroups_with_args*` call.  Capture
+/// mode is supported (replays into `CapturedNode::Dispatch` exactly
+/// like the unbaked path).  See `dispatch_record` for the lockstep.
+#[derive(Clone)]
+pub struct DispatchRecord {
+    /// Pipeline reference, looked up once at bake time.
+    pub pipeline: ComputePipelineState,
+    /// Threadgroup count.
+    pub threadgroups: MTLSize,
+    /// Threads per threadgroup.
+    pub threads_per_tg: MTLSize,
+    /// Threadgroup shared-memory bindings: `(slot_index, byte_length)`.
+    /// Empty when the kernel doesn't allocate `[[threadgroup]]` memory.
+    pub threadgroup_mem: Vec<(u64, u64)>,
+    /// Pre-encoded params struct bytes (bound as `KernelArg::Bytes`).
+    /// Empty when the kernel has no inline-bytes parameter.
+    pub params_bytes: Vec<u8>,
+    /// Slot index for `params_bytes`.  Ignored when `params_bytes` is empty.
+    pub params_slot: u64,
+    /// Slot indices for runtime buffer arguments, in caller order.
+    /// `dispatch_record` zips `runtime_buffers` against this list.
+    pub buffer_slots: Vec<u64>,
+    /// `CapturedOpKind` used when the encoder is in capture mode.
+    pub op_kind: CapturedOpKind,
+    /// Diagnostic label (kernel name) for debug/timing.
+    pub kernel_name: String,
+}
+
 /// Convert a `Pod` value to a byte slice suitable for `KernelArg::Bytes`.
 ///
 /// # Safety
@@ -1591,6 +1656,120 @@ impl CommandEncoder {
         }
 
         self.encode_with_args(pipeline, bindings, grid_size, threadgroup_size);
+    }
+
+    /// Dispatch a pre-baked record.
+    ///
+    /// ADR-029 iter-175 Step 1d — fast path for decode hot kernels
+    /// whose pipeline + threadgroup geometry + params bytes are
+    /// load-time-immutable.  `runtime_buffers` must be in the same
+    /// order as `rec.buffer_slots`.
+    ///
+    /// Equivalent Metal command stream to:
+    /// ```ignore
+    /// encoder.encode_threadgroups_with_args_and_shared(
+    ///     &rec.pipeline,
+    ///     bindings,  // = runtime_buffers zipped with buffer_slots + (params_slot, Bytes(&rec.params_bytes))
+    ///     &rec.threadgroup_mem,
+    ///     rec.threadgroups,
+    ///     rec.threads_per_tg,
+    /// );
+    /// ```
+    /// — but skips the kernel-name lookup, ggml_type match arms,
+    /// MTLSize::new, and param-struct field stores that the unbaked
+    /// path performs on every call.
+    ///
+    /// Capture mode and auto-barrier are supported identically to
+    /// `encode_threadgroups_with_args_and_shared`.  The caller is
+    /// expected to have called `set_pending_buffer_ranges` (capture)
+    /// or rely on auto-barrier for dataflow correctness before this
+    /// call, matching the contract of the unbaked dispatch_tracked_*
+    /// family.
+    pub fn dispatch_record(
+        &mut self,
+        rec: &DispatchRecord,
+        runtime_buffers: &[&MlxBuffer],
+    ) {
+        debug_assert_eq!(
+            rec.buffer_slots.len(),
+            runtime_buffers.len(),
+            "dispatch_record: runtime_buffers count must match buffer_slots ({}); got {}",
+            rec.buffer_slots.len(),
+            runtime_buffers.len(),
+        );
+
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(&rec.pipeline);
+        let op_kind_override = self.take_pending_op_kind();
+        // If a caller set an op_kind override via set_op_kind(), honor it;
+        // otherwise use the baked op_kind from the record.
+        let op_kind = if matches!(op_kind_override, CapturedOpKind::Other) {
+            rec.op_kind
+        } else {
+            op_kind_override
+        };
+        let (pending_reads, pending_writes) = self.take_pending_buffer_ranges();
+
+        if let Some(ref mut nodes) = self.capture {
+            // Reconstruct bindings for replay — runtime buffers first,
+            // params bytes (if any) last.  Order matches what the
+            // baked-path runtime encoding produces below.
+            let cap = runtime_buffers.len() + if rec.params_bytes.is_empty() { 0 } else { 1 };
+            let mut bindings: Vec<(u64, RecordedBinding)> = Vec::with_capacity(cap);
+            for (slot, buf) in rec.buffer_slots.iter().zip(runtime_buffers.iter()) {
+                bindings.push((
+                    *slot,
+                    RecordedBinding::Buffer {
+                        metal_buffer: buf.metal_buffer().to_owned(),
+                        offset: buf.byte_offset(),
+                    },
+                ));
+            }
+            if !rec.params_bytes.is_empty() {
+                bindings.push((
+                    rec.params_slot,
+                    RecordedBinding::Bytes(rec.params_bytes.clone()),
+                ));
+            }
+            nodes.push(CapturedNode::Dispatch {
+                pipeline: rec.pipeline.clone(),
+                bindings,
+                threads_per_grid: rec.threadgroups,
+                threads_per_threadgroup: rec.threads_per_tg,
+                threadgroup_memory: rec.threadgroup_mem.clone(),
+                dispatch_kind: DispatchKind::ThreadGroups,
+                op_kind,
+                reads: pending_reads,
+                writes: pending_writes,
+            });
+            return;
+        }
+
+        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above — encoder reference outlives this scope
+        // because `get_or_create_encoder` only mutates the `Option` wrapper.
+        let encoder = unsafe { &*encoder_ptr };
+        encoder.set_compute_pipeline_state(&rec.pipeline);
+        for (slot, buf) in rec.buffer_slots.iter().zip(runtime_buffers.iter()) {
+            encoder.set_buffer(*slot, Some(buf.metal_buffer()), buf.byte_offset());
+        }
+        if !rec.params_bytes.is_empty() {
+            encoder.set_bytes(
+                rec.params_slot,
+                rec.params_bytes.len() as u64,
+                rec.params_bytes.as_ptr() as *const _,
+            );
+        }
+        for &(idx, len) in rec.threadgroup_mem.iter() {
+            encoder.set_threadgroup_memory_length(idx, len);
+        }
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
+        // Skip assert_tg_size_multiple_of_32_if_hinted: bake-time
+        // construction already validated the geometry.
+        encoder.dispatch_thread_groups(rec.threadgroups, rec.threads_per_tg);
+        self.sample_dispatch_post(encoder, pre_idx);
     }
 
     /// Run the dataflow check, emit a barrier on conflict, and record
