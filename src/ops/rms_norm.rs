@@ -9,7 +9,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
-use crate::encoder::{CapturedOpKind, CommandEncoder};
+use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord};
 use crate::env_flags::cached_env_default_true;
 use std::sync::atomic::AtomicI8;
 
@@ -205,6 +205,98 @@ pub fn dispatch_rms_norm(
     );
 
     Ok(())
+}
+
+/// ADR-029 iter-175 Step 1f — pre-bake the per-(dtype, rows, dim)
+/// `dispatch_rms_norm` dispatch into a `DispatchRecord`.
+///
+/// Mirrors `dispatch_rms_norm`'s exact kernel-selection + geometry +
+/// shared-memory logic so a fast-path `dispatch_record` call produces a
+/// byte-identical Metal command stream.  Bakes once per (dtype, rows,
+/// dim) combination; subsequent calls skip:
+///   - `KernelRegistry::get_pipeline` HashMap lookup (~30 ns)
+///   - `MTLSize::new` × 2 (~5 ns)
+///   - `dim.next_power_of_two()` + bit-twiddling (~5 ns)
+///   - `set_op_kind` indirection (~5 ns) — baked into the record
+///
+/// On gemma4 APEX-Q5_K_M decode, hidden-size rms_norm dispatches fire
+/// ~120 times/token (pre-FF norm + pre-FF norm 2 + router norm +
+/// post-FF norm 1, each × 30 layers) — closer to Step 1d's coverage
+/// class than Step 1e/1e2, so this substep is potentially measurable
+/// above the σ=0.2% bench floor.
+///
+/// # Bake-time invariants
+///
+/// - Pipeline = `rms_norm_f32_v2` when `dtype==F32 && dim%4==0 &&
+///   HF2Q_RMS_NORM_V2` enabled (default-on); else
+///   `rms_norm_{f32,f16,bf16}`.  Returns `Err` on unsupported dtype.
+/// - `tg_size = min(256, dim.next_power_of_two())` — falsifications
+///   noted at iter-360 (cap raised to 1024 = -0.5/-0.7%) and iter-361
+///   (right-size to float4 = -0.4%); production keeps 256.
+/// - V2 path uses `(tg_size / 32).max(1) * 4` bytes shmem; scalar path
+///   uses `tg_size * 4` bytes (one float per thread for the tree-sum).
+/// - `op_kind = CapturedOpKind::RmsNorm` for the fusion pass (Phase 4e.2).
+/// - Bindings: input=0, weight=1, output=2, params_buf=3.
+/// - threadgroups = `(rows, 1, 1)`, threads_per_tg = `(tg_size, 1, 1)`.
+///
+/// # Errors
+///
+/// Returns `MlxError::InvalidArgument` if dtype is unsupported (not f32/f16/bf16)
+/// or if pipeline lookup fails.
+pub fn build_rms_norm_decode_record(
+    registry: &mut crate::kernel_registry::KernelRegistry,
+    device: &metal::DeviceRef,
+    dtype: DType,
+    rows: u32,
+    dim: u32,
+) -> Result<Option<DispatchRecord>> {
+    if rows == 0 || dim == 0 {
+        return Ok(None); // bake-time guard mirrors dispatch_rms_norm's runtime check
+    }
+
+    // Mirror `dispatch_rms_norm`'s kernel-selection logic.
+    let use_v2 = matches!(dtype, DType::F32)
+        && (dim % 4 == 0)
+        && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2");
+
+    let kernel_name = if use_v2 {
+        "rms_norm_f32_v2"
+    } else {
+        match dtype {
+            DType::F32 => "rms_norm_f32",
+            DType::F16 => "rms_norm_f16",
+            DType::BF16 => "rms_norm_bf16",
+            _ => return Ok(None), // unsupported — caller falls through
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?.clone();
+
+    let mut tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    if use_v2 && tg_size < 32 {
+        tg_size = 32;
+    }
+
+    let shared_mem_bytes = if use_v2 {
+        (tg_size / 32).max(1) * 4
+    } else {
+        tg_size * 4
+    };
+
+    let threadgroups = MTLSize::new(rows as u64, 1, 1);
+    let threads_per_tg = MTLSize::new(tg_size, 1, 1);
+
+    Ok(Some(DispatchRecord {
+        pipeline,
+        threadgroups,
+        threads_per_tg,
+        threadgroup_mem: vec![(0, shared_mem_bytes)],
+        params_bytes: Vec::new(),  // params_buf is a runtime buffer at slot 3, not inline bytes
+        params_slot: 0,             // ignored when params_bytes is empty
+        buffer_slots: vec![0, 1, 2, 3], // input, weight, output, params_buf
+        op_kind: CapturedOpKind::RmsNorm,
+        kernel_name: kernel_name.to_string(),
+    }))
 }
 
 /// Dispatch a fused 3-output RMS normalization (f32 only).
