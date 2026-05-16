@@ -48,7 +48,7 @@ pub enum KernelArg<'a> {
 
 /// Pre-baked dispatch record for hot decode paths.
 ///
-/// ADR-029 iter-175 Step 1d — first piece of the multi-week
+/// ADR-029 — first piece of the multi-week
 /// "Option A" refactor that the gemma4 decode gap analysis localized
 /// to per-dispatch CPU orchestration (forward_mlx::forward_decode →
 /// encode_one_layer → dispatch_qmatmul → quantized_matmul_ggml →
@@ -185,7 +185,7 @@ impl CapturedOpKind {
     }
 
     /// Stable string label suitable for embedding in the per-dispatch
-    /// profile dump (ADR-015 iter63 §A.5).  Matches the variant name —
+    /// profile dump (ADR-015).  Matches the variant name —
     /// `Other` is preserved verbatim so an aggregate-by-op_kind sort
     /// produces a clean "what isn't yet labeled" bucket.
     pub fn name(&self) -> &'static str {
@@ -268,7 +268,7 @@ fn ranges_from_buffers(bufs: &[&MlxBuffer]) -> Vec<MemRange> {
 /// `encode_threadgroups_with_shared`, replay). Without it, every
 /// `slice_view`-derived buffer bound via `KernelArg::Buffer` silently
 /// exposes the entire underlying allocation — surfaced by hf2q's
-/// nomic-bert iter-79 cosine parity bisection (cosine 0.098 → 0.999962
+/// nomic-bert cosine parity bisection (cosine 0.098 → 0.999962
 /// after fix).
 ///
 /// `KernelArg::BufferWithOffset(buf, offset)` continues to use the
@@ -358,7 +358,7 @@ pub fn dispatch_count() -> u64 {
     DISPATCH_COUNT.load(Ordering::Relaxed)
 }
 
-/// Per-pipeline dispatch bucket support (ADR-028 iter-284).
+/// Per-pipeline dispatch bucket support (ADR-028).
 ///
 /// Env-gated via `MLX_DISP_BUCKET=1`.  When enabled, every
 /// `encode*` call records its pipeline's label in a global hash map.
@@ -470,7 +470,7 @@ fn barrier_profile_enabled() -> bool {
 
 /// Whether `MLX_UNRETAINED_REFS=1` is set in the process environment.
 ///
-/// ADR-015 iter13 — when true, `CommandEncoder::new_with_residency` opens
+/// ADR-015 — when true, `CommandEncoder::new_with_residency` opens
 /// each `MTLCommandBuffer` via
 /// [`CommandQueueRef::new_command_buffer_with_unretained_references`]
 /// instead of the default `commandBuffer`.  llama.cpp's per-token decode
@@ -503,7 +503,7 @@ fn unretained_refs_enabled() -> bool {
 
 /// Whether `HF2Q_PIPELINE_TG_MULT_HINT=1` is set.  Cached on first read.
 ///
-/// ADR-029 iter-175 Step 1q safety gate: when this flag is ON, every
+/// ADR-029 safety gate: when this flag is ON, every
 /// pipeline created via `KernelRegistry` has
 /// `threadGroupSizeIsMultipleOfThreadExecutionWidth(true)`.  Apple's
 /// Metal spec says this is UB unless every dispatched threadgroup is
@@ -520,7 +520,7 @@ fn pipeline_tg_mult_hint_enabled() -> bool {
     })
 }
 
-/// ADR-029 iter-175 Step 1q — runtime safety check for
+/// ADR-029 — runtime safety check for
 /// `HF2Q_PIPELINE_TG_MULT_HINT=1`.
 ///
 /// When the env flag is ON, the Metal pipeline descriptor sets
@@ -562,7 +562,7 @@ fn assert_tg_size_multiple_of_32_if_hinted(
 
 /// Whether `HF2Q_AUTO_BARRIER=1` is set in the process environment.
 ///
-/// ADR-015 iter37 — when true, every [`CommandEncoder::dispatch_tracked`]
+/// ADR-015 —when true, every [`CommandEncoder::dispatch_tracked`]
 /// call consults a [`MemRanges`](crate::mem_ranges::MemRanges) tracker
 /// and auto-emits a `memoryBarrierWithScope:` exactly when the new
 /// dispatch's read/write ranges conflict with previously-recorded
@@ -575,7 +575,7 @@ fn assert_tg_size_multiple_of_32_if_hinted(
 ///
 /// Cached on first read via `OnceLock`.  Default OFF — production
 /// decode/prefill keeps its hand-placed `enc.memory_barrier()` calls
-/// until the migration in iter38+.
+/// until the migration to auto-barrier.
 fn auto_barrier_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -603,7 +603,7 @@ static AUTO_BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
 static AUTO_BARRIER_CONCURRENT: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
-// ADR-015 iter63 — per-dispatch GPU sampling support
+// ADR-015 —per-dispatch GPU sampling support
 // ---------------------------------------------------------------------------
 
 /// Hard cap on per-CB sample-buffer sample count (Risk R4 in
@@ -696,7 +696,7 @@ pub struct CommandEncoder {
     cmd_buf: CommandBuffer,
     /// Owned clone of the originating command queue.
     ///
-    /// ADR-019 Phase 0b iter89e2-A: stored at `new_with_residency` time so
+    /// ADR-019: stored at `new_with_residency` time so
     /// downstream lifecycle code (e.g. `EncoderSession::reset_for_next_stage`
     /// in Phase 0b-B) can open a fresh `CommandBuffer` from the same queue
     /// after a non-blocking `commit_stage()`. metal-rs 0.33's
@@ -705,7 +705,7 @@ pub struct CommandEncoder {
     /// so adding this field preserves the existing unsafe `Send` impl
     /// on `CommandEncoder` (declared below).
     ///
-    /// ADR-019 Phase 0b iter89e2-B (CONSUMED): read by
+    /// ADR-019 (CONSUMED): read by
     /// [`Self::reset_command_buffer`] to spawn a fresh `CommandBuffer`
     /// after a non-blocking `commit*` so `EncoderSession::reset_for_next_stage`
     /// can chain stage CBs without re-constructing the encoder. Holding a
@@ -733,14 +733,14 @@ pub struct CommandEncoder {
     pending_reads: Vec<MemRange>,
     /// Pending write buffer ranges for the NEXT captured dispatch.
     pending_writes: Vec<MemRange>,
-    /// ADR-015 iter8e (Phase 3b): residency set whose pending add/remove
+    /// ADR-015:residency set whose pending add/remove
     /// staging is flushed at every `commit*` boundary.
     ///
     /// Cloned from the device at `device.command_encoder()` time. `None`
     /// when residency sets are disabled (HF2Q_NO_RESIDENCY=1, macOS<15,
     /// or test-only `CommandEncoder::new` from a residency-less queue).
     residency_set: Option<ResidencySet>,
-    /// ADR-015 iter37: dataflow barrier inference state.
+    /// ADR-015: dataflow barrier inference state.
     ///
     /// Populated only when `HF2Q_AUTO_BARRIER=1` is set at process
     /// start (cached via [`auto_barrier_enabled`]).  Each
@@ -755,7 +755,7 @@ pub struct CommandEncoder {
     /// gate-off branch is a single bool-load + early return rather
     /// than an allocation/Option indirection.
     mem_ranges: MemRanges,
-    /// ADR-015 iter63 (per-dispatch profiling): the sample buffer for
+    /// ADR-015 (per-dispatch profiling): the sample buffer for
     /// `MTLCounterSampleBuffer.sampleCounters` calls that bracket every
     /// `encode*` dispatch in this CB.  Lazily allocated on first
     /// dispatch when `MLX_PROFILE_DISPATCH=1`; `None` otherwise.
@@ -763,16 +763,16 @@ pub struct CommandEncoder {
     /// the CB completes — re-allocated on the next `encode*` if the env
     /// gate stays set.
     sample_buffer: Option<CounterSampleBuffer>,
-    /// ADR-015 iter63: pending per-dispatch metadata that pairs with
+    /// ADR-015:pending per-dispatch metadata that pairs with
     /// sample indices `2*i` and `2*i+1` inside `sample_buffer`.  Each
     /// `encode*` call appends one entry (when sampling is active);
     /// `resolve_dispatch_samples` drains the vec at commit time.
     pending_dispatch_meta: Vec<PendingDispatchMeta>,
-    /// ADR-015 iter63: 0-based dispatch ordinal within the current CB.
+    /// ADR-015:0-based dispatch ordinal within the current CB.
     /// Incremented in every `encode*` site after taking the pending
     /// op_kind; reset to 0 inside `resolve_dispatch_samples`.
     dispatch_in_cb: u32,
-    /// ADR-015 iter63: most recent label set via `apply_labels`, used
+    /// ADR-015:most recent label set via `apply_labels`, used
     /// as the per-dispatch `cb_label` field.  `String::new()` until
     /// `commit_and_wait_labeled` / `commit_labeled` is called.
     last_label: String,
@@ -828,18 +828,18 @@ impl CommandEncoder {
     /// Create a new command encoder, optionally bound to a residency set so
     /// `commit*` boundaries can flush deferred add/remove staging.
     ///
-    /// ADR-015 iter8e (Phase 3b): the encoder's `commit_and_wait`,
+    /// ADR-015:the encoder's `commit_and_wait`,
     /// `commit_and_wait_labeled`, `commit`, `commit_labeled`,
     /// `commit_wait_with_gpu_time` all call
     /// [`ResidencySet::flush_pending`](ResidencySet::flush_pending) before
     /// submitting the Metal command buffer. This converts the
     /// per-allocation `[set commit]` storm
-    /// (~880 commits/decode-token in iter8d/8e) into
+    /// (~880 commits/decode-token) into
     /// at most one commit per CB submission — mirrors llama.cpp's
     /// `ggml-metal-device.m:1378-1382` pattern (batch addAllocation in
     /// loop, commit ONCE).
     ///
-    /// ADR-015 iter13: when the `MLX_UNRETAINED_REFS=1` env var is set at
+    /// ADR-015: when the `MLX_UNRETAINED_REFS=1` env var is set at
     /// process start, this constructor uses
     /// [`CommandQueueRef::new_command_buffer_with_unretained_references`]
     /// instead of `new_command_buffer`.  llama.cpp's per-token decode CBs
@@ -1026,7 +1026,7 @@ impl CommandEncoder {
             // to overlap on the GPU.  Memory barriers are inserted between
             // dependent dispatches via `memory_barrier()`.
             //
-            // ADR-015 iter61a-2 probe: HF2Q_FORCE_SERIAL_DISPATCH=1 falls back
+            // ADR-015 probe: HF2Q_FORCE_SERIAL_DISPATCH=1 falls back
             // to MTLDispatchType::Serial — every dispatch waits for the
             // previous to complete, eliminating concurrent-dispatch race
             // windows. Used to falsify Hypothesis (g): missing memory_barrier
@@ -1080,7 +1080,7 @@ impl CommandEncoder {
             return;
         }
         BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
-        // ADR-029 iter-175 Step 1e: when HF2Q_AUTO_BARRIER=1, hand-placed
+        // ADR-029: when HF2Q_AUTO_BARRIER=1, hand-placed
         // barriers must reset the MemRanges tracker so partial migration to
         // `dispatch_tracked_*` stays correct.  A hand-placed `memory_barrier()`
         // drains the GPU at this point; any tracked dispatch after it
@@ -1400,7 +1400,7 @@ impl CommandEncoder {
     }
 
     // -----------------------------------------------------------------
-    // ADR-015 iter37 — dataflow-driven auto-barrier dispatch family.
+    // ADR-015 —dataflow-driven auto-barrier dispatch family.
     //
     // These mirrors of `encode_threadgroups*_with_args*` take explicit
     // `reads: &[&MlxBuffer]` and `writes: &[&MlxBuffer]` slices.  When
@@ -1417,11 +1417,9 @@ impl CommandEncoder {
     // mechanism, so a `dispatch_tracked` call inside capture mode is
     // equivalent to `set_pending_buffer_ranges + encode_*`.
     //
-    // No production callsite migrates in iter37 — this is the API
-    // surface the qwen35 forward path will adopt incrementally in
-    // iter38+.  Today, every call to `dispatch_tracked` from a
-    // production code path lives behind an explicit caller decision
-    // to opt in.
+    // This API surface is opt-in; every call to `dispatch_tracked`
+    // from a production code path lives behind an explicit caller
+    // decision.
     // -----------------------------------------------------------------
 
     /// Auto-barrier-aware dispatch with [`KernelArg`] bindings (uses
@@ -1560,10 +1558,10 @@ impl CommandEncoder {
     /// for the behavioral contract; the only addition here is the
     /// `threadgroup_mem` slice forwarded to the underlying encode.
     ///
-    /// Closes the iter38-audit coverage gap: the 5 `rms_norm.rs`
-    /// callsites (`/opt/mlx-native/src/ops/rms_norm.rs:124,236,443,
-    /// 516,589`) all use `encode_threadgroups_with_shared` and need
-    /// dataflow tracking when migrated to auto-barrier in iter40+.
+    /// Used by the 5 `rms_norm.rs` callsites
+    /// (`/opt/mlx-native/src/ops/rms_norm.rs:124,236,443, 516,589`)
+    /// that use `encode_threadgroups_with_shared` and need dataflow
+    /// tracking for auto-barrier migration.
     ///
     /// 7-argument signature; `clippy::too_many_arguments` is allowed
     /// because each parameter is load-bearing for either the dispatch
@@ -1616,12 +1614,11 @@ impl CommandEncoder {
     /// [`dispatch_tracked_threadgroups_with_args`](Self::dispatch_tracked_threadgroups_with_args).
     /// See that method for the behavioral contract.
     ///
-    /// Closes the iter38-audit coverage gap: callers that use
-    /// per-thread grids — `rope.rs:108` (IMROPE), `sigmoid_mul.rs:76`
-    /// (sigmoid-mul), and `encode_helpers.rs:41` (kv_cache_copy) —
-    /// need a `dispatch_threads` flavor of the tracked dispatch
-    /// because their grid sizes are expressed in threads, not
-    /// threadgroups.
+    /// Callers using per-thread grids — `rope.rs:108` (IMROPE),
+    /// `sigmoid_mul.rs:76` (sigmoid-mul), and `encode_helpers.rs:41`
+    /// (kv_cache_copy) — need a `dispatch_threads` flavor of the
+    /// tracked dispatch because their grid sizes are expressed in
+    /// threads, not threadgroups.
     ///
     /// Note: the simpler `(slot, &MlxBuffer)` form (from
     /// [`encode`](Self::encode)) is a special case of this method —
@@ -1654,7 +1651,7 @@ impl CommandEncoder {
 
     /// Dispatch a pre-baked record.
     ///
-    /// ADR-029 iter-175 Step 1d — fast path for decode hot kernels
+    /// ADR-029 — fast path for decode hot kernels
     /// whose pipeline + threadgroup geometry + params bytes are
     /// load-time-immutable.  `runtime_buffers` must be in the same
     /// order as `rec.buffer_slots`.
@@ -1838,7 +1835,7 @@ impl CommandEncoder {
         threads_per_threadgroup: MTLSize,
         dispatch_kind: DispatchKind,
     ) {
-        // ADR-015 iter63 (Phase A.3): mirror the per-dispatch sampling
+        // ADR-015: mirror the per-dispatch sampling
         // scaffold here so capture-mode-recorded graphs (graph.rs
         // encode_sequential / encode_with_barriers / encode_chunk_with
         // _barriers) still produce per-dispatch entries.  The replay
@@ -1904,7 +1901,7 @@ impl CommandEncoder {
     }
 
     // ----------------------------------------------------------------
-    // ADR-015 iter63 — per-dispatch sample buffer lifecycle
+    // ADR-015 —per-dispatch sample buffer lifecycle
     // ----------------------------------------------------------------
 
     /// Allocate the per-CB `MTLCounterSampleBuffer` if it has not been
@@ -1937,7 +1934,7 @@ impl CommandEncoder {
             let cb = &*self.cmd_buf;
             msg_send![cb, device]
         };
-        // ADR-015 iter63 — Apple Silicon hardware constraint (NEW Risk
+        // ADR-015 —Apple Silicon hardware constraint (NEW Risk
         // discovered at impl time, supersedes design §A.7).  M-series
         // GPUs (verified: AGXG17XFamilyComputeContext = M5 Max series,
         // macOS 26) only support counter sampling AtStageBoundary —
@@ -2174,7 +2171,7 @@ impl CommandEncoder {
         // End the persistent compute encoder before committing.
         self.end_active_encoder();
 
-        // ADR-015 iter8e (Phase 3b): flush deferred residency-set
+        // ADR-015:flush deferred residency-set
         // add/remove staging so the residency hint covers any buffers
         // referenced by this CB. Single commit per CB boundary; no-op
         // when no residency set or no staged changes.
@@ -2210,7 +2207,7 @@ impl CommandEncoder {
     ///
     /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
     pub fn commit_and_wait_labeled(&mut self, label: &str) -> Result<()> {
-        // ADR-015 iter16 — propagate `label` to MTLCommandBuffer.setLabel and
+        // ADR-015 —propagate `label` to MTLCommandBuffer.setLabel and
         // (if a compute encoder is active) MTLComputeCommandEncoder.setLabel
         // BEFORE end_encoding/commit so xctrace's
         // `metal-application-encoders-list` table populates `cmdbuffer-label`
@@ -2220,12 +2217,12 @@ impl CommandEncoder {
         // `metal-gpu-submission-to-command-buffer-id` (sub_id ↔ encoder_id) →
         // `metal-gpu-execution-points` (per-dispatch start/end), this enables
         // per-phase µs/token attribution comparing hf2q vs llama side-by-side
-        // (iter15 §E "iter16 ATTRIBUTION PATH").  Cost is a single ObjC
+        // (label attribution path).  Cost is a single ObjC
         // msg_send per CB submission — sub-µs on M5 Max — and a no-op when
         // xctrace isn't recording, so this is unconditionally safe to call on
         // the production decode hot path.
         self.apply_labels(label);
-        // ADR-015 iter63: record GPU time AND resolve per-dispatch samples
+        // ADR-015:record GPU time AND resolve per-dispatch samples
         // when either env gate is set.  Per-dispatch sampling force-enables
         // the per-CB path so cross-validation per Risk R3 always has a
         // ground-truth comparator.
@@ -2252,7 +2249,7 @@ impl CommandEncoder {
     /// while profiling, which is the whole point — profile-mode is slow
     /// but informative).  When unset, identical to [`commit`](Self::commit).
     pub fn commit_labeled(&mut self, label: &str) {
-        // ADR-015 iter16 — see `commit_and_wait_labeled` for rationale.
+        // ADR-015 —see `commit_and_wait_labeled` for rationale.
         if crate::kernel_profile::is_enabled() {
             // Profile mode: force sync to capture GPU time.  apply_labels is
             // called inside commit_and_wait_labeled — do NOT call it twice
@@ -2298,7 +2295,7 @@ impl CommandEncoder {
             // ObjC object; safe before endEncoding.
             unsafe { &*self.active_encoder }.set_label(label);
         }
-        // ADR-015 iter63: capture the most recent label for per-dispatch
+        // ADR-015:capture the most recent label for per-dispatch
         // entries.  Cheap String allocation — only happens at CB commit
         // boundaries, not per dispatch.
         self.last_label.clear();
@@ -2340,7 +2337,7 @@ impl CommandEncoder {
     /// other work (e.g. preparing the next batch) while the GPU runs.
     pub fn commit(&mut self) {
         self.end_active_encoder();
-        // ADR-015 iter8e (Phase 3b): same flush hook as commit_and_wait —
+        // ADR-015:same flush hook as commit_and_wait —
         // this is the async-pipeline path that production decode uses.
         self.flush_residency_pending();
         self.cmd_buf.commit();
@@ -2376,7 +2373,7 @@ impl CommandEncoder {
 
     /// Borrow the residency set bound to this encoder, if one exists.
     ///
-    /// ADR-019 Phase 0b iter89e2-B: exposed `pub(crate)` so
+    /// ADR-019:exposed `pub(crate)` so
     /// [`crate::EncoderSession`] can route caller-driven add/remove
     /// requests through the same `Arc<ResidencySetInner>` the encoder
     /// itself flushes at every `commit*` boundary. The single-set
@@ -2392,7 +2389,7 @@ impl CommandEncoder {
 
     /// Reopen `cmd_buf` with a fresh `CommandBuffer` from the originating queue.
     ///
-    /// ADR-019 Phase 0b iter89e2-B: enables multi-stage chaining. After a
+    /// ADR-019:enables multi-stage chaining. After a
     /// non-blocking `commit*` has handed the prior CB to Metal, this method
     /// rotates `cmd_buf` to a freshly-allocated CB on the same queue and
     /// resets every per-CB scratch field so the next dispatch is encoded
@@ -2468,7 +2465,7 @@ impl CommandEncoder {
 
     /// Encode an `MTLSharedEvent` wait at `value` on the current CB.
     ///
-    /// ADR-019 Phase 0b iter89e2-B: pairs with [`Self::encode_signal_event`]
+    /// ADR-019:pairs with [`Self::encode_signal_event`]
     /// to express the inter-CB ordering D3 stage boundaries need. The new
     /// CB's GPU work blocks until the prior CB's signal lands on the same
     /// event at >= `value`.
@@ -2493,7 +2490,7 @@ impl CommandEncoder {
     /// End the active compute encoder, encode a stage-fence signal, and
     /// commit the CB non-blocking — atomically from the caller's view.
     ///
-    /// ADR-019 Phase 0b iter89e2-B: this is the helper
+    /// ADR-019:this is the helper
     /// [`crate::EncoderSession::fence_stage`] uses to thread the signal
     /// between the encoder-end and the CB-commit boundaries that
     /// `commit_labeled` would otherwise serialize. Sequence:
