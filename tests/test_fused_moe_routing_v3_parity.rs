@@ -230,6 +230,112 @@ fn v3_parity_gemma4_moe_routing_128_experts_top_8() {
     );
 }
 
+/// Crafted-tie stress test: 128-expert logits with cluster of TIED values
+/// at the top-K boundary.  Step 1i.2's lex-on-tie semantics should pick
+/// the LOWEST-INDEX of tied lanes, matching V2's serial scan.
+///
+/// This test was added in Step 1i.3 (this iteration) to harden the parity
+/// guarantee at the specific edge case Step 1i.1's docstring claimed to
+/// fix.  If this test passes but production decode still diverges, the
+/// V3-V2 divergence is NOT from softmax ties (further investigation
+/// would need a different hypothesis).
+#[test]
+fn v3_parity_crafted_tied_logits() {
+    let device = MlxDevice::new().expect("MlxDevice");
+    let mut registry = KernelRegistry::new();
+    let num_experts = 128u32;
+    let top_k = 8u32;
+
+    // Craft logits: 16 experts at value 10.0 (will tie after softmax),
+    // 112 experts at -10.0 (essentially zero probability after softmax).
+    // Top-K=8 picks 8 of the 16 tied experts.  Lex-on-tie should pick
+    // the LOWEST 8 indices: experts 0..7.
+    let mut logits = vec![-10.0_f32; num_experts as usize];
+    for i in 0..16 {
+        // Spread the tied experts across the 128-expert space so they
+        // exercise both SGs (gemma4's tg=64 splits as SG0: experts 0-31
+        // and 64-95, SG1: 32-63 and 96-127).
+        logits[i * 8] = 10.0; // experts 0, 8, 16, ..., 120
+    }
+    let scale = vec![1.0_f32; num_experts as usize];
+
+    let (ids_v2, _w_v2) = run_once(
+        &device, &mut registry, "v2", &logits, &scale, num_experts, top_k,
+    );
+    let (ids_v3, _w_v3) = run_once(
+        &device, &mut registry, "v3", &logits, &scale, num_experts, top_k,
+    );
+
+    println!("V2 ids (tied): {:?}", ids_v2);
+    println!("V3 ids (tied): {:?}", ids_v3);
+
+    // Both should pick experts 0, 8, 16, 24, 32, 40, 48, 56 — the LOWEST
+    // 8 indices among the 16 tied experts.
+    let mut s_v2 = ids_v2.clone();
+    let mut s_v3 = ids_v3.clone();
+    s_v2.sort_unstable();
+    s_v3.sort_unstable();
+
+    let expected: Vec<u32> = (0..8).map(|i| i * 8).collect();
+    println!("Expected (lowest-8 lex-on-tie): {:?}", expected);
+
+    // Critical: V3's lex-on-tie fix should make V3 pick same SET as V2.
+    assert_eq!(
+        s_v2, s_v3,
+        "V2 and V3 disagree on SET for crafted ties:\n  V2={:?}\n  V3={:?}",
+        ids_v2, ids_v3
+    );
+}
+
+/// Step 1i.3 stress: SPARSE router output mimicking production gemma4
+/// pattern (1-2 experts get most probability, others tiny + denormals).
+/// Production traces show this is the actual shape — most experts have
+/// prob ~1/128 (≈ 0.0078) before softmax sharpening.
+#[test]
+fn v3_parity_sparse_production_pattern() {
+    let device = MlxDevice::new().expect("MlxDevice");
+    let mut registry = KernelRegistry::new();
+    let num_experts = 128u32;
+    let top_k = 8u32;
+
+    // Sparse pattern: 2 dominant logits (high values), rest near zero.
+    // Softmax sharpens this so top 2 get most prob; rest get ~uniform tiny.
+    let mut logits = vec![0.0_f32; num_experts as usize];
+    logits[42] = 8.0;  // dominant
+    logits[99] = 7.5;  // second dominant
+    // Add tiny variation to remaining experts to avoid easy ties
+    let mut rng = Xoshiro256::new(0xC0DE_BEEF);
+    for (i, l) in logits.iter_mut().enumerate() {
+        if i != 42 && i != 99 {
+            *l = (rng.next_f64() as f32 - 0.5) * 0.01; // ±0.005 noise
+        }
+    }
+    let scale: Vec<f32> = (0..num_experts).map(|i| 0.9 + (i as f32) * 0.001).collect();
+
+    let (ids_v2, w_v2) = run_once(
+        &device, &mut registry, "v2", &logits, &scale, num_experts, top_k,
+    );
+    let (ids_v3, w_v3) = run_once(
+        &device, &mut registry, "v3", &logits, &scale, num_experts, top_k,
+    );
+
+    println!("V2 ids: {:?} weights: {:?}", ids_v2, w_v2);
+    println!("V3 ids: {:?} weights: {:?}", ids_v3, w_v3);
+
+    // V2 and V3 MUST agree on top-K order for sparse patterns
+    // (no ties at this scale of separation).
+    assert_eq!(
+        ids_v2, ids_v3,
+        "V3 picks different top-K ORDER than V2 — sparse production pattern"
+    );
+    for (i, (a, b)) in w_v2.iter().zip(w_v3.iter()).enumerate() {
+        let abs = (a - b).abs();
+        let rel = if a.abs() > 1e-6 { abs / a.abs() } else { abs };
+        println!("k={i} V2={a:.6e} V3={b:.6e} abs={abs:.4e} rel={rel:.4e}");
+        assert!(rel < 1e-5, "k={i} weight rel {rel:.4e} exceeds 1e-5");
+    }
+}
+
 #[test]
 fn v3_parity_with_per_expert_scale() {
     let device = MlxDevice::new().expect("MlxDevice");
