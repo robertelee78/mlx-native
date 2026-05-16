@@ -19,7 +19,7 @@ use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg, 
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use std::sync::atomic::AtomicI8;
 
-// ADR-029 iter-175 Step 1ao: cached hot-path env-flag gates for dispatch_mv.
+// ADR-029: cached hot-path env-flag gates for dispatch_mv.
 // Same pattern as Step 1an (dispatch_id_mv). ~120 attn dispatches per token
 // each hitting these 2 env reads.
 static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
@@ -198,7 +198,7 @@ impl GgmlType {
         }
     }
 
-    /// ADR-029 iter-23 H28-A — V2 large-tile tensor mm-kernel names.
+    /// ADR-029 H28-A — V2 large-tile tensor mm-kernel names.
     /// 64 (M tile) × 128 (N tile) output tile, direct-device B-read (no
     /// shmem staging), 4 simdgroups.  Ports llama.cpp's modern tensor
     /// kernel layout at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:
@@ -228,7 +228,7 @@ static TENSOR_MM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new
 
 fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     *TENSOR_MM_AVAILABLE.get_or_init(|| {
-        // ADR-029 iter-21 H28 probe: HF2Q_DISABLE_TENSOR_MM=1 forces the
+        // ADR-029 H28 probe: HF2Q_DISABLE_TENSOR_MM=1 forces the
         // simdgroup-MMA fallback so we can A/B test whether the tensor
         // variant is the source of the 2× prefill gap vs peer.
         if std::env::var("HF2Q_DISABLE_TENSOR_MM").as_deref() == Ok("1") {
@@ -358,7 +358,7 @@ pub fn quantized_matmul_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    // ADR-028 iter-384: output: &MlxBuffer (was &mut).  Encoders never mutate
+    // ADR-028: output: &MlxBuffer (was &mut).  Encoders never mutate
     // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
     // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
     // for the multi-thread encoding port (peer's n_cb=2 pattern).
@@ -461,7 +461,7 @@ pub fn quantized_matmul_ggml(
     }
 }
 
-/// ADR-029 iter-30 H29-speed: dispatch the V2 64×128 large-tile mm-tensor
+/// ADR-029 H29-speed: dispatch the V2 64×128 large-tile mm-tensor
 /// kernel with F16 weight input (no dequant — reads from a pre-materialized
 /// F16 shadow buffer).  Mirrors `dispatch_mm` geometry / shmem / dispatch
 /// for the V2 path but skips the per-call dequantize_func work.
@@ -513,7 +513,6 @@ pub fn dispatch_mm_v2_f16(
         _pad1: 0,
     };
 
-    // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
     let pipeline = registry
         .get_pipeline_with_constants(
             "hf2q_mul_mm_tensor_v2_f16",
@@ -602,23 +601,23 @@ fn dispatch_mv(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &MlxBuffer, // ADR-028 iter-384: was &mut, see public fn comment
+    output: &MlxBuffer, // ADR-028: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    // ADR-028 iter-309 — nr0=2 variant for q6_K mat-vec.  Peer pattern:
+    // ADR-028 —nr0=2 variant for q6_K mat-vec.  Peer pattern:
     // 4 rows/TG (vs baseline's 2) + cached `yl[16]` (vs no cache + device
     // re-reads).  Bit-exact-equivalent to the baseline at HEAD (parity
     // test in tests/adr_028_iter309_q6k_mv_nr2_parity.rs).
     //
-    // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2:
+    // ADR-028 default-flipped to ON (operator REFRAME #2:
     // "default should have the best things on that provide the best
     // mantra-aligned outcome for users").  Opt out with
     // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
         && cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2");
-    // ADR-028 iter-368 — Q8_0 NSG=4 NR=2 (peer-style port).  Default-OFF
+    // ADR-028 —Q8_0 NSG=4 NR=2 (peer-style port).  Default-OFF
     // until parity + bench validation; opt-in via `HF2Q_Q8_0_MV_NR2=1`.
-    // ADR-029 iter-175 Step 1ao: cached via AtomicI8.
+    // ADR-029: cached via AtomicI8.
     let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
         && cached_env_eq_one(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2");
     let kernel_name = if use_q6k_nr2 {
@@ -628,13 +627,13 @@ fn dispatch_mv(
     } else {
         params.ggml_type.kernel_name()
     };
-    // ADR-029 iter-162 H93: PSO-specialize batch divisors (ne12/r2/r3) at
+    // ADR-029 H93: PSO-specialize batch divisors (ne12/r2/r3) at
     // function-constant slots 700/701/702. Peer-grounded port of llama.cpp
     // commit da4495332. Hardcoded =1 here matches the gpu_params below
     // (current mlx-native usage is always single-batch); compiler folds
     // `im % 1 → 0` and `i12 / 1 → i12` at PSO compile, eliminating
     // ~3 expensive integer divisions per thread per dispatch.
-    // ADR-029 iter-175 Step 1ba: removed redundant .clone() — registry is not
+    // The redundant .clone() is omitted — registry is not
     // accessed again after pipeline lookup, so we can hold the &ComputePipelineState
     // reference across the rest of the function. Saves one objc retain/release
     // pair per dispatch.
@@ -673,10 +672,10 @@ fn dispatch_mv(
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),
     };
-    // ADR-028 iter-309 — nr0=2 variant doubles rows-per-TG to 4.  Same
+    // ADR-028 —nr0=2 variant doubles rows-per-TG to 4.  Same
     // 2 SGs × 32 threads layout, but each SG handles 2 rows so align=4.
     let align = if use_q6k_nr2 { 4usize } else { align };
-    // ADR-028 iter-368 — Q8_0 NR2 uses 32×4=128 threads/TG, 2 rows/TG.
+    // ADR-028 —Q8_0 NR2 uses 32×4=128 threads/TG, 2 rows/TG.
     let (nth0, nth1, align) = if use_q8_0_nr2 {
         (32u64, 4u64, 2usize)
     } else {
@@ -706,7 +705,7 @@ fn dispatch_mv(
             threads_per_tg,
         );
     } else {
-        // ADR-029 iter-175 Step 1e: dataflow-tracked dispatch.  When
+        // ADR-029: dataflow-tracked dispatch.  When
         // HF2Q_AUTO_BARRIER=1, the MemRanges tracker checks weight/input
         // against the cumulative state and auto-emits a barrier on RAW.
         // When HF2Q_AUTO_BARRIER=0 (default), this is identical to the
@@ -733,7 +732,7 @@ fn dispatch_mv(
 /// Build a pre-baked `DispatchRecord` for the Q6_K NR2 mat-vec
 /// decode-m=1 path.
 ///
-/// ADR-029 iter-175 Step 1d — first concrete consumer of
+/// ADR-029: first concrete consumer of
 /// [`DispatchRecord`].  The Q6_K NR2 path is the hottest single
 /// per-token dispatch shape on gemma4-APEX-Q5_K_M decode
 /// (Q/K/V proj × 30 layers + lm_head Q6_K = up to 91 dispatches/tok
@@ -820,7 +819,7 @@ fn dispatch_mm(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxBuffer,
-    output: &MlxBuffer, // ADR-028 iter-384: was &mut, see public fn comment
+    output: &MlxBuffer, // ADR-028: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
@@ -832,7 +831,7 @@ fn dispatch_mm(
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
     // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).
     //
-    // ADR-029 iter-26 default-flip: validated across regimes —
+    // ADR-029 default-flip: validated across regimes —
     //   gemma4-APEX-Q5_K_M (2K/4K/8K prefill): +6–7% byte-identical
     //   qwen3.6-APEX-Q5_K_M (4K prefill): +0–2% byte-identical
     //   decode m=1 unaffected (V2 only fires at m > MM_ROUTING_THRESHOLD=8)
@@ -850,7 +849,6 @@ fn dispatch_mm(
     } else {
         params.ggml_type.mm_kernel_name()
     };
-    // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
     let pipeline = registry
         .get_pipeline_with_constants(
             kernel_name,
@@ -1079,7 +1077,6 @@ pub fn quantized_matmul_mm_tensor_perm021(
         )));
     }
 
-    // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
     let pipeline = registry
         .get_pipeline_with_constants(
             kernel_name,
@@ -1146,7 +1143,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
 ///
 /// Same contract as `quantized_matmul_mm_tensor_perm021`, but reads weights
 /// from a caller-supplied F16 shadow buffer instead of dequantizing the
-/// quantized weight in the kernel.  Mirrors the H29-speed pattern (iter-30)
+/// quantized weight in the kernel.  Mirrors the H29-speed pattern
 /// applied to the perm021 layout — used for the O-projection prefill matmul
 /// when `MlxQWeight.f16_shadow` is populated.
 ///
@@ -1213,8 +1210,7 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
             &[],
             &[(700, 1), (701, 1), (702, 1)],
         )?;
-        // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
-
+    
     // nb01 = bytes per F16 weight row = k * sizeof(half)
     let nb01: u64 = (params.k as u64) * 2;
 
