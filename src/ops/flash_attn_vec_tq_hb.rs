@@ -6,7 +6,7 @@
 //!
 //! Bit-width is controlled at runtime via `FlashAttnVecTqHbParams::codebook_bits`.
 //!
-//! ADR-007 iter-24: measure Gate A/B/C at 5/6/8-bit to find smallest shippable bit-width.
+//! ADR-007: measure Gate A/B/C at 5/6/8-bit to find smallest shippable bit-width.
 
 use metal::MTLSize;
 
@@ -44,14 +44,14 @@ pub struct FlashAttnVecTqHbParams {
     pub scale_factor_d512: f32,
     /// Codebook bit-width: 5, 6, or 8.
     pub codebook_bits: u32,
-    /// ADR-028 iter-106: when 1, the kernel applies FWHT-pre internally on Q
+    /// ADR-028: when 1, the kernel applies FWHT-pre internally on Q
     /// (sign-premult + simd-shuffle butterfly + 1/sqrt(d) normalize). When 0
     /// (default — production-byte-identical), the caller must pre-rotate Q
     /// via `dispatch_fwht_sign_premult_f32` before this call.
     /// Setting this to 1 eliminates one dispatch + one forced memory_barrier
-    /// per layer (~9% decode lever per ADR-028 iter-104).
+    /// per layer (~9% decode lever per ADR-028).
     pub fuse_fwht_pre: u32,
-    /// ADR-028 iter-127 Path D: number of simdgroups per workgroup (NSG axis).
+    /// ADR-028 Path D:number of simdgroups per workgroup (NSG axis).
     ///
     /// llama.cpp's K-loop uses `for (ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`
     /// to split K-blocks across NSG simdgroups within each workgroup, on top
@@ -86,7 +86,7 @@ struct FlashAttnVecTqHbParamsGpu {
     scale_factor_d512: f32,
     codebook_bits: u32,
     fuse_fwht_pre: u32,
-    /// ADR-028 iter-127 Path D: NSG axis. See `FlashAttnVecTqHbParams::nsg`.
+    /// ADR-028 Path D:NSG axis. See `FlashAttnVecTqHbParams::nsg`.
     nsg: u32,
 }
 
@@ -132,7 +132,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
             params.codebook_bits
         )));
     }
-    // ADR-028 iter-127 Path D: NSG must be a power of 2 in [1, 32].
+    // ADR-028 Path D:NSG must be a power of 2 in [1, 32].
     // 32 is Apple Metal's max threads/threadgroup divided by simdgroup-width
     // (1024 / 32). Practically capped at 4 (matches llama.cpp policy).
     if params.nsg == 0 || (params.nsg & (params.nsg - 1)) != 0 {
@@ -141,7 +141,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
             params.nsg
         )));
     }
-    // ADR-028 iter-127c: kernel reduce uses a fixed-size NSG_MAX=4 stack array
+    // ADR-028: kernel reduce uses a fixed-size NSG_MAX=4 stack array
     // for per-simdgroup rescale factors. Tighten validation to match the
     // kernel-side cap. llama.cpp also caps at nsg=4 (`ggml-metal-ops.cpp:2954`).
     if params.nsg > 4 {
@@ -153,7 +153,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
     Ok(())
 }
 
-/// ADR-028 iter-127 Path D: select NSG (simdgroups per workgroup) from kv_seq_len.
+/// ADR-028 Path D:select NSG (simdgroups per workgroup) from kv_seq_len.
 ///
 /// Mirrors llama.cpp's policy at `ggml-metal-ops.cpp:2953`:
 /// `while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) { nsg *= 2; }`
@@ -168,7 +168,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 /// keeps short-context behavior byte-identical (nsg=1) per
 /// `feedback_metal_compiler_auto_optimizes_static_levers`.
 pub fn compute_nsg(kv_seq_len: u32) -> u32 {
-    // ADR-029 iter-175 Step 1at: cache parsed override.
+    // ADR-029: cache parsed override.
     // TQ-HB FA fires ~26-30 calls/token at gemma4 decode (TQ-HB-V is default V-KV).
     // Uncached env::var was ~70 ns/call (H-N bench).
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -186,7 +186,7 @@ pub fn compute_nsg(kv_seq_len: u32) -> u32 {
     if v > 0 {
         return v as u32;
     }
-    // ADR-028 iter-127d Path D: adaptive NSG policy from measured bench data.
+    // ADR-028 Path D: adaptive NSG policy from measured bench data.
     //
     // bench_fa_vec_tq_hb_gemma_decode (mlx-native commit 5aafd7a, M5 Max, NWG=32):
     //
@@ -208,7 +208,7 @@ pub fn compute_nsg(kv_seq_len: u32) -> u32 {
 }
 
 fn compute_nwg(kv_seq_len: u32) -> u32 {
-    // ADR-029 iter-175 Step 1at: cache parsed override (same pattern as compute_nsg).
+    // ADR-029: cache parsed override (same pattern as compute_nsg).
     use std::sync::atomic::{AtomicI32, Ordering};
     static CACHED_TQ_NWG: AtomicI32 = AtomicI32::new(-1);
     let mut v = CACHED_TQ_NWG.load(Ordering::Relaxed);
@@ -224,26 +224,15 @@ fn compute_nwg(kv_seq_len: u32) -> u32 {
     if v > 0 {
         return v as u32;
     }
-    // ADR-028 iter-119 kL-adaptive nwg.
+    // ADR-028 — kL-adaptive nwg.
     //
-    // iter-103 measured FA-vec-tq-hb GPU pure-time at gemma decode shape
-    // (16 query heads, head_dim=256): 40 µs/call FLAT for kL ∈ [64, 512],
-    // then linear (78 µs at kL=1024, 115 µs at kL=1536). Past 512 the
-    // 16 simdgroups split-K saturate before kL is consumed, so each WG
-    // does multiple outer-loop iterations.
-    //
-    // iter-100 measured nwg ∈ {16, 32} at short kL (≤170): identical
-    // throughput (GPU-saturated, doubling parallelism doesn't help).
-    // iter-118 measured at long kL (~860 with 800-token decode): nwg=32
-    // gave +4.7% production decode (62.4 vs 59.6 t/s). Threshold around
-    // 512: short kL prefers 16 (less reduce overhead), long kL prefers
-    // 32 (more parallelism for the longer K-dim).
-    //
-    // Per `feedback_metal_compiler_auto_optimizes_static_levers`, this
-    // is the FIRST positive lever after 11 falsifications; verified
-    // empirically with HF2Q_TQ_NWG=32 vs default at long-context production
-    // bench, NOT static-analysis-derived. No coherence change (FA-vec-tq-hb
-    // produces byte-identical output regardless of nwg).
+    // Past 512, the 16 simdgroups split-K saturate before kL is
+    // consumed, so each WG does multiple outer-loop iterations.
+    // Short kL prefers nwg=16 (less reduce overhead); long kL
+    // prefers nwg=32 (more parallelism for the longer K-dim) —
+    // measured +4.7% production decode at long context.
+    // No coherence change: FA-vec-tq-hb produces byte-identical
+    // output regardless of nwg.
     if kv_seq_len > 512 { 32 } else { 16 }
 }
 
@@ -298,9 +287,9 @@ pub fn flash_attn_vec_tq_hb(
             "flash_attn_vec_tq_hb: unsupported head_dim {head_dim}"
         ))),
     };
-    // ADR-028 iter-197: pass cbits as a Metal function constant for
+    // ADR-028: pass cbits as a Metal function constant for
     // compile-time specialization (eliminates the per-element if-else
-    // chain in dequant_hb_float4 — measured +8.5% in iter-196 bisect).
+    // chain in dequant_hb_float4 — measured +8.5%).
     // Index 50 must match `[[function_constant(50)]]` in the shader.
     let cbits_const = (params.codebook_bits as i32, 50usize);
     let pipeline = registry
@@ -314,20 +303,21 @@ pub fn flash_attn_vec_tq_hb(
     let pk = pad2(head_dim as usize, 128);
     let pv = pad2(head_dim as usize, 128);
     let sh = 4 * 32;
-    // ADR-028 iter-127b: shmem layout is NSG-aware:
+    // ADR-028: shmem layout is NSG-aware:
     //   [0, PK)                                                  — Q (shared)
     //   [PK, PK + NSG*SH)                                        — per-simdgroup ss
     //   [PK + NSG*SH, PK + NSG*SH + NSG*2*PV)                    — per-simdgroup so4
-    // At NSG=1 → `pk + sh + 2*pv` (pre-iter-127 layout, byte-identical).
+    // At NSG=1 → `pk + sh + 2*pv` (earlier layout, byte-identical).
     let nsg = params.nsg as usize;
     let shmem_halfs = pk + nsg * (sh + 2 * pv);
     let shmem_bytes = shmem_halfs * 2;
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);
 
-    // ADR-028 iter-127a Path D: threadgroup is `(simdgroup_width=32, NSG, 1)`.
-    // At NSG=1 (default), this is `(32, 1, 1)` — byte-identical to pre-iter-127
-    // dispatch shape. The NSG axis is read by the kernel via `params.nsg`.
+    // ADR-028 Path D: threadgroup is `(simdgroup_width=32, NSG, 1)`.
+    // At NSG=1 (default), this is `(32, 1, 1)` — byte-identical to
+    // the earlier dispatch shape. The NSG axis is read by the kernel
+    // via `params.nsg`.
     let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
     let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
 
@@ -389,7 +379,7 @@ pub fn tmp_buffer_bytes(num_heads: u32, head_dim: u32) -> usize {
     (nrows * max_nwg * (dv + 2)) * std::mem::size_of::<f32>()
 }
 
-/// ADR-028 §iter-485 (Phase 7d H3) — fused-undo variant.
+/// ADR-028 (Phase 7d H3) — fused-undo variant.
 ///
 /// Same as [`flash_attn_vec_tq_hb`], but the reduce step is replaced with
 /// `flash_attn_vec_reduce_tq_hb_undo`, which performs the cross-WG online-
@@ -527,8 +517,8 @@ mod tests {
 
     #[test]
     fn test_gpu_params_size() {
-        // ADR-028 iter-127a: 15 fields × 4 bytes = 60 bytes (added nsg).
-        // iter-106 was 14 (added fuse_fwht_pre); iter-127a adds nsg.
+        // ADR-028: 15 fields × 4 bytes = 60 bytes (added nsg).
+        // Was 14 before fuse_fwht_pre; nsg was added most recently.
         assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 60);
     }
 
@@ -574,7 +564,7 @@ mod tests {
         assert!(validate_params(&p).is_ok());
     }
 
-    // ADR-028 iter-127a — NSG-axis validation tests.
+    // ADR-028 — NSG-axis validation tests.
 
     #[test]
     fn test_validate_nsg_zero_rejected() {
@@ -590,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_validate_nsg_non_pow2_rejected() {
-        // ADR-028 iter-127c: cap tightened to ≤ 4 (kernel NSG_MAX). Test
+        // ADR-028: cap tightened to ≤ 4 (kernel NSG_MAX). Test
         // covers non-pow2 in [1, 4], plus the > 4 cap rejection.
         for nsg in [3u32, 5, 6, 7, 9, 16, 31, 33] {
             let p = FlashAttnVecTqHbParams {
@@ -606,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_validate_nsg_pow2_accepted() {
-        // ADR-028 iter-127c: only {1, 2, 4} accepted (matches kernel cap).
+        // ADR-028: only {1, 2, 4} accepted (matches kernel cap).
         for nsg in [1u32, 2, 4] {
             let p = FlashAttnVecTqHbParams {
                 num_heads: 8, num_kv_heads: 4, head_dim: 256,
@@ -619,7 +609,7 @@ mod tests {
         }
     }
 
-    /// ADR-028 iter-127a: env-var-mutating tests serialize through a mutex to
+    /// ADR-028: env-var-mutating tests serialize through a mutex to
     /// avoid races on parallel unit-test execution. `test_compute_nsg_default`
     /// and `test_compute_nsg_env_override` both touch `HF2Q_TQ_NSG`.
     static NSG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -627,7 +617,7 @@ mod tests {
     #[test]
     fn test_compute_nsg_adaptive_threshold() {
         let _guard = NSG_ENV_LOCK.lock().unwrap();
-        // iter-127d adaptive policy: NSG=1 below threshold, NSG=4 above.
+        // Adaptive policy: NSG=1 below threshold, NSG=4 above.
         // Threshold derived from bench data — see compute_nsg docstring.
         std::env::remove_var("HF2Q_TQ_NSG");
         // Below threshold: NSG=1 (cross-simdgroup reduce overhead dominates).
