@@ -1,5 +1,5 @@
 //! Fused affine quantized matmul (`Y = X @ dequant(W)^T`) — ADR-020
-//! iter-15 DWQ inference primitive.
+//! DWQ inference primitive.
 //!
 //! Given a DWQ-trained Linear weight stored as
 //! `(q_int: u8[N, K], scales: f32[N, K/group_size], biases:
@@ -17,16 +17,16 @@
 //! weight tensor in GPU memory (relevant for large Linears where
 //! `N · K · 4 bytes` is multi-hundred-MB).
 //!
-//! Layout matches iter-13b's `qdq_affine` kernel family: UNPACKED
-//! uint8 codes (one byte per nibble; supports up to 8-bit
-//! quantization without bit-packing).  A packed-byte variant
-//! matching mlx's on-disk convention (2 nibbles per byte for bits=4)
-//! is deferred to iter-15b.
+//! Layout matches the `qdq_affine` kernel family: UNPACKED uint8
+//! codes (one byte per nibble; supports up to 8-bit quantization
+//! without bit-packing).  A packed-byte variant matching mlx's
+//! on-disk convention (2 nibbles per byte for bits=4) is not
+//! yet implemented.
 //!
-//! Performance: iter-15 ships a correctness-first per-element kernel
-//! (one thread per `(m, n)` output element).  iter-15b will land a
-//! tiled + simdgroup-MMA variant matching mlx's `affine_qmm_t`
-//! (BM=BK=BN=32, WM=WN=2 — 4 simdgroups per TG, 128 threads).
+//! Performance: ships a correctness-first per-element kernel
+//! (one thread per `(m, n)` output element) alongside tiled and
+//! simdgroup-MMA variants (`_simd`, `_simd4`, `_simd4_gs64`) for
+//! the production decode/prefill paths.
 
 use metal::MTLSize;
 
@@ -303,8 +303,8 @@ pub fn dispatch_qmm_affine_t_f32_tiled(
     Ok(())
 }
 
-/// Dispatch the SIMDGROUP-MMA variant of `qmm_affine_t_f32` (ADR-020
-/// iter-15c).  Same I/O contract as
+/// Dispatch the SIMDGROUP-MMA variant of `qmm_affine_t_f32` (ADR-020).
+/// Same I/O contract as
 /// [`dispatch_qmm_affine_t_f32_tiled`] but uses Apple GPU's hardware
 /// `simdgroup_matrix<float, 8, 8>` MMA path for the inner reduction.
 ///
@@ -399,14 +399,13 @@ pub fn dispatch_qmm_affine_t_f32_simd(
     Ok(())
 }
 
-/// Dispatch the 4-SIMDGROUP-MMA variant of `qmm_affine_t_f32` (ADR-020
-/// iter-15c-2).  Same math as iter-15c-1 (`_simd`) but uses 4
-/// simdgroups (128 threads) per threadgroup arranged as a 2×2 grid,
-/// each owning a 16×16 sub-tile of a 32×32 TG output tile via 4
-/// simdgroup_matrix accumulators.  Mirrors the GGML `kernel_mul_mm`
-/// reference structure.
+/// Dispatch the 4-SIMDGROUP-MMA variant of `qmm_affine_t_f32` (ADR-020).
+/// Same math as the `_simd` variant but uses 4 simdgroups (128 threads)
+/// per threadgroup arranged as a 2×2 grid, each owning a 16×16 sub-tile
+/// of a 32×32 TG output tile via 4 simdgroup_matrix accumulators.
+/// Mirrors the GGML `kernel_mul_mm` reference structure.
 ///
-/// Constraints (host-validated): same as iter-15c-1.
+/// Constraints (host-validated): same as `_simd`.
 ///   - `group_size == 32`.
 ///   - `K % group_size == 0`.
 ///   - All buffers correct dtype + element_count.
@@ -494,8 +493,8 @@ pub fn dispatch_qmm_affine_t_f32_simd4(
     Ok(())
 }
 
-/// Dispatch the gs=64 variant of `qmm_affine_t_f32_simd4` (ADR-020
-/// iter-15c-2b).  Same 4-simdgroup geometry as `_simd4` but with
+/// Dispatch the gs=64 variant of `qmm_affine_t_f32_simd4` (ADR-020).
+/// Same 4-simdgroup geometry as `_simd4` but with
 /// `BK = 64` (= mlx-lm `dynamic_quant.py` canonical default group
 /// size).  Required for serving mlx-format DWQ-trained safetensors
 /// that use group_size=64 (vs GGUF Q4_0's group_size=32).
@@ -587,7 +586,7 @@ pub fn dispatch_qmm_affine_t_f32_simd4_gs64(
 }
 
 /// Dispatch the packed-U32 4-SIMDGROUP-MMA variant of `qmm_affine_t_f32`
-/// for bits=4 (ADR-020 AC#5 Iter A).  Same threadgroup geometry,
+/// for bits=4 (ADR-020 AC#5).  Same threadgroup geometry,
 /// accumulators, and write-back as `dispatch_qmm_affine_t_f32_simd4`,
 /// but the weight tensor `w_packed` is the packed-U32 mlx-on-disk
 /// layout: shape `[N, K/8]` U32 row-major, 8 codes per u32 along K.
@@ -909,7 +908,7 @@ mod tests {
         }
     }
 
-    /// Cross-validate against composing iter-13b's `qdq_affine_forward`
+    /// Cross-validate against composing `qdq_affine_forward`
     /// + a host-side standard matmul: the two paths must agree
     /// byte-for-byte (or within FP rounding noise) since the fused
     /// kernel is mathematically the same operation.
@@ -965,7 +964,7 @@ mod tests {
         .unwrap();
         encoder.commit_and_wait().unwrap();
 
-        // Path B: dequant via iter-13b's qdq_affine_forward, then host-side
+        // Path B: dequant via qdq_affine_forward, then host-side
         // matmul oracle (since dense_mm_f32 has its own size constraints
         // that we'd have to satisfy separately).  This compares the
         // FUSED kernel against the SAME math executed via the
@@ -1059,7 +1058,7 @@ mod tests {
 
     #[test]
     fn qmm_affine_tiled_matches_per_element_kernel() {
-        // Cross-check the tiled variant against iter-15's per-element
+        // Cross-check the tiled variant against the per-element
         // kernel: byte-equivalent (mod FP rounding noise) for the
         // same inputs, since they compute the same math.
         let device = MlxDevice::new().expect("device");
@@ -1214,7 +1213,7 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// ADR-020 iter-15c — simdgroup-MMA kernel byte-parity vs the
+    /// ADR-020 — simdgroup-MMA kernel byte-parity vs the
     /// per-element kernel.  Same inputs, same math, must match within
     /// FP rounding.  This is the load-bearing correctness test:
     /// without parity, the perf gain is meaningless.
@@ -1322,9 +1321,9 @@ mod tests {
         }
     }
 
-    /// ADR-020 iter-15c-2 — 4-simdgroup-per-TG variant byte-parity
-    /// vs the per-element kernel.  Same fixture as iter-15c-1's
-    /// parity test so the two MMA variants are cross-comparable.
+    /// ADR-020 — 4-simdgroup-per-TG variant byte-parity vs the
+    /// per-element kernel.  Same fixture as the `_simd` parity
+    /// test so the two MMA variants are cross-comparable.
     #[test]
     fn qmm_affine_simd4_matches_per_element_kernel() {
         let device = MlxDevice::new().expect("device");
@@ -1448,7 +1447,7 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// ADR-020 iter-15c-2b — gs=64 variant byte-parity vs the
+    /// ADR-020 — gs=64 variant byte-parity vs the
     /// per-element kernel.  Same shape as the gs=32 simd4 parity
     /// test but with K aligned to gs=64.
     #[test]
