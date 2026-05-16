@@ -1033,6 +1033,157 @@ kernel void fused_moe_routing_batch_f32(
     }
 }
 
+// ============================================================================
+// fused_moe_routing_batch_f32_v3 (ADR-029 iter-175 Step 1j) — batched prefill
+// counterpart of Step 1i's fused_moe_routing_f32_v3.
+//
+// Same parallel SG-tournament top-K as the unbatched V3, but operates
+// per-token within a threadgroup keyed by tgpig.x = tok_id.  Grid is
+// (n_tokens, 1, 1); each TG handles one token's routing using simd_max +
+// simd_sum + tournament reduction.
+//
+// Shared memory: 2*num_experts + 2*n_sg floats (same as unbatched V3).
+//
+// Default: opt-in via HF2Q_FUSED_MOE_ROUTING_V3=1 (shared env flag with
+// the unbatched V3 path).  Validates on the existing batched prefill
+// routing test fixture; should match V2 byte-equivalently except for
+// f32-tied softmax probabilities (vanishingly rare).
+// ============================================================================
+kernel void fused_moe_routing_batch_f32_v3(
+    device const float*               logits_all      [[buffer(0)]],
+    device uint*                      expert_ids_all  [[buffer(1)]],
+    device float*                     routing_weights_all [[buffer(2)]],
+    device const float*               per_expert_scale [[buffer(3)]],
+    constant FusedMoeRoutingParams&   params          [[buffer(4)]],
+    uint tok_id   [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    threadgroup float* shared [[threadgroup(0)]]
+) {
+    const uint num_experts = params.num_experts;
+    const uint top_k       = params.top_k;
+    const uint n_sg        = tg_size / 32u;
+
+    device const float* logits          = logits_all       + tok_id * num_experts;
+    device uint*        expert_ids      = expert_ids_all   + tok_id * top_k;
+    device float*       routing_weights = routing_weights_all + tok_id * top_k;
+
+    // --- Step 1: find max via simd_max + cross-SG reduce ---
+    float local_max = -INFINITY;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        local_max = max(local_max, logits[i]);
+    }
+    local_max = simd_max(local_max);
+    if (tiisg == 0) {
+        shared[num_experts + sgitg] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[num_experts + tiisg] : -INFINITY;
+        const float total = simd_max(v);
+        if (tiisg == 0) {
+            shared[num_experts + 0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float max_val = shared[num_experts + 0];
+
+    // --- Step 2: exp(x - max) and sum via simd_sum + cross-SG reduce ---
+    float local_sum = 0.0f;
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        const float e = exp(logits[i] - max_val);
+        shared[num_experts + i] = e;
+        local_sum += e;
+    }
+    local_sum = simd_sum(local_sum);
+    if (tiisg == 0) {
+        shared[2u * num_experts + sgitg] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[2u * num_experts + tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[2u * num_experts + 0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sum_exp = shared[2u * num_experts + 0];
+
+    // --- Step 3: write softmax probabilities to shared[0..num_experts) ---
+    for (uint i = tid; i < num_experts; i += tg_size) {
+        shared[i] = shared[num_experts + i] / sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Step 4 V3: PARALLEL top-K selection via SG-tournament reduce ---
+    for (uint k = 0; k < top_k; k++) {
+        float my_val = -1.0f;
+        uint  my_idx = 0u;
+        for (uint i = tid; i < num_experts; i += tg_size) {
+            const float v = shared[i];
+            if (v > my_val) {
+                my_val = v;
+                my_idx = i;
+            }
+        }
+        // SG-level tournament max-with-index
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            const float other_v = simd_shuffle_down(my_val, offset);
+            const uint  other_i = simd_shuffle_down(my_idx, offset);
+            if (other_v > my_val) {
+                my_val = other_v;
+                my_idx = other_i;
+            }
+        }
+        // Per-SG winners staged to shmem.
+        if (tiisg == 0) {
+            shared[2u * num_experts + sgitg] = my_val;
+            shared[2u * num_experts + n_sg + sgitg] = as_type<float>(my_idx);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // SG0 cross-SG tournament.
+        if (sgitg == 0) {
+            float v = (tiisg < n_sg) ? shared[2u * num_experts + tiisg] : -1.0f;
+            uint  i = (tiisg < n_sg) ? as_type<uint>(shared[2u * num_experts + n_sg + tiisg]) : 0u;
+            for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+                const float other_v = simd_shuffle_down(v, offset);
+                const uint  other_i = simd_shuffle_down(i, offset);
+                if (other_v > v) {
+                    v = other_v;
+                    i = other_i;
+                }
+            }
+            if (tiisg == 0) {
+                expert_ids[k] = i;
+                routing_weights[k] = v;
+                shared[i] = -1.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Step 5: renorm + per_expert_scale (single-thread, cheap) ---
+    if (tid == 0) {
+        float topk_sum = 0.0f;
+        for (uint k = 0; k < top_k; k++) {
+            topk_sum += routing_weights[k];
+        }
+        if (topk_sum > 0.0f) {
+            for (uint k = 0; k < top_k; k++) {
+                const uint eid = expert_ids[k];
+                routing_weights[k] = (routing_weights[k] / topk_sum) * per_expert_scale[eid];
+            }
+        } else {
+            for (uint k = 0; k < top_k; k++) {
+                routing_weights[k] = 0.0f;
+            }
+        }
+    }
+}
+
 /// Fused RMS normalization + residual addition + scalar multiply (float32).
 ///
 /// Computes:

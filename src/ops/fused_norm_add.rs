@@ -732,7 +732,18 @@ pub fn dispatch_fused_moe_routing_batch_f32(
         ));
     }
 
-    let pipeline = registry.get_pipeline("fused_moe_routing_batch_f32", device)?;
+    // ADR-029 iter-175 Step 1j: batched-prefill counterpart of the Step 1i
+    // V3 win.  Same parallel SG-tournament top-K replacing the serial scan
+    // (per-token within each TG).  Same HF2Q_FUSED_MOE_ROUTING_V3 env flag
+    // controls both unbatched + batched paths.
+    static CACHED_MOE_ROUTING_V3_BATCH: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let use_v3 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V3_BATCH, "HF2Q_FUSED_MOE_ROUTING_V3");
+    let kernel_name = if use_v3 {
+        "fused_moe_routing_batch_f32_v3"
+    } else {
+        "fused_moe_routing_batch_f32"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let gpu_params = GpuFusedMoeRoutingParams {
         num_experts,
@@ -740,7 +751,14 @@ pub fn dispatch_fused_moe_routing_batch_f32(
     };
 
     let tg_size = std::cmp::min(64, num_experts.next_power_of_two()) as u64;
-    let shared_slots = 2 * num_experts + tg_size as u32;
+    // V1 batch: 2*num_experts + tg_size (tree reduction scratch)
+    // V3 batch: 2*num_experts + 2*n_sg (per-SG val + idx tournament scratch)
+    let n_sg = ((tg_size + 31) / 32) as u32;
+    let shared_slots = if use_v3 {
+        2 * num_experts + 2 * n_sg
+    } else {
+        2 * num_experts + tg_size as u32
+    };
     let shared_mem_bytes = (shared_slots as u64) * 4;
 
     encode_threadgroups_with_args_and_shared(
