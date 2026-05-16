@@ -711,6 +711,99 @@ pub fn build_q6k_id_nr2_m1_record(
     }))
 }
 
+/// ADR-029 iter-175 Step 1e2 — pre-bake the per-weight Q8_0 `_id` (regular,
+/// non-NR2) decode dispatch into a `DispatchRecord`.
+///
+/// The MoE down dispatch in gemma4 APEX-Q5_K_M is Q8_0 → ~30 calls/decode-tok
+/// (1 down dispatch per layer × 30 layers).  Unlike the gate_up path, the
+/// down call site passes `n_tokens = real_top_k, top_k = 1` to
+/// `quantized_matmul_id_ggml` — so the kernel sees `total_rows = real_top_k`
+/// folded into `threadgroups.y`, and `params.ne1 = real_top_k`.  At decode
+/// time `real_top_k` is fixed by model config, so the bake is valid.
+///
+/// Pre-bakes:
+///   - Pipeline reference for `kernel_mul_mv_id_q8_0_f32` (regular variant)
+///   - threadgroups = `(div_ceil(n, 8), real_top_k, 1)`
+///   - threads_per_tg = `(8, 8, 1)` (N_DST=4 × N_SIMDGROUP=2 contract;
+///     2 SGs × 32 threads = 64 threads/TG; 8 rows/TG)
+///   - `GgmlMatvecIdGpuParams` bytes (n_tokens=real_top_k, top_k=1, ne1=real_top_k)
+///   - Binding slot order: weight=0, input=1, output=2, ids=3, params=4
+///
+/// Returns `None` when `HF2Q_Q8_0_ID_MV_NR2` is on — the opt-in NR2 kernel
+/// uses different geometry (threads=(32, 4, 1), align=2, shmem=256 bytes)
+/// and a record baked for the regular layout would be wrong.  Callers MUST
+/// fall through to the unbaked `dispatch_id_mv` path in that case.
+///
+/// Bake-time validation: pipeline lookup must succeed.  Geometry is
+/// hard-coded to the regular Q8_0_ID contract (N_DST=4, N_SIMDGROUP=2,
+/// align=8) — mirrors the kernel `kernel_mul_mv_id_q8_0_f32` constants
+/// at `quantized_matmul_id_ggml.metal:460-462` and the dispatch_id_mv
+/// `(nth0=8, nth1=8, align=8)` branch.
+///
+/// `real_top_k` and `expert_stride` are weight-specific; callers must
+/// pass the same `top_k` value the model config carries (folded into
+/// `params.n_tokens` at the down call site) and the same `expert_stride`
+/// they would have used in `GgmlQuantizedMatmulIdParams`.
+pub fn build_q8_0_id_decode_record(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    n: u32,
+    k: u32,
+    real_top_k: u32,
+    expert_stride: u64,
+) -> Result<Option<DispatchRecord>> {
+    // Only bakeable when the regular (non-NR2) Q8_0_ID kernel is selected.
+    // Mirrors the negation of `dispatch_id_mv`'s `use_q8_0_id_nr2` branch.
+    if cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2") {
+        return Ok(None);
+    }
+
+    // Pipeline lookup — regular `kernel_mul_mv_id_q8_0_f32` takes no
+    // function constants.
+    let pipeline = registry
+        .get_pipeline("kernel_mul_mv_id_q8_0_f32", device)?
+        .clone();
+
+    // `GgmlMatvecIdGpuParams` for the down dispatch: n_tokens=real_top_k,
+    // top_k=1, total_rows = n_tokens * top_k = real_top_k.
+    let gpu_params = GgmlMatvecIdGpuParams {
+        ne00: k as i64,
+        ne01: n as i64,
+        ne02: 1,
+        ne10: k as i64,
+        ne12: 1,
+        ne0: n as i64,
+        ne1: real_top_k as i64,
+        r2: 1,
+        r3: 1,
+        top_k: 1,
+        n_tokens: real_top_k,
+        expert_stride: expert_stride as i64,
+    };
+    let params_bytes = as_bytes(&gpu_params).to_vec();
+
+    // Regular Q8_0_ID: align=8 rows per TG, threads=(8, 8, 1).
+    const ALIGN: u32 = 8;
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(n as usize, ALIGN as usize) as u64,
+        real_top_k as u64,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(8, 8, 1);
+
+    Ok(Some(DispatchRecord {
+        pipeline,
+        threadgroups,
+        threads_per_tg,
+        threadgroup_mem: Vec::new(), // regular Q8_0_ID doesn't use shmem
+        params_bytes,
+        params_slot: 4,
+        buffer_slots: vec![0, 1, 2, 3], // weight, input, output, ids
+        op_kind: CapturedOpKind::Other,
+        kernel_name: "kernel_mul_mv_id_q8_0_f32".to_string(),
+    }))
+}
+
 /// Fused SwiGLU + expert-routed Q4_0 mat-vec.
 ///
 /// Computes `output[r][n] = sum_k(dequant(W_q4_0[ids[r]][n][k]) * (silu(gate[r][k]) * up[r][k]))`
