@@ -13,7 +13,7 @@
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
+use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg, as_bytes};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use std::sync::atomic::AtomicI8;
 
@@ -618,6 +618,97 @@ fn dispatch_id_mv(
     }
 
     Ok(())
+}
+
+/// ADR-029 iter-175 Step 1e — pre-bake the per-weight Q6_K `_id` NR2
+/// `m=1` decode dispatch into a `DispatchRecord`.
+///
+/// The MoE gate_up dispatch in gemma4 APEX-Q5_K_M is Q6_K, hits ~30
+/// calls/decode-tok (1 dispatch per layer, n_tokens=1, total_rows=top_k
+/// folded into `threadgroups.y` per `dispatch_id_mv`'s geometry).  Same
+/// rationale as `quantized_matmul_ggml::build_q6k_nr2_m1_record` — bake
+/// the load-time-immutable parts of the call once at first-dispatch.
+///
+/// Pre-bakes:
+///   - Pipeline reference (skips `KernelRegistry` HashMap lookup per call)
+///   - MTLSize threadgroups + threads_per_tg (skips MTLSize::new + match)
+///   - `GgmlMatvecIdGpuParams` bytes (skips struct construction + bytemuck)
+///   - Binding slot order: weight=0, input=1, output=2, ids=3, params=4
+///
+/// Returns `None` when `HF2Q_Q6K_ID_MV_NR2` is set off — the
+/// non-NR2 kernel uses a different geometry (2 SGs × 1 row/SG = align=2)
+/// and a record baked for the NR2 layout would be wrong.  Callers MUST
+/// fall through to the unbaked `dispatch_id_mv` path in that case.
+///
+/// Bake-time validation: pipeline lookup must succeed.  Threadgroup
+/// geometry is hard-coded to the Q6_K_ID NR2 contract (NSG=2, nr0=2,
+/// align=4 rows/TG, threads=(2, 32, 1)) — mirrors the kernel
+/// `kernel_mul_mv_id_q6_K_f32_nr2`'s `constexpr int NSG = 2; constexpr
+/// int nr0 = 2;` at `quantized_matmul_id_ggml.metal:1025-1026`.
+///
+/// `top_k` and `expert_stride` are weight-specific and folded into the
+/// baked `GgmlMatvecIdGpuParams.ne1 = top_k` (since `n_tokens=1` at
+/// decode) + `expert_stride`.  Callers must pass the same `top_k` and
+/// `expert_stride` they would have used in `GgmlQuantizedMatmulIdParams`.
+pub fn build_q6k_id_nr2_m1_record(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    expert_stride: u64,
+) -> Result<Option<DispatchRecord>> {
+    // Only bakeable when the NR2 variant is the selected one — same
+    // gate as `dispatch_id_mv`'s `use_q6k_id_nr2` branch.
+    if !cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2") {
+        return Ok(None);
+    }
+
+    // Pipeline lookup — `kernel_mul_mv_id_q6_K_f32_nr2` takes no
+    // function constants (unlike the non-_id Q6_K NR2 which carries
+    // 700/701/702 for ne12/r2/r3 promotion).
+    let pipeline = registry
+        .get_pipeline("kernel_mul_mv_id_q6_K_f32_nr2", device)?
+        .clone();
+
+    // GgmlMatvecIdGpuParams for n_tokens=1.  total_rows = 1 * top_k.
+    let gpu_params = GgmlMatvecIdGpuParams {
+        ne00: k as i64,
+        ne01: n as i64,
+        ne02: 1,
+        ne10: k as i64,
+        ne12: 1,
+        ne0: n as i64,
+        ne1: top_k as i64,
+        r2: 1,
+        r3: 1,
+        top_k,
+        n_tokens: 1,
+        expert_stride: expert_stride as i64,
+    };
+    let params_bytes = as_bytes(&gpu_params).to_vec();
+
+    // Q6_K_ID NR2: align=4 rows per TG, threads = (nth0=2, nth1=32, 1)
+    // (matches `dispatch_id_mv`'s Q6_K NR2 branch override).
+    const ALIGN: u32 = 4;
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(n as usize, ALIGN as usize) as u64,
+        top_k as u64,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(2, 32, 1);
+
+    Ok(Some(DispatchRecord {
+        pipeline,
+        threadgroups,
+        threads_per_tg,
+        threadgroup_mem: Vec::new(), // Q6_K_ID NR2 doesn't use shmem
+        params_bytes,
+        params_slot: 4,
+        buffer_slots: vec![0, 1, 2, 3], // weight, input, output, ids
+        op_kind: CapturedOpKind::Other,
+        kernel_name: "kernel_mul_mv_id_q6_K_f32_nr2".to_string(),
+    }))
 }
 
 /// Fused SwiGLU + expert-routed Q4_0 mat-vec.
