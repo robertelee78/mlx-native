@@ -17,7 +17,7 @@ use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg, 
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use std::sync::atomic::AtomicI8;
 
-// ADR-029 iter-175 Step 1an: cached hot-path env-flag gates for dispatch_id_mv.
+// ADR-029: cached hot-path env-flag gates for dispatch_id_mv.
 // Uncached env::var costs ~70 ns/call (H-N microbench); cached AtomicI8 ~2 ns.
 // dispatch_id_mv is called ~150 times/token; 2 env reads × 150 = 300 × 68 ns
 // = 20 µs/tok ≈ 0.2% wall just from these 2 sites.
@@ -80,7 +80,7 @@ impl GgmlType {
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
-            // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL mv_id ports.
+            // ADR-022 Phase 1 —Q5_1 / IQ4_NL mv_id ports.
             GgmlType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
@@ -99,7 +99,7 @@ impl GgmlType {
             // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
             // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32",
-            // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id ported.
+            // ADR-022 Phase 1 —Q5_1 / IQ4_NL mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
@@ -117,7 +117,7 @@ impl GgmlType {
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
             // ADR-013 P16 — Q4_K tensor-API mm_id ported.
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32",
-            // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL tensor-API mm_id ported.
+            // ADR-022 Phase 1 —Q5_1 / IQ4_NL tensor-API mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
@@ -278,9 +278,7 @@ pub fn quantized_matmul_id_ggml(
     //   * top_k values without a map0 instantiation
     //   * K < 32 (mm tile requires NK=32)
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
-    // ADR-022 Phase 2 — Q5_K mm_id ported; the Q5_K bypass at this site
-    // (and at the pooled entry below) was retained until iter-19's port
-    // closed the gap.
+    // ADR-022 Phase 2 — Q5_K mm_id ported.
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
@@ -405,7 +403,7 @@ pub fn quantized_matmul_id_ggml_pooled(
 
     // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
-    // ADR-022 Phase 2 — Q5_K mm_id ported; the previous Q5_K bypass here
+    // ADR-022 Phase 2 — Q5_K mm_id ported.  Previous bypass here
     // is retired (kernels live in id_mm.metal + id_mm_tensor.metal).
     // ADR-022 AC-4: env-gated trace (HF2Q_LOG_MM_ID_ROUTE=1) confirms mm_id
     // engagement on the qwen35 prefill path which goes through this pooled
@@ -483,19 +481,18 @@ fn dispatch_id_mv(
 ) -> Result<()> {
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
 
-    // ADR-028 iter-321 — nr0=2 variant for q6_K _id mat-vec.  Mirrors
-    // iter-309's non-_id work.
+    // ADR-028 —nr0=2 variant for q6_K _id mat-vec.  Mirrors
+    // the non-_id work.
     //
-    // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2).
+    // ADR-028 default-flipped to ON (operator REFRAME #2).
     // Opt out with `HF2Q_Q6K_ID_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
         && cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2");
-    // ADR-029 iter-6 — nr0=2 nsg=4 variant for q8_0 _id mat-vec.
+    // ADR-029 — nr0=2 nsg=4 variant for q8_0 _id mat-vec.
     // Matches peer's N_R0_Q8_0=2 + N_SG_Q8_0=4 in ggml-metal-impl.h:27,40.
     // gemma4 APEX-Q5_K_M MoE down_exps is Q8_0 → 30 dispatches/decode-tok
     // on this path.  Opt-in via `HF2Q_Q8_0_ID_MV_NR2=1`; default-off
-    // until coherence + bench validation.  ADR-029 iter-175 Step 1an:
-    // cached via AtomicI8.
+    // until coherence + bench validation. Cached via AtomicI8.
     let use_q8_0_id_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
         && cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2");
     let kernel_name = if use_q6k_id_nr2 {
@@ -556,10 +553,10 @@ fn dispatch_id_mv(
             )));
         }
     };
-    // ADR-028 iter-321 — nr0=2 doubles rows-per-TG to 4. Same 2 SGs × 32
+    // ADR-028 —nr0=2 doubles rows-per-TG to 4. Same 2 SGs × 32
     // threads, but each SG handles 2 rows so align=4.
     let align = if use_q6k_id_nr2 { 4usize } else { align };
-    // ADR-029 iter-6 — Q8_0 _id NR2 NSG=4: threads_per_tg=(32, 4), align=2
+    // ADR-029 — Q8_0 _id NR2 NSG=4: threads_per_tg=(32, 4), align=2
     // (each TG covers NR0=2 rows; all 4 SGs collaborate on K-dim).
     // Override geometry AFTER the Q4_0/Q8_0/Q5_1/IQ4_NL match arm above.
     let (nth0, nth1, align) = if use_q8_0_id_nr2 {
@@ -586,7 +583,7 @@ fn dispatch_id_mv(
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
     if use_q8_0_id_nr2 {
-        // ADR-029 iter-6: cross-SG reduction needs threadgroup memory:
+        // ADR-029: cross-SG reduction needs threadgroup memory:
         // NR0 * NW * sizeof(float) = 2 * 32 * 4 = 256 bytes.
         let smem_bytes: u64 = 2 * 32 * std::mem::size_of::<f32>() as u64;
         encoder.encode_threadgroups_with_args_and_shared(
@@ -620,7 +617,7 @@ fn dispatch_id_mv(
     Ok(())
 }
 
-/// ADR-029 iter-175 Step 1e — pre-bake the per-weight Q6_K `_id` NR2
+/// ADR-029 — pre-bake the per-weight Q6_K `_id` NR2
 /// `m=1` decode dispatch into a `DispatchRecord`.
 ///
 /// The MoE gate_up dispatch in gemma4 APEX-Q5_K_M is Q6_K, hits ~30
@@ -711,7 +708,7 @@ pub fn build_q6k_id_nr2_m1_record(
     }))
 }
 
-/// ADR-029 iter-175 Step 1e2 — pre-bake the per-weight Q8_0 `_id` (regular,
+/// ADR-029 — pre-bake the per-weight Q8_0 `_id` (regular,
 /// non-NR2) decode dispatch into a `DispatchRecord`.
 ///
 /// The MoE down dispatch in gemma4 APEX-Q5_K_M is Q8_0 → ~30 calls/decode-tok
@@ -1204,7 +1201,7 @@ pub fn dispatch_id_mm_for_test(
     let qk = params.ggml_type.block_values();
 
     // ---- Validate common shapes ----
-    // ADR-013 P16 — Q4_K added. ADR-022 P1.6 — Q5_1 / IQ4_NL added.
+    // ADR-013 P16 — Q4_K added. ADR-022 — Q5_1 / IQ4_NL added.
     // ADR-022 Phase 2 — Q5_K added.
     match params.ggml_type {
         GgmlType::Q4_0
