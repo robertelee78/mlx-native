@@ -10,7 +10,7 @@
 //! - `norms`:
 //!   - D=256: `[num_kv_heads, cache_capacity]` f32 — 1 norm per position (NORMS_PER_POS=1)
 //!   - D=512: `[num_kv_heads, cache_capacity, 2]` f32 — 2 per-block norms per position
-//!     (NORMS_PER_POS=2), per AmesianX cpy-utils.cuh:241-269 (ADR-007 iter-15 per-block norm).
+//!     (NORMS_PER_POS=2), per AmesianX cpy-utils.cuh:241-269 (ADR-007 per-block norm).
 //!
 //! `norms_per_pos(head_dim)` = `head_dim / 256`. Callers must allocate norms buffers
 //! with `num_kv_heads * cache_capacity * norms_per_pos(head_dim)` f32 elements.
@@ -45,10 +45,10 @@ struct HadamardQuantizeParams {
     write_pos: u32,
     cache_capacity: u32,
     is_sliding: u32,
-    /// iter-18 S2B: D=512 per-block scale factor (ablation via HF2Q_SCALE_FORMULA).
+    /// D=512 per-block scale factor (ablation via HF2Q_SCALE_FORMULA).
     /// bare=1.0 (control), sqrt256=16.0, sqrt512≈22.627. D=256 path ignores this.
     scale_factor_d512: f32,
-    /// iter-18 S2A: post-scale RMS probe flag (1=enabled, 0=disabled).
+    /// Post-scale RMS probe flag (1=enabled, 0=disabled).
     rms_probe_enabled: u32,
 }
 
@@ -75,9 +75,9 @@ struct HadamardQuantizeParams {
 /// * `cache_capacity`   — Cache capacity (ring buffer size for sliding, max_seq_len for global).
 /// * `write_pos`        — Write position in cache (the kernel applies modulo for sliding window).
 /// * `is_sliding`       — If `true`, `write_pos` is wrapped modulo `cache_capacity`.
-/// * `scale_factor_d512`— iter-18 S2B: D=512 per-block scale factor (1.0=bare, 16.0=sqrt256,
-///                        22.627=sqrt512). Pass `None` to use 1.0 (bare, iter-16 control).
-/// * `rms_scratch`      — iter-18 S2A: optional scratch buffer for post-scale RMS probe.
+/// * `scale_factor_d512`— D=512 per-block scale factor (1.0=bare, 16.0=sqrt256,
+///                        22.627=sqrt512). Pass `None` to use 1.0 (bare control).
+/// * `rms_scratch`      — Optional scratch buffer for post-scale RMS probe.
 ///                        Layout: `[num_kv_heads, norms_per_pos, 16]` f32.  Pass `None` to disable.
 ///
 /// # Errors
@@ -420,7 +420,7 @@ pub fn dispatch_hadamard_quantize_kv_seq(
 }
 
 // ============================================================================
-// ADR-028 iter-485 (Phase 7d / H4): fused K+V single-position 4-bit dispatch.
+// ADR-028 (Phase 7d / H4): fused K+V single-position 4-bit dispatch.
 // ============================================================================
 
 /// Dispatch the fused 4-bit Hadamard-quantize KV kernel.
@@ -560,7 +560,7 @@ pub fn dispatch_hadamard_quantize_kv_fast_dual(
 }
 
 // ============================================================================
-// Track B (iter-21): higher-bit dispatch (5-bit or 6-bit, byte-packed).
+// Track B: higher-bit dispatch (5-bit or 6-bit, byte-packed).
 // ============================================================================
 
 /// GPU-side params for the higher-bit quantize kernel.
@@ -580,7 +580,7 @@ struct HadamardQuantizeHbParams {
 ///
 /// Same pipeline as 4-bit (FWHT + norm) but writes 1 byte per element
 /// (byte-packed) using 5-bit (32 centroids), 6-bit (64 centroids), or
-/// 8-bit (256 centroids) codebook. (iter-24 adds 8-bit support)
+/// 8-bit (256 centroids) codebook.
 ///
 /// * `packed` must be `[num_kv_heads, cache_capacity, head_dim]` u8 (byte-packed).
 /// * `norms` layout is identical to 4-bit path.
@@ -643,7 +643,7 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     Ok(())
 }
 
-/// ADR-028 Phase 10e.5 (iter-351): no-FWHT V quantize for the hybrid path.
+/// ADR-028 Phase 10e.5: no-FWHT V quantize for the hybrid path.
 ///
 /// Same byte-packed Lloyd-Max output (5/6/8-bit) and same norm storage layout
 /// as `dispatch_hadamard_quantize_kv_hb`, but skips the Hadamard rotation so
@@ -716,7 +716,7 @@ pub fn dispatch_kv_quantize_v_no_fwht(
     Ok(())
 }
 
-/// ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy + V-no-FWHT-encode for the
+/// ADR-028 Phase 10c.5: fused F16-K-copy + V-no-FWHT-encode for the
 /// hybrid path.
 ///
 /// Combines the two hf2q hybrid-path decode dispatches into a single dispatch
@@ -730,7 +730,7 @@ pub fn dispatch_kv_quantize_v_no_fwht(
 ///
 /// Saves one Apple Metal kernel-launch floor (~14 µs) per layer per decode
 /// token.  At gemma4 30L: drops 60 → 30 KV-write dispatches/decode-token,
-/// expected ~+1% decode (per iter-351 measurement of dispatch-floor savings).
+/// expected ~+1% decode (measured dispatch-floor savings).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_kv_copy_kf16_quantize_v_no_fwht(
     encoder: &mut CommandEncoder,
@@ -803,7 +803,7 @@ pub fn dispatch_kv_copy_kf16_quantize_v_no_fwht(
     Ok(())
 }
 
-/// ADR-028 iter-148: fused K+V single-position Hadamard-quantize KV HB encoder.
+/// ADR-028: fused K+V single-position Hadamard-quantize KV HB encoder.
 ///
 /// Combines two `dispatch_hadamard_quantize_kv_hb` calls (one for K, one for V)
 /// into a single dispatch via grid Z-dim. Saves one Apple Metal kernel-launch
@@ -877,7 +877,7 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
     Ok(())
 }
 
-/// ADR-027 Phase B iter-14 — multi-token Hadamard-quantize KV (HB) dispatch.
+/// ADR-027 Phase B — multi-token Hadamard-quantize KV (HB) dispatch.
 ///
 /// Mirrors `dispatch_hadamard_quantize_kv_seq` (4-bit) but writes 1 byte
 /// per element via the 5/6/8-bit codebook used by `flash_attn_vec_tq_hb`.
@@ -886,7 +886,7 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
 /// values (via `KernelArg::BufferWithOffset`).
 ///
 /// Used by qwen35's prefill TQ encode loop in `gpu_full_attn::full_attn_
-/// layer_gpu` (ADR-027 Phase B iter-15) to populate `FullAttnKvSlot.tq`
+/// layer_gpu` (ADR-027 Phase B) to populate `FullAttnKvSlot.tq`
 /// at all prefill positions before the first decode SDPA reads them.
 ///
 /// # Arguments
@@ -918,7 +918,7 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
 /// (mirrors the 4-bit `_seq` rationale). Promote to a 2-D dispatch
 /// shader if measured to be the bottleneck.
 #[allow(clippy::too_many_arguments)]
-/// ADR-028 Phase 10e.5 (iter-351): no-FWHT V seq variant for batched prefill.
+/// ADR-028 Phase 10e.5: no-FWHT V seq variant for batched prefill.
 ///
 /// Dispatches `kv_quantize_v_no_fwht_d{256,512}` once per token in `[write_pos_start
 /// .. write_pos_start+n_tokens)` from `src + src_tok_offset` rows.  Mirrors
