@@ -834,7 +834,7 @@ impl CommandEncoder {
     /// [`ResidencySet::flush_pending`](ResidencySet::flush_pending) before
     /// submitting the Metal command buffer. This converts the
     /// per-allocation `[set commit]` storm
-    /// (~880 commits/decode-token in iter8d/8e claude+codex variants) into
+    /// (~880 commits/decode-token in iter8d/8e) into
     /// at most one commit per CB submission — mirrors llama.cpp's
     /// `ggml-metal-device.m:1378-1382` pattern (batch addAllocation in
     /// loop, commit ONCE).
@@ -1159,7 +1159,6 @@ impl CommandEncoder {
             });
             return;
         }
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: encoder_ptr aliases &self via active_encoder which we
@@ -1205,7 +1204,6 @@ impl CommandEncoder {
             });
             return;
         }
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
@@ -1260,7 +1258,6 @@ impl CommandEncoder {
             });
             return;
         }
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
@@ -1306,7 +1303,6 @@ impl CommandEncoder {
             });
             return;
         }
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
@@ -1347,7 +1343,6 @@ impl CommandEncoder {
             });
             return;
         }
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
@@ -1389,7 +1384,6 @@ impl CommandEncoder {
             });
             return;
         }
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
@@ -1745,7 +1739,6 @@ impl CommandEncoder {
             return;
         }
 
-        // ADR-015 iter63: per-dispatch sampling (no-op when env unset).
         self.ensure_sample_buffer();
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above — encoder reference outlives this scope

@@ -1,6 +1,5 @@
 //! Flash attention vector kernel — verbatim peer port (f16-K + f16-V, DK=DV=256).
 //!
-//! ADR-029 CFA cfa-20260512-fa-peer-port (iter-122).
 //! Ports llama.cpp's `kernel_flash_attn_ext_vec` body verbatim for the
 //! NWG=1, NSG=1, NE=1, DK=DV=256, f16-K/f16-V instantiation targeting
 //! gemma4 sliding decode.

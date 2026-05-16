@@ -171,9 +171,6 @@ impl MlxDevice {
         // logits → argmax → divergent generations across cold runs.
         // The cost is one memset per allocation; on workloads dominated by
         // weight-load (one-time) and kvcache (one-time), this is negligible.
-        // Per `feedback_no_broken_windows` + mantra "No fallback. No stub.
-        // Just pure excellence." — fix at the source.
-        //
         // Safety: `metal_buf.contents()` is non-null (verified above), points
         // to exactly `byte_len` bytes of `StorageModeShared` memory we just
         // allocated and have exclusive access to (no other thread or GPU

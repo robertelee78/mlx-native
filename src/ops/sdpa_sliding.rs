@@ -9,8 +9,7 @@
 //!
 //! # Status (2026-04-25): broken at prefill shapes — repair-or-remove TBD
 //!
-//! TODO(2026-04-25): remove or repair — see audit
-//! `cfa-20260425-fix-audit-findings`.
+//! TODO(2026-04-25): remove or repair.
 //!
 //! At prefill seq_len `S < window_size` this kernel should be mathematically
 //! identical to plain [`sdpa`](super::sdpa) (every position is within the

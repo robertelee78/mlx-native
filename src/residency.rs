@@ -44,7 +44,7 @@ enum ResidencySetInner {
         /// single `[set commit]` iff this flag was set, then clears it.
         ///
         /// This converts the per-allocation commit storm
-        /// (~880 commits/token in iter8d/8e claude+codex variants) into one
+        /// (~880 commits/token in iter8d/8e) into one
         /// commit per CB-submission boundary — mirrors llama.cpp's
         /// `ggml-metal-device.m:1378-1382` (batch addAllocation in loop,
         /// commit ONCE at the end of the batch).

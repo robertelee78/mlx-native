@@ -58,7 +58,7 @@ pub struct MlxBuffer {
 /// the residency set's pending flag but does NOT call `[set commit]`. The
 /// commit is flushed at the next [`CommandEncoder::commit*`] boundary via
 /// [`ResidencySet::flush_pending`]. This collapses the per-allocation commit
-/// storm (~880 commits/decode-token in iter8d/8e claude+codex variants) into
+/// storm (~880 commits/decode-token in iter8d/8e) into
 /// at most one commit per CB submission.
 pub(crate) struct MlxBufferStorage {
     inner: MetalBuffer,

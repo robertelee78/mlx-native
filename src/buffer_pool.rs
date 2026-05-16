@@ -178,9 +178,7 @@ impl MlxBufferPool {
                 // Cost: one memset per fresh allocation. Reused buffers (the
                 // steady-state hot path after warm-up) skip this entirely
                 // because their bytes are valid producer outputs from prior
-                // pool cycles. Per `feedback_no_broken_windows` + mantra
-                // "No fallback. No stub. Just pure excellence." — fix at the
-                // source.
+                // pool cycles.
                 //
                 // Safety: `raw.contents()` is non-null (verified above), points
                 // to exactly `bucket` bytes of `StorageModeShared` memory we
