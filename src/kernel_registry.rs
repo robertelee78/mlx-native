@@ -5,7 +5,7 @@
 //! extracted, and a `ComputePipelineState` is created and cached.  Subsequent
 //! calls return the cached pipeline.
 //!
-//! ## ADR-029 iter-175 Step 1l: precompiled `.metallib` fast path
+//! ## Precompiled `.metallib` fast path
 //!
 //! `build.rs` runs `xcrun metal -O3` on every `.metal` file under
 //! `src/shaders/` and links the results into a single `default.metallib`
@@ -18,11 +18,7 @@
 //! missing, empty embedded blob, load error) the code transparently falls
 //! back to the original source-compile path — byte-identical behavior.
 //!
-//! Empirical motivation (iter 1k test
-//! `tests/iter175_h_e_metallib_perf.rs`): on M5 Max at the gemma4 Q_sliding
-//! decode shape, precompiled is **+5.89% faster** than runtime-source
-//! (median 18.35 µs vs 19.49 µs) with a tighter p90 (19.54 vs 70.11) —
-//! Apple's runtime compile chain has occasional jitter outliers.
+//! Default-ON; precompiled gives ~+6% on gemma4 Q-sliding decode (M5 Max).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -37,20 +33,9 @@ use crate::error::{MlxError, Result};
 const EMBEDDED_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/default.metallib"));
 
 /// Returns `true` when the precompiled `.metallib` fast path is enabled
-/// (default-ON since Step 1m validation).  Set `MLX_PRECOMPILED_METALLIB=0`
-/// (or `false`, `off`) to opt out — useful for diagnosing kernel-compile
-/// regressions or A/B benching.
-///
-/// Step 1m multi-regime validation at HEAD (gemma4-APEX-Q5_K_M, M5 Max):
-/// - tg100 alt-pair 2-cycle: decode 95.5 → 95.9 t/s (+0.42%), prefill
-///   179 → 185 t/s (+3.3%)
-/// - tg2000 alt-pair 1-cycle: decode 93.1 → 92.8 t/s (−0.32%, within σ),
-///   prefill 171 → 178.5 t/s (+4.4%)
-/// - coherence_smoke: 2/2 PASS both configs
-///
-/// The Step 1l initial smoke (`tg50 95.4 → 62.1`) did NOT reproduce on
-/// rebuild — most likely a cold-PSO-cache or first-run-of-rebuilt-binary
-/// artifact rather than a real perf regression.
+/// (default-ON).  Set `MLX_PRECOMPILED_METALLIB=0` (or `false`, `off`)
+/// to opt out — useful for diagnosing kernel-compile regressions or
+/// A/B benching.
 fn precompiled_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -64,7 +49,7 @@ fn precompiled_enabled() -> bool {
 /// Returns `true` when the precompiled `.metallib` is consulted for
 /// `get_pipeline_with_constants` (FCV-specialized) kernels.  Inherits
 /// the master gate [`precompiled_enabled`]; both must be ON for the
-/// FCV path to use precompiled.  Default-ON since Step 1m validation.
+/// FCV path to use precompiled.  Default-ON.
 fn precompiled_fcv_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -104,7 +89,7 @@ pub struct KernelRegistry {
     ///
     /// Populated at construction time with all embedded shader sources.
     sources: HashMap<String, &'static str>,
-    /// ADR-029 iter-175 Step 1l: precompiled `default.metallib` (lazy).
+    /// Precompiled `default.metallib` (lazy).
     ///
     /// `None` initially.  On first `get_pipeline*` call under
     /// `MLX_PRECOMPILED_METALLIB=1`, populated via
@@ -1032,7 +1017,7 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_hybrid_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_dk512".into(), hybrid_src);
 
-        // ADR-029 CFA cfa-20260512-fa-peer-port (iter-122): verbatim llama.cpp peer port.
+        // ADR-029: verbatim llama.cpp peer port.
         // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.
         let peer_port_src: &'static str = include_str!("shaders/flash_attn_vec_peer_port_f16.metal");
         sources.insert("flash_attn_vec_peer_port_f16_dk256_dv256".into(), peer_port_src);
