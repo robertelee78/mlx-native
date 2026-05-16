@@ -513,14 +513,14 @@ pub fn dispatch_mm_v2_f16(
         _pad1: 0,
     };
 
+    // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
     let pipeline = registry
         .get_pipeline_with_constants(
             "hf2q_mul_mm_tensor_v2_f16",
             device.metal_device(),
             &[],
             &[(700, 1), (701, 1), (702, 1)],
-        )?
-        .clone();
+        )?;
 
     const THREADS_PER_TG: u64 = 128;
     let nra: u64 = 64;  // M_peer tile
@@ -770,14 +770,14 @@ fn dispatch_mm(
     } else {
         params.ggml_type.mm_kernel_name()
     };
+    // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
     let pipeline = registry
         .get_pipeline_with_constants(
             kernel_name,
             device.metal_device(),
             &[],
             &[(700, 1), (701, 1), (702, 1)],
-        )?
-        .clone();
+        )?;
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -999,14 +999,14 @@ pub fn quantized_matmul_mm_tensor_perm021(
         )));
     }
 
+    // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
     let pipeline = registry
         .get_pipeline_with_constants(
             kernel_name,
             device.metal_device(),
             &[],
             &[(700, 1), (701, 1), (702, 1)],
-        )?
-        .clone();
+        )?;
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -1132,8 +1132,8 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
             device.metal_device(),
             &[],
             &[(700, 1), (701, 1), (702, 1)],
-        )?
-        .clone();
+        )?;
+        // ADR-029 iter-175 Step 1bb: removed redundant .clone() (matches Step 1ba pattern).
 
     // nb01 = bytes per F16 weight row = k * sizeof(half)
     let nb01: u64 = (params.k as u64) * 2;
