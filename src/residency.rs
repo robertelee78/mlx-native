@@ -37,7 +37,7 @@ enum ResidencySetInner {
     Active {
         object: ObjcResidencySet,
         lock: Mutex<()>,
-        /// ADR-015 iter8e (Phase 3b): defer-and-flush pending flag.
+        /// ADR-015: defer-and-flush pending flag.
         ///
         /// `add_allocation` / `remove_allocation` set this to `true` instead
         /// of calling `[set commit]` per-call. `flush_pending` issues a
