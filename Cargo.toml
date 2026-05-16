@@ -118,5 +118,9 @@ name = "bench_dispatch_overhead"
 harness = false
 
 [[bench]]
+name = "bench_encoder_pattern_compare"
+harness = false
+
+[[bench]]
 name = "bench_sdpa_kv_dtype_compare"
 harness = false
