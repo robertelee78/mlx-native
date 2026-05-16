@@ -212,7 +212,7 @@ impl ComputeGraph {
                     op_kind,
                     ..
                 } => {
-                    // ADR-015 iter63 (Phase A.3): forward captured op_kind
+                    // ADR-015: forward captured op_kind
                     // into replay_dispatch via pending_op_kind so the
                     // per-dispatch profile entries from a recorded graph
                     // (GraphExecutor::begin_recorded path) are tagged with
@@ -267,7 +267,7 @@ impl ComputeGraph {
                     if has_ranges {
                         tracker.add(reads, writes);
                     }
-                    // ADR-015 iter63 (Phase A.3): see encode_sequential note.
+                    // ADR-015: see encode_sequential note.
                     encoder.set_op_kind(*op_kind);
                     encoder.replay_dispatch(
                         pipeline,
@@ -768,7 +768,7 @@ fn encode_chunk_with_barriers(nodes: &[CapturedNode], encoder: &mut CommandEncod
                 if has_ranges {
                     tracker.add(reads, writes);
                 }
-                // ADR-015 iter63 (Phase A.3): forward captured op_kind so the
+                // ADR-015: forward captured op_kind so the
                 // per-dispatch profile dump groups dual-buffer chunked replay
                 // entries by the same op_kind label as direct dispatch.
                 encoder.set_op_kind(*op_kind);
@@ -876,7 +876,7 @@ impl GraphExecutor {
     /// [`GraphSession::finish`] to commit and wait.
     pub fn begin(&self) -> Result<GraphSession<'_>> {
         let encoder = self.device.command_encoder()?;
-        // ADR-015 iter63 (Phase B): start a programmatic capture if
+        // ADR-015: start a programmatic capture if
         // MLX_METAL_CAPTURE+METAL_CAPTURE_ENABLED are set.  No-op when
         // unset; one-shot per process so subsequent forward passes do
         // not pay the env-check cost more than once.
@@ -913,7 +913,7 @@ impl GraphExecutor {
     pub fn begin_recorded(&self) -> Result<GraphSession<'_>> {
         let mut encoder = self.device.command_encoder()?;
         encoder.start_capture();
-        // ADR-015 iter63 (Phase B): see GraphExecutor::begin().
+        // ADR-015: see GraphExecutor::begin().
         let metal_capture = {
             let mut c = crate::metal_capture::MetalCapture::from_env(&self.device);
             if let Some(ref mut cap) = c {
@@ -1037,7 +1037,7 @@ pub struct GraphSession<'a> {
     group_sizes: [u32; 8],
     /// Whether this session was created in capture/record mode.
     recording: bool,
-    /// ADR-015 iter63 (Phase B): optional Metal frame capture wrapping
+    /// ADR-015: optional Metal frame capture wrapping
     /// this session's GPU work.  Populated by `MetalCapture::from_env`
     /// when `MLX_METAL_CAPTURE=<path>` + `METAL_CAPTURE_ENABLED=1` are
     /// both set in the process env AND the process-global one-shot
@@ -1647,7 +1647,7 @@ impl<'a> GraphSession<'a> {
             }
         }
         self.encoder.commit();
-        // ADR-015 iter63 (Phase B): close the capture window AFTER
+        // ADR-015: close the capture window AFTER
         // commit (so the CB is recorded inside the trace) but BEFORE
         // returning the encoder (so the trace finalizes promptly).
         // `MTLCaptureManager.stopCapture` marks the recording
@@ -1763,7 +1763,7 @@ impl<'a> GraphSession<'a> {
     ///
     /// Consumes the session.  Returns `(encoder, fusions_applied)`.
     ///
-    /// ADR-029 iter-39 H40 — first step of graph_opt port to prefill.
+    /// ADR-029: first step of graph_opt port to prefill.
     pub fn commit_with_fusion(
         mut self,
         registry: &mut KernelRegistry,
