@@ -869,11 +869,24 @@ kernel void fused_moe_routing_f32_v3(
                 my_idx = i;
             }
         }
-        // SG-level tournament max-with-index
+        // SG-level tournament max-with-LOWEST-index-on-tie.
+        //
+        // Step 1i.2 (this commit): two fixes vs original V3
+        //   (a) lex-on-tie: `if (other_v > my_val || (other_v == my_val &&
+        //       other_i < my_idx))` — matches V2's "lowest-idx-on-tie"
+        //       from serial scan from i=0.
+        //   (b) OOR shuffle guard: `simd_shuffle_down(x, offset)` from lane
+        //       L reads lane L+offset.  When L+offset >= 32 the result is
+        //       UNDEFINED per Apple Metal spec.  Without guarding, garbage
+        //       propagates through subsequent reduction steps (lane 16's
+        //       OOR-garbage at offset=16 reaches lane 0 at offset=4 etc.).
+        //       Explicit `valid = (tiisg + offset) < 32u` filter protects
+        //       against this.
         for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
             const float other_v = simd_shuffle_down(my_val, offset);
             const uint  other_i = simd_shuffle_down(my_idx, offset);
-            if (other_v > my_val) {
+            const bool valid = ((ushort)tiisg + offset) < 32u;
+            if (valid && (other_v > my_val || (other_v == my_val && other_i < my_idx))) {
                 my_val = other_v;
                 my_idx = other_i;
             }
@@ -885,14 +898,17 @@ kernel void fused_moe_routing_f32_v3(
             shared[2u * num_experts + n_sg + sgitg] = as_type<float>(my_idx);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // SG0 cross-SG tournament.
+        // SG0 cross-SG tournament with same OOR-guarded lex-on-tie semantics.
         if (sgitg == 0) {
             float v = (tiisg < n_sg) ? shared[2u * num_experts + tiisg] : -1.0f;
-            uint  i = (tiisg < n_sg) ? as_type<uint>(shared[2u * num_experts + n_sg + tiisg]) : 0u;
+            uint  i = (tiisg < n_sg)
+                ? as_type<uint>(shared[2u * num_experts + n_sg + tiisg])
+                : 0xFFFFFFFFu;
             for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
                 const float other_v = simd_shuffle_down(v, offset);
                 const uint  other_i = simd_shuffle_down(i, offset);
-                if (other_v > v) {
+                const bool valid = ((ushort)tiisg + offset) < 32u;
+                if (valid && (other_v > v || (other_v == v && other_i < i))) {
                     v = other_v;
                     i = other_i;
                 }
@@ -1119,6 +1135,8 @@ kernel void fused_moe_routing_batch_f32_v3(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Step 4 V3: PARALLEL top-K selection via SG-tournament reduce ---
+    // Lex-on-tie semantics matching unbatched V3 (Step 1i.1) — restores
+    // V3 ≡ V2 byte-identical output for production decode.
     for (uint k = 0; k < top_k; k++) {
         float my_val = -1.0f;
         uint  my_idx = 0u;
@@ -1129,11 +1147,12 @@ kernel void fused_moe_routing_batch_f32_v3(
                 my_idx = i;
             }
         }
-        // SG-level tournament max-with-index
+        // SG-level tournament: OOR-guarded lex-on-tie (Step 1i.2 fix).
         for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
             const float other_v = simd_shuffle_down(my_val, offset);
             const uint  other_i = simd_shuffle_down(my_idx, offset);
-            if (other_v > my_val) {
+            const bool valid = ((ushort)tiisg + offset) < 32u;
+            if (valid && (other_v > my_val || (other_v == my_val && other_i < my_idx))) {
                 my_val = other_v;
                 my_idx = other_i;
             }
@@ -1144,14 +1163,17 @@ kernel void fused_moe_routing_batch_f32_v3(
             shared[2u * num_experts + n_sg + sgitg] = as_type<float>(my_idx);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // SG0 cross-SG tournament.
+        // SG0 cross-SG tournament with same OOR-guarded lex-on-tie semantics.
         if (sgitg == 0) {
             float v = (tiisg < n_sg) ? shared[2u * num_experts + tiisg] : -1.0f;
-            uint  i = (tiisg < n_sg) ? as_type<uint>(shared[2u * num_experts + n_sg + tiisg]) : 0u;
+            uint  i = (tiisg < n_sg)
+                ? as_type<uint>(shared[2u * num_experts + n_sg + tiisg])
+                : 0xFFFFFFFFu;
             for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
                 const float other_v = simd_shuffle_down(v, offset);
                 const uint  other_i = simd_shuffle_down(i, offset);
-                if (other_v > v) {
+                const bool valid = ((ushort)tiisg + offset) < 32u;
+                if (valid && (other_v > v || (other_v == v && other_i < i))) {
                     v = other_v;
                     i = other_i;
                 }
