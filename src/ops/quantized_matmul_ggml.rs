@@ -634,14 +634,17 @@ fn dispatch_mv(
     // (current mlx-native usage is always single-batch); compiler folds
     // `im % 1 → 0` and `i12 / 1 → i12` at PSO compile, eliminating
     // ~3 expensive integer divisions per thread per dispatch.
+    // ADR-029 iter-175 Step 1ba: removed redundant .clone() — registry is not
+    // accessed again after pipeline lookup, so we can hold the &ComputePipelineState
+    // reference across the rest of the function. Saves one objc retain/release
+    // pair per dispatch.
     let pipeline = registry
         .get_pipeline_with_constants(
             kernel_name,
             device.metal_device(),
             &[],
             &[(700, 1), (701, 1), (702, 1)],
-        )?
-        .clone();
+        )?;
 
     let gpu_params = GgmlMatvecGpuParams {
         ne00: params.k as i64,
