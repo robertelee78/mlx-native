@@ -13,7 +13,7 @@ use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord};
 use crate::env_flags::cached_env_default_true;
 use std::sync::atomic::AtomicI8;
 
-// ADR-029 iter-175 Step 1ao: cached hot-path env-flag gates for rms_norm
+// ADR-029: cached hot-path env-flag gates for rms_norm
 // dispatchers. rms_norm is called multiple times per layer (attn_norm,
 // ffn_norm, post-attn-norm, post-ffn-norm, final norm) — many hits per token.
 static CACHED_RMS_NORM_V2: AtomicI8 = AtomicI8::new(-1);
@@ -104,7 +104,7 @@ pub fn dispatch_rms_norm(
         )));
     }
 
-    // hf2q ADR-030 iter-110 — defense-in-depth: kernel selection below
+    // hf2q ADR-030 — defense-in-depth: kernel selection below
     // gates on input.dtype() ONLY, and each rms_norm_{f32,f16,bf16}
     // Metal kernel declares its weight buffer with the matching dtype
     // (`device const float*`, `half*`, or `bfloat*`).  Passing a weight
@@ -136,10 +136,10 @@ pub fn dispatch_rms_norm(
         )));
     }
 
-    // ADR-028 iter-310 — float4 + simd_sum variant for F32 path.
+    // ADR-028 —float4 + simd_sum variant for F32 path.
     // Requires `dim % 4 == 0`; falls back to scalar when not.
     //
-    // ADR-028 iter-326 default-flipped to ON (operator REFRAME #2).
+    // ADR-028 default-flipped to ON (operator REFRAME #2).
     // Opt out with `HF2Q_RMS_NORM_V2=0` / `=false` / `=off`.
     let use_v2 = matches!(input.dtype(), DType::F32)
         && (dim % 4 == 0)
@@ -207,7 +207,7 @@ pub fn dispatch_rms_norm(
     Ok(())
 }
 
-/// ADR-029 iter-175 Step 1f — pre-bake the per-(dtype, rows, dim)
+/// ADR-029 — pre-bake the per-(dtype, rows, dim)
 /// `dispatch_rms_norm` dispatch into a `DispatchRecord`.
 ///
 /// Mirrors `dispatch_rms_norm`'s exact kernel-selection + geometry +
@@ -505,7 +505,7 @@ pub fn dispatch_fused_post_attn_triple_norm_f32(
         }
     }
 
-    // ADR-028 iter-370: V2 (float4 + simd_sum) variant when dim % 4 == 0.
+    // ADR-028: V2 (float4 + simd_sum) variant when dim % 4 == 0.
     // Default-OFF; opt-in via HF2Q_FUSED_TRIPLE_NORM_V2=1.  V1 was iter-186
     // (regressed -1.0% on decode); V2 saves 12 barriers/dispatch.
     let use_v2 = (dim % 4 == 0)
@@ -557,7 +557,7 @@ pub fn dispatch_fused_post_attn_triple_norm_f32(
     Ok(())
 }
 
-/// ADR-028 iter-218 — Dispatch fused post-FF norm 2 + end-of-layer FINAL.
+/// ADR-028 — Dispatch fused post-FF norm 2 + end-of-layer FINAL.
 ///
 /// Fuses the gemma4 layer-end pair into a single kernel:
 ///   (a) mlp_down = attn_out + norm(moe_accum, w2)
@@ -642,7 +642,7 @@ pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
         )));
     }
 
-    // ADR-028 iter-362: V2 path (float4 + simd_sum) — same math, 75% fewer
+    // ADR-028: V2 path (float4 + simd_sum) — same math, 75% fewer
     // barriers per dispatch (4 vs 16 at tg=256).  Requires `dim % 4 == 0`
     // (gemma4 hidden=3584 ✓).  Default-ON since parity-tested byte-identical
     // (max_abs=0, max_rel=0 at gemma4 hidden_dim across both scalar_is_vector
@@ -704,7 +704,7 @@ pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
     Ok(())
 }
 
-/// Dispatch the iter-367 fully-fused MoE-wsum + Path A end-of-layer kernel.
+/// Dispatch the fully-fused MoE-wsum + Path A end-of-layer kernel.
 ///
 /// Replaces the dispatch chain:
 ///   1. moe_weighted_sum: moe_down_id_out × routing_weights → moe_accum
@@ -905,7 +905,7 @@ pub fn dispatch_rms_norm_no_scale_bf16(
         )));
     }
 
-    // hf2q ADR-030 iter-112 — defense-in-depth dtype check.  This
+    // hf2q ADR-030 —defense-in-depth dtype check.  This
     // dispatcher hardcodes the BF16 kernel; passing F32 buffers would
     // mis-stride reads/writes.
     if input.dtype() != DType::BF16 {
@@ -998,7 +998,7 @@ pub fn dispatch_rms_norm_no_scale_f32(
         )));
     }
 
-    // hf2q ADR-030 iter-112 — defense-in-depth dtype check.  This
+    // hf2q ADR-030 —defense-in-depth dtype check.  This
     // dispatcher hardcodes the F32 kernel; passing BF16/F16 buffers
     // would mis-stride reads/writes.
     if input.dtype() != DType::F32 {
@@ -1014,7 +1014,7 @@ pub fn dispatch_rms_norm_no_scale_f32(
         )));
     }
 
-    // ADR-028 iter-310 — float4 + simd_sum variant.  Default-ON since
+    // ADR-028 —float4 + simd_sum variant.  Default-ON since
     // iter-326 (operator REFRAME #2).  Opt out with
     // `HF2Q_RMS_NORM_V2=0` / `=false` / `=off`.
     let use_v2 = (dim % 4 == 0) && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2");
@@ -1106,7 +1106,7 @@ pub fn dispatch_rms_norm_mul(
         )));
     }
 
-    // hf2q ADR-030 iter-112 — defense-in-depth dtype-coherence check.
+    // hf2q ADR-030 —defense-in-depth dtype-coherence check.
     // fused_rms_norm_mul_{f32,bf16} kernels declare norm_weight, scale,
     // and output at the input-dtype stride.  Mismatched buffers would
     // silently mis-stride (iter-106 signature).  Same pattern as the
