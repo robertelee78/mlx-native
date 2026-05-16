@@ -1086,47 +1086,61 @@ kernel void fused_moe_routing_batch_f32_v3(
     device uint*        expert_ids      = expert_ids_all   + tok_id * top_k;
     device float*       routing_weights = routing_weights_all + tok_id * top_k;
 
-    // --- Step 1: find max via simd_max + cross-SG reduce ---
+    // ADR-029 iter-175 Step 1j.2: SOFTMAX REDUCTION ORDER FIX.
+    //
+    // Step 1j originally used simd_max/simd_sum (matching unbatched V3).
+    // BUT the unbatched V3 falls back to V2 when V3 is off; V2 unbatched
+    // ALSO uses simd-reduce.  So unbatched V3 ≡ V2 byte-identical.
+    //
+    // Batched is DIFFERENT: when V3 is off, the BATCHED dispatcher falls
+    // back to V1 (`fused_moe_routing_batch_f32`) — there is no V2 batched.
+    // V1 batched uses TREE-REDUCE (scalar shmem reductions over tg_size).
+    //
+    // Different reduction order → different f32 rounding → softmax probs
+    // differ at ULP scale.  At top-K boundary, this swaps which experts
+    // get picked → different routing → cascading divergent decode.
+    //
+    // Production diagnosis (this iteration): test rig with
+    //   HF2Q_BATCHED_PREFILL=0 forces unbatched prefill (uses unbatched V3).
+    //   Result: V3-default ≡ V2-default BYTE-IDENTICAL output.
+    //   Confirms divergence is from batched kernel, NOT decode kernel.
+    //
+    // Fix: switch V3 batched softmax to tree-reduce, matching V1 batched.
+    // V3 batched still wins via PARALLEL top-K (Step 4 unchanged).
+    // V3 batched softmax+top-K ≡ V1 batched softmax+top-K at f32 level.
+
+    // --- Step 1: find max via TREE-REDUCE (matches V1 batched) ---
     float local_max = -INFINITY;
     for (uint i = tid; i < num_experts; i += tg_size) {
         local_max = max(local_max, logits[i]);
     }
-    local_max = simd_max(local_max);
-    if (tiisg == 0) {
-        shared[num_experts + sgitg] = local_max;
-    }
+    shared[tid] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgitg == 0) {
-        const float v = (tiisg < n_sg) ? shared[num_experts + tiisg] : -INFINITY;
-        const float total = simd_max(v);
-        if (tiisg == 0) {
-            shared[num_experts + 0] = total;
-        }
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] = max(shared[tid], shared[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    const float max_val = shared[0];
+    // Additional barrier (matches V1 batched) — prevents subsequent
+    // shared[tid] = local_sum from clobbering shared[0] before all
+    // simdgroups read max_val.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float max_val = shared[num_experts + 0];
 
-    // --- Step 2: exp(x - max) and sum via simd_sum + cross-SG reduce ---
+    // --- Step 2: exp(x - max) and sum via TREE-REDUCE (matches V1 batched) ---
     float local_sum = 0.0f;
     for (uint i = tid; i < num_experts; i += tg_size) {
         const float e = exp(logits[i] - max_val);
         shared[num_experts + i] = e;
         local_sum += e;
     }
-    local_sum = simd_sum(local_sum);
-    if (tiisg == 0) {
-        shared[2u * num_experts + sgitg] = local_sum;
-    }
+    shared[tid] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgitg == 0) {
-        const float v = (tiisg < n_sg) ? shared[2u * num_experts + tiisg] : 0.0f;
-        const float total = simd_sum(v);
-        if (tiisg == 0) {
-            shared[2u * num_experts + 0] = total;
-        }
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    const float sum_exp = shared[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float sum_exp = shared[2u * num_experts + 0];
 
     // --- Step 3: write softmax probabilities to shared[0..num_experts) ---
     for (uint i = tid; i < num_experts; i += tg_size) {
