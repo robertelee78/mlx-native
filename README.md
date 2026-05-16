@@ -19,12 +19,13 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 ### What we do that candle's Metal backend doesn't
 
-- **One `ComputeCommandEncoder` per forward pass** (`GraphExecutor` / `GraphSession`) — candle acquires an encoder per op and pools ~50 per command buffer
+- **One `MTLCommandBuffer` + one `ComputeCommandEncoder` per forward pass** (`GraphExecutor` / `GraphSession`) — candle's Metal backend defaults to flushing into a fresh command buffer every 50 dispatches (`CANDLE_METAL_COMPUTE_PER_BUFFER`, verified in `candle-metal-kernels/src/metal/commands.rs`)
 - **TurboQuant KV cache** — Lloyd-Max codebooks (2 / 3 / 4-bit nibble-packed) and byte-packed higher-bit (5 / 6 / 8-bit) variants, with fused Hadamard incoherence transform
-- **MoE routing on GPU** — `moe_gate` + `moe_softmax_topk` + expert-routed quantized matmul (no CPU round-trip for top-k expert selection)
-- **Custom Metal kernels for state-space models** — `gated_delta_net`, `ssm_conv`, `ssm_norm_gate`, `tri_solve`, `cumsum`
-- **Shape-specialized prefill** — D=256 / D=512 tiled flash-attention kernels tuned for production model shapes (Qwen3, Gemma 3 / 4)
-- **Fused norm-family kernels** — `fused_norm_add`, `fused_residual_norm`, `fused_post_attn_triple_norm`, `fused_moe_wsum_norm_add`, `fused_head_norm_rope`
+- **MoE routing on GPU** — `moe_gate` + `moe_softmax_topk` + V3 parallel SG-tournament top-K (`fused_moe_routing_f32`, default-on) + expert-routed quantized matmul (no CPU round-trip for top-k expert selection)
+- **Custom Metal kernels for state-space models** — `gated_delta_net` (+ chunk variants), `ssm_conv`, `ssm_norm_gate`, `tri_solve`, `cumsum`
+- **Shape-specialized prefill** — D=256 / D=512 tiled flash-attention kernels (bf16 + F16 / BF16 `_resume` dispatchers) tuned for production model shapes (Qwen3, Gemma 4)
+- **Fused norm-family kernels** — `fused_norm_add`, `fused_residual_norm`, `fused_post_attn_triple_norm`, `fused_post_ff_norm2_endlayer` (+ `_v2` default-on), `fused_moe_wsum_norm_add`, `fused_moe_wsum_post_ff_norm2_endlayer_v2`, `fused_head_norm_rope` (+ batch family)
+- **Precompiled `.metallib` at packaging time** — 112 shaders baked in; eliminates cold-start MSL compile (`MLX_PRECOMPILED_METALLIB` default-on; set `=0` to disable)
 - **GPU-resident sampling** — `softmax_sample` eliminates the logits-to-CPU readback on the hot path
 - **Sliding-window KV cache copy with ring wrap** — single GPU kernel instead of CPU-side index math
 - **Explicit barrier control** — `session.barrier()` and `session.barrier_between(reads, writes)` for precise GPU sync between dependent ops
@@ -42,7 +43,8 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 Supported model families used in production:
 - **Qwen3 / Qwen3.5 / Qwen3.6** (dense + MoE, GGUF)
-- **Gemma 3 / Gemma 4** (dense, with SWA + softcap, GQA)
+- **Qwen3-VL** (vision-tower kernels: im2col / bilinear-resize / 2×2 block-merge / feature-concat + `RopeMultiMode::Vision`)
+- **Gemma 4** (dense, with SWA + softcap, GQA)
 - **BERT-style** embeddings (bge-small-en-v1.5)
 - Generic transformer kernels for custom architectures
 
@@ -59,7 +61,7 @@ A thin, safe wrapper around Apple's Metal framework focused on compute shader di
 - **Thread-safe** — `MlxDevice` and `MlxBuffer` are `Send + Sync`
 - **Lazy compilation** — MSL shaders compiled on first use, then cached
 - **Buffer pooling** — power-of-two arena allocator for reuse
-- **Single-encoder graphs** — `GraphExecutor` batches dispatches for ~120× lower per-token overhead than per-op encoders (matches the llama.cpp pattern)
+- **Single-encoder graphs** — `GraphExecutor` batches all dispatches in a forward pass into one `MTLCommandBuffer` + one `ComputeCommandEncoder`. Measured ~13× lower per-dispatch wall vs per-op-encoder patterns at typical Q/K/V projection shape (Q5_K, n=4096, k=2816) in `bench_encoder_pattern_compare`; matches candle's default 50-per-buffer flush at production shapes
 
 ## Quick start
 
@@ -74,14 +76,14 @@ use mlx_native::{
 let device = MlxDevice::new()?;
 let mut registry = KernelRegistry::new();
 
-let input      = device.alloc_buffer(k * 4, DType::F32, vec![k])?;          // f32 input
-let weight     = /* mmap GGUF Q4_0 blocks into an MlxBuffer */;
-let mut output = device.alloc_buffer(n * 4, DType::F32, vec![n])?;
+let input  = device.alloc_buffer(k * 4, DType::F32, vec![k])?;              // f32 input
+let weight = /* mmap GGUF Q4_0 blocks into an MlxBuffer */;
+let output = device.alloc_buffer(n * 4, DType::F32, vec![n])?;
 
 let mut enc = device.command_encoder()?;
 quantized_matmul_ggml(
     &mut enc, &mut registry, &device,
-    &input, &weight, &mut output,
+    &input, &weight, &output,
     &GgmlQuantizedMatmulParams {
         m: 1,
         n: n as u32,
@@ -118,6 +120,8 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 | `KernelRegistry` | Lazy MSL compilation + pipeline cache |
 | `GraphExecutor` / `GraphSession` | Single-encoder batched forward passes |
 | `ComputeGraph` | Recorded graph IR (capture, fuse, replay) |
+| `EncoderSession` | Per-stage encoder lifecycle with MTLSharedEvent stage-fences (ADR-019, `HF2Q_ENCODER_SESSION=1`) |
+| `DispatchRecord` | Pre-baked dispatch metadata to skip per-call pipeline lookup + env-var reads (ADR-029) |
 | `DType` | Element data type enum (F32, F16, BF16, U8/16/32, I32) |
 | `MlxError` | Unified error type |
 | `GgufFile` / `TensorInfo` | GGUF model file mmap + metadata |
@@ -147,15 +151,20 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 ### Normalization
 - `rms_norm` — RMS normalization (f32 + triple-output variants)
 - `l2_norm` — L2 normalization
-- `fused_residual_norm` — RMS norm + residual add
-- `fused_norm_add` — MoE weighted_sum + RMS norm + add
-- `fused_head_norm_rope` — Per-head RMS norm + RoPE (with bf16 co-write variants)
+- `fused_residual_norm` — RMS norm + residual add (`_f32`, `_bf16`, `_scalar_f32` variants)
+- `fused_norm_add` — MoE weighted_sum + RMS norm + add (`_f32`, `_bf16`, `_no_weight_bf16`, `_scalar_f32` variants)
+- `fused_post_attn_triple_norm_f32` (+ `_v2`) — post-attention norm trio
+- `fused_post_ff_norm2_endlayer_f32` (+ `_v2` default-on) — post-FFN norm + residual at layer end
+- `fused_moe_wsum_norm_add` / `_dnorm_add` — MoE weighted-sum + norm + add
+- `fused_moe_wsum_post_ff_norm2_endlayer_f32_v2` — MoE-FFN end-of-layer fusion
+- `fused_head_norm_rope` — Per-head RMS norm + RoPE (`_f32`, `_bf16`, plus `_batch_*` family for prefill including `_batch_f32_with_bf16` and `_batch_f32_with_bf16_f32_perm`)
 
 ### Activation & gating
 - `gelu` — GeLU activation (F32, BF16)
 - `silu_mul` — SwiGLU (SiLU + elementwise multiply)
+- `fused_gelu_mul_bf16` — fused GeLU + elementwise multiply (bf16)
 - `sigmoid_mul` — Sigmoid-gated multiply
-- `softmax`, `softcap`, `scale_mask_softmax` — Softmax variants
+- `softmax`, `softcap`, `scale_mask_softmax` — Softmax variants (float4-vectorized)
 - `softmax_sample` — Sampling from logits
 
 ### Position encoding
@@ -165,13 +174,16 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 ### MoE
 - `moe_gate` — Gate logits → weights
 - `moe_softmax_topk` — GPU softmax + top-k expert selection
+- `fused_moe_routing_f32` / `_batch_f32` — V3 parallel SG-tournament top-K (default-on, +11.5% vs V2)
 - `moe_dispatch` — Per-expert matvec sequence with proper barriers
 - `moe_weighted_reduce` — Weighted sum across selected experts
 
 ### State-space (Mamba/Gated DeltaNet)
 - `ssm_conv` — Depthwise causal 1D convolution + SiLU
 - `ssm_norm_gate` — Norm + gate fusion (eliminates CPU bridge)
-- `gated_delta_net` — Fused GDN kernel
+- `gated_delta_net` — Fused GDN kernel (decode)
+- `gated_delta_net_chunk` / `_chunk_o` / `_kkt` / `_recompute_wu` — chunk-mode forward
+- `chunk_gated_delta_rule` / `_tri_solve_invert` — chunk-rule decomposition with triangular inversion
 - `compute_g_beta` — GDN g/beta computation
 - `tri_solve` — Lower-triangular unit-diagonal forward substitution
 - `cumsum` — Cumulative sum
