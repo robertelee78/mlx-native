@@ -651,6 +651,293 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     Ok(())
 }
 
+// ─── f16 D=512 dispatcher (NSG=8 default) ────────────────────────────────────
+
+/// Dispatch llama.cpp-derived NSG=8 flash-attention prefill for f16 Q/K/V/O,
+/// head_dim=512.
+///
+/// Sibling of [`dispatch_flash_attn_prefill_bf16_d512_with_blk`] with all
+/// buffers and the mask in F16 (half) instead of BF16.  Uses the
+/// `flash_attn_prefill_llamacpp_f16_d512` kernel entry point — same template
+/// as the BF16 variant, instantiated with `T=half, MaskT=half`.
+///
+/// **Why F16 instead of BF16 at D=512**: the kernel stores Q in 16-bit
+/// threadgroup memory before the tensor MMA; F16 has a 10-bit mantissa vs
+/// BF16's 7-bit.  Over a 512-element dot product the worst-case accumulated
+/// relative error scales as `sqrt(D) × 2^-mantissa`: BF16 ≈ 18%, F16 ≈ 2.2%.
+/// On Gemma 4 26B-A4B ara-abliterated, the BF16 D=512 path drifted argmax
+/// late in greedy decode (`Format: Hemoglobin` loop at decode-pos ~70 on a
+/// 300-item enumeration); the F16 variant lands below the empirical argmax-
+/// flip threshold and matches llama.cpp's coherent output.
+///
+/// Dynamic range: F16's 5-bit exponent (±65504) safely contains all Gemma 4
+/// activation magnitudes (max |V| ≈ 15, RMS-normalised Q/K ≈ 1).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d512_with_blk(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    blk: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
+        encoder, device, registry, q, k, v, mask, blk, out, params, NSG_D512,
+    )
+}
+
+/// Full F16 D=512 dispatcher with explicit NSG and optional blk.  The
+/// `_with_blk` variant above delegates here with `nsg = NSG_D512 = 8`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    blk: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+    nsg: u32,
+) -> Result<()> {
+    // ── Validate ──────────────────────────────────────────────────────────
+    if params.head_dim != 512 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d512: head_dim must be 512, got {}",
+            params.head_dim
+        )));
+    }
+    if nsg != 4 && nsg != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d512: nsg must be 4 or 8, got {nsg}"
+        )));
+    }
+    if blk.is_some() && mask.is_none() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_f16_d512: \
+             blk requires mask (a blk without a mask is meaningless)"
+                .into(),
+        ));
+    }
+    validate_params_d512(params)?;
+
+    // All buffers must be F16 for this dispatcher.
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::F16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d512: {name} buffer must be F16, \
+                 got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+    if let Some(m) = mask {
+        if m.dtype() != DType::F16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d512: mask buffer must be F16, \
+                 got {:?}",
+                m.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let kl = params.seq_len_k as usize;
+    let d = params.head_dim as usize; // = 512
+
+    validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    validate_buffer_size(k, "K", batch * h_kv * kl * d)?;
+    validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
+    validate_buffer_size(out, "out", batch * h * ql * d)?;
+    let mask_is_rank2_broadcast = mask.is_some_and(|m| m.shape().len() == 2);
+    if let Some(m) = mask {
+        if mask_is_rank2_broadcast {
+            validate_buffer_size(m, "mask", ql * kl)?;
+        } else {
+            validate_buffer_size(m, "mask", batch * h * ql * kl)?;
+        }
+    }
+
+    // ── Tile geometry (identical to BF16 D=512) ──────────────────────────
+    let nqpsg = NQPSG_D512;
+    let ncpsg = NCPSG_D512;
+
+    let nq = params.seq_len_q.div_ceil(nqpsg);
+    let nk = params.seq_len_k.div_ceil(ncpsg);
+    let nq_aligned = params.seq_len_q / nqpsg;
+    let nk_aligned = params.seq_len_k / ncpsg;
+    let ql_rem = params.seq_len_q % nqpsg;
+    let kl_rem = params.seq_len_k % ncpsg;
+
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = mask.is_some();
+    let has_blk = blk.is_some();
+    let do_causal = params.do_causal;
+
+    let bq_main = 8_u32;
+    let bk_main = 64_u32;
+
+    if let Some(b) = blk {
+        let nq_tiles = ql.div_ceil(bq_main as usize);
+        let nk_tiles = kl.div_ceil(bk_main as usize);
+        let expected = nq_tiles * nk_tiles;
+        if b.byte_len() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d512: blk buffer too small: \
+                 expected at least {expected} bytes (NQ={nq_tiles}, \
+                 NK={nk_tiles}), got {}",
+                b.byte_len()
+            )));
+        }
+    }
+
+    // ── Kernel name ───────────────────────────────────────────────────────
+    let kernel_name = K_LLAMACPP_F16_D512;  // additive f16 (or disabled) mask path
+
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+        &[
+            (FC_IDX_NSG, nsg as i32),
+        ],
+    )?;
+
+    let q_seq_stride = d as i64;
+    let q_head_stride = (ql * d) as i64;
+    let q_batch_stride = (h * ql * d) as i64;
+
+    let kv_seq_stride = d as i64;
+    let kv_head_stride = (kl * d) as i64;
+    let kv_batch_stride = (h_kv * kl * d) as i64;
+
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: 0,
+        _pad: 0,
+        q_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+        k_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        v_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+    };
+
+    let grid = MTLSize::new(
+        nq as u64,
+        params.n_heads as u64,
+        params.batch as u64,
+    );
+    let tg_size = MTLSize::new(32, nsg as u64, 1);
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+    let tgmem = TGMEM_BYTES_D512 as u64;
+
+    if has_mask {
+        let mask_buf = mask.ok_or_else(|| {
+            MlxError::InvalidArgument(
+                "flash_attn_prefill_d512: internal error — has_mask=true but mask is None".into(),
+            )
+        })?;
+
+        let (m_batch_stride, m_head_stride, m_ql_stride) = if mask_is_rank2_broadcast {
+            (0_i64, 0_i64, kl as i64)
+        } else {
+            ((h * ql * kl) as i64, (ql * kl) as i64, kl as i64)
+        };
+
+        let mask_params = AttnMaskParamsGpu {
+            m_strides: [m_batch_stride, m_head_stride, m_ql_stride],
+        };
+
+        if has_blk {
+            let blk_buf = blk.ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "flash_attn_prefill_d512: internal error — has_blk=true but blk is None".into(),
+                )
+            })?;
+
+            encoder.encode_threadgroups_with_args_and_shared(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(q)),
+                    (1, KernelArg::Buffer(k)),
+                    (2, KernelArg::Buffer(v)),
+                    (3, KernelArg::Buffer(out)),
+                    (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                    (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                    (6, KernelArg::Buffer(mask_buf)),
+                    (7, KernelArg::Buffer(blk_buf)),
+                ],
+                &[(0, tgmem)],
+                grid,
+                tg_size,
+            );
+        } else {
+            encoder.encode_threadgroups_with_args_and_shared(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(q)),
+                    (1, KernelArg::Buffer(k)),
+                    (2, KernelArg::Buffer(v)),
+                    (3, KernelArg::Buffer(out)),
+                    (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                    (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                    (6, KernelArg::Buffer(mask_buf)),
+                ],
+                &[(0, tgmem)],
+                grid,
+                tg_size,
+            );
+        }
+    } else {
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(q)),
+                (1, KernelArg::Buffer(k)),
+                (2, KernelArg::Buffer(v)),
+                (3, KernelArg::Buffer(out)),
+                (4, KernelArg::Bytes(as_bytes(&attn_params))),
+            ],
+            &[(0, tgmem)],
+            grid,
+            tg_size,
+        );
+    }
+
+    Ok(())
+}
+
 // ─── Tests (structural only; GPU tests live in tests/test_flash_attn_prefill.rs) ─
 
 #[cfg(test)]
