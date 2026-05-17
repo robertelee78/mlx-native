@@ -86,16 +86,38 @@ kernel void scale_mask_softmax_f32(
     float max_val = simd_max(local_max);
     if (tg_size > N_SIMDWIDTH) {
         // Cross-simdgroup reduction via shared memory.
-        if (sgitg == 0) {
-            shared[tiisg] = -INFINITY;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        //
+        // BUG-fix (2026-05-17 Gemma 4 ara seq=33 chemistry+backticks
+        // probe): the prior implementation had each thread read
+        // `shared[tiisg]` and run `simd_max` across its own simdgroup.
+        // That works when ALL simdgroups are full, but breaks when the
+        // trailing simdgroup is partial (e.g. tg_size=33 → sg0 has 32
+        // threads, sg1 has 1 thread): sg1's single thread reads
+        // `shared[0]` (= sg0's max) instead of sg1's own max, and the
+        // 1-lane simd_max returns sg0's max alone — losing sg1's max
+        // for any K-positions assigned to sg1.  On Gemma 4 ara at
+        // seq=33 this corrupted the softmax for K=32, flipping the
+        // first decode token from `<|channel>` (id 100) to `서` (id
+        // 237372) on enumerative+backticks prompts.
+        //
+        // Fix mirrors `fused_head_norm_rope_f32_v2` (mlx-native
+        // `fused_head_norm_rope_f32.metal:295-303`): do the cross-sg
+        // reduction in sg0 ONLY, write the final max to shared[0], and
+        // have ALL threads broadcast-read shared[0].
         if (tiisg == 0) {
             shared[sgitg] = max_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        max_val = shared[tiisg];
-        max_val = simd_max(max_val);
+        const uint n_sg = (tg_size + N_SIMDWIDTH - 1u) / N_SIMDWIDTH;
+        if (sgitg == 0) {
+            const float vsg = (tiisg < n_sg) ? shared[tiisg] : -INFINITY;
+            const float total_max = simd_max(vsg);
+            if (tiisg == 0) {
+                shared[0] = total_max;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_val = shared[0];
     }
 
     // ---- Phase 2: exp(v - max), store to output, accumulate sum ----
@@ -113,16 +135,21 @@ kernel void scale_mask_softmax_f32(
 
     float sum = simd_sum(local_sum);
     if (tg_size > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            shared[tiisg] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Same partial-simdgroup correctness fix as the row-max phase above.
         if (tiisg == 0) {
             shared[sgitg] = sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        sum = shared[tiisg];
-        sum = simd_sum(sum);
+        const uint n_sg = (tg_size + N_SIMDWIDTH - 1u) / N_SIMDWIDTH;
+        if (sgitg == 0) {
+            const float vsg = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+            const float total_sum = simd_sum(vsg);
+            if (tiisg == 0) {
+                shared[0] = total_sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sum = shared[0];
     }
 
     // ---- Phase 3: normalise.  Guard against sum=0 (fully-masked row). ----
@@ -193,16 +220,21 @@ kernel void scale_mask_softmax_f32_v4(
 
     float max_val = simd_max(local_max);
     if (tg_size > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            shared[tiisg] = -INFINITY;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Partial-simdgroup correctness fix — see scalar kernel above.
         if (tiisg == 0) {
             shared[sgitg] = max_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        max_val = shared[tiisg];
-        max_val = simd_max(max_val);
+        const uint n_sg = (tg_size + N_SIMDWIDTH - 1u) / N_SIMDWIDTH;
+        if (sgitg == 0) {
+            const float vsg = (tiisg < n_sg) ? shared[tiisg] : -INFINITY;
+            const float total_max = simd_max(vsg);
+            if (tiisg == 0) {
+                shared[0] = total_max;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_val = shared[0];
     }
 
     // ---- Phase 2: exp(v - max), store output, accumulate sum ----
@@ -221,16 +253,21 @@ kernel void scale_mask_softmax_f32_v4(
 
     float sum = simd_sum(local_sum);
     if (tg_size > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            shared[tiisg] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Partial-simdgroup correctness fix — see scalar kernel above.
         if (tiisg == 0) {
             shared[sgitg] = sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        sum = shared[tiisg];
-        sum = simd_sum(sum);
+        const uint n_sg = (tg_size + N_SIMDWIDTH - 1u) / N_SIMDWIDTH;
+        if (sgitg == 0) {
+            const float vsg = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+            const float total_sum = simd_sum(vsg);
+            if (tiisg == 0) {
+                shared[0] = total_sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sum = shared[0];
     }
 
     // ---- Phase 3: normalise ----
