@@ -169,34 +169,74 @@ void dq_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
     }
 }
 
+// FIX 2026-05-17: original `dq_q5_K` (commit 90c5691) used a buggy
+// scale-index pattern that does not match llama.cpp's `dequantize_q5_K`
+// reference at `ggml-metal.metal:683-705`.  Symptoms: any GGUF with
+// Q5_K tensors (which is most standard Q5_K_M community quants —
+// bartowski, unsloth) decoded to garbage because the F16 shadow built
+// at ADR-029 H29 load-time contained wrong values.  ara-abliterated
+// APEX-Q5_K_M uses zero Q5_K tensors so the bug never surfaced under
+// the existing test matrix.
+//
+// The CORRECT implementation already existed in
+// `mul_mv_ext.metal:212-232` (`dequantize_q5_K_t4x4`); this copy
+// adopts it.  Key differences vs the buggy version:
+//   - `get_scale_min_k4_just2(is, il/2, ...)` with `is = (il/4)*2`,
+//     not `(il/2, 8, ...)`.
+//   - `il = il & 3` aliasing before scale-branch use.
+//   - `d = il<2 ? xb->d : xb->d/16` (sub-scale dropoff).
+//   - `mask = il<2 ? 0x0F : 0xF0` (nibble selector — not the qh bit
+//     mask which is `ul = 1 << (il/2)`).
+//   - `qh_val = il<2 ? 16.f : 256.f` (high-bit weighting).
 template <typename type4x4>
 void dq_q5_K(device const block_q5_K * xb, short il, thread type4x4 & reg) {
-    device const uchar * q = xb->qs + 32*(il/4) + 16*(il&1);
-    device const uchar * qh = xb->qh + 16*(il&1);
-    const uchar2 sc = get_scale_min_k4_just2(il/2, 8, xb->scales);
-    const float d_all = (float)xb->d;
-    const float dl = d_all * sc[0];
-    const float ml = (float)xb->dmin * sc[1];
-    const ushort mask = 1 << (il/2);
+    device const uchar * q  = xb->qs;
+    device const uchar * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uchar ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? (float)xb->d : (float)xb->d / 16.f;
+    const float min = (float)xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float  qh_val = il < 2 ? 16.f : 256.f;
     float4x4 reg_f;
     for (int i = 0; i < 16; ++i) {
-        const float val = dl * (((q[i] >> (4*(il&2))) & 0xF) + (qh[i] & mask ? 16 : 0)) - ml;
-        reg_f[i/4][i%4] = val;
+        reg_f[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
     }
     reg = (type4x4) reg_f;
 }
 
+// FIX 2026-05-17: same bug class as `dq_q5_K` above.  Buggy version
+// missed `il & 3` aliasing, the `d/16` sub-scale branch, and used a
+// constant `k=8` second arg to `get_scale_min_k4_just2`.  Standard
+// Q4_K_M quants will use Q4_K extensively; we don't have an in-tree
+// Q4_K_M test fixture today (ara-abliterated has zero Q4_K), but a
+// future quant family would hit the same garbage-weights bug if this
+// copy stayed wrong.  Correct reference: `mul_mv_ext.metal:193-208`.
 template <typename type4x4>
 void dq_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
-    device const uchar * q = xb->qs + 32*(il/4) + 16*(il&1);
-    const uchar2 sc = get_scale_min_k4_just2(il/2, 8, xb->scales);
-    const float d_all = (float)xb->d;
-    const float dl = d_all * sc[0];
-    const float ml = (float)xb->dmin * sc[1];
+    device const uchar * q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? (float)xb->d : (float)xb->d / 16.f;
+    const float min = (float)xb->dmin;
+    const float dl  = d * sc[0];
+    const float ml  = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
     float4x4 reg_f;
     for (int i = 0; i < 16; ++i) {
-        const float val = dl * ((q[i] >> (4*(il&2))) & 0xF) - ml;
-        reg_f[i/4][i%4] = val;
+        reg_f[i/4][i%4] = dl * (q[i] & mask) - ml;
     }
     reg = (type4x4) reg_f;
 }
