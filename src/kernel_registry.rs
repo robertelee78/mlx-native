@@ -465,6 +465,8 @@ impl KernelRegistry {
         sources.insert("cast_f32_to_f16".into(), elementwise_src);
         sources.insert("cast_bf16_to_f32".into(), elementwise_src);
         sources.insert("cast_f32_to_bf16".into(), elementwise_src);
+        sources.insert("cast_bf16_to_f16".into(), elementwise_src);
+        sources.insert("cast_f16_to_bf16".into(), elementwise_src);
         sources.insert("scalar_mul_bf16".into(), elementwise_src);
         sources.insert("scalar_mul_f32".into(), elementwise_src);
         sources.insert("embedding_gather_scale_f32".into(), elementwise_src);

@@ -162,6 +162,78 @@ fn test_cast_f32_to_f16_and_back() {
     }
 }
 
+// ---- bf16↔f16 cast (added 2026-05-16 for F16 FA migration step 2) ----
+
+/// Round-trip test: bf16 → f16 → bf16 should preserve values within BF16's
+/// natural precision band.  BF16 has 7-bit mantissa, F16 has 10-bit, so
+/// the F16 intermediate carries the BF16 precision losslessly; the only
+/// rounding step is the final F16 → BF16 cast.
+#[test]
+fn test_cast_bf16_to_f16_and_back() {
+    use half::{bf16, f16};
+
+    let (device, mut registry) = setup();
+
+    let data_f32: Vec<f32> = vec![0.0, 1.0, -1.0, 0.5, 100.0, -100.0, 0.001, 15.0];
+    let data_bf: Vec<bf16> = data_f32.iter().map(|&x| bf16::from_f32(x)).collect();
+    let n = data_bf.len();
+
+    let mut bf_in = device.alloc_buffer(n * 2, DType::BF16, vec![n]).expect("bf in");
+    let f16_buf = device.alloc_buffer(n * 2, DType::F16, vec![n]).expect("f16");
+    let bf_back = device.alloc_buffer(n * 2, DType::BF16, vec![n]).expect("bf back");
+
+    bf_in.as_mut_slice::<bf16>().expect("write").copy_from_slice(&data_bf);
+
+    // bf16 -> f16
+    let mut encoder = device.command_encoder().expect("enc1");
+    mlx_native::ops::elementwise::cast(
+        &mut encoder, &mut registry, device.metal_device(),
+        &bf_in, &f16_buf, n,
+        mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+    ).expect("cast bf16->f16");
+    encoder.commit_and_wait().expect("commit1");
+
+    // f16 -> bf16
+    let mut encoder2 = device.command_encoder().expect("enc2");
+    mlx_native::ops::elementwise::cast(
+        &mut encoder2, &mut registry, device.metal_device(),
+        &f16_buf, &bf_back, n,
+        mlx_native::ops::elementwise::CastDirection::F16ToBF16,
+    ).expect("cast f16->bf16");
+    encoder2.commit_and_wait().expect("commit2");
+
+    let f16_mid: &[f16] = f16_buf.as_slice().expect("read mid");
+    let bf_out: &[bf16] = bf_back.as_slice().expect("read out");
+
+    // Verify the intermediate F16 representation is at least as precise as
+    // the BF16 input (F16's 10-bit mantissa > BF16's 7-bit).
+    for i in 0..n {
+        let bf_val = data_bf[i].to_f32();
+        let f16_val = f16_mid[i].to_f32();
+        let err = (bf_val - f16_val).abs();
+        let tol = bf_val.abs() * 1e-3 + 1e-4;
+        assert!(
+            err <= tol,
+            "bf16→f16 lost precision at idx {i}: bf16={bf_val:.6e} f16={f16_val:.6e} err={err:.3e}"
+        );
+    }
+
+    // Round-trip: bf16 → f16 → bf16 should recover the original BF16 exactly
+    // (no rounding-trip loss because F16 preserves all BF16 precision).
+    for i in 0..n {
+        assert_eq!(
+            bf_out[i].to_bits(),
+            data_bf[i].to_bits(),
+            "bf16→f16→bf16 round-trip not bit-exact at idx {i}: \
+             in=0x{:04x} out=0x{:04x} (f32 in={} f32 out={})",
+            data_bf[i].to_bits(),
+            bf_out[i].to_bits(),
+            data_bf[i].to_f32(),
+            bf_out[i].to_f32(),
+        );
+    }
+}
+
 // ---- transpose 2d f32 ----
 
 #[test]

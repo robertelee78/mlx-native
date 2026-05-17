@@ -590,6 +590,10 @@ pub enum CastDirection {
     BF16ToF32,
     /// f32 -> bf16
     F32ToBF16,
+    /// bf16 -> f16 (via f32 intermediate inside the kernel)
+    BF16ToF16,
+    /// f16 -> bf16 (via f32 intermediate inside the kernel)
+    F16ToBF16,
 }
 
 impl CastDirection {
@@ -599,6 +603,8 @@ impl CastDirection {
             CastDirection::F32ToF16 => "cast_f32_to_f16",
             CastDirection::BF16ToF32 => "cast_bf16_to_f32",
             CastDirection::F32ToBF16 => "cast_f32_to_bf16",
+            CastDirection::BF16ToF16 => "cast_bf16_to_f16",
+            CastDirection::F16ToBF16 => "cast_f16_to_bf16",
         }
     }
 
@@ -606,6 +612,7 @@ impl CastDirection {
         match self {
             CastDirection::F16ToF32 | CastDirection::BF16ToF32 => 2,
             CastDirection::F32ToF16 | CastDirection::F32ToBF16 => 4,
+            CastDirection::BF16ToF16 | CastDirection::F16ToBF16 => 2,
         }
     }
 
@@ -613,6 +620,7 @@ impl CastDirection {
         match self {
             CastDirection::F16ToF32 | CastDirection::BF16ToF32 => 4,
             CastDirection::F32ToF16 | CastDirection::F32ToBF16 => 2,
+            CastDirection::BF16ToF16 | CastDirection::F16ToBF16 => 2,
         }
     }
 }

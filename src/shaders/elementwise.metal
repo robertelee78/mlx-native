@@ -209,6 +209,56 @@ kernel void cast_f32_to_bf16(
 }
 
 // --------------------------------------------------------------------------
+// cast_bf16_to_f16 — convert bfloat16 to half (via f32 intermediate)
+//
+// Used by the F16 D=256 FA prefill path to convert pf_q_perm/pf_k_perm/
+// pf_v_perm (BF16) to F16 before dispatching the F16 SDPA kernel.
+//
+// Why via f32: BF16 has 7-bit mantissa, F16 has 10-bit.  Casting BF16 → F16
+// directly via static_cast<half>(bfloat) is not defined on Metal (no
+// implicit conversion path between bfloat and half).  The f32 intermediate
+// is the canonical conversion route, and the resulting F16 retains all the
+// BF16 precision (BF16 fits inside F16's mantissa range modulo F16's
+// narrower exponent range — Gemma 4 activations stay well within ±65504).
+//
+// Buffers:
+//   0: input  — bfloat [n_elements]
+//   1: output — half   [n_elements]
+//   2: params — { n_elements }
+// --------------------------------------------------------------------------
+kernel void cast_bf16_to_f16(
+    device const bfloat* input  [[buffer(0)]],
+    device half*         output [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    output[gid] = static_cast<half>(static_cast<float>(input[gid]));
+}
+
+// --------------------------------------------------------------------------
+// cast_f16_to_bf16 — convert half to bfloat16 (via f32 intermediate)
+//
+// Used by the F16 D=256 FA prefill path to convert the F16 SDPA output
+// back to BF16 for compatibility with the rest of the BF16 attention
+// island (o_proj input, fused_norm_add residual stream).
+//
+// Buffers:
+//   0: input  — half   [n_elements]
+//   1: output — bfloat [n_elements]
+//   2: params — { n_elements }
+// --------------------------------------------------------------------------
+kernel void cast_f16_to_bf16(
+    device const half* input  [[buffer(0)]],
+    device bfloat*     output [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    output[gid] = static_cast<bfloat>(static_cast<float>(input[gid]));
+}
+
+// --------------------------------------------------------------------------
 // transpose_2d_f32 — Transpose a 2D matrix [rows, cols] -> [cols, rows]
 //
 // Buffers:
