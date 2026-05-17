@@ -476,6 +476,7 @@ impl KernelRegistry {
         sources.insert("transpose_last2_f16".into(), elementwise_src);
         sources.insert("permute_021_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16_to_f32".into(), elementwise_src);
+        sources.insert("permute_021_f32_to_f16".into(), elementwise_src);
         sources.insert("transpose_2d_f32".into(), elementwise_src);
         sources.insert("transpose_2d_f16".into(), elementwise_src);
 

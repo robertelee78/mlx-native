@@ -500,3 +500,79 @@ pub fn permute_021_bf16_to_f32(
 
     Ok(())
 }
+
+/// Fused permute_021 + F32→F16 cast.  Reads F32 [A, B, C] in natural
+/// `[seq, n_heads, head_dim]` order and writes F16 [B, A, C] in
+/// permuted `[n_heads, seq, head_dim]` order, the layout the F16 FA
+/// dispatcher expects.
+///
+/// Step 4 of the BUG-gemma4-coherence F16 kernel migration: replaces
+/// the chain `F32 pf_*_normed → permute → BF16 pf_*_perm → cast → F16`
+/// (which would inherit BF16's 7-bit-mantissa precision floor) with a
+/// single F32→F16 cast at the permute step.  Preserves the full F32
+/// precision of the source until the final F16 store.
+///
+/// Buffers:
+/// - `input`: F32 `[dim_a, dim_b, dim_c]` — `[seq, n_heads, head_dim]`
+/// - `output`: F16 `[dim_b, dim_a, dim_c]` — `[n_heads, seq, head_dim]`
+pub fn permute_021_f32_to_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    dim_a: usize,
+    dim_b: usize,
+    dim_c: usize,
+) -> Result<()> {
+    if dim_a == 0 || dim_b == 0 || dim_c == 0 {
+        return Err(MlxError::InvalidArgument(
+            "permute_021_f32_to_f16: all dimensions must be > 0".into(),
+        ));
+    }
+
+    let total_elements = dim_a * dim_b * dim_c;
+    let in_bytes = total_elements * 4; // f32
+    let out_bytes = total_elements * 2; // f16
+    if input.byte_len() < in_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "permute_021_f32_to_f16: input buffer too small: need {} bytes, have {}",
+            in_bytes, input.byte_len()
+        )));
+    }
+    if output.byte_len() < out_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "permute_021_f32_to_f16: output buffer too small: need {} bytes, have {}",
+            out_bytes, output.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("permute_021_f32_to_f16", device)?;
+
+    let gpu_params = GpuPermute021Params {
+        dim_a: dim_a as u32,
+        dim_b: dim_b as u32,
+        dim_c: dim_c as u32,
+    };
+
+    let grid = MTLSize::new(dim_c as u64, dim_b as u64, dim_a as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, dim_c as u64),
+        std::cmp::min(4, dim_b as u64),
+        std::cmp::min(4, dim_a as u64),
+    );
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+
+    Ok(())
+}

@@ -512,6 +512,49 @@ kernel void permute_021_bf16_to_f32(
 }
 
 // --------------------------------------------------------------------------
+// permute_021_f32_to_f16 — fused permute + F32→F16 cast.
+//
+// Reads F32 [A, B, C] (natural [seq, n_heads, head_dim] for hf2q's
+// pf_q_normed / pf_k_normed / pf_v_normed) and writes F16 [B, A, C]
+// (permuted [n_heads, seq, head_dim] which is what the FA kernel
+// expects).  Fuses the F32→F16 cast and the 021-permute into a single
+// global-memory pass, avoiding two separate dispatches and an
+// intermediate F16 [seq, n_heads, head_dim] buffer.
+//
+// Step 4 of the BUG-gemma4-coherence F16 kernel migration: this kernel
+// preserves the full F32 precision of pf_*_normed when populating the
+// F16 perm buffers consumed by dispatch_flash_attn_prefill_f16_d256
+// (mlx-native commit 6562eda).  Going F32→F16 directly (instead of
+// F32→BF16→F16) avoids the upstream BF16 rounding that left the
+// step-3 wiring no more precise than the BF16 path.
+//
+// Buffers:
+//   0: input  — float [A * B * C]
+//   1: output — half  [B * A * C]
+//   2: params — Permute021Params { dim_a, dim_b, dim_c }
+//
+// Grid: (C, B, A) — each thread reads one F32 element and writes one
+// F16 element at the permuted position.
+// --------------------------------------------------------------------------
+kernel void permute_021_f32_to_f16(
+    device const float* input  [[buffer(0)]],
+    device half*        output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint b = gid.y;
+    const uint a = gid.z;
+
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+
+    const uint in_idx  = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    const uint out_idx = b * (params.dim_a * params.dim_c) + a * params.dim_c + c;
+
+    output[out_idx] = static_cast<half>(input[in_idx]);
+}
+
+// --------------------------------------------------------------------------
 // transpose_last2_bf16 — swap the last two axes of a 3D bf16 tensor.
 //
 //   input:  bfloat [A, B, C] row-major
