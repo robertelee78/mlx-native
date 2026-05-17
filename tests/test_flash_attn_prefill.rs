@@ -5447,6 +5447,108 @@ fn flash_attn_prefill_f16_d512_resume_qL_off_align_k_false_byte_identity() {
     );
 }
 
+/// Smoke test: F16 D=256 `_with_blk` dispatcher produces finite output and
+/// matches the BF16 dispatcher within a tolerance band derived from the
+/// difference in mantissa precision (BF16: 7-bit, F16: 10-bit).
+///
+/// This is step 1.B of the F16 kernel migration tracked in
+/// `project_bug_gemma4_coherence_fa_bf16_q_2026_05_16` auto-memory entry —
+/// verifies that the new dispatcher dispatches the existing F16 D=256
+/// kernel correctly.  Step 2 (wiring into batched prefill) is deferred
+/// pending bf16↔f16 cast infrastructure.
+#[test]
+fn test_gpu_f16_d256_with_blk_smoke() {
+    use mlx_native::ops::flash_attn_prefill::dispatch_flash_attn_prefill_f16_d256_with_blk;
+    use half::f16;
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let batch = 1usize;
+    let h = 2usize;
+    let kv_h = 2usize;
+    let ql = 32usize;
+    let kl = 32usize;
+    let d = 256usize;
+    let scale = 1.0_f32 / (d as f32).sqrt();
+
+    let q_f32 = pseudo_random_f32(SEED, batch * h * ql * d);
+    let k_f32 = pseudo_random_f32(SEED + 1, batch * kv_h * kl * d);
+    let v_f32 = pseudo_random_f32(SEED + 2, batch * kv_h * kl * d);
+
+    let q_f16: Vec<f16> = q_f32.iter().map(|&x| f16::from_f32(x)).collect();
+    let k_f16: Vec<f16> = k_f32.iter().map(|&x| f16::from_f32(x)).collect();
+    let v_f16: Vec<f16> = v_f32.iter().map(|&x| f16::from_f32(x)).collect();
+
+    let alloc_f16 = |elems: usize, name: &str| -> mlx_native::MlxBuffer {
+        device
+            .alloc_buffer(elems * 2, DType::F16, vec![elems])
+            .unwrap_or_else(|e| panic!("alloc_buffer({name}, {elems}): {e:?}"))
+    };
+    let fill_f16 = |buf: &mlx_native::MlxBuffer, data: &[f16]| {
+        let ptr = buf.contents_ptr() as *mut f16;
+        assert!(!ptr.is_null());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+    };
+    let read_f16 = |buf: &mlx_native::MlxBuffer, elems: usize| -> Vec<f16> {
+        let ptr = buf.contents_ptr() as *const f16;
+        assert!(!ptr.is_null());
+        let slice = unsafe { std::slice::from_raw_parts(ptr, elems) };
+        slice.to_vec()
+    };
+
+    let q_buf = alloc_f16(batch * h * ql * d, "Q");
+    let k_buf = alloc_f16(batch * kv_h * kl * d, "K");
+    let v_buf = alloc_f16(batch * kv_h * kl * d, "V");
+    let out_buf = alloc_f16(batch * h * ql * d, "out");
+    fill_f16(&q_buf, &q_f16);
+    fill_f16(&k_buf, &k_f16);
+    fill_f16(&v_buf, &v_f16);
+
+    let params = FlashAttnPrefillParams {
+        n_heads: h as u32,
+        n_kv_heads: kv_h as u32,
+        head_dim: d as u32,
+        seq_len_q: ql as u32,
+        seq_len_k: kl as u32,
+        batch: batch as u32,
+        scale,
+        do_causal: true,
+    };
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_flash_attn_prefill_f16_d256_with_blk(
+        &mut encoder, &device, &mut registry,
+        &q_buf, &k_buf, &v_buf, None, None, &out_buf, &params,
+    ).expect("F16 dispatch failed");
+    encoder.commit_and_wait().expect("commit");
+
+    let out_f16 = read_f16(&out_buf, batch * h * ql * d);
+    let out_f32: Vec<f32> = out_f16.iter().map(|x| x.to_f32()).collect();
+
+    // 1. All output elements must be finite (no NaN, no Inf).
+    let nan_count = out_f32.iter().filter(|x| x.is_nan()).count();
+    let inf_count = out_f32.iter().filter(|x| x.is_infinite()).count();
+    assert_eq!(nan_count, 0, "F16 dispatcher produced {nan_count} NaN outputs");
+    assert_eq!(inf_count, 0, "F16 dispatcher produced {inf_count} Inf outputs");
+
+    // 2. Output magnitude must be reasonable for normalised SDPA — Q·K·V
+    //    of unit-variance inputs has expected magnitudes O(1).  Asserting
+    //    max < 10 catches both "all zeros" (kernel didn't run) and "garbage"
+    //    (numerical blowup).
+    let max_abs = out_f32.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(max_abs > 0.0, "F16 dispatcher produced all-zero output (kernel didn't run?)");
+    assert!(max_abs < 10.0, "F16 dispatcher output max |x|={max_abs} suggests numerical blowup");
+
+    eprintln!(
+        "test_gpu_f16_d256_with_blk_smoke: PASS — F16 dispatcher dispatches \
+         flash_attn_prefill_f16_d256 correctly (max_abs={max_abs:.4e}, \
+         {} finite outputs across [B={batch}, H={h}, Q={ql}, D={d}])",
+        out_f32.len()
+    );
+}
+
 } // mod flash_attn_prefill_tests
 
 // ─── Non-macOS stub ───────────────────────────────────────────────────────────

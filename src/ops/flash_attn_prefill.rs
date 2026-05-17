@@ -825,6 +825,264 @@ pub fn dispatch_flash_attn_prefill_bf16_d256_with_blk(
     Ok(())
 }
 
+/// F16 variant of [`dispatch_flash_attn_prefill_bf16_d256_with_blk`].
+///
+/// Identical buffer-layout, parameter, and dispatch contract — only the
+/// expected I/O dtype (F16 instead of BF16) and the underlying kernel name
+/// (`flash_attn_prefill_f16_d256` instead of `..._bf16_d256`) differ.
+///
+/// # Why a second dispatcher
+///
+/// The BF16 variant has 7-bit mantissa precision per Q element loaded into
+/// shared memory.  Across 256-element dot products × 30 layers this
+/// compounds into ~argmax flips on greedy decode of enumeration-style
+/// prompts (see `project_bug_gemma4_coherence_fa_bf16_q_2026_05_16` in
+/// auto-memory).  F16 has 10-bit mantissa (~8× more precision per element),
+/// which should keep the FA D=256 main-prefill path coherent without
+/// needing the tensor-mm workaround that ships today (HF2Q_NO_FA=1 default,
+/// commit 03328ee5).
+///
+/// This dispatcher is step 1 of the migration.  It is NOT yet wired into
+/// batched prefill — that requires F16-typed pf_q_perm/pf_k_perm/pf_v_perm
+/// buffers (or bf16↔f16 cast kernels) and is tracked separately.
+///
+/// # Mathematical equivalence to BF16 path
+///
+/// Both kernels use the same template `attention<T, BQ=32, BK=16, BD=256,
+/// WM=4, WN=1, MaskT, float>` with AccumType=float.  The softmax accumulator
+/// and Q·K^T accumulator are F32 in both paths.  The only precision
+/// difference is the per-element representation of Q/K/V in shared memory
+/// (BF16 7-bit mantissa vs F16 10-bit) and the per-element output store.
+/// F16's narrower exponent range (5 bits, ±65504) safely contains all
+/// Gemma 4 activation magnitudes (max |V| ≈ 15, RMS-normalised Q/K ≈ 1).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d256_with_blk(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    blk: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    // ── Validate ──────────────────────────────────────────────────────────
+    if params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_flash_attn_prefill_f16_d256_with_blk: head_dim must be 256, got {}",
+            params.head_dim
+        )));
+    }
+    if blk.is_some() && mask.is_none() {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_flash_attn_prefill_f16_d256_with_blk: \
+             blk requires mask (a blk without a mask is meaningless)"
+                .into(),
+        ));
+    }
+    validate_params(params)?;
+
+    // All buffers must be F16 for this dispatcher.
+    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
+        if buf.dtype() != DType::F16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d256_with_blk: {name} buffer must be F16, \
+                 got {:?}",
+                buf.dtype()
+            )));
+        }
+    }
+    if let Some(m) = mask {
+        if m.dtype() != DType::F16 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d256_with_blk: mask buffer must be F16, \
+                 got {:?}",
+                m.dtype()
+            )));
+        }
+    }
+
+    let batch = params.batch as usize;
+    let h = params.n_heads as usize;
+    let h_kv = params.n_kv_heads as usize;
+    let ql = params.seq_len_q as usize;
+    let kl = params.seq_len_k as usize;
+    let d = params.head_dim as usize; // = 256
+
+    validate_buffer_size(q, "Q", batch * h * ql * d)?;
+    validate_buffer_size(k, "K", batch * h_kv * kl * d)?;
+    validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
+    validate_buffer_size(out, "out", batch * h * ql * d)?;
+    let mask_is_rank2_broadcast = mask.is_some_and(|m| m.shape().len() == 2);
+    if let Some(m) = mask {
+        if mask_is_rank2_broadcast {
+            validate_buffer_size(m, "mask", ql * kl)?;
+        } else {
+            validate_buffer_size(m, "mask", batch * h * ql * kl)?;
+        }
+    }
+
+    // ── Tile geometry ─────────────────────────────────────────────────────
+    let bq = BQ_D256;
+    let bk = BK_D256;
+    let wm = WM_D256;
+    let wn = WN_D256;
+
+    let nq = params.seq_len_q.div_ceil(bq);
+    let nk = params.seq_len_k.div_ceil(bk);
+    let nq_aligned = params.seq_len_q / bq;
+    let nk_aligned = params.seq_len_k / bk;
+    let ql_rem = params.seq_len_q % bq;
+    let kl_rem = params.seq_len_k % bk;
+
+    let align_q = ql_rem == 0;
+    let align_k = kl_rem == 0;
+    let has_mask = mask.is_some();
+    let has_blk = blk.is_some();
+    let do_causal = params.do_causal;
+
+    if let Some(b) = blk {
+        let nq_tiles = ql.div_ceil(BQ_D256 as usize);
+        let nk_tiles = kl.div_ceil(BK_D256 as usize);
+        let expected = nq_tiles * nk_tiles;
+        if b.byte_len() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d256_with_blk: blk buffer \
+                 too small: expected at least {expected} bytes (NQ={nq_tiles}, \
+                 NK={nk_tiles}), got {}",
+                b.byte_len()
+            )));
+        }
+    }
+
+    // ── Kernel name ───────────────────────────────────────────────────────
+    let kernel_name = K_F16_D256;
+
+    let pipeline = registry.get_pipeline_with_bool_constants(
+        kernel_name,
+        device.metal_device(),
+        &[
+            (200, align_q),
+            (201, align_k),
+            (300, has_mask),
+            (301, do_causal),
+            (303, has_blk),
+        ],
+    )?;
+
+    let q_seq_stride = d as i64;
+    let q_head_stride = (ql * d) as i64;
+    let q_batch_stride = (h * ql * d) as i64;
+
+    let kv_seq_stride = d as i64;
+    let kv_head_stride = (kl * d) as i64;
+    let kv_batch_stride = (h_kv * kl * d) as i64;
+
+    let gqa_factor = (params.n_heads / params.n_kv_heads) as i32;
+
+    let attn_params = AttnParamsGpu {
+        b: params.batch as i32,
+        h: params.n_heads as i32,
+        d: params.head_dim as i32,
+        ql: params.seq_len_q as i32,
+        kl: params.seq_len_k as i32,
+        gqa_factor,
+        scale: params.scale,
+        softcapping: 1.0_f32,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: nq_aligned as i32,
+        nk_aligned: nk_aligned as i32,
+        ql_rem: ql_rem as i32,
+        kl_rem: kl_rem as i32,
+        ql_off: 0,
+        _pad: 0,
+        q_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+        k_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        v_strides: [kv_batch_stride, kv_head_stride, kv_seq_stride],
+        o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
+    };
+
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
+    let tg_size = MTLSize::new(32, wm as u64, wn as u64);
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+
+    if has_mask {
+        let mask_buf = mask.ok_or_else(|| {
+            MlxError::InvalidArgument(
+                "flash_attn_prefill: internal error — has_mask=true but mask is None".into(),
+            )
+        })?;
+
+        let (m_batch_stride, m_head_stride, m_ql_stride) = if mask_is_rank2_broadcast {
+            (0_i64, 0_i64, kl as i64)
+        } else {
+            ((h * ql * kl) as i64, (ql * kl) as i64, kl as i64)
+        };
+
+        let mask_params = AttnMaskParamsGpu {
+            m_strides: [m_batch_stride, m_head_stride, m_ql_stride],
+        };
+
+        if has_blk {
+            let blk_buf = blk.ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "flash_attn_prefill: internal error — has_blk=true but blk is None".into(),
+                )
+            })?;
+
+            encoder.encode_threadgroups_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(q)),
+                    (1, KernelArg::Buffer(k)),
+                    (2, KernelArg::Buffer(v)),
+                    (3, KernelArg::Buffer(out)),
+                    (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                    (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                    (6, KernelArg::Buffer(mask_buf)),
+                    (7, KernelArg::Buffer(blk_buf)),
+                ],
+                grid,
+                tg_size,
+            );
+        } else {
+            encoder.encode_threadgroups_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(q)),
+                    (1, KernelArg::Buffer(k)),
+                    (2, KernelArg::Buffer(v)),
+                    (3, KernelArg::Buffer(out)),
+                    (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                    (5, KernelArg::Bytes(as_bytes(&mask_params))),
+                    (6, KernelArg::Buffer(mask_buf)),
+                ],
+                grid,
+                tg_size,
+            );
+        }
+    } else {
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(q)),
+                (1, KernelArg::Buffer(k)),
+                (2, KernelArg::Buffer(v)),
+                (3, KernelArg::Buffer(out)),
+                (4, KernelArg::Bytes(as_bytes(&attn_params))),
+            ],
+            grid,
+            tg_size,
+        );
+    }
+
+    Ok(())
+}
+
 // ─── bf16 D=256 RESUME dispatcher (qL_off > 0 + slot-capacity strides) ──────
 //
 // ADR-017 Phase E.a B.2-fix: extend the FA bf16 d256 fast path to support
