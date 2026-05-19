@@ -1093,6 +1093,15 @@ impl GgufFile {
         self.metadata.len()
     }
 
+    /// Absolute byte offset (from the start of the file) where the
+    /// tensor data region begins. Add a [`TensorInfo::offset`] to this
+    /// to get the absolute on-disk offset of a tensor's first byte —
+    /// useful for tests that want to verify raw payload bytes without
+    /// going through `load_tensor` (which requires an `MlxDevice`).
+    pub fn tensor_data_offset(&self) -> u64 {
+        self.tensor_data_offset
+    }
+
     // -----------------------------------------------------------------------
     // Tensor loading
     // -----------------------------------------------------------------------
