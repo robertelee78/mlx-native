@@ -446,7 +446,11 @@ fn test_q8_0_mm_matches_mv_small() {
     }
     let input = pseudo_random_f32(0x5678, m * k);
 
-    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 1e-3,
+    // MM kernel uses FP16 A-tile (`simdgroup_half8x8 ma[4]` at
+    // quantized_matmul_mm.metal:401) per llama.cpp's MMA design for
+    // tensor-core speedup. MV kernel keeps FP32 throughout. The precision
+    // bound is ~2 × sqrt(K) × eps_fp16 ≈ 1e-2 at K=128.
+    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 1.5e-2,
         "Q8_0 mm matches mv, M=16 N=64 K=128");
 }
 
@@ -464,7 +468,8 @@ fn test_q8_0_mm_matches_mv_prefill_shape() {
     }
     let input = pseudo_random_f32(0xBABE, m * k);
 
-    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 2e-2,
+    // FP16 A-tile precision bound at K=2112: ~2 × sqrt(2112) × eps_fp16 ≈ 5e-2.
+    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 5e-2,
         "Q8_0 mm matches mv, M=64 N=128 K=2112");
 }
 
@@ -481,7 +486,8 @@ fn test_q8_0_mm_matches_mv_irregular() {
     }
     let input = pseudo_random_f32(0x22, m * k);
 
-    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 5e-3,
+    // FP16 A-tile precision bound: ~2 × sqrt(256) × eps_fp16 ≈ 1.5e-2.
+    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 2e-2,
         "Q8_0 mm matches mv, M=17 N=72 K=256 (partial tiles)");
 }
 
@@ -502,10 +508,10 @@ fn test_q6_k_mm_matches_mv_small() {
     }
     let input = pseudo_random_f32(0x9ABC, m * k);
 
-    // Q6_K at K=256 accumulates 256 f32 multiplies; reduction order differs
-    // between mv (32-wide simd_sum tree) and mm (8-wide MMA tile + K-slot
-    // sum) by O(K * eps * max|v|).  Use 5e-3 to absorb this ordering jitter.
-    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 5e-3,
+    // Q6_K MM uses FP16 A-tile (`simdgroup_half8x8 ma[4]` per llama.cpp MMA
+    // design) while MV stays FP32. Precision bound at K=256:
+    // ~2 × sqrt(256) × eps_fp16 ≈ 1.5e-2 — calibrated with quant-noise margin.
+    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 2e-2,
         "Q6_K mm matches mv, M=16 N=32 K=256");
 }
 
@@ -525,7 +531,8 @@ fn test_q6_k_mm_matches_mv_prefill_shape() {
     }
     let input = pseudo_random_f32(0xF00D, m * k);
 
-    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 2e-2,
+    // FP16 A-tile precision bound at K=2048: ~2 × sqrt(2048) × eps_fp16 ≈ 5e-2.
+    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 5e-2,
         "Q6_K mm matches mv, M=64 N=128 K=2048");
 }
 
@@ -542,7 +549,8 @@ fn test_q6_k_mm_matches_mv_irregular() {
     }
     let input = pseudo_random_f32(0x66, m * k);
 
-    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 5e-3,
+    // FP16 A-tile precision bound at K=512: ~2 × sqrt(512) × eps_fp16 ≈ 2.3e-2.
+    check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 3e-2,
         "Q6_K mm matches mv, M=33 N=100 K=512 (partial tiles)");
 }
 
