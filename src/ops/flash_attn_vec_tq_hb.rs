@@ -167,12 +167,16 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 /// Override via `HF2Q_TQ_NSG` env var (1, 2, or 4 only). Default policy
 /// keeps short-context behavior byte-identical (nsg=1) per
 /// `feedback_metal_compiler_auto_optimizes_static_levers`.
+// 2026-05-20: pulled cache static to module level so tests can invalidate
+// between env::set_var calls. Initial value -1 means "not yet parsed".
+#[doc(hidden)]
+pub(crate) static CACHED_TQ_NSG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 pub fn compute_nsg(kv_seq_len: u32) -> u32 {
     // ADR-029: cache parsed override.
     // TQ-HB FA fires ~26-30 calls/token at gemma4 decode (TQ-HB-V is default V-KV).
     // Uncached env::var was ~70 ns/call (H-N bench).
-    use std::sync::atomic::{AtomicI32, Ordering};
-    static CACHED_TQ_NSG: AtomicI32 = AtomicI32::new(-1);
+    use std::sync::atomic::Ordering;
     let mut v = CACHED_TQ_NSG.load(Ordering::Relaxed);
     if v < 0 {
         let parsed = std::env::var("HF2Q_TQ_NSG")
@@ -632,16 +636,25 @@ mod tests {
 
     #[test]
     fn test_compute_nsg_env_override() {
+        use std::sync::atomic::Ordering;
         let _guard = NSG_ENV_LOCK.lock().unwrap();
+        // 2026-05-20: CACHED_TQ_NSG persists across calls for perf; invalidate
+        // before each env change so the test verifies actual env→nsg mapping.
+        let invalidate = || CACHED_TQ_NSG.store(-1, Ordering::Relaxed);
+        invalidate();
         std::env::set_var("HF2Q_TQ_NSG", "4");
         assert_eq!(compute_nsg(64), 4);
+        invalidate();
         std::env::set_var("HF2Q_TQ_NSG", "2");
         assert_eq!(compute_nsg(64), 2);
+        invalidate();
         std::env::set_var("HF2Q_TQ_NSG", "1");
         assert_eq!(compute_nsg(64), 1);
         // Invalid values fall through to default.
+        invalidate();
         std::env::set_var("HF2Q_TQ_NSG", "3");
         assert_eq!(compute_nsg(64), 1);
+        invalidate();
         std::env::remove_var("HF2Q_TQ_NSG");
     }
 }
