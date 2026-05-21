@@ -50,12 +50,26 @@ use crate::kernel_registry::KernelRegistry;
 
 pub static SSM_CONV_SHADER_SOURCE: &str = include_str!("../shaders/ssm_conv.metal");
 
+/// ADR-034 task #90 Step 4b (2026-05-21) — per-position conv-state capture
+/// kernel for K=N speculative decoding rollback on hybrid Qwen 3.5/3.6.
+/// Source: `../shaders/ssm_conv_capture.metal` — port of MTPLX
+/// `gdn_capture.py:61-125`.
+pub static SSM_CONV_CAPTURE_SHADER_SOURCE: &str =
+    include_str!("../shaders/ssm_conv_capture.metal");
+
 /// Register SSM conv shader sources with the given kernel registry.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("ssm_conv_forward_f32", SSM_CONV_SHADER_SOURCE);
     registry.register_source("ssm_conv_forward_bf16", SSM_CONV_SHADER_SOURCE);
     registry.register_source("ssm_conv_state_update_f32", SSM_CONV_SHADER_SOURCE);
     registry.register_source("ssm_conv_state_update_bf16", SSM_CONV_SHADER_SOURCE);
+    // ADR-034 task #90 Step 4b — capture variant. Fused forward + per-position
+    // state capture in one dispatch (no separate state-update kernel needed
+    // because each per-position state is computed inline).
+    registry.register_source(
+        "ssm_conv_capture_forward_f32",
+        SSM_CONV_CAPTURE_SHADER_SOURCE,
+    );
 }
 
 /// Shape parameters for an ssm_conv dispatch.
@@ -269,6 +283,124 @@ pub fn dispatch_ssm_conv(
         ],
         state_grid,
         state_tg,
+    );
+
+    Ok(())
+}
+
+/// ADR-034 task #90 Step 4b (2026-05-21) — Dispatch the SSM conv kernel
+/// with **per-position state capture**, used for K=N speculative decoding
+/// rollback on hybrid Qwen 3.5/3.6. Fuses forward output (identical to
+/// `ssm_conv_forward_f32`) with per-position state capture in one kernel
+/// dispatch (no separate state-update kernel needed; the per-position
+/// state is computed inline at each token).
+///
+/// Output buffer `conv_capture` shape `[n_seqs, n_tokens, K-1, channels]`
+/// F32. The caller selects `conv_capture[s, accepted_idx, :, :]` on
+/// partial-reject as the new active conv state.
+///
+/// Determinism contract: `conv_capture[..., n_tokens-1, ...]` is
+/// byte-identical to the `new_state` produced by
+/// `ssm_conv_state_update_f32` for the same inputs.
+///
+/// Only F32 supported in this iteration (matches the production hf2q
+/// Qwen 3.5/3.6 path). BF16 variant can be added if a future arch needs it.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_ssm_conv_with_capture(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    x: &MlxBuffer,
+    kernel_w: &MlxBuffer,
+    old_state: &MlxBuffer,
+    y: &MlxBuffer,
+    conv_capture: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    params: SsmConvParams,
+) -> Result<()> {
+    // Validate forward inputs (channels/n_tokens/n_seqs/k_width/x/y/old_state/kernel_w).
+    // Construct a dummy new_state for the validate() signature (a real
+    // new_state isn't needed because we don't dispatch the state-update
+    // kernel — we capture inline).
+    if params.channels == 0 || params.n_tokens == 0 || params.n_seqs == 0 {
+        return Err(MlxError::InvalidArgument(
+            "ssm_conv_with_capture: channels, n_tokens, n_seqs must all be > 0".into(),
+        ));
+    }
+    if params.k_width < 2 {
+        return Err(MlxError::InvalidArgument(
+            "ssm_conv_with_capture: k_width must be >= 2".into(),
+        ));
+    }
+    if x.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "ssm_conv_with_capture: only F32 supported in this iter; got x dtype {}",
+            x.dtype()
+        )));
+    }
+
+    let x_elems = (params.channels as usize)
+        .checked_mul(params.n_tokens as usize)
+        .and_then(|v| v.checked_mul(params.n_seqs as usize))
+        .ok_or_else(|| MlxError::InvalidArgument("ssm_conv_with_capture: shape overflow".into()))?;
+    let s_elems = ((params.k_width - 1) as usize)
+        * (params.channels as usize)
+        * (params.n_seqs as usize);
+    let capture_elems = (params.n_seqs as usize)
+        * (params.n_tokens as usize)
+        * ((params.k_width - 1) as usize)
+        * (params.channels as usize);
+    let w_elems = (params.k_width as usize) * (params.channels as usize);
+
+    for (name, buf, exp) in [
+        ("x", x, x_elems),
+        ("y", y, x_elems),
+        ("kernel_w", kernel_w, w_elems),
+        ("old_state", old_state, s_elems),
+        ("conv_capture", conv_capture, capture_elems),
+    ] {
+        if buf.element_count() != exp {
+            return Err(MlxError::InvalidArgument(format!(
+                "ssm_conv_with_capture: {} element count {} != expected {}",
+                name, buf.element_count(), exp
+            )));
+        }
+        if buf.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "ssm_conv_with_capture: {} must be F32 (got {})",
+                name, buf.dtype()
+            )));
+        }
+    }
+
+    let pipeline = registry.get_pipeline("ssm_conv_capture_forward_f32", device)?;
+
+    // One thread per (c, t, s) — same dispatch grid as ssm_conv_forward.
+    let grid = MTLSize::new(
+        params.channels as u64,
+        params.n_tokens as u64,
+        params.n_seqs as u64,
+    );
+    // Same threadgroup packing strategy as ssm_conv_forward.
+    let tg_c = std::cmp::min(params.channels, 256).max(1);
+    let remain = 256u32 / tg_c;
+    let tg_t = std::cmp::min(params.n_tokens, remain).max(1);
+    let remain2 = (256u32 / (tg_c * tg_t)).max(1);
+    let tg_s = std::cmp::min(params.n_seqs, remain2).max(1);
+    let tg = MTLSize::new(tg_c as u64, tg_t as u64, tg_s as u64);
+
+    encoder.encode(
+        pipeline,
+        &[
+            (0, x),
+            (1, kernel_w),
+            (2, old_state),
+            (3, y),
+            (4, conv_capture),
+            (5, params_buf),
+        ],
+        grid,
+        tg,
     );
 
     Ok(())
