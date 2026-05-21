@@ -217,6 +217,57 @@ fn capture_output_state_byte_identical_qwen35_shape() {
     assert_byte_identical("qwen35 capture[last] == state_out", &cap_capture, &dec_state);
 }
 
+/// ADR-034 task #90 Step 5 (2026-05-21) — STRONG parity test for the
+/// INTERMEDIATE recurrent captures: capture[t] for any t ∈ [0, n_tokens)
+/// must equal state_out from a separate dispatch_gated_delta_net_decode
+/// call with n_tokens=t+1 (truncated q/k/v/g/beta inputs). This is the
+/// ground truth for K=N partial-reject rollback.
+#[test]
+fn capture_intermediate_t_matches_truncated_dispatch() {
+    let (device, mut registry) = setup();
+    let p_full = GatedDeltaNetParams {
+        d_k: 128, d_v: 128, n_k_heads: 16, n_v_heads: 32, n_tokens: 4, n_seqs: 1,
+    };
+    let (q, k, v, g, beta, state_in) = random_inputs(p_full, 0x517E);
+    let (_, _, cap_capture) =
+        run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p_full);
+    let state_elems = (p_full.d_k * p_full.d_v * p_full.n_v_heads * p_full.n_seqs) as usize;
+
+    for t in 0..(p_full.n_tokens as usize - 1) {
+        // Truncate inputs to n_tokens=t+1: each (q, k, v, g, beta) is
+        // [..., n_tokens, n_seqs] with n_tokens varying. The arrays are
+        // laid out token-major within each head, so truncating to t+1
+        // tokens means slicing [0 .. (t+1) * per_token_stride] for each.
+        let qk_per_tok = (p_full.d_k * p_full.n_k_heads * p_full.n_seqs) as usize;
+        let v_per_tok = (p_full.d_v * p_full.n_v_heads * p_full.n_seqs) as usize;
+        let sc_per_tok = (p_full.n_v_heads * p_full.n_seqs) as usize;
+        let q_trunc = q[..qk_per_tok * (t + 1)].to_vec();
+        let k_trunc = k[..qk_per_tok * (t + 1)].to_vec();
+        let v_trunc = v[..v_per_tok * (t + 1)].to_vec();
+        let g_trunc = g[..sc_per_tok * (t + 1)].to_vec();
+        let beta_trunc = beta[..sc_per_tok * (t + 1)].to_vec();
+        let p_trunc = GatedDeltaNetParams {
+            d_k: p_full.d_k, d_v: p_full.d_v,
+            n_k_heads: p_full.n_k_heads, n_v_heads: p_full.n_v_heads,
+            n_tokens: (t + 1) as u32, n_seqs: p_full.n_seqs,
+        };
+        let (_y_trunc, state_trunc) = run_decode(
+            &device, &mut registry,
+            &q_trunc, &k_trunc, &v_trunc, &g_trunc, &beta_trunc,
+            &state_in, p_trunc,
+        );
+
+        // capture[t] must byte-match state_trunc.
+        let cap_t_offset = t * state_elems;
+        let cap_t = &cap_capture[cap_t_offset..cap_t_offset + state_elems];
+        assert_byte_identical(
+            &format!("recurrent capture[t={t}] vs trunc(n_tokens={})", t + 1),
+            cap_t,
+            &state_trunc,
+        );
+    }
+}
+
 /// AC#3 with n_tokens > 1: the LAST slice of state_capture must equal
 /// state_out. The earlier slices should NOT equal final state (they
 /// represent intermediate per-position states).

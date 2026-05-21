@@ -229,6 +229,73 @@ fn capture_y_byte_identical_small_shape() {
     }
 }
 
+/// ADR-034 task #90 Step 5 (2026-05-21) — STRONG parity test for the
+/// INTERMEDIATE captures: capture[t] for any t ∈ [0, n_tokens) must
+/// equal new_state from a separate dispatch_ssm_conv call with
+/// n_tokens = t+1. This is the ground truth for K=N partial-reject
+/// rollback (caller selects capture[accepted_idx]).
+///
+/// Without this test, only capture[last_t] was verified.
+#[test]
+fn capture_intermediate_t_matches_truncated_dispatch() {
+    let (device, mut registry) = setup();
+    let n_full = 4u32;
+    let p_full = SsmConvParams {
+        channels: 64,
+        n_tokens: n_full,
+        n_seqs: 1,
+        k_width: 4,
+    };
+    let x_n = (p_full.channels * n_full * p_full.n_seqs) as usize;
+    let w_n = (p_full.k_width * p_full.channels) as usize;
+    let s_n = ((p_full.k_width - 1) * p_full.channels * p_full.n_seqs) as usize;
+    let mut seed = 0x517E;
+    let x = rand_vec(&mut seed, x_n, 0.1);
+    let w = rand_vec(&mut seed, w_n, 0.05);
+    let s = rand_vec(&mut seed, s_n, 0.05);
+
+    let (_cap_y, cap_capture) =
+        run_capture(&device, &mut registry, &x, &w, &s, p_full);
+
+    let per_t = ((p_full.k_width - 1) * p_full.channels) as usize;
+    let k_minus1 = (p_full.k_width - 1) as usize;
+    let channels = p_full.channels as usize;
+
+    // For each intermediate t in 0..n_full-1, run the legacy
+    // dispatch_ssm_conv with n_tokens = t+1 (truncated x) and verify
+    // that its new_state byte-matches capture[t] (after re-indexing).
+    for t in 0..(n_full as usize - 1) {
+        let truncated_x_n = (p_full.channels as usize) * (t + 1) * (p_full.n_seqs as usize);
+        let truncated_x = x[..truncated_x_n].to_vec();
+        let p_trunc = SsmConvParams {
+            channels: p_full.channels,
+            n_tokens: (t + 1) as u32,
+            n_seqs: p_full.n_seqs,
+            k_width: p_full.k_width,
+        };
+        let (_y_trunc, state_trunc) =
+            run_legacy(&device, &mut registry, &truncated_x, &w, &s, p_trunc);
+
+        // capture[t] layout: per_t elements in [K-1, channels] order
+        // (channels innermost). Re-index to compare with state_trunc
+        // which is [channels, K-1] (K-1 innermost).
+        let cap_t_offset = t * per_t;
+        let cap_t = &cap_capture[cap_t_offset..cap_t_offset + per_t];
+        for i in 0..k_minus1 {
+            for c in 0..channels {
+                let cap_idx = i * channels + c;
+                let legacy_idx = c * k_minus1 + i;
+                assert_eq!(
+                    cap_t[cap_idx].to_bits(),
+                    state_trunc[legacy_idx].to_bits(),
+                    "capture[t={t}] vs trunc(n_tokens={trunc_n}) at i={i} c={c}",
+                    trunc_n = t + 1,
+                );
+            }
+        }
+    }
+}
+
 /// AC#3: capture[t=0] DIFFERS from capture[last_t] for n_tokens > 1 —
 /// confirms the recurrence is non-degenerate and per-position writes
 /// are happening at every t (not just the last).
