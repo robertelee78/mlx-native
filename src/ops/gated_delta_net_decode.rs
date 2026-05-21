@@ -51,6 +51,13 @@ use super::gated_delta_net::GatedDeltaNetParams;
 pub static GATED_DELTA_NET_DECODE_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_decode.metal");
 
+/// ADR-034 task #90 (2026-05-21) — per-position state capture variant
+/// for K≥2 speculative decoding on hybrid Qwen 3.5/3.6 (the MTPLX-style
+/// rollback mechanism documented at
+/// [[project_adr034_mtplx_gdn_capture_2026_05_21]]).
+pub static GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE: &str =
+    include_str!("../shaders/gated_delta_net_decode_capture.metal");
+
 /// Hard cap: D_k must be ≤ 32 * MAX_NSG. NSG=4 → 128.
 pub const MAX_NSG: u32 = 4;
 
@@ -67,6 +74,23 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(
         "gated_delta_net_decode_f32_4",
         GATED_DELTA_NET_DECODE_SHADER_SOURCE,
+    );
+    // ADR-034 task #90 — per-position state-capture variants. Same
+    // math + threading as decode_f32_<NSG>; ALSO writes
+    // state_capture[D_k, D_v, n_v_heads, n_tokens, n_seqs] after each
+    // token's update so caller can roll back to any accepted prefix
+    // on partial-reject in K=N spec-decode.
+    registry.register_source(
+        "gated_delta_net_decode_capture_f32_1",
+        GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "gated_delta_net_decode_capture_f32_2",
+        GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "gated_delta_net_decode_capture_f32_4",
+        GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
     );
 }
 
@@ -219,6 +243,107 @@ pub fn dispatch_gated_delta_net_decode(
             (6, output),
             (7, state_out),
             (8, params_buf),
+        ],
+        grid_tgs,
+        tg,
+    );
+
+    Ok(())
+}
+
+/// ADR-034 task #90 (2026-05-21) — Dispatch the Gated DeltaNet decode
+/// kernel with **per-position state capture**, the MTPLX-style rollback
+/// mechanism that unlocks K≥2 speculative decoding on hybrid Qwen 3.5/3.6.
+///
+/// Identical math + identical state_out semantics to
+/// [`dispatch_gated_delta_net_decode`]; additionally writes the recurrent
+/// state AFTER each token's update to a caller-owned `state_capture`
+/// buffer of shape `[D_k, D_v, n_v_heads, n_tokens, n_seqs]` (innermost
+/// `D_k`, same as `state_in`/`state_out` extended with a `n_tokens` axis).
+///
+/// On partial-reject in K=N spec-decode, the caller reads
+/// `state_capture[..., accepted_idx, ...]` as the new active state for
+/// the `LinearAttnStateSlot` — solving the GDN rollback gap documented
+/// at task #86.
+///
+/// **Determinism contract**: `state_capture[..., n_tokens-1, ...]` is
+/// guaranteed equal to `state_out` (byte-identical; same compute, same
+/// thread writes both at the end of the token loop).
+///
+/// # Errors
+///
+/// Returns [`MlxError::InvalidArgument`] when:
+/// - `state_capture.element_count() != n_tokens * state_elems`
+/// - `state_capture.dtype() != F32`
+/// - any of the other validations from [`validate`] fail.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gated_delta_net_decode_with_capture(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    g: &MlxBuffer,
+    beta: &MlxBuffer,
+    state_in: &MlxBuffer,
+    output: &MlxBuffer,
+    state_out: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    state_capture: &MlxBuffer,
+    p: GatedDeltaNetParams,
+) -> Result<()> {
+    validate(&p, q, k, v, g, beta, state_in, output, state_out)?;
+
+    // Validate state_capture extends the state shape with n_tokens.
+    let state_elems =
+        (p.d_k as usize) * (p.d_v as usize) * (p.n_v_heads as usize) * (p.n_seqs as usize);
+    let capture_expected = state_elems * (p.n_tokens as usize);
+    if state_capture.element_count() != capture_expected {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode_with_capture: state_capture element count {} != \
+             expected {} (n_tokens={} × state_elems={})",
+            state_capture.element_count(), capture_expected, p.n_tokens, state_elems,
+        )));
+    }
+    if state_capture.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode_with_capture: state_capture must be f32 (got {})",
+            state_capture.dtype(),
+        )));
+    }
+
+    let nsg: u32 = p.d_k / 32;
+    let kernel_name = match nsg {
+        1 => "gated_delta_net_decode_capture_f32_1",
+        2 => "gated_delta_net_decode_capture_f32_2",
+        4 => "gated_delta_net_decode_capture_f32_4",
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "gated_delta_net_decode_with_capture: unsupported NSG={} (D_k={})",
+                other, p.d_k
+            )));
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+
+    let tg = MTLSize::new(32, nsg as u64, 1);
+    let grid_tgs = MTLSize::new((p.d_v / nsg) as u64, p.n_v_heads as u64, p.n_seqs as u64);
+
+    encoder.encode_threadgroups(
+        pipeline,
+        &[
+            (0, q),
+            (1, k),
+            (2, v),
+            (3, g),
+            (4, beta),
+            (5, state_in),
+            (6, output),
+            (7, state_out),
+            (8, params_buf),
+            (9, state_capture),
         ],
         grid_tgs,
         tg,
