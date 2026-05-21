@@ -295,15 +295,34 @@ pub fn dispatch_gated_delta_net_decode_with_capture(
 ) -> Result<()> {
     validate(&p, q, k, v, g, beta, state_in, output, state_out)?;
 
-    // Validate state_capture extends the state shape with n_tokens.
+    // Validate state_capture shape. The kernel uses `params.n_tokens` as
+    // the per-sequence token stride (capture_seq_stride = n_tokens *
+    // n_v_heads * D_v * D_k), so for n_seqs > 1 the buffer MUST be sized
+    // exactly to that layout — otherwise sequence offsets interleave
+    // incorrectly. For n_seqs == 1 (current Qwen 3.5/3.6 production),
+    // seq_stride is unused and the buffer may be larger than required
+    // (e.g. pre-allocated at max-spec-depth + 1 in
+    // HybridKvCache::ensure_la_capture). Codex audit 2026-05-21
+    // (task #90 Step 2) flagged the n_seqs>1 case — guard accordingly.
     let state_elems =
         (p.d_k as usize) * (p.d_v as usize) * (p.n_v_heads as usize) * (p.n_seqs as usize);
-    let capture_expected = state_elems * (p.n_tokens as usize);
-    if state_capture.element_count() != capture_expected {
+    let capture_required = state_elems * (p.n_tokens as usize);
+    if p.n_seqs > 1 {
+        if state_capture.element_count() != capture_required {
+            return Err(MlxError::InvalidArgument(format!(
+                "gated_delta_net_decode_with_capture: state_capture element count {} != \
+                 required {} (n_tokens={} × state_elems={}); strict EQUALITY required \
+                 when n_seqs > 1 (got n_seqs={}) because the per-sequence token stride \
+                 depends on params.n_tokens",
+                state_capture.element_count(), capture_required, p.n_tokens,
+                state_elems, p.n_seqs,
+            )));
+        }
+    } else if state_capture.element_count() < capture_required {
         return Err(MlxError::InvalidArgument(format!(
-            "gated_delta_net_decode_with_capture: state_capture element count {} != \
-             expected {} (n_tokens={} × state_elems={})",
-            state_capture.element_count(), capture_expected, p.n_tokens, state_elems,
+            "gated_delta_net_decode_with_capture: state_capture element count {} < \
+             required {} (n_tokens={} × state_elems={})",
+            state_capture.element_count(), capture_required, p.n_tokens, state_elems,
         )));
     }
     if state_capture.dtype() != DType::F32 {
