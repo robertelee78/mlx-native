@@ -2463,6 +2463,34 @@ impl CommandEncoder {
         // dispatch fires — leaving them as-is is correct.
     }
 
+    /// Commit, wait for GPU completion, AND rotate to a fresh command
+    /// buffer in one shot — for callers that need a CPU sync point
+    /// mid-pipeline but want to continue dispatching ops onto the
+    /// same logical encoder.
+    ///
+    /// Use case: hf2q's ADR-033 §Pi imatrix intercept fires
+    /// `commit_and_wait` to sync the input buffer before reading it
+    /// on the CPU (per `forward.rs` doc "Syncs the input buffer
+    /// (commit_and_wait via the shared encoder)"), then immediately
+    /// continues with the original matmul dispatch. Without rotating
+    /// the CB, the next dispatch hits Metal's
+    /// `MTLCommandBufferStatusCommitted` assertion at
+    /// `setCurrentCommandEncoder:` line 323.
+    ///
+    /// Equivalent to `commit_and_wait()` + an internal-only
+    /// `reset_command_buffer()`. Bumps `SYNC_COUNT` and
+    /// `CMD_BUF_COUNT` exactly once each.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MlxError::CommandBufferError` if the commit-side GPU
+    /// reports an error. The CB-rotation half is infallible.
+    pub fn commit_wait_and_rotate(&mut self) -> Result<()> {
+        self.commit_and_wait()?;
+        self.reset_command_buffer();
+        Ok(())
+    }
+
     /// Encode an `MTLSharedEvent` wait at `value` on the current CB.
     ///
     /// ADR-019:pairs with [`Self::encode_signal_event`]
