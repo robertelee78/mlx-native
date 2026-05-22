@@ -69,6 +69,16 @@ const BLOCK_Q5_1_BYTES: u32 = 24;
 const QK4_NL: u32 = 32;
 const BLOCK_IQ4_NL_BYTES: u32 = 18;
 
+/// IQ4_XS (4-bit non-linear codebook, 256-element super-block).
+/// Block layout: d(fp16) + scales_h(u16) + scales_l[4] + qs[128] = 136 bytes.
+/// 4.25 effective bpw — 8 sub-blocks of 32 elements, each with a 6-bit
+/// scale (4 bits in scales_l + 2 bits in scales_h), 4-bit indices into
+/// the SAME `kvalues_iq4nl` codebook used by IQ4_NL.
+/// ADR-033 §Pi 2026-05-22 — added to unblock apex-i-quality on Qwen MoE
+/// (every quality-tier mudler config uses IQ4_XS for mid-layer experts).
+/// Reference: ggml-common.h `block_iq4_xs` at :449.
+const BLOCK_IQ4_XS_BYTES: u32 = 136;
+
 // ---- Public types ----
 
 /// GGML quantization type.
@@ -103,6 +113,15 @@ pub enum GgmlType {
     /// block, 18 bytes per block. Each 4-bit index selects from a fixed
     /// 16-entry signed codebook `kvalues_iq4nl`. ADR-022 Phase 1.
     IQ4_NL,
+    /// Super-block 4-bit non-linear codebook quant (id 23 in GGML).
+    /// 256 values per super-block, 136 bytes per block. 8 sub-blocks of
+    /// 32 elements each, with 6-bit per-sub-block scales (4-bit
+    /// scales_l + 2-bit scales_h). Shares the `kvalues_iq4nl` codebook
+    /// with IQ4_NL. ADR-033 §Pi 2026-05-22 — added to unblock
+    /// apex-i-quality on Qwen MoE (canonical mid-layer expert quant).
+    /// Reader-side recognized for GGUF header parsing; Metal mul_mv /
+    /// mul_mm kernels follow in a subsequent commit.
+    IQ4_XS,
 }
 
 impl GgmlType {
@@ -119,6 +138,7 @@ impl GgmlType {
             GgmlType::I16 => 1,
             GgmlType::Q5_1 => QK5_1,
             GgmlType::IQ4_NL => QK4_NL,
+            GgmlType::IQ4_XS => QK6_K, // super-block size = QK_K = 256
         }
     }
 
@@ -135,6 +155,7 @@ impl GgmlType {
             GgmlType::I16 => 2,
             GgmlType::Q5_1 => BLOCK_Q5_1_BYTES,
             GgmlType::IQ4_NL => BLOCK_IQ4_NL_BYTES,
+            GgmlType::IQ4_XS => BLOCK_IQ4_XS_BYTES,
         }
     }
 
@@ -154,6 +175,10 @@ impl GgmlType {
             // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL dense mv ports.
             GgmlType::Q5_1 => "kernel_mul_mv_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
+            // ADR-033 §Pi 2026-05-22 — reader-side variant; Metal mv
+            // kernel port pending (Task #16). Dispatch will error
+            // until the kernel ships.
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 
@@ -174,6 +199,8 @@ impl GgmlType {
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_f32",
+            // ADR-033 §Pi 2026-05-22 — Metal mm kernel port pending (Task #16).
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 
@@ -195,6 +222,8 @@ impl GgmlType {
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_f32",
+            // ADR-033 §Pi 2026-05-22 — Metal tensor mm port pending (Task #16).
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 
@@ -215,6 +244,8 @@ impl GgmlType {
             GgmlType::Q6_K => "kernel_mul_mm_q6_K_tensor_v2_f32",
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_v2_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_v2_f32",
+            // ADR-033 §Pi 2026-05-22 — Metal tensor-v2 mm port pending (Task #16).
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 }

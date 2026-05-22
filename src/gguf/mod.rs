@@ -74,6 +74,7 @@ const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_I16: u32 = 17;
 const GGML_TYPE_IQ4_NL: u32 = 20;
+const GGML_TYPE_IQ4_XS: u32 = 23;
 
 /// IQ4_NL non-linear codebook constants. 16 signed entries selected by
 /// 4-bit indices in `block_iq4_nl::qs`. Verified byte-equal with
@@ -318,6 +319,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_Q6_K => Ok(GgmlType::Q6_K),
         GGML_TYPE_I16 => Ok(GgmlType::I16),
         GGML_TYPE_IQ4_NL => Ok(GgmlType::IQ4_NL),
+        GGML_TYPE_IQ4_XS => Ok(GgmlType::IQ4_XS),
         other => Err(MlxError::GgufParseError(format!(
             "unsupported GGML type ID {other}"
         ))),
@@ -909,6 +911,14 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::I16 => dequantize_i16(data, output),
         GgmlType::Q5_1 => dequantize_q5_1(data, output),
         GgmlType::IQ4_NL => dequantize_iq4_nl(data, output),
+        // ADR-033 §Pi 2026-05-22 — reader recognizes IQ4_XS for GGUF
+        // header parsing + LoadOptions; dequant + Metal kernels port
+        // in a subsequent commit (Task #16). Surfacing as a clear typed
+        // error at the dequant call site is preferable to a silent
+        // partial-load that would later fail in matmul with no context.
+        GgmlType::IQ4_XS => Err(MlxError::InvalidArgument(
+            "IQ4_XS dequantize: pending Metal kernel port (ADR-033 §Pi Task #16)".into(),
+        )),
     }
 }
 
@@ -1176,7 +1186,13 @@ impl GgufFile {
             | GgmlType::Q6_K
             | GgmlType::I16
             | GgmlType::Q5_1
-            | GgmlType::IQ4_NL => {
+            | GgmlType::IQ4_NL
+            // ADR-033 §Pi 2026-05-22 — IQ4_XS uses the same opaque-U8
+            // on-device storage as the other quantized blocks; the
+            // Metal matmul kernel reads them directly. (Kernel port:
+            // Task #16. Until then, hf2q's runtime will surface a
+            // typed "unsupported" at the dispatch site.)
+            | GgmlType::IQ4_XS => {
                 // Store raw GGML blocks as a U8 buffer. Where a Metal
                 // quantized-matmul kernel exists for the type, it consumes
                 // these blocks directly without an explicit dequant pass on

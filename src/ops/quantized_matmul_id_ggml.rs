@@ -84,6 +84,8 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // ADR-033 §Pi Task #16 — IQ4_XS _id kernel port pending.
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 
@@ -103,6 +105,8 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // ADR-033 §Pi Task #16 — IQ4_XS _id kernel port pending.
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 
@@ -121,6 +125,8 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // ADR-033 §Pi Task #16 — IQ4_XS _id kernel port pending.
+            GgmlType::IQ4_XS => "unsupported",
         }
     }
 }
@@ -546,7 +552,11 @@ fn dispatch_id_mv(
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         GgmlType::F32
         | GgmlType::F16
-        | GgmlType::I16 => {
+        | GgmlType::I16
+        // ADR-033 §Pi Task #16 — IQ4_XS _id Metal kernels not yet ported;
+        // dispatch surfaces the same typed error as F32/F16/I16 until
+        // the kernel + (nth0, nth1, align) tuning lands.
+        | GgmlType::IQ4_XS => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_id_ggml does not support {:?}",
                 params.ggml_type
