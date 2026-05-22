@@ -712,6 +712,14 @@ impl KernelRegistry {
             "kernel_fused_gate_up_silu_q5_K_f32".into(),
             fused_gate_up_silu_q5_K_src,
         );
+        // ADR-034 task #93 cont. 28 — fused gate+up+silu_mul Q6_K.
+        #[allow(non_snake_case)]
+        let fused_gate_up_silu_q6_K_src: &'static str =
+            include_str!("shaders/fused_gate_up_silu_q6_K.metal");
+        sources.insert(
+            "kernel_fused_gate_up_silu_q6_K_f32".into(),
+            fused_gate_up_silu_q6_K_src,
+        );
         let compute_g_beta_src: &'static str = include_str!("shaders/compute_g_beta.metal");
         sources.insert("compute_g_beta_f32".into(), compute_g_beta_src);
         let ssm_norm_gate_src: &'static str = include_str!("shaders/ssm_norm_gate.metal");
