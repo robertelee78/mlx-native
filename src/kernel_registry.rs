@@ -675,6 +675,13 @@ impl KernelRegistry {
         sources.insert("sigmoid_mul_bf16".into(), sigmoid_mul_src);
         let silu_mul_src: &'static str = include_str!("shaders/silu_mul.metal");
         sources.insert("silu_mul_f32".into(), silu_mul_src);
+        // ADR-034 task #93 — fused gate_proj + up_proj + silu_mul Q8_0.
+        let fused_gate_up_silu_q8_0_src: &'static str =
+            include_str!("shaders/fused_gate_up_silu_q8_0.metal");
+        sources.insert(
+            "kernel_fused_gate_up_silu_q8_0_f32".into(),
+            fused_gate_up_silu_q8_0_src,
+        );
         let compute_g_beta_src: &'static str = include_str!("shaders/compute_g_beta.metal");
         sources.insert("compute_g_beta_f32".into(), compute_g_beta_src);
         let ssm_norm_gate_src: &'static str = include_str!("shaders/ssm_norm_gate.metal");
