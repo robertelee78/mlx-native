@@ -985,3 +985,266 @@ fn adr_037_e1_3_fixed_square_dk256_long_prefix_2026_05_22() {
         "dk256 fixed-square 4-leaf tree (long prefix, kv=512)",
     );
 }
+
+// --------------------------------------------------------------------------
+// Phase E1.4 — dynamic asymmetric tree vs CPU reference
+// --------------------------------------------------------------------------
+//
+// Validates that the mask buffer correctly encodes ARBITRARY tree
+// topologies, not just regular ones. Mirrors the kind of tree EAGLE-2
+// dynamic expansion produces (top-K branches by confidence, with
+// uneven branching factor per depth).
+
+/// Build a tree mask from a parents array.
+///
+/// `parents[i]` is `Some(parent_idx)` for non-root nodes, `None` for
+/// the root. Tree-node `i` lives at absolute KV position `prefix_len + i`.
+/// Each tree-node attends the full prefix + itself + all ancestors.
+fn build_tree_mask_from_parents(
+    prefix_len: usize,
+    parents: &[Option<usize>],
+    mask_stride: usize,
+) -> Vec<f32> {
+    let q_seq_len = parents.len();
+    let kv_seq_len = prefix_len + q_seq_len;
+    assert!(mask_stride >= kv_seq_len);
+    // Exactly one root.
+    assert_eq!(
+        parents.iter().filter(|p| p.is_none()).count(),
+        1,
+        "tree must have exactly one root"
+    );
+
+    let mut mask = vec![TREE_MASK_MASKED; q_seq_len * mask_stride];
+
+    for iq1 in 0..q_seq_len {
+        let row_base = iq1 * mask_stride;
+        // Prefix: always attended.
+        for k_pos in 0..prefix_len {
+            mask[row_base + k_pos] = TREE_MASK_ATTENDED;
+        }
+        // Self + all ancestors.
+        let mut cur = Some(iq1);
+        while let Some(node) = cur {
+            mask[row_base + prefix_len + node] = TREE_MASK_ATTENDED;
+            cur = parents[node];
+        }
+    }
+
+    mask
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_tree_matches_cpu(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    prefix_len: usize,
+    parents: &[Option<usize>],
+    kv_capacity: u32,
+    scale: f32,
+    seed: u64,
+    epsilon: f32,
+    label: &str,
+) {
+    let q_seq_len = parents.len() as u32;
+    let kv_seq_len = (prefix_len + q_seq_len as usize) as u32;
+    let mask_stride = kv_seq_len;
+
+    assert!(kv_capacity >= kv_seq_len, "{label}: kv_capacity too small");
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let q_elems = (num_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let kv_elems = (num_kv_heads as usize) * (kv_capacity as usize) * (head_dim as usize);
+
+    let mut q_data = vec![0.0f32; q_elems];
+    let mut k_data = vec![0.0f32; kv_elems];
+    let mut v_data = vec![0.0f32; kv_elems];
+    fill_random(&mut q_data, seed);
+    fill_random(&mut k_data, seed + 10_000);
+    fill_random(&mut v_data, seed + 20_000);
+
+    let mask_data = build_tree_mask_from_parents(prefix_len, parents, mask_stride as usize);
+
+    let gpu_out = run_tree_attention_gpu(
+        &device,
+        &mut registry,
+        &q_data,
+        &k_data,
+        &v_data,
+        &mask_data,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        q_seq_len,
+        kv_seq_len,
+        kv_capacity,
+        mask_stride,
+        scale,
+    );
+
+    let cpu_out = cpu_tree_sdpa(
+        &q_data,
+        &k_data,
+        &v_data,
+        &mask_data,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        q_seq_len as usize,
+        kv_seq_len as usize,
+        kv_capacity as usize,
+        mask_stride as usize,
+        scale,
+    );
+
+    assert_close(&gpu_out, &cpu_out, epsilon, label);
+}
+
+/// Canonical asymmetric tree for E1.4.
+///
+/// Topology (8 nodes, max depth 4):
+///   0 (root)
+///   ├── 1 ── 4 ── 7
+///   │   └── 5
+///   ├── 2 ── 6
+///   └── 3
+///
+/// Branching factor by depth: 3, varies (2, 1, 0), 1, 0.
+fn asymmetric_tree_parents() -> Vec<Option<usize>> {
+    vec![
+        None,    // 0 = root
+        Some(0), // 1 ← 0
+        Some(0), // 2 ← 0
+        Some(0), // 3 ← 0
+        Some(1), // 4 ← 1
+        Some(1), // 5 ← 1
+        Some(2), // 6 ← 2
+        Some(4), // 7 ← 4
+    ]
+}
+
+#[test]
+fn adr_037_e1_4_dynamic_asymmetric_dk256_2026_05_22() {
+    let parents = asymmetric_tree_parents();
+    assert_tree_matches_cpu(
+        4, 4, 256,
+        24,                         // prefix_len → kv = 24 + 8 = 32
+        &parents,
+        64,
+        1.0 / (256.0_f32).sqrt(),
+        24681,
+        1e-2,
+        "dk256 dynamic asymmetric tree (8 nodes, varying branching)",
+    );
+}
+
+#[test]
+fn adr_037_e1_4_dynamic_asymmetric_dk256_gqa_2026_05_22() {
+    let parents = asymmetric_tree_parents();
+    assert_tree_matches_cpu(
+        16, 8, 256,
+        24,
+        &parents,
+        64,
+        1.0,
+        13579,
+        1e-2,
+        "dk256 GQA dynamic asymmetric tree",
+    );
+}
+
+#[test]
+fn adr_037_e1_4_dynamic_asymmetric_dk512_2026_05_22() {
+    let parents = asymmetric_tree_parents();
+    assert_tree_matches_cpu(
+        4, 4, 512,
+        24,
+        &parents,
+        64,
+        1.0 / (512.0_f32).sqrt(),
+        86420,
+        1e-2,
+        "dk512 dynamic asymmetric tree",
+    );
+}
+
+#[test]
+fn adr_037_e1_4_dynamic_asymmetric_chain_root_2026_05_22() {
+    // Degenerate tree: linear chain [0 → 1 → 2 → 3 → 4]. Should
+    // reduce to causal qL=5 at kv_seq_len=32 — but goes through
+    // the explicit-mask path. Equivalent topology to the test in
+    // E1.2 chain_parity at qL=5, validated via CPU reference here
+    // (not byte-identity since CPU uses f64).
+    let parents: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(2), Some(3)];
+    assert_tree_matches_cpu(
+        4, 4, 256,
+        27,
+        &parents,
+        64,
+        1.0 / (256.0_f32).sqrt(),
+        97531,
+        1e-2,
+        "dk256 chain-as-degenerate-tree (5-node line, CPU ref)",
+    );
+}
+
+// --------------------------------------------------------------------------
+// Phase E1.5 — prefix+tree combined (long prefix + small tree on top)
+// --------------------------------------------------------------------------
+//
+// Production-shaped: long context (kv ~512+) with small tree budget
+// on top. Stress-tests interaction of NWG>1 reduce path, multi-query
+// kernel, and arbitrary tree mask all at once.
+
+#[test]
+fn adr_037_e1_5_prefix_plus_tree_dk256_long_2026_05_22() {
+    // 504-token natural prefix + 8-node asymmetric tree = kv 512.
+    // Mirrors production EAGLE-3 at moderately long context.
+    let parents = asymmetric_tree_parents();
+    assert_tree_matches_cpu(
+        4, 4, 256,
+        504,                         // long prefix → kv = 512
+        &parents,
+        1024,
+        1.0 / (256.0_f32).sqrt(),
+        11_223_344,
+        1e-2,
+        "dk256 prefix+tree combined (prefix=504, tree=8, kv=512)",
+    );
+}
+
+#[test]
+fn adr_037_e1_5_prefix_plus_tree_dk256_gqa_long_2026_05_22() {
+    // Same as above but with production GQA shape (e.g. Qwen 3.6 27B
+    // dense uses 64 q-heads / 8 kv-heads in many configs).
+    let parents = asymmetric_tree_parents();
+    assert_tree_matches_cpu(
+        16, 8, 256,
+        504,
+        &parents,
+        1024,
+        1.0,
+        55_667_788,
+        1e-2,
+        "dk256 GQA prefix+tree combined (prefix=504, tree=8, kv=512)",
+    );
+}
+
+#[test]
+fn adr_037_e1_5_prefix_plus_tree_dk512_long_2026_05_22() {
+    // dk512 variant for full kernel-template coverage.
+    let parents = asymmetric_tree_parents();
+    assert_tree_matches_cpu(
+        4, 4, 512,
+        504,
+        &parents,
+        1024,
+        1.0 / (512.0_f32).sqrt(),
+        99_887_766,
+        1e-2,
+        "dk512 prefix+tree combined (prefix=504, tree=8, kv=512)",
+    );
+}
