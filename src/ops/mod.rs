@@ -65,6 +65,8 @@ pub mod flash_attn_prefill_d512;
 pub mod flash_attn_prefill_mask;
 pub mod flash_attn_vec;
 pub mod flash_attn_vec_tq;
+// ADR-037 Phase E1.1 (2026-05-22) — EAGLE-3 + dynamic tree port.
+pub mod tree_attention;
 pub mod flash_attn_vec_tq_hb;
 pub mod flash_attn_vec_hybrid;
 pub mod flash_attn_vec_peer_port_f16;

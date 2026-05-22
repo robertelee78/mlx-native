@@ -551,6 +551,18 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_f16kv_dk256".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_f16kv_dk512".into(), flash_attn_vec_src);
 
+        // ADR-037 Phase E1.1 (2026-05-22) — tree-attention kernel for
+        // EAGLE-3 + dynamic tree speculative decoding. Variant of
+        // flash_attn_vec consuming an explicit per-(query, kv_pos) mask
+        // buffer instead of implicit causal. Reduce pass reuses
+        // flash_attn_vec_reduce_* (identical output layout).
+        let tree_attention_src: &'static str =
+            include_str!("shaders/tree_attention.metal");
+        sources.insert("tree_attention_dk256".into(), tree_attention_src);
+        sources.insert("tree_attention_dk512".into(), tree_attention_src);
+        sources.insert("tree_attention_f16kv_dk256".into(), tree_attention_src);
+        sources.insert("tree_attention_f16kv_dk512".into(), tree_attention_src);
+
         // RoPE, normalization, activation kernels (Story 1.4)
         let rope_src: &'static str = include_str!("shaders/rope.metal");
         sources.insert("rope_f32".into(), rope_src);
