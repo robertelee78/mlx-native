@@ -255,8 +255,15 @@ pub fn flash_attn_vec(
     // without this barrier, causing the reduce to read stale/partial `tmp` data.
     if nwg > 1 {
         encoder.memory_barrier();
+        // ADR-034 task #89 (2026-05-21) — nrows = num_heads * q_seq_len.
+        // At q_seq_len=1 this is byte-identical to pre-task-#89 (was just
+        // num_heads). At q_seq_len>1, the reduce dispatches one
+        // threadgroup per (query, head) pair, matching the main kernel's
+        // partial-output layout `dst[rid * DV4 * NWG + ...]` where
+        // rid in [0, num_heads * q_seq_len).
+        let total_rows = params.num_heads * params.q_seq_len;
         let reduce_params = FlashAttnVecReduceParamsGpu {
-            nrows: params.num_heads,
+            nrows: total_rows,
         };
 
         let reduce_kernel = match head_dim {
@@ -267,8 +274,8 @@ pub fn flash_attn_vec(
         let reduce_pipeline =
             registry.get_pipeline(reduce_kernel, device.metal_device())?;
 
-        // Grid: (num_heads, 1, 1), Threadgroup: (32*NWG, 1, 1)
-        let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
+        // Grid: (num_heads * q_seq_len, 1, 1), Threadgroup: (32*NWG, 1, 1)
+        let reduce_tg = MTLSize::new(total_rows as u64, 1, 1);
         let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
 
         // Annotate reads/writes for the capture graph so the reorder pass
@@ -312,8 +319,22 @@ pub fn flash_attn_vec(
 /// The temp buffer stores partial results from NWG workgroups:
 /// - `nrows * head_dim * NWG` floats for the partial output vectors
 /// - `nrows * 2 * NWG` floats for the S and M values
+///
+/// ADR-034 task #89 (2026-05-21) — `nrows = num_heads * q_seq_len`. At
+/// the default `q_seq_len = 1` this returns the same value as
+/// pre-task-#89 (`num_heads * NWG * (head_dim + 2) * 4`). For
+/// `q_seq_len > 1` the buffer scales linearly with qL.
 pub fn tmp_buffer_bytes(num_heads: u32, head_dim: u32) -> usize {
-    let nrows = num_heads as usize;
+    tmp_buffer_bytes_with_qL(num_heads, head_dim, 1)
+}
+
+/// ADR-034 task #89 (2026-05-21) — qL-aware temp buffer size. Callers
+/// that dispatch with `q_seq_len > 1` (spec-decode verify) must use
+/// this to size the tmp buffer correctly. `tmp_buffer_bytes(...)` is
+/// kept as the qL=1 wrapper for backward compatibility.
+#[allow(non_snake_case)]
+pub fn tmp_buffer_bytes_with_qL(num_heads: u32, head_dim: u32, q_seq_len: u32) -> usize {
+    let nrows = (num_heads as usize) * (q_seq_len as usize);
     let nwg = NWG as usize;
     let dv = head_dim as usize;
     // DV * NWG floats per row for output, plus 2 * NWG floats per row for S/M.

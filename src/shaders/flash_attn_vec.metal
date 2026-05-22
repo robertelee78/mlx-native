@@ -311,7 +311,14 @@ kernel void flash_attn_vec_impl(
     //   dst[rid * DV4 * NWG + NWG * i + iwg] = output float4 at dim chunk i
     //   After the DV data: S and M values for each (row, workgroup).
     if (sgitg == 0) {
-        const int64_t nrows = params.n_heads;  // For batch=1
+        // ADR-034 task #89 (2026-05-21) — generalized to qL >= 1.
+        // For qL=1: nrows = n_heads * 1 = n_heads (byte-identical to
+        // pre-task-#89). For qL>1: nrows = n_heads * qL, which is the
+        // correct count of (query, head) output rows. The S/M section
+        // starts at offset `nrows * DV * NWG` in `dst`, so this MUST
+        // include the qL factor or the S/M writes collide with the
+        // data section.
+        const int64_t nrows = (int64_t)params.n_heads * (int64_t)params.qL;
         const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
 
         device float4 *dst4 = (device float4 *)dst;
