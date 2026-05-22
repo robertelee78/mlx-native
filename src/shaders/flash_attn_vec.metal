@@ -428,6 +428,12 @@ kernel void flash_attn_vec_reduce(
 
 typedef decltype(flash_attn_vec_reduce<256>) flash_attn_vec_reduce_t;
 
+// ADR-037 Phase E4b.6 (2026-05-22) — dk128 added for tree_attention's
+// Qwen 3.6 27B target (head_dim=128). DV4 = 128/4 = 32 stays within
+// the NWG <= 32 reducer contract.
+template [[host_name("flash_attn_vec_reduce_dk128")]]
+kernel flash_attn_vec_reduce_t flash_attn_vec_reduce<128>;
+
 template [[host_name("flash_attn_vec_reduce_dk256")]]
 kernel flash_attn_vec_reduce_t flash_attn_vec_reduce<256>;
 

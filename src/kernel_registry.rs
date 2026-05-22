@@ -545,6 +545,7 @@ impl KernelRegistry {
             include_str!("shaders/flash_attn_vec.metal");
         sources.insert("flash_attn_vec_dk256".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_dk512".into(), flash_attn_vec_src);
+        sources.insert("flash_attn_vec_reduce_dk128".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_reduce_dk256".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_reduce_dk512".into(), flash_attn_vec_src);
         // F16 KV variants (Phase 4a)
@@ -558,8 +559,10 @@ impl KernelRegistry {
         // flash_attn_vec_reduce_* (identical output layout).
         let tree_attention_src: &'static str =
             include_str!("shaders/tree_attention.metal");
+        sources.insert("tree_attention_dk128".into(), tree_attention_src);
         sources.insert("tree_attention_dk256".into(), tree_attention_src);
         sources.insert("tree_attention_dk512".into(), tree_attention_src);
+        sources.insert("tree_attention_f16kv_dk128".into(), tree_attention_src);
         sources.insert("tree_attention_f16kv_dk256".into(), tree_attention_src);
         sources.insert("tree_attention_f16kv_dk512".into(), tree_attention_src);
 

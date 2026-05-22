@@ -24,6 +24,7 @@ pub static FLASH_ATTN_VEC_SHADER_SOURCE: &str =
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("flash_attn_vec_dk256", FLASH_ATTN_VEC_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_dk512", FLASH_ATTN_VEC_SHADER_SOURCE);
+    registry.register_source("flash_attn_vec_reduce_dk128", FLASH_ATTN_VEC_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_reduce_dk256", FLASH_ATTN_VEC_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_reduce_dk512", FLASH_ATTN_VEC_SHADER_SOURCE);
     // F16 KV variants (Phase 4a)

@@ -37,8 +37,10 @@ pub static TREE_ATTENTION_SHADER_SOURCE: &str =
 /// `register()` helpers exist for tooling that builds incremental
 /// registries.
 pub fn register(registry: &mut KernelRegistry) {
+    registry.register_source("tree_attention_dk128", TREE_ATTENTION_SHADER_SOURCE);
     registry.register_source("tree_attention_dk256", TREE_ATTENTION_SHADER_SOURCE);
     registry.register_source("tree_attention_dk512", TREE_ATTENTION_SHADER_SOURCE);
+    registry.register_source("tree_attention_f16kv_dk128", TREE_ATTENTION_SHADER_SOURCE);
     registry.register_source("tree_attention_f16kv_dk256", TREE_ATTENTION_SHADER_SOURCE);
     registry.register_source("tree_attention_f16kv_dk512", TREE_ATTENTION_SHADER_SOURCE);
 }
@@ -217,9 +219,11 @@ fn validate_buffers(
 }
 
 fn validate_params(params: &TreeAttentionParams) -> Result<()> {
-    if params.head_dim != 256 && params.head_dim != 512 {
+    // ADR-037 Phase E4b.6 (2026-05-22): added 128 for Qwen 3.6 27B.
+    // Template `static_assert(DK % 32 == 0)` satisfied for all three.
+    if params.head_dim != 128 && params.head_dim != 256 && params.head_dim != 512 {
         return Err(MlxError::InvalidArgument(format!(
-            "tree_attention: head_dim must be 256 or 512, got {}",
+            "tree_attention: head_dim must be 128, 256, or 512, got {}",
             params.head_dim
         )));
     }
@@ -317,8 +321,10 @@ pub fn tree_attention(
     // Q/tree_mask/output/tmp are always F32 (validated below).
     let kv_is_f16 = k.dtype() == DType::F16;
     let kernel_name = match (head_dim, kv_is_f16) {
+        (128, false) => "tree_attention_dk128",
         (256, false) => "tree_attention_dk256",
         (512, false) => "tree_attention_dk512",
+        (128, true)  => "tree_attention_f16kv_dk128",
         (256, true)  => "tree_attention_f16kv_dk256",
         (512, true)  => "tree_attention_f16kv_dk512",
         _ => unreachable!(),
@@ -363,6 +369,7 @@ pub fn tree_attention(
         let reduce_params = FlashAttnVecReduceParamsGpu { nrows: total_rows };
 
         let reduce_kernel = match head_dim {
+            128 => "flash_attn_vec_reduce_dk128",
             256 => "flash_attn_vec_reduce_dk256",
             512 => "flash_attn_vec_reduce_dk512",
             _ => unreachable!(),
@@ -457,10 +464,11 @@ mod tests {
 
     #[test]
     fn test_validate_params_bad_head_dim() {
+        // 64 isn't supported (only 128, 256, 512 are templated).
         let p = TreeAttentionParams {
             num_heads: 16,
             num_kv_heads: 8,
-            head_dim: 128,
+            head_dim: 64,
             kv_seq_len: 100,
             kv_capacity: 1024,
             scale: 1.0,
@@ -468,6 +476,22 @@ mod tests {
             mask_stride: 100,
         };
         assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn adr_037_e4b6_validate_params_accepts_dk128_2026_05_22() {
+        // Qwen 3.6 27B uses head_dim=128. Added by Phase E4b.6.
+        let p = TreeAttentionParams {
+            num_heads: 40,
+            num_kv_heads: 8,
+            head_dim: 128,
+            kv_seq_len: 64,
+            kv_capacity: 256,
+            scale: 1.0,
+            q_seq_len: 1,
+            mask_stride: 64,
+        };
+        validate_params(&p).expect("dk128 should validate");
     }
 
     #[test]

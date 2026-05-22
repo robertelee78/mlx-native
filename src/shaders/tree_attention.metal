@@ -287,6 +287,14 @@ kernel void tree_attention_impl(
 
 typedef decltype(tree_attention_impl<256, 256, float>) tree_attention_f32kv_t;
 
+// ADR-037 Phase E4b.6 (2026-05-22) — dk128 added for Qwen 3.6 27B
+// (head_dim=128). The shader template's `static_assert(DK % 32 == 0)`
+// is satisfied (128 % 32 == 0). Same byte-identity contract applies
+// at tree=1 — verified by new parity tests in
+// `tests/test_tree_attention_e1_1_parity.rs`.
+template [[host_name("tree_attention_dk128")]]
+kernel tree_attention_f32kv_t tree_attention_impl<128, 128, float>;
+
 template [[host_name("tree_attention_dk256")]]
 kernel tree_attention_f32kv_t tree_attention_impl<256, 256, float>;
 
@@ -294,6 +302,9 @@ template [[host_name("tree_attention_dk512")]]
 kernel tree_attention_f32kv_t tree_attention_impl<512, 512, float>;
 
 typedef decltype(tree_attention_impl<256, 256, half>) tree_attention_f16kv_t;
+
+template [[host_name("tree_attention_f16kv_dk128")]]
+kernel tree_attention_f16kv_t tree_attention_impl<128, 128, half>;
 
 template [[host_name("tree_attention_f16kv_dk256")]]
 kernel tree_attention_f16kv_t tree_attention_impl<256, 256, half>;
