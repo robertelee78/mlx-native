@@ -682,6 +682,13 @@ impl KernelRegistry {
             "kernel_fused_gate_up_silu_q8_0_f32".into(),
             fused_gate_up_silu_q8_0_src,
         );
+        // ADR-034 task #94 — fused dual Q4_0 projection (FA Q/K/V/gate fuse).
+        let fused_dual_proj_q4_0_src: &'static str =
+            include_str!("shaders/fused_dual_proj_q4_0.metal");
+        sources.insert(
+            "kernel_fused_dual_proj_q4_0_f32".into(),
+            fused_dual_proj_q4_0_src,
+        );
         let compute_g_beta_src: &'static str = include_str!("shaders/compute_g_beta.metal");
         sources.insert("compute_g_beta_f32".into(), compute_g_beta_src);
         let ssm_norm_gate_src: &'static str = include_str!("shaders/ssm_norm_gate.metal");

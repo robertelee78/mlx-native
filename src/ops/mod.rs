@@ -20,6 +20,7 @@ pub mod gather_bench;
 pub mod hadamard;
 pub mod hadamard_quantize_kv;
 pub mod encode_helpers;
+pub mod fused_dual_proj_q4_0;
 pub mod fused_gate_up_silu_q8_0;
 pub mod fused_head_norm_rope;
 pub mod fused_norm_add;
