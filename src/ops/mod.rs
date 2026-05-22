@@ -24,6 +24,8 @@ pub mod fused_dual_proj_q4_0;
 pub mod fused_gate_up_silu_iq4_nl;
 #[allow(non_snake_case)]
 pub mod fused_gate_up_silu_q4_K;
+#[allow(non_snake_case)]
+pub mod fused_gate_up_silu_q5_K;
 pub mod fused_gate_up_silu_q8_0;
 pub mod fused_head_norm_rope;
 pub mod fused_norm_add;
