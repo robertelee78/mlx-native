@@ -127,6 +127,17 @@ constant int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113
 };
 
+// IQ4_XS (ADR-033 §Pi 2026-05-22): super-block 4-bit codebook quant.
+// 256 elements per super-block, 8 × 32-element sub-blocks each with a
+// 6-bit signed scale (4-bit scales_l + 2-bit scales_h). 136 bytes.
+// Reference: ggml-common.h:444-450 `block_iq4_xs`.
+typedef struct {
+    half     d;
+    uint16_t scales_h;
+    uint8_t  scales_l[QK_K / 64];  // 4
+    uint8_t  qs[QK_K / 2];         // 128
+} block_iq4_xs;
+
 // ---- Q5_1 dot product helper (ADR-022 Phase 1) ----
 //
 // Mirrors `block_q_n_dot_y<block_q5_1>` from llama.cpp
@@ -215,6 +226,30 @@ inline float block_iq4_nl_dot_y(
     }
 
     return d * acc;
+}
+
+// IQ4_XS dot helper — see comment in quantized_matmul_ggml.metal for full
+// docs. Processes ONE 32-element sub-block of a super-block.
+// `ib32` ∈ [0,7] selects sub-block; `il` ∈ {0, 8} selects which 8-element
+// half of the sub-block to process.
+inline float block_iq4_xs_dot_y(
+    device const block_iq4_xs * qb,
+    thread float * yl_raw,
+    int ib32,
+    int il
+) {
+    const float d = qb->d;
+    const int ls = ((qb->scales_l[ib32 / 2] >> 4*(ib32 % 2)) & 0xf)
+                 | (((qb->scales_h >> 2*ib32) & 0x3) << 4);
+    const float dl = d * (float)(ls - 32);
+    float acc = 0.f;
+    device const uint8_t * qs = qb->qs + 16*ib32 + il;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t b = qs[i];
+        acc += yl_raw[i]     * (float)kvalues_iq4nl[b & 0x0F];
+        acc += yl_raw[i + 8] * (float)kvalues_iq4nl[(b >> 4) & 0x0F];
+    }
+    return dl * acc;
 }
 
 // ---- Q4_0 dot product helper (identical to quantized_matmul_ggml.metal) ----
@@ -725,6 +760,79 @@ kernel void kernel_mul_mv_id_q5_1_f32(
 // Reference: llama.cpp `kernel_mul_mv_iq4_nl_f32_impl` at
 // ggml-metal.metal (template instantiated at line 10359 via
 // kernel_mul_mv_id<mmv_fn<...>>); inlined here in mlx-native style.
+
+// ====================================================================
+// IQ4_XS expert-indexed mat-vec kernel (ADR-033 §Pi Task #16 2026-05-22)
+// ====================================================================
+//
+// MoE-routed variant of `kernel_mul_mv_iq4_xs_f32` (see
+// quantized_matmul_ggml.metal). Each output_row picks an expert id
+// from `ids[output_row]` and reads that expert's weight slab
+// (offset = expert_id * expert_stride). Geometry mirrors IQ4_NL's
+// mv_id (N_SIMDGROUP=2, N_DST=4, threadgroup=(8,8,1)).
+//
+// Reference: llama.cpp `kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>`
+// at ggml-metal.metal:10432. Inlined here in mlx-native style (no
+// template metaprogramming).
+
+kernel void kernel_mul_mv_id_iq4_xs_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+
+    const int nb = p.ne00 / QK_K; // super-blocks per row
+    const int r0 = tgpig.x;
+    const int output_row = tgpig.y;
+
+    if (output_row >= (int)p.ne1) return;
+
+    const uint token_idx = output_row / p.top_k;
+    const uint expert_id = ids[output_row];
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    device const block_iq4_xs * x = (device const block_iq4_xs *)((device const char *)src0
+                                  + expert_id * p.expert_stride) + first_row * nb;
+
+    device const float * y = src1 + token_idx * p.ne10;
+
+    // tiisg partitions super-block × (sub-block, half) work — see
+    // kernel_mul_mv_iq4_xs_f32 comment for derivation.
+    const int ix  = tiisg / 16; // 0 or 1
+    const int it  = tiisg % 16; // 0..15
+    const int ib32 = it / 2;
+    const int il   = (it % 2) * 8;
+
+    float yl_raw[16];
+    float sumf[nr] = {0.f};
+
+    for (int ibl = ix; ibl < nb; ibl += 2) {
+        device const float * yb = y + ibl * QK_K + ib32 * 32 + il;
+        for (int i = 0; i < 8; i++) {
+            yl_raw[i]     = yb[i];
+            yl_raw[i + 8] = yb[i + 16];
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_iq4_xs_dot_y(x + ibl + row*nb, yl_raw, ib32, il);
+        }
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
 
 kernel void kernel_mul_mv_id_iq4_nl_f32(
     device const  char  * src0   [[buffer(0)]],
