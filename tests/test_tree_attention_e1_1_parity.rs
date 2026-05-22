@@ -598,3 +598,390 @@ fn adr_037_e1_1_tree1_parity_dk256_unaligned_2026_05_22() {
         "dk256 unaligned-kv_seq_len tree=1 parity",
     );
 }
+
+// --------------------------------------------------------------------------
+// Phase E1.3 — fixed-square tree (non-causal within tree segment) vs CPU
+// --------------------------------------------------------------------------
+//
+// E1.1 and E1.2 verify byte-identity against flash_attn_vec for masks that
+// reduce to implicit causal. E1.3+ uses non-causal masks that have no
+// flash_attn_vec equivalent — these need a CPU reference SDPA that accepts
+// an explicit mask buffer. CPU reference uses f64 internally; comparison
+// is within an absolute-error tolerance, not bit-equality.
+
+/// Generic CPU reference SDPA with explicit mask buffer.
+///
+/// Q: [num_heads, q_seq_len, head_dim]   ← MATCHES kernel input layout
+///                                         (kernel reads Q at offset
+///                                         `(iq2 * q_l + iq1) * DK`)
+/// K: [num_kv_heads, kv_capacity, head_dim]   (first kv_seq_len valid)
+/// V: [num_kv_heads, kv_capacity, head_dim]
+/// mask: [q_seq_len, mask_stride]  cell (i, j) ∈ {TREE_MASK_ATTENDED,
+///                                              TREE_MASK_MASKED}
+///
+/// Returns output in **`[q_seq_len, num_heads, head_dim]` layout** —
+/// matches the GPU kernel's output where row index `rid = iq2 +
+/// iq1 * n_heads`. Reading `output[iq1 * n_heads * dim + h * dim + d]`
+/// is `(query, head, dim)` order.
+///
+/// Mirrors the math the GPU kernel performs: softmax over masked dot
+/// products with `scale`. Uses f64 accumulator for the dot product +
+/// softmax-renormalize chain to match the per-thread-precision the
+/// Metal kernel achieves via on-chip half/float interleaving.
+#[allow(clippy::too_many_arguments)]
+fn cpu_tree_sdpa(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    kv_capacity: usize,
+    mask_stride: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let heads_per_kv = num_heads / num_kv_heads;
+    let mut output = vec![0.0f32; num_heads * q_seq_len * head_dim];
+
+    for h in 0..num_heads {
+        let kv_h = h / heads_per_kv;
+        let k_head_base = kv_h * kv_capacity * head_dim;
+        let v_head_base = kv_h * kv_capacity * head_dim;
+
+        for iq1 in 0..q_seq_len {
+            let q_offset = h * q_seq_len * head_dim + iq1 * head_dim;
+            let mask_row_base = iq1 * mask_stride;
+
+            // Gather attended positions and their dot products.
+            let mut scores = Vec::<(usize, f32)>::with_capacity(kv_seq_len);
+            for k_pos in 0..kv_seq_len {
+                let cell = mask[mask_row_base + k_pos];
+                if cell == TREE_MASK_MASKED {
+                    continue;
+                }
+                debug_assert_eq!(
+                    cell, TREE_MASK_ATTENDED,
+                    "mask cells must be one of the sentinel values"
+                );
+
+                let k_off = k_head_base + k_pos * head_dim;
+                let mut dot = 0.0f64;
+                for d in 0..head_dim {
+                    dot += q[q_offset + d] as f64 * k[k_off + d] as f64;
+                }
+                scores.push((k_pos, dot as f32 * scale));
+            }
+
+            if scores.is_empty() {
+                continue; // all-masked row → zero output (kernel does the same)
+            }
+
+            // Softmax (max-renorm for stability).
+            let max_score = scores
+                .iter()
+                .map(|(_, s)| *s)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exp_scores: Vec<f32> =
+                scores.iter().map(|(_, s)| (*s - max_score).exp()).collect();
+            let sum_exp: f32 = exp_scores.iter().sum();
+            let inv_sum = if sum_exp == 0.0 { 0.0 } else { 1.0 / sum_exp };
+
+            // Weighted V sum. Output layout is [query, head, dim] —
+            // matches kernel rid = iq2 + iq1 * n_heads writes.
+            let o_offset = iq1 * num_heads * head_dim + h * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for ((k_pos, _), &exp_s) in scores.iter().zip(exp_scores.iter()) {
+                    let weight = exp_s * inv_sum;
+                    acc += weight * v[v_head_base + k_pos * head_dim + d];
+                }
+                output[o_offset + d] = acc;
+            }
+        }
+    }
+
+    output
+}
+
+/// Run tree_attention on GPU with the given mask, return outputs.
+#[allow(clippy::too_many_arguments)]
+fn run_tree_attention_gpu(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_data: &[f32],
+    k_data: &[f32],
+    v_data: &[f32],
+    mask_data: &[f32],
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    q_seq_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    mask_stride: u32,
+    scale: f32,
+) -> Vec<f32> {
+    let q_elems = (num_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let kv_elems = (num_kv_heads as usize) * (kv_capacity as usize) * (head_dim as usize);
+    let mask_elems = (q_seq_len as usize) * (mask_stride as usize);
+    let out_bytes = q_elems * 4;
+
+    let mut q_buf = device
+        .alloc_buffer(q_elems * 4, DType::F32, vec![q_elems])
+        .expect("alloc Q");
+    let mut k_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc K");
+    let mut v_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc V");
+    let mut mask_buf = device
+        .alloc_buffer(mask_elems * 4, DType::F32, vec![mask_elems])
+        .expect("alloc mask");
+    let out_buf = device
+        .alloc_buffer(out_bytes, DType::F32, vec![q_elems])
+        .expect("alloc output");
+
+    q_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(q_data);
+    k_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(k_data);
+    v_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(v_data);
+    mask_buf
+        .as_mut_slice::<f32>()
+        .unwrap()
+        .copy_from_slice(mask_data);
+
+    let tmp_bytes = tree_attention::tmp_buffer_bytes(num_heads, head_dim, q_seq_len);
+    let tmp_buf = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .expect("alloc tmp");
+
+    let params = TreeAttentionParams {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity,
+        scale,
+        q_seq_len,
+        mask_stride,
+    };
+    let mut enc = device.command_encoder().expect("encoder");
+    tree_attention::tree_attention(
+        &mut enc,
+        registry,
+        device,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &mask_buf,
+        &out_buf,
+        &tmp_buf,
+        &params,
+    )
+    .expect("tree_attention dispatch");
+    enc.commit_and_wait().expect("commit");
+
+    out_buf.as_slice::<f32>().unwrap().to_vec()
+}
+
+/// Compare GPU output to CPU reference within an absolute-error
+/// tolerance (CPU uses f64, GPU uses interleaved half/float — exact
+/// bit-equality is not expected).
+fn assert_close(gpu: &[f32], cpu: &[f32], epsilon: f32, label: &str) {
+    assert_eq!(gpu.len(), cpu.len(), "{label}: output length mismatch");
+    let mut max_diff = 0.0f32;
+    let mut max_idx = 0usize;
+    for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+        let d = (g - c).abs();
+        if d > max_diff {
+            max_diff = d;
+            max_idx = i;
+        }
+    }
+    if max_diff > epsilon {
+        panic!(
+            "{label}: max abs diff {max_diff:.6e} at idx {max_idx} exceeds tolerance {epsilon:.6e} (gpu={:.6}, cpu={:.6})",
+            gpu[max_idx], cpu[max_idx]
+        );
+    }
+    eprintln!(
+        "{label}: max abs diff {max_diff:.6e} (within {epsilon:.6e}); compared {} values",
+        gpu.len()
+    );
+}
+
+/// Build a "fixed-square" tree mask: root + N leaves over a prefix.
+///
+/// Tree layout (qL = 1 + n_leaves total tree-nodes):
+///   - tree-node 0 (root):     attends prefix [0, prefix_len) + self
+///   - tree-node 1..=n_leaves: attends prefix [0, prefix_len) + root + self
+///
+/// Tree-nodes occupy absolute positions [prefix_len, prefix_len + qL).
+/// `kv_seq_len = prefix_len + qL`.
+fn build_fixed_square_mask(
+    prefix_len: usize,
+    n_leaves: usize,
+    mask_stride: usize,
+) -> Vec<f32> {
+    let q_seq_len = 1 + n_leaves;
+    let kv_seq_len = prefix_len + q_seq_len;
+    assert!(mask_stride >= kv_seq_len, "mask_stride must be >= kv_seq_len");
+
+    let mut mask = vec![TREE_MASK_MASKED; q_seq_len * mask_stride];
+
+    // Root: attends [0, prefix_len) + self at (prefix_len).
+    let root_base = 0 * mask_stride;
+    for k_pos in 0..prefix_len {
+        mask[root_base + k_pos] = TREE_MASK_ATTENDED;
+    }
+    mask[root_base + prefix_len] = TREE_MASK_ATTENDED;
+
+    // Leaves: each attends [0, prefix_len) + root + self.
+    for leaf in 0..n_leaves {
+        let iq1 = 1 + leaf; // tree-node index
+        let row_base = iq1 * mask_stride;
+        for k_pos in 0..prefix_len {
+            mask[row_base + k_pos] = TREE_MASK_ATTENDED;
+        }
+        // Root is at absolute position `prefix_len`.
+        mask[row_base + prefix_len] = TREE_MASK_ATTENDED;
+        // Self is at absolute position `prefix_len + iq1`.
+        mask[row_base + prefix_len + iq1] = TREE_MASK_ATTENDED;
+    }
+
+    mask
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_fixed_square_matches_cpu(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    prefix_len: usize,
+    n_leaves: usize,
+    kv_capacity: u32,
+    scale: f32,
+    seed: u64,
+    epsilon: f32,
+    label: &str,
+) {
+    let q_seq_len = (1 + n_leaves) as u32;
+    let kv_seq_len = (prefix_len + q_seq_len as usize) as u32;
+    let mask_stride = kv_seq_len;
+
+    assert!(kv_capacity >= kv_seq_len, "{label}: kv_capacity too small");
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let q_elems = (num_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let kv_elems = (num_kv_heads as usize) * (kv_capacity as usize) * (head_dim as usize);
+
+    let mut q_data = vec![0.0f32; q_elems];
+    let mut k_data = vec![0.0f32; kv_elems];
+    let mut v_data = vec![0.0f32; kv_elems];
+    fill_random(&mut q_data, seed);
+    fill_random(&mut k_data, seed + 10_000);
+    fill_random(&mut v_data, seed + 20_000);
+
+    let mask_data = build_fixed_square_mask(prefix_len, n_leaves, mask_stride as usize);
+
+    // --- GPU ---
+    let gpu_out = run_tree_attention_gpu(
+        &device,
+        &mut registry,
+        &q_data,
+        &k_data,
+        &v_data,
+        &mask_data,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        q_seq_len,
+        kv_seq_len,
+        kv_capacity,
+        mask_stride,
+        scale,
+    );
+
+    // --- CPU ---
+    let cpu_out = cpu_tree_sdpa(
+        &q_data,
+        &k_data,
+        &v_data,
+        &mask_data,
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        q_seq_len as usize,
+        kv_seq_len as usize,
+        kv_capacity as usize,
+        mask_stride as usize,
+        scale,
+    );
+
+    assert_close(&gpu_out, &cpu_out, epsilon, label);
+}
+
+#[test]
+fn adr_037_e1_3_fixed_square_dk256_root4leaves_2026_05_22() {
+    // Smallest non-trivial tree: 1 root + 4 leaves, depth=2, fanout=4.
+    // Prefix of 27 tokens → kv_seq_len = 27 + 5 = 32 (exact C boundary).
+    // Each leaf attends prefix + root + self (no sibling-to-sibling
+    // attention — strict tree semantics).
+    assert_fixed_square_matches_cpu(
+        4,                          // num_heads
+        4,                          // num_kv_heads
+        256,                        // head_dim
+        27,                         // prefix_len
+        4,                          // n_leaves
+        64,                         // kv_capacity
+        1.0 / (256.0_f32).sqrt(),   // scale
+        12321,                      // seed
+        1e-2,                       // tolerance (matches existing crate convention)
+        "dk256 fixed-square 4-leaf tree (prefix=27, qL=5)",
+    );
+}
+
+#[test]
+fn adr_037_e1_3_fixed_square_dk256_gqa_root4leaves_2026_05_22() {
+    // GQA variant — 16 query heads sharing 8 KV heads. Validates that
+    // the mask is keyed by query position (not KV head) and survives
+    // the heads_per_kv mapping in the shader.
+    assert_fixed_square_matches_cpu(
+        16, 8, 256, 27, 4, 64,
+        1.0,
+        45654,
+        1e-2,
+        "dk256 GQA fixed-square 4-leaf tree",
+    );
+}
+
+#[test]
+fn adr_037_e1_3_fixed_square_dk512_root4leaves_2026_05_22() {
+    assert_fixed_square_matches_cpu(
+        4, 4, 512, 27, 4, 64,
+        1.0 / (512.0_f32).sqrt(),
+        78787,
+        1e-2,
+        "dk512 fixed-square 4-leaf tree",
+    );
+}
+
+#[test]
+fn adr_037_e1_3_fixed_square_dk256_long_prefix_2026_05_22() {
+    // Long prefix (kv_seq_len = 507 + 5 = 512) exercises NWG > 1
+    // reduce kernel path simultaneously with non-causal tree mask.
+    // This is the closest synthetic test to production EAGLE-3 long
+    // context with a small tree on top.
+    assert_fixed_square_matches_cpu(
+        4, 4, 256, 507, 4, 1024,
+        1.0 / (256.0_f32).sqrt(),
+        91919,
+        1e-2,
+        "dk256 fixed-square 4-leaf tree (long prefix, kv=512)",
+    );
+}
