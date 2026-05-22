@@ -65,15 +65,13 @@ fn pack_q8_0(values: &[f32]) -> Vec<u8> {
     bytes
 }
 
-#[test]
-fn fused_gate_up_silu_q8_0_byte_identical_to_unfused() {
+fn run_parity_at_m(m: u32) {
     let device = MlxDevice::new().expect("MlxDevice::new");
     let mut registry = KernelRegistry::new();
 
     // Shape: small but realistic. Hidden_size = 256 (8 blocks), intermediate = 64.
     let hidden_size: u32 = 256;
     let intermediate_size: u32 = 64;
-    let m: u32 = 1; // decode
 
     // Generate input + weights with deterministic PRNG.
     let input = pseudo_random_f32(0xC0FFEE, (hidden_size * m) as usize);
@@ -159,8 +157,10 @@ fn fused_gate_up_silu_q8_0_byte_identical_to_unfused() {
     let mut params_buf_silu = device
         .alloc_buffer(4, DType::U32, vec![1])
         .expect("alloc params silu");
-    params_buf_silu.as_mut_slice::<u32>().expect("write params")[0] =
-        intermediate_size;
+    // silu_mul processes `n` total elements; for m>1 this is intermediate_size * m
+    // (the silu_mul kernel is 1D over the flattened output).
+    let silu_n: u32 = intermediate_size * m;
+    params_buf_silu.as_mut_slice::<u32>().expect("write params")[0] = silu_n;
 
     let mv_params = GgmlQuantizedMatmulParams {
         m,
@@ -206,7 +206,7 @@ fn fused_gate_up_silu_q8_0_byte_identical_to_unfused() {
         &tmp_up,
         &out_unfused,
         &params_buf_silu,
-        intermediate_size,
+        silu_n,
     )
     .expect("silu_mul");
     enc.commit_and_wait().expect("commit unfused");
@@ -288,6 +288,27 @@ fn fused_gate_up_silu_q8_0_byte_identical_to_unfused() {
     // documented contract from adr_028_iter309 (Q6_K parity).
     assert!(
         max_abs_diff < 1e-5,
-        "fused vs unfused max_abs_diff {max_abs_diff:.3e} exceeds 1e-5"
+        "fused vs unfused max_abs_diff {max_abs_diff:.3e} exceeds 1e-5 (m={m})"
     );
+}
+
+#[test]
+fn fused_gate_up_silu_q8_0_byte_identical_to_unfused() {
+    run_parity_at_m(1);
+}
+
+#[test]
+fn fused_gate_up_silu_q8_0_m_eq_2_byte_identical_to_unfused() {
+    // ADR-034 task #93 Step 2 — confirms the kernel handles m=2 (the SPEC
+    // K=1 BATCHED verify path's input shape). If this passes, no kernel
+    // changes are needed for Step 2; we just need to remove the
+    // seq_len==1 restriction in build_dense_ffn_layer_gpu_q_into_pooled.
+    run_parity_at_m(2);
+}
+
+#[test]
+fn fused_gate_up_silu_q8_0_m_eq_4_byte_identical_to_unfused() {
+    // Stress-test at m=4 (would cover a hypothetical future K=N=3 BATCHED
+    // verify path that batches 4 tokens).
+    run_parity_at_m(4);
 }
