@@ -65,10 +65,8 @@ struct TreeAttentionParams {
     uint  mask_stride;
 };
 
-struct TreeAttentionReduceParams {
-    uint nrows;
-};
-
+// Reduce pass reuses `flash_attn_vec_reduce_*` from flash_attn_vec.metal
+// verbatim — same output layout. No separate Reduce params struct here.
 
 // --------------------------------------------------------------------------
 // Template for the main tree-attention kernel.

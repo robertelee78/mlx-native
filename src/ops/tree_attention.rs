@@ -28,6 +28,14 @@ pub static TREE_ATTENTION_SHADER_SOURCE: &str =
     include_str!("../shaders/tree_attention.metal");
 
 /// Register tree-attention shader source with the given kernel registry.
+///
+/// **Dependency**: this helper registers only the tree-attention main
+/// kernels. The reduce pass (`flash_attn_vec_reduce_*`) is reused
+/// verbatim from `flash_attn_vec`, so callers that use a minimal
+/// registry must ALSO call `flash_attn_vec::register(registry)`. The
+/// default `KernelRegistry::new()` pre-registers both — the explicit
+/// `register()` helpers exist for tooling that builds incremental
+/// registries.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("tree_attention_dk256", TREE_ATTENTION_SHADER_SOURCE);
     registry.register_source("tree_attention_dk512", TREE_ATTENTION_SHADER_SOURCE);
@@ -86,6 +94,128 @@ struct FlashAttnVecReduceParamsGpu {
 /// kernel assumes one (host-)thread per NWG and NWG <= 32.
 const NWG: u32 = 32;
 
+/// Codex /cfa Phase E1 gate (2026-05-22): defensive buffer dtype +
+/// byte-length validation. Caught:
+///   - K/V dtype mismatch (would read V with wrong stride)
+///   - Q/mask/output/tmp dtype slips (must all be F32)
+///   - Undersized buffers (GPU OOB read/write)
+/// Without these checks the kernel reads/writes purely from params,
+/// so undersized buffers escape to GPU.
+#[allow(clippy::too_many_arguments)]
+fn validate_buffers(
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    tree_mask: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    params: &TreeAttentionParams,
+) -> Result<()> {
+    // --- dtype contract ---
+    if q.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: q dtype must be F32, got {:?}",
+            q.dtype()
+        )));
+    }
+    if k.dtype() != v.dtype() {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: k.dtype ({:?}) must match v.dtype ({:?})",
+            k.dtype(),
+            v.dtype()
+        )));
+    }
+    if !matches!(k.dtype(), DType::F32 | DType::F16) {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: k/v dtype must be F32 or F16, got {:?}",
+            k.dtype()
+        )));
+    }
+    if tree_mask.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: tree_mask dtype must be F32, got {:?}",
+            tree_mask.dtype()
+        )));
+    }
+    if output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: output dtype must be F32, got {:?}",
+            output.dtype()
+        )));
+    }
+    if tmp.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: tmp dtype must be F32, got {:?}",
+            tmp.dtype()
+        )));
+    }
+
+    // --- byte-length contract ---
+    let head_dim = params.head_dim as usize;
+    let num_heads = params.num_heads as usize;
+    let num_kv_heads = params.num_kv_heads as usize;
+    let q_seq_len = params.q_seq_len as usize;
+    let kv_capacity = params.kv_capacity as usize;
+    let mask_stride = params.mask_stride as usize;
+    let kv_dtype_bytes: usize = match k.dtype() {
+        DType::F32 => 4,
+        DType::F16 => 2,
+        _ => unreachable!("validated above"),
+    };
+
+    let req_q = num_heads * q_seq_len * head_dim * 4;
+    let req_kv = num_kv_heads * kv_capacity * head_dim * kv_dtype_bytes;
+    let req_mask = q_seq_len * mask_stride * 4;
+    let req_output = num_heads * q_seq_len * head_dim * 4;
+    let req_tmp =
+        tmp_buffer_bytes(params.num_heads, params.head_dim, params.q_seq_len);
+
+    if q.byte_len() < req_q {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: q buffer too small: have {} bytes, need >= {}",
+            q.byte_len(),
+            req_q
+        )));
+    }
+    if k.byte_len() < req_kv {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: k buffer too small: have {} bytes, need >= {}",
+            k.byte_len(),
+            req_kv
+        )));
+    }
+    if v.byte_len() < req_kv {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: v buffer too small: have {} bytes, need >= {}",
+            v.byte_len(),
+            req_kv
+        )));
+    }
+    if tree_mask.byte_len() < req_mask {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: tree_mask buffer too small: have {} bytes, need >= {}",
+            tree_mask.byte_len(),
+            req_mask
+        )));
+    }
+    if output.byte_len() < req_output {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: output buffer too small: have {} bytes, need >= {}",
+            output.byte_len(),
+            req_output
+        )));
+    }
+    if tmp.byte_len() < req_tmp {
+        return Err(MlxError::InvalidArgument(format!(
+            "tree_attention: tmp buffer too small: have {} bytes, need >= {}",
+            tmp.byte_len(),
+            req_tmp
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_params(params: &TreeAttentionParams) -> Result<()> {
     if params.head_dim != 256 && params.head_dim != 512 {
         return Err(MlxError::InvalidArgument(format!(
@@ -138,12 +268,18 @@ fn validate_params(params: &TreeAttentionParams) -> Result<()> {
 /// # Buffers
 /// * `q` — `[num_heads, q_seq_len, head_dim]`, F32.
 /// * `k` — `[num_kv_heads, kv_capacity, head_dim]`, F32 or F16.
-/// * `v` — `[num_kv_heads, kv_capacity, head_dim]`, F32 or F16.
+///   K and V must share the same dtype (validated below).
+/// * `v` — `[num_kv_heads, kv_capacity, head_dim]`, same dtype as K.
 /// * `tree_mask` — `[q_seq_len, mask_stride]`, F32. Cell (i, j) ∈
 ///   `{TREE_MASK_ATTENDED (0.0), TREE_MASK_MASKED (-65504.0)}` indicating
 ///   whether query i can attend to KV position j. Cells with j >=
 ///   kv_seq_len within a row are ignored (bounds-checked by shader).
-/// * `output` — `[num_heads, q_seq_len, head_dim]`, F32, pre-allocated.
+/// * `output` — **`[q_seq_len, num_heads, head_dim]`**, F32, pre-allocated.
+///   NOTE: output is **query-outer, head-inner** — different from Q
+///   layout — because the kernel writes via `rid = iq2 + iq1 *
+///   n_heads` (see `flash_attn_vec.metal:322`, inherited identically
+///   by tree_attention.metal). Callers reading row `iq1` for head `h`
+///   should index `output[iq1 * num_heads * head_dim + h * head_dim + d]`.
 /// * `tmp` — partial-result scratch sized by `tmp_buffer_bytes(...)`.
 pub fn tree_attention(
     encoder: &mut CommandEncoder,
@@ -158,6 +294,7 @@ pub fn tree_attention(
     params: &TreeAttentionParams,
 ) -> Result<()> {
     validate_params(params)?;
+    validate_buffers(q, k, v, tree_mask, output, tmp, params)?;
 
     let head_dim = params.head_dim;
     let nwg = NWG;
@@ -174,6 +311,10 @@ pub fn tree_attention(
         mask_stride: params.mask_stride,
     };
 
+    // Codex /cfa Phase E1 gate (2026-05-22): K and V dtype must match;
+    // shader templates K and V on the same `KV_T` type. K/V mismatch
+    // would cause one side to be read with the wrong stride/precision.
+    // Q/tree_mask/output/tmp are always F32 (validated below).
     let kv_is_f16 = k.dtype() == DType::F16;
     let kernel_name = match (head_dim, kv_is_f16) {
         (256, false) => "tree_attention_dk256",

@@ -624,10 +624,15 @@ fn adr_037_e1_1_tree1_parity_dk256_unaligned_2026_05_22() {
 /// iq1 * n_heads`. Reading `output[iq1 * n_heads * dim + h * dim + d]`
 /// is `(query, head, dim)` order.
 ///
-/// Mirrors the math the GPU kernel performs: softmax over masked dot
-/// products with `scale`. Uses f64 accumulator for the dot product +
-/// softmax-renormalize chain to match the per-thread-precision the
-/// Metal kernel achieves via on-chip half/float interleaving.
+/// **Precision caveat** (codex /cfa Phase E1 review, 2026-05-22):
+/// the GPU kernel casts Q to `half4` in shared memory before the dot
+/// product (`tree_attention.metal:135-137`). This CPU reference uses
+/// full F32 (with f64 accumulator) without the half-rounding step,
+/// so it is the **ideal mathematical reference**, not a bit-exact
+/// model of the kernel. The 1e-2 absolute-error tolerance in
+/// `assert_close` accommodates the half-cast precision loss.
+/// For byte-identity validation we use E1.1 + E1.2 (which compare two
+/// GPU paths with identical half-casting).
 #[allow(clippy::too_many_arguments)]
 fn cpu_tree_sdpa(
     q: &[f32],
@@ -1246,5 +1251,213 @@ fn adr_037_e1_5_prefix_plus_tree_dk512_long_2026_05_22() {
         99_887_766,
         1e-2,
         "dk512 prefix+tree combined (prefix=504, tree=8, kv=512)",
+    );
+}
+
+// --------------------------------------------------------------------------
+// Codex /cfa Phase E1 gate (2026-05-22) — negative-path validation tests.
+//
+// Proves that validate_buffers catches the Critical findings from the
+// codex review (K/V dtype mismatch + undersized buffers) BEFORE the
+// kernel dispatches. Without these checks the kernel reads/writes
+// purely from params and undersized/mismatched buffers escape to GPU.
+// --------------------------------------------------------------------------
+
+#[test]
+fn adr_037_e1_gate_kv_dtype_mismatch_rejected_2026_05_22() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let head_dim = 256_u32;
+    let num_heads = 4_u32;
+    let q_seq_len = 1_u32;
+    let kv_seq_len = 32_u32;
+    let kv_capacity = 64_u32;
+
+    let q_elems = (num_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let kv_elems = (num_heads as usize) * (kv_capacity as usize) * (head_dim as usize);
+
+    // K is F32 but V is F16 — codex Critical 1.
+    let q_buf = device
+        .alloc_buffer(q_elems * 4, DType::F32, vec![q_elems])
+        .expect("alloc Q");
+    let k_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc K");
+    let v_buf = device
+        .alloc_buffer(kv_elems * 2, DType::F16, vec![kv_elems])
+        .expect("alloc V");
+    let mask_buf = device
+        .alloc_buffer((q_seq_len * kv_seq_len * 4) as usize, DType::F32, vec![1])
+        .expect("alloc mask");
+    let out_buf = device
+        .alloc_buffer(q_elems * 4, DType::F32, vec![q_elems])
+        .expect("alloc out");
+    let tmp_bytes = tree_attention::tmp_buffer_bytes(num_heads, head_dim, q_seq_len);
+    let tmp_buf = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .expect("alloc tmp");
+
+    let params = TreeAttentionParams {
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity,
+        scale: 1.0,
+        q_seq_len,
+        mask_stride: kv_seq_len,
+    };
+    let mut enc = device.command_encoder().expect("encoder");
+    let err = tree_attention::tree_attention(
+        &mut enc,
+        &mut registry,
+        &device,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &mask_buf,
+        &out_buf,
+        &tmp_buf,
+        &params,
+    )
+    .expect_err("K/V dtype mismatch should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("k.dtype") && msg.contains("must match"),
+        "expected K/V dtype mismatch error, got: {msg}"
+    );
+}
+
+#[test]
+fn adr_037_e1_gate_undersized_mask_rejected_2026_05_22() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let head_dim = 256_u32;
+    let num_heads = 4_u32;
+    let q_seq_len = 4_u32;
+    let kv_seq_len = 32_u32;
+    let kv_capacity = 64_u32;
+
+    let q_elems = (num_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let kv_elems = (num_heads as usize) * (kv_capacity as usize) * (head_dim as usize);
+
+    let q_buf = device
+        .alloc_buffer(q_elems * 4, DType::F32, vec![q_elems])
+        .expect("alloc Q");
+    let k_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc K");
+    let v_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc V");
+    // Undersized mask: should be q_seq_len * mask_stride * 4 = 4*32*4
+    // = 512 bytes; allocate half that → codex Critical 2.
+    let mask_buf = device
+        .alloc_buffer(256, DType::F32, vec![64])
+        .expect("alloc mask");
+    let out_buf = device
+        .alloc_buffer(q_elems * 4, DType::F32, vec![q_elems])
+        .expect("alloc out");
+    let tmp_bytes = tree_attention::tmp_buffer_bytes(num_heads, head_dim, q_seq_len);
+    let tmp_buf = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .expect("alloc tmp");
+
+    let params = TreeAttentionParams {
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity,
+        scale: 1.0,
+        q_seq_len,
+        mask_stride: kv_seq_len,
+    };
+    let mut enc = device.command_encoder().expect("encoder");
+    let err = tree_attention::tree_attention(
+        &mut enc,
+        &mut registry,
+        &device,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &mask_buf,
+        &out_buf,
+        &tmp_buf,
+        &params,
+    )
+    .expect_err("undersized mask should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tree_mask buffer too small"),
+        "expected mask-undersized error, got: {msg}"
+    );
+}
+
+#[test]
+fn adr_037_e1_gate_wrong_q_dtype_rejected_2026_05_22() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let head_dim = 256_u32;
+    let num_heads = 4_u32;
+    let q_seq_len = 1_u32;
+    let kv_seq_len = 32_u32;
+    let kv_capacity = 64_u32;
+
+    let q_elems = (num_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let kv_elems = (num_heads as usize) * (kv_capacity as usize) * (head_dim as usize);
+
+    // Q tagged as F16 — kernel expects F32. Shape sufficient.
+    let q_buf = device
+        .alloc_buffer(q_elems * 2, DType::F16, vec![q_elems])
+        .expect("alloc Q (wrong dtype)");
+    let k_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc K");
+    let v_buf = device
+        .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
+        .expect("alloc V");
+    let mask_buf = device
+        .alloc_buffer((kv_seq_len * 4) as usize, DType::F32, vec![32])
+        .expect("alloc mask");
+    let out_buf = device
+        .alloc_buffer(q_elems * 4, DType::F32, vec![q_elems])
+        .expect("alloc out");
+    let tmp_bytes = tree_attention::tmp_buffer_bytes(num_heads, head_dim, q_seq_len);
+    let tmp_buf = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .expect("alloc tmp");
+
+    let params = TreeAttentionParams {
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity,
+        scale: 1.0,
+        q_seq_len,
+        mask_stride: kv_seq_len,
+    };
+    let mut enc = device.command_encoder().expect("encoder");
+    let err = tree_attention::tree_attention(
+        &mut enc,
+        &mut registry,
+        &device,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &mask_buf,
+        &out_buf,
+        &tmp_buf,
+        &params,
+    )
+    .expect_err("non-F32 Q should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("q dtype must be F32"),
+        "expected Q-dtype error, got: {msg}"
     );
 }
