@@ -175,10 +175,11 @@ impl GgmlType {
             // ADR-022 Phase 1 P1.5 — Q5_1 / IQ4_NL dense mv ports.
             GgmlType::Q5_1 => "kernel_mul_mv_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
-            // ADR-033 §Pi 2026-05-22 — reader-side variant; Metal mv
-            // kernel port pending (Task #16). Dispatch will error
-            // until the kernel ships.
-            GgmlType::IQ4_XS => "unsupported",
+            // ADR-033 §Pi Task #16 SHIPPED 2026-05-22 — mirrors IQ4_NL
+            // geometry (N_SIMDGROUP=2, N_DST=4, threadgroup=(8,8,1)).
+            // Byte-cmp parity tested against llama.cpp's Metal IQ4_XS
+            // kernel via tests/iq4_xs_metal_parity.rs.
+            GgmlType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
         }
     }
 
@@ -410,7 +411,12 @@ pub fn quantized_matmul_ggml(
         | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_1
-        | GgmlType::IQ4_NL => {}
+        | GgmlType::IQ4_NL
+        // ADR-033 §Pi Task #16 2026-05-22 — mv kernel ported. mm
+        // kernel pending; dispatcher routes to mv path at m ≤
+        // MM_ROUTING_THRESHOLD = 8 (the critical decode-time hot
+        // path on Qwen MoE expert tensors).
+        | GgmlType::IQ4_XS => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_ggml does not support {:?} — use a different dispatch path",
@@ -698,7 +704,11 @@ fn dispatch_mv(
         GgmlType::Q4_0
         | GgmlType::Q8_0
         | GgmlType::Q5_1
-        | GgmlType::IQ4_NL => (8u64, 8u64, 8usize),
+        | GgmlType::IQ4_NL
+        // ADR-033 §Pi Task #16 — kernel_mul_mv_iq4_xs_f32 ports
+        // IQ4_NL's (N_SIMDGROUP=2, N_DST=4) geometry so the
+        // launch tuple (8, 8, 8) is shared.
+        | GgmlType::IQ4_XS => (8u64, 8u64, 8usize),
         // Q4_K / Q5_K (ADR-022 Phase 2) mirror Q6_K's 2-row-per-tg geometry.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),

@@ -166,6 +166,26 @@ constant int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113
 };
 
+// IQ4_XS (ADR-033 §Pi 2026-05-22). Super-block layout:
+//   - 256 elements per super-block
+//   - 2 bytes f16 super-block scale d
+//   - 2 bytes scales_h: 8 × 2-bit sub-block scale high bits
+//   - 4 bytes scales_l: 8 × 4-bit sub-block scale low nibbles
+//   - 128 bytes qs: 8 sub-blocks × 32 elements × 4-bit indices into kvalues_iq4nl
+//   = 136 bytes per super-block = 4.25 bpw
+// Per-sub-block decoded scale: ls = (scales_l[ib/2] >> 4*(ib%2)) & 0xf
+//                                    | ((scales_h >> 2*ib) & 3) << 4
+//                            dl = d * (ls - 32)
+// Reference: ggml-common.h:444-450 `block_iq4_xs`.
+typedef struct {
+    half     d;
+    uint16_t scales_h;
+    uint8_t  scales_l[QK_K / 64];  // 4
+    uint8_t  qs[QK_K / 2];         // 128
+} block_iq4_xs;
+static_assert(sizeof(block_iq4_xs) == sizeof(half) + sizeof(uint16_t) + QK_K/64 + QK_K/2,
+              "wrong iq4_xs block size");
+
 // Q5_1 dot helper — see id_ggml.metal:135-179 for the formula derivation.
 inline float block_q5_1_dot_y(
     device const block_q5_1 * qb,
@@ -207,6 +227,35 @@ inline float block_iq4_nl_dot_y(
         acc += yl_raw[i + 8] * (float)kvalues_iq4nl[(b >> 4) & 0x0F];
     }
     return d * acc;
+}
+
+// IQ4_XS dot helper — processes ONE 32-element sub-block of a super-block.
+// `qb` points at the super-block, `ib32` ∈ [0,7] selects the sub-block,
+// `il` ∈ {0, 8} selects which 8-element half of the sub-block to process
+// (mirrors IQ4_NL's il convention — il is the byte offset into qs[16]).
+// Caller supplies yl_raw[0..15] = the corresponding 16 input activations.
+//
+// Per-sub-block scale decode (mirrors dequantize_iq4_xs):
+//   ls = (scales_l[ib32/2] >> 4*(ib32%2)) & 0xf | ((scales_h >> 2*ib32) & 3) << 4
+//   dl = d * (ls - 32)
+inline float block_iq4_xs_dot_y(
+    device const block_iq4_xs * qb,
+    thread float * yl_raw,
+    int ib32,
+    int il
+) {
+    const float d = qb->d;
+    const int ls = ((qb->scales_l[ib32 / 2] >> 4*(ib32 % 2)) & 0xf)
+                 | (((qb->scales_h >> 2*ib32) & 0x3) << 4);
+    const float dl = d * (float)(ls - 32);
+    float acc = 0.f;
+    device const uint8_t * qs = qb->qs + 16*ib32 + il;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t b = qs[i];
+        acc += yl_raw[i]     * (float)kvalues_iq4nl[b & 0x0F];
+        acc += yl_raw[i + 8] * (float)kvalues_iq4nl[(b >> 4) & 0x0F];
+    }
+    return dl * acc;
 }
 
 // ---- Q4_0 mat-vec kernel ----
@@ -362,6 +411,84 @@ kernel void kernel_mul_mv_q5_1_f32(
         }
 
         yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[im*p.ne0*p.ne1 + r1*p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// ---- IQ4_XS mat-vec kernel (ADR-033 §Pi 2026-05-22) ----
+//
+// Super-block (256-element) variant of IQ4_NL. Each row's K dimension is
+// split into nb = ne00 / QK_K super-blocks. Each super-block contains 8
+// sub-blocks of 32 elements with per-sub-block 6-bit scales.
+//
+// Geometry mirrors IQ4_NL (N_SIMDGROUP=2, N_DST=4, threadgroup=(8,8,1)):
+//   - 2 SIMD groups × 4 rows = 8 rows per threadgroup
+//   - 32 threads per SIMD group; threads partition the super-block range
+//     via tiisg-strided iteration (correctness-first; perf-tuning in
+//     follow-up).
+//
+// Each thread processes a sub-block-half-at-a-time and uses simd_sum to
+// reduce per-row partial sums. The kernel is byte-cmp-validated against
+// llama.cpp's `kernel_mul_mv_iq4_xs_f32` via a per-row parity test on
+// synthetic input (see tests/iq4_xs_metal_parity.rs).
+kernel void kernel_mul_mv_iq4_xs_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+
+    const int nb = p.ne00 / QK_K; // super-blocks per row
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
+
+    const uint offset0 = first_row * nb + (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
+
+    device const block_iq4_xs * x = (device const block_iq4_xs *) src0 + offset0;
+    device const float        * y = (device const float        *) src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+
+    float sumf[nr] = {0.f};
+
+    // tiisg ∈ [0, 31] partitions the (super-block, sub-block, half) work
+    // across the 32 threads in the SIMD group.
+    // 16 (sub-block, half) pairs per super-block; 32 threads → each
+    // thread covers one (sub-block, half) pair across alternating
+    // super-blocks (ix selects which super-block lane).
+    const int ix  = tiisg / 16; // 0 or 1
+    const int it  = tiisg % 16; // 0..15
+    const int ib32 = it / 2;    // 0..7  → sub-block within super-block
+    const int il   = (it % 2) * 8; // 0 or 8 → byte offset into qs
+
+    float yl_raw[16];
+
+    for (int ibl = ix; ibl < nb; ibl += 2) {
+        // 16 input activations corresponding to (sub-block ib32, half il).
+        device const float * yb = y + ibl * QK_K + ib32 * 32 + il;
+        for (int i = 0; i < 8; i++) {
+            yl_raw[i]     = yb[i];
+            yl_raw[i + 8] = yb[i + 16];
+        }
+
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_iq4_xs_dot_y(x + ibl + row*nb, yl_raw, ib32, il);
+        }
     }
 
     for (int row = 0; row < nr; ++row) {

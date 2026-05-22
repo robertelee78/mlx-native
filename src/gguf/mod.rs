@@ -868,6 +868,66 @@ fn dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Dequantize raw IQ4_XS bytes to f32. Pure-Rust mirror of
+/// `dequantize_row_iq4_xs` at `/opt/llama.cpp/ggml/src/ggml-quants.c:2667`.
+///
+/// Block layout (256-element super-block, 136 bytes):
+///   - d:        2 bytes f16 super-block scale
+///   - scales_h: 2 bytes u16, holds 8 × 2-bit sub-block scale tops
+///   - scales_l: 4 bytes, holds 8 × 4-bit sub-block scale low nibbles
+///     (two sub-blocks per byte: low nibble = sub-block 2k, high nibble = 2k+1)
+///   - qs:     128 bytes, nibble-packed 4-bit codebook indices
+///
+/// Per sub-block ib32 ∈ [0,7]:
+///   ls = (scales_l[ib32/2] >> 4*(ib32%2)) & 0xf
+///      | ((scales_h >> 2*ib32) & 3) << 4
+///   dl = d * (ls - 32)
+/// Per element pair (j in [0,15]) in sub-block ib32:
+///   out[j]      = dl * KVALUES_IQ4_NL[qs[16*ib32 + j] & 0xf]
+///   out[j + 16] = dl * KVALUES_IQ4_NL[qs[16*ib32 + j] >> 4]
+///
+/// Codebook is shared with IQ4_NL. ADR-033 §Pi 2026-05-22.
+fn dequantize_iq4_xs(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 136;
+    const BLOCK_ELEMS: usize = 256;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "IQ4_XS data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "IQ4_XS output buffer too small".into(),
+        ));
+    }
+    for i in 0..num_blocks {
+        let block = &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+        let d = f16_from_le_bytes([block[0], block[1]]);
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..];
+        let out = &mut output[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
+        for ib32 in 0..(BLOCK_ELEMS / 32) {
+            let lo_nibble = (scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf;
+            let hi_two = ((scales_h >> (2 * ib32)) & 0x3) as u8;
+            let ls = (lo_nibble | (hi_two << 4)) as i32;
+            let dl = d * ((ls - 32) as f32);
+            let qs_sub = &qs[16 * ib32..16 * (ib32 + 1)];
+            let out_sub = &mut out[32 * ib32..32 * (ib32 + 1)];
+            for j in 0..16 {
+                let lo = (qs_sub[j] & 0x0f) as usize;
+                let hi = (qs_sub[j] >> 4) as usize;
+                out_sub[j] = dl * KVALUES_IQ4_NL[lo] as f32;
+                out_sub[j + 16] = dl * KVALUES_IQ4_NL[hi] as f32;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Test-only export of `dequantize_q5_1` for ADR-022 parity tests in
 /// `/opt/mlx-native/tests/adr_022_phase1_dequant_parity.rs`. Hidden
 /// behind a doc(hidden) marker so it's not part of the public API but
@@ -875,6 +935,12 @@ fn dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()> {
 #[doc(hidden)]
 pub fn test_only_dequantize_q5_1(data: &[u8], output: &mut [f32]) -> Result<()> {
     dequantize_q5_1(data, output)
+}
+
+/// Test-only export of `dequantize_iq4_xs` for ADR-033 §Pi parity tests.
+#[doc(hidden)]
+pub fn test_only_dequantize_iq4_xs(data: &[u8], output: &mut [f32]) -> Result<()> {
+    dequantize_iq4_xs(data, output)
 }
 
 /// Test-only export of `dequantize_iq4_nl` for ADR-022 parity tests.
@@ -911,14 +977,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::I16 => dequantize_i16(data, output),
         GgmlType::Q5_1 => dequantize_q5_1(data, output),
         GgmlType::IQ4_NL => dequantize_iq4_nl(data, output),
-        // ADR-033 §Pi 2026-05-22 — reader recognizes IQ4_XS for GGUF
-        // header parsing + LoadOptions; dequant + Metal kernels port
-        // in a subsequent commit (Task #16). Surfacing as a clear typed
-        // error at the dequant call site is preferable to a silent
-        // partial-load that would later fail in matmul with no context.
-        GgmlType::IQ4_XS => Err(MlxError::InvalidArgument(
-            "IQ4_XS dequantize: pending Metal kernel port (ADR-033 §Pi Task #16)".into(),
-        )),
+        GgmlType::IQ4_XS => dequantize_iq4_xs(data, output),
     }
 }
 
