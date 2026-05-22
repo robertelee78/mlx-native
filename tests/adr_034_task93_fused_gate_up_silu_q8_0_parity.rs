@@ -190,6 +190,14 @@ fn fused_gate_up_silu_q8_0_byte_identical_to_unfused() {
         &mv_params,
     )
     .expect("up matvec");
+    // RAW barrier: silu_mul uses untracked `encoder.encode()` which doesn't
+    // register reads with the auto-barrier dataflow tracker. Without an
+    // explicit barrier, silu_mul could begin reading tmp_gate / tmp_up
+    // before the matvec writes complete, getting zeros from the
+    // alloc_buffer init (per ADR-015 iter61a). Explicit barrier matches
+    // what the production unfused path does implicitly via separate
+    // command-buffer commits between FFN ops.
+    enc.memory_barrier();
     dispatch_silu_mul(
         &mut enc,
         &mut registry,
