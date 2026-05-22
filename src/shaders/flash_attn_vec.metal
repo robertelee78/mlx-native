@@ -41,6 +41,14 @@ struct FlashAttnVecParams {
     uint  sliding_window;  // window size (mask_type==2 only)
     float softcap;         // logit softcapping (0 = disabled)
     uint  nwg;             // number of workgroups
+    // ADR-034 task #89 (2026-05-21) — number of queries to process per
+    // dispatch. Default 1 (decode); spec-decode verify with cur_len>0
+    // calls with qL = seq_len <= 8 dispatching that many threadgroups
+    // in grid.x. Each (iq1, iq2) threadgroup processes query iq1 for
+    // head iq2, with causal mask `abs_pos = kv_seq_len - qL + iq1`.
+    // Peer-code reference: llama.cpp's kernel_flash_attn_ext_vec uses
+    // an identical pattern (NQPSG=1, ne01 threadgroups in qL dim).
+    uint  qL;
 };
 
 // Parameters for the reduce kernel.
@@ -125,8 +133,14 @@ kernel void flash_attn_vec_impl(
     so4 += tiisg;
 
     // Compute device pointers.
-    // Q layout: [n_heads, seq_len, head_dim] — for decode, seq_len=1.
-    device const float4 *q4 = (device const float4 *)(Q + iq2 * DK);
+    // Q layout: [n_heads, qL, head_dim] — for decode qL=1 (single
+    // query per head); spec-decode verify uses qL in [2, 8] and
+    // grid.x = qL dispatches one threadgroup per (query, head).
+    // ADR-034 task #89 (2026-05-21): with qL=1 + iq1=0 (decode), the
+    // offset reduces to `iq2 * 0 + iq2 * DK = iq2 * DK` (byte-identical
+    // to pre-task-#89 behavior).
+    device const float4 *q4 =
+        (device const float4 *)(Q + (iq2 * params.qL + iq1) * DK);
 
     // K layout: [n_kv_heads, kv_capacity, head_dim]
     device const KV_T *k_base = K + kv_head * params.kv_capacity * DK;
@@ -159,9 +173,16 @@ kernel void flash_attn_vec_impl(
 
     // Compute masking bounds.
     const uint kv_seq_len = params.kv_seq_len;
-    // For decode: single query at position (kv_seq_len - 1).
-    const uint abs_pos = kv_seq_len - 1;
-    const uint causal_max_k = min(abs_pos + 1, kv_seq_len); // = kv_seq_len
+    // ADR-034 task #89 (2026-05-21) — generalized to qL >= 1.
+    // For decode (qL=1, iq1=0): abs_pos = kv_seq_len - 1 + 0 = kv_seq_len - 1
+    // (byte-identical to pre-task-#89 behavior).
+    // For spec-decode verify (qL > 1): query iq1 lives at absolute
+    // position `kv_seq_len - qL + iq1` (kv_seq_len already includes
+    // the qL new positions appended by kv_cache_write before this
+    // SDPA call — so kv_seq_len - qL is the position of the FIRST
+    // new query, and iq1 is the offset within the new chunk).
+    const uint abs_pos = kv_seq_len - params.qL + iq1;
+    const uint causal_max_k = min(abs_pos + 1, kv_seq_len);
 
     uint window_start = 0;
     if (params.mask_type == 2 && params.sliding_window > 0) {

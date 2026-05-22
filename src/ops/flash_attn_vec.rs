@@ -52,6 +52,21 @@ pub struct FlashAttnVecParams {
     pub sliding_window: u32,
     /// Logit softcapping (0 = disabled).
     pub softcap: f32,
+    /// ADR-034 task #89 (2026-05-21) — number of queries to process
+    /// per dispatch. Default 1 (decode). For spec-decode verify with
+    /// `cur_len > 0` + `seq_len in [2, 8]`, call with `q_seq_len =
+    /// seq_len`. The shader dispatches `q_seq_len` threadgroups in
+    /// `grid.x`; each handles one (query, head) pair with causal mask
+    /// `abs_pos = kv_seq_len - q_seq_len + iq1`. Peer-code reference:
+    /// llama.cpp's `kernel_flash_attn_ext_vec` (NQPSG=1, ne01
+    /// threadgroups in qL dim).
+    pub q_seq_len: u32,
+}
+
+impl FlashAttnVecParams {
+    /// Default `q_seq_len` for decode (single query). Use for all
+    /// existing call sites; spec-decode verify sets `q_seq_len > 1`.
+    pub const DEFAULT_Q_SEQ_LEN: u32 = 1;
 }
 
 /// GPU-side parameter struct. Must match the MSL `FlashAttnVecParams` exactly.
@@ -68,6 +83,8 @@ struct FlashAttnVecParamsGpu {
     sliding_window: u32,
     softcap: f32,
     nwg: u32,
+    /// ADR-034 task #89 (2026-05-21) — see FlashAttnVecParams::q_seq_len.
+    q_l: u32,
 }
 
 /// GPU-side reduce params. Must match MSL `FlashAttnVecReduceParams`.
@@ -109,6 +126,20 @@ fn validate_params(params: &FlashAttnVecParams) -> Result<()> {
         return Err(MlxError::InvalidArgument(format!(
             "flash_attn_vec: kv_capacity ({}) must be >= kv_seq_len ({})",
             params.kv_capacity, params.kv_seq_len
+        )));
+    }
+    // ADR-034 task #89: q_seq_len >= 1 invariant. The shader uses
+    // `abs_pos = kv_seq_len - q_seq_len + iq1`, so q_seq_len > kv_seq_len
+    // would underflow the unsigned subtraction.
+    if params.q_seq_len == 0 {
+        return Err(MlxError::InvalidArgument(
+            "flash_attn_vec: q_seq_len must be > 0".into(),
+        ));
+    }
+    if params.q_seq_len > params.kv_seq_len {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec: q_seq_len ({}) must be <= kv_seq_len ({})",
+            params.q_seq_len, params.kv_seq_len
         )));
     }
     Ok(())
@@ -160,6 +191,7 @@ pub fn flash_attn_vec(
         sliding_window: params.sliding_window,
         softcap: params.softcap,
         nwg,
+        q_l: params.q_seq_len,
     };
     // Select kernel by head dimension and KV dtype.
     // F16 KV: K/V buffers are half-precision, halving bandwidth (Phase 4a).
@@ -187,8 +219,17 @@ pub fn flash_attn_vec(
     encoder.set_op_kind(CapturedOpKind::Sdpa);
 
     // Dispatch main kernel.
-    // Grid: (1 query, num_heads, nwg)
-    let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
+    // Grid: (q_seq_len, num_heads, nwg)
+    // ADR-034 task #89 (2026-05-21) — q_seq_len = 1 (decode) keeps the
+    // pre-change behavior exactly (single threadgroup per head, single
+    // query at position kv_seq_len-1). q_seq_len > 1 (spec-decode
+    // verify) dispatches one threadgroup per (query, head) pair; each
+    // computes attention for its own query at its own causal position.
+    let threadgroups = MTLSize::new(
+        params.q_seq_len as u64,
+        params.num_heads as u64,
+        nwg as u64,
+    );
     let threadgroup_size = MTLSize::new(32, 1, 1); // 1 simdgroup of 32 threads
 
     // Pass params as inline bytes — no Metal buffer allocation.
@@ -301,6 +342,7 @@ mod tests {
             mask_type: 1,
             sliding_window: 0,
             softcap: 0.0,
+            q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
         };
         assert!(validate_params(&p).is_ok());
     }
@@ -317,15 +359,57 @@ mod tests {
             mask_type: 0,
             sliding_window: 0,
             softcap: 0.0,
+            q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
         };
         assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn adr_034_task_89_q_seq_len_zero_rejected_2026_05_21() {
+        let p = FlashAttnVecParams {
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 256,
+            kv_seq_len: 100,
+            kv_capacity: 1024,
+            scale: 1.0,
+            mask_type: 1,
+            sliding_window: 0,
+            softcap: 0.0,
+            q_seq_len: 0,
+        };
+        let err = validate_params(&p).unwrap_err().to_string();
+        assert!(err.contains("q_seq_len must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_034_task_89_q_seq_len_exceeds_kv_rejected_2026_05_21() {
+        let p = FlashAttnVecParams {
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 256,
+            kv_seq_len: 4,
+            kv_capacity: 1024,
+            scale: 1.0,
+            mask_type: 1,
+            sliding_window: 0,
+            softcap: 0.0,
+            q_seq_len: 8, // > kv_seq_len, would underflow abs_pos
+        };
+        let err = validate_params(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("must be <= kv_seq_len"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn test_gpu_params_layout() {
         assert_eq!(
             std::mem::size_of::<FlashAttnVecParamsGpu>(),
-            40, // 10 x u32/f32 = 40 bytes
+            // ADR-034 task #89 (2026-05-21): added q_l field; was 40
+            // bytes (10 fields), now 44 bytes (11 fields).
+            44, // 11 x u32/f32 = 44 bytes
         );
     }
 
