@@ -165,10 +165,34 @@ fn validate_buffers(
         _ => unreachable!("validated above"),
     };
 
-    let req_q = num_heads * q_seq_len * head_dim * 4;
-    let req_kv = num_kv_heads * kv_capacity * head_dim * kv_dtype_bytes;
-    let req_mask = q_seq_len * mask_stride * 4;
-    let req_output = num_heads * q_seq_len * head_dim * 4;
+    // ADR-037 Phase E4b.6 codex /cfa (2026-05-22) — Critical: use
+    // checked_mul on all required-byte computations. Plain usize
+    // multiply of u32-sourced values can wrap on adversarial/corrupted
+    // params, allowing undersized buffers to pass validation while
+    // the kernel indexes using the original large params.
+    let mul = |a: usize, b: usize, ctx: &str| -> Result<usize> {
+        a.checked_mul(b).ok_or_else(|| {
+            MlxError::InvalidArgument(format!(
+                "tree_attention: {} multiplication overflows usize",
+                ctx
+            ))
+        })
+    };
+    let req_q = {
+        let a = mul(num_heads, q_seq_len, "num_heads*q_seq_len")?;
+        let b = mul(a, head_dim, "num_heads*q_seq_len*head_dim")?;
+        mul(b, 4, "req_q")?
+    };
+    let req_kv = {
+        let a = mul(num_kv_heads, kv_capacity, "num_kv_heads*kv_capacity")?;
+        let b = mul(a, head_dim, "num_kv_heads*kv_capacity*head_dim")?;
+        mul(b, kv_dtype_bytes, "req_kv")?
+    };
+    let req_mask = {
+        let a = mul(q_seq_len, mask_stride, "q_seq_len*mask_stride")?;
+        mul(a, 4, "req_mask")?
+    };
+    let req_output = req_q; // same shape as Q output
     let req_tmp =
         tmp_buffer_bytes(params.num_heads, params.head_dim, params.q_seq_len);
 
@@ -411,12 +435,22 @@ pub fn tree_attention(
 /// Compute the temp buffer size needed for tree-attention. Identical
 /// to flash_attn_vec's tmp buffer (same output layout) — kept as a
 /// separate function for clarity at call sites.
+///
+/// ADR-037 Phase E4b.6 codex /cfa (2026-05-22): uses saturating_mul
+/// so adversarial inputs above usize::MAX clamp to usize::MAX
+/// instead of wrapping. Callers see a clearly-too-large requirement
+/// which fails any subsequent alloc/comparison rather than silently
+/// passing with a small wrapped value.
 #[allow(non_snake_case)]
 pub fn tmp_buffer_bytes(num_heads: u32, head_dim: u32, q_seq_len: u32) -> usize {
-    let nrows = (num_heads as usize) * (q_seq_len as usize);
+    let nrows = (num_heads as usize).saturating_mul(q_seq_len as usize);
     let nwg = NWG as usize;
     let dv = head_dim as usize;
-    (nrows * nwg * (dv + 2)) * std::mem::size_of::<f32>()
+    let dv_plus_2 = dv.saturating_add(2);
+    nrows
+        .saturating_mul(nwg)
+        .saturating_mul(dv_plus_2)
+        .saturating_mul(std::mem::size_of::<f32>())
 }
 
 fn pad2(x: usize, n: usize) -> usize {
