@@ -73,6 +73,7 @@ pub mod flash_attn_vec_peer_port_f16;
 pub mod flash_attn_vec_reduce_tq_hb_undo;
 pub mod fwht_standalone;
 pub mod chunk_gated_delta_rule;
+pub mod chunk_gated_delta_rule_bank_split;
 pub mod chunk_gated_delta_rule_tri_solve_invert;
 pub mod gated_delta_net;
 pub mod gated_delta_net_decode;
