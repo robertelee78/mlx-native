@@ -79,12 +79,23 @@
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
+use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::chunk_gated_delta_rule::{
-    ChunkGatedDeltaRuleParams, FIXED_BT, MAX_K, MAX_V,
+    build_chunk_local_cumsum_g_params, build_l2_norm_params,
+    dispatch_chunk_local_cumsum_g, ChunkGatedDeltaRuleParams, FIXED_BT, L2_NORM_EPS, MAX_K, MAX_V,
 };
+use crate::ops::chunk_gated_delta_rule_tri_solve_invert::{
+    build_chunk_tri_solve_invert_params, dispatch_chunk_tri_solve_invert,
+    ChunkTriSolveInvertParams,
+};
+use crate::ops::gated_delta_net_kkt::{
+    build_gated_delta_net_kkt_params, dispatch_gated_delta_net_kkt, GatedDeltaNetKktParams,
+};
+use crate::ops::l2_norm::dispatch_l2_norm;
+use crate::ops::elementwise::elementwise_add;
 use metal::MTLSize;
 
 /// K-dimension supported by this bank-split implementation. Hard-coded to
@@ -221,41 +232,222 @@ pub fn dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
     // Validate first — fail fast on shape errors before we touch GPU resources.
     validate_bank_split(&p, q, k, v, g_log_decay, beta, h0, o, final_state)?;
 
-    // Iter 16+ body plan:
+    let metal_device = _device.metal_device();
+
+    // ============================================================
+    // Iter 18 body — stages 1-4 (l2_norm + bank-slice + cumsum +
+    // per-bank kkt + A_strict SUM + tri_solve_invert).
     //
-    // ```ignore
-    // // Allocate per-bank temp buffers.
-    // let a_strict_partial = device.alloc_buffer(a_elems * 4, F32, ...)?;
-    // let h_partial = device.alloc_buffer(h_elems * 2, BF16, ...)?;
-    // let o_partial = device.alloc_buffer(o_elems * 2, BF16, ...)?;
+    // Stages 5-7 (recompute_wu + chunk_inter_state + chunk_o) and
+    // 7.5/8 (output SUM + final_state CONCAT) land in iter 19.
+    // ============================================================
+
+    // Per-bank K dimension. BANK_SPLIT_K = NUM_BANKS * K_BANK.
+    let k_bank: u32 = MAX_K;
+    // Rows of q/k for bank-slice (treated as [B*T*Hg, K] flat layout).
+    let qk_rows: u32 = p.b * p.t * p.hg;
+    // Rows of h0/final_state for bank-slice (treated as [B*H*V, K] flat layout).
+    let hf_rows: u32 = p.b * p.h * p.v;
+
+    // ---- Allocate per-bank Q/K temp buffers (BF16) ----
+    // After l2_norm + slice, each bank has [B, T, Hg, K_BANK] BF16.
+    let bank_qk_elems = (qk_rows as usize) * (k_bank as usize);
+    let q_normed_full = _device.alloc_buffer(
+        (qk_rows as usize) * (p.k as usize) * 2,
+        DType::BF16,
+        vec![qk_rows as usize, p.k as usize],
+    )?;
+    let k_normed_full = _device.alloc_buffer(
+        (qk_rows as usize) * (p.k as usize) * 2,
+        DType::BF16,
+        vec![qk_rows as usize, p.k as usize],
+    )?;
+    let q_bank_bufs: [MlxBuffer; 2] = [
+        _device.alloc_buffer(
+            bank_qk_elems * 2,
+            DType::BF16,
+            vec![qk_rows as usize, k_bank as usize],
+        )?,
+        _device.alloc_buffer(
+            bank_qk_elems * 2,
+            DType::BF16,
+            vec![qk_rows as usize, k_bank as usize],
+        )?,
+    ];
+    let k_bank_bufs: [MlxBuffer; 2] = [
+        _device.alloc_buffer(
+            bank_qk_elems * 2,
+            DType::BF16,
+            vec![qk_rows as usize, k_bank as usize],
+        )?,
+        _device.alloc_buffer(
+            bank_qk_elems * 2,
+            DType::BF16,
+            vec![qk_rows as usize, k_bank as usize],
+        )?,
+    ];
+
+    // ---- Allocate per-bank h0 slice (F32) ----
+    // h0 layout is [B, H, V, K=256] f32 → slice into [B*H*V, K=128].
+    let bank_hf_elems = (hf_rows as usize) * (k_bank as usize);
+    let h0_bank_bufs: [MlxBuffer; 2] = [
+        _device.alloc_buffer(
+            bank_hf_elems * 4,
+            DType::F32,
+            vec![hf_rows as usize, k_bank as usize],
+        )?,
+        _device.alloc_buffer(
+            bank_hf_elems * 4,
+            DType::F32,
+            vec![hf_rows as usize, k_bank as usize],
+        )?,
+    ];
+
+    // ---- Stage 1: l2_norm on full q and k (K=BANK_SPLIT_K=256) ----
     //
-    // // Stage 1: l2_norm (per-bank since k_bankN is a K-slice of full k).
-    // // Stage 2: cumsum_g — runs ONCE (K-independent).
-    // for bank_idx in 0..NUM_BANKS {
-    //     // Extract K-slice views (q_bank, k_bank).
-    //     // Stage 3: kkt for this bank → A_strict_partial[bank_idx].
-    // }
-    // // Stage 3.5: SUM A_strict_partial across banks → A_strict_full.
+    // CRITICAL: l2_norm depends on the FULL K — must be applied before
+    // bank-slicing since ||row||_2 cannot be decomposed across K-banks.
+    if p.use_qk_l2norm {
+        let l2_params = build_l2_norm_params(_device, L2_NORM_EPS, p.k)?;
+        dispatch_l2_norm(
+            _encoder, _registry, metal_device, q, &q_normed_full, &l2_params, qk_rows, p.k,
+        )?;
+        _encoder.memory_barrier();
+        dispatch_l2_norm(
+            _encoder, _registry, metal_device, k, &k_normed_full, &l2_params, qk_rows, p.k,
+        )?;
+        _encoder.memory_barrier();
+    } else {
+        // l2_norm skipped — but we still need a separate buffer that's
+        // safe to slice from. Note: avoiding the alloc-then-copy by
+        // having callers pre-normalize is the iter-5+ caller-contract;
+        // the bank-split path follows the same contract. For now, copy
+        // the inputs into the normed buffers via the slice helper (slice
+        // with k_bank=k_full is a no-op copy).
+        // Caller-contract optimization: iter 19+ may special-case to
+        // avoid the copy when use_qk_l2norm=false. For iter 18 the path
+        // ships correct semantics first; caller currently always passes
+        // use_qk_l2norm=true for Qwen3.6.
+        return Err(MlxError::InvalidArgument(
+            "chunk_bank_split: iter 18 requires use_qk_l2norm=true \
+             (caller-contract per Qwen3.6 default). use_qk_l2norm=false \
+             support lands in iter 19+."
+                .into(),
+        ));
+    }
+
+    // ---- Stage 2: bank-slice q_normed, k_normed, h0 into per-bank buffers ----
+    for bank_idx in 0..NUM_BANKS {
+        let bank_offset = bank_idx * MAX_K;
+        let bi = bank_idx as usize;
+        dispatch_bank_slice_bf16(
+            _encoder, _registry, metal_device,
+            &q_normed_full, &q_bank_bufs[bi],
+            qk_rows, p.k, k_bank, bank_offset,
+        )?;
+        dispatch_bank_slice_bf16(
+            _encoder, _registry, metal_device,
+            &k_normed_full, &k_bank_bufs[bi],
+            qk_rows, p.k, k_bank, bank_offset,
+        )?;
+        dispatch_bank_slice_f32(
+            _encoder, _registry, metal_device,
+            h0, &h0_bank_bufs[bi],
+            hf_rows, p.k, k_bank, bank_offset,
+        )?;
+    }
+    _encoder.memory_barrier();
+
+    // ---- Stage 3: cumsum_g (K-independent, runs ONCE) ----
+    let g_elems = (p.b * p.t * p.h) as usize;
+    let g_cumsum_buf =
+        _device.alloc_buffer(g_elems * 4, DType::F32, vec![g_elems])?;
+    let cumsum_params = build_chunk_local_cumsum_g_params(_device, &p)?;
+    dispatch_chunk_local_cumsum_g(
+        _encoder, _registry, metal_device,
+        g_log_decay, &g_cumsum_buf, &cumsum_params, &p,
+    )?;
+    _encoder.memory_barrier();
+
+    // ---- Stage 4: per-bank kkt → A_strict_partial[0..NUM_BANKS] ----
+    let a_elems = (p.b * p.t * p.h * p.bt) as usize;
+    let a_strict_partial: [MlxBuffer; 2] = [
+        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?,
+        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?,
+    ];
+
+    // The per-bank kkt uses K=MAX_K=k_bank. All other params unchanged.
+    let kkt_params_value = GatedDeltaNetKktParams {
+        b: p.b,
+        t: p.t,
+        hg: p.hg,
+        h: p.h,
+        k: k_bank, // PER-BANK K
+        bt: p.bt,
+    };
+    let kkt_params = build_gated_delta_net_kkt_params(_device, kkt_params_value)?;
+
+    for bank_idx in 0..NUM_BANKS {
+        let bi = bank_idx as usize;
+        dispatch_gated_delta_net_kkt(
+            _encoder, _registry, metal_device,
+            &k_bank_bufs[bi], beta, &g_cumsum_buf,
+            &a_strict_partial[bi],
+            &kkt_params, kkt_params_value,
+        )?;
+    }
+    _encoder.memory_barrier();
+
+    // ---- Stage 4.5: SUM A_strict_partial[0] + A_strict_partial[1] → A_strict_full ----
     //
-    // // Stage 4: tri_solve_invert on A_strict_full → A_inv.
+    // Math: kkt[i,j] over full K = Σ over K[0..128] + Σ over K[128..256].
+    let a_strict_full =
+        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
+    elementwise_add(
+        _encoder, _registry, metal_device,
+        &a_strict_partial[0], &a_strict_partial[1], &a_strict_full,
+        a_elems, DType::F32,
+    )?;
+    _encoder.memory_barrier();
+
+    // ---- Stage 5: tri_solve_invert on the full A_strict → A_inv ----
+    let a_inv_buf =
+        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
+    let invert_params_value = ChunkTriSolveInvertParams {
+        b: p.b,
+        t: p.t,
+        h: p.h,
+        bt: p.bt,
+    };
+    let invert_params = build_chunk_tri_solve_invert_params(_device, invert_params_value)?;
+    dispatch_chunk_tri_solve_invert(
+        _encoder, _registry, metal_device,
+        &a_strict_full, &a_inv_buf,
+        &invert_params, invert_params_value,
+    )?;
+    _encoder.memory_barrier();
+
+    // Iter 18 ships stages 1-5. Suppress unused-variable warnings for
+    // the buffers that iter 19+ consumes (a_inv_buf, q_bank_bufs,
+    // k_bank_bufs, h0_bank_bufs, v, beta, o, final_state).
+    let _ = (
+        &a_inv_buf, &q_bank_bufs, &k_bank_bufs, &h0_bank_bufs,
+        v, beta, o, final_state,
+    );
+
+    // ---- Stages 6-9 land in iter 19 ----
+    // - per-bank recompute_wu (uses A_inv_full + per-bank k + v + beta + g_cumsum)
+    // - per-bank chunk_inter_state (uses per-bank k + w + u + g_cumsum + per-bank h0)
+    // - per-bank chunk_o (uses per-bank q + per-bank k + v_new + per-bank h)
+    // - elementwise_add_bf16 for o (cross-bank SUM)
+    // - 2× bank_concat_f32 for final_state (per-bank → full K=256)
     //
-    // for bank_idx in 0..NUM_BANKS {
-    //     // Stage 5: recompute_w_u per bank → w_bank, u_bank (u is identical
-    //     //   across banks since v is shared; keep one u, two w).
-    //     // Stage 6: chunk_inter_state per bank → h_bank, v_new_bank,
-    //     //   final_state_bank.
-    //     // Stage 7: chunk_o per bank → o_bank.
-    // }
-    // // Stage 7.5: SUM o_bank across banks → o (final output).
-    // // Stage 8: concat final_state_bank → final_state[V, K=BANK_SPLIT_K].
-    // ```
-    //
-    // Iter 16 implements stages 1-3 + 3.5 (kkt SUM).
-    // Iter 17 implements stages 4-6.
-    // Iter 18 implements stages 7-8 + parity test.
+    // For now, return error to signal the body is incomplete. Iter 19 lifts.
     Err(MlxError::InvalidArgument(
-        "chunk_bank_split: iter 15 ships scaffolding only; body lands in iter 16+. \
-         For K=128 (Qwen3.5), use dispatch_chunk_gated_delta_rule_fwd directly."
+        "chunk_bank_split: iter 18 implements stages 1-5 (l2_norm + slice + \
+         cumsum + per-bank kkt + A_strict SUM + tri_solve_invert). \
+         Stages 6-9 (recompute_wu + chunk_inter_state + chunk_o + output \
+         combine) land in iter 19."
             .into(),
     ))
 }
