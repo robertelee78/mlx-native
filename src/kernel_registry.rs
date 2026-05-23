@@ -377,6 +377,14 @@ impl KernelRegistry {
         // ADR-022 Phase 2 — Q5_K mm_id template instantiation.
         sources.insert("kernel_mul_mm_id_q5_K_f32".into(), ggml_id_mm_src);
 
+        // ADR-033 §Pi Task #20 / ADR-034 §93 — fused MoE gate+up+silu_mul
+        // mm_id kernel for Q6_K. Replaces 3 dispatches (gate_mm_id, up_mm_id,
+        // silu_mul_id) with 1 fused dispatch per MoE FFN per layer. Closes
+        // hf2q-vs-llama.cpp prefill gap at production Qwen MoE shapes.
+        let fused_q6_k_mm_id_src: &'static str =
+            include_str!("shaders/fused_gate_up_silu_mm_id_q6_K.metal");
+        sources.insert("kernel_fused_gate_up_silu_mm_id_q6_K_f32".into(), fused_q6_k_mm_id_src);
+
         // MoE-routed quantized matrix-matrix kernels — tensor API variant
         // (ADR-011 Phase 3 Wave P3b-tensor).  Uses the MPP tensor_ops
         // matmul2d primitive for hardware-tensor-core MMA on M3+.  Only

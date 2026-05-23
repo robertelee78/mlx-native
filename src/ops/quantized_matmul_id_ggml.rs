@@ -1464,3 +1464,245 @@ pub fn dispatch_id_mm_for_test(
 
     Ok(())
 }
+
+// ============================================================================
+// ADR-033 §Pi Task #20 + ADR-034 §93 — fused MoE gate_up_silu_mm_id dispatch.
+//
+// Replaces 3 dispatches per MoE FFN per layer:
+//
+//   1. gate_mm_id  — matmul gate_w × x  → tmp_gate
+//   2. up_mm_id    — matmul up_w   × x  → tmp_up
+//   3. silu_mul_id — elem-wise   silu(tmp_gate) * tmp_up → out
+//
+// with a single fused dispatch:
+//
+//   fused_gate_up_silu_mm_id(gate_w, up_w, x, htpe, hids, out)
+//
+// The map0 stage runs once (shared between gate and up — same ids), then
+// the fused kernel reuses the staged B-tile across both gate and up matmuls
+// and applies silu_mul element-wise at writeback. Bandwidth savings:
+//   - 1× input B-tile read instead of 2×
+//   - 1× output writeback instead of 2× (tmp_gate + tmp_up no longer needed)
+//   - 1× map0 dispatch instead of 2× (shared in unfused path)
+//   - Dispatch overhead: 1 kernel launch instead of 3
+//
+// Currently Q6_K only — Q5_K and IQ4_XS variants are next iters of the
+// same arc per ADR-033 §Pi multi-iter plan.
+// ============================================================================
+
+/// Test-only helper: invoke the fused gate_up_silu mm_id kernel.
+///
+/// Computes `out[token*top_k + slot][col] = silu(gate_w[expert][col] · x[token])
+///                                          * (up_w[expert][col] · x[token])`
+///
+/// Input contract identical to `dispatch_id_mm_for_test` except weight has
+/// been split into `gate_w` and `up_w` (same shape, same expert stride).
+///
+/// Output `dst` is shape `[n_tokens * top_k, N]` (single fused result —
+/// no intermediate `tmp_gate` / `tmp_up` buffers).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gate_w: &MlxBuffer,
+    up_w: &MlxBuffer,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+) -> Result<()> {
+    // ---- Validate ----
+    // Iter 4: Q6_K only. Q5_K + IQ4_XS variants ship in follow-up iters.
+    match params.ggml_type {
+        GgmlType::Q6_K => {}
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_id_mm_fused_gate_up_silu_for_test does not support {:?} (Q6_K only in iter 4)",
+                other
+            )));
+        }
+    }
+    if params.n_tokens == 0
+        || params.k == 0
+        || params.n == 0
+        || params.top_k == 0
+        || params.n_experts == 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "n_tokens, K, N, top_k, n_experts must all be > 0".into(),
+        ));
+    }
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "K ({}) must be divisible by block QK ({})",
+            params.k, qk
+        )));
+    }
+    if params.top_k != 1 && params.top_k != 8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "fused dispatch: no map0 instantiation for top_k={} (need 1 or 8)",
+            params.top_k
+        )));
+    }
+
+    let blocks_per_row = params.k / qk;
+    let block_bytes = params.ggml_type.block_bytes();
+    let per_expert_bytes =
+        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
+
+    if (params.expert_stride as usize) < per_expert_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "expert_stride ({}) < per_expert_bytes ({})",
+            params.expert_stride, per_expert_bytes
+        )));
+    }
+    let expected_w = per_expert_bytes * params.n_experts as usize;
+    if gate_w.byte_len() < expected_w {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: gate_w buffer too small".into(),
+        ));
+    }
+    if up_w.byte_len() < expected_w {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: up_w buffer too small".into(),
+        ));
+    }
+    if input.byte_len()
+        < (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of()
+    {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: input buffer too small".into(),
+        ));
+    }
+    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
+    if ids.byte_len() < total_rows * DType::U32.size_of() {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: ids buffer too small".into(),
+        ));
+    }
+    if output.byte_len() < total_rows * (params.n as usize) * DType::F32.size_of() {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: output buffer too small".into(),
+        ));
+    }
+    if htpe.byte_len() < params.htpe_bytes() {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: htpe buffer too small".into(),
+        ));
+    }
+    if hids.byte_len() < params.hids_bytes() {
+        return Err(MlxError::InvalidArgument(
+            "fused dispatch: hids buffer too small".into(),
+        ));
+    }
+
+    // ---- Stage 1: map0 (identical to unfused path) ----
+    let map0_kernel_name = match params.top_k {
+        1 => "kernel_mul_mm_id_map0_ne20_1",
+        8 => "kernel_mul_mm_id_map0_ne20_8",
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "fused dispatch: no map0 instantiation for top_k={}",
+                other
+            )));
+        }
+    };
+    let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
+
+    let map0_params = GgmlIdMmMap0GpuParams {
+        ne10: params
+            .n
+            .try_into()
+            .map_err(|_| MlxError::InvalidArgument("N out of i32 range".into()))?,
+        ne11: params.top_k as i32,
+        nb11: 0,
+        nb12: 0,
+        ne21: params.n_tokens as i32,
+        ne20: params.top_k as i32,
+        nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
+    };
+
+    let map0_shmem =
+        (params.n_experts as u64) * (params.top_k as u64) * std::mem::size_of::<u16>() as u64;
+    let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
+    let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        map0_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&map0_params))),
+            (1, KernelArg::Buffer(ids)),
+            (2, KernelArg::Buffer(htpe)),
+            (3, KernelArg::Buffer(hids)),
+        ],
+        &[(0, map0_shmem)],
+        map0_threadgroups,
+        map0_threads,
+    );
+
+    encoder.memory_barrier();
+
+    // ---- Stage 2: fused mm_id ----
+    let mm_pipeline =
+        registry.get_pipeline("kernel_fused_gate_up_silu_mm_id_q6_K_f32", device.metal_device())?;
+
+    let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
+    let row_bytes = (params.k as u64) * (DType::F32.size_of() as u64);
+
+    let mm_params = GgmlIdMmMmGpuParams {
+        ne00: params.k as i32,
+        ne02: params.n_experts as i32,
+        nb01,
+        nb02: params.expert_stride,
+        nb03: 0,
+        ne11: params.top_k as i32,
+        _pad0: 0,
+        nb10: DType::F32.size_of() as u64,
+        nb11: 0,
+        nb12: row_bytes,
+        nb13: 0,
+        ne20: params.top_k as i32,
+        ne21: params.n_tokens as i32,
+        ne0: params.n as i32,
+        ne1: params.top_k as i32,
+        r2: 1,
+        r3: 1,
+        _pad1: 0,
+    };
+
+    const NR0: u64 = 64;
+    const NR1: u64 = 32;
+    const THREADS_PER_TG: u64 = 128;
+    // Fused kernel doubles writeback buffer: 16 KB instead of 8 KB.
+    const FUSED_SHMEM_BYTES: u64 = 16384;
+
+    let mm_threadgroups = metal::MTLSize::new(
+        (params.n_tokens as u64 + NR1 - 1) / NR1,
+        (params.n as u64 + NR0 - 1) / NR0,
+        params.n_experts as u64,
+    );
+    let mm_threads = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        mm_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&mm_params))),
+            (1, KernelArg::Buffer(gate_w)),
+            (2, KernelArg::Buffer(up_w)),
+            (3, KernelArg::Buffer(input)),
+            (4, KernelArg::Buffer(htpe)),
+            (5, KernelArg::Buffer(hids)),
+            (6, KernelArg::Buffer(output)),
+        ],
+        &[(0, FUSED_SHMEM_BYTES)],
+        mm_threadgroups,
+        mm_threads,
+    );
+
+    Ok(())
+}

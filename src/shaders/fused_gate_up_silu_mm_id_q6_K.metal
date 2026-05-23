@@ -55,30 +55,44 @@ typedef struct {
 static_assert(sizeof(block_q6_K) == sizeof(half) + QK_K/16 + 3*QK_K/4,
               "wrong q6_K block size");
 
-// Per-call dequantize: writes 16 elements of one Q6_K block to a half4x4
-// tile. Mirrors the dequantize_q6_K used in `quantized_matmul_id_mm.metal`.
+// Per-call dequantize: writes 16 elements of one Q6_K block to a 4x4 tile.
+// Verbatim port of `dequantize_q6_K` from quantized_matmul_id_mm.metal:213
+// (which is itself the upstream llama.cpp template). DO NOT modify — the
+// `il`/scales index arithmetic + kmask bit-packing is mm-template-specific.
 template <typename type4x4>
 void dequantize_q6_K_fused(device const block_q6_K * xb, short il, thread type4x4 & reg) {
-    const float d_all = xb->d;
-    device const uint8_t * ql = xb->ql + 64*(il/8) + 32*((il/2)%2);
-    device const uint8_t * qh = xb->qh + 32*(il/8);
-    const int kk = il % 2;
-    const float dl = d_all * xb->scales[il*2];
-    const float dl2 = d_all * xb->scales[il*2 + 1];
-    for (int n = 0; n < 4; n++) {
-        const float v0 =
-            (float)((int8_t)((ql[16*kk + n + 0] & 0xF) | (((qh[n + 0] >> (4*kk + 0)) & 0x3) << 4)) - 32) * dl;
-        const float v1 =
-            (float)((int8_t)((ql[16*kk + n + 4] & 0xF) | (((qh[n + 4] >> (4*kk + 0)) & 0x3) << 4)) - 32) * dl;
-        const float v2 =
-            (float)((int8_t)((ql[16*kk + n + 8] & 0xF) | (((qh[n + 8] >> (4*kk + 0)) & 0x3) << 4)) - 32) * dl2;
-        const float v3 =
-            (float)((int8_t)((ql[16*kk + n + 12] & 0xF) | (((qh[n + 12] >> (4*kk + 0)) & 0x3) << 4)) - 32) * dl2;
-        reg[n][0] = v0;
-        reg[n][1] = v1;
-        reg[n][2] = v2;
-        reg[n][3] = v3;
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il>2 ? 2 : 0;
+    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uint8_t shr_l = il>1 ? 4 : 0;
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
+        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg_f[i][0] = dl0 *  ((half)(q & 0xFF))      - ml;
+        reg_f[i][1] = dl1 * ((float)(q & 0xFF00))    - ml;
+        reg_f[i][2] = dl2 * ((float)(q & 0xFF0000))  - ml;
+        reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
     }
+    reg = (type4x4) reg_f;
 }
 
 // Args struct — same shape as GgmlMatmulIdMm_MmParams in the
