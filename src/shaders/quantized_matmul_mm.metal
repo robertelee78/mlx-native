@@ -414,6 +414,10 @@ kernel void hf2q_mul_mm_impl(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // ADR-033 §Pi Task #20 iter 9 — added #pragma unroll matching
+            // llama.cpp's FOR_UNROLL at ggml-metal.metal:9907 (mm_id path,
+            // shared template body).
+            #pragma clang loop unroll(full)
             for (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
                 const short sy = (tiitg/NL0)/8;
@@ -427,24 +431,32 @@ kernel void hf2q_mul_mm_impl(
             }
         }
 
-        // ---- Stage B tile (float input, bounds-checked for K tail) ----
+        // ---- Stage B tile (vectorized fast path + scalar bounds-check fallback) ----
         //
-        // llama.cpp switches between a fast-path 2x4 vector store and a
-        // per-element loop keyed on FC_mul_mm_bc_inp.  For correctness at
-        // K not divisible by NK, we always take the per-element path.
-        // Our K values (2048, 2112, 2816, 4096) *are* multiples of NK=32,
-        // but keep the bounds check for defensive safety.
-        for (short i = 0; i < 8; ++i) {
+        // ADR-033 §Pi Task #20 iter 9 — vectorized 8-float B-tile store
+        // when K is divisible by NK (true for all production projection
+        // shapes — K ∈ {2048, 2112, 2816, 4096, 5120}, all multiples of
+        // NK=32). Matches llama.cpp's FC_mul_mm_bc_inp=false fast path.
+        // The scalar bounds-checked fallback stays for defensive safety
+        // on hypothetical K%NK!=0 shapes.
+        {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-
-            const short lx = i;
             const short ly = (tiitg/NL1)%8;
-
             const short ib = 4*sx + sy;
-
-            *(sb + 64*ib + 8*ly + lx) =
-                (loop_k + iy + i < args.ne00) ? *((device float *) y + i) : 0.f;
+            if (loop_k + NK <= args.ne00) {
+                threadgroup float * dst_row = sb + 64*ib + 8*ly;
+                device const float * src_row = (device const float *) y;
+                ((threadgroup float4 *) dst_row)[0] = ((device const float4 *) src_row)[0];
+                ((threadgroup float4 *) dst_row)[1] = ((device const float4 *) src_row)[1];
+            } else {
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < 8; ++i) {
+                    const short lx = i;
+                    *(sb + 64*ib + 8*ly + lx) =
+                        (loop_k + iy + i < args.ne00) ? *((device float *) y + i) : 0.f;
+                }
+            }
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
