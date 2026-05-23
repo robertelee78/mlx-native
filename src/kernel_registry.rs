@@ -1179,6 +1179,72 @@ impl KernelRegistry {
         self.sources.insert(name, source);
     }
 
+    /// ADR-033 §Pi Task #20 iter 11 (2026-05-23) — eagerly compile a list
+    /// of kernel pipelines to move first-call JIT/PSO-creation cost out of
+    /// the prefill hot path and into the model-load window.
+    ///
+    /// The profiler showed that on Qwen3.6 35B-A3B MoE prefill at seq=553,
+    /// the FIRST FA layer + FIRST FFN layer take ~40ms each (vs ~14µs
+    /// warm) — that's 80ms of the 221ms prefill, dominated by Metal
+    /// pipeline state creation. Pre-creating these pipelines at load time
+    /// (when 3.3s is already being spent on model parse + upload) is a
+    /// strict perf win for measured prefill throughput.
+    ///
+    /// Best-effort: silently skips kernels that aren't registered (e.g.,
+    /// list contains a kernel name for an arch this build doesn't use).
+    /// Logs at debug level on failure to keep load-path quiet.
+    ///
+    /// Returns the count of pipelines successfully prewarmed.
+    pub fn prewarm_pipelines(
+        &mut self,
+        device: &metal::DeviceRef,
+        names: &[&str],
+    ) -> usize {
+        let mut warmed = 0_usize;
+        for name in names {
+            // Skip if already cached.
+            if self.cache.contains_key(*name) {
+                warmed += 1;
+                continue;
+            }
+            // Skip if no source registered for this name.
+            if !self.sources.contains_key(*name) {
+                continue;
+            }
+            // Best-effort: ignore errors so one broken kernel doesn't
+            // poison the whole prewarm pass.
+            if self.get_pipeline(name, device).is_ok() {
+                warmed += 1;
+            }
+        }
+        warmed
+    }
+
+    /// ADR-033 §Pi Task #20 iter 11 (2026-05-23) — prewarm every registered
+    /// kernel source. Useful when the exact set of needed kernels is hard
+    /// to enumerate (e.g., serving paths that span multiple arches).
+    /// Total cost is bounded by the number of registered kernels times
+    /// the per-pipeline PSO creation cost (~5-15ms typical on M-series).
+    ///
+    /// Returns (warmed, skipped) counts.
+    pub fn prewarm_all(&mut self, device: &metal::DeviceRef) -> (usize, usize) {
+        let names: Vec<String> = self.sources.keys().cloned().collect();
+        let mut warmed = 0_usize;
+        let mut skipped = 0_usize;
+        for name in &names {
+            if self.cache.contains_key(name) {
+                warmed += 1;
+                continue;
+            }
+            if self.get_pipeline(name, device).is_ok() {
+                warmed += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        (warmed, skipped)
+    }
+
     /// Get a compiled compute pipeline for the named kernel function.
     ///
     /// On first call for a given name, this compiles the MSL source into a
