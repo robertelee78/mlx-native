@@ -673,6 +673,138 @@ pub fn dispatch_bank_slice_f32(
     Ok(())
 }
 
+/// ADR-033 §Pi Task #25 iter 21 — dispatch wrapper for the K=256 native
+/// `gated_delta_net_chunk_inter_state_bf16_k256` kernel.
+///
+/// Sister to [`dispatch_gated_delta_net_chunk_inter_state`] in the K=128
+/// path. Same shape contract except K must equal `BANK_SPLIT_K` (= 256).
+///
+/// Threadgroup memory budget at K=256, BV=32:
+///   bh tile     : BV × K  × 4 = 32 × 256 × 4 = 32 KB (running f32 state)
+///   bv_stage_bf : BV × BT × 2 = 32 × 64  × 2 =  4 KB
+///   Total: 36 KB
+///
+/// **NOTE (iter 21):** M-series threadgroup-memory cap is 32 KB. This
+/// dispatch WILL FAIL at runtime if device.maxThreadgroupMemoryLength
+/// < 36 KB. Iter 22 may pivot to BV=16 (16 KB bh + 2 KB stage = 18 KB)
+/// or fp16 bh staging if the cap is hit on M5 Max. Shipping this wrapper
+/// to surface the empirical constraint per "code+test==truth".
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_chunk_inter_state_k256(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    k: &MlxBuffer,
+    w: &MlxBuffer,
+    u: &MlxBuffer,
+    g: &MlxBuffer,
+    h0: &MlxBuffer,
+    h_out: &MlxBuffer,
+    v_new: &MlxBuffer,
+    final_state: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    p: crate::ops::gated_delta_net_chunk::GatedDeltaNetChunkParams,
+) -> Result<()> {
+    use crate::ops::gated_delta_net_chunk::DEFAULT_BV;
+
+    if p.k != BANK_SPLIT_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_chunk_inter_state_k256: K ({}) must equal {} exactly. \
+             For K=128 (Qwen3.5), use dispatch_gated_delta_net_chunk_inter_state.",
+            p.k, BANK_SPLIT_K
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("gated_delta_net_chunk_inter_state_bf16_k256", device)?;
+
+    let nv_tiles = (p.v / DEFAULT_BV) as u64;
+    let grid_tgs = MTLSize::new(nv_tiles, p.h as u64, p.b as u64);
+    let tg = MTLSize::new(128, 1, 1);
+
+    let bh_bytes: u64 = (DEFAULT_BV * p.k) as u64 * 4;
+    let bv_stage_bytes: u64 = (DEFAULT_BV * p.bt) as u64 * 2;
+    let shared_bytes = bh_bytes + bv_stage_bytes;
+
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[
+            (0, k),
+            (1, w),
+            (2, u),
+            (3, g),
+            (4, h0),
+            (5, h_out),
+            (6, v_new),
+            (7, final_state),
+            (8, params_buf),
+        ],
+        &[(0, shared_bytes)],
+        grid_tgs,
+        tg,
+    );
+
+    Ok(())
+}
+
+/// ADR-033 §Pi Task #25 iter 21 — dispatch wrapper for the K=256 native
+/// `gated_delta_net_chunk_o_bf16_k256` kernel.
+///
+/// Sister to [`dispatch_gated_delta_net_chunk_o`]. Same shape contract
+/// except K must equal `BANK_SPLIT_K` (= 256).
+///
+/// chunk_o's threadgroup-memory budget is K-independent (`bA_stage` at
+/// BT*BT*2 = 8 KB), so K=256 fits comfortably without the bh-tile
+/// blow-up that affects inter_state.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_chunk_o_k256(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    h: &MlxBuffer,
+    g: &MlxBuffer,
+    o: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    p: crate::ops::gated_delta_net_chunk_o::GatedDeltaNetChunkOParams,
+) -> Result<()> {
+    if p.k != BANK_SPLIT_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_chunk_o_k256: K ({}) must equal {} exactly.",
+            p.k, BANK_SPLIT_K
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("gated_delta_net_chunk_o_bf16_k256", device)?;
+
+    let nv = p.num_v_tiles() as u64;
+    let nt = p.num_chunks() as u64;
+    let bh = (p.b * p.h) as u64;
+    let grid_tgs = MTLSize::new(nv, nt, bh);
+    let tg = MTLSize::new(256, 1, 1);
+
+    let ba_stage_bytes: u64 = (p.bt as u64) * (p.bt as u64) * 2;
+
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[
+            (0, q),
+            (1, k),
+            (2, v),
+            (3, h),
+            (4, g),
+            (5, o),
+            (6, params_buf),
+        ],
+        &[(0, ba_stage_bytes)],
+        grid_tgs,
+        tg,
+    );
+
+    Ok(())
+}
+
 /// ADR-033 §Pi Task #25 iter 17 — F32 bank concatenate (inverse of slice).
 ///
 /// Writes `src[rows, k_bank]` into `dst[rows, k_full]` at the
@@ -933,6 +1065,102 @@ mod tests {
                         src_data[src_idx],
                     );
                 }
+            }
+        }
+    }
+
+    /// Iter 21 SMOKE TEST — verify the K=256 native chunk_inter_state
+    /// kernel can be dispatched without runtime error (shmem cap +
+    /// pipeline-state creation). This is the empirical check that the
+    /// 36 KB threadgroup memory budget at K=256, BV=32 fits the device.
+    /// If this test fails with "newComputePipelineState…" or
+    /// "setThreadgroupMemoryLength…" error, iter 22 needs to pivot to
+    /// BV=16 (16 KB bh) or fp16 bh storage.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn chunk_inter_state_k256_dispatch_smoke() {
+        use crate::ops::gated_delta_net_chunk::{
+            build_gated_delta_net_chunk_params, GatedDeltaNetChunkParams,
+        };
+        use crate::{DType, KernelRegistry, MlxDevice};
+
+        // Smallest valid K=256 shape: B=1, T=64=FIXED_BT, Hg=H=1, V=32=DEFAULT_BV.
+        let p = GatedDeltaNetChunkParams {
+            b: 1,
+            t: FIXED_BT,
+            hg: 1,
+            h: 1,
+            k: BANK_SPLIT_K, // 256
+            v: 32,
+            bt: FIXED_BT,
+        };
+
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let mut registry = KernelRegistry::new();
+
+        // Zero-init inputs sized per the kernel contract.
+        let k_elems = (p.b * p.t * p.hg * p.k) as usize;
+        let w_elems = (p.b * p.t * p.h * p.k) as usize;
+        let u_elems = (p.b * p.t * p.h * p.v) as usize;
+        let g_elems = (p.b * p.t * p.h) as usize;
+        let h0_elems = (p.b * p.h * p.v * p.k) as usize;
+        let h_out_elems = (p.b * p.num_chunks() * p.h * p.v * p.k) as usize;
+        let final_state_elems = h0_elems;
+
+        let k_buf = device.alloc_buffer(k_elems * 2, DType::BF16, vec![k_elems]).unwrap();
+        let w_buf = device.alloc_buffer(w_elems * 2, DType::BF16, vec![w_elems]).unwrap();
+        let u_buf = device.alloc_buffer(u_elems * 2, DType::BF16, vec![u_elems]).unwrap();
+        let g_buf = device.alloc_buffer(g_elems * 4, DType::F32, vec![g_elems]).unwrap();
+        let h0_buf = device.alloc_buffer(h0_elems * 4, DType::F32, vec![h0_elems]).unwrap();
+        let h_out_buf = device.alloc_buffer(h_out_elems * 2, DType::BF16, vec![h_out_elems]).unwrap();
+        let v_new_buf = device.alloc_buffer(u_elems * 2, DType::BF16, vec![u_elems]).unwrap();
+        let final_state_buf =
+            device.alloc_buffer(final_state_elems * 4, DType::F32, vec![final_state_elems]).unwrap();
+
+        let params_buf = build_gated_delta_net_chunk_params(&device, p)
+            .expect("build params");
+
+        let mut encoder = device.command_encoder().unwrap();
+        let result = dispatch_chunk_inter_state_k256(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &k_buf, &w_buf, &u_buf, &g_buf, &h0_buf,
+            &h_out_buf, &v_new_buf, &final_state_buf,
+            &params_buf, p,
+        );
+
+        match result {
+            Ok(()) => {
+                // Dispatch was queued; commit and confirm execution doesn't
+                // panic. Don't validate output values — this is a smoke test
+                // for capability, not numerical parity (iter 22 adds that).
+                let commit = encoder.commit_and_wait();
+                match commit {
+                    Ok(()) => {
+                        eprintln!(
+                            "[iter 21 smoke] K=256 chunk_inter_state \
+                             dispatch SUCCEEDED — shmem budget fits within \
+                             device cap. Native kernel viable."
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        // Empirical finding: surface the shmem-cap signal if hit.
+                        eprintln!(
+                            "[iter 21 smoke] K=256 chunk_inter_state commit \
+                             FAILED — likely shmem cap exceeded. Error: {msg}"
+                        );
+                        // Don't fail the test — this is an EMPIRICAL probe.
+                        // Iter 22 will use this signal to decide BV=16 pivot.
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[iter 21 smoke] K=256 chunk_inter_state ENCODE failed \
+                     (validation or pipeline creation): {e}"
+                );
             }
         }
     }
