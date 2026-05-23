@@ -732,3 +732,33 @@ kernel void hf2q_mul_mm_id_impl<block_iq4_nl, 2, dequantize_iq4_nl>(
     constant GgmlMatmulIdMm_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ============================================================================
+// ADR-033 §Pi Task #20 debug kernel — dequantize_iq4_xs dump
+// ============================================================================
+//
+// Standalone diagnostic kernel that calls `dequantize_iq4_xs` at all
+// 16 il values for ONE block_iq4_xs and writes the dequantized output
+// (256 floats) to a buffer. Lets a Rust test compare the kernel's
+// dequant output against the canonical CPU reference
+// (`test_only_dequantize_iq4_xs`).
+//
+// Layout: dst[il * 16 + j] for il ∈ [0,16), j ∈ [0,16) = 256 floats.
+// Each `il` call produces 16 elements in row-major reg[i/4][i%4] order,
+// matching how the mm_id template stages them via the same indexing.
+//
+// Dispatch: one threadgroup, one thread. We're not benchmarking — just
+// reading the dequant output for parity vs CPU.
+kernel void hf2q_dequant_iq4_xs_dump(
+        device const block_iq4_xs * src [[buffer(0)]],
+        device float * dst [[buffer(1)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    for (short il = 0; il < 16; ++il) {
+        half4x4 reg;
+        dequantize_iq4_xs(src, il, reg);
+        for (int i = 0; i < 16; ++i) {
+            dst[il * 16 + i] = (float)reg[i / 4][i % 4];
+        }
+    }
+}
