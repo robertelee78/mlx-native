@@ -22,7 +22,9 @@
 // Dispatch geometry (matches `hf2q_mul_mm_id_impl<block_q6_K, …>`):
 //   threadgroups   = (ceil(n_tokens*top_k / NR1), ceil(N / NR0), n_experts)
 //   threads_per_tg = 128 (4 simdgroups × 32 threads)
-//   shmem          = 16 KB (2× the A-tile + 1× B-tile)
+//   shmem          = 16 KB peak (writeback dominates)
+//     K-loop:  4 KB sa_gate + 4 KB sa_up + 4 KB sb  = 12 KB
+//     Writeback: 8 KB temp_str_gate + 8 KB temp_str_up = 16 KB (overlays)
 //
 // Buffer layout:
 //   buffer(0): args         constant GgmlMatmulIdMm_MmParams &
@@ -281,9 +283,63 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
         }
     }
 
-    // Iter 3 will: apply silu_mul = (mc_gate * sigmoid(mc_gate)) * mc_up,
-    // simdgroup_store to shmem, and write back to dst with hids lookup.
-    // For now the writeback is empty so we can prove compile + grid wiring.
-    (void)dst;
-    (void)nr0;
+    // ---- Fused silu_mul writeback ----
+    //
+    // Shmem layout (writeback overlays the K-loop A-tile/B-tile slots,
+    // which are no longer needed):
+    //   offset    0 ..  8191   temp_str_gate (8 KB — 4 SG × 16×32 floats)
+    //   offset 8192 .. 16383   temp_str_up   (8 KB)
+    //
+    // Each simdgroup writes its 8 mc-tiles into its quadrant of the
+    // 64×32 output tile, then a single barrier publishes both buffers.
+    // The per-row copy loop reads gate + up, applies silu_mul, writes dst.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str_gate = ((threadgroup float *) shmem)
+        + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    threadgroup float * temp_str_up   = ((threadgroup float *)(shmem + 8192))
+        + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc_gate[i], temp_str_gate + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        simdgroup_store(mc_up[i],   temp_str_up   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Per-row copy with fused silu_mul: each simdgroup strides through nr1.
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int id = ids_i32[im*args.ne21 + r1 + j];
+
+        const short ide = id % args.ne20;  // slot index
+        const short idt = id / args.ne20;  // token index
+
+        device float  * D  = (device float  *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+        device float4 * D4 = (device float4 *) D;
+
+        threadgroup float  * Cg  = (threadgroup float *)  shmem          + j*NR0;
+        threadgroup float  * Cu  = (threadgroup float *) (shmem + 8192)  + j*NR0;
+        threadgroup float4 * Cg4 = (threadgroup float4 *) Cg;
+        threadgroup float4 * Cu4 = (threadgroup float4 *) Cu;
+
+        int i = tiisg;
+        for (; i < nr0/4; i += 32) {
+            float4 g4 = *(Cg4 + i);
+            float4 u4 = *(Cu4 + i);
+            float4 r4;
+            // silu(g) = g / (1 + exp(-g));  out = silu(g) * u
+            r4.x = (g4.x / (1.0f + exp(-g4.x))) * u4.x;
+            r4.y = (g4.y / (1.0f + exp(-g4.y))) * u4.y;
+            r4.z = (g4.z / (1.0f + exp(-g4.z))) * u4.z;
+            r4.w = (g4.w / (1.0f + exp(-g4.w))) * u4.w;
+            *(D4 + i) = r4;
+        }
+
+        i = (4*(nr0/4)) + tiisg;
+        for (; i < nr0; i += 32) {
+            const float g = *(Cg + i);
+            const float u = *(Cu + i);
+            *(D + i) = (g / (1.0f + exp(-g))) * u;
+        }
+    }
 }
