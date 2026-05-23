@@ -277,6 +277,17 @@ fn adr033_pi_iq4_xs_mv_id_parity_realistic() {
 }
 
 #[test]
+fn adr033_pi_iq4_xs_mv_id_top_k_8_below_routing_threshold() {
+    // ADR-033 §Pi Task #20 diagnostic — mv_id at top_k=8 just below the
+    // mm_id routing threshold (n_tokens=32, threshold is >32 → mm_id).
+    // This stays in mv_id codepath and validates that mv_id's IQ4_XS
+    // dequant works correctly at top_k=8. If THIS passes, the top_k=8
+    // bug is localized to mm_id (NOT mv_id, NOT the dequant function
+    // itself).
+    run_iq4_xs_mv_id_parity(32, 8, 8, 64, QK_K, 0xAD33_2014_D004, 5e-3);
+}
+
+#[test]
 fn adr033_pi_iq4_xs_mv_id_parity_qwen_shape() {
     // Qwen 3.5 35B-A3B routed-expert shape per dispatch: 1 token, top_k=8,
     // 256 experts, ffn_down_exps has inner dim K=512 (= moe_intermediate_size).

@@ -304,16 +304,18 @@ constant float kvalues_iq4nl_f[16] = {
 };
 
 // ADR-033 §Pi Task #20 — IQ4_XS dequant for the mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:948-966 (`dequantize_iq4_xs`).
-// 16 elements per call addressed by il ∈ [0,16). `il/2 = ib32` selects
-// the 32-element sub-block (0..7), `il%2` selects which 16-elem half
-// (low / high) within that sub-block. Per-sub-block 6-bit scale is
-// reconstructed from the 4 low bits in scales_l[ib32/2] (nibble-packed,
-// 2 sub-blocks per byte) plus the top 2 bits in scales_h (2 bits per
-// sub-block in a uint16_t). Scale value `ls - 32` applies a signed
-// offset of 32 since the recorded value is the un-offset 6-bit unsigned.
-// Nibble unpacking + codebook lookup mirrors IQ4_NL above but using
-// 16-byte sub-stripes of qs starting at byte offset `16*ib32`.
+// Spec source: llama.cpp ggml-metal.metal:948-966 (`dequantize_iq4_xs`)
+// — ported verbatim modulo formatting.
+//
+// 16 elements per call addressed by `il ∈ [0,16)`:
+//   - `ib32 = il/2` selects the 32-element sub-block (0..7) in qs;
+//   - `il%2` selects which 16-elem half (low/high nibble) within that
+//     sub-block.
+//
+// Per-sub-block 6-bit signed scale is reconstructed from 4 low bits in
+// `scales_l[ib32/2]` (nibble-packed, 2 sub-blocks per byte) plus the top
+// 2 bits in `scales_h` (2 bits per sub-block in a uint16_t). Scale value
+// is `xb->d * (ls - 32)` — the offset of 32 is the signed-conversion.
 template <typename type4x4>
 void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 & reg) {
     // il is 0..15 for QK_K = 256 — index of 32-elem sub-block is il/2

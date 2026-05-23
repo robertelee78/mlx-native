@@ -225,6 +225,15 @@ fn run_iq4_xs_mm_id_parity(
     let mut htpe_buf = device
         .alloc_buffer(dispatch.htpe_bytes(), DType::U32, vec![n_experts])
         .unwrap();
+    // Zero-init htpe — `map0` may accumulate per-expert counts via
+    // atomic_increment, requiring a zero starting state. alloc_buffer
+    // doesn't guarantee zero-init.
+    {
+        let s = htpe_buf.as_mut_slice::<u32>().unwrap();
+        for v in s.iter_mut() {
+            *v = 0;
+        }
+    }
     let mut hids_buf = device
         .alloc_buffer(
             dispatch.hids_bytes(),
