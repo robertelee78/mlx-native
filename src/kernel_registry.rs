@@ -703,6 +703,12 @@ impl KernelRegistry {
         let bank_slice_bf16_src: &'static str =
             include_str!("shaders/bank_slice_bf16.metal");
         sources.insert("bank_slice_bf16".into(), bank_slice_bf16_src);
+        // ADR-033 §Pi Task #25 iter 17 — F32 variants (for h0 input and
+        // final_state output) + concat (inverse of slice, for assembling
+        // the K=256 final_state from per-bank K=128 outputs). Same source
+        // file — multiple kernels share the BankSliceParams struct.
+        sources.insert("bank_slice_f32".into(), bank_slice_bf16_src);
+        sources.insert("bank_concat_f32".into(), bank_slice_bf16_src);
         // ADR-034 task #93 — fused gate_proj + up_proj + silu_mul Q8_0.
         let fused_gate_up_silu_q8_0_src: &'static str =
             include_str!("shaders/fused_gate_up_silu_q8_0.metal");

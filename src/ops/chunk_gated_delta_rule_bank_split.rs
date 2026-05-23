@@ -360,6 +360,146 @@ pub fn dispatch_bank_slice_bf16(
     Ok(())
 }
 
+/// ADR-033 §Pi Task #25 iter 17 — F32 variant of `dispatch_bank_slice_bf16`.
+///
+/// Same algorithm but for F32 buffers — used for the f32 `h0` initial-state
+/// input of the bank-split chunk pipeline (h0 layout is [B, H, V, K] f32).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_bank_slice_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    dst: &MlxBuffer,
+    rows: u32,
+    k_full: u32,
+    k_bank: u32,
+    bank_offset: u32,
+) -> Result<()> {
+    if rows == 0 || k_full == 0 || k_bank == 0 {
+        return Err(MlxError::InvalidArgument(
+            "bank_slice_f32: rows, k_full, k_bank must all be > 0".into(),
+        ));
+    }
+    if bank_offset + k_bank > k_full {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_slice_f32: bank_offset ({bank_offset}) + k_bank ({k_bank}) \
+             must be <= k_full ({k_full})"
+        )));
+    }
+    let src_bytes = (rows as usize) * (k_full as usize) * 4;
+    if src.byte_len() < src_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_slice_f32: src buffer too small: need {src_bytes} bytes, have {}",
+            src.byte_len()
+        )));
+    }
+    let dst_bytes = (rows as usize) * (k_bank as usize) * 4;
+    if dst.byte_len() < dst_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_slice_f32: dst buffer too small: need {dst_bytes} bytes, have {}",
+            dst.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("bank_slice_f32", device)?;
+
+    let gpu_params = BankSliceGpuParams {
+        rows,
+        k_full,
+        k_bank,
+        bank_offset,
+    };
+
+    let grid = MTLSize::new(k_bank as u64, rows as u64, 1);
+    let tg = MTLSize::new(std::cmp::min(32, k_bank as u64), 1, 1);
+
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(dst)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+    Ok(())
+}
+
+/// ADR-033 §Pi Task #25 iter 17 — F32 bank concatenate (inverse of slice).
+///
+/// Writes `src[rows, k_bank]` into `dst[rows, k_full]` at the
+/// `dst[:, bank_offset..bank_offset+k_bank]` slice. Used after the
+/// bank-split pipeline to assemble the final_state[B, H, V, K=256] output
+/// from two per-bank final_state[B, H, V, K=128] buffers.
+///
+/// Call twice (once per bank) into the same dst to assemble the full
+/// K=256 final_state. dst MUST be pre-zeroed before the first call (or
+/// the second call's K-slice will overwrite cleanly without zeroing).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_bank_concat_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    dst: &MlxBuffer,
+    rows: u32,
+    k_full: u32,
+    k_bank: u32,
+    bank_offset: u32,
+) -> Result<()> {
+    if rows == 0 || k_full == 0 || k_bank == 0 {
+        return Err(MlxError::InvalidArgument(
+            "bank_concat_f32: rows, k_full, k_bank must all be > 0".into(),
+        ));
+    }
+    if bank_offset + k_bank > k_full {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_concat_f32: bank_offset ({bank_offset}) + k_bank ({k_bank}) \
+             must be <= k_full ({k_full})"
+        )));
+    }
+    let src_bytes = (rows as usize) * (k_bank as usize) * 4;
+    if src.byte_len() < src_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_concat_f32: src buffer too small: need {src_bytes} bytes, have {}",
+            src.byte_len()
+        )));
+    }
+    let dst_bytes = (rows as usize) * (k_full as usize) * 4;
+    if dst.byte_len() < dst_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_concat_f32: dst buffer too small: need {dst_bytes} bytes, have {}",
+            dst.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("bank_concat_f32", device)?;
+
+    let gpu_params = BankSliceGpuParams {
+        rows,
+        k_full,
+        k_bank,
+        bank_offset,
+    };
+
+    let grid = MTLSize::new(k_bank as u64, rows as u64, 1);
+    let tg = MTLSize::new(std::cmp::min(32, k_bank as u64), 1, 1);
+
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(dst)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +618,191 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Iter 17 GPU parity test — verify the F32 variant of bank_slice
+    /// extracts a K-bank slice correctly. Bit-equivalent to CPU reference.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn bank_slice_f32_matches_cpu_reference() {
+        use crate::{DType, KernelRegistry, MlxDevice};
+
+        let rows: u32 = 8;
+        let k_full: u32 = 256;
+        let k_bank: u32 = 128;
+
+        let total = (rows * k_full) as usize;
+        let src_data: Vec<f32> = (0..total)
+            .map(|i| (i as f32) * 0.0173 - 1.5)
+            .collect();
+
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let mut registry = KernelRegistry::new();
+
+        let mut src_buf = device
+            .alloc_buffer(total * 4, DType::F32, vec![rows as usize, k_full as usize])
+            .expect("alloc src");
+        src_buf
+            .as_mut_slice::<f32>()
+            .expect("src as_mut")
+            .copy_from_slice(&src_data);
+
+        let dst_elems = (rows * k_bank) as usize;
+        let dst_buf = device
+            .alloc_buffer(
+                dst_elems * 4,
+                DType::F32,
+                vec![rows as usize, k_bank as usize],
+            )
+            .expect("alloc dst");
+
+        for bank_idx in 0..NUM_BANKS {
+            let bank_offset = bank_idx * MAX_K;
+            let mut encoder = device.command_encoder().expect("encoder");
+            dispatch_bank_slice_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &src_buf,
+                &dst_buf,
+                rows,
+                k_full,
+                k_bank,
+                bank_offset,
+            )
+            .expect("dispatch");
+            encoder.commit_and_wait().expect("commit_and_wait");
+
+            let dst_data: &[f32] = dst_buf.as_slice().expect("dst as_slice");
+            for r in 0..rows {
+                for k in 0..k_bank {
+                    let src_idx = (r * k_full + bank_offset + k) as usize;
+                    let dst_idx = (r * k_bank + k) as usize;
+                    assert_eq!(
+                        dst_data[dst_idx].to_bits(),
+                        src_data[src_idx].to_bits(),
+                        "bank_idx={bank_idx} r={r} k={k}: dst {} != src {}",
+                        dst_data[dst_idx],
+                        src_data[src_idx],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Iter 17 GPU parity test — verify bank_concat_f32 correctly writes
+    /// per-bank slices into the right offsets in a wider dst buffer.
+    /// Slice then concat should be the identity (round-trip).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn bank_concat_f32_is_inverse_of_slice() {
+        use crate::{DType, KernelRegistry, MlxDevice};
+
+        let rows: u32 = 8;
+        let k_full: u32 = 256;
+        let k_bank: u32 = 128;
+
+        // Source: [rows, k_full] with distinctive per-position values.
+        let total = (rows * k_full) as usize;
+        let src_data: Vec<f32> = (0..total)
+            .map(|i| (i as f32) * 0.0287 + 0.5)
+            .collect();
+
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let mut registry = KernelRegistry::new();
+
+        let mut src_buf = device
+            .alloc_buffer(total * 4, DType::F32, vec![rows as usize, k_full as usize])
+            .expect("alloc src");
+        src_buf
+            .as_mut_slice::<f32>()
+            .expect("src")
+            .copy_from_slice(&src_data);
+
+        // Two per-bank intermediate buffers.
+        let bank_elems = (rows * k_bank) as usize;
+        let bank0_buf = device
+            .alloc_buffer(bank_elems * 4, DType::F32, vec![rows as usize, k_bank as usize])
+            .expect("alloc bank0");
+        let bank1_buf = device
+            .alloc_buffer(bank_elems * 4, DType::F32, vec![rows as usize, k_bank as usize])
+            .expect("alloc bank1");
+
+        // Destination: zero-init [rows, k_full] for concat output.
+        let mut dst_buf = device
+            .alloc_buffer(total * 4, DType::F32, vec![rows as usize, k_full as usize])
+            .expect("alloc dst");
+        dst_buf
+            .as_mut_slice::<f32>()
+            .expect("dst init")
+            .iter_mut()
+            .for_each(|v| *v = 0.0);
+
+        // 1) Slice src → bank0, bank1.
+        // 2) Concat bank0, bank1 → dst.
+        let mut encoder = device.command_encoder().expect("encoder");
+        dispatch_bank_slice_f32(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &src_buf,
+            &bank0_buf,
+            rows,
+            k_full,
+            k_bank,
+            0,
+        )
+        .expect("slice bank0");
+        dispatch_bank_slice_f32(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &src_buf,
+            &bank1_buf,
+            rows,
+            k_full,
+            k_bank,
+            MAX_K,
+        )
+        .expect("slice bank1");
+        encoder.memory_barrier();
+        dispatch_bank_concat_f32(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &bank0_buf,
+            &dst_buf,
+            rows,
+            k_full,
+            k_bank,
+            0,
+        )
+        .expect("concat bank0");
+        dispatch_bank_concat_f32(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &bank1_buf,
+            &dst_buf,
+            rows,
+            k_full,
+            k_bank,
+            MAX_K,
+        )
+        .expect("concat bank1");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        // Round-trip: dst should equal src bit-for-bit.
+        let dst_data: &[f32] = dst_buf.as_slice().expect("dst as_slice");
+        for i in 0..total {
+            assert_eq!(
+                dst_data[i].to_bits(),
+                src_data[i].to_bits(),
+                "round-trip at idx {i}: dst {} != src {}",
+                dst_data[i],
+                src_data[i],
+            );
         }
     }
 }

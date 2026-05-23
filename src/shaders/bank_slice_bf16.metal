@@ -51,3 +51,44 @@ kernel void bank_slice_bf16(
     const uint dst_idx = r * p.k_bank + k;
     dst[dst_idx] = src[src_idx];
 }
+
+// ADR-033 §Pi Task #25 iter 17 (2026-05-23) — F32 variant.
+// Same algorithm as bank_slice_bf16, but for f32 buffers. Used for the
+// f32 h0 initial-state input and f32 final_state output of the bank-split
+// chunk pipeline (h0/final_state layout is [B, H, V, K] f32).
+kernel void bank_slice_f32(
+    device const float * src     [[buffer(0)]],
+    device       float * dst     [[buffer(1)]],
+    constant BankSliceParams & p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint k = gid.x;
+    const uint r = gid.y;
+    if (k >= p.k_bank || r >= p.rows) return;
+
+    const uint src_idx = r * p.k_full + p.bank_offset + k;
+    const uint dst_idx = r * p.k_bank + k;
+    dst[dst_idx] = src[src_idx];
+}
+
+// ADR-033 §Pi Task #25 iter 17 — bank CONCAT (inverse of slice).
+// Combines two `[rows, k_bank]` f32 buffers into a single `[rows, k_full]`
+// where dst[:, bank_offset..bank_offset+k_bank] = src.
+//
+// Used post-pipeline to assemble the final_state[B, H, V, K=256] output
+// from the two per-bank final_state[B, H, V, K=128] buffers.
+kernel void bank_concat_f32(
+    device const float * src     [[buffer(0)]],
+    device       float * dst     [[buffer(1)]],
+    constant BankSliceParams & p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint k = gid.x;
+    const uint r = gid.y;
+    if (k >= p.k_bank || r >= p.rows) return;
+
+    // Inverse mapping: dst is k_full-wide, src is k_bank-wide.
+    const uint src_idx = r * p.k_bank + k;
+    const uint dst_idx = r * p.k_full + p.bank_offset + k;
+    dst[dst_idx] = src[src_idx];
+}

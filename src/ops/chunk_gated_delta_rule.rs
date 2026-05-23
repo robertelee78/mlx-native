@@ -284,7 +284,11 @@ fn validate(
 
 /// Build the 5-u32 params buffer for `chunk_local_cumsum_g_f32`:
 /// `[B, T, H, BT, NT]`.
-fn build_chunk_local_cumsum_g_params(
+///
+/// ADR-033 §Pi Task #25 iter 17 (2026-05-23): visibility widened to
+/// `pub(crate)` so the K=256 bank-split path
+/// (`chunk_gated_delta_rule_bank_split`) can compose this stage.
+pub(crate) fn build_chunk_local_cumsum_g_params(
     device: &MlxDevice,
     p: &ChunkGatedDeltaRuleParams,
 ) -> Result<MlxBuffer> {
@@ -301,7 +305,9 @@ fn build_chunk_local_cumsum_g_params(
 }
 
 /// Build the 2-f32 params buffer for `dispatch_l2_norm`: `[eps, dim]`.
-fn build_l2_norm_params(device: &MlxDevice, eps: f32, dim: u32) -> Result<MlxBuffer> {
+///
+/// ADR-033 §Pi Task #25 iter 17: pub(crate) for bank-split composition.
+pub(crate) fn build_l2_norm_params(device: &MlxDevice, eps: f32, dim: u32) -> Result<MlxBuffer> {
     let mut buf = device.alloc_buffer(2 * 4, DType::F32, vec![2])?;
     {
         let s = buf.as_mut_slice::<f32>()?;
@@ -312,7 +318,9 @@ fn build_l2_norm_params(device: &MlxDevice, eps: f32, dim: u32) -> Result<MlxBuf
 }
 
 /// Dispatch the chunk-local cumsum on g (B*NT*H independent chunks).
-fn dispatch_chunk_local_cumsum_g(
+///
+/// ADR-033 §Pi Task #25 iter 17: pub(crate) for bank-split composition.
+pub(crate) fn dispatch_chunk_local_cumsum_g(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &metal::DeviceRef,
