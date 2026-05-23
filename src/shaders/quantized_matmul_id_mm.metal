@@ -146,6 +146,21 @@ typedef struct {
     uint8_t qs[QK4_0 / 2];
 } block_iq4_nl;
 
+// ADR-033 §Pi Task #20 — IQ4_XS block (136 bytes) for mm_id port.
+// Layout: [half d][uint16_t scales_h][uint8_t scales_l[4]][uint8_t qs[128]]
+// QK_K = 256 elements per super-block, organized as 8 sub-blocks of 32
+// elements each. Each sub-block has a 6-bit signed scale (offset by 32)
+// packed across scales_l (low 4 bits each, 2 per byte) + scales_h (top
+// 2 bits each, 2 bits per sub-block in a uint16_t). Per-quant nibbles
+// in qs are 4-bit codebook indexes into `kvalues_iq4nl` (shared with
+// IQ4_NL). Lock-step with quantized_matmul_id_ggml.metal:139.
+typedef struct {
+    half     d;
+    uint16_t scales_h;
+    uint8_t  scales_l[4];
+    uint8_t  qs[QK_K/2];
+} block_iq4_xs;
+
 // IQ4_NL non-linear codebook (frozen by ggml-common.h:1109-1112).
 // Lock-step with the duplicates in quantized_matmul_id_ggml.metal,
 // quantized_matmul_ggml.metal, and the host-side `KVALUES_IQ4_NL`
@@ -270,6 +285,39 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
     for (int i = 0; i < 4; ++i) {
         aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
+        reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
+        reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
+        reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
+        reg[i][3] = d * (float)kvalues_iq4nl[q8[3]];
+    }
+}
+
+// ADR-033 §Pi Task #20 — IQ4_XS dequant for the mm_id MMA-tile path.
+// Spec source: llama.cpp ggml-metal.metal:948-966 (`dequantize_iq4_xs`).
+// 16 elements per call addressed by il ∈ [0,16). `il/2 = ib32` selects
+// the 32-element sub-block (0..7), `il%2` selects which 16-elem half
+// (low / high) within that sub-block. Per-sub-block 6-bit scale is
+// reconstructed from the 4 low bits in scales_l[ib32/2] (nibble-packed,
+// 2 sub-blocks per byte) plus the top 2 bits in scales_h (2 bits per
+// sub-block in a uint16_t). Scale value `ls - 32` applies a signed
+// offset of 32 since the recorded value is the un-offset 6-bit unsigned.
+// Nibble unpacking + codebook lookup mirrors IQ4_NL above but using
+// 16-byte sub-stripes of qs starting at byte offset `16*ib32`.
+template <typename type4x4>
+void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 & reg) {
+    // il is 0..15 for QK_K = 256 — index of 32-elem sub-block is il/2
+    const int ib32 = il / 2;
+    il = il % 2;
+    // il = 0 or 1: il=0 → first 16 quants of the 32-elem sub-block,
+    //              il=1 → second 16 quants.
+    device const uint32_t * q4 = (device const uint32_t *)xb->qs + 4 * ib32;
+    const int ls = ((xb->scales_l[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)
+                 | (((xb->scales_h >> 2 * ib32) & 3) << 4);
+    const float d = (float)xb->d * (ls - 32);
+    uint32_t aux32;
+    thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
+    for (int i = 0; i < 4; ++i) {
+        aux32 = (q4[i] >> 4 * il) & 0x0f0f0f0f;
         reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
         reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
         reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
@@ -647,6 +695,24 @@ kernel void hf2q_mul_mm_id_impl<block_q5_1, 2, dequantize_q5_1>(
     constant GgmlMatmulIdMm_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-033 §Pi Task #20 — IQ4_XS mm_id template instantiation.
+// Matches llama.cpp ggml-metal.metal:10252's
+// `kernel_mul_mm_id_iq4_xs_f32` (parameters: block_iq4_xs + QK_NL=16
+// + dequantize_iq4_xs).
+template [[host_name("kernel_mul_mm_id_iq4_xs_f32")]]
+kernel void hf2q_mul_mm_id_impl<block_iq4_xs, QK_NL, dequantize_iq4_xs>(
+        constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const char * htpe [[buffer(3)]],
+        device const char * hids [[buffer(4)]],
+        device       char * dst  [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]);
 
 template [[host_name("kernel_mul_mm_id_iq4_nl_f32")]]
 kernel void hf2q_mul_mm_id_impl<block_iq4_nl, 2, dequantize_iq4_nl>(

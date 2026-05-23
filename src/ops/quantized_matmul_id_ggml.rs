@@ -106,8 +106,10 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
-            // ADR-033 §Pi Task #16 — IQ4_XS _id kernel port pending.
-            GgmlType::IQ4_XS => "unsupported",
+            // ADR-033 §Pi Task #20 — IQ4_XS mm_id ported (simdgroup MMA
+            // path). Tensor-API variant is not yet ported; tests fall
+            // back to the simdgroup path via TENSOR_MM_ID_AVAILABLE probe.
+            GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_f32",
         }
     }
 
@@ -126,7 +128,9 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
-            // ADR-033 §Pi Task #16 — IQ4_XS _id kernel port pending.
+            // ADR-033 §Pi Task #20 — IQ4_XS tensor-API mm_id port deferred.
+            // The simdgroup variant above suffices for correctness; the
+            // tensor variant is a perf optimization for M3+ tensor cores.
             GgmlType::IQ4_XS => "unsupported",
         }
     }
@@ -1212,7 +1216,7 @@ pub fn dispatch_id_mm_for_test(
 
     // ---- Validate common shapes ----
     // ADR-013 P16 — Q4_K added. ADR-022 — Q5_1 / IQ4_NL added.
-    // ADR-022 Phase 2 — Q5_K added.
+    // ADR-022 Phase 2 — Q5_K added. ADR-033 §Pi Task #20 — IQ4_XS added.
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q8_0
@@ -1220,7 +1224,8 @@ pub fn dispatch_id_mm_for_test(
         | GgmlType::Q5_K
         | GgmlType::Q6_K
         | GgmlType::Q5_1
-        | GgmlType::IQ4_NL => {}
+        | GgmlType::IQ4_NL
+        | GgmlType::IQ4_XS => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm_for_test does not support {:?}", other
@@ -1360,8 +1365,13 @@ pub fn dispatch_id_mm_for_test(
     // mm_id variant on M3+.  The probe caches the decision after the
     // first dispatch; subsequent calls are branch-free.
     let use_tensor = probe_tensor_mm_id(registry, device);
-    let mm_kernel_name = if use_tensor {
-        params.ggml_type.id_mm_tensor_kernel_name()
+    // Fall through to the simdgroup variant when the per-type tensor
+    // kernel isn't shipped — e.g. IQ4_XS (ADR-033 §Pi Task #20 shipped
+    // the simdgroup variant only; tensor-API variant deferred as a
+    // perf optimization).
+    let tensor_name = params.ggml_type.id_mm_tensor_kernel_name();
+    let mm_kernel_name = if use_tensor && tensor_name != "unsupported" {
+        tensor_name
     } else {
         params.ggml_type.id_mm_kernel_name()
     };
