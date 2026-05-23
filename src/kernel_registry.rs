@@ -1220,6 +1220,41 @@ impl KernelRegistry {
         warmed
     }
 
+    /// ADR-033 §Pi Task #20 iter 12 (2026-05-23) — prewarm pipelines that
+    /// require `[[function_constant]]` specialization. Each entry is
+    /// `(name, &[(constant_index, bool_value)])`. Mirrors
+    /// `prewarm_pipelines` but routes through
+    /// `get_pipeline_with_bool_constants` so kernels declaring
+    /// `function_constant` decls without defaults can be safely
+    /// prewarmed.
+    ///
+    /// Use case: hot-path kernels like `flash_attn_prefill_bf16_d256`
+    /// (uses bool constants 200/201/300/301/303 for align/mask/causal/blk
+    /// flags) cannot be safely prewarmed without specialization — Metal
+    /// `validateWithDevice:` asserts and aborts the process. Provide
+    /// the constants production uses and prewarming becomes safe.
+    ///
+    /// Returns count warmed.
+    pub fn prewarm_pipelines_with_bool_constants(
+        &mut self,
+        device: &metal::DeviceRef,
+        entries: &[(&str, &[(usize, bool)])],
+    ) -> usize {
+        let mut warmed = 0_usize;
+        for (name, bool_constants) in entries {
+            if !self.sources.contains_key(*name) {
+                continue;
+            }
+            if self
+                .get_pipeline_with_bool_constants(name, device, bool_constants)
+                .is_ok()
+            {
+                warmed += 1;
+            }
+        }
+        warmed
+    }
+
     /// ADR-033 §Pi Task #20 iter 11 (2026-05-23) — prewarm every registered
     /// kernel source. Useful when the exact set of needed kernels is hard
     /// to enumerate (e.g., serving paths that span multiple arches).
