@@ -657,6 +657,19 @@ impl KernelRegistry {
             "gated_delta_net_chunk_inter_state_bf16".into(),
             gdn_chunk_src,
         );
+        // ADR-033 §Pi Task #25 iter 19 — K=256 native variant. Same algorithm
+        // as gated_delta_net_chunk_inter_state_bf16 but with compile-time
+        // 32-tile MMA loops (vs 16 for K=128). Required for Qwen3.6's
+        // head_dim=256 chunk-scan path support. Per the K=128 kernel's
+        // documented constraint at gated_delta_net_chunk.metal:441, runtime-K
+        // bounds defeat MMA scheduling — this separate kernel keeps K=256
+        // compile-time-known, avoiding the 3.15× regression.
+        let gdn_chunk_k256_src: &'static str =
+            include_str!("shaders/gated_delta_net_chunk_k256.metal");
+        sources.insert(
+            "gated_delta_net_chunk_inter_state_bf16_k256".into(),
+            gdn_chunk_k256_src,
+        );
         // Wave 5b.1 iter 2 — chunk_scaled_dot_kkt kernel (input-side of
         // the chunk pipeline; spec source: FLA chunk_scaled_dot_kkt.py:36-99).
         let gdn_kkt_src: &'static str =
