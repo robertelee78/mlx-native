@@ -292,6 +292,17 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
     }
 }
 
+// ADR-033 §Pi Task #20 — IQ4_XS float codebook table.
+// Identical values to `kvalues_iq4nl` above but pre-converted to float
+// to match llama.cpp's `kvalues_iq4nl_f` representation byte-for-byte.
+// Used by `dequantize_iq4_xs` below — using the int8 table + cast was
+// producing numerical divergence at top_k=8 mm_id batch shapes, so the
+// safer mirror of canonical is to emit a float table directly.
+constant float kvalues_iq4nl_f[16] = {
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+    1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
+};
+
 // ADR-033 §Pi Task #20 — IQ4_XS dequant for the mm_id MMA-tile path.
 // Spec source: llama.cpp ggml-metal.metal:948-966 (`dequantize_iq4_xs`).
 // 16 elements per call addressed by il ∈ [0,16). `il/2 = ib32` selects
@@ -318,10 +329,10 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
     for (int i = 0; i < 4; ++i) {
         aux32 = (q4[i] >> 4 * il) & 0x0f0f0f0f;
-        reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
-        reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
-        reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
-        reg[i][3] = d * (float)kvalues_iq4nl[q8[3]];
+        reg[i][0] = d * kvalues_iq4nl_f[q8[0]];
+        reg[i][1] = d * kvalues_iq4nl_f[q8[1]];
+        reg[i][2] = d * kvalues_iq4nl_f[q8[2]];
+        reg[i][3] = d * kvalues_iq4nl_f[q8[3]];
     }
 }
 
