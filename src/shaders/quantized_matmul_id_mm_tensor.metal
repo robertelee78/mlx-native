@@ -94,6 +94,17 @@ typedef struct {
     uint8_t qs[QK4_0 / 2];
 } block_iq4_nl;
 
+// ADR-033 §Pi Task #20 tensor-API — IQ4_XS block (136 bytes).
+// Layout: [half d][uint16 scales_h][uint8[4] scales_l][uint8[128] qs].
+// Same struct as in quantized_matmul_id_mm.metal — each Metal file is
+// compiled separately so per-file typedefs are required.
+typedef struct {
+    half     d;
+    uint16_t scales_h;
+    uint8_t  scales_l[4];
+    uint8_t  qs[QK_K/2];
+} block_iq4_xs;
+
 constant int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
     1, 13, 25, 38, 53, 69, 89, 113
@@ -205,6 +216,30 @@ void dq_iq4_nl_id(device const block_iq4_nl * xb, short il, thread type4x4 & reg
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
     for (int i = 0; i < 4; ++i) {
         aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
+        reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
+        reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
+        reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
+        reg[i][3] = d * (float)kvalues_iq4nl[q8[3]];
+    }
+}
+
+// ADR-033 §Pi Task #20 tensor-API — IQ4_XS dequant for the tensor-cored
+// MMA path. Spec source: llama.cpp ggml-metal.metal:948-966
+// (`dequantize_iq4_xs`) — ported verbatim modulo formatting. Same
+// algorithm as `dequantize_iq4_xs` in quantized_matmul_id_mm.metal but
+// scoped to the tensor-API kernel's namespace.
+template <typename type4x4>
+void dq_iq4_xs_id(device const block_iq4_xs * xb, short il, thread type4x4 & reg) {
+    const int ib32 = il / 2;
+    il = il % 2;
+    device const uint32_t * q4 = (device const uint32_t *)xb->qs + 4 * ib32;
+    const int ls = ((xb->scales_l[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)
+                 | (((xb->scales_h >> 2 * ib32) & 3) << 4);
+    const float d = (float)xb->d * (ls - 32);
+    uint32_t aux32;
+    thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
+    for (int i = 0; i < 4; ++i) {
+        aux32 = (q4[i] >> 4 * il) & 0x0f0f0f0f;
         reg[i][0] = d * (float)kvalues_iq4nl[q8[0]];
         reg[i][1] = d * (float)kvalues_iq4nl[q8[1]];
         reg[i][2] = d * (float)kvalues_iq4nl[q8[2]];
@@ -455,6 +490,18 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_q5_1, 2, dq_q5_1_id>(
 
 template [[host_name("kernel_mul_mm_id_iq4_nl_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_nl, 2, dq_iq4_nl_id>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
+// template instantiation. Closes the prefill perf gap vs llama.cpp
+// at production-Qwen-MoE shape — the simdgroup variant alone clocks
+// ~1465 tok/s on M5 Max while llama.cpp's tensor-core kernel hits
+// ~2127 tok/s. Tensor-core path uses Apple M3+'s simdgroup matrix
+// multiply intrinsics via mlx's `tensor_ops::matmul2d` reduction.
+template [[host_name("kernel_mul_mm_id_iq4_xs_tensor_f32")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_xs, QK_NL, dq_iq4_xs_id>(
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

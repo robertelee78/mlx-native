@@ -128,10 +128,9 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
-            // ADR-033 §Pi Task #20 — IQ4_XS tensor-API mm_id port deferred.
-            // The simdgroup variant above suffices for correctness; the
-            // tensor variant is a perf optimization for M3+ tensor cores.
-            GgmlType::IQ4_XS => "unsupported",
+            // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
+            // SHIPPED 2026-05-22 to close the prefill perf gap vs llama.cpp.
+            GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32",
         }
     }
 }
