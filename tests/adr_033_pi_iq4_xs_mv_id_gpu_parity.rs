@@ -288,6 +288,21 @@ fn adr033_pi_iq4_xs_mv_id_top_k_8_below_routing_threshold() {
 }
 
 #[test]
+fn adr033_pi_iq4_xs_auto_dispatch_top_k_8_production_shape() {
+    // ADR-033 §Pi Task #20 bypass validation — same shape as the
+    // failing mm_id test (n_tokens=64, top_k=8) but via the auto
+    // dispatcher `quantized_matmul_id_ggml`. With the IQ4_XS mm_id
+    // bypass shipped (iq4_xs_mm_id_bypass), this should route through
+    // mv_id and produce correct output even at production n_tokens.
+    //
+    // If this test ever FAILS after the upstream mm_id_iq4_xs bug is
+    // fixed and the bypass is removed, it'll catch the regression at
+    // the auto-dispatcher level (which is what production hf2q-serve
+    // actually hits).
+    run_iq4_xs_mv_id_parity(64, 8, 8, 64, QK_K, 0xAD33_2014_DB05, 5e-3);
+}
+
+#[test]
 fn adr033_pi_iq4_xs_mv_id_parity_qwen_shape() {
     // Qwen 3.5 35B-A3B routed-expert shape per dispatch: 1 token, top_k=8,
     // 256 experts, ffn_down_exps has inner dim K=512 (= moe_intermediate_size).

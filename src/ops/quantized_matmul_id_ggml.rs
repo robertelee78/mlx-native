@@ -293,6 +293,7 @@ pub fn quantized_matmul_id_ggml(
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
+        && !iq4_xs_mm_id_bypass(params.ggml_type)
     {
         // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
         // engages on prefill. `HF2Q_LOG_MM_ID_ROUTE=1` enables the line.
@@ -314,6 +315,33 @@ pub fn quantized_matmul_id_ggml(
     }
 
     dispatch_id_mv(encoder, registry, device, input, weight, ids, output, params)
+}
+
+/// ADR-033 §Pi Task #20 — IQ4_XS mm_id at top_k=8 has a known
+/// numerical-divergence bug (output rows silently zero-out for certain
+/// (token, slot) pairs). The kernel template + dequantize_iq4_xs port
+/// are byte-identical to llama.cpp's reference, so the bug is somewhere
+/// in the IQ4_XS-specific tile/staging interaction — needs printf-
+/// instrumented Metal debug to localize further.
+///
+/// Until that fix lands, route IQ4_XS through the mv_id codepath
+/// regardless of n_tokens. mv_id is parity-tested correct at all top_k
+/// (see `adr_033_pi_iq4_xs_mv_id_gpu_parity.rs`). Trade-off: prefill
+/// at top_k=8 is ~3-5x slower than mm_id would deliver if correct
+/// — but correctness over perf is the right call for a customer-facing
+/// quantization path.
+///
+/// `HF2Q_FORCE_IQ4_XS_MM_ID=1` overrides this bypass (for use by the
+/// next debug iter — lets the operator engage the buggy path on
+/// purpose to capture failing inputs for kernel debug).
+fn iq4_xs_mm_id_bypass(t: GgmlType) -> bool {
+    if t != GgmlType::IQ4_XS {
+        return false;
+    }
+    !matches!(
+        std::env::var("HF2Q_FORCE_IQ4_XS_MM_ID").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    )
 }
 
 /// Same contract as `quantized_matmul_id_ggml`, but takes caller-owned
@@ -422,6 +450,7 @@ pub fn quantized_matmul_id_ggml_pooled(
     if params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
+        && !iq4_xs_mm_id_bypass(params.ggml_type)
     {
         if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
             eprintln!(
