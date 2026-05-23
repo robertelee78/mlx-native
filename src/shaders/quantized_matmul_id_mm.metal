@@ -579,6 +579,9 @@ kernel void hf2q_mul_mm_id_impl(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // ADR-033 §Pi Task #20 iter 8 — added #pragma unroll to match
+            // llama.cpp's FOR_UNROLL for 16-iter A-tile staging loop.
+            #pragma clang loop unroll(full)
             for (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
                 const short sy = (tiitg/NL0)/8;
@@ -589,15 +592,35 @@ kernel void hf2q_mul_mm_id_impl(
             }
         }
 
-        // ---- B tile stage (per-element, bounds-checked for K tail) ----
-        for (short i = 0; i < 8; ++i) {
+        // ---- B tile stage ----
+        //
+        // ADR-033 §Pi Task #20 iter 8 — vectorized B-tile store fast path
+        // matching llama.cpp `*(threadgroup S1_2x4 *)(sb + ...) = (S1_2x4) *((device T1_2x4 *) y)`.
+        // Each thread does ONE 8-float store instead of 8 scalar stores
+        // when the K-loop iteration is fully in-bounds. For Q6_K with
+        // K%QK_K==0 and NK=32, K is always divisible by NK, so the fast
+        // path is taken every iteration (no tail). Kept the scalar
+        // bounds-checked fallback for non-Q6_K shapes.
+        {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-            const short lx = i;
             const short ly = (tiitg/NL1)%8;
             const short ib = 4*sx + sy;
-            *(sb + 64*ib + 8*ly + lx) =
-                (loop_k + iy + i < args.ne00) ? *((device float *) y + i) : 0.f;
+            if (loop_k + NK <= args.ne00) {
+                // Fast path: vectorized 8-float store (= S1_2x4 / float8).
+                threadgroup float * dst_row = sb + 64*ib + 8*ly;
+                device const float * src_row = (device const float *) y;
+                ((threadgroup float4 *) dst_row)[0] = ((device const float4 *) src_row)[0];
+                ((threadgroup float4 *) dst_row)[1] = ((device const float4 *) src_row)[1];
+            } else {
+                // Tail: scalar with bounds check.
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < 8; ++i) {
+                    const short lx = i;
+                    *(sb + 64*ib + 8*ly + lx) =
+                        (loop_k + iy + i < args.ne00) ? *((device float *) y + i) : 0.f;
+                }
+            }
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
