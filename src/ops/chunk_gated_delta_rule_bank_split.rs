@@ -435,19 +435,73 @@ pub fn dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
         v, beta, o, final_state,
     );
 
-    // ---- Stages 6-9 land in iter 19 ----
-    // - per-bank recompute_wu (uses A_inv_full + per-bank k + v + beta + g_cumsum)
-    // - per-bank chunk_inter_state (uses per-bank k + w + u + g_cumsum + per-bank h0)
-    // - per-bank chunk_o (uses per-bank q + per-bank k + v_new + per-bank h)
-    // - elementwise_add_bf16 for o (cross-bank SUM)
-    // - 2× bank_concat_f32 for final_state (per-bank → full K=256)
+    // ---- Stages 6-9: design finding — chunk_inter_state requires structural change ----
     //
-    // For now, return error to signal the body is incomplete. Iter 19 lifts.
+    // Initial assumption (iter 15-17): the existing K=128 chunk_inter_state
+    // kernel could be called twice as a black-box per bank. EMPIRICAL REVIEW
+    // (iter 18 planning) shows this is INCORRECT because of cross-bank
+    // coupling in v_new:
+    //
+    //   v_new[t] = u[t] - w_full @ bh_full^T
+    //            = u[t] - (w_bank0 @ bh_bank0^T + w_bank1 @ bh_bank1^T)
+    //
+    // v_new is shared across both banks (only V dim, no K) and depends on
+    // the SUM of per-bank w @ bh^T. The existing chunk_inter_state kernel
+    // does this computation inline per dispatch, so two independent calls
+    // produce TWO DIFFERENT v_new buffers — neither equal to the
+    // mathematically correct full-K v_new.
+    //
+    // The correct decomposition requires structural change to chunk_inter_state:
+    //
+    //   Stage 6a (NEW kernel `chunk_inter_state_partial_v_k128.metal`):
+    //     per-bank partial output `partial_v_bank = w_bank @ bh_bank^T`
+    //     [B, T, H, V] BF16. NO subtraction from u, NO bh update.
+    //
+    //   Stage 6b (existing `elementwise_add_bf16`):
+    //     SUM partial_v_bank0 + partial_v_bank1 → total_w_bh.
+    //
+    //   Stage 6c (NEW elementwise_sub or fused — TBD):
+    //     v_new = u - total_w_bh.
+    //
+    //   Stage 6d (NEW kernel `chunk_inter_state_bh_update_k128.metal`):
+    //     per-bank `bh_bank = bh_bank * exp(g_last) + v_new^T @ k_bank` +
+    //     write bh_bank into h_bank output buffer.
+    //
+    //   Stage 7 (existing chunk_o per bank): runs per bank since
+    //     o = q @ h^T = q_bank0 @ h_bank0^T + q_bank1 @ h_bank1^T can be
+    //     decomposed into per-bank dispatches + SUM.
+    //
+    // FLA's b_h1..b_h4 approach handles this by keeping ALL bank accumulators
+    // in a single kernel — `bh_acc1[16] + bh_acc2[16] + bh_acc3[16] + bh_acc4[16]`
+    // for K=256 = 4×K=64 banks. Same total register count as a naive K=256
+    // kernel but with compile-time-known per-bank arrays so the MMA scheduler
+    // can fully unroll.
+    //
+    // Path forward (next iters):
+    //   Iter 19: NEW unified kernel `gated_delta_net_chunk_k256.metal` based
+    //     on the K=128 inter_state kernel but with TWO compile-time bh_acc
+    //     arrays of size 16 each (mirroring FLA's b_h1..b_h4 pattern at
+    //     2 banks instead of 4). ~500 LOC MSL + Rust wrapper.
+    //   Iter 20: NEW unified `gated_delta_net_chunk_o_k256.metal` (similar
+    //     pattern — single kernel, 2 bank-internal acc arrays).
+    //   Iter 21: per-bank recompute_wu can use the existing K=128 kernel
+    //     called twice (recompute_wu doesn't have the v_new coupling
+    //     issue because u doesn't depend on K). + elementwise_add bf16
+    //     for the o output SUM + 2× bank_concat_f32 for final_state.
+    //   Iter 22: orchestrator parity test vs autoregressive at K=256.
+    //   Iter 23: end-to-end Qwen3.6 35B-A3B Q4_0 MoE prefill bench.
+    //
+    // The bank-split scaffolding shipped in iters 15-18 (bank_slice helpers,
+    // pub(crate) widening, l2_norm + cumsum + kkt-SUM + tri_solve_invert)
+    // remains correct and reusable. Only stage 6+ needs the new kernel work.
+    //
+    // For iter 18: return InvalidArgument; iter 19+ replaces this stub with
+    // the new unified-kernel calls.
     Err(MlxError::InvalidArgument(
         "chunk_bank_split: iter 18 implements stages 1-5 (l2_norm + slice + \
          cumsum + per-bank kkt + A_strict SUM + tri_solve_invert). \
-         Stages 6-9 (recompute_wu + chunk_inter_state + chunk_o + output \
-         combine) land in iter 19."
+         Stages 6+ require new unified K=256 inter_state/chunk_o kernels per \
+         iter 18 closing note in source — land in iter 19+."
             .into(),
     ))
 }
