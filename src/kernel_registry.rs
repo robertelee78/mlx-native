@@ -670,6 +670,16 @@ impl KernelRegistry {
             "gated_delta_net_chunk_inter_state_bf16_k256".into(),
             gdn_chunk_k256_src,
         );
+        // ADR-033 §Pi Task #25 iter 20 — K=256 native chunk_o variant.
+        // Sister kernel to iter 19's inter_state_k256. Bumped from K=128's
+        // num_k_tiles=16 to num_k_tiles=32; bo_acc/bA_acc accumulators are
+        // V/BT-indexed (not K-indexed) so they keep their original sizes.
+        let gdn_chunk_o_k256_src: &'static str =
+            include_str!("shaders/gated_delta_net_chunk_o_k256.metal");
+        sources.insert(
+            "gated_delta_net_chunk_o_bf16_k256".into(),
+            gdn_chunk_o_k256_src,
+        );
         // Wave 5b.1 iter 2 — chunk_scaled_dot_kkt kernel (input-side of
         // the chunk pipeline; spec source: FLA chunk_scaled_dot_kkt.py:36-99).
         let gdn_kkt_src: &'static str =
