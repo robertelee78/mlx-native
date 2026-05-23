@@ -698,6 +698,11 @@ impl KernelRegistry {
         sources.insert("sigmoid_mul_bf16".into(), sigmoid_mul_src);
         let silu_mul_src: &'static str = include_str!("shaders/silu_mul.metal");
         sources.insert("silu_mul_f32".into(), silu_mul_src);
+        // ADR-033 §Pi Task #25 iter 16 — K-bank slice copy for K=256 → 2×K=128
+        // bank-split chunk-scan path (Qwen3.6 head_dim=256 support).
+        let bank_slice_bf16_src: &'static str =
+            include_str!("shaders/bank_slice_bf16.metal");
+        sources.insert("bank_slice_bf16".into(), bank_slice_bf16_src);
         // ADR-034 task #93 — fused gate_proj + up_proj + silu_mul Q8_0.
         let fused_gate_up_silu_q8_0_src: &'static str =
             include_str!("shaders/fused_gate_up_silu_q8_0.metal");

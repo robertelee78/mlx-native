@@ -79,12 +79,13 @@
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::chunk_gated_delta_rule::{
     ChunkGatedDeltaRuleParams, FIXED_BT, MAX_K, MAX_V,
 };
+use metal::MTLSize;
 
 /// K-dimension supported by this bank-split implementation. Hard-coded to
 /// 256 in iter 15 to match Qwen3.6 head_dim. Future iters may generalize
@@ -259,6 +260,106 @@ pub fn dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
     ))
 }
 
+/// GPU params struct for the `bank_slice_bf16` kernel. Must match the
+/// `BankSliceParams` declaration in `shaders/bank_slice_bf16.metal`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BankSliceGpuParams {
+    rows: u32,
+    k_full: u32,
+    k_bank: u32,
+    bank_offset: u32,
+}
+
+/// Iter 16 helper — extract a K-bank slice from a BF16 source buffer.
+///
+/// Reads `[rows, k_full]` BF16 K-innermost and writes the
+/// `[rows, k_bank]` slice starting at `K[bank_offset..bank_offset+k_bank]`
+/// into a contiguous destination buffer.
+///
+/// Used by the K=256 bank-split path to materialize per-bank temp Q/K
+/// inputs that the existing K=128 chunk pipeline can consume directly.
+///
+/// # Arguments
+///
+/// * `encoder`     - Command encoder to record the dispatch into.
+/// * `registry`    - Kernel registry (must have `bank_slice_bf16` registered).
+/// * `device`      - Metal device.
+/// * `src`         - Source `[rows, k_full]` BF16 buffer.
+/// * `dst`         - Destination `[rows, k_bank]` BF16 buffer.
+/// * `rows`        - Number of rows (B * T * Hg for q/k inputs).
+/// * `k_full`      - Source K dimension (e.g. 256 for Qwen3.6).
+/// * `k_bank`      - Destination K dimension (typically MAX_K=128).
+/// * `bank_offset` - Source K offset to start reading (0 for bank 0,
+///                   MAX_K for bank 1).
+///
+/// # Errors
+///
+/// `MlxError::InvalidArgument` if dimensions or buffer sizes are invalid.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_bank_slice_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    dst: &MlxBuffer,
+    rows: u32,
+    k_full: u32,
+    k_bank: u32,
+    bank_offset: u32,
+) -> Result<()> {
+    if rows == 0 || k_full == 0 || k_bank == 0 {
+        return Err(MlxError::InvalidArgument(
+            "bank_slice_bf16: rows, k_full, k_bank must all be > 0".into(),
+        ));
+    }
+    if bank_offset + k_bank > k_full {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_slice_bf16: bank_offset ({bank_offset}) + k_bank ({k_bank}) \
+             must be <= k_full ({k_full})"
+        )));
+    }
+    let src_bytes = (rows as usize) * (k_full as usize) * 2;
+    if src.byte_len() < src_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_slice_bf16: src buffer too small: need {src_bytes} bytes, have {}",
+            src.byte_len()
+        )));
+    }
+    let dst_bytes = (rows as usize) * (k_bank as usize) * 2;
+    if dst.byte_len() < dst_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "bank_slice_bf16: dst buffer too small: need {dst_bytes} bytes, have {}",
+            dst.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("bank_slice_bf16", device)?;
+
+    let gpu_params = BankSliceGpuParams {
+        rows,
+        k_full,
+        k_bank,
+        bank_offset,
+    };
+
+    // Grid: (k_bank, rows, 1). TG: (32, 1, 1).
+    let grid = MTLSize::new(k_bank as u64, rows as u64, 1);
+    let tg = MTLSize::new(std::cmp::min(32, k_bank as u64), 1, 1);
+
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(dst)),
+            (2, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        grid,
+        tg,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +401,83 @@ mod tests {
     fn bank_split_k_divides_evenly_into_banks() {
         assert_eq!(BANK_SPLIT_K % MAX_K, 0);
         assert_eq!(NUM_BANKS, BANK_SPLIT_K / MAX_K);
+    }
+
+    /// Iter 16 GPU parity test — verify the bank_slice_bf16 kernel
+    /// correctly extracts a K-bank slice from a [rows, k_full] BF16
+    /// source.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn bank_slice_bf16_matches_cpu_reference() {
+        use crate::{DType, KernelRegistry, MlxDevice};
+        use half::bf16;
+
+        let rows: u32 = 4;
+        let k_full: u32 = 256;
+        let k_bank: u32 = 128;
+
+        // Generate deterministic test data [rows, k_full] BF16.
+        let total = (rows * k_full) as usize;
+        let src_data: Vec<bf16> = (0..total)
+            .map(|i| bf16::from_f32((i as f32) * 0.0173 - 1.5))
+            .collect();
+
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let mut registry = KernelRegistry::new();
+
+        // Upload src.
+        let mut src_buf = device
+            .alloc_buffer(total * 2, DType::BF16, vec![rows as usize, k_full as usize])
+            .expect("alloc src");
+        src_buf
+            .as_mut_slice::<bf16>()
+            .expect("src as_mut")
+            .copy_from_slice(&src_data);
+
+        // Allocate dst.
+        let dst_elems = (rows * k_bank) as usize;
+        let dst_buf = device
+            .alloc_buffer(
+                dst_elems * 2,
+                DType::BF16,
+                vec![rows as usize, k_bank as usize],
+            )
+            .expect("alloc dst");
+
+        for bank_idx in 0..NUM_BANKS {
+            let bank_offset = bank_idx * MAX_K;
+
+            // Build encoder, dispatch, commit.
+            let mut encoder = device.command_encoder().expect("encoder");
+            dispatch_bank_slice_bf16(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &src_buf,
+                &dst_buf,
+                rows,
+                k_full,
+                k_bank,
+                bank_offset,
+            )
+            .expect("dispatch");
+            encoder.commit_and_wait().expect("commit_and_wait");
+
+            // CPU reference + compare.
+            let dst_data: &[bf16] = dst_buf.as_slice().expect("dst as_slice");
+            for r in 0..rows {
+                for k in 0..k_bank {
+                    let src_idx = (r * k_full + bank_offset + k) as usize;
+                    let dst_idx = (r * k_bank + k) as usize;
+                    assert_eq!(
+                        dst_data[dst_idx].to_bits(),
+                        src_data[src_idx].to_bits(),
+                        "bank_idx={bank_idx} r={r} k={k}: dst {} != src {}",
+                        dst_data[dst_idx].to_f32(),
+                        src_data[src_idx].to_f32(),
+                    );
+                }
+            }
+        }
     }
 }
