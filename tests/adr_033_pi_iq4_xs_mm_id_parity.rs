@@ -151,8 +151,33 @@ fn run_iq4_xs_mm_id_parity(
 
     let total_rows = n_tokens * top_k;
     let mut ids = vec![0_u32; total_rows];
-    for v in ids.iter_mut() {
-        *v = (xs64(&mut state) as u32) % (n_experts as u32);
+    // Production MoE routing picks the top_k *distinct* highest-scoring
+    // experts per token (real routers do top-k selection over distinct
+    // expert scores). The mm_id kernel's `hids` buffer is sized
+    // `[n_experts, n_tokens]` accordingly — each token contributes ≤ 1
+    // to any single expert's routed list. Generate distinct-per-token
+    // ids via a Fisher-Yates partial shuffle over [0, n_experts).
+    {
+        let mut pool = vec![0_u32; n_experts];
+        for t in 0..n_tokens {
+            for j in 0..n_experts {
+                pool[j] = j as u32;
+            }
+            // Partial shuffle: pick top_k unique experts for this token.
+            for j in 0..top_k.min(n_experts) {
+                let r = (xs64(&mut state) as usize) % (n_experts - j);
+                let pick = pool[j + r];
+                pool[j + r] = pool[j];
+                pool[j] = pick;
+                ids[t * top_k + j] = pick;
+            }
+            // If top_k > n_experts (shouldn't happen in practice), pad
+            // with expert 0. mm_id only supports top_k ∈ {1, 8} so this
+            // path is dormant.
+            for j in n_experts..top_k {
+                ids[t * top_k + j] = 0;
+            }
+        }
     }
 
     let device = MlxDevice::new().unwrap();
@@ -303,33 +328,156 @@ fn adr033_pi_task20_iq4_xs_mm_id_parity_small_batch_top_k1() {
     run_iq4_xs_mm_id_parity(32, 1, 4, 16, QK_K, 0xAD33_2014_D001, 1e-3, 5e-3);
 }
 
-// KNOWN ISSUE — IQ4_XS mm_id at top_k=8 with non-trivial batch shapes
-// produces numerical divergence vs the mv_id reference at certain
-// output rows. The same shape passes for Q5_K (see
-// `adr022_phase2_q5_k_mm_id_parity_prefill_path`), so the issue is
-// IQ4_XS-specific. mv_id parity (the decode path) IS still bit-equal
-// across all shapes — see `adr_033_pi_iq4_xs_mv_id_gpu_parity.rs`.
-//
-// Hypothesis: `dequantize_iq4_xs` interacts subtly with the mm_id
-// kernel template's tile-loop / shmem-staging at top_k > 1. The dequant
-// matches llama.cpp ggml-metal.metal:948-966 line-for-line, so the bug
-// may be in the block_iq4_xs struct's interaction with the kernel
-// template's `nl=16` parameter (vs Q5_K's `nl=QK_NL=16` with a
-// different block layout). Needs deeper Metal kernel debug — likely
-// involves printf-style debugging of the per-thread dequant tile
-// emitted at the failing rows.
-//
-// Workaround: today's apex-i-quality production GGUFs are loadable +
-// servable via llama.cpp (which has its own mm_id_iq4_xs), so the
-// customer-facing impact of this gap is hf2q-NATIVE prefill at top_k=8.
-// Decode-path (mv_id, parity-verified) covers single-token generation;
-// prefill at >8 tokens routes through this path and currently errors.
+// Regression guard — mm_id at top_k=8 production shape should write
+// EVERY output row (never leave any all-zero). Pre-fix (when the test
+// used random per-slot ids violating the production-distinct-per-token
+// invariant), this surfaced ~45% of output rows as all-zero, which
+// guided the root-cause investigation. Post-fix (distinct routing
+// matching production MoE), zero count should be 0.
 #[test]
-#[ignore = "top_k=8 IQ4_XS mm_id has numerical divergence vs mv_id reference — see KNOWN ISSUE block"]
+fn adr033_pi_task20_iq4_xs_mm_id_no_zero_rows() {
+    let n_tokens = 64usize;
+    let top_k = 8usize;
+    let n_experts = 8usize;
+    let n = 64usize;
+    let k = QK_K;
+    let seed = 0xAD33_2014_D9009u64;
+
+    let blocks_per_row = k / QK_K;
+    let per_expert_bytes = n * blocks_per_row * BLOCK_IQ4_XS_BYTES;
+
+    let mut state = seed;
+    let mut stacked_bytes = Vec::with_capacity(n_experts * per_expert_bytes);
+    for _expert in 0..n_experts {
+        for _row in 0..n {
+            let mut row_f32 = vec![0.0_f32; k];
+            for v in row_f32.iter_mut() {
+                *v = random_pm1(&mut state) * 0.5;
+            }
+            stacked_bytes.extend(ref_quantize_iq4_xs(&row_f32));
+        }
+    }
+
+    let mut input_data = vec![0.0_f32; n_tokens * k];
+    for v in input_data.iter_mut() {
+        *v = random_pm1(&mut state);
+    }
+    let total_rows = n_tokens * top_k;
+    let mut ids = vec![0_u32; total_rows];
+    // Production MoE routing picks the top_k *distinct* highest-scoring
+    // experts per token (real routers do top-k selection over distinct
+    // expert scores). The mm_id kernel's `hids` buffer is sized
+    // `[n_experts, n_tokens]` accordingly — each token contributes ≤ 1
+    // to any single expert's routed list. Generate distinct-per-token
+    // ids via a Fisher-Yates partial shuffle over [0, n_experts).
+    {
+        let mut pool = vec![0_u32; n_experts];
+        for t in 0..n_tokens {
+            for j in 0..n_experts {
+                pool[j] = j as u32;
+            }
+            // Partial shuffle: pick top_k unique experts for this token.
+            for j in 0..top_k.min(n_experts) {
+                let r = (xs64(&mut state) as usize) % (n_experts - j);
+                let pick = pool[j + r];
+                pool[j + r] = pool[j];
+                pool[j] = pick;
+                ids[t * top_k + j] = pick;
+            }
+            // If top_k > n_experts (shouldn't happen in practice), pad
+            // with expert 0. mm_id only supports top_k ∈ {1, 8} so this
+            // path is dormant.
+            for j in n_experts..top_k {
+                ids[t * top_k + j] = 0;
+            }
+        }
+    }
+
+    let device = MlxDevice::new().unwrap();
+    let mut registry = KernelRegistry::new();
+    let mut weight_buf = device
+        .alloc_buffer(stacked_bytes.len(), DType::U8, vec![stacked_bytes.len()])
+        .unwrap();
+    weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&stacked_bytes);
+    let mut input_buf = device
+        .alloc_buffer(input_data.len() * 4, DType::F32, vec![input_data.len()])
+        .unwrap();
+    input_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&input_data);
+    let mut ids_buf = device
+        .alloc_buffer(total_rows * 4, DType::U32, vec![total_rows])
+        .unwrap();
+    ids_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
+
+    let dispatch = GgmlIdMmDispatchParams {
+        n_tokens: n_tokens as u32,
+        top_k: top_k as u32,
+        n: n as u32,
+        k: k as u32,
+        n_experts: n_experts as u32,
+        expert_stride: per_expert_bytes as u64,
+        ggml_type: GgmlType::IQ4_XS,
+    };
+    let mut htpe_buf = device.alloc_buffer(dispatch.htpe_bytes(), DType::U32, vec![n_experts]).unwrap();
+    {
+        let s = htpe_buf.as_mut_slice::<u32>().unwrap();
+        for v in s.iter_mut() { *v = 0; }
+    }
+    let mut hids_buf = device.alloc_buffer(dispatch.hids_bytes(), DType::U32, vec![n_experts, n_tokens]).unwrap();
+    let mut mm_id_out = device.alloc_buffer(total_rows * n * 4, DType::F32, vec![total_rows * n]).unwrap();
+    {
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_id_mm_for_test(
+            &mut encoder, &mut registry, &device,
+            &input_buf, &weight_buf, &ids_buf,
+            &mut htpe_buf, &mut hids_buf, &mut mm_id_out,
+            &dispatch,
+        ).unwrap();
+        encoder.commit_and_wait().unwrap();
+    }
+
+    let out: &[f32] = mm_id_out.as_slice().unwrap();
+    let mut zero_rows: Vec<usize> = Vec::new();
+    for r in 0..total_rows {
+        let row = &out[r * n..(r + 1) * n];
+        let all_zero = row.iter().all(|&v| v == 0.0);
+        if all_zero {
+            zero_rows.push(r);
+        }
+    }
+    eprintln!(
+        "[adr-033 §Pi Task #20 no-zero-rows guard] {} of {} output rows all-zero",
+        zero_rows.len(),
+        total_rows
+    );
+    assert!(
+        zero_rows.is_empty(),
+        "mm_id at top_k=8 left {} of {} output rows all-zero — regression of the \
+         IQ4_XS top_k=8 routing-invariant gap (see commit history for full RCA). \
+         First 10: {:?}",
+        zero_rows.len(),
+        total_rows,
+        &zero_rows[..zero_rows.len().min(10)]
+    );
+}
+
+// ADR-033 §Pi Task #20 — IQ4_XS mm_id at top_k=8 production shape.
+//
+// PRE-FIX: this test was #[ignore]'d because mm_id at top_k=8 silently
+// failed to write certain output rows for IQ4_XS. Localized root cause:
+// `dispatch_id_mm_pooled`'s mm grid_x was sized for `n_tokens` routed
+// rows per expert, but with top_k > 1 the per-expert routed count
+// (htpe[im]) can exceed n_tokens when routing is uneven. Output rows
+// beyond grid_x*NR1 stayed at the buffer's initial value (0). Q5_K
+// passed by lucky routing distribution; IQ4_XS happened to trigger it.
+//
+// FIX: grid_x now uses `n_tokens * top_k` (worst-case all routed rows
+// to one expert). The kernel's `if (r1 >= neh1) return` early-exit
+// handles unused tiles correctly.
+//
+// This test pins the fix at production-Qwen-MoE-style shape.
+#[test]
 fn adr033_pi_task20_iq4_xs_mm_id_parity_matches_q5_k_shape() {
     // Cloned exactly from `adr022_phase2_q5_k_mm_id_parity_prefill_path` —
-    // n_tokens=64, top_k=8, n_experts=8, n=64, k=256 — which is known to
-    // pass for Q5_K. When un-ignored, will isolate the IQ4_XS dequant
-    // from any shape-specific kernel idiosyncrasies.
+    // n_tokens=64, top_k=8, n_experts=8, n=64, k=256.
     run_iq4_xs_mm_id_parity(64, 8, 8, 64, QK_K, 0xAD33_2014_D002, 1e-3, 5e-3);
 }

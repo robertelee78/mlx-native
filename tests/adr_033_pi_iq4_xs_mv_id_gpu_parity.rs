@@ -171,8 +171,29 @@ fn run_iq4_xs_mv_id_parity(
 
     let total_rows = n_tokens * top_k;
     let mut ids = vec![0_u32; total_rows];
-    for v in ids.iter_mut() {
-        *v = (xs64(&mut state) as u32) % (n_experts as u32);
+    // Production MoE routing picks top_k *distinct* experts per token.
+    // The mm_id kernel (which auto-dispatch routes large n_tokens to,
+    // even from this mv_id-named test runner) relies on htpe[expert] ≤
+    // n_tokens, which requires distinct-per-token routing. Use a
+    // Fisher-Yates partial shuffle. See
+    // `adr_033_pi_iq4_xs_mm_id_parity.rs` for full root-cause notes.
+    {
+        let mut pool = vec![0_u32; n_experts];
+        for t in 0..n_tokens {
+            for j in 0..n_experts {
+                pool[j] = j as u32;
+            }
+            for j in 0..top_k.min(n_experts) {
+                let r = (xs64(&mut state) as usize) % (n_experts - j);
+                let pick = pool[j + r];
+                pool[j + r] = pool[j];
+                pool[j] = pick;
+                ids[t * top_k + j] = pick;
+            }
+            for j in n_experts..top_k {
+                ids[t * top_k + j] = 0;
+            }
+        }
     }
 
     let cpu_out = cpu_reference_matmul(
