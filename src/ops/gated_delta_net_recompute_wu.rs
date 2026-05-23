@@ -78,7 +78,13 @@ use crate::kernel_registry::KernelRegistry;
 pub static GATED_DELTA_NET_RECOMPUTE_WU_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_recompute_wu.metal");
 
-pub const MAX_K: u32 = 192;
+/// ADR-033 §Pi Task #25 iter 22 (2026-05-23): lifted 192 → 256 to support
+/// Qwen3.6 (head_dim=256) chunk-scan path. The recompute_wu kernel's
+/// shmem is K-INDEPENDENT (ba_tile = BT*BT*4 = 16 KB; stage = BT*max(BV,BK)*2
+/// = 8 KB; total 24 KB regardless of K). Per-thread scalar accumulation
+/// (NOT simdgroup_matrix MMA) so K=256's 4-iteration outer loop (vs 2
+/// at K=128) doesn't trigger the compile-time-array MMA regression.
+pub const MAX_K: u32 = 256;
 pub const MAX_V: u32 = 256;
 pub const DEFAULT_BK: u32 = 64;
 pub const DEFAULT_BV: u32 = 64;
@@ -355,12 +361,14 @@ mod tests {
         let w_buf = dummy_buf(&device, DType::BF16);
         let u_buf = dummy_buf(&device, DType::BF16);
 
+        // ADR-033 §Pi Task #25 iter 22 — MAX_K lifted 192 → 256 to enable
+        // Qwen3.6 chunk-scan path. Test now exercises K=384 above the new cap.
         let p = GatedDeltaNetRecomputeWuParams {
             b: 1,
             t: 128,
             hg: 2,
             h: 4,
-            k: 256, // > MAX_K (192) — must reject.
+            k: 384, // > MAX_K (256) — must reject.
             v: 128,
             bt: 64,
         };
@@ -368,18 +376,18 @@ mod tests {
         let err = validate(
             &p, &k_buf, &v_buf, &beta_buf, &g_buf, &a_buf, &w_buf, &u_buf,
         )
-        .expect_err("validate must reject K=256");
+        .expect_err("validate must reject K=384");
         let msg = err.to_string();
         assert!(
-            msg.contains("256"),
-            "expected K=256 in error message, got: {msg}"
+            msg.contains("384"),
+            "expected K=384 in error message, got: {msg}"
         );
         assert!(
             msg.contains("32 KB") || msg.contains("threadgroup"),
             "expected threadgroup-memory-budget context in error, got: {msg}"
         );
         assert!(
-            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
+            msg.contains("MAX_K = 256") || msg.contains("MAX_K=256"),
             "expected explicit MAX_K cap in error, got: {msg}"
         );
     }

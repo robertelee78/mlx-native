@@ -69,10 +69,21 @@ use crate::kernel_registry::KernelRegistry;
 pub static GATED_DELTA_NET_KKT_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_kkt.metal");
 
-/// Hard cap on per-tile head-dim K. Matches iter-1 chunk kernel cap; the
-/// 32 KB threadgroup-memory budget is tight at K = 192 (24 KB used).
-/// Iter-3 will lift this when the autotuned BK schedule lands.
-pub const MAX_K: u32 = 192;
+/// Hard cap on per-tile head-dim K.
+///
+/// ADR-033 §Pi Task #25 iter 22 (2026-05-23): lifted 192 → 256 to support
+/// Qwen3.6 (head_dim=256) chunk-scan path. The kkt kernel's shmem is
+/// K-INDEPENDENT (bk_stage = BT*BK*2 = 8 KB; ba_acc = BT*BT*4 = 16 KB;
+/// total 24 KB regardless of K). The outer K-loop iterates `K/BK = K/64`
+/// times — at K=256 that's 4 iterations (vs 2 at K=128) with no
+/// register-pressure change (no compile-time-known K-indexed
+/// accumulator arrays in this kernel — it uses per-thread scalar
+/// accumulation, not simdgroup_matrix MMA).
+///
+/// The K=256 path is empirically smoke-tested via the bank_split test
+/// suite in `chunk_gated_delta_rule_bank_split` and via end-to-end
+/// dispatch in iter 23+ (orchestrator).
+pub const MAX_K: u32 = 256;
 
 /// Default BK split — iterating K/BK times within the kernel.
 pub const DEFAULT_BK: u32 = 64;
@@ -295,28 +306,31 @@ mod tests {
         let g_buf = dummy_buf(&device, DType::F32);
         let a_buf = dummy_buf(&device, DType::F32);
 
+        // ADR-033 §Pi Task #25 iter 22 — MAX_K lifted 192 → 256 to enable
+        // Qwen3.6 chunk-scan path. The test now exercises K=384 (above the
+        // new cap) to keep the rejection-path coverage.
         let p = GatedDeltaNetKktParams {
             b: 1,
             t: 128,
             hg: 2,
             h: 4,
-            k: 256, // > MAX_K (192) — must reject.
+            k: 384, // > MAX_K (256) — must reject.
             bt: 64,
         };
 
         let err = validate(&p, &k_buf, &beta_buf, &g_buf, &a_buf)
-            .expect_err("validate must reject K=256");
+            .expect_err("validate must reject K=384");
         let msg = err.to_string();
         assert!(
-            msg.contains("256"),
-            "expected K=256 in error message, got: {msg}"
+            msg.contains("384"),
+            "expected K=384 in error message, got: {msg}"
         );
         assert!(
             msg.contains("32 KB") || msg.contains("threadgroup"),
             "expected threadgroup-memory-budget context in error, got: {msg}"
         );
         assert!(
-            msg.contains("MAX_K = 192") || msg.contains("MAX_K=192"),
+            msg.contains("MAX_K = 256") || msg.contains("MAX_K=256"),
             "expected explicit MAX_K cap in error, got: {msg}"
         );
     }

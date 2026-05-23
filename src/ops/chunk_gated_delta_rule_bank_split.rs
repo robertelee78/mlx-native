@@ -91,11 +91,20 @@ use crate::ops::chunk_gated_delta_rule_tri_solve_invert::{
     build_chunk_tri_solve_invert_params, dispatch_chunk_tri_solve_invert,
     ChunkTriSolveInvertParams,
 };
+use crate::ops::gated_delta_net_chunk::{
+    build_gated_delta_net_chunk_params, GatedDeltaNetChunkParams,
+};
+use crate::ops::gated_delta_net_chunk_o::{
+    build_gated_delta_net_chunk_o_params, GatedDeltaNetChunkOParams,
+};
 use crate::ops::gated_delta_net_kkt::{
     build_gated_delta_net_kkt_params, dispatch_gated_delta_net_kkt, GatedDeltaNetKktParams,
 };
+use crate::ops::gated_delta_net_recompute_wu::{
+    build_gated_delta_net_recompute_wu_params, dispatch_gated_delta_net_recompute_wu,
+    GatedDeltaNetRecomputeWuParams,
+};
 use crate::ops::l2_norm::dispatch_l2_norm;
-use crate::ops::elementwise::elementwise_add;
 use metal::MTLSize;
 
 /// K-dimension supported by this bank-split implementation. Hard-coded to
@@ -235,130 +244,62 @@ pub fn dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
     let metal_device = _device.metal_device();
 
     // ============================================================
-    // Iter 18 body — stages 1-4 (l2_norm + bank-slice + cumsum +
-    // per-bank kkt + A_strict SUM + tri_solve_invert).
+    // Iter 22 body — NATIVE K=256 pipeline.
     //
-    // Stages 5-7 (recompute_wu + chunk_inter_state + chunk_o) and
-    // 7.5/8 (output SUM + final_state CONCAT) land in iter 19.
+    // After iters 19-20 added K=256 chunk_inter_state + chunk_o kernels
+    // (compile-time 32-tile MMA loops) and iter 22 lifted kkt + recompute_wu
+    // MAX_K from 192→256 (their kernels are runtime-K-parameterized with
+    // per-thread scalar accumulation — no MMA scheduler regression),
+    // the entire chunk pipeline can run natively at K=256 with no
+    // bank-split orchestration.
+    //
+    // The bank_slice / bank_concat helpers from iters 16-17 remain in
+    // this file as dead-code reference for future K≥384 cases, but are
+    // NOT used by this dispatch path.
+    //
+    // Pipeline (mirrors dispatch_chunk_gated_delta_rule_fwd at K=128 but
+    // at K=BANK_SPLIT_K=256):
+    //
+    //   Stage 1 — l2_norm (full q, k at K=256)
+    //   Stage 2 — chunk_local_cumsum_g (K-independent)
+    //   Stage 3 — kkt at K=256 (single dispatch; runtime K-loop)
+    //   Stage 4 — tri_solve_invert (K-independent)
+    //   Stage 5 — recompute_wu at K=256 (single dispatch; runtime K-loop)
+    //   Stage 6 — chunk_inter_state_bf16_k256 (NEW iter 19; compile-time
+    //              32-tile MMA loops)
+    //   Stage 7 — chunk_o_bf16_k256 (NEW iter 20; compile-time 32-tile
+    //              MMA loops)
     // ============================================================
 
-    // Per-bank K dimension. BANK_SPLIT_K = NUM_BANKS * K_BANK.
-    let k_bank: u32 = MAX_K;
-    // Rows of q/k for bank-slice (treated as [B*T*Hg, K] flat layout).
+    // ---- Stage 1: l2_norm (full q, k at K=256) ----
     let qk_rows: u32 = p.b * p.t * p.hg;
-    // Rows of h0/final_state for bank-slice (treated as [B*H*V, K] flat layout).
-    let hf_rows: u32 = p.b * p.h * p.v;
+    let q_qk_elems = (qk_rows as usize) * (p.k as usize);
+    let q_normed_buf;
+    let k_normed_buf;
+    let q_for_pipeline: &MlxBuffer;
+    let k_for_pipeline: &MlxBuffer;
 
-    // ---- Allocate per-bank Q/K temp buffers (BF16) ----
-    // After l2_norm + slice, each bank has [B, T, Hg, K_BANK] BF16.
-    let bank_qk_elems = (qk_rows as usize) * (k_bank as usize);
-    let q_normed_full = _device.alloc_buffer(
-        (qk_rows as usize) * (p.k as usize) * 2,
-        DType::BF16,
-        vec![qk_rows as usize, p.k as usize],
-    )?;
-    let k_normed_full = _device.alloc_buffer(
-        (qk_rows as usize) * (p.k as usize) * 2,
-        DType::BF16,
-        vec![qk_rows as usize, p.k as usize],
-    )?;
-    let q_bank_bufs: [MlxBuffer; 2] = [
-        _device.alloc_buffer(
-            bank_qk_elems * 2,
-            DType::BF16,
-            vec![qk_rows as usize, k_bank as usize],
-        )?,
-        _device.alloc_buffer(
-            bank_qk_elems * 2,
-            DType::BF16,
-            vec![qk_rows as usize, k_bank as usize],
-        )?,
-    ];
-    let k_bank_bufs: [MlxBuffer; 2] = [
-        _device.alloc_buffer(
-            bank_qk_elems * 2,
-            DType::BF16,
-            vec![qk_rows as usize, k_bank as usize],
-        )?,
-        _device.alloc_buffer(
-            bank_qk_elems * 2,
-            DType::BF16,
-            vec![qk_rows as usize, k_bank as usize],
-        )?,
-    ];
-
-    // ---- Allocate per-bank h0 slice (F32) ----
-    // h0 layout is [B, H, V, K=256] f32 → slice into [B*H*V, K=128].
-    let bank_hf_elems = (hf_rows as usize) * (k_bank as usize);
-    let h0_bank_bufs: [MlxBuffer; 2] = [
-        _device.alloc_buffer(
-            bank_hf_elems * 4,
-            DType::F32,
-            vec![hf_rows as usize, k_bank as usize],
-        )?,
-        _device.alloc_buffer(
-            bank_hf_elems * 4,
-            DType::F32,
-            vec![hf_rows as usize, k_bank as usize],
-        )?,
-    ];
-
-    // ---- Stage 1: l2_norm on full q and k (K=BANK_SPLIT_K=256) ----
-    //
-    // CRITICAL: l2_norm depends on the FULL K — must be applied before
-    // bank-slicing since ||row||_2 cannot be decomposed across K-banks.
     if p.use_qk_l2norm {
+        q_normed_buf = _device.alloc_buffer(q_qk_elems * 2, DType::BF16, vec![q_qk_elems])?;
+        k_normed_buf = _device.alloc_buffer(q_qk_elems * 2, DType::BF16, vec![q_qk_elems])?;
         let l2_params = build_l2_norm_params(_device, L2_NORM_EPS, p.k)?;
         dispatch_l2_norm(
-            _encoder, _registry, metal_device, q, &q_normed_full, &l2_params, qk_rows, p.k,
+            _encoder, _registry, metal_device, q, &q_normed_buf, &l2_params, qk_rows, p.k,
         )?;
         _encoder.memory_barrier();
         dispatch_l2_norm(
-            _encoder, _registry, metal_device, k, &k_normed_full, &l2_params, qk_rows, p.k,
+            _encoder, _registry, metal_device, k, &k_normed_buf, &l2_params, qk_rows, p.k,
         )?;
         _encoder.memory_barrier();
+        q_for_pipeline = &q_normed_buf;
+        k_for_pipeline = &k_normed_buf;
     } else {
-        // l2_norm skipped — but we still need a separate buffer that's
-        // safe to slice from. Note: avoiding the alloc-then-copy by
-        // having callers pre-normalize is the iter-5+ caller-contract;
-        // the bank-split path follows the same contract. For now, copy
-        // the inputs into the normed buffers via the slice helper (slice
-        // with k_bank=k_full is a no-op copy).
-        // Caller-contract optimization: iter 19+ may special-case to
-        // avoid the copy when use_qk_l2norm=false. For iter 18 the path
-        // ships correct semantics first; caller currently always passes
-        // use_qk_l2norm=true for Qwen3.6.
-        return Err(MlxError::InvalidArgument(
-            "chunk_bank_split: iter 18 requires use_qk_l2norm=true \
-             (caller-contract per Qwen3.6 default). use_qk_l2norm=false \
-             support lands in iter 19+."
-                .into(),
-        ));
+        // Caller passes pre-normed inputs.
+        q_for_pipeline = q;
+        k_for_pipeline = k;
     }
 
-    // ---- Stage 2: bank-slice q_normed, k_normed, h0 into per-bank buffers ----
-    for bank_idx in 0..NUM_BANKS {
-        let bank_offset = bank_idx * MAX_K;
-        let bi = bank_idx as usize;
-        dispatch_bank_slice_bf16(
-            _encoder, _registry, metal_device,
-            &q_normed_full, &q_bank_bufs[bi],
-            qk_rows, p.k, k_bank, bank_offset,
-        )?;
-        dispatch_bank_slice_bf16(
-            _encoder, _registry, metal_device,
-            &k_normed_full, &k_bank_bufs[bi],
-            qk_rows, p.k, k_bank, bank_offset,
-        )?;
-        dispatch_bank_slice_f32(
-            _encoder, _registry, metal_device,
-            h0, &h0_bank_bufs[bi],
-            hf_rows, p.k, k_bank, bank_offset,
-        )?;
-    }
-    _encoder.memory_barrier();
-
-    // ---- Stage 3: cumsum_g (K-independent, runs ONCE) ----
+    // ---- Stage 2: cumsum_g (K-independent) ----
     let g_elems = (p.b * p.t * p.h) as usize;
     let g_cumsum_buf =
         _device.alloc_buffer(g_elems * 4, DType::F32, vec![g_elems])?;
@@ -369,48 +310,28 @@ pub fn dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
     )?;
     _encoder.memory_barrier();
 
-    // ---- Stage 4: per-bank kkt → A_strict_partial[0..NUM_BANKS] ----
+    // ---- Stage 3: kkt at K=256 (single dispatch) ----
     let a_elems = (p.b * p.t * p.h * p.bt) as usize;
-    let a_strict_partial: [MlxBuffer; 2] = [
-        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?,
-        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?,
-    ];
-
-    // The per-bank kkt uses K=MAX_K=k_bank. All other params unchanged.
+    let a_strict_buf =
+        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
     let kkt_params_value = GatedDeltaNetKktParams {
         b: p.b,
         t: p.t,
         hg: p.hg,
         h: p.h,
-        k: k_bank, // PER-BANK K
+        k: p.k, // K=256 native
         bt: p.bt,
     };
     let kkt_params = build_gated_delta_net_kkt_params(_device, kkt_params_value)?;
-
-    for bank_idx in 0..NUM_BANKS {
-        let bi = bank_idx as usize;
-        dispatch_gated_delta_net_kkt(
-            _encoder, _registry, metal_device,
-            &k_bank_bufs[bi], beta, &g_cumsum_buf,
-            &a_strict_partial[bi],
-            &kkt_params, kkt_params_value,
-        )?;
-    }
-    _encoder.memory_barrier();
-
-    // ---- Stage 4.5: SUM A_strict_partial[0] + A_strict_partial[1] → A_strict_full ----
-    //
-    // Math: kkt[i,j] over full K = Σ over K[0..128] + Σ over K[128..256].
-    let a_strict_full =
-        _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
-    elementwise_add(
+    dispatch_gated_delta_net_kkt(
         _encoder, _registry, metal_device,
-        &a_strict_partial[0], &a_strict_partial[1], &a_strict_full,
-        a_elems, DType::F32,
+        k_for_pipeline, beta, &g_cumsum_buf,
+        &a_strict_buf,
+        &kkt_params, kkt_params_value,
     )?;
     _encoder.memory_barrier();
 
-    // ---- Stage 5: tri_solve_invert on the full A_strict → A_inv ----
+    // ---- Stage 4: tri_solve_invert (K-independent) ----
     let a_inv_buf =
         _device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
     let invert_params_value = ChunkTriSolveInvertParams {
@@ -422,88 +343,81 @@ pub fn dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
     let invert_params = build_chunk_tri_solve_invert_params(_device, invert_params_value)?;
     dispatch_chunk_tri_solve_invert(
         _encoder, _registry, metal_device,
-        &a_strict_full, &a_inv_buf,
+        &a_strict_buf, &a_inv_buf,
         &invert_params, invert_params_value,
     )?;
     _encoder.memory_barrier();
 
-    // Iter 18 ships stages 1-5. Suppress unused-variable warnings for
-    // the buffers that iter 19+ consumes (a_inv_buf, q_bank_bufs,
-    // k_bank_bufs, h0_bank_bufs, v, beta, o, final_state).
-    let _ = (
-        &a_inv_buf, &q_bank_bufs, &k_bank_bufs, &h0_bank_bufs,
-        v, beta, o, final_state,
-    );
+    // ---- Stage 5: recompute_wu at K=256 (single dispatch) ----
+    let w_elems = (p.b * p.t * p.h * p.k) as usize;
+    let u_elems = (p.b * p.t * p.h * p.v) as usize;
+    let w_buf = _device.alloc_buffer(w_elems * 2, DType::BF16, vec![w_elems])?;
+    let u_buf = _device.alloc_buffer(u_elems * 2, DType::BF16, vec![u_elems])?;
+    let recompute_wu_params_value = GatedDeltaNetRecomputeWuParams {
+        b: p.b,
+        t: p.t,
+        hg: p.hg,
+        h: p.h,
+        k: p.k, // K=256 native
+        v: p.v,
+        bt: p.bt,
+    };
+    let recompute_wu_params =
+        build_gated_delta_net_recompute_wu_params(_device, recompute_wu_params_value)?;
+    dispatch_gated_delta_net_recompute_wu(
+        _encoder, _registry, metal_device,
+        k_for_pipeline, v, beta, &g_cumsum_buf, &a_inv_buf,
+        &w_buf, &u_buf,
+        &recompute_wu_params, recompute_wu_params_value,
+    )?;
+    _encoder.memory_barrier();
 
-    // ---- Stages 6-9: design finding — chunk_inter_state requires structural change ----
-    //
-    // Initial assumption (iter 15-17): the existing K=128 chunk_inter_state
-    // kernel could be called twice as a black-box per bank. EMPIRICAL REVIEW
-    // (iter 18 planning) shows this is INCORRECT because of cross-bank
-    // coupling in v_new:
-    //
-    //   v_new[t] = u[t] - w_full @ bh_full^T
-    //            = u[t] - (w_bank0 @ bh_bank0^T + w_bank1 @ bh_bank1^T)
-    //
-    // v_new is shared across both banks (only V dim, no K) and depends on
-    // the SUM of per-bank w @ bh^T. The existing chunk_inter_state kernel
-    // does this computation inline per dispatch, so two independent calls
-    // produce TWO DIFFERENT v_new buffers — neither equal to the
-    // mathematically correct full-K v_new.
-    //
-    // The correct decomposition requires structural change to chunk_inter_state:
-    //
-    //   Stage 6a (NEW kernel `chunk_inter_state_partial_v_k128.metal`):
-    //     per-bank partial output `partial_v_bank = w_bank @ bh_bank^T`
-    //     [B, T, H, V] BF16. NO subtraction from u, NO bh update.
-    //
-    //   Stage 6b (existing `elementwise_add_bf16`):
-    //     SUM partial_v_bank0 + partial_v_bank1 → total_w_bh.
-    //
-    //   Stage 6c (NEW elementwise_sub or fused — TBD):
-    //     v_new = u - total_w_bh.
-    //
-    //   Stage 6d (NEW kernel `chunk_inter_state_bh_update_k128.metal`):
-    //     per-bank `bh_bank = bh_bank * exp(g_last) + v_new^T @ k_bank` +
-    //     write bh_bank into h_bank output buffer.
-    //
-    //   Stage 7 (existing chunk_o per bank): runs per bank since
-    //     o = q @ h^T = q_bank0 @ h_bank0^T + q_bank1 @ h_bank1^T can be
-    //     decomposed into per-bank dispatches + SUM.
-    //
-    // FLA's b_h1..b_h4 approach handles this by keeping ALL bank accumulators
-    // in a single kernel — `bh_acc1[16] + bh_acc2[16] + bh_acc3[16] + bh_acc4[16]`
-    // for K=256 = 4×K=64 banks. Same total register count as a naive K=256
-    // kernel but with compile-time-known per-bank arrays so the MMA scheduler
-    // can fully unroll.
-    //
-    // Path forward (next iters):
-    //   Iter 19: NEW unified kernel `gated_delta_net_chunk_k256.metal` based
-    //     on the K=128 inter_state kernel but with TWO compile-time bh_acc
-    //     arrays of size 16 each (mirroring FLA's b_h1..b_h4 pattern at
-    //     2 banks instead of 4). ~500 LOC MSL + Rust wrapper.
-    //   Iter 20: NEW unified `gated_delta_net_chunk_o_k256.metal` (similar
-    //     pattern — single kernel, 2 bank-internal acc arrays).
-    //   Iter 21: per-bank recompute_wu can use the existing K=128 kernel
-    //     called twice (recompute_wu doesn't have the v_new coupling
-    //     issue because u doesn't depend on K). + elementwise_add bf16
-    //     for the o output SUM + 2× bank_concat_f32 for final_state.
-    //   Iter 22: orchestrator parity test vs autoregressive at K=256.
-    //   Iter 23: end-to-end Qwen3.6 35B-A3B Q4_0 MoE prefill bench.
-    //
-    // The bank-split scaffolding shipped in iters 15-18 (bank_slice helpers,
-    // pub(crate) widening, l2_norm + cumsum + kkt-SUM + tri_solve_invert)
-    // remains correct and reusable. Only stage 6+ needs the new kernel work.
-    //
-    // For iter 18: return InvalidArgument; iter 19+ replaces this stub with
-    // the new unified-kernel calls.
-    Err(MlxError::InvalidArgument(
-        "chunk_bank_split: iter 18 implements stages 1-5 (l2_norm + slice + \
-         cumsum + per-bank kkt + A_strict SUM + tri_solve_invert). \
-         Stages 6+ require new unified K=256 inter_state/chunk_o kernels per \
-         iter 18 closing note in source — land in iter 19+."
-            .into(),
-    ))
+    // ---- Stage 6: chunk_inter_state_bf16_k256 (NEW iter 19) ----
+    let nt = p.num_chunks();
+    let h_elems = (p.b * nt * p.h * p.v * p.k) as usize;
+    let v_new_elems = (p.b * p.t * p.h * p.v) as usize;
+    let h_buf = _device.alloc_buffer(h_elems * 2, DType::BF16, vec![h_elems])?;
+    let v_new_buf = _device.alloc_buffer(v_new_elems * 2, DType::BF16, vec![v_new_elems])?;
+    let chunk_params_value = GatedDeltaNetChunkParams {
+        b: p.b,
+        t: p.t,
+        hg: p.hg,
+        h: p.h,
+        k: p.k, // K=256
+        v: p.v,
+        bt: p.bt,
+    };
+    let chunk_params = build_gated_delta_net_chunk_params(_device, chunk_params_value)?;
+    dispatch_chunk_inter_state_k256(
+        _encoder, _registry, metal_device,
+        k_for_pipeline, &w_buf, &u_buf, &g_cumsum_buf, h0,
+        &h_buf, &v_new_buf, final_state,
+        &chunk_params, chunk_params_value,
+    )?;
+    _encoder.memory_barrier();
+
+    // ---- Stage 7: chunk_o_bf16_k256 (NEW iter 20) ----
+    let chunk_o_params_value = GatedDeltaNetChunkOParams {
+        b: p.b,
+        t: p.t,
+        hg: p.hg,
+        h: p.h,
+        k: p.k, // K=256
+        v: p.v,
+        bt: p.bt,
+        scale: p.scale,
+    };
+    let chunk_o_params =
+        build_gated_delta_net_chunk_o_params(_device, chunk_o_params_value)?;
+    dispatch_chunk_o_k256(
+        _encoder, _registry, metal_device,
+        q_for_pipeline, k_for_pipeline, &v_new_buf, &h_buf, &g_cumsum_buf,
+        o,
+        &chunk_o_params, chunk_o_params_value,
+    )?;
+
+    // Pipeline complete.
+    Ok(())
 }
 
 /// GPU params struct for the `bank_slice_bf16` kernel. Must match the
@@ -1067,6 +981,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Iter 22 SMOKE TEST — full K=256 pipeline end-to-end.
+    ///
+    /// Dispatches `dispatch_chunk_gated_delta_rule_fwd_k256_bank_split`
+    /// (the K=256 native pipeline composed in iter 22) at a small shape
+    /// and verifies the dispatch completes without runtime error. This
+    /// is the FIRST end-to-end exercise of the multi-iter arc — proves
+    /// that the kkt → tri_solve → recompute_wu → chunk_inter_state_k256
+    /// → chunk_o_k256 chain runs cleanly at K=256.
+    ///
+    /// Does NOT validate numerical correctness vs an autoregressive
+    /// oracle — that lands in iter 23 along with the end-to-end
+    /// Qwen3.6 prefill bench.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn chunk_k256_pipeline_smoke() {
+        use crate::{DType, KernelRegistry, MlxDevice};
+
+        let device = MlxDevice::new().expect("MlxDevice::new");
+        let mut registry = KernelRegistry::new();
+
+        // Small but valid K=256 shape: B=1, T=64, Hg=1, H=1, K=256, V=64,
+        // BT=64. V=64 satisfies recompute_wu's V%BV==0 requirement.
+        let p = ChunkGatedDeltaRuleParams {
+            b: 1,
+            t: 64,
+            hg: 1,
+            h: 1,
+            k: BANK_SPLIT_K, // 256
+            v: 64,
+            bt: FIXED_BT,
+            scale: 1.0,
+            use_qk_l2norm: true,
+        };
+
+        // Allocate inputs (zero-init is fine for smoke test).
+        let qk_elems = (p.b * p.t * p.hg * p.k) as usize;
+        let v_elems = (p.b * p.t * p.h * p.v) as usize;
+        let g_elems = (p.b * p.t * p.h) as usize;
+        let h0_elems = (p.b * p.h * p.v * p.k) as usize;
+        let o_elems = v_elems;
+
+        let q_buf = device.alloc_buffer(qk_elems * 2, DType::BF16, vec![qk_elems]).unwrap();
+        let k_buf = device.alloc_buffer(qk_elems * 2, DType::BF16, vec![qk_elems]).unwrap();
+        let v_buf = device.alloc_buffer(v_elems * 2, DType::BF16, vec![v_elems]).unwrap();
+        let g_buf = device.alloc_buffer(g_elems * 4, DType::F32, vec![g_elems]).unwrap();
+        let beta_buf = device.alloc_buffer(g_elems * 4, DType::F32, vec![g_elems]).unwrap();
+        let h0_buf = device.alloc_buffer(h0_elems * 4, DType::F32, vec![h0_elems]).unwrap();
+        let o_buf = device.alloc_buffer(o_elems * 2, DType::BF16, vec![o_elems]).unwrap();
+        let final_state_buf =
+            device.alloc_buffer(h0_elems * 4, DType::F32, vec![h0_elems]).unwrap();
+
+        let mut encoder = device.command_encoder().unwrap();
+        let result = dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
+            &mut encoder, &mut registry, &device,
+            &q_buf, &k_buf, &v_buf, &g_buf, &beta_buf, &h0_buf,
+            &o_buf, &final_state_buf, p,
+        );
+        assert!(
+            result.is_ok(),
+            "K=256 pipeline encode failed: {:?}",
+            result.err()
+        );
+        let commit = encoder.commit_and_wait();
+        assert!(
+            commit.is_ok(),
+            "K=256 pipeline commit failed: {:?}",
+            commit.err()
+        );
+        eprintln!(
+            "[iter 22 smoke] K=256 full pipeline (l2_norm + cumsum + kkt + \
+             tri_solve + recompute_wu + chunk_inter_state_k256 + \
+             chunk_o_k256) dispatched + committed SUCCESSFULLY at \
+             B=1,T=64,K=256,V=32,BT=64."
+        );
     }
 
     /// Iter 21 SMOKE TEST — verify the K=256 native chunk_inter_state
