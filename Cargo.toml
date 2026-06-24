@@ -132,3 +132,7 @@ harness = false
 [[bench]]
 name = "bench_lmhead_batch_row_parity"
 harness = false
+
+[[bench]]
+name = "bench_moe_id_token_parity"
+harness = false
