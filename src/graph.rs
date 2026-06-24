@@ -1178,6 +1178,35 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Byte-identity-required variant of [`Self::quantized_matmul_id_ggml`] —
+    /// always routes to the per-token `mv_id` kernel (ADR-040 Phase F
+    /// `iter-F-moe-mvid`). The gemma4 `[N,hidden]` batched decode body calls
+    /// this for its MoE gate_up/down `_id` dispatches so that at N≥5 (where the
+    /// down projection's `n_tokens = N*top_k > 32` would otherwise cross into
+    /// the `mm_id` grouped kernel, whose reduction order is not bit-identical
+    /// to serial) the batched forward stays byte-identical to N serial decodes.
+    pub fn quantized_matmul_id_ggml_mv(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            params,
+        )
+    }
+
     /// Pooled-scratch variant of [`Self::quantized_matmul_id_ggml`] — the
     /// `IdMmScratch` is caller-owned so batched prefill amortises the
     /// per-call allocations that the auto entry point incurs (ADR-011

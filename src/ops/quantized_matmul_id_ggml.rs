@@ -197,6 +197,48 @@ pub fn quantized_matmul_id_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    quantized_matmul_id_ggml_impl(
+        encoder, registry, device, input, weight, ids, output, params, false,
+    )
+}
+
+/// ADR-040 Phase F `iter-F-moe-mvid` — byte-identity-required variant: always
+/// routes to the per-token `mv_id` kernel, bypassing the `n_tokens > 32`
+/// `mm_id` grouped route. Decode continuous-batching (the gemma4 `[N,hidden]`
+/// batched body) at N≥5 has `n_tokens = N*top_k > 32` on the MoE down
+/// projection; the `mm_id` grouped reduction is NOT bit-identical to the
+/// serial per-token `mv_id` path, so a batched decode forward that must stay
+/// byte-identical to N serial decodes calls this instead. `mm_id` is a prefill
+/// throughput optimization and a measured regression at N≤8, so forcing `mv_id`
+/// costs nothing at decode width.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    quantized_matmul_id_ggml_impl(
+        encoder, registry, device, input, weight, ids, output, params, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantized_matmul_id_ggml_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    force_mv: bool,
+) -> Result<()> {
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
 
@@ -289,7 +331,8 @@ pub fn quantized_matmul_id_ggml(
     //   * K < 32 (mm tile requires NK=32)
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     // ADR-022 Phase 2 — Q5_K mm_id ported.
-    if params.n_tokens > mm_id_routing_threshold()
+    if !force_mv
+        && params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
     {
