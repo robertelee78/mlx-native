@@ -67,8 +67,15 @@ using namespace metal;
 //   buffer(5): state_in    f32
 //   buffer(6): output      f32
 //   buffer(7): state_out   f32
-//   buffer(8): params      uint[8]: (D_k, D_v, n_k_heads, n_v_heads,
-//                                    n_tokens, n_seqs, 0, 0)
+//   buffer(8): params      uint[9]: (D_k, D_v, n_k_heads, n_v_heads,
+//                                    n_tokens, n_seqs, 0, 0,
+//                                    q_scale_bits)  // ADR-033 §Pi iter 25:
+//                                    q_scale_bits = as_type<uint>(1.0f/sqrt(D_k))
+//                                    if non-zero, kernel applies q_scale at
+//                                    output writeback (matches llama.cpp pattern,
+//                                    eliminates the per-layer scalar_mul_f32
+//                                    pre-pass dispatch). If zero, kernel runs
+//                                    in legacy mode (caller pre-scaled q).
 
 // `NSG` per-thread state-cell count. Caller selects via kernel-name dispatch:
 // `gated_delta_net_decode_f32_1` / `_2` / `_4`. NSG must be an integer divisor
@@ -102,6 +109,12 @@ inline void gated_delta_net_decode_impl(
     const uint n_v_heads = params[3];
     const uint n_tokens  = params[4];
     const uint n_seqs    = params[5];
+    // ADR-033 §Pi iter 25 (2026-05-23): q_scale fold-in (matches llama.cpp).
+    // If params[8] != 0, interpret as a f32 bits encoding of q_scale, and
+    // apply at output writeback. Default (params[8]==0) preserves legacy
+    // contract (caller pre-scales q).
+    const uint q_scale_bits = params[8];
+    const float q_scale = q_scale_bits == 0u ? 1.0f : as_type<float>(q_scale_bits);
 
     const uint v_head = tgpig.y;
     const uint seq    = tgpig.z;
@@ -176,9 +189,11 @@ inline void gated_delta_net_decode_impl(
         const float y = metal::simd_sum(partial_y);
 
         // Output: lane 0 of each (i20) row writes the fully-reduced value.
-        // (q_scale=1/sqrt(D_k) is applied by the caller to `q` upstream.)
+        // ADR-033 §Pi iter 25: apply q_scale at writeback (matches llama.cpp
+        // line 2636 `y*scale`). When q_scale_bits == 0, q_scale == 1.0 and
+        // the legacy caller-pre-scales-q contract is preserved.
         if (tx == 0) {
-            output[seq * v_seq_stride + t * v_token_stride + v_head * D_v + i20] = y;
+            output[seq * v_seq_stride + t * v_token_stride + v_head * D_v + i20] = y * q_scale;
         }
     }
 

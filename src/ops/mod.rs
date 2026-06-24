@@ -4,6 +4,7 @@
 
 pub mod argmax;
 pub mod argsort;
+pub mod moe_mm_id_map0;
 pub mod top_k;
 pub mod copy;
 pub mod cumsum;

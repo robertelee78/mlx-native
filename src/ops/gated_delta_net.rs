@@ -207,12 +207,18 @@ pub fn dispatch_gated_delta_net(
     Ok(())
 }
 
-/// Build the 8-u32 params buffer.
+/// Build the 9-u32 params buffer.
+///
+/// ADR-033 §Pi iter 25 (2026-05-23): extended from 8 → 9 u32 to include
+/// q_scale_bits at index 8. When non-zero, the gated_delta_net_decode
+/// kernel applies `output *= as_type<float>(q_scale_bits)` at writeback
+/// (matching llama.cpp's per-kernel q_scale fold-in). When zero, kernel
+/// preserves the legacy contract (caller pre-scales q).
 pub fn build_gated_delta_net_params(
     device: &crate::MlxDevice,
     p: GatedDeltaNetParams,
 ) -> Result<MlxBuffer> {
-    let mut buf = device.alloc_buffer(8 * 4, DType::U32, vec![8])?;
+    let mut buf = device.alloc_buffer(9 * 4, DType::U32, vec![9])?;
     {
         let s = buf.as_mut_slice::<u32>()?;
         s[0] = p.d_k;
@@ -223,6 +229,36 @@ pub fn build_gated_delta_net_params(
         s[5] = p.n_seqs;
         s[6] = 0;
         s[7] = 0;
+        s[8] = 0; // q_scale_bits — 0 = legacy (no fold-in); caller may overwrite.
+    }
+    Ok(buf)
+}
+
+/// ADR-033 §Pi iter 25 — variant that builds the params buffer with
+/// q_scale folded-in. Eliminates the per-layer scalar_mul_f32 dispatch
+/// (saves ~0.02-0.03 ms per dispatch × 30 linear-attn layers per Qwen3.6
+/// prefill ≈ 0.7-0.9 ms = ~0.3-0.4% of pp576 wall, matching the residual
+/// peer-parity gap).
+///
+/// Caller passes the unscaled q buffer; the kernel scales the output at
+/// writeback (matching llama.cpp `kernel_gated_delta_net_impl` pattern).
+pub fn build_gated_delta_net_params_with_q_scale(
+    device: &crate::MlxDevice,
+    p: GatedDeltaNetParams,
+    q_scale: f32,
+) -> Result<MlxBuffer> {
+    let mut buf = device.alloc_buffer(9 * 4, DType::U32, vec![9])?;
+    {
+        let s = buf.as_mut_slice::<u32>()?;
+        s[0] = p.d_k;
+        s[1] = p.d_v;
+        s[2] = p.n_k_heads;
+        s[3] = p.n_v_heads;
+        s[4] = p.n_tokens;
+        s[5] = p.n_seqs;
+        s[6] = 0;
+        s[7] = 0;
+        s[8] = q_scale.to_bits();
     }
     Ok(buf)
 }

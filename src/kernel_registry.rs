@@ -428,6 +428,28 @@ impl KernelRegistry {
         sources.insert("fused_gelu_mul_bf16".into(), moe_dispatch_src);
         sources.insert("moe_swiglu_seq_bf16".into(), moe_dispatch_src);
         sources.insert("moe_weighted_sum_seq_bf16_input".into(), moe_dispatch_src);
+
+        // ADR-033 §Pi next-iter arc — two-pass MoE mm_id (iter A: map0).
+        // Pre-pass that sorts tokens by expert assignment before the main
+        // mm_id kernel. Ported from llama.cpp's kernel_mul_mm_id_map0; one
+        // template specialization per supported ne20 (n_expert_used).
+        let moe_mm_id_map0_src: &'static str =
+            include_str!("shaders/moe_mm_id_map0.metal");
+        sources.insert("moe_mm_id_map0_ne20_1".into(),  moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_2".into(),  moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_4".into(),  moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_5".into(),  moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_6".into(),  moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_8".into(),  moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_10".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_16".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_22".into(), moe_mm_id_map0_src);
+
+        // ADR-033 §Pi iter B-1 — main mm_id kernel skeleton (Q4_0). Body
+        // pending iter B-2 (simdgroup matmul + Q4_0 dequant chain).
+        let moe_mm_id_q4_0_src: &'static str =
+            include_str!("shaders/moe_mm_id_q4_0.metal");
+        sources.insert("moe_mm_id_q4_0_f32_skeleton".into(), moe_mm_id_q4_0_src);
         // ADR-020 iter-11h-e3a: backward kernels for moe_weighted_sum_seq.
         sources.insert(
             "moe_weighted_sum_seq_backward_outputs_f32".into(),
