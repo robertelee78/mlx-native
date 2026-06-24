@@ -27,10 +27,16 @@
 //! # Buffer / params contract
 //!
 //! Identical to [`super::gated_delta_net::dispatch_gated_delta_net`]:
-//! * `q` — pre-scaled by `1/sqrt(D_k)` (caller's responsibility)
+//! * `q` — pre-scaled by `1/sqrt(D_k)` (caller's responsibility), UNLESS
+//!   `params[8]` (q_scale_bits) is non-zero, in which case `q` is passed
+//!   unscaled and the kernel folds the scale in at writeback.
 //! * `k`, `v`, `g`, `beta`, `state_in`, `output`, `state_out` — same shapes
-//! * `params_buf` — same 8-u32 layout, built via
-//!   [`super::gated_delta_net::build_gated_delta_net_params`]
+//! * `params_buf` — 9-u32 layout (ADR-033 §Pi iter 25; extended from 8),
+//!   built via [`super::gated_delta_net::build_gated_delta_net_params`] or
+//!   [`super::gated_delta_net::build_gated_delta_net_params_with_q_scale`].
+//!   Index 8 = `q_scale_bits` (0 = legacy / no fold-in). The dispatchers
+//!   reject any buffer with fewer than 9 u32 to prevent an OOB read of
+//!   `params[8]` in the kernel.
 //!
 //! # NSG selection
 //!
@@ -188,6 +194,20 @@ fn validate(
     Ok(())
 }
 
+/// ADR-033 §Pi iter 25: the decode kernels read `params[8]` (q_scale_bits)
+/// unconditionally, so the params buffer MUST hold at least 9 u32. Reject
+/// shorter buffers here rather than triggering an OOB read on the GPU.
+fn validate_params_buf(params_buf: &MlxBuffer) -> Result<()> {
+    if params_buf.element_count() < 9 {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode: params_buf has {} u32, expected >= 9 \
+             (index 8 = q_scale_bits); build via build_gated_delta_net_params[_with_q_scale]",
+            params_buf.element_count()
+        )));
+    }
+    Ok(())
+}
+
 /// Dispatch the decode-only fused Gated DeltaNet kernel.
 ///
 /// Equivalent math to [`super::gated_delta_net::dispatch_gated_delta_net`];
@@ -210,6 +230,7 @@ pub fn dispatch_gated_delta_net_decode(
     p: GatedDeltaNetParams,
 ) -> Result<()> {
     validate(&p, q, k, v, g, beta, state_in, output, state_out)?;
+    validate_params_buf(params_buf)?;
 
     let nsg: u32 = p.d_k / 32;
     let kernel_name = match nsg {
@@ -294,6 +315,7 @@ pub fn dispatch_gated_delta_net_decode_with_capture(
     p: GatedDeltaNetParams,
 ) -> Result<()> {
     validate(&p, q, k, v, g, beta, state_in, output, state_out)?;
+    validate_params_buf(params_buf)?;
 
     // Validate state_capture shape. The kernel uses `params.n_tokens` as
     // the per-sequence token stride (capture_seq_stride = n_tokens *

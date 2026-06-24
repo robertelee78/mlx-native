@@ -78,6 +78,12 @@ inline void gated_delta_net_decode_capture_impl(
     const uint n_v_heads = params[3];
     const uint n_tokens  = params[4];
     const uint n_seqs    = params[5];
+    // ADR-033 §Pi iter 25: q_scale fold-in — mirror of the non-capture
+    // gated_delta_net_decode kernel so capture stays bit-equivalent. When
+    // params[8] != 0 it is the f32-bits encoding of q_scale, applied at
+    // writeback; params[8] == 0 preserves the legacy contract (q pre-scaled).
+    const uint q_scale_bits = params[8];
+    const float q_scale = q_scale_bits == 0u ? 1.0f : as_type<float>(q_scale_bits);
 
     const uint v_head = tgpig.y;
     const uint seq    = tgpig.z;
@@ -147,7 +153,7 @@ inline void gated_delta_net_decode_capture_impl(
 
         // Output: lane 0 writes the fully-reduced value.
         if (tx == 0) {
-            output[seq * v_seq_stride + t * v_token_stride + v_head * D_v + i20] = y;
+            output[seq * v_seq_stride + t * v_token_stride + v_head * D_v + i20] = y * q_scale;
         }
 
         // ADR-034 task #90 — capture per-position state AFTER this

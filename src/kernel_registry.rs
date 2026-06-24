@@ -446,10 +446,13 @@ impl KernelRegistry {
         sources.insert("moe_mm_id_map0_ne20_22".into(), moe_mm_id_map0_src);
 
         // ADR-033 §Pi iter B-1 — main mm_id kernel skeleton (Q4_0). Body
-        // pending iter B-2 (simdgroup matmul + Q4_0 dequant chain).
-        let moe_mm_id_q4_0_src: &'static str =
-            include_str!("shaders/moe_mm_id_q4_0.metal");
-        sources.insert("moe_mm_id_q4_0_f32_skeleton".into(), moe_mm_id_q4_0_src);
+        // pending iter B-2 (simdgroup matmul + Q4_0 dequant chain). NOT
+        // registered: the shader currently writes zeros for routed tiles, so
+        // registering it would expose a known-wrong pipeline (and prewarm_all
+        // would compile it). The shader file is retained for iter B-2; re-add
+        // the source insert once the real matmul body lands.
+        //   let moe_mm_id_q4_0_src = include_str!("shaders/moe_mm_id_q4_0.metal");
+        //   sources.insert("moe_mm_id_q4_0_f32_skeleton".into(), moe_mm_id_q4_0_src);
         // ADR-020 iter-11h-e3a: backward kernels for moe_weighted_sum_seq.
         sources.insert(
             "moe_weighted_sum_seq_backward_outputs_f32".into(),
