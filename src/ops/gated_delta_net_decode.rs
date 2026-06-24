@@ -198,6 +198,16 @@ fn validate(
 /// unconditionally, so the params buffer MUST hold at least 9 u32. Reject
 /// shorter buffers here rather than triggering an OOB read on the GPU.
 fn validate_params_buf(params_buf: &MlxBuffer) -> Result<()> {
+    // dtype MUST be U32: the kernel reads `params` as `device const uint *`.
+    // Checking dtype + element_count together guarantees >= 9*4 = 36 bytes;
+    // an element_count-only check would pass a malformed 9-byte U8 buffer and
+    // still OOB-read params[8].
+    if params_buf.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode: params_buf must be u32 (got {})",
+            params_buf.dtype()
+        )));
+    }
     if params_buf.element_count() < 9 {
         return Err(MlxError::InvalidArgument(format!(
             "gated_delta_net_decode: params_buf has {} u32, expected >= 9 \

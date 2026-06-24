@@ -26,8 +26,11 @@ using namespace metal;
 //   buffer(5): state_in       f32
 //   buffer(6): output         f32
 //   buffer(7): state_out      f32   (= state after final token, same as decode)
-//   buffer(8): params         uint[8]: (D_k, D_v, n_k_heads, n_v_heads,
-//                                       n_tokens, n_seqs, 0, 0)
+//   buffer(8): params         uint[9]: (D_k, D_v, n_k_heads, n_v_heads,
+//                                       n_tokens, n_seqs, 0, 0, q_scale_bits)
+//                                       index 8 = q_scale_bits (0 = no fold-in,
+//                                       caller pre-scales q; non-zero = f32 bits
+//                                       of q_scale applied at writeback)
 //   buffer(9): state_capture  f32   (per-position state, ADDED in this kernel)
 //
 // # Memory layout for state_capture

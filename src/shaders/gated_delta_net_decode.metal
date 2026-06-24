@@ -135,12 +135,13 @@ inline void gated_delta_net_decode_impl(
     const uint state_head_stride = D_v * D_k;
     const uint state_seq_stride  = n_v_heads * state_head_stride;
 
-    // NOTE: this kernel does NOT fold-in `q_scale = 1/sqrt(D_k)` (whereas
-    // llama.cpp's `kernel_gated_delta_net_impl` does). The hf2q caller
-    // pre-scales `q_l2 -> q_scaled` via `scalar_mul_f32` before dispatching,
-    // matching the existing `gated_delta_net_f32` kernel's contract. Keeping
-    // this kernel a drop-in for `dispatch_gated_delta_net` is the parity
-    // ground-truth for iter56.
+    // q_scale handling (ADR-033 §Pi iter 25): this kernel folds in
+    // `q_scale` at writeback ONLY when params[8] (q_scale_bits) != 0 — see
+    // the q_scale computation above and the `y * q_scale` store below. When
+    // params[8] == 0 (legacy contract), q_scale == 1.0 and the caller is
+    // responsible for pre-scaling `q_l2 -> q_scaled` via `scalar_mul_f32`
+    // before dispatch, matching `gated_delta_net_f32`. This keeps the kernel
+    // a drop-in for `dispatch_gated_delta_net` and the parity ground-truth.
 
     // Per-thread state row slice — NSG cells covering D_k positions
     // `is = tx*NSG + j` for j in 0..NSG.
