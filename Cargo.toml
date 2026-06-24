@@ -128,3 +128,7 @@ harness = false
 [[bench]]
 name = "bench_f3_decode_mv_vs_mm"
 harness = false
+
+[[bench]]
+name = "bench_lmhead_batch_row_parity"
+harness = false
