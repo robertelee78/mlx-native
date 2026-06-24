@@ -60,6 +60,8 @@ struct FlashAttnVecHybridParamsGpu {
     codebook_bits: u32,
     fuse_fwht_pre: u32,
     nsg: u32,
+    /// ADR-040 M4: batched-flash query count (1 for the non-batched kernel).
+    n_queries: u32,
 }
 
 /// GPU-side reduce params (re-uses flash_attn_vec_reduce_dk{256,512} kernel).
@@ -211,6 +213,7 @@ pub fn flash_attn_vec_hybrid(
         codebook_bits: params.codebook_bits,
         fuse_fwht_pre: params.fuse_fwht_pre,
         nsg: params.nsg,
+        n_queries: 1,
     };
 
     let kernel_name = match head_dim {
@@ -301,6 +304,144 @@ pub fn flash_attn_vec_hybrid(
     Ok(())
 }
 
+/// ADR-040 M4 — BATCHED multi-sequence decode flash. One dispatch over `n_q`
+/// queries (grid.x = n_q), each attending to its OWN physical-slot KV region in
+/// the shared multi-seq buffers. Per-query input addressing (Q/K/V/V_norms base
+/// offsets + kv_seq_len + ring_start passed as `[n_q]` u32 device arrays);
+/// inner attention math identical to `flash_attn_vec_hybrid` ⇒ per-row
+/// bit-identical. The reduce kernel is reused unchanged with `nrows = n_q*heads`.
+///
+/// Requires all queries to share the SAME (nwg, nsg) bucket — the caller gates
+/// on it (decode lengths in the same kv_seq_len band) and falls back to N
+/// per-slot dispatches otherwise. `q`/`dst` are `[n_q, heads*head_dim]`;
+/// `k_f16`/`v_packed`/`v_norms` are the FULL multi-seq buffers; `tmp` is
+/// `[n_q, heads*head_dim*nwg + heads*2*nwg]`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_hybrid_batched(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+) -> Result<()> {
+    validate_params(params)?;
+    if k_f16.dtype() != crate::DType::F16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched: k_f16 must be DType::F16, got {:?}",
+            k_f16.dtype()
+        )));
+    }
+    let head_dim = params.head_dim;
+    // params.kv_seq_len must be the MAX over queries (used only for nwg bucket).
+    let nwg = compute_nwg(params.kv_seq_len);
+
+    let gpu_params = FlashAttnVecHybridParamsGpu {
+        n_heads: params.num_heads,
+        n_kv_heads: params.num_kv_heads,
+        head_dim: params.head_dim,
+        kv_seq_len: params.kv_seq_len,
+        kv_capacity: params.kv_capacity,
+        scale: params.scale,
+        mask_type: params.mask_type,
+        sliding_window: params.sliding_window,
+        softcap: params.softcap,
+        nwg,
+        ring_start: params.ring_start,
+        scale_factor_d512: params.scale_factor_d512,
+        codebook_bits: params.codebook_bits,
+        fuse_fwht_pre: params.fuse_fwht_pre,
+        nsg: params.nsg,
+        n_queries: n_q,
+    };
+
+    let kernel_name = match head_dim {
+        256 => "flash_attn_vec_hybrid_batched_dk256",
+        512 => "flash_attn_vec_hybrid_batched_dk512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched: unsupported head_dim {head_dim}"
+        ))),
+    };
+    let cbits_const = (params.codebook_bits as i32, 50usize);
+    let v_is_f16: i32 = match v_packed.dtype() {
+        crate::DType::F16 => 1,
+        _ => 0,
+    };
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(cbits_const.1, cbits_const.0), (51usize, v_is_f16)],
+    )?;
+
+    let pk = pad2(head_dim as usize, 128);
+    let pv = pad2(head_dim as usize, 128);
+    let sh = 4 * 32;
+    let nsg = params.nsg as usize;
+    let shmem_halfs = pk + nsg * (sh + 2 * pv);
+    let shmem_bytes = shmem_halfs * 2;
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+
+    // grid.x = n_q (was 1). Each (query, head, wg) threadgroup.
+    let threadgroups = MTLSize::new(n_q as u64, params.num_heads as u64, nwg as u64);
+    let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
+
+    let dst_buf = if nwg == 1 { output } else { tmp };
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(q)),
+            (2, KernelArg::Buffer(k_f16)),
+            (3, KernelArg::Buffer(v_packed)),
+            (4, KernelArg::Buffer(v_norms)),
+            (5, KernelArg::Buffer(dst_buf)),
+            (6, KernelArg::Buffer(slot_id_arr)),
+            (7, KernelArg::Buffer(seq_pos_arr)),
+        ],
+        &[(0, shmem_bytes as u64)],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    if nwg > 1 {
+        encoder.memory_barrier();
+        // nrows = n_q * heads so the reduce's S/M base clears ALL queries' partials.
+        let reduce_params = FlashAttnVecReduceParamsGpu { nrows: n_q * params.num_heads };
+        let reduce_kernel = match head_dim {
+            256 => "flash_attn_vec_reduce_dk256",
+            512 => "flash_attn_vec_reduce_dk512",
+            _ => unreachable!(),
+        };
+        let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
+        // grid.x = n_q * heads (one row per (query, head)).
+        let reduce_tg = MTLSize::new((n_q * params.num_heads) as u64, 1, 1);
+        let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
+        encoder.encode_threadgroups_with_args(
+            reduce_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                (1, KernelArg::Buffer(tmp)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&nwg))),
+            ],
+            reduce_tg,
+            reduce_tg_size,
+        );
+    }
+
+    Ok(())
+}
+
 fn pad2(x: usize, n: usize) -> usize {
     (x + n - 1) & !(n - 1)
 }
@@ -314,7 +455,7 @@ mod tests {
         // 15 u32-sized fields × 4 bytes = 60 bytes — must match TQ-HB layout
         // exactly so the kernel's `constant FlashAttnVecTqHbParams &params`
         // binding sees the same bytes.
-        assert_eq!(std::mem::size_of::<FlashAttnVecHybridParamsGpu>(), 60);
+        assert_eq!(std::mem::size_of::<FlashAttnVecHybridParamsGpu>(), 64);
     }
 
     #[test]

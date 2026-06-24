@@ -1146,6 +1146,9 @@ impl KernelRegistry {
         let hybrid_src: &'static str = include_str!("shaders/flash_attn_vec_hybrid.metal");
         sources.insert("flash_attn_vec_hybrid_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_dk512".into(), hybrid_src);
+        // ADR-040 M4 — batched multi-seq decode flash (same source file).
+        sources.insert("flash_attn_vec_hybrid_batched_dk256".into(), hybrid_src);
+        sources.insert("flash_attn_vec_hybrid_batched_dk512".into(), hybrid_src);
 
         // ADR-029: verbatim llama.cpp peer port.
         // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.
