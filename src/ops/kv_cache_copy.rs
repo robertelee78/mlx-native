@@ -323,6 +323,57 @@ pub fn dispatch_kv_cache_copy_batch_f32_to_f16(
     Ok(())
 }
 
+/// ADR-040 M4 — BATCHED multi-sequence F16-K copy: writes all `n_queries`
+/// decode queries' K into their own physical-slot regions of the shared
+/// multi_seq F16 cache in ONE dispatch (grid.z = N), replacing the per-slot
+/// host-side loop. `src` is `[N, n_heads*head_dim]` F32; `cache` is the FULL
+/// multi_seq buffer `[n_seqs, n_heads, capacity, head_dim]` F16; `slot_id`/
+/// `seq_pos` are `[N]` u32. Byte-identical to N single-slot calls.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_copy_batch_f32_to_f16_batched(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    cache: &MlxBuffer,
+    slot_id: &MlxBuffer,
+    seq_pos: &MlxBuffer,
+    n_queries: u32,
+    n_heads: u32,
+    head_dim: u32,
+    capacity: u32,
+    is_ring: bool,
+) -> Result<()> {
+    if n_heads == 0 || head_dim == 0 || n_queries == 0 {
+        return Ok(());
+    }
+    let pipeline = registry.get_pipeline("kv_cache_copy_batch_f32_to_f16_batched", device)?;
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let head_dim_bytes = head_dim.to_ne_bytes();
+    let capacity_bytes = capacity.to_ne_bytes();
+    let is_ring_bytes = (if is_ring { 1u32 } else { 0u32 }).to_ne_bytes();
+
+    use super::encode_helpers::{encode_with_args, KernelArg};
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(cache)),
+            (2, KernelArg::Buffer(slot_id)),
+            (3, KernelArg::Buffer(seq_pos)),
+            (4, KernelArg::Bytes(&n_heads_bytes)),
+            (5, KernelArg::Bytes(&head_dim_bytes)),
+            (6, KernelArg::Bytes(&capacity_bytes)),
+            (7, KernelArg::Bytes(&is_ring_bytes)),
+        ],
+        MTLSize::new(head_dim as u64, n_heads as u64, n_queries as u64),
+        MTLSize::new(std::cmp::min(256, head_dim as u64), 1, 1),
+    );
+
+    Ok(())
+}
+
 /// Fused single-position K + V cache copy (F32 source → F32 cache) — DECODE shape.
 ///
 /// ADR-028 iter-145: collapses the 2-dispatch pattern (1× K, 1× V) into a single

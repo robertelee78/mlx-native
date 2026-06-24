@@ -472,6 +472,8 @@ impl KernelRegistry {
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
         sources.insert("kv_cache_copy_batch_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_batch_f32_to_f16".into(), kv_cache_src);
+        // ADR-040 M4 — batched multi-seq F16-K copy (grid.z = N queries)
+        sources.insert("kv_cache_copy_batch_f32_to_f16_batched".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32_to_f16".into(), kv_cache_src);
         // Wave P4.11 — fused K+V copy variants
@@ -1100,6 +1102,9 @@ impl KernelRegistry {
         // Track B (iter-21): higher-bit (5/6-bit) quantize kernels (byte-packed)
         sources.insert("hadamard_quantize_kv_hb_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_hb_d512".into(), hq_fast_src);
+        // ADR-040 M4 — batched multi-seq FWHT-V quantize (grid.y = N queries)
+        sources.insert("hadamard_quantize_kv_hb_batched_d256".into(), hq_fast_src);
+        sources.insert("hadamard_quantize_kv_hb_batched_d512".into(), hq_fast_src);
         // ADR-028 iter-148: fused K+V single-position HB encoder
         sources.insert("hadamard_quantize_kv_hb_dual_d256".into(), hq_fast_src);
         sources.insert("hadamard_quantize_kv_hb_dual_d512".into(), hq_fast_src);

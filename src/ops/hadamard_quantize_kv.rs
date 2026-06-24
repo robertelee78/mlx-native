@@ -643,6 +643,72 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     Ok(())
 }
 
+/// ADR-040 M4 — BATCHED multi-sequence FWHT-V quantize: quantizes all
+/// `n_queries` decode queries' V into their own physical-slot regions of the
+/// shared multi_seq packed/norms buffers in ONE dispatch (grid.y = N), replacing
+/// the per-slot host-side loop. `src` is `[N, nkv*head_dim]` F32; `packed`/
+/// `norms` are the FULL multi_seq buffers; `slot_id`/`seq_pos` are `[N]` u32.
+/// Per-query addressing only ⇒ byte-identical to N single-slot calls.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_hb_batched(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,
+    norms: &MlxBuffer,
+    slot_id: &MlxBuffer,
+    seq_pos: &MlxBuffer,
+    n_queries: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    if num_kv_heads == 0 || head_dim == 0 || n_queries == 0 { return Ok(()); }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_hadamard_quantize_kv_hb_batched: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
+    }
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_hb_batched_d256",
+        512 => "hadamard_quantize_kv_hb_batched_d512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "hadamard_quantize_kv_hb_batched: head_dim {} not supported (need 256 or 512)", head_dim))),
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos: 0, // per-query write_pos comes from seq_pos[]; this field is unused by the batched kernel
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512,
+        codebook_bits,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src)),
+            (1, KA::Buffer(packed)),
+            (2, KA::Buffer(norms)),
+            (3, KA::Bytes(params_bytes)),
+            (4, KA::Buffer(slot_id)),
+            (5, KA::Buffer(seq_pos)),
+        ],
+        MTLSize::new(num_kv_heads as u64, n_queries as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
+
+    Ok(())
+}
+
 /// ADR-028 Phase 10e.5: no-FWHT V quantize for the hybrid path.
 ///
 /// Same byte-packed Lloyd-Max output (5/6/8-bit) and same norm storage layout

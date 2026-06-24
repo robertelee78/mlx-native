@@ -109,6 +109,43 @@ kernel void kv_cache_copy_batch_f32_to_f16(
     cache[dst_idx] = half(src[src_idx]);
 }
 
+/// ADR-040 M4 — BATCHED multi-sequence F16-K copy: copies N decode queries'
+/// K into their own physical-slot regions of the shared multi_seq cache in ONE
+/// dispatch (grid.z = N), eliminating the per-slot host-side loop.
+///
+/// Source layout: [N, n_heads*head_dim] flat F32 (N tokens, all heads).
+/// Cache layout:  [n_seqs, n_heads, capacity, head_dim] head-major F16.
+/// Per-query addressing ONLY — the write is byte-identical to N single-slot
+/// `kv_cache_copy_batch_f32_to_f16` calls (slot_id[iq] selects the slot region,
+/// seq_pos[iq] the write position; ring-wrap derived in-kernel).
+///
+/// Grid: 3D — x=elem (head_dim), y=head (n_heads), z=query (N).
+kernel void kv_cache_copy_batch_f32_to_f16_batched(
+    device const float* src       [[buffer(0)]],   // [N, n_heads*head_dim] flat F32
+    device half*        cache     [[buffer(1)]],   // [n_seqs, n_heads, capacity, head_dim] F16
+    device const uint*  slot_id   [[buffer(2)]],   // [N] physical slot per query
+    device const uint*  seq_pos   [[buffer(3)]],   // [N] raw seq position per query
+    constant uint&      n_heads   [[buffer(4)]],
+    constant uint&      head_dim  [[buffer(5)]],
+    constant uint&      capacity  [[buffer(6)]],
+    constant uint&      is_ring   [[buffer(7)]],   // 1 = sliding/ring (wrap pos)
+    uint3 tid [[thread_position_in_grid]]          // x=elem, y=head, z=query
+) {
+    uint elem = tid.x;
+    uint head = tid.y;
+    uint iq   = tid.z;
+    if (head >= n_heads || elem >= head_dim) return;
+
+    uint sp   = seq_pos[iq];
+    uint pos  = (is_ring != 0u) ? (sp % capacity) : sp;
+    uint slot = slot_id[iq];
+
+    uint src_idx = iq * (n_heads * head_dim) + head * head_dim + elem;
+    uint dst_idx = slot * (n_heads * capacity * head_dim)
+                 + head * capacity * head_dim + pos * head_dim + elem;
+    cache[dst_idx] = half(src[src_idx]);
+}
+
 /// Fused K + V single-position cache copy (F32 source → F32 cache) — DECODE shape.
 ///
 /// Combines two kv_cache_copy_batch_f32 dispatches (one for K, one for V) into a

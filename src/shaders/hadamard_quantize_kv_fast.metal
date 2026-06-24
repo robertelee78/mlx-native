@@ -850,6 +850,162 @@ kernel void hadamard_quantize_kv_hb<512>(
     constant HadamardQuantizeHbParams &, uint, uint);
 
 // ============================================================================
+// ADR-040 M4 — BATCHED multi-sequence FWHT-V quantize.
+//
+// Identical FWHT + Lloyd-Max codebook math to `hadamard_quantize_kv_hb<HEAD_DIM>`
+// above; ONLY the src/packed/norms base addressing + write_pos become per-query,
+// driven by slot_id_arr[iq] / seq_pos_arr[iq]. One dispatch over N queries
+// (grid.y = N) replaces the N per-slot host-side dispatches. Per-query math is
+// byte-identical to N single-slot calls ⇒ bit-identical by construction.
+//
+// Grid: 2D — x=head (num_kv_heads), y=query (N). 1 simdgroup (32 lanes) per (head,query).
+template<ushort HEAD_DIM>
+kernel void hadamard_quantize_kv_hb_batched(
+    device const float                    *src        [[buffer(0)]],  // [N, nkv*HEAD_DIM] F32
+    device       uint8_t                  *packed     [[buffer(1)]],  // [n_seqs, nkv, cap, HEAD_DIM] u8
+    device       float                    *norms      [[buffer(2)]],  // [n_seqs, nkv, cap, npp] f32
+    constant HadamardQuantizeHbParams     &params     [[buffer(3)]],
+    device const uint                     *slot_id_arr[[buffer(4)]],  // [N]
+    device const uint                     *seq_pos_arr[[buffer(5)]],  // [N] raw seq position
+    uint2 tgid [[threadgroup_position_in_grid]],   // x=head, y=query
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    constexpr ushort EPT = HEAD_DIM / 32;
+    constexpr ushort NPP = (HEAD_DIM == 256) ? 1 : 2;
+    const uint head_idx = tgid.x;
+    const uint iq       = tgid.y;
+    const uint lane = tiisg;
+
+    if (head_idx >= params.num_kv_heads) return;
+
+    const uint slot = slot_id_arr[iq];
+    const uint wpos = seq_pos_arr[iq];
+
+    // 1. Load elements (per-query src row offset).
+    const uint src_base = iq * (params.num_kv_heads * HEAD_DIM)
+                        + head_idx * HEAD_DIM + lane * EPT;
+    float elems[EPT];
+    for (ushort i = 0; i < EPT; i++) elems[i] = src[src_base + i];
+
+    // 1b. D1 sign pre-multiplication (SRHT).
+    for (ushort i = 0; i < EPT; i++) {
+        ushort j = lane * EPT + i;
+        uint8_t sign_byte = (HEAD_DIM == 256) ? TBQ_SIGNS_256[j >> 3] : TBQ_SIGNS_512[j >> 3];
+        float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+        elems[i] *= sign_val;
+    }
+
+    // 2. FWHT.
+    fwht_simd<EPT>(elems, lane);
+
+    // 3. Normalize 1/sqrt(d).
+    const float inv_sqrt_d = rsqrt(float(HEAD_DIM));
+    for (ushort i = 0; i < EPT; i++) elems[i] *= inv_sqrt_d;
+
+    // 4. Compute norm(s).
+    float local_sq_sum = 0.0f;
+    for (ushort i = 0; i < EPT; i++) local_sq_sum += elems[i] * elems[i];
+
+    float norm0, norm1;
+    if (HEAD_DIM == 256) {
+        norm0 = sqrt(simd_sum(local_sq_sum));
+        norm1 = 0.0f;
+    } else {
+        float blk0_sq = (lane < 16u) ? simd_sum(local_sq_sum) : 0.0f;
+        float blk1_sq = (lane >= 16u) ? simd_sum(local_sq_sum) : 0.0f;
+        blk0_sq = simd_broadcast(blk0_sq, 0u);
+        blk1_sq = simd_broadcast(blk1_sq, 16u);
+        norm0 = sqrt(blk0_sq / 256.0f);
+        norm1 = sqrt(blk1_sq / 256.0f);
+    }
+
+    // 5. Scale elements to N(0,1) range for quantization.
+    if (HEAD_DIM == 256) {
+        float inv_norm = (norm0 > 1.0e-10f) ? (1.0f / norm0) : 0.0f;
+        float scale = inv_norm * sqrt(float(HEAD_DIM));
+        for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+    } else {
+        float blk_norm = (lane < 16u) ? norm0 : norm1;
+        float inv_blk_norm = (blk_norm > 1.0e-10f) ? (1.0f / blk_norm) : 0.0f;
+        float scale = inv_blk_norm * params.scale_factor_d512;
+        for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
+    }
+
+    // 6. Quantize with higher-bit codebook (5, 6, or 8-bit).
+    const uint cbits = params.codebook_bits;
+    uint8_t indices[EPT];
+    for (ushort i = 0; i < EPT; i++) {
+        float v = elems[i];
+        uint8_t idx;
+        if (cbits == 5u) {
+            idx = (v > BOUNDARIES_5BIT[15]) ? 16 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx + 7]) ? 8 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx + 3]) ? 4 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx + 1]) ? 2 : 0;
+            idx += (v > BOUNDARIES_5BIT[idx]) ? 1 : 0;
+        } else if (cbits == 6u) {
+            idx = (v > BOUNDARIES_6BIT[31]) ? 32 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 15]) ? 16 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 7]) ? 8 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 3]) ? 4 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx + 1]) ? 2 : 0;
+            idx += (v > BOUNDARIES_6BIT[idx]) ? 1 : 0;
+        } else {
+            idx = (v > BOUNDARIES_8BIT[127]) ? 128 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 63]) ? 64 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 31]) ? 32 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 15]) ? 16 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 7])  ?  8 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 3])  ?  4 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx + 1])  ?  2 : 0;
+            idx += (v > BOUNDARIES_8BIT[idx])      ?  1 : 0;
+        }
+        indices[i] = idx;
+    }
+
+    // 7. Write byte-packed output (per-query slot region).
+    uint actual_pos = (params.is_sliding != 0u)
+        ? (wpos % params.cache_capacity)
+        : wpos;
+    const uint slot_packed_base = slot * (params.num_kv_heads * params.cache_capacity * HEAD_DIM);
+    const uint packed_base = slot_packed_base
+                           + head_idx * params.cache_capacity * HEAD_DIM
+                           + actual_pos * HEAD_DIM;
+    const uint elem_base = packed_base + lane * EPT;
+    for (ushort i = 0; i < EPT; i++) {
+        packed[elem_base + i] = indices[i];
+    }
+
+    // 8. Store norm(s) — per-query slot region.
+    const uint slot_norm_base = slot * (params.num_kv_heads * params.cache_capacity * NPP);
+    if (HEAD_DIM == 256) {
+        if (lane == 0) {
+            norms[slot_norm_base + head_idx * params.cache_capacity + actual_pos] = norm0;
+        }
+    } else {
+        if (lane == 0u) {
+            uint norm_base = slot_norm_base + head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 0u] = norm0;
+        } else if (lane == 16u) {
+            uint norm_base = slot_norm_base + head_idx * params.cache_capacity * 2u + actual_pos * 2u;
+            norms[norm_base + 1u] = norm1;
+        }
+    }
+}
+
+template [[host_name("hadamard_quantize_kv_hb_batched_d256")]]
+kernel void hadamard_quantize_kv_hb_batched<256>(
+    device const float *, device uint8_t *, device float *,
+    constant HadamardQuantizeHbParams &, device const uint *, device const uint *,
+    uint2, uint);
+
+template [[host_name("hadamard_quantize_kv_hb_batched_d512")]]
+kernel void hadamard_quantize_kv_hb_batched<512>(
+    device const float *, device uint8_t *, device float *,
+    constant HadamardQuantizeHbParams &, device const uint *, device const uint *,
+    uint2, uint);
+
+// ============================================================================
 // ADR-028 Phase 10e.5 (iter-351): no-FWHT V quantize kernel for the hybrid path.
 //
 // Same byte-packed Lloyd-Max quantization as `hadamard_quantize_kv_hb` BUT:
