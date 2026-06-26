@@ -332,6 +332,20 @@ static BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
 /// opt-in.
 static BARRIER_NS: AtomicU64 = AtomicU64::new(0);
 
+/// ADR-040 §0.21 decode-gap probe — accumulated GPU-busy time (sum of
+/// `GPUEndTime - GPUStartTime` across `commit_and_wait` command buffers), in ns.
+/// Gated by `HF2Q_GPU_BUSY=1` (reads two ObjC props per sync only when set).
+/// Compare `gpu_busy_ns()` to the wall-clock of a workload to split GPU-busy
+/// from CPU-encode/idle: GPU-busy ≪ wall-clock ⇒ CPU-encode/launch bound.
+static GPU_BUSY_NS: AtomicU64 = AtomicU64::new(0);
+static GPU_BUSY_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HF2Q_GPU_BUSY").as_deref() == Ok("1"));
+
+/// Read accumulated GPU-busy ns (see [`GPU_BUSY_NS`]).
+pub fn gpu_busy_ns() -> u64 {
+    GPU_BUSY_NS.load(Ordering::Relaxed)
+}
+
 /// Reset all counters to zero.
 pub fn reset_counters() {
     SYNC_COUNT.store(0, Ordering::Relaxed);
@@ -339,6 +353,7 @@ pub fn reset_counters() {
     CMD_BUF_COUNT.store(0, Ordering::Relaxed);
     BARRIER_COUNT.store(0, Ordering::Relaxed);
     BARRIER_NS.store(0, Ordering::Relaxed);
+    GPU_BUSY_NS.store(0, Ordering::Relaxed);
     AUTO_BARRIER_COUNT.store(0, Ordering::Relaxed);
     AUTO_BARRIER_CONCURRENT.store(0, Ordering::Relaxed);
 }
@@ -2179,6 +2194,18 @@ impl CommandEncoder {
 
         self.cmd_buf.commit();
         self.cmd_buf.wait_until_completed();
+
+        // ADR-040 §0.21 — accumulate GPU-busy time (gated; 2 ObjC reads/sync).
+        if *GPU_BUSY_ON {
+            let (gpu_start, gpu_end): (f64, f64) = unsafe {
+                let cb = &*self.cmd_buf;
+                let s: f64 = msg_send![cb, GPUStartTime];
+                let e: f64 = msg_send![cb, GPUEndTime];
+                (s, e)
+            };
+            let ns = ((gpu_end - gpu_start).max(0.0) * 1_000_000_000.0) as u64;
+            GPU_BUSY_NS.fetch_add(ns, Ordering::Relaxed);
+        }
 
         match self.cmd_buf.status() {
             MTLCommandBufferStatus::Completed => Ok(()),
