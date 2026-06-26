@@ -171,13 +171,6 @@ kernel void flash_attn_prefill_blk_bf16(
         // Fully-inside tile — classify by simdgroup reduction.
         res = 0;
 
-        // Per-lane pointer to the tile start: mask row 0 of the Q-tile,
-        // column (tile_k_start + tiisg).  When tiisg >= BK, the pointer is
-        // out-of-tile — we gate reads on `tiisg < BK` so those lanes
-        // contribute identity values (bfloat16_t has no sentinel better
-        // than what we start mmin/mmax at, so skipping the read is the
-        // correct behaviour).
-        //
         // Wave 4 Phase B: widen the row-offset multiplication to int64_t.
         // With qt, BQ, M_stride all int the product `(qt * BQ) * M_stride`
         // overflows i32 at qt >= 1024 (1024 * 32 * 65536 = 2^31), wrapping
@@ -185,8 +178,8 @@ kernel void flash_attn_prefill_blk_bf16(
         // the mask buffer's base.  Mirrors the already-correct
         // flash_attn_prefill_d512.metal:411-413 ulong-cast idiom.  See
         // /tmp/cfa-cfa-20260427-adr005-wave4/phase-A-report.md §2.5.2.
-        device const bfloat16_t* mask_src =
-            mask + (int64_t)(qt * BQ) * (int64_t)M_stride + tile_k_start + tiisg;
+        const int64_t row_base = (int64_t)(qt * BQ) * (int64_t)M_stride
+                                 + (int64_t)tile_k_start;
 
         // Use f32 for reduction to avoid bf16 comparison subtleties — bf16
         // min/max are well-defined on Apple Silicon but f32 reductions are
@@ -216,10 +209,19 @@ kernel void flash_attn_prefill_blk_bf16(
             }
         }
 
-        // Walk the tile's rows.  Only lanes with tiisg < BK do useful work;
-        // other lanes carry identity (mmin=+inf, mmax=-inf) through the
-        // reduction which is the simd_min/simd_max identity.
-        if (tiisg < BK) {
+        // Walk EVERY column of the tile, striding by the simd width so all
+        // BK columns are examined — not just the first NW=32.  The original
+        // code mapped one column per lane (`col = tile_k_start + tiisg`) with
+        // no stride loop, so for BK > NW (D=512 uses BK=64) columns 32..BK-1
+        // were NEVER read: a tile whose first 32 cols are all-attended but
+        // whose cols 32..63 contain masked cells was misclassified as
+        // `res=2` (all-attended), making the main kernel SKIP the mask-add →
+        // cross-sequence leakage on multi-chunk (kL>=64) block-diagonal masks
+        // (ADR-040 iter-G(a) / §0.19). For BK<=NW the inner loop runs once per
+        // lane with `col<BK` (lanes tiisg>=BK carry identity), so D=256
+        // (BK=16) behaviour is byte-unchanged.
+        for (int col = tiisg; col < BK; col += NW) {
+            device const bfloat16_t* mask_src = mask + row_base + col;
             for (int j = 0; j < q_rows; ++j) {
                 float v = float(mask_src[j * M_stride]);
                 mmin = min(mmin, v);

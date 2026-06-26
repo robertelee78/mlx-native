@@ -1223,6 +1223,119 @@ fn iter_g_a_block_diagonal_mask_isolates_sequences() {
     assert!(d2 < 5e-2, "seq2 block-diagonal isolation FAILED: maxdiff={d2}");
 }
 
+/// ADR-040 iter-G(a) / task #19 — F16 FA block-diagonal isolation REPRO.
+/// Same shape as the BF16 spike above, but through the F16 D256 + D512 prefill
+/// kernels. Each concatenated sequence's output rows MUST match running that
+/// sequence ALONE. The parent bisect found the F16 path is offset-NON-invariant
+/// with block-diagonal masks while BF16 isolates — this is the fast harness for
+/// the kernel fix. Prints maxdiff per (d, L1, L2); a LARGE diff = isolation
+/// FAILED (the bug). h=1 keeps the seq slices contiguous.
+#[test]
+fn iter_g_a_f16_block_diagonal_isolation_repro() {
+    use half::f16;
+    use mlx_native::ops::flash_attn_prefill::{
+        dispatch_flash_attn_prefill_f16_d256_with_blk, FlashAttnPrefillParams,
+    };
+    use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_f16_d512_with_blk;
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_d512::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let alloc_f16b = |elems: usize| device.alloc_buffer(elems * 2, DType::F16, vec![elems]).expect("alloc f16");
+    let fill_f16b = |buf: &mlx_native::MlxBuffer, data: &[f16]| {
+        let ptr = buf.contents_ptr() as *mut f16;
+        assert!(!ptr.is_null());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()); }
+    };
+    let read_f16b = |buf: &mlx_native::MlxBuffer, elems: usize| -> Vec<f32> {
+        let ptr = buf.contents_ptr() as *const f16;
+        let s = unsafe { std::slice::from_raw_parts(ptr, elems) };
+        s.iter().map(|x| x.to_f32()).collect()
+    };
+    // Masked sentinel: f16(-inf) — matches production (bf16(-inf) cast to f16).
+    let neg = f16::NEG_INFINITY;
+
+    let mut any_fail = false;
+    for &d in &[256usize, 512usize] {
+        let (h, kv_h) = (1usize, 1usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        for &(l1, l2) in &[(10usize, 14usize), (2, 10), (18, 20), (34, 8), (6, 70), (70, 70)] {
+            let t = l1 + l2;
+            let q = pseudo_random_f32(SEED, h * t * d);
+            let k = pseudo_random_f32(SEED + 1, kv_h * t * d);
+            let v = pseudo_random_f32(SEED + 2, kv_h * t * d);
+            let (qf, kf, vf) = (f32_to_f16(&q), f32_to_f16(&k), f32_to_f16(&v));
+            let seq_of = |i: usize| if i < l1 { (0usize, i) } else { (1usize, i - l1) };
+            let mut mask = vec![f16::ZERO; t * t];
+            for qi in 0..t {
+                let (qs, qp) = seq_of(qi);
+                for kj in 0..t {
+                    let (ks, kp) = seq_of(kj);
+                    mask[qi * t + kj] = if qs == ks && kp <= qp { f16::ZERO } else { neg };
+                }
+            }
+            // bf16 copy of the mask for the blk classifier (production: blk reads
+            // the bf16 mask, FA reads the f16 cast — same values).
+            let mask_bf: Vec<bf16> = mask.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+            let (bq, bk) = if d == 256 { (32u32, 16u32) } else { (8u32, 64u32) };
+            let run = |reg: &mut KernelRegistry, qd: &[f16], kd: &[f16], vd: &[f16], md: &[f16], mbf: &[bf16], ql: usize, kl: usize, use_blk: bool| -> Vec<f32> {
+                let qb = alloc_f16b(h * ql * d); fill_f16b(&qb, qd);
+                let kb = alloc_f16b(kv_h * kl * d); fill_f16b(&kb, kd);
+                let vb = alloc_f16b(kv_h * kl * d); fill_f16b(&vb, vd);
+                let mb = alloc_f16b(h * ql * kl); fill_f16b(&mb, md);
+                let ob = alloc_f16b(h * ql * d);
+                let params = FlashAttnPrefillParams {
+                    n_heads: h as u32, n_kv_heads: kv_h as u32, head_dim: d as u32,
+                    seq_len_q: ql as u32, seq_len_k: kl as u32, batch: 1, scale, do_causal: false,
+                };
+                let blk_buf = if use_blk {
+                    let bp = BlkParams { seq_len_q: ql as u32, seq_len_k: kl as u32, bq, bk };
+                    let mbb = alloc_bf16(&device, h * ql * kl, "maskbf");
+                    fill_bf16_buffer(&mbb, mbf);
+                    let blk = alloc_blk_buffer(&device, &bp).expect("alloc blk");
+                    let mut be = device.command_encoder().expect("blk enc");
+                    dispatch_flash_attn_prefill_blk(&mut be, &device, reg, &mbb, &blk, &bp).expect("blk");
+                    be.commit_and_wait().expect("blk commit");
+                    Some(blk)
+                } else { None };
+                let mut enc = device.command_encoder().expect("enc");
+                if d == 256 {
+                    dispatch_flash_attn_prefill_f16_d256_with_blk(&mut enc, &device, reg, &qb, &kb, &vb, Some(&mb), blk_buf.as_ref(), &ob, &params).expect("d256");
+                } else {
+                    dispatch_flash_attn_prefill_f16_d512_with_blk(&mut enc, &device, reg, &qb, &kb, &vb, Some(&mb), blk_buf.as_ref(), &ob, &params).expect("d512");
+                }
+                enc.commit_and_wait().expect("commit");
+                read_f16b(&ob, h * ql * d)
+            };
+            // alone refs (own causal mask) — bf16 + f16 copies
+            let mut m1 = vec![f16::ZERO; l1 * l1];
+            for qi in 0..l1 { for kj in 0..l1 { m1[qi * l1 + kj] = if kj <= qi { f16::ZERO } else { neg }; } }
+            let mut m2 = vec![f16::ZERO; l2 * l2];
+            for qi in 0..l2 { for kj in 0..l2 { m2[qi * l2 + kj] = if kj <= qi { f16::ZERO } else { neg }; } }
+            let m1bf: Vec<bf16> = m1.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+            let m2bf: Vec<bf16> = m2.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+            let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            for use_blk in [false, true] {
+                let out_cat = run(&mut registry, &qf, &kf, &vf, &mask, &mask_bf, t, t, use_blk);
+                let out1 = run(&mut registry, &qf[0..h * l1 * d], &kf[0..kv_h * l1 * d], &vf[0..kv_h * l1 * d], &m1, &m1bf, l1, l1, use_blk);
+                let out2 = run(&mut registry, &qf[h * l1 * d..h * t * d], &kf[kv_h * l1 * d..kv_h * t * d], &vf[kv_h * l1 * d..kv_h * t * d], &m2, &m2bf, l2, l2, use_blk);
+                let d1 = maxd(&out_cat[0..h * l1 * d], &out1);
+                let d2 = maxd(&out_cat[h * l1 * d..h * t * d], &out2);
+                let fail = d1 > 5e-2 || d2 > 5e-2;
+                any_fail |= fail;
+                eprintln!("[F16 iso d={d} L1={l1} L2={l2} off2={l1} blk={use_blk}] seq1={d1:.3e} seq2={d2:.3e} {}", if fail { "FAIL" } else { "ok" });
+            }
+        }
+    }
+    // Regression gate for the D=512 blk multi-chunk fix (the blk classifier now
+    // strides over all BK columns; previously D=512 BK=64 only read the first 32,
+    // misclassifying tiles and leaking across sequences).
+    assert!(!any_fail, "F16 block-diagonal isolation FAILED — D=512 blk multi-chunk leakage");
+}
+
 /// Compute the CPU reference for a bf16 GPU run.
 ///
 /// Takes the bf16-rounded inputs (so input precision loss is captured
