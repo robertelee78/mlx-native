@@ -19,7 +19,7 @@
 //! records a barrier sentinel.  Call `take_capture()` to extract the recorded
 //! graph for later replay via `ComputeGraph::encode_sequential()`.
 
-use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use metal::{
     CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
@@ -481,6 +481,25 @@ fn barrier_profile_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+/// Runtime-flippable gate for the encode trace, so a caller can scope the dump
+/// to a single region (e.g. just `lm_head_batched`) instead of every dispatch.
+static ENCODE_TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// DIAGNOSTIC: enable/disable the per-dispatch + per-barrier encode trace at
+/// runtime (scoped dump). See [`encode_trace_enabled`].
+pub fn set_encode_trace(active: bool) {
+    ENCODE_TRACE_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// DIAGNOSTIC (MLX_ENCODE_TRACE=1 OR [`set_encode_trace(true)`]): log every
+/// dispatch + memory_barrier as it is encoded, with the active-encoder pointer —
+/// a textual command-stream dump to verify barrier placement/ordering relative
+/// to dispatches (codex-requested for the mN lm_head→softcap race).
+fn encode_trace_enabled() -> bool {
+    ENCODE_TRACE_ACTIVE.load(Ordering::Relaxed)
+        || std::env::var("MLX_ENCODE_TRACE").as_deref() == Ok("1")
 }
 
 /// Whether `MLX_UNRETAINED_REFS=1` is set in the process environment.
@@ -1107,6 +1126,9 @@ impl CommandEncoder {
         }
         // SAFETY: active_encoder is non-null and valid.
         let encoder = unsafe { &*self.active_encoder };
+        if encode_trace_enabled() {
+            eprintln!("[ENCODE-TRACE] BARRIER  enc={:p}", self.active_encoder);
+        }
         if barrier_profile_enabled() {
             // mach_absolute_time path — only on when MLX_PROFILE_BARRIERS=1.
             let start = std::time::Instant::now();
@@ -1223,6 +1245,13 @@ impl CommandEncoder {
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
         let encoder = unsafe { &*encoder_ptr };
+        if encode_trace_enabled() {
+            eprintln!(
+                "[ENCODE-TRACE] DISPATCH(tg) enc={:p} pipeline={:p} tgs=({},{},{})",
+                encoder_ptr, pipeline as *const _,
+                threadgroups.width, threadgroups.height, threadgroups.depth
+            );
+        }
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
@@ -1277,6 +1306,13 @@ impl CommandEncoder {
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
         let encoder = unsafe { &*encoder_ptr };
+        if encode_trace_enabled() {
+            eprintln!(
+                "[ENCODE-TRACE] DISPATCH(tg+sh) enc={:p} pipeline={:p} tgs=({},{},{})",
+                encoder_ptr, pipeline as *const _,
+                threadgroups.width, threadgroups.height, threadgroups.depth
+            );
+        }
         encoder.set_compute_pipeline_state(pipeline);
         for &(index, buf) in buffers {
             encoder.set_buffer(index, Some(buf.metal_buffer()), buf.byte_offset());
@@ -1362,6 +1398,13 @@ impl CommandEncoder {
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
         let encoder = unsafe { &*encoder_ptr };
+        if encode_trace_enabled() {
+            eprintln!(
+                "[ENCODE-TRACE] DISPATCH enc={:p} pipeline={:p} tgs=({},{},{})",
+                encoder_ptr, pipeline as *const _,
+                threadgroups.width, threadgroups.height, threadgroups.depth
+            );
+        }
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
         let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
@@ -1403,6 +1446,13 @@ impl CommandEncoder {
         let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
         // SAFETY: see encode() above.
         let encoder = unsafe { &*encoder_ptr };
+        if encode_trace_enabled() {
+            eprintln!(
+                "[ENCODE-TRACE] DISPATCH(args+sh) enc={:p} pipeline={:p} tgs=({},{},{})",
+                encoder_ptr, pipeline as *const _,
+                threadgroups.width, threadgroups.height, threadgroups.depth
+            );
+        }
         encoder.set_compute_pipeline_state(pipeline);
         apply_bindings(encoder, bindings);
         for &(index, byte_length) in threadgroup_mem {
