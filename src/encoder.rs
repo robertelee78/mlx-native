@@ -2521,15 +2521,23 @@ impl CommandEncoder {
     /// `new_with_residency` accounting. Does NOT bump `SYNC_COUNT` (no
     /// commit/wait happens here).
     pub(crate) fn reset_command_buffer(&mut self) {
-        // ADR-040 §0.21c-track2: real `assert!` (not `debug_assert!`) so the
-        // invariant fails LOUD in release too. With the encoder-retain fix, a
-        // stray non-null `active_encoder` here would silently leak the +1 retain
-        // (this path nulls it without releasing). The contract is that callers
-        // commit first (→ end_active_encoder → release); guard it in release.
-        assert!(
+        // ADR-040 §0.21c-track2: leak-safe + end-safe reset. With the
+        // encoder-retain fix, the bare `active_encoder = null` below would, on
+        // ANY path that reaches here with a non-null active encoder, LEAK the +1
+        // retain AND leave an un-`endEncoding`'d encoder (Metal then asserts
+        // "Command encoder released without endEncoding"). Pre-patch this was a
+        // harmless borrowed +0 pointer guarded only by a debug_assert (compiled
+        // out in release). Now route through `end_active_encoder` FIRST: it ends
+        // + releases the encoder if non-null, and is a no-op if null — so the
+        // reset is correct regardless of caller contract, in debug AND release.
+        // The contract is still that callers commit first; the debug_assert
+        // (after the safe handling) flags a violation in tests without crashing
+        // production.
+        self.end_active_encoder();
+        debug_assert!(
             self.active_encoder.is_null(),
-            "reset_command_buffer called with an active compute encoder \
-             — caller must commit (which calls end_active_encoder) first"
+            "reset_command_buffer: active_encoder should be null after \
+             end_active_encoder — caller should commit before reset"
         );
         let cmd_buf = if unretained_refs_enabled() {
             self.queue
