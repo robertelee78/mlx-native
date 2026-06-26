@@ -1430,6 +1430,107 @@ fn iter_g_a_f16_d512_gqa_block_diagonal_isolation() {
     eprintln!("[F16 GQA d512] any_fail={any_fail}");
 }
 
+/// ADR-040 iter-G(a) — F16 block-diagonal isolation of the EARLIER sequence
+/// under GQA (h=8, kv_h=2), within a single chunk. The existing D512-GQA test
+/// only checks seq2 (the LATER seq), which never leaks (its predecessor's keys
+/// are causally masked from B's perspective). The MODEL bisect localizes the
+/// within-chunk leak to the EARLIER seq (A): A's queries attend FUTURE keys (B,
+/// at higher indices) that the block-diagonal mask marks -inf — an attend-future
+/// / mask-skip failure. This gate exercises BOTH head_dims at GQA, checking
+/// seq1 (offset 0).
+#[test]
+fn iter_g_a_f16_gqa_earlier_seq_block_diagonal_isolation() {
+    use half::f16;
+    use mlx_native::ops::flash_attn_prefill::{
+        dispatch_flash_attn_prefill_f16_d256_with_blk, FlashAttnPrefillParams,
+    };
+    use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_f16_d512_with_blk;
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+    flash_attn_prefill_d512::register(&mut registry);
+    flash_attn_prefill_blk::register(&mut registry);
+
+    let (h, kv_h) = (8usize, 2usize);
+    let neg = f16::NEG_INFINITY;
+    let alloc_f16b = |elems: usize| device.alloc_buffer(elems * 2, DType::F16, vec![elems]).expect("alloc");
+    let fill_f16b = |buf: &mlx_native::MlxBuffer, data: &[f16]| {
+        let p = buf.contents_ptr() as *mut f16; unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len()); }
+    };
+    let read_f16b = |buf: &mlx_native::MlxBuffer, n: usize| -> Vec<f32> {
+        let p = buf.contents_ptr() as *const f16; unsafe { std::slice::from_raw_parts(p, n) }.iter().map(|x| x.to_f32()).collect()
+    };
+    let mut any_fail = false;
+    for &d in &[256usize, 512usize] {
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let (bq, bk) = if d == 256 { (32u32, 16u32) } else { (8u32, 64u32) };
+        let extract = |full: &[f16], heads: usize, t: usize, o: usize, l: usize| -> Vec<f16> {
+            let mut out = vec![f16::ZERO; heads * l * d];
+            for g in 0..heads { for j in 0..l {
+                let src = g * t * d + (o + j) * d;
+                out[g * l * d + j * d..g * l * d + j * d + d].copy_from_slice(&full[src..src + d]);
+            }}
+            out
+        };
+        let run = |reg: &mut KernelRegistry, q: &[f16], k: &[f16], v: &[f16], mf: &[f16], mbf: &[bf16], ql: usize, kl: usize| -> Vec<f32> {
+            let qb = alloc_f16b(h * ql * d); fill_f16b(&qb, q);
+            let kb = alloc_f16b(kv_h * kl * d); fill_f16b(&kb, k);
+            let vb = alloc_f16b(kv_h * kl * d); fill_f16b(&vb, v);
+            let mb = device.alloc_buffer(ql * kl * 2, DType::F16, vec![ql, kl]).expect("mask"); fill_f16b(&mb, mf);
+            let ob = alloc_f16b(h * ql * d);
+            let params = FlashAttnPrefillParams {
+                n_heads: h as u32, n_kv_heads: kv_h as u32, head_dim: d as u32,
+                seq_len_q: ql as u32, seq_len_k: kl as u32, batch: 1, scale, do_causal: false,
+            };
+            let bp = BlkParams { seq_len_q: ql as u32, seq_len_k: kl as u32, bq, bk };
+            let mbb = alloc_bf16(&device, ql * kl, "mbf"); fill_bf16_buffer(&mbb, mbf);
+            let blk = alloc_blk_buffer(&device, &bp).expect("blk");
+            let mut be = device.command_encoder().expect("be");
+            dispatch_flash_attn_prefill_blk(&mut be, &device, reg, &mbb, &blk, &bp).expect("blk dispatch");
+            be.commit_and_wait().expect("blk commit");
+            let mut enc = device.command_encoder().expect("enc");
+            if d == 256 {
+                dispatch_flash_attn_prefill_f16_d256_with_blk(&mut enc, &device, reg, &qb, &kb, &vb, Some(&mb), Some(&blk), &ob, &params).expect("d256");
+            } else {
+                dispatch_flash_attn_prefill_f16_d512_with_blk(&mut enc, &device, reg, &qb, &kb, &vb, Some(&mb), Some(&blk), &ob, &params).expect("d512");
+            }
+            enc.commit_and_wait().expect("commit");
+            read_f16b(&ob, h * ql * d)
+        };
+        for &(l1, l2) in &[(26usize, 20usize), (2, 10), (18, 20), (34, 8)] {
+            let t = l1 + l2;
+            let q = f32_to_f16(&pseudo_random_f32(SEED, h * t * d));
+            let k = f32_to_f16(&pseudo_random_f32(SEED + 1, kv_h * t * d));
+            let v = f32_to_f16(&pseudo_random_f32(SEED + 2, kv_h * t * d));
+            let seq_of = |i: usize| if i < l1 { (0usize, i) } else { (1usize, i - l1) };
+            let mut mcat = vec![f16::ZERO; t * t];
+            for qi in 0..t { for kj in 0..t {
+                let (qs, qp) = seq_of(qi); let (ks, kp) = seq_of(kj);
+                mcat[qi * t + kj] = if qs == ks && kp <= qp { f16::ZERO } else { neg };
+            }}
+            let mcatb: Vec<bf16> = mcat.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+            let out_cat = run(&mut registry, &q, &k, &v, &mcat, &mcatb, t, t);
+            // seq1 ALONE (rows [0, l1), own causal mask)
+            let mut m1 = vec![f16::ZERO; l1 * l1];
+            for qi in 0..l1 { for kj in 0..l1 { m1[qi * l1 + kj] = if kj <= qi { f16::ZERO } else { neg }; } }
+            let m1b: Vec<bf16> = m1.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+            let q1 = extract(&q, h, t, 0, l1); let k1 = extract(&k, kv_h, t, 0, l1); let v1 = extract(&v, kv_h, t, 0, l1);
+            let out1 = run(&mut registry, &q1, &k1, &v1, &m1, &m1b, l1, l1);
+            let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let mut d1 = 0.0f32;
+            for g in 0..h {
+                let cat_rows = &out_cat[g * t * d..g * t * d + l1 * d];
+                let alone_rows = &out1[g * l1 * d..g * l1 * d + l1 * d];
+                d1 = d1.max(maxd(cat_rows, alone_rows));
+            }
+            let fail = d1 > 5e-2; any_fail |= fail;
+            eprintln!("[F16 GQA EARLIER d={d} L1={l1} L2={l2}] seq1 maxdiff={d1:.3e} {}", if fail { "FAIL" } else { "ok" });
+        }
+    }
+    assert!(!any_fail, "F16 GQA earlier-sequence block-diagonal isolation FAILED");
+}
+
 /// Compute the CPU reference for a bf16 GPU run.
 ///
 /// Takes the bf16-rounded inputs (so input precision loss is captured
