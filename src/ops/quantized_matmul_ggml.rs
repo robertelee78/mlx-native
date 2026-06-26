@@ -24,6 +24,8 @@ use std::sync::atomic::AtomicI8;
 // each hitting these 2 env reads.
 static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_MV_NR2: AtomicI8 = AtomicI8::new(-1);
+// ADR-040 §0.21 decode mul_mv_ext lever (opt-in, default off — see routing site).
+static CACHED_DECODE_MV_EXT: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -491,6 +493,49 @@ pub fn quantized_matmul_ggml(
     // types now have a real mm path; the mm_supported guard is a
     // compatibility no-op kept for future "type not yet ported" cases.
     let mm_supported = true;
+    // ADR-040 §0.21 decode F3 lever: at small continuous-batching decode width
+    // m∈[2,8], route quantized matmuls to the weight-amortizing `mul_mv_ext`
+    // kernel (llama.cpp's small-batch path, ggml-metal-ops.cpp:2079-2133:
+    // `r1ptg` src1 columns processed per threadgroup, so each quantized weight
+    // block is read ONCE across the m columns — vs the regular `mv` which
+    // re-reads the weight per column, measured ~5× at m=8). mul_mv_ext is
+    // BYTE-IDENTICAL to mv (per-column dot-product, same MAC order; proven by
+    // adr_022_phase{1,4}_mv_ext_parity), so batched decode stays bit-exact to
+    // the serial m=1 path. Gated to the instantiated qtypes (gemma4 = Q6_K +
+    // Q8_0) and k divisible by the type's block; everything else falls through
+    // to the existing mv/mm routing unchanged.
+    // ADR-040 §0.21 decode F3 lever (mul_mv_ext weight-amortization) — opt-in,
+    // DEFAULT OFF (HF2Q_DECODE_MV_EXT=1). MEASURED: routing decode m∈[2,8] to
+    // mul_mv_ext gives N=8 decode 197→245.8 t/s (+25%, toward llama 291) — the
+    // weight-reload gap is real and this closes a big chunk. BUT it currently
+    // BREAKS slot_aware_n8_per_slot_parity (bit-exact) in the gemma4 model —
+    // mul_mv_ext is NOT bit-identical to the regular mv for the model's shapes
+    // (the adr_022_phase4 mv_ext parity tests use fp-tolerance, and Q6_K mv_ext
+    // has no parity test at all). So it stays OFF by default (byte-identical
+    // bar) until the mv_ext kernels are proven/made bit-exact (Q6_K especially);
+    // the env preserves the validated speedup for that follow-up. NON-blocking.
+    let mv_ext_ok = matches!(
+        params.ggml_type,
+        GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0
+    );
+    if cached_env_eq_one(&CACHED_DECODE_MV_EXT, "HF2Q_DECODE_MV_EXT")
+        && params.m >= 2
+        && params.m <= 8
+        && params.k >= 32
+        && mv_ext_ok
+        && params.k % (params.ggml_type.block_values() as u32) == 0
+    {
+        let ext_params = crate::ops::mul_mv_ext::MulMvExtParams {
+            m: params.m,
+            n: params.n,
+            k: params.k,
+            batch: 1,
+            ggml_type: params.ggml_type,
+        };
+        return crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
+            encoder, registry, device, weight, input, output, &ext_params,
+        );
+    }
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
         dispatch_mm(encoder, registry, device, input, weight, output, params)
     } else {
