@@ -1077,6 +1077,18 @@ impl CommandEncoder {
             let encoder = self
                 .cmd_buf
                 .compute_command_encoder_with_dispatch_type(dispatch_type);
+            // ADR-040 §0.21c-track2 ROOT FIX (codex): `compute_command_encoder_*`
+            // returns a borrowed `&ComputeCommandEncoderRef` to an AUTORELEASED
+            // object (metal-rs commandbuffer.rs warning / gfx-rs/metal-rs#128).
+            // We hold this pointer across many Rust calls (and an autorelease-pool
+            // drain can release it out from under us), so messages sent through it
+            // — including `memoryBarrierWithScope:` — are NOT guaranteed to land on
+            // a live, owned encoder, defeating cross-dispatch ordering. llama RETAINS
+            // its concurrent encoder (`[res->obj retain]`, released at end). Match
+            // that: take a strong +1 ref now, balanced by `release` in
+            // `end_active_encoder`. Keeps MTLDispatchTypeConcurrent +
+            // memoryBarrierWithScope unchanged.
+            let _: () = unsafe { msg_send![encoder, retain] };
             self.active_encoder = encoder as *const ComputeCommandEncoderRef;
         }
         // SAFETY: active_encoder is non-null and points to a valid encoder
@@ -1091,6 +1103,14 @@ impl CommandEncoder {
             // SAFETY: the pointer was obtained from cmd_buf.new_compute_command_encoder()
             // and has not been ended yet.
             unsafe { &*self.active_encoder }.end_encoding();
+            // ADR-040 §0.21c-track2: balance the +1 `retain` taken in
+            // get_or_create_encoder (the encoder is no longer needed after
+            // end_encoding). SAFETY: active_encoder is the non-null pointer we
+            // retained; this drops our strong ref.
+            let enc = self.active_encoder;
+            unsafe {
+                let _: () = msg_send![enc, release];
+            }
             self.active_encoder = std::ptr::null();
         }
     }
@@ -2501,7 +2521,12 @@ impl CommandEncoder {
     /// `new_with_residency` accounting. Does NOT bump `SYNC_COUNT` (no
     /// commit/wait happens here).
     pub(crate) fn reset_command_buffer(&mut self) {
-        debug_assert!(
+        // ADR-040 §0.21c-track2: real `assert!` (not `debug_assert!`) so the
+        // invariant fails LOUD in release too. With the encoder-retain fix, a
+        // stray non-null `active_encoder` here would silently leak the +1 retain
+        // (this path nulls it without releasing). The contract is that callers
+        // commit first (→ end_active_encoder → release); guard it in release.
+        assert!(
             self.active_encoder.is_null(),
             "reset_command_buffer called with an active compute encoder \
              — caller must commit (which calls end_active_encoder) first"
