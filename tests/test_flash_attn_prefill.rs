@@ -1110,6 +1110,67 @@ fn run_bf16_gpu(
     bf16_to_f32(&out_bf16)
 }
 
+/// ADR-040 iter-G(a) SPIKE: a BLOCK-DIAGONAL additive causal mask isolates
+/// concatenated sequences in one FA pass (do_causal=false). Two prompts
+/// (L1=10, L2=14) are concatenated into a T=24 stream; the block-diagonal mask
+/// sets cross-sequence pairs to the finite -inf sentinel. The concatenated
+/// output rows for each sequence MUST match running that sequence ALONE.
+/// Critically, seq 2's queries (global pos 10..24) see seq 1's keys (global pos
+/// 0..9) at LOWER global positions — a plain global-causal mask would let them
+/// attend; correct isolation requires the block structure (codex's #6 case).
+#[test]
+fn iter_g_a_block_diagonal_mask_isolates_sequences() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill::register(&mut registry);
+
+    let (h, kv_h, d, batch) = (1usize, 1usize, 256usize, 1usize);
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let (l1, l2) = (10usize, 14usize);
+    let t = l1 + l2;
+    // Finite -inf sentinel (bf16-representable; matches the kernel's mask regime).
+    let neg = -3.0e38f32;
+
+    let q = pseudo_random_f32(SEED, h * t * d);
+    let k = pseudo_random_f32(SEED + 1, kv_h * t * d);
+    let v = pseudo_random_f32(SEED + 2, kv_h * t * d);
+    let (qb, kb, vb) = (f32_to_bf16(&q), f32_to_bf16(&k), f32_to_bf16(&v));
+
+    let seq_of = |i: usize| if i < l1 { (0usize, i) } else { (1usize, i - l1) };
+    let mut mask = vec![0.0f32; t * t];
+    for qi in 0..t {
+        let (qs, qp) = seq_of(qi);
+        for kj in 0..t {
+            let (ks, kp) = seq_of(kj);
+            mask[qi * t + kj] = if qs == ks && kp <= qp { 0.0 } else { neg };
+        }
+    }
+    let maskb = f32_to_bf16(&mask);
+    let out_cat = run_bf16_gpu(
+        &device, &mut registry, &qb, &kb, &vb, Some(&maskb),
+        batch, h, kv_h, t, t, d, scale, false,
+    );
+
+    // Per-sequence reference runs (each alone, own causal mask).
+    let run_alone = |dev: &MlxDevice, reg: &mut KernelRegistry, qs: &[bf16], ks: &[bf16], vs: &[bf16], l: usize| {
+        let mut m = vec![0.0f32; l * l];
+        for qi in 0..l { for kj in 0..l { m[qi * l + kj] = if kj <= qi { 0.0 } else { neg }; } }
+        let mb = f32_to_bf16(&m);
+        run_bf16_gpu(dev, reg, qs, ks, vs, Some(&mb), batch, h, kv_h, l, l, d, scale, false)
+    };
+    let out1 = run_alone(&device, &mut registry, &qb[0..h*l1*d], &kb[0..kv_h*l1*d], &vb[0..kv_h*l1*d], l1);
+    let out2 = run_alone(&device, &mut registry, &qb[h*l1*d..h*t*d], &kb[kv_h*l1*d..kv_h*t*d], &vb[kv_h*l1*d..kv_h*t*d], l2);
+
+    let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let d1 = maxd(&out_cat[0..h*l1*d], &out1);
+    let d2 = maxd(&out_cat[h*l1*d..h*t*d], &out2);
+    eprintln!("[iter-G(a) block-diag spike] seq1 maxdiff={d1:.3e} seq2 maxdiff={d2:.3e}");
+    // bf16 + different K-tile counts (concat=24 keys vs alone=10/14) => tiny fp
+    // reduction-order diffs only; large diff = isolation FAILED.
+    assert!(d1 < 5e-2, "seq1 block-diagonal isolation FAILED: maxdiff={d1}");
+    assert!(d2 < 5e-2, "seq2 block-diagonal isolation FAILED: maxdiff={d2}");
+}
+
 /// Compute the CPU reference for a bf16 GPU run.
 ///
 /// Takes the bf16-rounded inputs (so input precision loss is captured
