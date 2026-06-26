@@ -90,7 +90,7 @@ use mlx_native::ops::flash_attn_prefill_d512::{
 };
 use mlx_native::ops::flash_attn_prefill_mask::{
     self as flash_attn_prefill_mask,
-    build_sdpa_mask_bf16, SdpaMaskParams,
+    build_block_diagonal_sdpa_mask_bf16, build_sdpa_mask_bf16, SdpaMaskParams,
 };
 use mlx_native::ops::flash_attn_prefill_blk::{
     self as flash_attn_prefill_blk,
@@ -1118,6 +1118,58 @@ fn run_bf16_gpu(
 /// Critically, seq 2's queries (global pos 10..24) see seq 1's keys (global pos
 /// 0..9) at LOWER global positions — a plain global-causal mask would let them
 /// attend; correct isolation requires the block structure (codex's #6 case).
+/// ADR-040 iter-G(a) — verify the GPU block-diagonal mask BUILDER produces the
+/// exact block-diagonal causal mask for N concatenated sequences. Builds the
+/// mask via `build_block_diagonal_sdpa_mask_bf16` from host seq_id/local_pos and
+/// checks every cell against the reference predicate (same-seq AND per-seq
+/// causal). This pins the kernel that the hf2q multi-seq prefill depends on.
+#[test]
+fn iter_g_a_gpu_block_diagonal_mask_values() {
+    use half::bf16;
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_prefill_mask::register(&mut registry);
+
+    let seq_lens = [3usize, 4, 2];
+    let t: usize = seq_lens.iter().sum(); // 9
+    let mut seq_id_h: Vec<u32> = Vec::new();
+    let mut local_pos_h: Vec<u32> = Vec::new();
+    for (s, &l) in seq_lens.iter().enumerate() {
+        for p in 0..l {
+            seq_id_h.push(s as u32);
+            local_pos_h.push(p as u32);
+        }
+    }
+    let mut seq_id_buf = device.alloc_buffer(t * 4, DType::U32, vec![t]).unwrap();
+    seq_id_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&seq_id_h);
+    let mut local_pos_buf = device.alloc_buffer(t * 4, DType::U32, vec![t]).unwrap();
+    local_pos_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&local_pos_h);
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let mask = build_block_diagonal_sdpa_mask_bf16(
+        &device, &mut registry, &mut encoder,
+        &seq_id_buf, &local_pos_buf, t as u32, None, true,
+    )
+    .expect("build block-diagonal mask");
+    encoder.commit_and_wait().expect("commit");
+
+    let rb: &[bf16] = mask.as_slice().unwrap();
+    let neg = bf16::NEG_INFINITY.to_bits();
+    let zero = bf16::from_f32(0.0).to_bits();
+    for q in 0..t {
+        for k in 0..t {
+            let got = rb[q * t + k].to_bits();
+            let attended = seq_id_h[q] == seq_id_h[k] && local_pos_h[k] <= local_pos_h[q];
+            let want = if attended { zero } else { neg };
+            assert_eq!(
+                got, want,
+                "mask[{q},{k}] seq({},{}) lpos({},{}): got {got:04x} want {want:04x}",
+                seq_id_h[q], seq_id_h[k], local_pos_h[q], local_pos_h[k]
+            );
+        }
+    }
+}
+
 #[test]
 fn iter_g_a_block_diagonal_mask_isolates_sequences() {
     let device = MlxDevice::new().expect("Metal device");

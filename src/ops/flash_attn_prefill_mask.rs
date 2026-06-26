@@ -89,11 +89,18 @@ pub static FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE: &str =
 /// Kernel entry point for the bf16 mask-fill kernel.
 pub const K_FILL_BF16: &str = "flash_attn_prefill_mask_fill_bf16";
 
+/// Kernel entry point for the block-diagonal (multi-sequence) bf16 mask-fill
+/// kernel (ADR-040 iter-G(a) cross-slot prefill).
+pub const K_FILL_BLOCKDIAG_BF16: &str = "flash_attn_prefill_mask_fill_blockdiag_bf16";
+
 /// Register the SWA-mask-fill shader source with the given kernel registry.
 ///
-/// Must be called before any dispatch of `build_sdpa_mask_bf16`.
+/// Must be called before any dispatch of `build_sdpa_mask_bf16` or
+/// `build_block_diagonal_sdpa_mask_bf16` (both entry points live in the same
+/// shader source, so one registration covers both).
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(K_FILL_BF16, FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE);
+    registry.register_source(K_FILL_BLOCKDIAG_BF16, FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE);
 }
 
 /// Host-side parameters for the SWA-mask builder.
@@ -252,6 +259,97 @@ pub fn build_sdpa_mask_bf16(
         &[
             (0, KernelArg::Buffer(&mask)),
             (1, KernelArg::Bytes(as_bytes(&fill_params))),
+        ],
+        threadgroups,
+        tg_size,
+    );
+
+    Ok(mask)
+}
+
+/// Shader-side parameter struct for the block-diagonal mask fill.  Mirrors
+/// `BlockDiagMaskParams` in `flash_attn_prefill_mask.metal`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlockDiagMaskParamsGpu {
+    seq_len: u32,
+    n_swa: i32,
+    causal: u32,
+}
+
+/// Allocate and fill a bf16 BLOCK-DIAGONAL attention mask on the GPU
+/// (ADR-040 iter-G(a) cross-slot batched prefill).
+///
+/// The mask is `[T, T]` where `T == seq_id.len() == local_pos.len()` is the
+/// concatenated length of N sequences.  `seq_id[i]` is the sequence index of
+/// token `i`; `local_pos[i]` is its per-sequence position.  Query `qi` attends
+/// key `kj` iff `seq_id[qi] == seq_id[kj]` AND (causal: `local_pos[kj] <=
+/// local_pos[qi]`) AND (window: `local_pos[qi] - local_pos[kj] < n`); else the
+/// cell is `bf16(-INFINITY)` (0xFF80).  Values are byte-identical to
+/// [`build_sdpa_mask_bf16`] on each sequence's diagonal block.
+///
+/// Both `seq_id` and `local_pos` are read as `u32` device buffers; the host may
+/// populate them via `as_mut_slice` (they are kernel *arguments*, so their
+/// StorageModeShared CPU writes are read correctly, unlike a CPU-written final
+/// mask buffer — which is why this mask is GPU-produced).
+///
+/// # Errors
+/// - `MlxError::InvalidArgument` if `t == 0` or `window_size == Some(0)`.
+pub fn build_block_diagonal_sdpa_mask_bf16(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    encoder: &mut CommandEncoder,
+    seq_id: &MlxBuffer,
+    local_pos: &MlxBuffer,
+    t: u32,
+    window_size: Option<u32>,
+    causal: bool,
+) -> Result<MlxBuffer> {
+    if t == 0 {
+        return Err(MlxError::InvalidArgument(
+            "build_block_diagonal_sdpa_mask_bf16: t must be > 0".into(),
+        ));
+    }
+    if let Some(0) = window_size {
+        return Err(MlxError::InvalidArgument(
+            "build_block_diagonal_sdpa_mask_bf16: window_size=Some(0) is not \
+             allowed (pass None for causal-only)".into(),
+        ));
+    }
+
+    let byte_len = (t as usize)
+        .checked_mul(t as usize)
+        .and_then(|x| x.checked_mul(2))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!(
+                "build_block_diagonal_sdpa_mask_bf16: mask size (T={t}) overflows usize"
+            ))
+        })?;
+
+    let mask = device.alloc_buffer(byte_len, DType::BF16, vec![t as usize, t as usize])?;
+
+    let fill_params = BlockDiagMaskParamsGpu {
+        seq_len: t,
+        n_swa: match window_size {
+            None => -1,
+            Some(w) => w.min(i32::MAX as u32) as i32,
+        },
+        causal: if causal { 1 } else { 0 },
+    };
+
+    let pipeline = registry.get_pipeline(K_FILL_BLOCKDIAG_BF16, device.metal_device())?;
+
+    let tg_x = t.next_power_of_two().max(32).min(256);
+    let threadgroups = MTLSize::new(t as u64, 1, 1);
+    let tg_size = MTLSize::new(tg_x as u64, 1, 1);
+
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(&mask)),
+            (1, KernelArg::Bytes(as_bytes(&fill_params))),
+            (2, KernelArg::Buffer(seq_id)),
+            (3, KernelArg::Buffer(local_pos)),
         ],
         threadgroups,
         tg_size,

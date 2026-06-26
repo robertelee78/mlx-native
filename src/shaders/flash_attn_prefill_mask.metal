@@ -123,3 +123,57 @@ kernel void flash_attn_prefill_mask_fill_bf16(
         mask[row_offset + k_pos] = is_masked ? masked_val : attended_val;
     }
 }
+
+// ── Block-diagonal variant (ADR-040 iter-G(a) cross-slot prefill) ───────────
+//
+// Builds the additive mask for N concatenated sequences in one [T, T] buffer,
+// where T = Σ Lᵢ.  Isolation is enforced ENTIRELY by the mask (llama.cpp's
+// unified-batch technique): query qi attends key kj iff they are in the SAME
+// sequence AND per-seq-causal (AND, for sliding layers, within the window).
+// Per-token `seq_id` and per-seq-LOCAL `local_pos` are passed as host-written
+// kernel arguments (the same pattern as `pf_positions` for RoPE) — the kernel
+// GPU-WRITES the mask buffer so the downstream F16 cast / blk pre-pass / FA
+// consume a GPU-produced buffer (a CPU-written final mask buffer is not
+// reliably read by those consumers; the producing kernel must be on the GPU).
+// Values are byte-identical to the single-seq kernel on the diagonal blocks.
+struct BlockDiagMaskParams {
+    uint seq_len;   // T — both dims of the square mask (row stride)
+    int  n_swa;     // sliding window; -1 = disabled (global / causal-only)
+    uint causal;    // 1 = apply per-seq causal masking
+};
+
+kernel void flash_attn_prefill_mask_fill_blockdiag_bf16(
+    device bfloat16_t* mask                 [[buffer(0)]],
+    constant BlockDiagMaskParams& params    [[buffer(1)]],
+    device const uint* seq_id               [[buffer(2)]],   // [T] per-token seq id
+    device const uint* local_pos            [[buffer(3)]],   // [T] per-seq local pos
+    uint q_row                              [[threadgroup_position_in_grid]],
+    uint tid                                [[thread_index_in_threadgroup]],
+    uint tg_size                            [[threads_per_threadgroup]]
+) {
+    const uint t          = params.seq_len;
+    const int  n_swa      = params.n_swa;
+    const bool causal     = params.causal != 0u;
+    const uint row_offset = q_row * t;
+    const uint qs         = seq_id[q_row];
+    const int  qp         = int(local_pos[q_row]);
+
+    const bfloat16_t masked_val   = bfloat16_t(-INFINITY);
+    const bfloat16_t attended_val = bfloat16_t(0.0);
+
+    for (uint k_pos = tid; k_pos < t; k_pos += tg_size) {
+        bool is_masked = false;
+        if (seq_id[k_pos] != qs) {
+            is_masked = true;                       // cross-sequence: isolate
+        } else {
+            const int kp = int(local_pos[k_pos]);
+            if (causal && kp > qp) {
+                is_masked = true;                   // future key (per-seq causal)
+            }
+            if (n_swa > 0 && (qp - kp) >= n_swa) {
+                is_masked = true;                   // outside sliding window
+            }
+        }
+        mask[row_offset + k_pos] = is_masked ? masked_val : attended_val;
+    }
+}
