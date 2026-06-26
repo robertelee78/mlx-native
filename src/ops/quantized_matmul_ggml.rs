@@ -525,9 +525,13 @@ pub fn quantized_matmul_ggml(
     // by adr_040_q6k_mv_mN_byte_parity (GPU u32 bit-compare) AND the gemma4
     // slot_aware_n8_per_slot_parity_vs_serial model test. Tile width R1 = m
     // (single TG covers all m columns; any column-tiling stays bit-identical
-    // since columns are independent). Default OFF on first ship; flip to
-    // default-ON only after model parity + throughput win confirmed.
-    if cached_env_eq_one(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN")
+    // since columns are independent).
+    // ADR-040 §0.21c-track2: DEFAULT-ON (lead-approved 2026-06-26). Opt out with
+    // HF2Q_DECODE_MVN=0. Bar met: byte-equal spike GREEN under the precompiled
+    // -O3 metallib + release-deterministic parity (after the encoder-retain root
+    // fix that the mvN flake surfaced — encoder.rs §0.21c-track2) + measured
+    // +12.5% net N=8 decode throughput (clean single-tenant).
+    if cached_env_default_true(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN")
         && matches!(params.ggml_type, GgmlType::Q6_K)
         && params.m >= 2
         && params.m <= 8
