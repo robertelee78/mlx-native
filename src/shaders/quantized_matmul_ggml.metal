@@ -933,6 +933,179 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
     }
 }
 
+// ---- Q6_K mat-vec kernel, mN (column-amortizing) variant (ADR-040 §0.21c) ----
+//
+// Weight-amortizing analogue of `kernel_mul_mv_q6_K_f32_nr2`, but amortizing
+// across N src1 COLUMNS (the batched-decode / m axis) instead of across weight
+// ROWS.  Plain `kernel_mul_mv_q6_K_f32` re-reads + re-dequantizes the entire
+// Q6_K weight once PER src1 column (measured ~5.15× weight traffic at m=8).
+// This kernel reads each weight block + integer-unpacks its 4 dequantized
+// values ONCE, then reuses them across R1 columns — closing the batched-decode
+// weight-reload gap WITHOUT a coherence tradeoff.
+//
+// BIT-IDENTITY (codex's mandatory bar): the per-column accumulation is a
+// LITERAL clone of plain mv's `sums[4]` / `sc` / `dall` / `simd_sum` tree.  The
+// only column-dependent state is the per-column `yy_c` input pointer and the
+// `dst` store index; the dequant unpack (`w0..w3`, kept as `int` so the
+// `float * int` promotion matches plain mv exactly) is column-independent and
+// hoisted.  No `dot()`, no float4 horizontal reductions, no loop reordering.
+// Result: `dst_mN[c][row]` is bit-equal (u32 to_bits) to plain mv's `dst` for
+// column c — proven by tests/adr_040_q6k_mv_mN_byte_parity.rs.
+//
+// Dispatch: threadgroups=(ceil(N/2), ceil(M/R1), B), threads_per_tg=(2, 32, 1).
+// Each SIMD group handles 1 weight row × R1 columns.  `r1_base = R1 * tgpig.y`.
+// R1 is a compile-time template arg; instantiated for R1 ∈ {2..8} below.
+template <short R1>
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short nr0 = 2;   // weight rows per simdgroup (matches nr2)
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r0 = tgpig.x;
+    const int64_t r1_base = (int64_t)R1 * tgpig.y;   // first src1 column for this TG
+    const int     im = tgpig.z;
+
+    // Match nr2's row grouping EXACTLY: NSG=2 simdgroups × nr0=2 rows per SG.
+    const int first_row = (int)((r0 * 2 + sgitg) * nr0);
+
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
+
+    const uint offset0 = (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
+
+    device const block_q6_K * x_base = (device const block_q6_K *) src0 + first_row * nb + offset0;
+
+    // Per-column src1 pointers — the ONLY column-dependent input state.
+    device const float * yy_c[R1];
+    for (short c = 0; c < R1; ++c) {
+        yy_c[c] = (device const float *) src1 + (r1_base + c)*p.ne10 + im*p.ne00*p.ne1;
+    }
+
+    const short tid  = tiisg / 2;
+    const short ix   = tiisg % 2;
+    const short ip   = tid / 8;
+    const short il   = tid % 8;
+    const short l0   = 4 * il;
+    const short is   = 8*ip + l0/16;
+
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l = 64*ip + l0;
+    const short q_offset_h = 32*ip + l0;
+
+    // BIT-IDENTITY TARGET: kernel_mul_mv_q6_K_f32_nr2.
+    //
+    // The gemma4 model runs Q6_K decode through NR2 (default-on), so the serial
+    // m=1 reference the parity test compares against uses NR2 — and NR2 is NOT
+    // byte-equal to plain mv in general (it caches `yl[16]` and reads `yl[...]`
+    // as the multiply operand, which changes the Metal FMA-contraction vs plain
+    // mv's direct `y[...]`; measured: a 1-ULP drift at e.g. n=1024).  Therefore
+    // this kernel is a LITERAL clone of NR2's per-row block body (same `yl`
+    // cache, same `yl[...]` operand form, same array `sumf[]`, same `short`
+    // indexing), specialized across R1 COLUMNS instead of NR2's nr0=2 rows.
+    //
+    // Amortization: the weight bytes for each of this SG's `nr0` rows are read +
+    // dequantized once per block and reused across all R1 columns (NR2 reuses
+    // the cached `yl` across rows; we reuse the read weight across columns — the
+    // same trick on the orthogonal axis).  Each column's `yl_c[16]` is the only
+    // per-column cache.
+    float sumf[nr0][R1];
+    for (short rr = 0; rr < nr0; ++rr) {
+        for (short c = 0; c < R1; ++c) {
+            sumf[rr][c] = 0.f;
+        }
+    }
+    float yl_c[R1][16];
+
+    for (int i = ix; i < nb; i += 2) {
+        // Cache each column's Y vector once per block (NR2 caches one row's Y;
+        // we cache R1 columns' Y, reused across this SG's nr0 weight rows).
+        for (short c = 0; c < R1; ++c) {
+            device const float * y = yy_c[c] + i * QK_K + y_offset;
+            for (int l = 0; l < 4; ++l) {
+                yl_c[c][4*l + 0] = y[l +  0];
+                yl_c[c][4*l + 1] = y[l + 32];
+                yl_c[c][4*l + 2] = y[l + 64];
+                yl_c[c][4*l + 3] = y[l + 96];
+            }
+        }
+
+        for (int row = 0; row < nr0; ++row) {
+            device const block_q6_K * xr = x_base + row * nb;
+            device const uint8_t * q1 = xr[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xr[i].qh + q_offset_h;
+            device const int8_t  * sc = xr[i].scales + is;
+
+            const float dall = xr[i].d;
+
+            for (short c = 0; c < R1; ++c) {
+                // EXACT clone of NR2's per-row inner body — only `yl` → `yl_c[c]`.
+                float4 sums = {0.f, 0.f, 0.f, 0.f};
+                for (int l = 0; l < 4; ++l) {
+                    sums[0] += yl_c[c][4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                    sums[1] += yl_c[c][4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                    sums[2] += yl_c[c][4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                    sums[3] += yl_c[c][4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+                }
+
+                sumf[row][c] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            }
+        }
+    }
+
+    for (int row = 0; row < nr0; ++row) {
+        const int out_row = first_row + row;
+        for (short c = 0; c < R1; ++c) {
+            const float tot = simd_sum(sumf[row][c]);
+            if (tiisg == 0 && out_row < p.ne01 && (r1_base + c) < p.ne1) {
+                dst[(r1_base + c)*p.ne0 + im*p.ne0*p.ne1 + out_row] = tot;
+            }
+        }
+    }
+}
+
+// Explicit R1 ∈ {2..8} instantiations (mirrors mul_mv_ext's host_name pattern).
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_2")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<2>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_3")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<3>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_4")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<4>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_5")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<5>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_6")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<6>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_7")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<7>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_8")]]
+kernel void hf2q_mul_mv_q6_K_f32_mN_impl<8>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, uint3, uint, uint);
+
 // ---- Q4_K mat-vec kernel ----
 //
 // ADR-013 P7 — port of llama.cpp `kernel_mul_mv_q4_K_f32_impl`

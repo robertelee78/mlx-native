@@ -26,6 +26,8 @@ static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 // ADR-040 §0.21 decode mul_mv_ext lever (opt-in, default off — see routing site).
 static CACHED_DECODE_MV_EXT: AtomicI8 = AtomicI8::new(-1);
+// ADR-040 §0.21c decode mvN lever (bit-identical column-amortizing Q6_K mv).
+static CACHED_DECODE_MVN: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -514,6 +516,33 @@ pub fn quantized_matmul_ggml(
     // has no parity test at all). So it stays OFF by default (byte-identical
     // bar) until the mv_ext kernels are proven/made bit-exact (Q6_K especially);
     // the env preserves the validated speedup for that follow-up. NON-blocking.
+    // ADR-040 §0.21c decode mvN lever — BIT-IDENTICAL column-amortizing Q6_K
+    // mat-vec. Reads each Q6_K weight block once and reuses its dequant across
+    // m∈[2,8] src1 columns (vs plain mv's per-column weight reload). Unlike
+    // mul_mv_ext (which is NOT bit-exact for the model's shapes and stays
+    // default-off), this kernel is a literal clone of plain mv's accumulation
+    // tree, so batched decode stays byte-exact to the serial m=1 path — proven
+    // by adr_040_q6k_mv_mN_byte_parity (GPU u32 bit-compare) AND the gemma4
+    // slot_aware_n8_per_slot_parity_vs_serial model test. Tile width R1 = m
+    // (single TG covers all m columns; any column-tiling stays bit-identical
+    // since columns are independent). Default OFF on first ship; flip to
+    // default-ON only after model parity + throughput win confirmed.
+    if cached_env_eq_one(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN")
+        && matches!(params.ggml_type, GgmlType::Q6_K)
+        && params.m >= 2
+        && params.m <= 8
+        && params.k % QK6_K == 0
+    {
+        if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
+            eprintln!(
+                "[mvN-route] Q6_K m={} n={} k={} → mN tiles={:?}",
+                params.m, params.n, params.k, mn_column_tiling(params.m as usize)
+            );
+        }
+        return dispatch_mv_q6k_mn_adaptive(
+            encoder, registry, device, input, weight, output, params,
+        );
+    }
     let mv_ext_ok = matches!(
         params.ggml_type,
         GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0
@@ -812,6 +841,175 @@ fn dispatch_mv(
         );
     }
 
+    Ok(())
+}
+
+/// ADR-040 §0.21c — dispatch the bit-identical column-amortizing Q6_K mat-vec
+/// (`kernel_mul_mv_q6_K_f32_mN_r1_{R1}`) as a SINGLE tile of width `r1ptg` over
+/// a width-`params.m` batch (so `r1ptg` must equal `params.m`). For arbitrary
+/// m∈[2,8] with register-safe tiling, prefer [`dispatch_mv_q6k_mn_adaptive`].
+///
+/// The kernel is BYTE-IDENTICAL to `kernel_mul_mv_q6_K_f32_nr2` (the gemma4
+/// model's default serial decode kernel) — it is a literal clone of NR2's
+/// per-row block body (same `yl` cache, same operand form, same array `sumf`,
+/// same `short` indexing) specialized across R1 columns instead of NR2's nr0=2
+/// rows. NR2 is NOT byte-equal to plain mv in general, so cloning NR2 (not plain
+/// mv) is what keeps the model's m=1-serial-vs-m=8-batched parity bit-exact.
+/// The weight bytes for this SG's nr0 rows are read + dequantized once per block
+/// and reused across all R1 columns (the amortization).
+///
+/// Geometry matches NR2: (2,32) threadgroup, 2 SGs × nr0=2 rows/SG → 4 rows/TG
+/// (align=4 on N); the M axis is tiled by R1 (grid.y = ceil(m / R1)).
+pub fn dispatch_mv_q6k_mn(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    r1ptg: usize,
+) -> Result<()> {
+    dispatch_mv_q6k_mn_chunk(
+        encoder, registry, device, input, weight, output, params, r1ptg, 0, params.m as usize,
+    )
+}
+
+/// Dispatch a single mN tile for a contiguous column range `[col0, col0+width)`
+/// of the m=`params.m` batch. `r1ptg` is the template width (must equal `width`,
+/// in 2..=8). The src1/dst buffers are bound with byte offsets so the kernel's
+/// chunk-local column index `c ∈ [0, width)` maps to the global column `col0+c`;
+/// since columns are independent, any such tiling stays bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mv_q6k_mn_chunk(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    r1ptg: usize,
+    col0: usize,
+    width: usize,
+) -> Result<()> {
+    debug_assert!(matches!(params.ggml_type, GgmlType::Q6_K));
+    debug_assert!((2..=8).contains(&r1ptg));
+    debug_assert_eq!(r1ptg, width);
+
+    let kernel_name = match r1ptg {
+        2 => "kernel_mul_mv_q6_K_f32_mN_r1_2",
+        3 => "kernel_mul_mv_q6_K_f32_mN_r1_3",
+        4 => "kernel_mul_mv_q6_K_f32_mN_r1_4",
+        5 => "kernel_mul_mv_q6_K_f32_mN_r1_5",
+        6 => "kernel_mul_mv_q6_K_f32_mN_r1_6",
+        7 => "kernel_mul_mv_q6_K_f32_mN_r1_7",
+        8 => "kernel_mul_mv_q6_K_f32_mN_r1_8",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_mv_q6k_mn: r1ptg must be 2..=8, got {r1ptg}"
+            )))
+        }
+    };
+
+    // Same FC specialization (ne12/r2/r3 = 1) as dispatch_mv's hot path.
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
+
+    // Chunk-local params: ne1 = chunk width (so the kernel's column boundary
+    // guard `(r1_base + c) < ne1` is correct for this chunk's local indexing).
+    let gpu_params = GgmlMatvecGpuParams {
+        ne00: params.k as i64,
+        ne01: params.n as i64,
+        ne02: 1,
+        ne10: params.k as i64,
+        ne12: 1,
+        ne0: params.n as i64,
+        ne1: width as i64,
+        r2: 1,
+        r3: 1,
+    };
+
+    let n = params.n as usize;
+
+    // Byte offsets that shift src1/dst to the chunk's first column. The kernel's
+    // chunk-local column index c∈[0,width) then maps to global column col0+c.
+    //   src1 column stride = ne10 = k f32 elements
+    //   dst  column stride = ne0  = n f32 elements
+    let f32_sz = DType::F32.size_of() as u64;
+    let input_off = (col0 as u64) * (params.k as u64) * f32_sz;
+    let output_off = (col0 as u64) * (params.n as u64) * f32_sz;
+
+    // Geometry matches NR2 (the bit-identity target): 2 SGs × 32 threads,
+    // nr0=2 rows/SG → 4 rows/TG (align=4 on N). grid.y tiles this chunk's
+    // `width` columns by R1 (= 1 TG-row since width == r1ptg).
+    let align = 4usize;
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(n, align) as u64,
+        div_ceil(width, r1ptg) as u64,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(2, 32, 1);
+
+    encoder.dispatch_tracked_threadgroups_with_args(
+        &pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::BufferWithOffset(input, input_off)),
+            (2, KernelArg::BufferWithOffset(output, output_off)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[weight, input],
+        &[output],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
+/// Pick the column-tiling for a width-`m` batch that keeps each tile within the
+/// register-safe single-tile width and balances tile widths. Empirically the
+/// `yl_c[R1][16]` register cache spills past R1≈5 (measured: a throughput
+/// cliff at R1≥6), so tiles are capped at 5 and split as evenly as possible.
+/// Every tile width lands in 2..=5, EXCEPT a width-1 remainder which is handled
+/// by the caller (m=1 never reaches mN; a tail width of 1 is merged up).
+fn mn_column_tiling(m: usize) -> Vec<(usize, usize)> {
+    // (col0, width) tiles. m ∈ [2,8] only.
+    match m {
+        2 => vec![(0, 2)],
+        3 => vec![(0, 3)],
+        4 => vec![(0, 4)],
+        5 => vec![(0, 5)],
+        6 => vec![(0, 3), (3, 3)],
+        7 => vec![(0, 4), (4, 3)],
+        8 => vec![(0, 4), (4, 4)],
+        _ => vec![(0, m)], // unreachable for the gated m-range
+    }
+}
+
+/// Adaptive entry point: tile the m∈[2,8] batch into register-safe column
+/// chunks (each width 2..=5) and dispatch one mN tile per chunk. Bit-identity
+/// is preserved because columns are independent — any column-tiling produces
+/// the same per-column output. This is the routing target for HF2Q_DECODE_MVN.
+pub fn dispatch_mv_q6k_mn_adaptive(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    for (col0, width) in mn_column_tiling(params.m as usize) {
+        dispatch_mv_q6k_mn_chunk(
+            encoder, registry, device, input, weight, output, params, width, col0, width,
+        )?;
+    }
     Ok(())
 }
 

@@ -103,7 +103,8 @@ pub use ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 pub use ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
-    dispatch_mm_for_test, quantized_matmul_ggml, quantized_matmul_mm_tensor_perm021,
+    dispatch_mm_for_test, dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive,
+    quantized_matmul_ggml, quantized_matmul_mm_tensor_perm021,
     quantized_matmul_mm_tensor_perm021_f16,
     GgmlQuantizedMatmulParams, GgmlQuantizedMatmulPerm021Params, GgmlType,
     MM_ROUTING_THRESHOLD,
