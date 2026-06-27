@@ -424,6 +424,10 @@ kernel void hf2q_mul_mm_tensor_impl(
         auto sA = tA.slice(0, 0);
         auto sB = tB.slice(0, 0);
         mm.run(sB, sA, cT);
+        // ADR-040 §0.19: post-mm.run barrier (see V2 path + llama
+        // ggml-metal.metal:9549) — prevents the next K-iter from overwriting
+        // sa/sb while mm.run may still read them under GPU contention.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- Write-back ----
@@ -1004,6 +1008,10 @@ kernel void hf2q_mul_mm_tensor_perm021_impl(
         auto sA = tA.slice(0, 0);
         auto sB = tB.slice(0, 0);
         mm.run(sB, sA, cT);
+        // ADR-040 §0.19: post-mm.run barrier (see V2 path + llama
+        // ggml-metal.metal:9549) — prevents the next K-iter from overwriting
+        // sa/sb while mm.run may still read them under GPU contention.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- Write-back (identical to f32 variant) ----
@@ -1192,6 +1200,10 @@ kernel void hf2q_mul_mm_tensor_perm021_f16_impl(
         auto sA = tA.slice(0, 0);
         auto sB = tB.slice(0, 0);
         mm.run(sB, sA, cT);
+        // ADR-040 §0.19: post-mm.run barrier (see V2 path + llama
+        // ggml-metal.metal:9549) — prevents the next K-iter from overwriting
+        // sa/sb while mm.run may still read them under GPU contention.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- Write-back (identical to quantized variant) ----

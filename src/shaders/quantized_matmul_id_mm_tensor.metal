@@ -425,6 +425,12 @@ kernel void hf2q_mul_mm_id_tensor_impl(
         auto sA = tA.slice(0, 0);
         auto sB = tB.slice(0, 0);
         mm.run(sB, sA, cT);
+        // ADR-040 §0.19: post-mm.run barrier — without it the next K-iter
+        // overwrites sa/sb while this mm.run may still be reading them under
+        // GPU contention (intra-kernel race; deterministic single-tenant by
+        // timing-luck, flakes under multi-process scheduling). Mirrors the V2
+        // path + llama's kernel_mul_mm (ggml-metal.metal:9549).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // Write-back: always through shmem (scatter-by-hids) — same pattern as
