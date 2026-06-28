@@ -1049,6 +1049,21 @@ pub struct GraphSession<'a> {
     metal_capture: Option<crate::metal_capture::MetalCapture>,
 }
 
+/// ADR-040 §25 — gated accumulator for time spent in `barrier_between`
+/// conflict-tracking (HF2Q_BARRIER_NS=1), to split the serial host encode.
+static BARRIER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BARRIER_NS_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HF2Q_BARRIER_NS").as_deref() == Ok("1"));
+
+/// Total ns accumulated in barrier_between conflict-tracking since the last reset.
+pub fn barrier_ns() -> u64 {
+    BARRIER_NS.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Reset the barrier-ns accumulator (call before a timed decode region).
+pub fn barrier_ns_reset() {
+    BARRIER_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl<'a> GraphSession<'a> {
     /// Encode an RMS normalization into this session's encoder.
     ///
@@ -1521,6 +1536,10 @@ impl<'a> GraphSession<'a> {
     /// `ggml_metal_op_concurrency_reset` pattern.
     #[inline]
     pub fn barrier_between(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
+        // ADR-040 §25 — gated host-encode profiling (HF2Q_BARRIER_NS=1): time the
+        // conflict-tracking work (conflicts_reason + tracker.add) to split the
+        // ~2.44ms/step serial encode into barrier-overhead vs Metal arg-encoding.
+        let _bt = if *BARRIER_NS_ON { Some(std::time::Instant::now()) } else { None };
         // In capture mode, stash the read/write ranges so the next captured
         // dispatch node carries them for the reorder pass (Phase 4e.3).
         if self.recording {
@@ -1556,6 +1575,9 @@ impl<'a> GraphSession<'a> {
         self.dispatch_in_group += 1;
         self.total_dispatches += 1;
         self.tracker.add(reads, writes);
+        if let Some(t) = _bt {
+            BARRIER_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Print group size histogram to stderr (for HF2Q_MLX_TIMING debug).

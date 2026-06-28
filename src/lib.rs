@@ -80,7 +80,9 @@ pub use encoder::{
 pub use encoder_session::EncoderSession;
 pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
 pub use error::{MlxError, Result};
-pub use graph::{ComputeGraph, GraphExecutor, GraphSession, OpKind};
+pub use graph::{
+    barrier_ns, barrier_ns_reset, ComputeGraph, GraphExecutor, GraphSession, OpKind,
+};
 pub use kernel_registry::KernelRegistry;
 // Test-only counters and gate-reset helpers.  Marked #[doc(hidden)] so
 // they don't appear in published rustdoc; consumers should not depend
