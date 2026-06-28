@@ -2440,6 +2440,26 @@ impl CommandEncoder {
         self.cmd_buf.commit();
     }
 
+    /// ADR-040 §25 — accumulate this (async-committed) command buffer's GPU-busy
+    /// time into the global accumulator, for HF2Q_GPU_BUSY profiling of the
+    /// CB-pipelined decode path (where chunks `commit()` async and only the last
+    /// `commit_and_wait()`s — without this, the async chunks' GPU time is missed,
+    /// undercounting GPU-busy). Call ONLY after the CB is known complete (e.g.
+    /// after a later same-queue `commit_and_wait` returned). No-op when the
+    /// HF2Q_GPU_BUSY gate is off.
+    pub fn accumulate_gpu_busy(&self) {
+        if *GPU_BUSY_ON {
+            let (gpu_start, gpu_end): (f64, f64) = unsafe {
+                let cb = &*self.cmd_buf;
+                let s: f64 = msg_send![cb, GPUStartTime];
+                let e: f64 = msg_send![cb, GPUEndTime];
+                (s, e)
+            };
+            let ns = ((gpu_end - gpu_start).max(0.0) * 1_000_000_000.0) as u64;
+            GPU_BUSY_NS.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
     /// Block until a previously committed command buffer completes.
     ///
     /// Must be called after [`commit`](Self::commit).  Do not call after
