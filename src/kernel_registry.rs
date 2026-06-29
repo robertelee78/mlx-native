@@ -1188,6 +1188,10 @@ impl KernelRegistry {
         // GPU sampling kernels — eliminate logits readback (Phase 6)
         let argmax_src: &'static str = include_str!("shaders/argmax.metal");
         sources.insert("argmax_f32".into(), argmax_src);
+        // ADR-040 §26 iter-M — GPU first-max argmax + threshold candidate collect.
+        let gpu_sample_src: &'static str =
+            include_str!("shaders/gpu_sample_argmax_candidates.metal");
+        sources.insert("gpu_sample_argmax_candidates".into(), gpu_sample_src);
         let softmax_sample_src: &'static str =
             include_str!("shaders/softmax_sample.metal");
         sources.insert("softmax_sample_f32".into(), softmax_sample_src);

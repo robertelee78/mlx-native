@@ -3,6 +3,7 @@
 //! Each submodule implements dispatch for a specific kernel family.
 
 pub mod argmax;
+pub mod gpu_sample;
 pub mod argsort;
 pub mod moe_mm_id_map0;
 pub mod top_k;
