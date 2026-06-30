@@ -545,7 +545,15 @@ kernel void hf2q_mul_mm_id_impl(
     // (token_idx, slot_idx) of the row this thread owns.
     const int id = ids_i32[im * args.ne21 + r1 + lr1];
     const short i11 = (id % args.ne20) % args.ne11;   // slot index
-    const short i12 = (id / args.ne20);               // token index
+    // §0.19 FIX (2026-06-30): token/row index must be `int`, not `short`.
+    // The flat [n_tokens, K] input layout makes i12 = id/ne20 range up to
+    // n_tokens-1 (65535 at 8k, 131071 at 16k for the MoE down call where
+    // n_tokens = seq_len*top_k). `short` overflows at 32768 → negative
+    // i12 → `args.nb12*i12` wraps to an OOB device address (read of
+    // run-varying memory). llama keeps this index small via its
+    // [K, n_expert_used, n_tokens] multi-dim layout; our flat port must
+    // widen it. Bit-identical for n_tokens<=32768 (parity gate).
+    const int   i12 = (id / args.ne20);               // token index
     const short i13 = 0;
 
     // Base of expert `im`'s weight slab.
@@ -559,7 +567,7 @@ kernel void hf2q_mul_mm_id_impl(
 
     device const float * y = (device const float *)(src1
         + args.nb13*i13
-        + args.nb12*i12
+        + args.nb12*(uint64_t)i12
         + args.nb11*i11
         + args.nb10*iy);
 
@@ -671,9 +679,24 @@ kernel void hf2q_mul_mm_id_impl(
         const int id = ids_i32[im*args.ne21 + r1 + j];
 
         const short ide = id % args.ne20;  // slot index (output row-major)
-        const short idt = id / args.ne20;  // token index (output batch)
+        // §0.19 FIX (2026-06-30): output token/batch index must be `int` —
+        // same overflow as i12 above. For the MoE down call idt = id ranges
+        // to n_tokens-1 (65535 at 8k); `short` overflows at 32768 → negative
+        // idt → the `dst + idt*ne1*ne0` write-back wraps to an OOB device
+        // address (corrupting/reading run-varying memory). Bit-identical for
+        // n_tokens<=32768.
+        const int   idt = id / args.ne20;  // token index (output batch)
 
-        device float  * D  = (device float  *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+        // §0.19 FIX (2026-06-30, codex SHIP-WITH-CHANGES): force the output
+        // ELEMENT offset to 64-bit (promote each factor BEFORE multiply) so the
+        // dst address never overflows int32 at large ne0/ne1/token counts —
+        // mirrors the int32 dst-offset fix in dense_mm_bf16_tensor.metal.
+        // Byte-identical for in-range values.
+        const uint64_t dst_off =
+            (uint64_t) r0
+            + (uint64_t) ide * (uint64_t) args.ne0
+            + (uint64_t) idt * (uint64_t) args.ne1 * (uint64_t) args.ne0;
+        device float  * D  = (device float  *) dst + dst_off;
         device float4 * D4 = (device float4 *) D;
 
         threadgroup float  * C  = (threadgroup float *) shmem + j*NR0;

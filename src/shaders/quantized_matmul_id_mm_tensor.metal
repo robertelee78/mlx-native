@@ -338,7 +338,10 @@ kernel void hf2q_mul_mm_id_tensor_impl(
 
     const int id = ids_i32[im * args.ne21 + r1 + lr1];
     const short i11 = (id % args.ne20) % args.ne11;
-    const short i12 = (id / args.ne20);
+    // §0.19 FIX (2026-06-30): token/row index must be `int` — flat
+    // [n_tokens, K] layout makes i12 reach n_tokens-1 (65535 at 8k); `short`
+    // overflows at 32768 → OOB gather. See quantized_matmul_id_mm.metal.
+    const int   i12 = (id / args.ne20);
     const short i13 = 0;
 
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
@@ -351,7 +354,7 @@ kernel void hf2q_mul_mm_id_tensor_impl(
 
     device const float * y = (device const float *)(src1
         + args.nb13*i13
-        + args.nb12*i12
+        + args.nb12*(uint64_t)i12
         + args.nb11*i11
         + args.nb10*iy);
 
@@ -448,9 +451,19 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     for (short j = sgitg; j < nr1; j += 4) {
         const int id = ids_i32[im*args.ne21 + r1 + j];
         const short ide = id % args.ne20;
-        const short idt = id / args.ne20;
+        // §0.19 FIX (2026-06-30): output token/batch index must be `int` —
+        // `short` overflows at n_tokens>32768 → OOB write-back. See
+        // quantized_matmul_id_mm.metal.
+        const int   idt = id / args.ne20;
 
-        device float  * D  = (device float  *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+        // §0.19 FIX (2026-06-30, codex SHIP-WITH-CHANGES): 64-bit output
+        // element offset (each factor promoted before multiply). See
+        // quantized_matmul_id_mm.metal. Byte-identical for in-range values.
+        const uint64_t dst_off =
+            (uint64_t) r0
+            + (uint64_t) ide * (uint64_t) args.ne0
+            + (uint64_t) idt * (uint64_t) args.ne1 * (uint64_t) args.ne0;
+        device float  * D  = (device float  *) dst + dst_off;
         device float4 * D4 = (device float4 *) D;
 
         threadgroup float  * C  = sc + j*NR0;
