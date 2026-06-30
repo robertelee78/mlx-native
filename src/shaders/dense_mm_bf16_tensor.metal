@@ -240,9 +240,16 @@ kernel void hf2q_dense_mm_bf16_f32_tensor(
     }
 
     if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+        // 64-bit destination offset: the per-head plane term im*ne1*ne0
+        // overflows signed int32 once seq>~12.8k (e.g. im=13, seq=13312 ->
+        // 2.30e9 > 2^31), wrapping to a wild OOB write. Promote each factor
+        // BEFORE multiplying (not the product), mirroring the uint64_t
+        // src-side strides (offset0, :123) and the V2 kernel (:415).
+        const uint64_t dst_base =
+            (uint64_t)im * (uint64_t)args.ne1 * (uint64_t)args.ne0;
         device float * C = (device float *) dst +
-            r0 +
-            r1 * args.ne0 + im*args.ne1*args.ne0;
+            (uint64_t)r0 +
+            (uint64_t)r1 * (uint64_t)args.ne0 + dst_base;
 
         auto tC = tensor<device float, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(args.ne0, NR1));
         cT.store(tC);
@@ -256,7 +263,7 @@ kernel void hf2q_dense_mm_bf16_f32_tensor(
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float  * D  = (device float  *) dst + (uint64_t)r0 + (uint64_t)(r1 + j)*(uint64_t)args.ne0 + (uint64_t)im*(uint64_t)args.ne1*(uint64_t)args.ne0;
                 device float4 * D4 = (device float4 *) D;
 
                 threadgroup float  * C  = sc + (j*NR0);
