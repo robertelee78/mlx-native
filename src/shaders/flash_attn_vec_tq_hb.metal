@@ -722,3 +722,402 @@ kernel flash_attn_vec_tq_hb_t flash_attn_vec_tq_hb_impl<256, 256>;
 
 template [[host_name("flash_attn_vec_tq_hb_dk512")]]
 kernel flash_attn_vec_tq_hb_t flash_attn_vec_tq_hb_impl<512, 512>;
+
+// ---------------------------------------------------------------------------
+// ADR-040 M-SPEED-LC — batched-decode params: adds n_queries.
+//
+// Kept as a SEPARATE struct from FlashAttnVecTqHbParams above (the one used by
+// flash_attn_vec_tq_hb_impl) rather than extending that struct in place: the
+// non-batched scalar kernel is the production hot path with a host-side
+// 60-byte constant buffer (FlashAttnVecTqHbParamsGpu in ops/flash_attn_vec_tq_hb.rs).
+// Appending n_queries there would grow the Metal-side struct to 64 bytes while
+// the existing dispatcher still uploads only 60 bytes, so `params.n_queries`
+// in the untouched kernel would read past the end of the constant buffer.
+// A dedicated struct keeps the scalar kernel's ABI byte-for-byte unchanged.
+// ---------------------------------------------------------------------------
+struct FlashAttnVecTqHbBatchedParams {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  head_dim;
+    uint  kv_seq_len;
+    uint  kv_capacity;
+    float scale;
+    uint  mask_type;
+    uint  sliding_window;
+    float softcap;
+    uint  nwg;
+    uint  ring_start;
+    float scale_factor_d512;
+    uint  codebook_bits;
+    uint  fuse_fwht_pre;
+    uint  nsg;
+    uint  n_queries;      // ADR-040 M-SPEED-LC: batched flash query count
+};
+
+// ---------------------------------------------------------------------------
+// ADR-040 M-SPEED-LC — BATCHED multi-sequence decode flash, byte-packed
+// 5/6/8-bit TQ-HB K/V.
+//
+// SKELETON cloned from flash_attn_vec_hybrid_batched_impl (flash_attn_vec_hybrid.metal):
+// grid.x = n_q (one query per column); per-query `slot_id_arr`/`seq_pos_arr`
+// give per-query kv_seq_len (`ksl_b`), ring_start (`rs_b`), and base offsets
+// into the shared multi-seq K/V/K_norms/V_norms buffers (`k_off_b`, `kn_off_b`,
+// `v_off_b`, `vn_off_b`) and Q (`q_off_b`).
+//
+// Q*K^T and O=O+w*V inner math is copied VERBATIM from flash_attn_vec_tq_hb_impl
+// above (byte-packed K read via dequant_hb_float4 + K_norms — unlike the hybrid
+// kernel's F16-K direct read) — only the base pointer offsets become per-query,
+// so at a fixed (slot content, kv_seq_len, ring_start) this kernel's per-query
+// output is bit-identical to flash_attn_vec_tq_hb_impl's single-seq output.
+// ---------------------------------------------------------------------------
+template<short DK, short DV>
+kernel void flash_attn_vec_tq_hb_batched_impl(
+    constant FlashAttnVecTqHbBatchedParams &params      [[buffer(0)]],
+    device const float               *Q           [[buffer(1)]],
+    device const uint8_t             *K_packed    [[buffer(2)]],
+    device const float               *K_norms     [[buffer(3)]],
+    device const uint8_t             *V_packed    [[buffer(4)]],
+    device const float               *V_norms     [[buffer(5)]],
+    device       float               *dst         [[buffer(6)]],
+    device const uint                *slot_id_arr [[buffer(7)]],
+    device const uint                *seq_pos_arr [[buffer(8)]],
+    threadgroup  half                *shmem       [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr short DK4 = DK / 4;
+    constexpr short DV4 = DV / 4;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NL  = NW;
+    constexpr short PK  = PAD2(DK, 128);
+    constexpr short PK4 = PK / 4;
+    constexpr short PV  = PAD2(DV, 128);
+    constexpr short PV4 = PV / 4;
+    constexpr short SH  = 4 * C;  // 128 halfs = 64 floats
+
+    static_assert(DK % 32 == 0, "DK must be divisible by 32");
+    static_assert(DV % 32 == 0, "DV must be divisible by 32");
+    static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
+    static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
+
+    const uint NWG = params.nwg;
+    const uint NSG = params.nsg;  // ADR-028 iter-127b Path D: simdgroups per workgroup
+    const ushort iwg = tgpig[2] % NWG;
+    const ushort iq2 = tgpig[1];  // head index
+    const ushort iq1 = tgpig[0];  // query index (0..n_q-1)
+    const uint   sp_b      = seq_pos_arr[iq1];
+    const uint   slot_b    = slot_id_arr[iq1];
+    const bool   is_ring_b = (params.mask_type == 2u);
+    const uint   ksl_b     = is_ring_b ? min(sp_b + 1u, params.kv_capacity) : (sp_b + 1u);
+    const uint   rs_b      = (is_ring_b && ksl_b >= params.kv_capacity) ? ((sp_b + 1u) % params.kv_capacity) : 0u;
+    constexpr ushort npp_b = (DK == 512) ? 2 : 1;
+    const uint   q_off_b   = (uint)iq1 * params.n_heads * DK;
+    const uint   k_off_b   = slot_b * params.n_kv_heads * params.kv_capacity * DK;
+    const uint   kn_off_b  = slot_b * params.n_kv_heads * params.kv_capacity * npp_b;
+    const uint   v_off_b   = slot_b * params.n_kv_heads * params.kv_capacity * DV;
+    const uint   vn_off_b  = slot_b * params.n_kv_heads * params.kv_capacity * npp_b;
+
+    // GQA: map query head to KV head.
+    const uint heads_per_kv = params.n_heads / params.n_kv_heads;
+    const uint kv_head = iq2 / heads_per_kv;
+
+    // Shared memory layout — identical to flash_attn_vec_tq_hb_impl (see its
+    // comment above for the full bank breakdown).
+    threadgroup half4  *sq4 = (threadgroup half4  *)(shmem);
+    threadgroup float  *ss  = (threadgroup float  *)(shmem + PK + (uint)sgitg * SH);
+    threadgroup float4 *so4 = (threadgroup float4 *)(shmem + PK + NSG * SH + (uint)sgitg * 2 * PV);
+
+    if (params.fuse_fwht_pre != 0u) {
+        constexpr ushort EPT = DK / 32;  // 8 for D=256, 16 for D=512
+        const uint base = q_off_b + iq2 * DK + tiisg * EPT;
+        float elems[EPT];
+        for (ushort i = 0; i < EPT; i++) {
+            elems[i] = Q[base + i];
+        }
+        for (ushort i = 0; i < EPT; i++) {
+            ushort j = tiisg * EPT + i;
+            uint8_t sign_byte = (DK == 256) ? TBQ_SIGNS_256_FA[j >> 3] : TBQ_SIGNS_512_FA[j >> 3];
+            float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+            elems[i] *= sign_val;
+        }
+        fwht_simd_fa<EPT>(elems, (uint)tiisg);
+        const float inv_sqrt_d = rsqrt(float(DK));
+        for (ushort i = 0; i < EPT; i++) {
+            elems[i] *= inv_sqrt_d;
+        }
+        constexpr ushort SQ4_PER_THREAD = EPT / 4;
+        for (ushort q = 0; q < SQ4_PER_THREAD; q++) {
+            ushort sq_idx = tiisg * SQ4_PER_THREAD + q;
+            sq4[sq_idx] = half4(elems[q*4 + 0], elems[q*4 + 1],
+                                elems[q*4 + 2], elems[q*4 + 3]);
+        }
+        for (ushort i = tiisg + DK4; i < PK4; i += NW) {
+            sq4[i] = half4(0.0h);
+        }
+    } else {
+        for (ushort i = tiisg; i < PK4; i += NW) {
+            if (i < DK4) {
+                float4 qval = *((device const float4 *)(Q + q_off_b + iq2 * DK + i * 4));
+                sq4[i] = half4(qval);
+            } else {
+                sq4[i] = half4(0.0h);
+            }
+        }
+    }
+
+    // Zero output accumulator.
+    so4 += tiisg;
+    for (short i = 0; i < DV4 / NL; ++i) {
+        so4[i * NL] = float4(0.0f);
+    }
+
+    // Zero scratch buffer.
+    for (ushort i = tiisg; i < SH / 4; i += NW) {
+        ((threadgroup float *)(shmem + PK))[i] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax state.
+    float S = 0.0f;
+    float M = -FLT_MAX / 2;
+
+    const ushort tx = tiisg;
+    const uint kv_seq_len = ksl_b;
+    const uint kv_capacity = params.kv_capacity;
+    const uint ring_start = rs_b;
+    const uint cbits = params.codebook_bits;
+    const float sf_d512 = params.scale_factor_d512;
+    const bool is_d512 = (DK > 256);
+
+    uint window_start_logical = 0;
+    if (params.mask_type == 2 && params.sliding_window > 0 && kv_seq_len > params.sliding_window) {
+        window_start_logical = kv_seq_len - params.sliding_window;
+    }
+
+    threadgroup const half4 *pq4 = sq4 + tx;
+
+    for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
+        uint ic = ic0 * C;
+        if (ic >= kv_seq_len) break;
+
+        // Compute mask for this chunk.
+        {
+            uint k_pos = ic + tx;
+            float mask_val = 0.0f;
+            if (k_pos >= kv_seq_len) {
+                mask_val = -65504.0f;
+            } else {
+                uint logical_idx = (k_pos - ring_start + kv_capacity) % kv_capacity;
+                if (logical_idx >= kv_seq_len || logical_idx < window_start_logical) {
+                    mask_val = -65504.0f;
+                }
+            }
+            ss[tx] = mask_val;
+        }
+
+        if (simd_max(ss[tiisg]) <= -65504.0f) continue;
+
+        // ---- Q * K^T (byte-packed TQ-HB K — VERBATIM from
+        // flash_attn_vec_tq_hb_impl, with k_off_b/kn_off_b per-query base
+        // offsets added to the K_packed/K_norms pointers) ----
+        {
+            float mqk[C];
+            const float inv_sqrt_dk = rsqrt(float(DK));
+
+            for (short cc = 0; cc < C; ++cc) {
+                uint kv_pos = ic + cc;
+                if (kv_pos >= kv_seq_len) {
+                    mqk[cc] = 0.0f;
+                    continue;
+                }
+
+                // Dequant scale for K.
+                float k_sn;
+                if (is_d512) {
+                    device const float *knorm = K_norms + kn_off_b + (kv_head * kv_capacity + kv_pos) * 2u;
+                    (void)k_sn;
+                    (void)inv_sqrt_dk;
+
+                    device const uint8_t *k_base =
+                        K_packed + k_off_b + (kv_head * kv_capacity + kv_pos) * DK;
+
+                    float partial = 0.0f;
+                    // Block 0: coords 0..255
+                    {
+                        float sn0 = knorm[0] / sf_d512;
+                        for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
+                            uint coord = (uint)(tx + ii * NL) * 4u;
+                            float4 k_val = dequant_hb_float4(k_base, coord, sn0, cbits);
+                            partial += dot(k_val, float4(pq4[ii * NL]));
+                        }
+                    }
+                    // Block 1: coords 256..511
+                    {
+                        float sn1 = knorm[1] / sf_d512;
+                        const uint blk1_start = DK / 2;
+                        for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
+                            uint coord = blk1_start + (uint)(tx + ii * NL) * 4u;
+                            float4 k_val = dequant_hb_float4(k_base, coord, sn1, cbits);
+                            partial += dot(k_val, float4(pq4[(DK4/2/NL + ii) * NL]));
+                        }
+                    }
+                    mqk[cc] = simd_sum(partial);
+                } else {
+                    float k_norm_val = K_norms[kn_off_b + kv_head * kv_capacity + kv_pos];
+                    k_sn = k_norm_val * inv_sqrt_dk;
+
+                    device const uint8_t *k_base =
+                        K_packed + k_off_b + (kv_head * kv_capacity + kv_pos) * DK + tx * 4u;
+
+                    float partial = 0.0f;
+                    for (short ii = 0; ii < DK4 / NL; ++ii) {
+                        float4 k_val = dequant_hb_float4(k_base, (uint)(ii * NL) * 4u, k_sn, cbits);
+                        partial += dot(k_val, float4(pq4[ii * NL]));
+                    }
+                    mqk[cc] = simd_sum(partial);
+                }
+            }
+
+            ss[tx] = fma(mqk[tx], params.scale, ss[tx]);
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Online softmax ----
+        {
+            const float m_old = M;
+            const float s_new = ss[tiisg];
+            M = simd_max(max(M, s_new));
+            const float ms = exp(m_old - M);
+            const float vs = exp(s_new - M);
+            S = S * ms + simd_sum(vs);
+            ss[tiisg] = vs;
+            for (short ii = 0; ii < DV4 / NL; ++ii) {
+                so4[ii * NL] *= ms;
+            }
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- O = O + softmax_weights * V (VERBATIM from
+        // flash_attn_vec_tq_hb_impl, with v_off_b/vn_off_b per-query base
+        // offsets added) ----
+        {
+            float4 lo[DV4 / NL];
+            for (short ii = 0; ii < DV4 / NL; ++ii) lo[ii] = float4(0.0f);
+
+            const float inv_sqrt_dv = rsqrt(float(DV));
+
+            for (short cc = 0; cc < C; ++cc) {
+                uint kv_pos = ic + cc;
+                if (kv_pos >= kv_seq_len) continue;
+
+                if (is_d512) {
+                    device const float *vnorm = V_norms + vn_off_b + (kv_head * kv_capacity + kv_pos) * 2u;
+                    device const uint8_t *v_base =
+                        V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV;
+                    float w = ss[cc];
+
+                    // Block 0: coords 0..255
+                    float sn0 = vnorm[0] / sf_d512 * w;
+                    for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                        uint coord = (uint)(tx + ii * NL) * 4u;
+                        lo[ii] += dequant_hb_float4(v_base, coord, sn0, cbits);
+                    }
+                    // Block 1: coords 256..511
+                    float sn1 = vnorm[1] / sf_d512 * w;
+                    for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                        uint coord = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
+                        lo[DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, cbits);
+                    }
+                } else {
+                    float v_norm_val = V_norms[vn_off_b + kv_head * kv_capacity + kv_pos];
+                    float v_sw = v_norm_val * inv_sqrt_dv * ss[cc];
+                    device const uint8_t *v_base =
+                        V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV + tx * 4u;
+
+                    for (short ii = 0; ii < DV4 / NL; ++ii) {
+                        lo[ii] += dequant_hb_float4(v_base, (uint)(ii * NL) * 4u, v_sw, cbits);
+                    }
+                }
+            }
+
+            for (short ii = 0; ii < DV4 / NL; ++ii) {
+                so4[ii * NL] += lo[ii];
+            }
+        }
+    }
+
+    // Store M and S for the reduce kernel (each simdgroup writes to its own bank).
+    if (tiisg == 0) {
+        ss[0] = S;
+        ss[1] = M;
+    }
+
+    so4 -= tiisg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Cross-simdgroup online-softmax reduce (identical to
+    // flash_attn_vec_tq_hb_impl — see its comment above) ----
+    if (NSG > 1u && sgitg == 0) {
+        constexpr ushort NSG_MAX = 4;
+        float ms_arr[NSG_MAX];
+        float M_global = -FLT_MAX / 2;
+        for (ushort j = 0; j < NSG; ++j) {
+            threadgroup const float *ssj = (threadgroup const float *)(shmem + PK + (uint)j * SH);
+            M_global = max(M_global, ssj[1]);
+        }
+        float S_total = 0.0f;
+        for (ushort j = 0; j < NSG; ++j) {
+            threadgroup const float *ssj = (threadgroup const float *)(shmem + PK + (uint)j * SH);
+            const float M_j = ssj[1];
+            const float S_j = ssj[0];
+            ms_arr[j] = exp(M_j - M_global);
+            S_total += S_j * ms_arr[j];
+        }
+        for (ushort i = tiisg; i < DV4; i += NW) {
+            float4 acc = float4(0.0f);
+            for (ushort j = 0; j < NSG; ++j) {
+                threadgroup const float4 *so4_j = (threadgroup const float4 *)(shmem + PK + NSG * SH + (uint)j * 2u * PV);
+                acc += so4_j[i] * ms_arr[j];
+            }
+            so4[i] = acc;
+        }
+        if (tiisg == 0) {
+            ss[0] = S_total;
+            ss[1] = M_global;
+        }
+        S = S_total;
+        M = M_global;
+    }
+
+    // ---- Write output ----
+    if (sgitg == 0) {
+        const int64_t nrows = (int64_t)params.n_queries * params.n_heads;
+        const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
+        const uint NWG_val = params.nwg;
+        const float inv_S = (NWG_val == 1) ? ((S == 0.0f) ? 0.0f : 1.0f / S) : 1.0f;
+
+        device float4 *dst4 = (device float4 *)dst;
+        for (ushort i = tiisg; i < DV4; i += NW) {
+            dst4[rid * DV4 * NWG_val + NWG_val * i + iwg] = so4[i] * inv_S;
+        }
+
+        if (NWG_val > 1 && tiisg == 0) {
+            device float *dst1 = (device float *)dst + nrows * DV * NWG_val;
+            dst1[rid * (2 * NWG_val) + 2 * iwg + 0] = S;
+            dst1[rid * (2 * NWG_val) + 2 * iwg + 1] = M;
+        }
+    }
+}
+
+// ADR-040 M-SPEED-LC — batched multi-sequence TQ-HB decode flash.
+typedef decltype(flash_attn_vec_tq_hb_batched_impl<256, 256>) flash_attn_vec_tq_hb_batched_t;
+
+template [[host_name("flash_attn_vec_tq_hb_batched_dk256")]]
+kernel flash_attn_vec_tq_hb_batched_t flash_attn_vec_tq_hb_batched_impl<256, 256>;
+
+template [[host_name("flash_attn_vec_tq_hb_batched_dk512")]]
+kernel flash_attn_vec_tq_hb_batched_t flash_attn_vec_tq_hb_batched_impl<512, 512>;

@@ -1143,6 +1143,9 @@ impl KernelRegistry {
         let tq_hb_src: &'static str = include_str!("shaders/flash_attn_vec_tq_hb.metal");
         sources.insert("flash_attn_vec_tq_hb_dk256".into(), tq_hb_src);
         sources.insert("flash_attn_vec_tq_hb_dk512".into(), tq_hb_src);
+        // ADR-040 M-SPEED-LC — batched multi-seq TQ-HB decode flash (same source file).
+        sources.insert("flash_attn_vec_tq_hb_batched_dk256".into(), tq_hb_src);
+        sources.insert("flash_attn_vec_tq_hb_batched_dk512".into(), tq_hb_src);
 
         // ADR-028 §iter-485 (Phase 7d H3): fused TQ-HB reduce + FWHT-sign-undo.
         // Combines flash_attn_vec_reduce + fwht_sign_undo_f32 into a single

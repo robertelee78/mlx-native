@@ -24,6 +24,10 @@ pub static FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE: &str =
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("flash_attn_vec_tq_hb_dk256", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_tq_hb_dk512", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
+    // ADR-040 M-SPEED-LC: batched multi-sequence variant (same source file —
+    // the batched kernel template is appended to flash_attn_vec_tq_hb.metal).
+    registry.register_source("flash_attn_vec_tq_hb_batched_dk256", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
+    registry.register_source("flash_attn_vec_tq_hb_batched_dk512", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
 }
 
 /// Parameters for the HB TQ flash attention vector kernel.
@@ -505,6 +509,195 @@ pub fn flash_attn_vec_tq_hb_with_fused_undo(
         crate::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
             encoder, registry, device.metal_device(),
             output, params.num_heads, head_dim,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// GPU-side params for the BATCHED TQ-HB kernel. Byte-identical field layout
+/// to `FlashAttnVecTqHbParamsGpu` above, plus `n_queries` appended.
+///
+/// ADR-040 M-SPEED-LC (codex constraint #3): this is a DEDICATED struct, not
+/// a widened version of `FlashAttnVecTqHbParamsGpu` — the non-batched
+/// dispatchers (`flash_attn_vec_tq_hb`, `flash_attn_vec_tq_hb_with_fused_undo`)
+/// keep uploading the unchanged 60-byte struct to the unchanged scalar
+/// kernel; only the new `flash_attn_vec_tq_hb_batched_*` pipeline reads the
+/// 64-byte `FlashAttnVecTqHbBatchedParams` declared in the Metal source.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlashAttnVecTqHbBatchedParamsGpu {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    scale: f32,
+    mask_type: u32,
+    sliding_window: u32,
+    softcap: f32,
+    nwg: u32,
+    ring_start: u32,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+    fuse_fwht_pre: u32,
+    nsg: u32,
+    n_queries: u32,
+}
+
+/// ADR-040 M-SPEED-LC — BATCHED multi-sequence decode flash for byte-packed
+/// 5/6/8-bit TQ-HB K/V.
+///
+/// Mirrors `flash_attn_vec_hybrid_batched`'s per-query input-addressing
+/// mechanism (grid.x = n_q; per-query `[n_q]` u32 device arrays
+/// `slot_id_arr`/`seq_pos_arr` give per-query kv_seq_len/ring_start and
+/// K/K_norms/V/V_norms base offsets into the shared multi-seq buffers), but
+/// reads K as byte-packed TQ-HB (`dequant_hb_float4` codebook lookup +
+/// per-position/per-block `K_norms`) — the inner Q*K^T / O=O+w*V math is
+/// copied VERBATIM from `flash_attn_vec_tq_hb_impl` in the shader (only the
+/// base pointer offsets become per-query), so each query's output is
+/// bit-identical to the single-seq scalar TQ-HB path run at the same
+/// (kv_seq_len, ring_start, K/V content).
+///
+/// FUSED REDUCE+UNDO PATH TAKEN: this dispatcher mirrors the SCALAR
+/// production hot path `flash_attn_vec_tq_hb_with_fused_undo` (not the plain
+/// `flash_attn_vec_tq_hb`), since that fused sequence is what production
+/// decode actually runs. `flash_attn_vec_reduce_tq_hb_undo` is REUSED
+/// UNCHANGED (no cloned/batched variant needed) because inspection of
+/// `flash_attn_vec_reduce_tq_hb_undo.metal` shows it is already
+/// row-count-agnostic: grid = `(nrows, 1, 1)` with `rid = tgpig`, and every
+/// read (`htmp + nrows*DV*NWG` then `sm[rid*(2*NWG)+...]`, `htmp4 + rid*DV4*NWG`)
+/// and write (`dst + rid*DV`) is purely a function of `rid` — no cross-row
+/// shared state. Passing `nrows = n_q * num_heads` therefore produces exactly
+/// the same fused reduce+undo for each of the `n_q*num_heads` rows as calling
+/// it once per query would. This is the identical pattern
+/// `flash_attn_vec_hybrid_batched` uses to reuse the plain
+/// `flash_attn_vec_reduce_dk{256,512}` with `nrows = n_q * num_heads`.
+///
+/// At `nwg == 1` (rare in production — `compute_nwg` only returns 1 via the
+/// `HF2Q_TQ_NWG=1` override; the default policy always picks 16 or 32), the
+/// SDPA kernel writes the final ROTATED-domain output directly per query, so
+/// this dispatcher applies `fwht_sign_undo_f32` across all `n_q * num_heads`
+/// rows (also row-count-agnostic: grid.x = the `num_heads` parameter, one
+/// threadgroup per row) — mirroring the `nwg == 1` branch of
+/// `flash_attn_vec_tq_hb_with_fused_undo` — to preserve the same CALLER
+/// CONTRACT (no separate `fwht_sign_undo` dispatch needed by the caller).
+///
+/// Requires all queries to share the SAME (nwg, nsg) bucket — the caller
+/// gates on it and falls back to per-slot dispatches otherwise.
+/// `params.kv_seq_len` must be the MAX over queries (nwg-bucket selection
+/// only; each query's real kv_seq_len/ring_start comes from `seq_pos_arr` +
+/// `params.mask_type`, mirroring `flash_attn_vec_hybrid_batched`). `q`/`dst`
+/// are `[n_q, heads*head_dim]`; `k_packed`/`k_norms`/`v_packed`/`v_norms` are
+/// the FULL multi-seq buffers; `tmp` must be sized via
+/// `tmp_buffer_bytes(n_q * params.num_heads, head_dim)`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_tq_hb_batched(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+) -> Result<()> {
+    validate_params(params)?;
+
+    let head_dim = params.head_dim;
+    let nwg = compute_nwg(params.kv_seq_len);
+
+    let gpu_params = FlashAttnVecTqHbBatchedParamsGpu {
+        n_heads: params.num_heads,
+        n_kv_heads: params.num_kv_heads,
+        head_dim: params.head_dim,
+        kv_seq_len: params.kv_seq_len,
+        kv_capacity: params.kv_capacity,
+        scale: params.scale,
+        mask_type: params.mask_type,
+        sliding_window: params.sliding_window,
+        softcap: params.softcap,
+        nwg,
+        ring_start: params.ring_start,
+        scale_factor_d512: params.scale_factor_d512,
+        codebook_bits: params.codebook_bits,
+        fuse_fwht_pre: params.fuse_fwht_pre,
+        nsg: params.nsg,
+        n_queries: n_q,
+    };
+
+    let kernel_name = match head_dim {
+        256 => "flash_attn_vec_tq_hb_batched_dk256",
+        512 => "flash_attn_vec_tq_hb_batched_dk512",
+        _ => return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_tq_hb_batched: unsupported head_dim {head_dim}"
+        ))),
+    };
+    let cbits_const = (params.codebook_bits as i32, 50usize);
+    let pipeline = registry
+        .get_pipeline_with_constants(
+            kernel_name,
+            device.metal_device(),
+            &[],
+            &[(cbits_const.1, cbits_const.0)],
+        )?;
+
+    let pk = pad2(head_dim as usize, 128);
+    let pv = pad2(head_dim as usize, 128);
+    let sh = 4 * 32;
+    let nsg = params.nsg as usize;
+    let shmem_halfs = pk + nsg * (sh + 2 * pv);
+    let shmem_bytes = shmem_halfs * 2;
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+
+    // grid.x = n_q (was 1). Each (query, head, wg) threadgroup.
+    let threadgroups = MTLSize::new(n_q as u64, params.num_heads as u64, nwg as u64);
+    let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
+
+    let dst_buf = if nwg == 1 { output } else { tmp };
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(q)),
+            (2, KernelArg::Buffer(k_packed)),
+            (3, KernelArg::Buffer(k_norms)),
+            (4, KernelArg::Buffer(v_packed)),
+            (5, KernelArg::Buffer(v_norms)),
+            (6, KernelArg::Buffer(dst_buf)),
+            (7, KernelArg::Buffer(slot_id_arr)),
+            (8, KernelArg::Buffer(seq_pos_arr)),
+        ],
+        &[(0, shmem_bytes as u64)],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    if nwg > 1 {
+        encoder.memory_barrier();
+        // nrows = n_q * heads — see rustdoc above for the row-independence
+        // evidence that justifies reusing this kernel unchanged.
+        crate::ops::flash_attn_vec_reduce_tq_hb_undo::dispatch_flash_attn_vec_reduce_tq_hb_undo(
+            encoder, registry, device,
+            tmp, output,
+            n_q * params.num_heads, head_dim, nwg,
+        )?;
+    } else {
+        // NWG=1 path: SDPA wrote final output directly to `output` in the
+        // ROTATED domain (per query). Apply in-place undo across all
+        // n_q*num_heads rows to preserve the H3 caller contract.
+        encoder.memory_barrier();
+        crate::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+            encoder, registry, device.metal_device(),
+            output, n_q * params.num_heads, head_dim,
         )?;
     }
 
