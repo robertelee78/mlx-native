@@ -8,11 +8,14 @@
 //! empirical test).
 //!
 //! Behavior:
-//! - On macOS / aarch64 with xcrun available, builds the .metallib.
-//! - On other targets OR if xcrun is missing, writes an empty file so
-//!   `include_bytes!` still compiles; the kernel_registry path treats an
-//!   empty embedded metallib as "not present" and falls back to runtime
-//!   source compile.
+//! - On macOS / aarch64, probes the Metal Toolchain and hard-errors if
+//!   absent — a missing toolchain silently undoes the precompiled-metallib
+//!   perf win (ADR-022 iter-68 burn class). The intentional-skip path
+//!   (`MLX_NATIVE_SKIP_METALLIB` or non-macOS target) writes an empty file
+//!   so `include_bytes!` still compiles.
+//! - Compiles ALL shaders; a single failure no longer loses the whole
+//!   metallib — survivors are linked, failures fall back to runtime source
+//!   compile per-shader. If 0 shaders succeed (systemic failure), hard-errors.
 //! - Re-runs only when a .metal file under src/shaders/ changes.
 //!
 //! Environment hygiene (2026-08-02 RCA): the `metal` frontend derives its
@@ -87,15 +90,57 @@ fn main() {
         return;
     }
 
+    // Probe the Metal Toolchain ONCE before iterating. On macOS, an absent
+    // toolchain is a HARD ERROR — the silent empty-metallib fallback masks a
+    // real perf regression (ADR-022 iter-68 burn class: 3% larger AIR, 70µs
+    // jitter, one-time source-compile tax on every process start). The
+    // intentional-skip path (MLX_NATIVE_SKIP_METALLIB / non-macOS) is handled
+    // above and stays graceful.
+    //
+    // Auto-install: if the probe fails, attempt `xcodebuild -downloadComponent
+    // MetalToolchain` so a fresh clone reaches a working state without manual
+    // Xcode fiddling. Set `MLX_NATIVE_NO_AUTOINSTALL_METAL=1` to opt out (CI
+    // that wants to control the toolchain itself). If install fails or is
+    // declined, hard-error with the manual command — never silently degrade.
+    if !metal_toolchain_present() {
+        if env::var("MLX_NATIVE_NO_AUTOINSTALL_METAL").is_ok() {
+            panic!(
+                "mlx-native build.rs: Metal Toolchain not found and auto-install disabled \
+                 (MLX_NATIVE_NO_AUTOINSTALL_METAL=1). Run manually: \
+                 xcodebuild -downloadComponent MetalToolchain",
+            );
+        }
+        println!("cargo:warning=mlx-native: Metal Toolchain not found — attempting auto-install via `xcodebuild -downloadComponent MetalToolchain` (~700 MB download)...");
+        match install_metal_toolchain() {
+            Ok(()) => println!("cargo:warning=mlx-native: Metal Toolchain installed; re-probing."),
+            Err(e) => panic!(
+                "mlx-native build.rs: Metal Toolchain auto-install failed ({}). \
+                 Run manually: xcodebuild -downloadComponent MetalToolchain",
+                e,
+            ),
+        }
+        if !metal_toolchain_present() {
+            panic!(
+                "mlx-native build.rs: Metal Toolchain still not found after auto-install. \
+                 Run manually: xcodebuild -downloadComponent MetalToolchain, then rebuild.",
+            );
+        }
+    }
+
     // Build .air files under OUT_DIR/air/.
     let air_dir = out_dir.join("air");
     fs::create_dir_all(&air_dir).expect("create air dir");
 
+    // Compile ALL shaders. A single failure no longer loses the whole metallib
+    // — survivors are linked into the metallib, failures fall back to runtime
+    // source-compile per-shader at load time. If 0 succeed (systemic failure),
+    // we hard-error below.
     let mut air_files: Vec<PathBuf> = Vec::with_capacity(metal_files.len());
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
     for metal_path in &metal_files {
         let stem = metal_path.file_stem().unwrap().to_string_lossy().to_string();
         let air_path = air_dir.join(format!("{stem}.air"));
-        let status = Command::new("xcrun")
+        let output = Command::new("xcrun")
             .args(["-sdk", "macosx", "metal", "-O3", "-c"])
             .arg(metal_path)
             .arg("-o")
@@ -103,34 +148,58 @@ fn main() {
             // See header: keep the CPU-binary deployment target out of
             // shader language-version resolution.
             .env_remove("MACOSX_DEPLOYMENT_TARGET")
-            .status();
+            .output();
 
-        match status {
-            Ok(s) if s.success() => {
+        match output {
+            Ok(o) if o.status.success() => {
                 air_files.push(air_path);
             }
-            Ok(s) => {
-                // Compile failure on a single shader: skip building the metallib;
-                // hf2q will fall back to runtime source-compile at load time.
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                let first_line = stderr.lines().next().unwrap_or(&stderr);
+                failures.push((metal_path.clone(), first_line.to_string()));
                 println!(
                     "cargo:warning=mlx-native: xcrun metal -O3 failed on {} (status={}); \
-                     writing empty metallib, will fall back to runtime source compile",
+                     this shader will be runtime-source-compiled at load time: {}",
                     metal_path.display(),
-                    s
+                    o.status,
+                    first_line,
                 );
-                fs::write(&metallib_path, b"").expect("write empty metallib placeholder");
-                return;
             }
             Err(e) => {
+                failures.push((metal_path.clone(), e.to_string()));
                 println!(
-                    "cargo:warning=mlx-native: xcrun not available ({}); \
-                     writing empty metallib, will fall back to runtime source compile",
-                    e
+                    "cargo:warning=mlx-native: cannot invoke xcrun metal on {} ({}); \
+                     this shader will be runtime-source-compiled at load time",
+                    metal_path.display(),
+                    e,
                 );
-                fs::write(&metallib_path, b"").expect("write empty metallib placeholder");
-                return;
             }
         }
+    }
+
+    if air_files.is_empty() {
+        let last = failures
+            .last()
+            .map(|(p, e)| format!("{}: {e}", p.display()))
+            .unwrap_or_else(|| "unknown".to_string());
+        panic!(
+            "mlx-native build.rs: all {} metal shader(s) failed to compile — 0 .air files \
+             produced. This is a systemic failure, not a single-shader bug. \
+             Last failure: {last}. \
+             Run: xcodebuild -downloadComponent MetalToolchain",
+            metal_files.len(),
+        );
+    }
+
+    if !failures.is_empty() {
+        println!(
+            "cargo:warning=mlx-native: {failures} shader(s) failed, {ok} succeeded — \
+             linking partial metallib ({ok} shaders precompiled, {failures} fall back to \
+             runtime source compile)",
+            failures = failures.len(),
+            ok = air_files.len(),
+        );
     }
 
     // Link all .air into a single .metallib.
@@ -164,4 +233,38 @@ fn main() {
             fs::write(&metallib_path, b"").expect("write empty metallib placeholder");
         }
     }
+}
+
+/// Probe whether the Metal Toolchain is installed and `xcrun metal` can run.
+/// Returns true on success, false if the toolchain is missing or `xcrun` itself
+/// is unavailable. Used to gate the hard-error / auto-install path.
+fn metal_toolchain_present() -> bool {
+    match Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "--version"])
+        .output()
+    {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Attempt to install the Metal Toolchain via `xcodebuild -downloadComponent`.
+/// Returns Ok(()) on success, Err with a diagnostic on any failure. Idempotent
+/// — if the component is already present, xcodebuild reports success quickly.
+fn install_metal_toolchain() -> Result<(), String> {
+    let output = Command::new("xcodebuild")
+        .args(["-downloadComponent", "MetalToolchain"])
+        .output()
+        .map_err(|e| format!("cannot invoke xcodebuild: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "xcodebuild -downloadComponent MetalToolchain exited {} — stderr: {} stdout: {}",
+            output.status,
+            stderr.trim(),
+            stdout.trim(),
+        ));
+    }
+    Ok(())
 }

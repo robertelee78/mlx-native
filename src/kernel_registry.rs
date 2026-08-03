@@ -28,8 +28,9 @@ use metal::{ComputePipelineDescriptor, ComputePipelineState, FunctionConstantVal
 use crate::error::{MlxError, Result};
 
 /// Bytes of the precompiled `default.metallib` produced by `build.rs` from
-/// every `src/shaders/*.metal` file.  Empty when `MLX_NATIVE_SKIP_METALLIB`
-/// was set at build time or xcrun was unavailable.
+/// every `src/shaders/*.metal` file.  Empty only when
+/// `MLX_NATIVE_SKIP_METALLIB` was set at build time (non-macOS or explicit
+/// skip); toolchain-absent on macOS is now a hard build error.
 const EMBEDDED_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/default.metallib"));
 
 /// Returns `true` when the precompiled `.metallib` fast path is enabled
@@ -1238,6 +1239,12 @@ impl KernelRegistry {
         if !self.precompiled_load_attempted {
             self.precompiled_load_attempted = true;
             if EMBEDDED_METALLIB.is_empty() {
+                eprintln!(
+                    "[mlx-native] WARN: embedded default.metallib is empty (build.rs skipped \
+                     precompiled metallib); falling back to runtime source-compile for every \
+                     shader. Set MLX_PRECOMPILED_METALLIB=0 to silence this, or rebuild with a \
+                     Metal Toolchain present for the precompiled fast path."
+                );
                 return None;
             }
             // Apple's `newLibraryWithData:` expects a dispatch_data_t.
