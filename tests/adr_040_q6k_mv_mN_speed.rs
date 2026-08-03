@@ -1,4 +1,5 @@
 //! ADR-040 §0.21c — speed sweep for `kernel_mul_mv_q6_K_f32_mN` vs plain mv.
+#![allow(non_snake_case)] // mN/mvN camel-case preserved for kernel-naming parity
 //!
 //! Measures GPU-busy time (commit_wait_with_gpu_time) for the bit-identical
 //! column-amortizing mN kernel at m=2..8 on an lm_head-like shape (large N,

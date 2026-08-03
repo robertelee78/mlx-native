@@ -96,8 +96,6 @@ kernel void tree_attention_impl(
     constexpr short NL  = NW;
     constexpr short PK  = PAD2(DK, 128);
     constexpr short PK4 = PK / 4;
-    constexpr short PV  = PAD2(DV, 128);
-    constexpr short PV4 = PV / 4;
     constexpr short SH  = 4 * C;
 
     static_assert(DK % 32 == 0, "DK must be divisible by 32");

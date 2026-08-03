@@ -1,4 +1,5 @@
 //! ADR-040 §0.21c — BYTE-IDENTITY spike for `kernel_mul_mv_q6_K_f32_mN_r1_{R1}`.
+#![allow(non_snake_case)] // mN/mvN camel-case preserved for kernel-naming parity
 //!
 //! The mN kernel amortizes the Q6_K weight read + dequant across R1 src1
 //! COLUMNS (the batched-decode m axis), vs plain `kernel_mul_mv_q6_K_f32` which

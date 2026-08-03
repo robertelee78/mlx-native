@@ -869,8 +869,6 @@ fn test_q6_k_production_shape() {
 #[test]
 #[ignore]
 fn bench_iter109_decode_hot_kernels() {
-    use std::time::Instant;
-
     bench_one_shape("Q proj  (Q6_K, m=1 n=4096 k=2816)", 1, 4096, 2816, GgmlType::Q6_K, 30);
     bench_one_shape("K proj  (Q6_K, m=1 n=2048 k=2816)", 1, 2048, 2816, GgmlType::Q6_K, 30);
     bench_one_shape("V proj  (Q6_K, m=1 n=2048 k=2816)", 1, 2048, 2816, GgmlType::Q6_K, 30);

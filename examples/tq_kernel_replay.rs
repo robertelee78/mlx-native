@@ -333,53 +333,6 @@ struct ReplayMetrics {
 // CPU helpers (mirror test_flash_attn_vec_tq.rs)
 // ---------------------------------------------------------------------------
 
-fn boundaries_4bit() -> [f32; 15] {
-    let mut b = [0.0f32; 15];
-    for i in 0..15 {
-        b[i] = (CODEBOOK_4BIT[i] + CODEBOOK_4BIT[i + 1]) / 2.0;
-    }
-    b
-}
-
-fn nearest_centroid_4bit(value: f32) -> u8 {
-    let boundaries = boundaries_4bit();
-    let mut idx: u8 = 0;
-    for &b in &boundaries {
-        if value > b {
-            idx += 1;
-        }
-    }
-    idx
-}
-
-/// Quantize a head vector into nibble-packed format (mirrors test file).
-fn nibble_quantize(x: &[f32], head_dim: usize) -> (Vec<u8>, f32) {
-    let mut rotated = x.to_vec();
-    fwht_inplace(&mut rotated).unwrap();
-
-    let norm: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm < 1e-30 {
-        return (vec![0u8; head_dim / 2], 0.0);
-    }
-
-    let inv_norm = 1.0 / norm;
-    let scale = (head_dim as f32).sqrt();
-
-    let mut packed = vec![0u8; head_dim / 2];
-    for c in 0..head_dim {
-        let scaled = rotated[c] * inv_norm * scale;
-        let idx = nearest_centroid_4bit(scaled);
-        let byte_idx = c / 2;
-        if c % 2 == 0 {
-            packed[byte_idx] = idx & 0xF;
-        } else {
-            packed[byte_idx] |= (idx & 0xF) << 4;
-        }
-    }
-
-    (packed, norm)
-}
-
 /// Dequantize from nibble-packed format (mirrors test file).
 fn nibble_dequantize(packed: &[u8], norm: f32, head_dim: usize) -> Vec<f32> {
     let inv_scale = 1.0 / (head_dim as f32).sqrt();
@@ -980,6 +933,7 @@ fn run_variation(
                 mask_type: p.mask_type,        // 2 (sliding window)
                 sliding_window: p.sliding_window, // 1024
                 softcap: p.softcap,
+                q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
             };
 
             // Mirror: ONE barrier before flash_attn_vec dispatch (publish q + k_dense + v_dense)
@@ -1142,6 +1096,7 @@ fn run_variation(
                 mask_type: p.mask_type,
                 sliding_window: p.sliding_window,
                 softcap: p.softcap,
+                q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
             };
 
             let mut floor_encoder = device.command_encoder().expect("floor encoder");
@@ -1370,7 +1325,6 @@ fn seeded_gaussian_seed(base: u64, pos: u64, idx: u64) -> u64 {
 /// by mlx-native (or we implement our own if not available).
 fn seeded_gaussian(initial: u64, n: usize) -> Vec<f32> {
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     // Simple deterministic Box-Muller using a Lehmer/LCG sequence seeded by initial.
     // Uses a linear congruential generator for portability without external deps.
@@ -1469,15 +1423,14 @@ fn run_multistep(
         // Layout: k_packed [nkv, kv_capacity, hd/2] u8; k_norms [nkv, kv_capacity] f32.
         let k_packed_bytes = nkv * kvc * (hd / 2);
         let norms_bytes = nkv * kvc * 4;
-        let k_dense_bytes = nkv * kvc * hd * 4;
 
-        let mut k_packed_buf = device
+        let k_packed_buf = device
             .alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
             .expect("alloc K packed multistep");
         let mut k_norms_buf = device
             .alloc_buffer(norms_bytes, DType::F32, vec![nkv, kvc])
             .expect("alloc K norms multistep");
-        let mut v_packed_buf = device
+        let v_packed_buf = device
             .alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
             .expect("alloc V packed multistep");
         let mut v_norms_buf = device
@@ -1506,7 +1459,7 @@ fn run_multistep(
                     .expect("alloc V token");
 
                 {
-                    let k_src_off = logical_i * nkv * hd; // NO — layout is [nkv, kvl, hd], so:
+                    // k_pre_flat layout is [nkv, kvl, hd]:
                     // k_pre_flat[kv_h * kvl_logical * hd + logical_i * hd + c]
                     // Build as [nkv, hd] interleaved.
                     let kslice = k_token_buf.as_mut_slice::<f32>().expect("write K token");
@@ -1677,6 +1630,7 @@ fn run_multistep(
             mask_type,
             sliding_window,
             softcap,
+            q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
         };
 
         {
@@ -2138,11 +2092,11 @@ fn encode_and_get_oracle(
     let k_packed_bytes = nkv * kvc * (hd / 2);
     let norms_bytes    = nkv * kvc * 4;
 
-    let mut k_packed_buf = device.alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
+    let k_packed_buf = device.alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
         .expect("alloc K packed pf");
     let mut k_norms_buf  = device.alloc_buffer(norms_bytes, DType::F32, vec![nkv, kvc])
         .expect("alloc K norms pf");
-    let mut v_packed_buf = device.alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
+    let v_packed_buf = device.alloc_buffer(k_packed_bytes, DType::U8, vec![nkv, kvc, hd / 2])
         .expect("alloc V packed pf");
     let mut v_norms_buf  = device.alloc_buffer(norms_bytes, DType::F32, vec![nkv, kvc])
         .expect("alloc V norms pf");

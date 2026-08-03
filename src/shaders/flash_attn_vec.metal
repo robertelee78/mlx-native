@@ -103,8 +103,6 @@ kernel void flash_attn_vec_impl(
     constexpr short NL  = NW;               // NE=1 -> NL=NW
     constexpr short PK  = PAD2(DK, 128);    // pad head dim to 128 boundary
     constexpr short PK4 = PK / 4;
-    constexpr short PV  = PAD2(DV, 128);
-    constexpr short PV4 = PV / 4;
     constexpr short SH  = 4 * C;            // 128 halfs = 64 floats
 
     static_assert(DK % 32 == 0, "DK must be divisible by 32");

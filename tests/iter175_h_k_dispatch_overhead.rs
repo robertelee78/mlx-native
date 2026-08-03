@@ -19,7 +19,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use metal::{ComputePipelineDescriptor, MTLSize};
-use mlx_native::{DType, MlxBuffer, MlxDevice};
+use mlx_native::{DType, MlxDevice};
 
 const TRIVIAL_KERNEL_SRC: &str = "
 #include <metal_stdlib>

@@ -160,9 +160,6 @@ using namespace metal;
 //   buffer(6): params   uint[11] = [B, T, Hg, H, K, V, BT, NT, BK, BV]
 //                                   plus float[1] scale at byte offset 40.
 
-constant uint TG_THREADS = 256u;
-constant uint NSG = 8u;        // simdgroups per threadgroup (= TG_THREADS / 32)
-
 kernel void gated_delta_net_chunk_o_bf16(
     device const bfloat *q          [[buffer(0)]],
     device const bfloat *k          [[buffer(1)]],
@@ -196,7 +193,6 @@ kernel void gated_delta_net_chunk_o_bf16(
     const uint i_v_tile = tgid.x;
     const uint i_t      = tgid.y;
     const uint i_bh     = tgid.z;
-    const uint tid      = tid3.x;
 
     const uint i_b = i_bh / H;
     const uint i_h = i_bh - i_b * H;

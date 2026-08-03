@@ -64,8 +64,6 @@ using namespace metal;
 //   buffer(1): A_inv    [B, T, H, BT] f32   (output)
 //   buffer(2): params: uint4 = (B, T, H, BT)
 
-constant constexpr uint MAX_BT = 64;  // iter-4 fixed
-
 kernel void chunk_tri_solve_invert_f32(
     device const float *A_strict [[buffer(0)]],
     device       float *A_inv    [[buffer(1)]],

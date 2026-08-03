@@ -122,7 +122,6 @@ kernel void flash_attn_vec_peer_port_f16_dk256_dv256(
     constexpr short PK4 = PK/4;            // = 64
 
     constexpr short PV  = PAD2(DV, 128);   // = 256
-    constexpr short PV4 = PV/4;            // = 64
 
     constexpr short NW  = N_SIMDWIDTH;     // = 32
     constexpr short NE  = 1;               // baked (NE_FC at file header; NE local for body expressions)

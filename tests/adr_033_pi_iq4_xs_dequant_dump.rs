@@ -126,7 +126,7 @@ fn adr033_pi_task20_dequant_iq4_xs_dump_matches_cpu() {
         .unwrap()
         .copy_from_slice(&block_bytes);
 
-    let mut dst_buf: MlxBuffer = device
+    let dst_buf: MlxBuffer = device
         .alloc_buffer(QK_K * 4, DType::F32, vec![QK_K])
         .unwrap();
 

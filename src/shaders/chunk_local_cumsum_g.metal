@@ -34,8 +34,6 @@ using namespace metal;
 //   Iter 5 perf can replace with a Hillis-Steele scan if needed; the
 //   8-threadgroup serial scan is well below noise on M5 Max.
 
-constant constexpr uint MAX_BT = 64;
-
 kernel void chunk_local_cumsum_g_f32(
     device const float *g_in     [[buffer(0)]],
     device       float *g_cumsum [[buffer(1)]],

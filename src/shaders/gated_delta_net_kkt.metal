@@ -90,8 +90,6 @@ using namespace metal;
 //   buffer(4): params   uint[8] = [B, T, Hg, H, K, BT, NT, BK]
 
 constant uint TG_THREADS = 256u;
-constant uint BT_FIXED   = 64u;   // chunk size (iter-2 fixed)
-constant uint BK_FIXED   = 64u;   // K-tile width (iter-2 fixed)
 
 kernel void gated_delta_net_kkt_bf16(
     device const bfloat *k          [[buffer(0)]],

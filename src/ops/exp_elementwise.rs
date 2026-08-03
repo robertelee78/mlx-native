@@ -130,7 +130,7 @@ mod tests {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
         let n = 64usize;
-        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.073 - 1.5)).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.073 - 1.5).collect();
 
         let mut x_buf = alloc_f32(&device, n);
         x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
@@ -195,7 +195,7 @@ mod tests {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
         let n = 16usize;
-        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.043 - 0.5)).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.043 - 0.5).collect();
 
         // Forward via mlx-native.
         let mut x_buf = alloc_f32(&device, n);

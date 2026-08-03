@@ -44,7 +44,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 struct DumpFile {
     layer: usize,
-    pos: usize,
     k_path: PathBuf,
     v_path: PathBuf,
     meta_path: PathBuf,
@@ -84,7 +83,7 @@ fn discover_dumps(dump_dir: &Path) -> Vec<DumpFile> {
 
         let path = entry.path();
         let entry = files.entry((layer, pos)).or_insert(DumpFile {
-            layer, pos,
+            layer,
             k_path: PathBuf::new(),
             v_path: PathBuf::new(),
             meta_path: PathBuf::new(),

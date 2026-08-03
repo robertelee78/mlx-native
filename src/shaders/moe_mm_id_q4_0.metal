@@ -56,7 +56,6 @@ struct MoeMmIdQ4_0Params {
 // shape and silently produces wrong outputs.
 constant constexpr int NR0 = 64;
 constant constexpr int NR1 = 32;
-constant constexpr int NK  = 32;
 
 // --------------------------------------------------------------------------
 // SKELETON ENTRY POINT (iter B-1)

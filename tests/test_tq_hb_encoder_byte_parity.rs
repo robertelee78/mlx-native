@@ -1,4 +1,5 @@
 //! ADR-007 Path C F-0.2 (iter-3): GPU-vs-CPU encoder byte parity for
+#![allow(non_snake_case)] // kL camel-case preserved for kernel-naming parity
 //! `hadamard_quantize_kv_hb` (HB byte-packed 5/6/8-bit codec).
 //!
 //! Hypothesis under test (F-0.2 falsifier first half):
@@ -747,8 +748,6 @@ fn d256_gpu_bytes_roundtrip_via_oracle_meets_gate_a() {
 #[test]
 #[ignore]
 fn bench_fa_vec_tq_hb_gemma_decode() {
-    use std::time::Instant;
-
     // Gemma-4-26b decode shape.
     let num_heads: u32 = 16;
     let num_kv_heads: u32 = 8;

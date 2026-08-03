@@ -147,8 +147,7 @@ using namespace metal;
 //   buffer(8): params      uint[8] = [B, T, Hg, H, K, V, BT, NT]
 
 constant uint BV = 32u;          // V-tile width (per-threadgroup V slice)
-constant uint TG_THREADS = 128u; // threadgroup size
-constant uint NSG = 4u;          // simdgroups per threadgroup (= TG_THREADS / 32)
+constant uint TG_THREADS = 128u; // threadgroup size (= 4 simdgroups)
 
 // bf16 round-trip — cast to bfloat then back to float to truncate
 // f32 -> bf16 -> f32 (matches PyTorch `.to(bfloat16).float()`).

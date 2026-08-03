@@ -135,7 +135,7 @@ fn h_l_wrapper_overhead() {
             ];
             enc.encode_threadgroups_with_args(&pipe, &bindings, tg, threads);
         }
-        enc.commit_and_wait();
+        enc.commit_and_wait().expect("commit_and_wait");
     }
     let mut wrap_samples = Vec::with_capacity(MEASURE);
     for _ in 0..MEASURE {
@@ -151,7 +151,7 @@ fn h_l_wrapper_overhead() {
             enc.encode_threadgroups_with_args(&pipe, &bindings, tg, threads);
         }
         wrap_samples.push(t0.elapsed().as_secs_f64() * 1e6);
-        enc.commit_and_wait();
+        enc.commit_and_wait().expect("commit_and_wait");
     }
     wrap_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let wrap_median = wrap_samples[MEASURE/2];
@@ -172,7 +172,7 @@ fn h_l_wrapper_overhead() {
             ];
             enc.dispatch_tracked_threadgroups_with_args(&pipe, &bindings, &reads, &writes, tg, threads);
         }
-        enc.commit_and_wait();
+        enc.commit_and_wait().expect("commit_and_wait");
     }
     let mut tracked_samples = Vec::with_capacity(MEASURE);
     for _ in 0..MEASURE {
@@ -188,7 +188,7 @@ fn h_l_wrapper_overhead() {
             enc.dispatch_tracked_threadgroups_with_args(&pipe, &bindings, &reads, &writes, tg, threads);
         }
         tracked_samples.push(t0.elapsed().as_secs_f64() * 1e6);
-        enc.commit_and_wait();
+        enc.commit_and_wait().expect("commit_and_wait");
     }
     tracked_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let tracked_median = tracked_samples[MEASURE/2];

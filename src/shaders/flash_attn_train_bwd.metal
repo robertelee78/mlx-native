@@ -431,8 +431,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
       continue;
     }
 
-    // Base pointer to this thread's Q and dO rows in device memory.
-    const device T* q_row_ptr  = Q_head  + (long)q_abs_this * params->Q_strides[2];
+    // Base pointer to this thread's dO row in device memory.
     const device T* do_row_ptr = dO_head + (long)q_abs_this * params->O_strides[2];
 
     // S[k] = scale * sum_d Q[q_abs_this][d] * K[k][d]

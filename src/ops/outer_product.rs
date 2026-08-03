@@ -191,7 +191,7 @@ mod tests {
         let n = 8usize;
         let m = 5usize;
         let lhs: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.1).collect();
-        let rhs: Vec<f32> = (0..m).map(|i| ((i as f32) * 0.137 - 0.3)).collect();
+        let rhs: Vec<f32> = (0..m).map(|i| (i as f32) * 0.137 - 0.3).collect();
 
         let mut lhs_buf = alloc_f32(&device, n, vec![n]);
         lhs_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&lhs);

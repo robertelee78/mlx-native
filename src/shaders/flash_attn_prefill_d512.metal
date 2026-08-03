@@ -242,8 +242,9 @@ constant int  fc_nsg   [[function_constant(322)]];
 
 // Provide sensible defaults when a function constant isn't set (avoids
 // undefined-behaviour during preview compiles).  Actual values are always
-// supplied by the dispatcher at pipeline-creation time.
-constant bool align_Q_def  = is_function_constant_defined(align_Q)  ? align_Q  : true;
+// supplied by the dispatcher at pipeline-creation time.  align_Q / align_K
+// needs no default: this kernel reads the runtime args (qL / qL_off)
+// directly instead of that function constant (see :520 hoist).
 constant bool align_K_def  = is_function_constant_defined(align_K)  ? align_K  : true;
 constant bool has_mask_def = is_function_constant_defined(has_mask) ? has_mask : false;
 constant bool do_causal_def = is_function_constant_defined(do_causal) ? do_causal : false;
@@ -309,12 +310,10 @@ void flash_attn_prefill_d512_impl(
   constexpr short DK = 512;
   constexpr short DV = 512;
 
-  constexpr short DK4  = DK / 4;
   constexpr short DK8  = DK / 8;
   // PV matches llama.cpp's PAD2(DV, 64) (ggml-metal.metal:5804); for DV=512
   // PV=512 so there is no actual padding.
   constexpr short PV   = DV;
-  constexpr short PV4  = PV / 4;
   constexpr short PV8  = PV / 8;
 
   constexpr short NW  = 32;

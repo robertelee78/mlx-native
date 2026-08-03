@@ -146,7 +146,6 @@ kernel void flash_attn_vec_tq_v2_impl(
 
     // Shared memory for KV tile: CT * max(DK4, DV4) half4 elements.
     // Reused for K tile, then V tile within each chunk.
-    constexpr short TILE_SIZE = CT * (DK4 > DV4 ? DK4 : DV4); // in half4
 
     static_assert(DK % 32 == 0, "DK must be divisible by 32");
     static_assert(DV % 32 == 0, "DV must be divisible by 32");

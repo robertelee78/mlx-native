@@ -22,7 +22,8 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 const QK_K: usize = 256;
 const BLOCK_Q4_K_BYTES: usize = 144;
 const BLOCK_Q5_K_BYTES: usize = 176;
-const BLOCK_Q6_K_BYTES: usize = 210;
+// Q6_K (210-byte blocks) is intentionally not exercised by this test —
+// see the Q6_K note above the K-quant packer below.
 
 fn xs64(state: &mut u64) -> u64 {
     *state ^= *state >> 12;

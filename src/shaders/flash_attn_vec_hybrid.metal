@@ -376,7 +376,6 @@ kernel void flash_attn_vec_hybrid_impl(
     constexpr short PK  = PAD2(DK, 128);
     constexpr short PK4 = PK / 4;
     constexpr short PV  = PAD2(DV, 128);
-    constexpr short PV4 = PV / 4;
     constexpr short SH  = 4 * C;  // 128 halfs = 64 floats
 
     static_assert(DK % 32 == 0, "DK must be divisible by 32");
@@ -791,7 +790,6 @@ kernel void flash_attn_vec_hybrid_batched_impl(
     constexpr short PK  = PAD2(DK, 128);
     constexpr short PK4 = PK / 4;
     constexpr short PV  = PAD2(DV, 128);
-    constexpr short PV4 = PV / 4;
     constexpr short SH  = 4 * C;  // 128 halfs = 64 floats
 
     static_assert(DK % 32 == 0, "DK must be divisible by 32");

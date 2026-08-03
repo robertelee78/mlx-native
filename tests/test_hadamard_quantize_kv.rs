@@ -708,14 +708,14 @@ fn test_hadamard_quantize_kv_hb_dual_byte_identity_d256() {
         for x in b.as_mut_slice::<f32>().expect("zero").iter_mut() { *x = 0.0; }
         b
     };
-    let mut pk_fused = alloc_packed("pk_f");
-    let mut pv_fused = alloc_packed("pv_f");
-    let mut nk_fused = alloc_norms("nk_f");
-    let mut nv_fused = alloc_norms("nv_f");
-    let mut pk_legacy = alloc_packed("pk_l");
-    let mut pv_legacy = alloc_packed("pv_l");
-    let mut nk_legacy = alloc_norms("nk_l");
-    let mut nv_legacy = alloc_norms("nv_l");
+    let pk_fused = alloc_packed("pk_f");
+    let pv_fused = alloc_packed("pv_f");
+    let nk_fused = alloc_norms("nk_f");
+    let nv_fused = alloc_norms("nv_f");
+    let pk_legacy = alloc_packed("pk_l");
+    let pv_legacy = alloc_packed("pv_l");
+    let nk_legacy = alloc_norms("nk_l");
+    let nv_legacy = alloc_norms("nv_l");
 
     // Fused dispatch — single launch processes both K and V via z=0/z=1.
     {
@@ -808,14 +808,14 @@ fn test_hadamard_quantize_kv_fast_dual_byte_identity_d256() {
         for x in b.as_mut_slice::<f32>().expect("zero").iter_mut() { *x = 0.0; }
         b
     };
-    let mut pk_fused = alloc_packed("pk_f");
-    let mut pv_fused = alloc_packed("pv_f");
-    let mut nk_fused = alloc_norms("nk_f");
-    let mut nv_fused = alloc_norms("nv_f");
-    let mut pk_legacy = alloc_packed("pk_l");
-    let mut pv_legacy = alloc_packed("pv_l");
-    let mut nk_legacy = alloc_norms("nk_l");
-    let mut nv_legacy = alloc_norms("nv_l");
+    let pk_fused = alloc_packed("pk_f");
+    let pv_fused = alloc_packed("pv_f");
+    let nk_fused = alloc_norms("nk_f");
+    let nv_fused = alloc_norms("nv_f");
+    let pk_legacy = alloc_packed("pk_l");
+    let pv_legacy = alloc_packed("pv_l");
+    let nk_legacy = alloc_norms("nk_l");
+    let nv_legacy = alloc_norms("nv_l");
 
     // Fused dispatch — Z-dim split handles K and V in one launch.
     {
@@ -907,14 +907,14 @@ fn test_hadamard_quantize_kv_fast_dual_byte_identity_d512() {
         for x in b.as_mut_slice::<f32>().expect("zero").iter_mut() { *x = 0.0; }
         b
     };
-    let mut pk_fused = alloc_packed("pk_f");
-    let mut pv_fused = alloc_packed("pv_f");
-    let mut nk_fused = alloc_norms("nk_f");
-    let mut nv_fused = alloc_norms("nv_f");
-    let mut pk_legacy = alloc_packed("pk_l");
-    let mut pv_legacy = alloc_packed("pv_l");
-    let mut nk_legacy = alloc_norms("nk_l");
-    let mut nv_legacy = alloc_norms("nv_l");
+    let pk_fused = alloc_packed("pk_f");
+    let pv_fused = alloc_packed("pv_f");
+    let nk_fused = alloc_norms("nk_f");
+    let nv_fused = alloc_norms("nv_f");
+    let pk_legacy = alloc_packed("pk_l");
+    let pv_legacy = alloc_packed("pv_l");
+    let nk_legacy = alloc_norms("nk_l");
+    let nv_legacy = alloc_norms("nv_l");
 
     {
         let mut enc = device.command_encoder().expect("enc fused");

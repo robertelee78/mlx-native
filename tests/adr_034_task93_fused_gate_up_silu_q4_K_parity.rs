@@ -22,7 +22,6 @@ use mlx_native::{
 };
 
 const QK_K: usize = 256;
-const K_SCALE_SIZE: usize = 12;
 
 fn pseudo_random_f32(seed: u64, n: usize) -> Vec<f32> {
     let mut state = seed;

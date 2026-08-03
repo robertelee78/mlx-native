@@ -1,4 +1,5 @@
 //! Integration tests for the flash-attention prefill kernel.
+#![allow(non_snake_case)] // qL camel-case preserved for kernel-naming parity
 //!
 //! Tests the `attention<BQ, BK, BD, WM, WN>` kernel in
 //! `src/shaders/flash_attn_prefill.metal` against a CPU reference that

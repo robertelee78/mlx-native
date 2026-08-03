@@ -1,16 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Lloyd-Max codebook for N(0,1) at 4-bit (16 centroids).
-// Must match CODEBOOK_4BIT in turboquant.rs exactly.
-constant float CODEBOOK_4BIT[16] = {
-    -2.7325896f, -2.0690172f, -1.6180464f, -1.2562312f,
-    -0.9423405f, -0.6567591f, -0.3880483f, -0.1283950f,
-     0.1283950f,  0.3880483f,  0.6567591f,  0.9423405f,
-     1.2562312f,  1.6180464f,  2.0690172f,  2.7325896f,
-};
-
-// Decision boundaries: midpoints of adjacent codebook centroids.
+// Decision boundaries: midpoints of adjacent centroids of the
+// CODEBOOK_4BIT table in turboquant.rs (single source of truth).
 // BOUNDARIES_4BIT[i] = (CODEBOOK_4BIT[i] + CODEBOOK_4BIT[i+1]) / 2
 constant float BOUNDARIES_4BIT[15] = {
     -2.4008034f,  // midpoint(-2.7325896, -2.0690172)

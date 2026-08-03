@@ -91,8 +91,7 @@ using namespace metal;
 
 // ----- constants -----
 
-constant uint RMODE_MROPE   = 8u;
-constant uint RMODE_IMROPE  = 40u;
+constant uint RMODE_IMROPE  = 40u;  // MROPE (=8, see rope_multi.rs) takes the default path
 constant uint RMODE_VISION  = 24u;
 
 // pick_axis returns position axis index (0=t/y, 1=h/x, 2=w, 3=e) for a
