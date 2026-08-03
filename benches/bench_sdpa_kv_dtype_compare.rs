@@ -82,6 +82,7 @@ fn bench_sdpa_f32(device: &MlxDevice, registry: &mut KernelRegistry) -> (f64, u6
         mask_type: 2,
         sliding_window: SLIDING_WINDOW,
         softcap: 0.0,
+        q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
     };
 
     for _ in 0..WARMUP {
@@ -129,6 +130,7 @@ fn bench_sdpa_f16(device: &MlxDevice, registry: &mut KernelRegistry) -> (f64, u6
         mask_type: 2,
         sliding_window: SLIDING_WINDOW,
         softcap: 0.0,
+        q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
     };
 
     for _ in 0..WARMUP {

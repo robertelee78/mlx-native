@@ -131,6 +131,7 @@ fn run_kernel(
         mask_type,
         sliding_window,
         softcap: 0.0,
+        q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
     };
 
     let mut encoder = device.command_encoder().expect("encoder");

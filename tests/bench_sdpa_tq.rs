@@ -288,6 +288,7 @@ fn bench_f16_sdpa(
         mask_type: 1,
         sliding_window: 0,
         softcap: 0.0,
+        q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
     };
 
     // Warmup
