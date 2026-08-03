@@ -330,15 +330,19 @@ pub(crate) fn macos_15_or_newer() -> bool {
 }
 
 unsafe fn ns_error_message(error: *mut Object) -> String {
-    let desc: *mut Object = msg_send![error, localizedDescription];
-    if desc.is_null() {
-        return "MTLResidencySet creation failed".into();
-    }
+    // Rust 2024: unsafe operations inside unsafe fn require an explicit
+    // unsafe block. Wrap the body so this is future-proof.
+    unsafe {
+        let desc: *mut Object = msg_send![error, localizedDescription];
+        if desc.is_null() {
+            return "MTLResidencySet creation failed".into();
+        }
 
-    let text: *const std::os::raw::c_char = msg_send![desc, UTF8String];
-    if text.is_null() {
-        return "MTLResidencySet creation failed".into();
-    }
+        let text: *const std::os::raw::c_char = msg_send![desc, UTF8String];
+        if text.is_null() {
+            return "MTLResidencySet creation failed".into();
+        }
 
-    CStr::from_ptr(text).to_string_lossy().into_owned()
+        CStr::from_ptr(text).to_string_lossy().into_owned()
+    }
 }

@@ -212,8 +212,10 @@ fn main() {
 
     match metallib_cmd.status() {
         Ok(s) if s.success() => {
+            // Informational, not a warning — use plain println! (visible with
+            // `cargo build -v/-vv`); don't route success through cargo:warning=.
             println!(
-                "cargo:warning=mlx-native: built default.metallib ({} shaders, {} bytes)",
+                "mlx-native: built default.metallib ({} shaders, {} bytes)",
                 air_files.len(),
                 fs::metadata(&metallib_path).map(|m| m.len()).unwrap_or(0)
             );
