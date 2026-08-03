@@ -18,3 +18,16 @@ _bmad-output/
 
 # Python fixture caches
 tests/fixtures/__pycache__/
+
+# Ruflo local secrets and runtime data
+.env
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Codex local configuration
+.codex/
+# Claude Flow runtime data
+# Environment variables
