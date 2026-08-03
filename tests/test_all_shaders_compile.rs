@@ -17,6 +17,15 @@
 //! pipeline registration. Only actual compile errors (non-zero exit code +
 //! `error:` line in stderr) fail the test.
 //!
+//! Environment hygiene (2026-08-02 RCA, mirrors build.rs): `metal` derives its
+//! default `-std` from `MACOSX_DEPLOYMENT_TARGET`. A low target (e.g. 11.0 in
+//! ~/.cargo/config.toml, meant for the CPU binary) drops the default below
+//! metal3.1 and 42 shaders fail on `bfloat` — a false negative that made this
+//! gate red for reasons unrelated to shader correctness. The Rust binary's
+//! deployment target has no bearing on GPU shader requirements, so we strip
+//! it here exactly as build.rs does: both then compile with the host
+//! toolchain's latest std, which is the configuration that actually ships.
+//!
 //! Apple-only: skipped on non-Apple targets via `cfg(target_vendor = "apple")`.
 
 #![cfg(target_vendor = "apple")]
@@ -53,6 +62,9 @@ fn all_metal_shaders_compile_via_xcrun() {
             .arg(&path)
             .arg("-o")
             .arg("/dev/null")
+            // See header: keep the CPU-binary deployment target out of
+            // shader language-version resolution (same as build.rs).
+            .env_remove("MACOSX_DEPLOYMENT_TARGET")
             .output()
             .expect("xcrun metal -c invocation");
 

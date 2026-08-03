@@ -14,6 +14,20 @@
 //!   empty embedded metallib as "not present" and falls back to runtime
 //!   source compile.
 //! - Re-runs only when a .metal file under src/shaders/ changes.
+//!
+//! Environment hygiene (2026-08-02 RCA): the `metal` frontend derives its
+//! default `-std` from `MACOSX_DEPLOYMENT_TARGET`. A low deployment target
+//! (e.g. 11.0, set machine-wide in ~/.cargo/config.toml for the CPU binary)
+//! silently drops the default below metal3.1, so `bfloat` and every newer
+//! feature fail to parse — and this build script used to swallow that into
+//! "write empty metallib, fall back to runtime compile", a silent perf
+//! regression of the exact class ADR-022 iter-68 burned on. The deployment
+//! target of the Rust CPU binary has NO bearing on GPU shader language
+//! requirements (shaders need the toolchain's best: bfloat, mpp::tensor_ops),
+//! so we strip the variable from the compiler's environment. With it gone,
+//! `metal` defaults to the host toolchain's latest std, which self-consistently
+//! tracks the shaders' requirements on every machine. Older toolchains that
+//! genuinely lack a feature still hit the graceful empty-metallib fallback.
 
 use std::env;
 use std::fs;
@@ -86,6 +100,9 @@ fn main() {
             .arg(metal_path)
             .arg("-o")
             .arg(&air_path)
+            // See header: keep the CPU-binary deployment target out of
+            // shader language-version resolution.
+            .env_remove("MACOSX_DEPLOYMENT_TARGET")
             .status();
 
         match status {
