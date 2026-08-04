@@ -1225,6 +1225,9 @@ impl KernelRegistry {
         sources.insert("deepseek_hc_split_sinkhorn_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_pre_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_post_f32".into(), deepseek_hc_src);
+        let deepseek_sparse_src: &'static str =
+            include_str!("shaders/deepseek_sparse_attention.metal");
+        sources.insert("deepseek_sparse_attention_bf16".into(), deepseek_sparse_src);
         let sdpa_decode_src: &'static str =
             include_str!("shaders/sdpa_decode.metal");
         sources.insert("sdpa_decode".into(), sdpa_decode_src);

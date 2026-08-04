@@ -15,6 +15,7 @@ pub mod dense_mm_bf16;
 pub mod dense_mm_f16;
 pub mod dense_mm_f32_f32;
 pub mod deepseek_hyper_connection;
+pub mod deepseek_sparse_attention;
 pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;
