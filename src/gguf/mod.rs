@@ -69,6 +69,7 @@ const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
+const GGML_TYPE_Q2_K: u32 = 10;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
@@ -314,6 +315,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_Q4_0 => Ok(GgmlType::Q4_0),
         GGML_TYPE_Q5_1 => Ok(GgmlType::Q5_1),
         GGML_TYPE_Q8_0 => Ok(GgmlType::Q8_0),
+        GGML_TYPE_Q2_K => Ok(GgmlType::Q2_K),
         GGML_TYPE_Q4_K => Ok(GgmlType::Q4_K),
         GGML_TYPE_Q5_K => Ok(GgmlType::Q5_K),
         GGML_TYPE_Q6_K => Ok(GgmlType::Q6_K),
@@ -460,6 +462,56 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
         let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
         (sc, m)
     }
+}
+
+/// Dequantize GGML Q2_K super-blocks to f32.
+///
+/// Each 84-byte block stores sixteen 16-value groups. `scales[g]` packs
+/// a 4-bit multiplier in its low nibble and a 4-bit minimum multiplier
+/// in its high nibble. Four consecutive groups share one two-bit plane
+/// in `qs`; the two 128-value halves use separate 32-byte regions.
+fn dequantize_q2_k(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 84;
+    const BLOCK_ELEMS: usize = 256;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "Q2_K data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "Q2_K output buffer too small".into(),
+        ));
+    }
+
+    for block_index in 0..num_blocks {
+        let block = &data[block_index * BLOCK_BYTES..(block_index + 1) * BLOCK_BYTES];
+        let scales = &block[..16];
+        let qs = &block[16..80];
+        let d = f16_from_le_bytes([block[80], block[81]]);
+        let dmin = f16_from_le_bytes([block[82], block[83]]);
+        let out = &mut output[block_index * BLOCK_ELEMS..(block_index + 1) * BLOCK_ELEMS];
+
+        for (group, &scale) in scales.iter().enumerate() {
+            let scale_value = d * (scale & 0x0f) as f32;
+            let min_value = dmin * (scale >> 4) as f32;
+            let half = group / 8;
+            let group_in_half = group % 8;
+            let shift = 2 * (group_in_half / 2);
+            let q_offset = half * 32 + (group_in_half % 2) * 16;
+
+            for lane in 0..16 {
+                let quant = (qs[q_offset + lane] >> shift) & 0x03;
+                out[group * 16 + lane] = scale_value * quant as f32 - min_value;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Dequantize Q5_K blocks to f32.
@@ -971,6 +1023,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::F16 => dequantize_f16(data, output),
         GgmlType::Q4_0 => dequantize_q4_0(data, output),
         GgmlType::Q8_0 => dequantize_q8_0(data, output),
+        GgmlType::Q2_K => dequantize_q2_k(data, output),
         GgmlType::Q4_K => dequantize_q4_k(data, output),
         GgmlType::Q6_K => dequantize_q6_k(data, output),
         GgmlType::Q5_K => dequantize_q5_k(data, output),
@@ -1240,6 +1293,7 @@ impl GgufFile {
             }
             GgmlType::Q4_0
             | GgmlType::Q8_0
+            | GgmlType::Q2_K
             | GgmlType::Q4_K
             | GgmlType::Q5_K
             | GgmlType::Q6_K

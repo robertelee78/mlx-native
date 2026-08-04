@@ -64,6 +64,15 @@ typedef struct {
     int8_t qs[QK8_0];
 } block_q8_0;
 
+typedef struct {
+    uint8_t scales[QK_K/16];
+    uint8_t qs[QK_K/4];
+    half    d;
+    half    dmin;
+} block_q2_K;
+static_assert(sizeof(block_q2_K) == 2*sizeof(half) + QK_K/16 + QK_K/4,
+              "wrong q2_K block size");
+
 // Q5_K: 256 values per block, 176 bytes per block.
 // Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qh[32]][uint8_t qs[128]]
 typedef struct {
@@ -539,6 +548,82 @@ kernel void kernel_mul_mv_id_q8_0_f32(
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < p.ne01) {
             dst[output_row * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// Expert-routed sibling of the dense correctness-first Q2_K matvec.
+kernel void kernel_mul_mv_id_q2_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr = 4;
+    const int output_row = int(tgpig.y);
+    if (output_row >= p.ne1) return;
+
+    const int nb = p.ne00 / QK_K;
+    const uint token_idx = uint(output_row) / p.top_k;
+    const uint expert_id = ids[output_row];
+    const int first_row = (int(tgpig.x) * N_SIMDGROUP + int(sgitg)) * nr;
+    device const block_q2_K * x = (device const block_q2_K *)(src0 + expert_id*p.expert_stride)
+                                      + first_row*nb;
+    device const float * y = src1 + token_idx*p.ne10;
+    float yl[32];
+    float sumf[nr] = {0.f};
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8*ir) / 16;
+    device const float * y4 = y + ix*QK_K + 128*iq + 8*ir;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+            yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+            yl[i + 16] = y4[i + 64]; sumy[2] += yl[i + 16];
+            yl[i + 24] = y4[i + 96]; sumy[3] += yl[i + 24];
+        }
+
+        for (int row = 0; row < nr; ++row) {
+            device const block_q2_K * block = x + ib + row*nb;
+            device const uint8_t * sc = block->scales + 8*iq + is;
+            device const uint16_t * qs = (device const uint16_t *)block->qs + 16*iq + 4*ir;
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (int i = 0; i < 8; i += 2) {
+                acc1[0] += yl[i +  0] * (qs[i/2] & 0x0003);
+                acc2[0] += yl[i +  1] * (qs[i/2] & 0x0300);
+                acc1[1] += yl[i +  8] * (qs[i/2] & 0x000c);
+                acc2[1] += yl[i +  9] * (qs[i/2] & 0x0c00);
+                acc1[2] += yl[i + 16] * (qs[i/2] & 0x0030);
+                acc2[2] += yl[i + 17] * (qs[i/2] & 0x3000);
+                acc1[3] += yl[i + 24] * (qs[i/2] & 0x00c0);
+                acc2[3] += yl[i + 25] * (qs[i/2] & 0xc000);
+            }
+            const float d = block->d;
+            const float dmin = float(block->dmin) / 16.f;
+            sumf[row] += d * ((acc1[0] + acc2[0]/256.f) * (sc[0] & 0x0f) +
+                              (acc1[1] + acc2[1]/256.f) * (sc[2] & 0x0f) / 4.f +
+                              (acc1[2] + acc2[2]/256.f) * (sc[4] & 0x0f) / 16.f +
+                              (acc1[3] + acc2[3]/256.f) * (sc[6] & 0x0f) / 64.f) -
+                         dmin * (sumy[0] * (sc[0] & 0xf0) + sumy[1] * (sc[2] & 0xf0) +
+                                 sumy[2] * (sc[4] & 0xf0) + sumy[3] * (sc[6] & 0xf0));
+        }
+        y4 += 4*QK_K;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row*p.ne0 + first_row + row] = total;
         }
     }
 }

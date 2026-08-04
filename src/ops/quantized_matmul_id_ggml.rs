@@ -75,6 +75,7 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
+            GgmlType::Q2_K => "kernel_mul_mv_id_q2_K_f32",
             // ADR-013 P7 — Q4_K mv_id ported from llama.cpp
             // (ggml-metal.metal:10349) for dwq46/dwq48 MoE expert weights.
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
@@ -105,7 +106,7 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::Q2_K => "unsupported",
             // ADR-033 §Pi Task #20 — IQ4_XS mm_id ported (simdgroup MMA
             // path). Tensor-API variant is not yet ported; tests fall
             // back to the simdgroup path via TENSOR_MM_ID_AVAILABLE probe.
@@ -127,7 +128,7 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL tensor-API mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::Q2_K => "unsupported",
             // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
             // SHIPPED 2026-05-22 to close the prefill perf gap vs llama.cpp.
             GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32",
@@ -332,6 +333,7 @@ fn quantized_matmul_id_ggml_impl(
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     // ADR-022 Phase 2 — Q5_K mm_id ported.
     if !force_mv
+        && !matches!(params.ggml_type, GgmlType::Q2_K)
         && params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
@@ -461,7 +463,8 @@ pub fn quantized_matmul_id_ggml_pooled(
     // ADR-022 AC-4: env-gated trace (HF2Q_LOG_MM_ID_ROUTE=1) confirms mm_id
     // engagement on the qwen35 prefill path which goes through this pooled
     // entry, not the auto entry above.
-    if params.n_tokens > mm_id_routing_threshold()
+    if !matches!(params.ggml_type, GgmlType::Q2_K)
+        && params.n_tokens > mm_id_routing_threshold()
         && (params.top_k == 1 || params.top_k == 8)
         && params.k >= 32
     {
@@ -596,6 +599,7 @@ fn dispatch_id_mv(
         // ADR-033 §Pi Task #16 — IQ4_XS mv_id mirrors IQ4_NL's
         // (N_SIMDGROUP=2, N_DST=4, NWG=2) launch geometry.
         | GgmlType::IQ4_XS => (8u64, 8u64, 8usize),
+        GgmlType::Q2_K => (2u64, 32u64, 8usize),
         // Q4_K, Q5_K, and Q6_K all use the 2-row-per-threadgroup (2, 32)
         // geometry.  ADR-013 P7 — Q4_K added; mirrors Q5_K (NSG=2,
         // 1 row per simdgroup; same kmask scale-decode).

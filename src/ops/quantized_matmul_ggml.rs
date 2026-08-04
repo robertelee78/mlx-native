@@ -6,7 +6,7 @@
 //! Weight buffers contain raw GGML blocks — the same bytes that come from
 //! GGUF mmap. No intermediate conversion.
 //!
-//! Supported formats: Q4_0 (4-bit), Q8_0 (8-bit), Q6_K (6-bit super-block).
+//! Supported formats include Q2_K, Q4_0, Q8_0, and K-quants through Q6_K.
 //!
 //! Portions derived from candle-metal-kernels v0.10.2 (Apache-2.0) and
 //! llama.cpp (MIT). See src/shaders/quantized_matmul_ggml.metal for full
@@ -44,6 +44,11 @@ const BLOCK_Q8_0_BYTES: u32 = 34;
 /// Q4_K: 256 values per block, 144 bytes per block.
 const QK4_K: u32 = 256;
 const BLOCK_Q4_K_BYTES: u32 = 144;
+
+/// Q2_K: 256 values per block, 84 bytes per block.
+/// Layout: scales[16] + qs[64] + d(f16) + dmin(f16).
+const QK2_K: u32 = 256;
+const BLOCK_Q2_K_BYTES: u32 = 84;
 
 /// Q5_K: 256 values per block, 176 bytes per block.
 /// Block layout: d(fp16) + dmin(fp16) + scales[12] + qh[32] + qs[128] = 176.
@@ -97,6 +102,8 @@ pub enum GgmlType {
     Q4_0,
     /// 8-bit quantization. 32 values per block, 34 bytes per block.
     Q8_0,
+    /// 2-bit super-block quantization. 256 values per block, 84 bytes per block.
+    Q2_K,
     /// 4-bit super-block quantization. 256 values per block, 144 bytes per block.
     Q4_K,
     /// 5-bit super-block quantization. 256 values per block, 176 bytes per block.
@@ -136,6 +143,7 @@ impl GgmlType {
             GgmlType::F16 => 1,
             GgmlType::Q4_0 => QK4_0,
             GgmlType::Q8_0 => QK8_0,
+            GgmlType::Q2_K => QK2_K,
             GgmlType::Q4_K => QK4_K,
             GgmlType::Q5_K => QK5_K,
             GgmlType::Q6_K => QK6_K,
@@ -153,6 +161,7 @@ impl GgmlType {
             GgmlType::F16 => 2,
             GgmlType::Q4_0 => BLOCK_Q4_0_BYTES,
             GgmlType::Q8_0 => BLOCK_Q8_0_BYTES,
+            GgmlType::Q2_K => BLOCK_Q2_K_BYTES,
             GgmlType::Q4_K => BLOCK_Q4_K_BYTES,
             GgmlType::Q5_K => BLOCK_Q5_K_BYTES,
             GgmlType::Q6_K => BLOCK_Q6_K_BYTES,
@@ -171,6 +180,7 @@ impl GgmlType {
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
+            GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
             // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp.
             GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
             // ADR-022 Phase 2 — Q5_K dense mv ported.
@@ -196,7 +206,8 @@ impl GgmlType {
             // ADR-022 Phase 3 — Q4_K dense mm ported.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16 => "unsupported",
+            | GgmlType::I16
+            | GgmlType::Q2_K => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_f32",
@@ -219,7 +230,8 @@ impl GgmlType {
             // ADR-022 Phase 3: Q4_K tensor mm landed.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16 => "unsupported",
+            | GgmlType::I16
+            | GgmlType::Q2_K => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_f32",
@@ -241,7 +253,8 @@ impl GgmlType {
         match self {
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16 => "unsupported",
+            | GgmlType::I16
+            | GgmlType::Q2_K => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_v2_f32",
@@ -411,6 +424,7 @@ pub fn quantized_matmul_ggml(
         // ADR-022 Phase 2 — Q5_K added (mv + mm + mm_tensor).
         GgmlType::Q4_0
         | GgmlType::Q8_0
+        | GgmlType::Q2_K
         | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -494,7 +508,9 @@ pub fn quantized_matmul_ggml(
     // ADR-022 Phase 3 — Q4_K dense mm + mm_tensor ported. All quantized
     // types now have a real mm path; the mm_supported guard is a
     // compatibility no-op kept for future "type not yet ported" cases.
-    let mm_supported = true;
+    // Q2_K currently has a correctness-first Metal matvec kernel. Route all
+    // batch sizes through it until a separately parity-proven MM kernel lands.
+    let mm_supported = !matches!(params.ggml_type, GgmlType::Q2_K);
     // ADR-040 §0.21 decode F3 lever: at small continuous-batching decode width
     // m∈[2,8], route quantized matmuls to the weight-amortizing `mul_mv_ext`
     // kernel (llama.cpp's small-batch path, ggml-metal-ops.cpp:2079-2133:
@@ -787,6 +803,8 @@ fn dispatch_mv(
         // IQ4_NL's (N_SIMDGROUP=2, N_DST=4) geometry so the
         // launch tuple (8, 8, 8) is shared.
         | GgmlType::IQ4_XS => (8u64, 8u64, 8usize),
+        // Q2_K uses two simdgroups with four output rows per simdgroup.
+        GgmlType::Q2_K => (2u64, 32u64, 8usize),
         // Q4_K / Q5_K (ADR-022 Phase 2) mirror Q6_K's 2-row-per-tg geometry.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         _ => unreachable!(),

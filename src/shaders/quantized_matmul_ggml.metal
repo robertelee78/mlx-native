@@ -95,6 +95,17 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(half) + QK8_0, "wrong q8_0 block size");
 
+// Q2_K: 16 groups of 16 values in one 256-value super-block.
+// Each scale byte packs a 4-bit scale and 4-bit minimum multiplier.
+typedef struct {
+    uint8_t scales[QK_K/16];
+    uint8_t qs[QK_K/4];
+    half    d;
+    half    dmin;
+} block_q2_K;
+static_assert(sizeof(block_q2_K) == 2*sizeof(half) + QK_K/16 + QK_K/4,
+              "wrong q2_K block size");
+
 typedef struct {
     uint8_t ql[QK_K/2];      // lower 4 bits of 6-bit values
     uint8_t qh[QK_K/4];      // upper 2 bits of 6-bit values
@@ -625,6 +636,85 @@ kernel void kernel_mul_mv_q8_0_f32(
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < p.ne01) {
             dst[r1 * p.ne0 + im * p.ne0 * p.ne1 + first_row + row] = tot;
+        }
+    }
+}
+
+// Correctness-first Q2_K matvec. Each simdgroup owns four output rows;
+// its 32 lanes partition every 256-value super-block into eight values.
+kernel void kernel_mul_mv_q2_K_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr = 4;
+    const int nb = p.ne00 / QK_K;
+    const int first_row = (int(tgpig.x) * N_SIMDGROUP + int(sgitg)) * nr;
+    const int input_row = int(tgpig.y);
+    const int im = int(tgpig.z);
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
+    const uint offset0 = first_row * nb
+        + (i12/QMM_R2(p)) * (nb*p.ne01)
+        + (i13/QMM_R3(p)) * (nb*p.ne01*p.ne02);
+
+    device const block_q2_K * x = (device const block_q2_K *)src0 + offset0;
+    device const float * y = src1 + input_row*p.ne10 + im*p.ne00*p.ne1;
+    float yl[32];
+    float sumf[nr] = {0.f};
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8*ir) / 16;
+    device const float * y4 = y + ix*QK_K + 128*iq + 8*ir;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+            yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+            yl[i + 16] = y4[i + 64]; sumy[2] += yl[i + 16];
+            yl[i + 24] = y4[i + 96]; sumy[3] += yl[i + 24];
+        }
+
+        for (int row = 0; row < nr; ++row) {
+            device const block_q2_K * block = x + ib + row*nb;
+            device const uint8_t * sc = block->scales + 8*iq + is;
+            device const uint16_t * qs = (device const uint16_t *)block->qs + 16*iq + 4*ir;
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (int i = 0; i < 8; i += 2) {
+                acc1[0] += yl[i +  0] * (qs[i/2] & 0x0003);
+                acc2[0] += yl[i +  1] * (qs[i/2] & 0x0300);
+                acc1[1] += yl[i +  8] * (qs[i/2] & 0x000c);
+                acc2[1] += yl[i +  9] * (qs[i/2] & 0x0c00);
+                acc1[2] += yl[i + 16] * (qs[i/2] & 0x0030);
+                acc2[2] += yl[i + 17] * (qs[i/2] & 0x3000);
+                acc1[3] += yl[i + 24] * (qs[i/2] & 0x00c0);
+                acc2[3] += yl[i + 25] * (qs[i/2] & 0xc000);
+            }
+            const float d = block->d;
+            const float dmin = float(block->dmin) / 16.f;
+            sumf[row] += d * ((acc1[0] + acc2[0]/256.f) * (sc[0] & 0x0f) +
+                              (acc1[1] + acc2[1]/256.f) * (sc[2] & 0x0f) / 4.f +
+                              (acc1[2] + acc2[2]/256.f) * (sc[4] & 0x0f) / 16.f +
+                              (acc1[3] + acc2[3]/256.f) * (sc[6] & 0x0f) / 64.f) -
+                         dmin * (sumy[0] * (sc[0] & 0xf0) + sumy[1] * (sc[2] & 0xf0) +
+                                 sumy[2] * (sc[4] & 0xf0) + sumy[3] * (sc[6] & 0xf0));
+        }
+        y4 += 4*QK_K;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[input_row*p.ne0 + im*p.ne0*p.ne1 + first_row + row] = total;
         }
     }
 }

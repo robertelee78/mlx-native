@@ -140,6 +140,7 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_ggml.metal");
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_q2_K_f32".into(), ggml_src);
         // ADR-028 iter-368: peer-style NSG=4 NR=2 variant (128 threads/TG).
         sources.insert("kernel_mul_mv_q8_0_f32_nr2".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
@@ -341,6 +342,7 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_ggml.metal");
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q2_K_f32".into(), ggml_id_src);
         // ADR-013 P7 — Q4_K MoE expert-routed mat-vec (port of
         // llama.cpp's kernel_mul_mv_id_q4_K_f32 at ggml-metal.metal:10349).
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);

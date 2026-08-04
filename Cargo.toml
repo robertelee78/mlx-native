@@ -94,6 +94,10 @@ name = "bench_decode_qmatmul_shapes"
 harness = false
 
 [[bench]]
+name = "bench_deepseek_q2_k"
+harness = false
+
+[[bench]]
 name = "bench_decode_moe_id_shapes"
 harness = false
 
