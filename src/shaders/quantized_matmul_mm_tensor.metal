@@ -79,6 +79,13 @@ typedef struct {
 } block_q8_0;
 
 typedef struct {
+    uint8_t scales[QK_K/16];
+    uint8_t qs[QK_K/4];
+    half    d;
+    half    dmin;
+} block_q2_K;
+
+typedef struct {
     uint8_t ql[QK_K/2];
     uint8_t qh[QK_K/4];
     int8_t  scales[QK_K/16];
@@ -161,6 +168,26 @@ void dequantize_q8_0_t(device const block_q8_0 * xb, short il, thread type4x4 & 
     }
 
     reg = (type4x4) reg_f;
+}
+
+// Pinned llama.cpp 6ea215d17 ggml-metal.metal::dequantize_q2_K.
+template <typename type4x4>
+void dequantize_q2_K_t(device const block_q2_K * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    const float min = xb->dmin;
+    device const uint8_t * q = (device const uint8_t *)xb->qs;
+    const uint8_t sc = xb->scales[il];
+
+    q = q + 32*(il/8) + 16*(il&1);
+    il = (il/2)%4;
+
+    const half coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    const uchar mask = il>1 ? (il>2 ? 192 : 48) : (il>0 ? 12 : 3);
+    const float dl = d * (sc & 0xF) * coef;
+    const float ml = min * (sc >> 4);
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
 }
 
 template <typename type4x4>
@@ -755,6 +782,11 @@ kernel void hf2q_mul_mm_tensor_v2_impl<block_q8_0, 2, dequantize_q8_0_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
+template [[host_name("kernel_mul_mm_q2_K_tensor_v2_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q2_K, QK_NL, dequantize_q2_K_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
 template [[host_name("kernel_mul_mm_q6_K_tensor_v2_f32")]]
 kernel void hf2q_mul_mm_tensor_v2_impl<block_q6_K, QK_NL, dequantize_q6_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
@@ -789,6 +821,11 @@ kernel void hf2q_mul_mm_tensor_impl<block_q4_0, 2, dequantize_q4_0_t>(
 
 template [[host_name("kernel_mul_mm_q8_0_tensor_f32")]]
 kernel void hf2q_mul_mm_tensor_impl<block_q8_0, 2, dequantize_q8_0_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_q2_K_tensor_f32")]]
+kernel void hf2q_mul_mm_tensor_impl<block_q2_K, QK_NL, dequantize_q2_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 

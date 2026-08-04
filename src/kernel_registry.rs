@@ -174,6 +174,7 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_mm.metal");
         sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_q2_K_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q6_K_f32".into(), ggml_mm_src);
         // ADR-022 Phase 1 — dense Q5_1 / IQ4_NL mm.
         sources.insert("kernel_mul_mm_q5_1_f32".into(), ggml_mm_src);
@@ -199,6 +200,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q4_0_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q2_K_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL tensor mm.
         sources.insert("kernel_mul_mm_q5_1_tensor_f32".into(), ggml_mm_tensor_src);
@@ -224,6 +226,7 @@ impl KernelRegistry {
         // dispatcher can pick V1 vs V2 at runtime via HF2Q_LARGE_TILE_MM.
         sources.insert("kernel_mul_mm_q4_0_tensor_v2_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q8_0_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q2_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q5_1_tensor_v2_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_iq4_nl_tensor_v2_f32".into(), ggml_mm_tensor_src);
@@ -375,9 +378,11 @@ impl KernelRegistry {
         let ggml_id_mm_src: &'static str =
             include_str!("shaders/quantized_matmul_id_mm.metal");
         sources.insert("kernel_mul_mm_id_map0_ne20_1".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_map0_ne20_6".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_q2_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
         // ADR-013 P16 — Q4_K mm_id (port of llama.cpp ggml-metal.metal:10169).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
@@ -404,6 +409,7 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_mm_tensor.metal");
         sources.insert("kernel_mul_mm_id_q4_0_tensor_f32".into(), ggml_id_mm_tensor_src);
         sources.insert("kernel_mul_mm_id_q8_0_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert("kernel_mul_mm_id_q2_K_tensor_f32".into(), ggml_id_mm_tensor_src);
         sources.insert("kernel_mul_mm_id_q6_K_tensor_f32".into(), ggml_id_mm_tensor_src);
         // ADR-013 P16 — Q4_K tensor-API mm_id.
         sources.insert("kernel_mul_mm_id_q4_K_tensor_f32".into(), ggml_id_mm_tensor_src);

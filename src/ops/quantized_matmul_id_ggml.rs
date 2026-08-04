@@ -97,6 +97,7 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
+            GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_f32",
             // ADR-022 Phase 2 — Q5_K mm_id ported.
             GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
@@ -106,7 +107,7 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::Q2_K => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
             // ADR-033 §Pi Task #20 — IQ4_XS mm_id ported (simdgroup MMA
             // path). Tensor-API variant is not yet ported; tests fall
             // back to the simdgroup path via TENSOR_MM_ID_AVAILABLE probe.
@@ -120,6 +121,7 @@ impl GgmlType {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
+            GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_tensor_f32",
             // ADR-022 Phase 2 — Q5_K mm_id_tensor ported.
             GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
@@ -128,12 +130,19 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL tensor-API mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::Q2_K => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
             // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
             // SHIPPED 2026-05-22 to close the prefill perf gap vs llama.cpp.
             GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32",
         }
     }
+}
+
+#[inline]
+fn has_mm_id_map0(top_k: u32) -> bool {
+    // Exact template set used by the production models currently supported:
+    // top-k 6 is DeepSeek-V4; 1 and 8 retain the existing Gemma/Qwen paths.
+    matches!(top_k, 1 | 6 | 8)
 }
 
 /// One-shot probe for mm_id tensor-API availability.  Cached separately
@@ -323,8 +332,8 @@ fn quantized_matmul_id_ggml_impl(
     // P3b-tensor.2 — extended to top_k=1 (Gemma 4's MoE down call).
     // Without this the down call's 19,640-row matmul falls back to mv_id
     // and re-reads each expert's weights once per row — ~50% of prefill
-    // wall time burnt on weight re-reads.  Today we have ne20_1 and
-    // ne20_8 instantiations; other top_k values still fall back to mv_id.
+    // wall time burnt on weight re-reads.  The map0 template set is
+    // {1, 6, 8}; other top_k values still fall back to mv_id.
     //
     // Falls back to the mv_id path for:
     //   * decode (n_tokens <= 8)
@@ -333,9 +342,8 @@ fn quantized_matmul_id_ggml_impl(
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     // ADR-022 Phase 2 — Q5_K mm_id ported.
     if !force_mv
-        && !matches!(params.ggml_type, GgmlType::Q2_K)
         && params.n_tokens > mm_id_routing_threshold()
-        && (params.top_k == 1 || params.top_k == 8)
+        && has_mm_id_map0(params.top_k)
         && params.k >= 32
     {
         // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
@@ -365,7 +373,7 @@ fn quantized_matmul_id_ggml_impl(
 /// `MTLDevice.newBufferWithLength:` allocations the auto entry point
 /// incurs (ADR-011 Phase 3 Wave P3b — "scratch pooling").
 ///
-/// When the dispatch routes to the mv_id path (decode / top_k != 8 /
+/// When the dispatch routes to the mv_id path (decode / unsupported top_k /
 /// K < 32), the scratch is not touched — it is only used on the mm_id
 /// path.  Callers may over-size the scratch once per prefill and share
 /// it across every mm_id call in the forward pass.
@@ -456,16 +464,15 @@ pub fn quantized_matmul_id_ggml_pooled(
         )));
     }
 
-    // P3b-tensor.2 — accept top_k ∈ {1, 8} (Gemma 4's MoE down/gate_up).
+    // Accept the exact map0 template set {1, 6, 8}; top-k 6 serves DeepSeek-V4.
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     // ADR-022 Phase 2 — Q5_K mm_id ported.  Previous bypass here
     // is retired (kernels live in id_mm.metal + id_mm_tensor.metal).
     // ADR-022 AC-4: env-gated trace (HF2Q_LOG_MM_ID_ROUTE=1) confirms mm_id
     // engagement on the qwen35 prefill path which goes through this pooled
     // entry, not the auto entry above.
-    if !matches!(params.ggml_type, GgmlType::Q2_K)
-        && params.n_tokens > mm_id_routing_threshold()
-        && (params.top_k == 1 || params.top_k == 8)
+    if params.n_tokens > mm_id_routing_threshold()
+        && has_mm_id_map0(params.top_k)
         && params.k >= 32
     {
         if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
@@ -1274,6 +1281,7 @@ pub fn dispatch_id_mm_for_test(
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q8_0
+        | GgmlType::Q2_K
         | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -1301,9 +1309,9 @@ pub fn dispatch_id_mm_for_test(
 
     // Match the top_k template instantiations available in the shader.
     // P3b-tensor.2 — added ne20_1 alongside ne20_8 (Gemma 4 MoE down).
-    if params.top_k != 1 && params.top_k != 8 {
+    if !has_mm_id_map0(params.top_k) {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_id_mm_for_test: top_k {} has no map0 instantiation (need 1 or 8)",
+            "dispatch_id_mm_for_test: top_k {} has no map0 instantiation (need 1, 6, or 8)",
             params.top_k
         )));
     }
@@ -1368,6 +1376,7 @@ pub fn dispatch_id_mm_for_test(
     // ~50% of prefill time wasted on weight re-reads.
     let map0_kernel_name = match params.top_k {
         1 => "kernel_mul_mm_id_map0_ne20_1",
+        6 => "kernel_mul_mm_id_map0_ne20_6",
         8 => "kernel_mul_mm_id_map0_ne20_8",
         other => return Err(MlxError::InvalidArgument(format!(
             "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",

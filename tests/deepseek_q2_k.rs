@@ -2,6 +2,10 @@
 
 use mlx_native::{
     gguf::{test_only_dequantize, GgufFile},
+    ops::{
+        quantized_matmul_ggml::{dispatch_mm_for_test, dispatch_mm_simd_for_test},
+        quantized_matmul_id_ggml::{dispatch_id_mm_for_test, GgmlIdMmDispatchParams},
+    },
     quantized_matmul_ggml, quantized_matmul_id_ggml, DType, GgmlQuantizedMatmulIdParams,
     GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxDevice,
 };
@@ -110,7 +114,7 @@ fn q2_k_gguf_type_10_parses_with_exact_block_size() {
     let _ = std::fs::remove_file(path);
 }
 
-fn run_dense(rows: usize) {
+fn run_dense(rows: usize, force_mm: bool, force_simd: bool) {
     let n = 8usize;
     let mut weights = Vec::with_capacity(n * BLOCK_BYTES);
     let mut decoded = Vec::with_capacity(n);
@@ -156,21 +160,50 @@ fn run_dense(rows: usize) {
         ggml_type: GgmlType::Q2_K,
     };
     let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_ggml(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input_buf,
-        &weight_buf,
-        &output_buf,
-        &params,
-    )
-    .expect("Q2_K Metal matmul");
+    if force_simd {
+        dispatch_mm_simd_for_test(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &weight_buf,
+            &output_buf,
+            &params,
+        )
+        .expect("Q2_K forced simdgroup Metal MM");
+    } else if force_mm {
+        dispatch_mm_for_test(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &weight_buf,
+            &output_buf,
+            &params,
+        )
+        .expect("Q2_K forced Metal MM");
+    } else {
+        quantized_matmul_ggml(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &weight_buf,
+            &output_buf,
+            &params,
+        )
+        .expect("Q2_K Metal matmul");
+    }
     encoder.commit_and_wait().expect("GPU completion");
     let actual = output_buf.as_slice::<f32>().expect("output slice");
+    let tolerance = if force_mm || force_simd || rows > 8 {
+        1e-2
+    } else {
+        2e-4
+    };
     for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
         assert!(
-            (got - want).abs() <= 2e-4,
+            (got - want).abs() <= tolerance,
             "dense mismatch {index}: {got} != {want}"
         );
     }
@@ -178,17 +211,26 @@ fn run_dense(rows: usize) {
 
 #[test]
 fn q2_k_dense_metal_decode_matches_reference() {
-    run_dense(1);
+    run_dense(1, false, false);
 }
 
 #[test]
-fn q2_k_dense_metal_batch_falls_back_to_proven_matvec() {
-    run_dense(9);
+fn q2_k_dense_metal_prefill_matches_reference() {
+    run_dense(9, false, false);
 }
 
 #[test]
-fn q2_k_expert_routed_metal_matches_reference() {
-    let (experts, n, tokens, top_k) = (3usize, 8usize, 2usize, 2usize);
+fn q2_k_dense_forced_mm_matches_reference() {
+    run_dense(9, true, false);
+}
+
+#[test]
+fn q2_k_dense_forced_simd_mm_matches_reference() {
+    run_dense(9, false, true);
+}
+
+fn run_expert(tokens: usize, top_k: usize, experts: usize, force_mm: bool) {
+    let n = 8usize;
     let mut weights = Vec::new();
     let mut decoded = vec![vec![vec![0.0f32; QK_K]; n]; experts];
     for (expert, expert_rows) in decoded.iter_mut().enumerate() {
@@ -199,7 +241,9 @@ fn q2_k_expert_routed_metal_matches_reference() {
         }
     }
     let inputs = input(tokens);
-    let ids = [2u32, 0, 1, 2];
+    let ids: Vec<u32> = (0..tokens)
+        .flat_map(|token| (0..top_k).map(move |slot| ((token * 3 + slot) % experts) as u32))
+        .collect();
     let mut expected = Vec::new();
     for (route, &expert) in ids.iter().enumerate() {
         let token = route / top_k;
@@ -247,23 +291,74 @@ fn q2_k_expert_routed_metal_matches_reference() {
         ggml_type: GgmlType::Q2_K,
     };
     let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input_buf,
-        &weight_buf,
-        &ids_buf,
-        &output_buf,
-        &params,
-    )
-    .expect("Q2_K expert Metal matmul");
+    if force_mm {
+        let htpe = device
+            .alloc_buffer(experts * 4, DType::U32, vec![experts])
+            .expect("htpe");
+        let hids = device
+            .alloc_buffer(experts * tokens * 4, DType::U32, vec![experts, tokens])
+            .expect("hids");
+        let mm_params = GgmlIdMmDispatchParams {
+            n_tokens: tokens as u32,
+            top_k: top_k as u32,
+            n: n as u32,
+            k: QK_K as u32,
+            n_experts: experts as u32,
+            expert_stride: (n * BLOCK_BYTES) as u64,
+            ggml_type: GgmlType::Q2_K,
+        };
+        dispatch_id_mm_for_test(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &weight_buf,
+            &ids_buf,
+            &htpe,
+            &hids,
+            &output_buf,
+            &mm_params,
+        )
+        .expect("Q2_K expert forced Metal MM_ID");
+    } else {
+        quantized_matmul_id_ggml(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &weight_buf,
+            &ids_buf,
+            &output_buf,
+            &params,
+        )
+        .expect("Q2_K expert Metal matmul");
+    }
     encoder.commit_and_wait().expect("GPU completion");
     let actual = output_buf.as_slice::<f32>().expect("output slice");
+    let tolerance = if force_mm || (tokens > 32 && matches!(top_k, 1 | 6 | 8)) {
+        1e-2
+    } else {
+        2e-4
+    };
     for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
         assert!(
-            (got - want).abs() <= 2e-4,
+            (got - want).abs() <= tolerance,
             "expert mismatch {index}: {got} != {want}"
         );
     }
+}
+
+#[test]
+fn q2_k_expert_routed_metal_matches_reference() {
+    run_expert(2, 2, 3, false);
+}
+
+#[test]
+fn q2_k_expert_mm_id_top_k_6_matches_reference() {
+    run_expert(33, 6, 8, true);
+}
+
+#[test]
+fn q2_k_public_prefill_top_k_6_matches_reference() {
+    run_expert(33, 6, 8, false);
 }

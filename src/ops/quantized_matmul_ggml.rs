@@ -206,8 +206,8 @@ impl GgmlType {
             // ADR-022 Phase 3 — Q4_K dense mm ported.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::Q2_K => "unsupported",
+            | GgmlType::I16 => "unsupported",
+            GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_f32",
@@ -230,8 +230,8 @@ impl GgmlType {
             // ADR-022 Phase 3: Q4_K tensor mm landed.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::Q2_K => "unsupported",
+            | GgmlType::I16 => "unsupported",
+            GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_f32",
@@ -253,8 +253,8 @@ impl GgmlType {
         match self {
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::Q2_K => "unsupported",
+            | GgmlType::I16 => "unsupported",
+            GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_v2_f32",
@@ -508,9 +508,9 @@ pub fn quantized_matmul_ggml(
     // ADR-022 Phase 3 — Q4_K dense mm + mm_tensor ported. All quantized
     // types now have a real mm path; the mm_supported guard is a
     // compatibility no-op kept for future "type not yet ported" cases.
-    // Q2_K currently has a correctness-first Metal matvec kernel. Route all
-    // batch sizes through it until a separately parity-proven MM kernel lands.
-    let mm_supported = !matches!(params.ggml_type, GgmlType::Q2_K);
+    // Types without a parity-proven MM kernel remain on the matvec fallback.
+    // Q2_K joins the proven K-quant MM family; IQ4_XS is still mv-only here.
+    let mm_supported = !matches!(params.ggml_type, GgmlType::IQ4_XS);
     // ADR-040 §0.21 decode F3 lever: at small continuous-batching decode width
     // m∈[2,8], route quantized matmuls to the weight-amortizing `mul_mv_ext`
     // kernel (llama.cpp's small-batch path, ggml-metal-ops.cpp:2079-2133:
@@ -586,7 +586,7 @@ pub fn quantized_matmul_ggml(
         );
     }
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
-        dispatch_mm(encoder, registry, device, input, weight, output, params)
+        dispatch_mm(encoder, registry, device, input, weight, output, params, false)
     } else {
         dispatch_mv(encoder, registry, device, input, weight, output, params)
     }
@@ -695,11 +695,34 @@ pub fn dispatch_mm_for_test(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    validate_mm_for_test(params)?;
+    dispatch_mm(encoder, registry, device, input, weight, output, params, false)
+}
+
+/// Test-only helper that forces the non-tensor simdgroup-MMA fallback.
+/// This proves the path used on devices without Metal tensor support while
+/// leaving the production capability probe and routing unchanged.
+#[doc(hidden)]
+pub fn dispatch_mm_simd_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    validate_mm_for_test(params)?;
+    dispatch_mm(encoder, registry, device, input, weight, output, params, true)
+}
+
+fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
     // Re-run common validation so this entry point is safe on its own.
     let qk = params.ggml_type.block_values();
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q8_0
+        | GgmlType::Q2_K
         | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -721,7 +744,7 @@ pub fn dispatch_mm_for_test(
             "K ({}) must be divisible by block QK ({})", params.k, qk
         )));
     }
-    dispatch_mm(encoder, registry, device, input, weight, output, params)
+    Ok(())
 }
 
 /// Matrix-vector dispatch (original path, unchanged from pre-Phase-3).
@@ -1127,12 +1150,13 @@ fn dispatch_mm(
     weight: &MlxBuffer,
     output: &MlxBuffer, // ADR-028: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
+    force_simd: bool,
 ) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // variant on M3+ (hardware tensor cores); fall back to the simdgroup
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
-    let use_tensor = probe_tensor_mm(registry, device);
+    let use_tensor = !force_simd && probe_tensor_mm(registry, device);
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
     // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).
