@@ -84,7 +84,7 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mv_id ports.
             GgmlType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             // ADR-033 §Pi Task #16 SHIPPED 2026-05-22 — mirrors IQ4_NL
             // _id geometry (N_SIMDGROUP=2, N_DST=4, (8, 8, 8) launch).
             GgmlType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
@@ -107,7 +107,7 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             // ADR-033 §Pi Task #20 — IQ4_XS mm_id ported (simdgroup MMA
             // path). Tensor-API variant is not yet ported; tests fall
             // back to the simdgroup path via TENSOR_MM_ID_AVAILABLE probe.
@@ -130,7 +130,7 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL tensor-API mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
             // SHIPPED 2026-05-22 to close the prefill perf gap vs llama.cpp.
             GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32",
@@ -613,7 +613,8 @@ fn dispatch_id_mv(
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         GgmlType::F32
         | GgmlType::F16
-        | GgmlType::I16 => {
+        | GgmlType::I16
+        | GgmlType::I32 => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_id_ggml does not support {:?}",
                 params.ggml_type

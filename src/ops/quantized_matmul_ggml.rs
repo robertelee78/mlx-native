@@ -116,6 +116,9 @@ pub enum GgmlType {
     /// Recognized for GGUF header parsing; dequant depends on per-tensor
     /// scale metadata (ADR-013 Decision 12). No matmul kernel.
     I16,
+    /// 32-bit signed integer (GGML type ID 26). Used by DeepSeek-V4 hash
+    /// router tables; loaded as raw `DType::I32`, not a matmul weight.
+    I32,
     /// Legacy 5-bit asymmetric quant (id 7 in GGML). 32 values per block,
     /// 24 bytes per block. Carries a per-block `m` (min) term in addition
     /// to the scale `d`. ADR-022 Phase 1.
@@ -148,6 +151,7 @@ impl GgmlType {
             GgmlType::Q5_K => QK5_K,
             GgmlType::Q6_K => QK6_K,
             GgmlType::I16 => 1,
+            GgmlType::I32 => 1,
             GgmlType::Q5_1 => QK5_1,
             GgmlType::IQ4_NL => QK4_NL,
             GgmlType::IQ4_XS => QK6_K, // super-block size = QK_K = 256
@@ -166,6 +170,7 @@ impl GgmlType {
             GgmlType::Q5_K => BLOCK_Q5_K_BYTES,
             GgmlType::Q6_K => BLOCK_Q6_K_BYTES,
             GgmlType::I16 => 2,
+            GgmlType::I32 => 4,
             GgmlType::Q5_1 => BLOCK_Q5_1_BYTES,
             GgmlType::IQ4_NL => BLOCK_IQ4_NL_BYTES,
             GgmlType::IQ4_XS => BLOCK_IQ4_XS_BYTES,
@@ -176,8 +181,8 @@ impl GgmlType {
     /// — used for `m <= MM_ROUTING_THRESHOLD`.
     fn kernel_name(self) -> &'static str {
         match self {
-            // F32 / F16 / I16 are type-not-applicable for this dispatch.
-            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 => "unsupported",
+            // Scalar/non-quantized types are not applicable to this dispatch.
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
@@ -206,7 +211,8 @@ impl GgmlType {
             // ADR-022 Phase 3 — Q4_K dense mm ported.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16 => "unsupported",
+            | GgmlType::I16
+            | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
@@ -230,7 +236,8 @@ impl GgmlType {
             // ADR-022 Phase 3: Q4_K tensor mm landed.
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16 => "unsupported",
+            | GgmlType::I16
+            | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
@@ -253,7 +260,8 @@ impl GgmlType {
         match self {
             GgmlType::F32
             | GgmlType::F16
-            | GgmlType::I16 => "unsupported",
+            | GgmlType::I16
+            | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",

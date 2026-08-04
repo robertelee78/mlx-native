@@ -76,6 +76,7 @@ const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_I16: u32 = 17;
 const GGML_TYPE_IQ4_NL: u32 = 20;
 const GGML_TYPE_IQ4_XS: u32 = 23;
+const GGML_TYPE_I32: u32 = 26;
 
 /// IQ4_NL non-linear codebook constants. 16 signed entries selected by
 /// 4-bit indices in `block_iq4_nl::qs`. Verified byte-equal with
@@ -322,6 +323,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_I16 => Ok(GgmlType::I16),
         GGML_TYPE_IQ4_NL => Ok(GgmlType::IQ4_NL),
         GGML_TYPE_IQ4_XS => Ok(GgmlType::IQ4_XS),
+        GGML_TYPE_I32 => Ok(GgmlType::I32),
         other => Err(MlxError::GgufParseError(format!(
             "unsupported GGML type ID {other}"
         ))),
@@ -629,6 +631,28 @@ fn dequantize_i16(data: &[u8], output: &mut [f32]) -> Result<()> {
     for i in 0..num_elements {
         let v = i16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
         output[i] = v as f32;
+    }
+    Ok(())
+}
+
+/// Convert raw little-endian I32 values to f32 for callers that explicitly
+/// request a floating-point view. The normal hash-router load path preserves
+/// exact integers through [`GgufFile::load_tensor`].
+fn dequantize_i32(data: &[u8], output: &mut [f32]) -> Result<()> {
+    if data.len() % 4 != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "I32 data length {} is not divisible by four",
+            data.len()
+        )));
+    }
+    let num_elements = data.len() / 4;
+    if output.len() < num_elements {
+        return Err(MlxError::GgufParseError(
+            "I32 output buffer too small".into(),
+        ));
+    }
+    for (chunk, value) in data.chunks_exact(4).zip(output.iter_mut()) {
+        *value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32;
     }
     Ok(())
 }
@@ -1028,6 +1052,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::Q6_K => dequantize_q6_k(data, output),
         GgmlType::Q5_K => dequantize_q5_k(data, output),
         GgmlType::I16 => dequantize_i16(data, output),
+        GgmlType::I32 => dequantize_i32(data, output),
         GgmlType::Q5_1 => dequantize_q5_1(data, output),
         GgmlType::IQ4_NL => dequantize_iq4_nl(data, output),
         GgmlType::IQ4_XS => dequantize_iq4_xs(data, output),
@@ -1260,7 +1285,7 @@ impl GgufFile {
     /// GGML blocks with dtype `U8` — these are consumed directly by
     /// `quantized_matmul_ggml` kernels.
     ///
-    /// For F32 and F16 tensors the buffer has the corresponding typed dtype.
+    /// F32, F16, and I32 tensors retain their corresponding typed dtype.
     ///
     /// # Errors
     ///
@@ -1285,6 +1310,15 @@ impl GgufFile {
             GgmlType::F16 => {
                 let mut buf =
                     device.alloc_buffer(info.byte_len, DType::F16, info.shape.clone())?;
+                {
+                    let slice: &mut [u8] = buf.as_mut_slice()?;
+                    slice.copy_from_slice(&data);
+                }
+                Ok(buf)
+            }
+            GgmlType::I32 => {
+                let mut buf =
+                    device.alloc_buffer(info.byte_len, DType::I32, info.shape.clone())?;
                 {
                     let slice: &mut [u8] = buf.as_mut_slice()?;
                     slice.copy_from_slice(&data);
