@@ -18,6 +18,7 @@ pub mod deepseek_hyper_connection;
 pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;
+pub mod embedding_q2_k;
 pub mod gather;
 pub mod gather_bench;
 pub mod hadamard;

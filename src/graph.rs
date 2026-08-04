@@ -1167,6 +1167,27 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Gather GGML Q2_K embedding rows directly into F32 activations.
+    pub fn embedding_gather_q2_k(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weight: &MlxBuffer,
+        token_ids: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::embedding_q2_k::EmbeddingQ2KParams,
+    ) -> Result<()> {
+        ops::embedding_q2_k::embedding_gather_q2_k(
+            &mut self.encoder,
+            registry,
+            device,
+            weight,
+            token_ids,
+            output,
+            params,
+        )
+    }
+
     /// Encode an expert-routed GGML block-format quantized mat-vec into this session's encoder.
     ///
     /// Delegates to [`ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml`].

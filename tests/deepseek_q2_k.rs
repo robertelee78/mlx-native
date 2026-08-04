@@ -3,6 +3,7 @@
 use mlx_native::{
     gguf::{test_only_dequantize, GgufFile},
     ops::{
+        embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams},
         quantized_matmul_ggml::{dispatch_mm_for_test, dispatch_mm_simd_for_test},
         quantized_matmul_id_ggml::{dispatch_id_mm_for_test, GgmlIdMmDispatchParams},
     },
@@ -84,6 +85,73 @@ fn q2_k_host_decode_rejects_malformed_buffers() {
     let mut output = vec![0.0f32; QK_K];
     assert!(test_only_dequantize(&bytes[..BLOCK_BYTES - 1], GgmlType::Q2_K, &mut output).is_err());
     assert!(test_only_dequantize(&bytes, GgmlType::Q2_K, &mut output[..QK_K - 1]).is_err());
+}
+
+#[test]
+fn q2_k_embedding_gather_matches_canonical_rows_and_rejects_bad_ids() {
+    let vocab = 3usize;
+    let mut weights = Vec::with_capacity(vocab * BLOCK_BYTES);
+    let mut decoded = Vec::with_capacity(vocab);
+    for row in 0..vocab {
+        let bytes = block(row as u8 + 2);
+        decoded.push(reference_dequant(&bytes));
+        weights.extend(bytes);
+    }
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    mlx_native::ops::embedding_q2_k::register(&mut registry);
+    let mut weight = device
+        .alloc_buffer(weights.len(), DType::U8, vec![vocab, QK_K])
+        .expect("weight");
+    weight
+        .as_mut_slice::<u8>()
+        .expect("weight slice")
+        .copy_from_slice(&weights);
+    let mut ids = device
+        .alloc_buffer(2 * 4, DType::U32, vec![2])
+        .expect("ids");
+    ids.as_mut_slice::<u32>()
+        .expect("id slice")
+        .copy_from_slice(&[2, 0]);
+    let output = device
+        .alloc_buffer(2 * QK_K * 4, DType::F32, vec![2, QK_K])
+        .expect("output");
+    let params = EmbeddingQ2KParams {
+        vocab_size: vocab,
+        embed_dim: QK_K,
+        n_tokens: 2,
+    };
+    let mut encoder = device.command_encoder().expect("encoder");
+    embedding_gather_q2_k(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &weight,
+        &ids,
+        &output,
+        &params,
+    )
+    .expect("Q2_K embedding gather");
+    encoder.commit_and_wait().expect("GPU completion");
+    let actual = output.as_slice::<f32>().expect("output slice");
+    for (actual_row, expected_row) in actual.chunks_exact(QK_K).zip([&decoded[2], &decoded[0]]) {
+        for (&got, &want) in actual_row.iter().zip(expected_row) {
+            assert!((got - want).abs() <= 1e-6, "{got} != {want}");
+        }
+    }
+
+    ids.as_mut_slice::<u32>().expect("id slice")[1] = vocab as u32;
+    let mut encoder = device.command_encoder().expect("encoder");
+    assert!(embedding_gather_q2_k(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &weight,
+        &ids,
+        &output,
+        &params,
+    )
+    .is_err());
 }
 
 #[test]
