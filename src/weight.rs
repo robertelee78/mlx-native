@@ -749,6 +749,9 @@ fn discover_safetensors_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 mod tests {
     use super::*;
     use safetensors::tensor::{Dtype as StDtype, TensorView};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
     // ---- QuantizedWeight construction and accessors ----
 
@@ -1268,6 +1271,7 @@ mod tests {
     fn tempdir() -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("mlx_native_test_{}", std::process::id()));
+        path.push(format!("case_{}", TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed)));
         path.push(format!("{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
