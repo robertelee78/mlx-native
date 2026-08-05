@@ -3,8 +3,9 @@
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::ops::deepseek_moe_routing::{
-    dispatch_deepseek_moe_hash_route, dispatch_deepseek_moe_score_route, DEEPSEEK_MOE_EXPERTS,
-    DEEPSEEK_MOE_ROUTE_SCALE, DEEPSEEK_MOE_TOP_K,
+    dispatch_deepseek_moe_hash_route, dispatch_deepseek_moe_sanitize_indices,
+    dispatch_deepseek_moe_score_route, DEEPSEEK_MOE_EXPERTS, DEEPSEEK_MOE_ROUTE_SCALE,
+    DEEPSEEK_MOE_TOP_K,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -206,6 +207,26 @@ fn dynamic_invalid_values_fail_each_route_closed() {
     encoder.commit_and_wait().unwrap();
     assert_eq!(ids.as_slice::<i32>().unwrap(), &[-1; K]);
     assert_eq!(weights.as_slice::<f32>().unwrap(), &[0.0; K]);
+}
+
+#[test]
+fn signed_route_indices_are_sanitized_before_expert_matmul() {
+    let device = MlxDevice::new().unwrap();
+    let indices = i32_buffer(&device, &[-1, 0, 255, 256, 17, -9], vec![1, K]);
+    let safe = device.alloc_buffer(K * 4, DType::U32, vec![1, K]).unwrap();
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_deepseek_moe_sanitize_indices(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &indices,
+        &safe,
+        1,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    assert_eq!(safe.as_slice::<u32>().unwrap(), &[0, 0, 255, 0, 17, 0]);
 }
 
 #[test]

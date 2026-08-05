@@ -19,6 +19,7 @@ pub const DEEPSEEK_MOE_TOP_K: usize = 6;
 pub const DEEPSEEK_MOE_ROUTE_SCALE: f32 = 1.5;
 pub const DEEPSEEK_MOE_SCORE_ROUTE_KERNEL: &str = "deepseek_moe_score_route_f32";
 pub const DEEPSEEK_MOE_HASH_ROUTE_KERNEL: &str = "deepseek_moe_hash_route_f32";
+pub const DEEPSEEK_MOE_SANITIZE_INDICES_KERNEL: &str = "deepseek_moe_sanitize_indices";
 const SCORE_THREADS: u64 = DEEPSEEK_MOE_EXPERTS as u64;
 const HASH_THREADS: u64 = 256;
 
@@ -32,6 +33,10 @@ pub fn register(registry: &mut KernelRegistry) {
     );
     registry.register_source(
         DEEPSEEK_MOE_HASH_ROUTE_KERNEL,
+        DEEPSEEK_MOE_ROUTING_SHADER_SOURCE,
+    );
+    registry.register_source(
+        DEEPSEEK_MOE_SANITIZE_INDICES_KERNEL,
         DEEPSEEK_MOE_ROUTING_SHADER_SOURCE,
     );
 }
@@ -187,6 +192,46 @@ pub fn dispatch_deepseek_moe_hash_route(
         ],
         MTLSize::new((n_tokens as u64).div_ceil(HASH_THREADS), 1, 1),
         MTLSize::new(HASH_THREADS, 1, 1),
+    );
+    Ok(())
+}
+
+/// Convert signed route indices to the unsigned expert-matmul contract.
+///
+/// Invalid fail-closed sentinels become expert zero. Their corresponding
+/// route weights are already zero, so this prevents an out-of-range weight
+/// read while preserving the eventual all-zero token result.
+pub fn dispatch_deepseek_moe_sanitize_indices(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    indices: &MlxBuffer,
+    safe_indices: &MlxBuffer,
+    n_tokens: usize,
+) -> Result<()> {
+    if n_tokens == 0 || n_tokens > u32::MAX as usize {
+        return Err(MlxError::InvalidArgument(
+            "deepseek_moe_routing: n_tokens must be in 1..=u32::MAX".into(),
+        ));
+    }
+    let shape = [n_tokens, DEEPSEEK_MOE_TOP_K];
+    validate_buffer(indices, "indices", DType::I32, &shape)?;
+    validate_buffer(safe_indices, "safe_indices", DType::U32, &shape)?;
+    let params = DeepSeekMoeRoutingParams {
+        n_tokens: n_tokens as u32,
+        vocab_size: 0,
+    };
+    let pipeline =
+        registry.get_pipeline(DEEPSEEK_MOE_SANITIZE_INDICES_KERNEL, device.metal_device())?;
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&params))),
+            (1, KernelArg::Buffer(indices)),
+            (2, KernelArg::Buffer(safe_indices)),
+        ],
+        MTLSize::new(n_tokens as u64, 1, 1),
+        MTLSize::new(DEEPSEEK_MOE_TOP_K as u64, 1, 1),
     );
     Ok(())
 }
