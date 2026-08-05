@@ -49,7 +49,12 @@ impl DeepSeekCompressorParams {
         if self.start_pos == 0 {
             (self.seq_len / self.ratio.max(1)) as usize
         } else {
-            usize::from(self.start_pos.saturating_add(1) % self.ratio.max(1) == 0)
+            let ratio = self.ratio.max(1);
+            self.start_pos
+                .saturating_add(self.seq_len)
+                .checked_div(ratio)
+                .unwrap_or(0)
+                .saturating_sub(self.start_pos / ratio) as usize
         }
     }
 
@@ -91,11 +96,6 @@ fn validate_params(p: &DeepSeekCompressorParams) -> Result<(usize, usize, usize,
             "deepseek_compressor: batch, seq_len, and cache_len must be nonzero".into(),
         ));
     }
-    if p.start_pos != 0 && p.seq_len != 1 {
-        return Err(MlxError::InvalidArgument(
-            "deepseek_compressor: incremental calls require seq_len=1".into(),
-        ));
-    }
     if p.start_pos == u32::MAX {
         return Err(MlxError::InvalidArgument(
             "deepseek_compressor: start_pos cannot be u32::MAX".into(),
@@ -123,10 +123,8 @@ fn validate_params(p: &DeepSeekCompressorParams) -> Result<(usize, usize, usize,
     let count = p.output_count();
     let last_cache = if p.start_pos == 0 {
         count
-    } else if count == 1 {
-        p.start_pos as usize / ratio + 1
     } else {
-        0
+        p.start_pos as usize / ratio + count
     };
     if last_cache > p.cache_len as usize {
         return Err(MlxError::InvalidArgument(
@@ -136,7 +134,7 @@ fn validate_params(p: &DeepSeekCompressorParams) -> Result<(usize, usize, usize,
     Ok((p.batch as usize, p.seq_len as usize, ratio, dim))
 }
 
-/// Encode prefill (`start_pos=0`) or one-token incremental compression.
+/// Encode position-zero prefill or a contiguous incremental append.
 ///
 /// `kv`/`score` are `[batch, seq_len, coff*head_dim]`, APE is
 /// `[ratio, coff*head_dim]`, state is
@@ -196,7 +194,11 @@ pub fn dispatch_deepseek_compressor(
         )?;
     }
 
-    let groups_per_batch = params.output_slots();
+    let groups_per_batch = if params.start_pos == 0 {
+        params.output_slots()
+    } else {
+        1
+    };
     let groups = checked_shape(&[batch, groups_per_batch])?;
     if groups > u32::MAX as usize {
         return Err(MlxError::InvalidArgument(

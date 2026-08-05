@@ -201,6 +201,7 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
                     seq: usize,
                     kv_state: &MlxBuffer,
                     score_state: &MlxBuffer,
+                    cache: &MlxBuffer,
                     registry: &mut KernelRegistry| {
         let kv = f32_buffer(
             &device,
@@ -247,7 +248,7 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
         read_bf16(&output, params.output_slots() * dim)
     };
 
-    let prefill_output = dispatch(0, prefill, &kv_state, &score_state, &mut registry);
+    let prefill_output = dispatch(0, prefill, &kv_state, &score_state, &cache, &mut registry);
     let blocks = prefill / ratio;
     for block in 0..blocks {
         let expected =
@@ -277,8 +278,33 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
         "prefill score state",
     );
 
+    let batched_kv_state = f32_buffer(
+        &device,
+        kv_state.as_slice().unwrap(),
+        vec![1, coff * ratio, projected],
+    );
+    let batched_score_state = f32_buffer(
+        &device,
+        score_state.as_slice().unwrap(),
+        vec![1, coff * ratio, projected],
+    );
+    let batched_cache = bf16_buffer(
+        &device,
+        &read_bf16(&cache, cache_len * dim),
+        vec![1, cache_len, dim],
+    );
+    let batched_output = dispatch(
+        prefill,
+        total - prefill,
+        &batched_kv_state,
+        &batched_score_state,
+        &batched_cache,
+        &mut registry,
+    );
+    let mut expected_batched_output = Vec::new();
+
     for position in prefill..total {
-        let output = dispatch(position, 1, &kv_state, &score_state, &mut registry);
+        let output = dispatch(position, 1, &kv_state, &score_state, &cache, &mut registry);
         let slot = (if overlap { ratio } else { 0 }) + position % ratio;
         for feature in 0..projected {
             let src = position * projected + feature;
@@ -292,6 +318,7 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
             let expected =
                 compressed_reference(&all_kv, &all_score, &ape, &norm, ratio, dim, block, epsilon);
             assert_bf16_close(&output[..dim], &expected, "decode");
+            expected_batched_output.extend_from_slice(&expected);
             if overlap {
                 expected_kv_state.copy_within(ratio * projected..2 * ratio * projected, 0);
                 expected_score_state.copy_within(ratio * projected..2 * ratio * projected, 0);
@@ -316,6 +343,26 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
             "decode score state",
         );
     }
+    assert_bf16_close(
+        &batched_output[..expected_batched_output.len()],
+        &expected_batched_output,
+        "batched append output",
+    );
+    assert_state(
+        batched_kv_state.as_slice().unwrap(),
+        &expected_kv_state,
+        "batched append kv state",
+    );
+    assert_state(
+        batched_score_state.as_slice().unwrap(),
+        &expected_score_state,
+        "batched append score state",
+    );
+    assert_bf16_close(
+        &read_bf16(&batched_cache, cache_len * dim),
+        &read_bf16(&cache, cache_len * dim),
+        "batched append cache",
+    );
 }
 
 #[test]
@@ -326,7 +373,7 @@ fn ratio4_overlap_prefill_and_incremental_match_for_both_production_dims() {
 
 #[test]
 fn ratio128_nonoverlap_prefill_and_boundary_update_match() {
-    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_LONG, 512, 255);
+    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_LONG, 512, 127);
 }
 
 #[test]

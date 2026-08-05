@@ -81,11 +81,6 @@ fn validate_params(p: &DeepSeekIndexerParams) -> Result<(usize, usize, usize)> {
             "deepseek_indexer: batch, query_len, and kv_len must be nonzero".into(),
         ));
     }
-    if p.start_pos != 0 && p.query_len != 1 {
-        return Err(MlxError::InvalidArgument(
-            "deepseek_indexer: incremental calls require query_len=1".into(),
-        ));
-    }
     if p.start_pos.checked_add(p.query_len).is_none() {
         return Err(MlxError::InvalidArgument(
             "deepseek_indexer: start_pos + query_len overflows".into(),

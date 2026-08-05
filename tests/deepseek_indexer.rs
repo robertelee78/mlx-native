@@ -4,8 +4,9 @@
 
 use half::bf16;
 use mlx_native::ops::deepseek_indexer::{
-    dispatch_deepseek_indexer, dispatch_deepseek_indexer_into, DeepSeekIndexerParams, DEEPSEEK_INDEXER_HEADS,
-    DEEPSEEK_INDEXER_HEAD_DIM, DEEPSEEK_INDEXER_RATIO, DEEPSEEK_INDEXER_TOP_K,
+    dispatch_deepseek_indexer, dispatch_deepseek_indexer_into, DeepSeekIndexerParams,
+    DEEPSEEK_INDEXER_HEADS, DEEPSEEK_INDEXER_HEAD_DIM, DEEPSEEK_INDEXER_RATIO,
+    DEEPSEEK_INDEXER_TOP_K,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -214,6 +215,7 @@ fn run_case(batch: usize, queries: usize, kv_len: usize, start_pos: usize, offse
 fn prefill_and_decode_match_cpu_with_causal_sentinels_and_offset() {
     run_case(1, 12, 3, 0, 128);
     run_case(2, 1, 12, 39, 257);
+    run_case(1, 6, 12, 39, 257);
 }
 
 #[test]
