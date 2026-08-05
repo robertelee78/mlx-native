@@ -217,6 +217,7 @@ fn bench(
 }
 
 #[test]
+#[ignore = "benchmark requires a compatible /opt/llama.cpp checkout; run explicitly"]
 fn h_i_peer_vs_hf2q_id_kernel() {
     let device = MlxDevice::new().expect("MlxDevice::new");
     let out_dir = std::env::temp_dir().to_string_lossy().to_string();
