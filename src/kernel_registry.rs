@@ -1241,6 +1241,16 @@ impl KernelRegistry {
             "deepseek_moe_hash_route_f32".into(),
             deepseek_moe_routing_src,
         );
+        let deepseek_moe_activation_src: &'static str =
+            include_str!("shaders/deepseek_moe_activation.metal");
+        sources.insert(
+            "deepseek_moe_swiglu_f32".into(),
+            deepseek_moe_activation_src,
+        );
+        sources.insert(
+            "deepseek_moe_weighted_reduce_f32".into(),
+            deepseek_moe_activation_src,
+        );
         let deepseek_sparse_src: &'static str =
             include_str!("shaders/deepseek_sparse_attention.metal");
         sources.insert("deepseek_sparse_attention_bf16".into(), deepseek_sparse_src);
