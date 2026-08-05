@@ -3,8 +3,8 @@
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::ops::deepseek_hyper_connection::{
-    dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn, register, DEEPSEEK_HC_EPS,
-    DEEPSEEK_HC_MULT, DEEPSEEK_HC_SINKHORN_ITERS,
+    dispatch_hc_head_weights, dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn,
+    register, DEEPSEEK_HC_EPS, DEEPSEEK_HC_MULT, DEEPSEEK_HC_SINKHORN_ITERS,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -97,6 +97,14 @@ fn pre_reference(x: &[f32], weights: &[f32], tokens: usize, embd: usize) -> Vec<
         }
     }
     out
+}
+
+fn head_weights_reference(mixes: &[f32], scale: f32, base: &[f32]) -> Vec<f32> {
+    mixes
+        .iter()
+        .enumerate()
+        .map(|(index, mix)| sigmoid(mix * scale + base[index % HC]) + DEEPSEEK_HC_EPS)
+        .collect()
 }
 
 fn post_reference(
@@ -200,6 +208,37 @@ fn split_sinkhorn_matches_cpu_for_decode_and_prefill() {
                 assert!((sum - 1.0).abs() < 2e-5, "column {destination} sum {sum}");
             }
         }
+    }
+}
+
+#[test]
+fn head_weights_match_cpu_for_decode_and_prefill() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    register(&mut registry);
+    for tokens in [1usize, 17, 257] {
+        let mixes_data = values(tokens * HC, 13, 0.04);
+        let scale_data = [-0.35];
+        let base_data = values(HC, 14, 0.005);
+        let expected = head_weights_reference(&mixes_data, scale_data[0], &base_data);
+        let mixes = buffer(&device, &mixes_data, vec![tokens, HC]);
+        let scale = buffer(&device, &scale_data, vec![1]);
+        let base = buffer(&device, &base_data, vec![HC]);
+        let weights = output(&device, tokens * HC, vec![tokens, HC]);
+        let mut encoder = device.command_encoder().expect("encoder");
+        dispatch_hc_head_weights(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &mixes,
+            &scale,
+            &base,
+            &weights,
+            tokens as u32,
+        )
+        .expect("head weights dispatch");
+        encoder.commit_and_wait().expect("head weights completion");
+        assert_close(weights.as_slice().unwrap(), &expected, 2e-6, "head weights");
     }
 }
 
@@ -311,6 +350,18 @@ fn invalid_shapes_and_dtypes_are_rejected_before_encoding() {
         1,
     )
     .is_err());
+    let head_scale_wrong = output(&device, 2, vec![2]);
+    assert!(dispatch_hc_head_weights(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &post,
+        &head_scale_wrong,
+        &base,
+        &post,
+        1,
+    )
+    .is_err());
     assert!(dispatch_hc_pre(&mut encoder, &mut registry, &device, &x, &post, &out, 0, 1,).is_err());
 
     let x_post = output(&device, 1, vec![1, 1]);
@@ -371,6 +422,26 @@ fn non_finite_inputs_fail_closed_to_finite_zero_outputs() {
     assert!(pre.as_slice::<f32>().unwrap()[HC..]
         .iter()
         .all(|v| v.is_finite()));
+
+    let head_mixes = buffer(&device, &[0.0, f32::NAN, 1.0, -1.0], vec![1, HC]);
+    let head_scale = buffer(&device, &[0.5], vec![1]);
+    let head_base = buffer(&device, &[0.0; HC], vec![HC]);
+    let head_weights = output(&device, HC, vec![1, HC]);
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_hc_head_weights(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &head_mixes,
+        &head_scale,
+        &head_base,
+        &head_weights,
+        1,
+    )
+    .expect("guarded head weights");
+    encoder.commit_and_wait().expect("guarded head completion");
+    let head_values = head_weights.as_slice::<f32>().unwrap();
+    assert!(head_values.iter().all(|value| *value == 0.0));
 
     let mut x_data = vec![1.0; HC * 8];
     x_data[8 + 2] = f32::INFINITY;

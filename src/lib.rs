@@ -104,8 +104,8 @@ pub use ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params}
 pub use ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 pub use ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 pub use ops::deepseek_hyper_connection::{
-    dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn, DEEPSEEK_HC_EPS,
-    DEEPSEEK_HC_MULT, DEEPSEEK_HC_SINKHORN_ITERS,
+    dispatch_hc_head_weights, dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn,
+    DEEPSEEK_HC_EPS, DEEPSEEK_HC_MULT, DEEPSEEK_HC_SINKHORN_ITERS,
 };
 pub use ops::embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};

@@ -1223,6 +1223,7 @@ impl KernelRegistry {
         let deepseek_hc_src: &'static str =
             include_str!("shaders/deepseek_hyper_connection.metal");
         sources.insert("deepseek_hc_split_sinkhorn_f32".into(), deepseek_hc_src);
+        sources.insert("deepseek_hc_head_weights_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_pre_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_post_f32".into(), deepseek_hc_src);
         let deepseek_activation_quant_src: &'static str =

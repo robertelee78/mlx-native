@@ -2,6 +2,7 @@
 //
 // Row-major public layouts:
 //   mixes    [token, 24]
+//   head mixes/head weights [token, 4]
 //   pre/post [token, 4]
 //   comb     [token, source, destination]
 //   residual/output [token, branch, embedding]
@@ -115,6 +116,32 @@ kernel void deepseek_hc_split_sinkhorn_f32(
 
     if (lane < HC * HC) {
         comb[token * HC * HC + lane] = isfinite(value) ? value : 0.0f;
+    }
+}
+
+kernel void deepseek_hc_head_weights_f32(
+        constant HcSplitParams &params       [[buffer(0)]],
+        device const float *mixes            [[buffer(1)]],
+        device const float *scale            [[buffer(2)]],
+        device const float *base             [[buffer(3)]],
+        device float *weights                [[buffer(4)]],
+        uint threadgroup_id                  [[threadgroup_position_in_grid]],
+        ushort lane                          [[thread_index_in_simdgroup]]) {
+    const uint token = threadgroup_id;
+    if (token >= params.n_tokens) {
+        return;
+    }
+    const float factor = scale[0];
+    const float mix = lane < HC ? mixes[token * HC + lane] : 0.0f;
+    const float bias = lane < HC ? base[lane] : 0.0f;
+    const float transformed = fma(mix, factor, bias);
+    const uint invalid = simd_sum(
+        lane < HC &&
+        (!isfinite(mix) || !isfinite(factor) || !isfinite(bias) || !isfinite(transformed))
+            ? 1u : 0u);
+    if (lane < HC) {
+        weights[token * HC + lane] =
+            invalid == 0 ? hc_sigmoid(transformed) + HC_EPS : 0.0f;
     }
 }
 

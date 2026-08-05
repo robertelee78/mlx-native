@@ -23,18 +23,19 @@ pub const DEEPSEEK_HC_EPS: f32 = 1.0e-6;
 
 const MIX_WIDTH: usize = (2 + DEEPSEEK_HC_MULT) * DEEPSEEK_HC_MULT;
 const SPLIT_KERNEL: &str = "deepseek_hc_split_sinkhorn_f32";
+const HEAD_KERNEL: &str = "deepseek_hc_head_weights_f32";
 const PRE_KERNEL: &str = "deepseek_hc_pre_f32";
 const POST_KERNEL: &str = "deepseek_hc_post_f32";
 const SIMD_WIDTH: u64 = 32;
 const MAX_SIMDGROUPS: u64 = 4;
 
-/// Embedded source for all three Hyper-Connection kernels.
+/// Embedded source for all Hyper-Connection kernels.
 pub static DEEPSEEK_HC_SHADER_SOURCE: &str =
     include_str!("../shaders/deepseek_hyper_connection.metal");
 
-/// Register the three Hyper-Connection entry points.
+/// Register the Hyper-Connection entry points.
 pub fn register(registry: &mut KernelRegistry) {
-    for name in [SPLIT_KERNEL, PRE_KERNEL, POST_KERNEL] {
+    for name in [SPLIT_KERNEL, HEAD_KERNEL, PRE_KERNEL, POST_KERNEL] {
         registry.register_source(name, DEEPSEEK_HC_SHADER_SOURCE);
     }
 }
@@ -139,6 +140,47 @@ pub fn dispatch_hc_split_sinkhorn(
             (4, KernelArg::Buffer(pre)),
             (5, KernelArg::Buffer(post)),
             (6, KernelArg::Buffer(comb)),
+        ],
+        grid,
+        threads,
+    );
+    Ok(())
+}
+
+/// Produce the final Hyper-Connection collapse weights.
+///
+/// Layouts are `mixes [tokens, 4]`, `scale [1]`, `base [4]`, and
+/// `weights [tokens, 4]`. The exact transform is
+/// `sigmoid(mixes * scale + base) + DEEPSEEK_HC_EPS`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hc_head_weights(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    mixes: &MlxBuffer,
+    scale: &MlxBuffer,
+    base: &MlxBuffer,
+    weights: &MlxBuffer,
+    n_tokens: u32,
+) -> Result<()> {
+    let tokens = validate_tokens(n_tokens)?;
+    validate_buffer(mixes, "head mixes", &[tokens, DEEPSEEK_HC_MULT])?;
+    validate_buffer(scale, "head scale", &[1])?;
+    validate_buffer(base, "head base", &[DEEPSEEK_HC_MULT])?;
+    validate_buffer(weights, "head weights", &[tokens, DEEPSEEK_HC_MULT])?;
+
+    let pipeline = registry.get_pipeline(HEAD_KERNEL, device.metal_device())?;
+    let grid = MTLSize::new(n_tokens as u64, 1, 1);
+    let threads = MTLSize::new(SIMD_WIDTH, 1, 1);
+    let params = HcSplitParams { n_tokens };
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&params))),
+            (1, KernelArg::Buffer(mixes)),
+            (2, KernelArg::Buffer(scale)),
+            (3, KernelArg::Buffer(base)),
+            (4, KernelArg::Buffer(weights)),
         ],
         grid,
         threads,
