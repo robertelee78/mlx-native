@@ -76,7 +76,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
+use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::DType;
@@ -94,6 +94,8 @@ pub static FLASH_ATTN_PREFILL_BLK_SHADER_SOURCE: &str =
 /// (BQ=32, BK=16) and D=512 (BQ=8, BK=8) pipelines.  The kernel registry
 /// caches compiled pipelines keyed by the `(name, bq, bk)` combination.
 pub const K_BLK_BF16: &str = "flash_attn_prefill_blk_bf16";
+/// Kernel entry point for an F16 additive mask.
+pub const K_BLK_F16: &str = "flash_attn_prefill_blk_f16";
 
 // ─── Function-constant indices ───────────────────────────────────────────────
 
@@ -120,6 +122,7 @@ pub const FC_IDX_HAS_BLK: usize = 303;
 /// live in separate `.metal` files and compile independently.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(K_BLK_BF16, FLASH_ATTN_PREFILL_BLK_SHADER_SOURCE);
+    registry.register_source(K_BLK_F16, FLASH_ATTN_PREFILL_BLK_SHADER_SOURCE);
 }
 
 // ─── MSL struct mirrors ──────────────────────────────────────────────────────
@@ -298,12 +301,56 @@ pub fn dispatch_flash_attn_prefill_blk(
     blk_out: &MlxBuffer,
     params: &BlkParams,
 ) -> Result<()> {
+    dispatch_flash_attn_prefill_blk_typed(
+        encoder,
+        device,
+        registry,
+        mask,
+        blk_out,
+        params,
+        DType::BF16,
+        K_BLK_BF16,
+    )
+}
+
+/// F16 sibling of [`dispatch_flash_attn_prefill_blk`].
+pub fn dispatch_flash_attn_prefill_blk_f16(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    mask: &MlxBuffer,
+    blk_out: &MlxBuffer,
+    params: &BlkParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_blk_typed(
+        encoder,
+        device,
+        registry,
+        mask,
+        blk_out,
+        params,
+        DType::F16,
+        K_BLK_F16,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_flash_attn_prefill_blk_typed(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    mask: &MlxBuffer,
+    blk_out: &MlxBuffer,
+    params: &BlkParams,
+    mask_dtype: DType,
+    kernel_name: &str,
+) -> Result<()> {
     validate_params(params)?;
 
-    if mask.dtype() != DType::BF16 {
+    if mask.dtype() != mask_dtype {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_flash_attn_prefill_blk: mask buffer must be BF16, got {:?}",
-            mask.dtype()
+            "dispatch_flash_attn_prefill_blk: mask buffer must be {mask_dtype}, got {}",
+            mask.dtype(),
         )));
     }
 
@@ -312,11 +359,11 @@ pub fn dispatch_flash_attn_prefill_blk(
     let kl = params.seq_len_k as usize;
     let mask_bytes_needed = ql
         .checked_mul(kl)
-        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_mul(mask_dtype.size_of()))
         .ok_or_else(|| {
             MlxError::InvalidArgument(format!(
-                "dispatch_flash_attn_prefill_blk: qL ({}) * kL ({}) * 2 overflows usize",
-                ql, kl,
+                "dispatch_flash_attn_prefill_blk: qL ({ql}) * kL ({kl}) * {} overflows usize",
+                mask_dtype.size_of(),
             ))
         })?;
     if mask.byte_len() < mask_bytes_needed {
@@ -358,13 +405,10 @@ pub fn dispatch_flash_attn_prefill_blk(
     // pre-pass kernel, so the bool constants slice is empty and only the
     // two int constants (400 → bq, 401 → bk) drive the cache key.
     let pipeline = registry.get_pipeline_with_constants(
-        K_BLK_BF16,
+        kernel_name,
         device.metal_device(),
         &[],
-        &[
-            (FC_IDX_BQ, params.bq as i32),
-            (FC_IDX_BK, params.bk as i32),
-        ],
+        &[(FC_IDX_BQ, params.bq as i32), (FC_IDX_BK, params.bk as i32)],
     )?;
 
     // ── Grid geometry ─────────────────────────────────────────────────────
@@ -462,19 +506,22 @@ mod tests {
             seq_len_k: 8,
             bq: 32,
             bk: 16,
-        }).is_err());
+        })
+        .is_err());
         assert!(blk_buffer_byte_len(&BlkParams {
             seq_len_q: 8,
             seq_len_k: 0,
             bq: 32,
             bk: 16,
-        }).is_err());
+        })
+        .is_err());
         assert!(blk_buffer_byte_len(&BlkParams {
             seq_len_q: 8,
             seq_len_k: 8,
             bq: 0,
             bk: 16,
-        }).is_err());
+        })
+        .is_err());
     }
 
     #[test]
@@ -484,7 +531,8 @@ mod tests {
             seq_len_k: 8,
             bq: 32,
             bk: 16,
-        }).is_err());
+        })
+        .is_err());
     }
 
     #[test]

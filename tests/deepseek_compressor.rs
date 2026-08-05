@@ -153,6 +153,19 @@ fn assert_bf16_close(got: &[bf16], want: &[bf16], label: &str) {
     }
 }
 
+fn assert_bf16_equal(got: &[bf16], want: &[bf16], label: &str) {
+    assert_eq!(got.len(), want.len());
+    for (index, (got, want)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{label}[{index}] {} != {}",
+            got.to_f32(),
+            want.to_f32()
+        );
+    }
+}
+
 fn assert_state(got: &[f32], want: &[f32], label: &str) {
     for (index, (got, want)) in got.iter().zip(want).enumerate() {
         assert!(
@@ -162,13 +175,13 @@ fn assert_state(got: &[f32], want: &[f32], label: &str) {
     }
 }
 
-fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
+fn run_ratio_case(ratio: usize, dim: usize, prefill: usize, total: usize) {
     let device = MlxDevice::new().unwrap();
     let overlap = ratio == DEEPSEEK_COMPRESS_RATIO_OVERLAP;
     let coff = if overlap { 2 } else { 1 };
     let projected = coff * dim;
     let epsilon = 1e-6;
-    let total = if overlap { 12 } else { 256 };
+    assert!(total > prefill);
     let all_kv = values(total * projected, 1, 0.003);
     let all_score = values(total * projected, 2, 0.002);
     let ape = values(ratio * projected, 3, 0.001);
@@ -343,7 +356,7 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
             "decode score state",
         );
     }
-    assert_bf16_close(
+    assert_bf16_equal(
         &batched_output[..expected_batched_output.len()],
         &expected_batched_output,
         "batched append output",
@@ -358,7 +371,7 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
         &expected_score_state,
         "batched append score state",
     );
-    assert_bf16_close(
+    assert_bf16_equal(
         &read_bf16(&batched_cache, cache_len * dim),
         &read_bf16(&cache, cache_len * dim),
         "batched append cache",
@@ -367,13 +380,152 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
 
 #[test]
 fn ratio4_overlap_prefill_and_incremental_match_for_both_production_dims() {
-    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_OVERLAP, 128, 10);
-    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_OVERLAP, 512, 10);
+    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_OVERLAP, 128, 10, 12);
+    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_OVERLAP, 512, 10, 12);
 }
 
 #[test]
 fn ratio128_nonoverlap_prefill_and_boundary_update_match() {
-    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_LONG, 512, 127);
+    run_ratio_case(DEEPSEEK_COMPRESS_RATIO_LONG, 512, 127, 256);
+}
+
+#[test]
+fn aligned_multi_block_append_matches_incremental_state_and_cache() {
+    for dim in [128, 512] {
+        for suffix in [4, 5, 8, 10, 128] {
+            run_ratio_case(DEEPSEEK_COMPRESS_RATIO_OVERLAP, dim, 4, 4 + suffix);
+        }
+    }
+    for suffix in [128, 129, 255, 256] {
+        run_ratio_case(DEEPSEEK_COMPRESS_RATIO_LONG, 512, 128, 128 + suffix);
+    }
+}
+
+#[test]
+fn initial_ratio4_block_is_byte_identical_to_four_incremental_steps() {
+    for dim in [128, 512] {
+        let device = MlxDevice::new().unwrap();
+        let ratio = DEEPSEEK_COMPRESS_RATIO_OVERLAP;
+        let projected = 2 * dim;
+        let state_len = 2 * ratio * projected;
+        let kv = values(ratio * projected, 1, 0.003);
+        let score = values(ratio * projected, 2, 0.002);
+        let ape_data = values(ratio * projected, 3, 0.001);
+        let norm_data = values(dim, 4, 0.002)
+            .into_iter()
+            .map(|x| x + 1.0)
+            .collect::<Vec<_>>();
+        let ape = f32_buffer(&device, &ape_data, vec![ratio, projected]);
+        let norm = f32_buffer(&device, &norm_data, vec![dim]);
+
+        let run = |start_pos: usize,
+                   seq_len: usize,
+                   kv_state: &MlxBuffer,
+                   score_state: &MlxBuffer,
+                   cache: &MlxBuffer,
+                   registry: &mut KernelRegistry| {
+            let input_kv = f32_buffer(
+                &device,
+                &kv[start_pos * projected..(start_pos + seq_len) * projected],
+                vec![1, seq_len, projected],
+            );
+            let input_score = f32_buffer(
+                &device,
+                &score[start_pos * projected..(start_pos + seq_len) * projected],
+                vec![1, seq_len, projected],
+            );
+            let params = DeepSeekCompressorParams {
+                batch: 1,
+                seq_len: seq_len as u32,
+                start_pos: start_pos as u32,
+                ratio: ratio as u32,
+                head_dim: dim as u32,
+                cache_len: 1,
+                epsilon: 1e-6,
+                write_cache: 1,
+            };
+            let output = bf16_buffer(
+                &device,
+                &vec![bf16::ZERO; params.output_slots() * dim],
+                vec![1, params.output_slots(), dim],
+            );
+            let mut encoder = device.command_encoder().unwrap();
+            dispatch_deepseek_compressor(
+                &mut encoder,
+                registry,
+                &device,
+                &input_kv,
+                &input_score,
+                &ape,
+                &norm,
+                kv_state,
+                score_state,
+                &output,
+                cache,
+                &params,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+            output
+        };
+
+        let batched_kv_state = f32_buffer(
+            &device,
+            &vec![0.0; state_len],
+            vec![1, 2 * ratio, projected],
+        );
+        let batched_score_state = f32_buffer(
+            &device,
+            &vec![f32::NEG_INFINITY; state_len],
+            vec![1, 2 * ratio, projected],
+        );
+        let batched_cache = bf16_buffer(&device, &vec![bf16::ZERO; dim], vec![1, 1, dim]);
+        let mut batched_registry = KernelRegistry::new();
+        let batched_output = run(
+            0,
+            ratio,
+            &batched_kv_state,
+            &batched_score_state,
+            &batched_cache,
+            &mut batched_registry,
+        );
+
+        let serial_kv_state = f32_buffer(
+            &device,
+            &vec![0.0; state_len],
+            vec![1, 2 * ratio, projected],
+        );
+        let serial_score_state = f32_buffer(
+            &device,
+            &vec![f32::NEG_INFINITY; state_len],
+            vec![1, 2 * ratio, projected],
+        );
+        let serial_cache = bf16_buffer(&device, &vec![bf16::ZERO; dim], vec![1, 1, dim]);
+        let mut serial_registry = KernelRegistry::new();
+        let mut serial_output = None;
+        for position in 0..ratio {
+            serial_output = Some(run(
+                position,
+                1,
+                &serial_kv_state,
+                &serial_score_state,
+                &serial_cache,
+                &mut serial_registry,
+            ));
+        }
+        let serial_output = serial_output.unwrap();
+
+        assert_eq!(
+            read_bf16(&batched_output, dim),
+            read_bf16(&serial_output, dim),
+            "ratio-4 dim-{dim} output differs"
+        );
+        assert_eq!(
+            read_bf16(&batched_cache, dim),
+            read_bf16(&serial_cache, dim),
+            "ratio-4 dim-{dim} cache differs"
+        );
+    }
 }
 
 #[test]

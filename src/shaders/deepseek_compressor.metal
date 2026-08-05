@@ -40,8 +40,11 @@ kernel void deepseek_compressor_bf16(
     const uint output_slots = p.start_pos == 0
         ? max(1u, p.seq_len / p.ratio)
         : max(1u, append_output_count);
-    const uint batch = p.start_pos == 0 ? group.x / output_slots : group.x;
-    const uint block = p.start_pos == 0 ? group.x % output_slots : 0;
+    const bool parallel_append =
+        p.start_pos != 0 && p.start_pos % p.ratio == 0 && p.seq_len >= p.ratio;
+    const bool block_parallel = p.start_pos == 0 || parallel_append;
+    const uint batch = block_parallel ? group.x / output_slots : group.x;
+    const uint block = block_parallel ? group.x % output_slots : 0;
     const ulong state_batch = ulong(batch) * coff * p.ratio * projected;
     const ulong input_batch = ulong(batch) * p.seq_len * projected;
     const ulong output_base = (ulong(batch) * output_slots + block) * p.head_dim;
@@ -50,6 +53,146 @@ kernel void deepseek_compressor_bf16(
     threadgroup uint bad[COMP_THREADS];
     threadgroup float rms_scale;
     threadgroup uint row_invalid;
+
+    // An append beginning on a compression boundary has no recurrent
+    // dependency between completed output blocks. Block zero combines the
+    // prior recurrent group with the first current group for ratio-four
+    // overlap; every later block reads only this transaction's input. This
+    // preserves incremental arithmetic while exposing all completed blocks
+    // as independent threadgroups. Block zero publishes the final recurrent
+    // state only after it has consumed the prior state.
+    if (parallel_append) {
+        float compressed[2] = { 0.0f, 0.0f };
+        uint local_bad = 0;
+        for (uint part = 0; part < 2; ++part) {
+            const uint feature = tid + part * COMP_THREADS;
+            if (feature >= p.head_dim) continue;
+            float maximum = -INFINITY;
+            const uint window = overlap ? 2 * p.ratio : p.ratio;
+            for (uint item = 0; item < window; ++item) {
+                const uint token = item % p.ratio;
+                const uint source_feature =
+                    overlap && item >= p.ratio ? p.head_dim + feature : feature;
+                float s;
+                float v;
+                if (overlap && item < p.ratio && block == 0) {
+                    const ulong src = state_batch + ulong(item) * projected + source_feature;
+                    s = score_state[src];
+                    v = kv_state[src];
+                } else {
+                    const uint source_block = overlap && item < p.ratio ? block - 1 : block;
+                    const ulong src = input_batch
+                        + ulong(source_block * p.ratio + token) * projected
+                        + source_feature;
+                    s = score[src] + ape[token * projected + source_feature];
+                    v = kv[src];
+                }
+                local_bad |= (isnan(s) || s == INFINITY || !isfinite(v)) ? 1u : 0u;
+                maximum = max(maximum, s);
+            }
+            float denominator = 0.0f;
+            float numerator = 0.0f;
+            for (uint item = 0; item < window; ++item) {
+                const uint token = item % p.ratio;
+                const uint source_feature =
+                    overlap && item >= p.ratio ? p.head_dim + feature : feature;
+                float s;
+                float v;
+                if (overlap && item < p.ratio && block == 0) {
+                    const ulong src = state_batch + ulong(item) * projected + source_feature;
+                    s = score_state[src];
+                    v = kv_state[src];
+                } else {
+                    const uint source_block = overlap && item < p.ratio ? block - 1 : block;
+                    const ulong src = input_batch
+                        + ulong(source_block * p.ratio + token) * projected
+                        + source_feature;
+                    s = score[src] + ape[token * projected + source_feature];
+                    v = kv[src];
+                }
+                const float weight = exp(s - maximum);
+                denominator += weight;
+                numerator = fma(weight, v, numerator);
+            }
+            const float pooled = numerator / denominator;
+            compressed[part] = float(bfloat(isfinite(pooled) ? pooled : 0.0f));
+            local_bad |= (!isfinite(pooled) || !isfinite(norm[feature])) ? 1u : 0u;
+        }
+
+        bad[tid] = local_bad;
+        sums[tid] = compressed[0] * compressed[0] + compressed[1] * compressed[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = COMP_THREADS / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                bad[tid] += bad[tid + stride];
+                sums[tid] += sums[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            row_invalid = bad[0] != 0 || !isfinite(sums[0]);
+            rms_scale = row_invalid == 0
+                ? rsqrt(sums[0] / float(p.head_dim) + p.epsilon)
+                : 0.0f;
+            if (!isfinite(rms_scale)) row_invalid = 1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float normalized[2] = { 0.0f, 0.0f };
+        for (uint part = 0; part < 2; ++part) {
+            const uint feature = tid + part * COMP_THREADS;
+            if (feature < p.head_dim) {
+                normalized[part] = compressed[part] * rms_scale * norm[feature];
+            }
+        }
+        bad[tid] = (!isfinite(normalized[0]) || !isfinite(normalized[1])) ? 1u : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = COMP_THREADS / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) bad[tid] += bad[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0 && bad[0] != 0) row_invalid = 1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint cache_slot = p.start_pos / p.ratio + block;
+        const ulong cache_base = (ulong(batch) * p.cache_len + cache_slot) * p.head_dim;
+        for (uint part = 0; part < 2; ++part) {
+            const uint feature = tid + part * COMP_THREADS;
+            if (feature < p.head_dim) {
+                const bfloat result = bfloat(row_invalid == 0 ? normalized[part] : 0.0f);
+                output[output_base + feature] = result;
+                if (p.write_cache != 0) cache[cache_base + feature] = result;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        if (block == 0) {
+            const uint cutoff = p.seq_len - p.seq_len % p.ratio;
+            const uint remainder = p.seq_len - cutoff;
+            const uint completed_start = cutoff - p.ratio;
+            const uint state_rows = coff * p.ratio;
+            const uint state_count = state_rows * projected;
+            for (uint i = tid; i < state_count; i += COMP_THREADS) {
+                const uint state_row = i / projected;
+                const uint feature = i % projected;
+                const uint token = state_row % p.ratio;
+                uint source_row;
+                if (overlap && state_row < p.ratio) {
+                    source_row = completed_start + token;
+                } else if (token < remainder) {
+                    source_row = cutoff + token;
+                } else {
+                    source_row = completed_start + token;
+                }
+                const ulong src = input_batch + ulong(source_row) * projected + feature;
+                const float v = kv[src];
+                const float s = score[src] + ape[token * projected + feature];
+                kv_state[state_batch + i] = safe_state_value(v);
+                score_state[state_batch + i] = isfinite(s) && isfinite(v) ? s : NAN;
+            }
+        }
+        return;
+    }
 
     // A nonzero append owns one threadgroup per batch. Advance recurrent
     // compressor state in token order inside that group and emit every block

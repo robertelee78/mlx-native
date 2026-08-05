@@ -194,7 +194,10 @@ pub fn dispatch_deepseek_compressor(
         )?;
     }
 
-    let groups_per_batch = if params.start_pos == 0 {
+    let aligned_parallel_append = params.start_pos != 0
+        && params.start_pos % params.ratio == 0
+        && params.seq_len >= params.ratio;
+    let groups_per_batch = if params.start_pos == 0 || aligned_parallel_append {
         params.output_slots()
     } else {
         1

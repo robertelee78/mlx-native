@@ -394,6 +394,37 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_sinks(
     )
 }
 
+/// BF16 D=512 prefill with both a tile-skip map and learned attention sinks.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: &MlxBuffer,
+    blk: &MlxBuffer,
+    sinks: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        Some(mask),
+        Some(blk),
+        Some(sinks),
+        out,
+        params,
+        NSG_D512,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     encoder: &mut CommandEncoder,
@@ -776,6 +807,37 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_sinks(
         v,
         mask,
         None,
+        Some(sinks),
+        out,
+        params,
+        NSG_D512,
+    )
+}
+
+/// F16 D=512 prefill with both a tile-skip map and learned attention sinks.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d512_with_blk_and_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: &MlxBuffer,
+    blk: &MlxBuffer,
+    sinks: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_f16_d512_with_nsg_blk_and_sinks(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        Some(mask),
+        Some(blk),
         Some(sinks),
         out,
         params,

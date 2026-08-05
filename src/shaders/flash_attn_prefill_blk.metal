@@ -122,12 +122,13 @@ struct FlashAttnPrefillBlkParams {
 // asymptotically cheaper than inline classification in the main kernel:
 // no K/V loads, no mask staging to shared memory, no cross-simdgroup
 // synchronisation.
-kernel void flash_attn_prefill_blk_bf16(
-    device const bfloat16_t* mask                   [[buffer(0)]],
-    device       char*       blk_out                [[buffer(1)]],
-    constant FlashAttnPrefillBlkParams& params      [[buffer(2)]],
-    uint3  tgpig                                    [[threadgroup_position_in_grid]],
-    ushort tiisg                                    [[thread_index_in_simdgroup]]
+template<typename MaskT>
+void flash_attn_prefill_blk_impl(
+    device const MaskT* mask,
+    device       char*  blk_out,
+    constant FlashAttnPrefillBlkParams& params,
+    uint3  tgpig,
+    ushort tiisg
 ) {
     const int BQ = BQ_def;          // Q-rows per tile
     const int BK = BK_def;          // K-cols per tile
@@ -221,7 +222,7 @@ kernel void flash_attn_prefill_blk_bf16(
         // lane with `col<BK` (lanes tiisg>=BK carry identity), so D=256
         // (BK=16) behaviour is byte-unchanged.
         for (int col = tiisg; col < BK; col += NW) {
-            device const bfloat16_t* mask_src = mask + row_base + col;
+            device const MaskT* mask_src = mask + row_base + col;
             for (int j = 0; j < q_rows; ++j) {
                 float v = float(mask_src[j * M_stride]);
                 mmin = min(mmin, v);
@@ -266,4 +267,24 @@ kernel void flash_attn_prefill_blk_bf16(
     if (tiisg == 0) {
         blk_out[qt * NK + kt] = res;
     }
+}
+
+kernel void flash_attn_prefill_blk_bf16(
+    device const bfloat16_t* mask                   [[buffer(0)]],
+    device       char*       blk_out                [[buffer(1)]],
+    constant FlashAttnPrefillBlkParams& params      [[buffer(2)]],
+    uint3  tgpig                                    [[threadgroup_position_in_grid]],
+    ushort tiisg                                    [[thread_index_in_simdgroup]]
+) {
+    flash_attn_prefill_blk_impl(mask, blk_out, params, tgpig, tiisg);
+}
+
+kernel void flash_attn_prefill_blk_f16(
+    device const half* mask                         [[buffer(0)]],
+    device       char* blk_out                      [[buffer(1)]],
+    constant FlashAttnPrefillBlkParams& params      [[buffer(2)]],
+    uint3  tgpig                                    [[threadgroup_position_in_grid]],
+    ushort tiisg                                    [[thread_index_in_simdgroup]]
+) {
+    flash_attn_prefill_blk_impl(mask, blk_out, params, tgpig, tiisg);
 }

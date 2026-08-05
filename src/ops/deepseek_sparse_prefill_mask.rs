@@ -120,7 +120,14 @@ fn dispatch_typed(
     let top_k = params.top_k as usize;
     let heads = params.heads as usize;
     let index_elements = checked_product(&[batch, queries, top_k])?;
-    let mask_elements = checked_product(&[batch, heads, queries, kv_len])?;
+    let broadcast = mask.shape() == [queries, kv_len];
+    if broadcast && batch != 1 {
+        return Err(MlxError::InvalidArgument(
+            "deepseek_sparse_prefill_mask: rank-2 broadcast masks require batch=1".into(),
+        ));
+    }
+    let mask_heads = if broadcast { 1 } else { heads };
+    let mask_elements = checked_product(&[batch, mask_heads, queries, kv_len])?;
     if indices.dtype() != DType::I32
         || indices.shape() != [batch, queries, top_k]
         || indices.byte_len() < index_elements * DType::I32.size_of()
@@ -131,35 +138,49 @@ fn dispatch_typed(
             indices.shape()
         )));
     }
+    let expected_mask = if broadcast {
+        vec![queries, kv_len]
+    } else {
+        vec![batch, heads, queries, kv_len]
+    };
     if mask.dtype() != mask_dtype
-        || mask.shape() != [batch, heads, queries, kv_len]
+        || mask.shape() != expected_mask
         || mask.byte_len() < mask_elements * mask_dtype.size_of()
     {
         return Err(MlxError::InvalidArgument(format!(
-            "deepseek_sparse_prefill_mask: mask must be {mask_dtype} [{batch}, {heads}, {queries}, {kv_len}], got {} {:?}",
+            "deepseek_sparse_prefill_mask: mask must be {mask_dtype} {:?}, got {} {:?}",
+            expected_mask,
             mask.dtype(),
             mask.shape()
         )));
     }
+
+    let shader_params = DeepSeekSparsePrefillMaskParams {
+        batch: params.batch,
+        query_len: params.query_len,
+        kv_len: params.kv_len,
+        top_k: params.top_k,
+        heads: mask_heads as u32,
+    };
 
     let fill = registry.get_pipeline(fill_kernel, device.metal_device())?;
     encoder.set_op_kind(CapturedOpKind::Other);
     encoder.encode_with_args(
         fill,
         &[
-            (0, KernelArg::Bytes(as_bytes(params))),
+            (0, KernelArg::Bytes(as_bytes(&shader_params))),
             (1, KernelArg::Buffer(mask)),
         ],
         MTLSize::new(mask_elements as u64, 1, 1),
         MTLSize::new(THREADS.min(mask_elements as u64), 1, 1),
     );
     encoder.memory_barrier();
-    let scatter_elements = checked_product(&[batch, queries, top_k, heads])?;
+    let scatter_elements = checked_product(&[batch, queries, top_k, mask_heads])?;
     let scatter = registry.get_pipeline(scatter_kernel, device.metal_device())?;
     encoder.encode_with_args(
         scatter,
         &[
-            (0, KernelArg::Bytes(as_bytes(params))),
+            (0, KernelArg::Bytes(as_bytes(&shader_params))),
             (1, KernelArg::Buffer(indices)),
             (2, KernelArg::Buffer(mask)),
         ],
