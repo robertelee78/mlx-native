@@ -642,4 +642,23 @@ fn malformed_and_nonfinite_inputs_fail_closed() {
         &params
     )
     .is_err());
+
+    params.head_dim = 128;
+    params.start_pos = u32::MAX - 1;
+    let mut encoder = device.command_encoder().unwrap();
+    assert!(dispatch_deepseek_compressor(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &kv,
+        &score,
+        &ape,
+        &norm,
+        &kv_state,
+        &score_state,
+        &output,
+        &cache,
+        &params
+    )
+    .is_err());
 }

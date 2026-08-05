@@ -51,10 +51,9 @@ impl DeepSeekCompressorParams {
         } else {
             let ratio = self.ratio.max(1);
             self.start_pos
-                .saturating_add(self.seq_len)
-                .checked_div(ratio)
-                .unwrap_or(0)
-                .saturating_sub(self.start_pos / ratio) as usize
+                .checked_add(self.seq_len)
+                .map(|end_pos| end_pos / ratio - self.start_pos / ratio)
+                .unwrap_or(0) as usize
         }
     }
 
@@ -96,9 +95,9 @@ fn validate_params(p: &DeepSeekCompressorParams) -> Result<(usize, usize, usize,
             "deepseek_compressor: batch, seq_len, and cache_len must be nonzero".into(),
         ));
     }
-    if p.start_pos == u32::MAX {
+    if p.start_pos.checked_add(p.seq_len).is_none() {
         return Err(MlxError::InvalidArgument(
-            "deepseek_compressor: start_pos cannot be u32::MAX".into(),
+            "deepseek_compressor: start_pos + seq_len overflows u32".into(),
         ));
     }
     let ratio = p.ratio as usize;
