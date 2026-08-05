@@ -61,6 +61,18 @@ pub fn dispatch_kv_cache_copy(
     if n_new == 0 || row_size == 0 {
         return Ok(()); // Nothing to copy
     }
+    if src.dtype() != crate::dtypes::DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy: src must be BF16, got {:?}",
+            src.dtype()
+        )));
+    }
+    if cache.dtype() != crate::dtypes::DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_copy: cache must be BF16, got {:?}",
+            cache.dtype()
+        )));
+    }
 
     let total_elements = (n_new as u64) * (row_size as u64);
     let src_elements = src.element_count() as u64;

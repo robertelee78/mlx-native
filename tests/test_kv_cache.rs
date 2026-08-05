@@ -226,6 +226,38 @@ fn test_kv_cache_copy_empty() {
 }
 
 #[test]
+fn test_kv_cache_copy_rejects_non_bf16_buffers() {
+    let (device, mut registry) = setup();
+    let bf16 = device
+        .alloc_buffer(8, DType::BF16, vec![4])
+        .expect("alloc bf16");
+    let f32 = device
+        .alloc_buffer(16, DType::F32, vec![4])
+        .expect("alloc f32");
+
+    for (src, cache, expected) in [
+        (&f32, &bf16, "src must be BF16"),
+        (&bf16, &f32, "cache must be BF16"),
+    ] {
+        let mut encoder = device.command_encoder().expect("encoder");
+        let error = kv_cache_copy::dispatch_kv_cache_copy(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            src,
+            cache,
+            0,
+            4,
+            1,
+            1,
+            false,
+        )
+        .expect_err("dtype mismatch must fail before encoding");
+        assert!(error.to_string().contains(expected));
+    }
+}
+
+#[test]
 fn test_kv_cache_copy_global_overflow_error() {
     let (device, mut registry) = setup();
 
