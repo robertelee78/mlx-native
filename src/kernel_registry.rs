@@ -1231,6 +1231,16 @@ impl KernelRegistry {
         let deepseek_indexer_src: &'static str = include_str!("shaders/deepseek_indexer.metal");
         sources.insert("deepseek_indexer_score_bf16".into(), deepseek_indexer_src);
         sources.insert("deepseek_indexer_topk_i32".into(), deepseek_indexer_src);
+        let deepseek_moe_routing_src: &'static str =
+            include_str!("shaders/deepseek_moe_routing.metal");
+        sources.insert(
+            "deepseek_moe_score_route_f32".into(),
+            deepseek_moe_routing_src,
+        );
+        sources.insert(
+            "deepseek_moe_hash_route_f32".into(),
+            deepseek_moe_routing_src,
+        );
         let deepseek_sparse_src: &'static str =
             include_str!("shaders/deepseek_sparse_attention.metal");
         sources.insert("deepseek_sparse_attention_bf16".into(), deepseek_sparse_src);

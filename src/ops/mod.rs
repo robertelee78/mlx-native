@@ -17,6 +17,7 @@ pub mod dense_mm_f32_f32;
 pub mod deepseek_hyper_connection;
 pub mod deepseek_compressor;
 pub mod deepseek_indexer;
+pub mod deepseek_moe_routing;
 pub mod deepseek_sparse_attention;
 pub mod deepseek_tail_rope;
 pub mod dequant_to_f16;
