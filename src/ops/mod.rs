@@ -18,6 +18,7 @@ pub mod deepseek_hyper_connection;
 pub mod deepseek_compressor;
 pub mod deepseek_indexer;
 pub mod deepseek_sparse_attention;
+pub mod deepseek_tail_rope;
 pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;
