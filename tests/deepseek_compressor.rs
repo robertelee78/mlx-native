@@ -220,6 +220,7 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize) {
             head_dim: dim as u32,
             cache_len: cache_len as u32,
             epsilon,
+            write_cache: 1,
         };
         let output = bf16_buffer(
             &device,
@@ -364,6 +365,7 @@ fn malformed_and_nonfinite_inputs_fail_closed() {
         head_dim: dim as u32,
         cache_len: 2,
         epsilon: 1e-6,
+        write_cache: 1,
     };
     let mut registry = KernelRegistry::new();
     let mut encoder = device.command_encoder().unwrap();
@@ -384,6 +386,46 @@ fn malformed_and_nonfinite_inputs_fail_closed() {
     .unwrap();
     encoder.commit_and_wait().unwrap();
     assert!(read_bf16(&output, dim).iter().all(|x| x.to_f32() == 0.0));
+
+    let sentinel_cache = bf16_buffer(&device, &[bf16::ONE], vec![1]);
+    params.write_cache = 0;
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_deepseek_compressor(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &kv,
+        &score,
+        &ape,
+        &norm,
+        &kv_state,
+        &score_state,
+        &output,
+        &sentinel_cache,
+        &params,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    assert_eq!(read_bf16(&sentinel_cache, 1), vec![bf16::ONE]);
+
+    params.write_cache = 2;
+    let mut encoder = device.command_encoder().unwrap();
+    assert!(dispatch_deepseek_compressor(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &kv,
+        &score,
+        &ape,
+        &norm,
+        &kv_state,
+        &score_state,
+        &output,
+        &cache,
+        &params
+    )
+    .is_err());
+    params.write_cache = 1;
     params.head_dim = 512;
     let mut encoder = device.command_encoder().unwrap();
     assert!(dispatch_deepseek_compressor(

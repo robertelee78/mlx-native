@@ -39,6 +39,9 @@ pub struct DeepSeekCompressorParams {
     pub head_dim: u32,
     pub cache_len: u32,
     pub epsilon: f32,
+    /// One writes normalized pre-RoPE rows to `cache`; zero emits only to
+    /// `output`, allowing the caller to apply RoPE/quantization first.
+    pub write_cache: u32,
 }
 
 impl DeepSeekCompressorParams {
@@ -112,6 +115,11 @@ fn validate_params(p: &DeepSeekCompressorParams) -> Result<(usize, usize, usize,
             "deepseek_compressor: epsilon must be finite and positive".into(),
         ));
     }
+    if p.write_cache > 1 {
+        return Err(MlxError::InvalidArgument(
+            "deepseek_compressor: write_cache must be zero or one".into(),
+        ));
+    }
     let count = p.output_count();
     let last_cache = if p.start_pos == 0 {
         count
@@ -179,12 +187,14 @@ pub fn dispatch_deepseek_compressor(
         DType::BF16,
         &[batch, params.output_slots(), dim],
     )?;
-    validate_buffer(
-        cache,
-        "cache",
-        DType::BF16,
-        &[batch, params.cache_len as usize, dim],
-    )?;
+    if params.write_cache != 0 {
+        validate_buffer(
+            cache,
+            "cache",
+            DType::BF16,
+            &[batch, params.cache_len as usize, dim],
+        )?;
+    }
 
     let groups_per_batch = params.output_slots();
     let groups = checked_shape(&[batch, groups_per_batch])?;

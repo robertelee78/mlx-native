@@ -11,6 +11,7 @@ struct DeepSeekCompressorParams {
     uint head_dim;
     uint cache_len;
     float epsilon;
+    uint write_cache;
 };
 
 constant uint COMP_THREADS = 256;
@@ -202,7 +203,7 @@ kernel void deepseek_compressor_bf16(
         if (feature < p.head_dim) {
             const bfloat result = bfloat(row_invalid == 0 ? normalized[part] : 0.0f);
             output[output_base + feature] = result;
-            cache[cache_base + feature] = result;
+            if (p.write_cache != 0) cache[cache_base + feature] = result;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

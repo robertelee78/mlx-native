@@ -60,6 +60,7 @@ fn benchmark_ratio4_and_ratio128_prefill() {
             head_dim: dim as u32,
             cache_len: (seq / ratio) as u32,
             epsilon: 1e-6,
+            write_cache: 1,
         };
         let mut registry = KernelRegistry::new();
         let start = Instant::now();

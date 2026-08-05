@@ -14,6 +14,7 @@ pub mod dense_gemv_bf16;
 pub mod dense_mm_bf16;
 pub mod dense_mm_f16;
 pub mod dense_mm_f32_f32;
+pub mod deepseek_activation_quant;
 pub mod deepseek_hyper_connection;
 pub mod deepseek_compressor;
 pub mod deepseek_indexer;

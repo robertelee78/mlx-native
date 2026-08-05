@@ -1225,6 +1225,16 @@ impl KernelRegistry {
         sources.insert("deepseek_hc_split_sinkhorn_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_pre_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_post_f32".into(), deepseek_hc_src);
+        let deepseek_activation_quant_src: &'static str =
+            include_str!("shaders/deepseek_activation_quant.metal");
+        sources.insert(
+            "deepseek_mxfp8_fake_quant_bf16".into(),
+            deepseek_activation_quant_src,
+        );
+        sources.insert(
+            "deepseek_hadamard_mxfp4_bf16".into(),
+            deepseek_activation_quant_src,
+        );
         let deepseek_compressor_src: &'static str =
             include_str!("shaders/deepseek_compressor.metal");
         sources.insert("deepseek_compressor_bf16".into(), deepseek_compressor_src);
