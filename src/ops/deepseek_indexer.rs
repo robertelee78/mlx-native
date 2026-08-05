@@ -41,6 +41,13 @@ pub struct DeepSeekIndexerParams {
     pub offset: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct DeepSeekIndexerOutputLayout {
+    row_stride: u32,
+    column_offset: u32,
+}
+
 fn checked_shape(dims: &[usize]) -> Result<usize> {
     dims.iter().try_fold(1usize, |count, &dim| {
         count.checked_mul(dim).ok_or_else(|| {
@@ -139,7 +146,66 @@ pub fn dispatch_deepseek_indexer(
     output: &MlxBuffer,
     params: &DeepSeekIndexerParams,
 ) -> Result<()> {
+    dispatch_deepseek_indexer_into(
+        encoder,
+        registry,
+        device,
+        q,
+        kv,
+        weights,
+        scratch,
+        output,
+        DEEPSEEK_INDEXER_TOP_K,
+        0,
+        params,
+    )
+}
+
+/// Score and select compressed KV entries into a strided output row.
+///
+/// This is the batched-prefill sibling of [`dispatch_deepseek_indexer`]. It
+/// writes the 512 selected indices at `column_offset` inside each
+/// `row_stride`-wide `[batch, query]` row, leaving every other column
+/// untouched. The contiguous entry point above remains source-compatible.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_deepseek_indexer_into(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    kv: &MlxBuffer,
+    weights: &MlxBuffer,
+    scratch: &MlxBuffer,
+    output: &MlxBuffer,
+    output_row_stride: usize,
+    output_column_offset: usize,
+    params: &DeepSeekIndexerParams,
+) -> Result<()> {
     let (batch, queries, kv_len) = validate_params(params)?;
+    let tail_end = output_column_offset
+        .checked_add(DEEPSEEK_INDEXER_TOP_K)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(
+                "deepseek_indexer: output column offset plus top-k overflows".into(),
+            )
+        })?;
+    if tail_end > output_row_stride {
+        return Err(MlxError::InvalidArgument(format!(
+            "deepseek_indexer: output tail {output_column_offset}..{tail_end} exceeds row stride {output_row_stride}"
+        )));
+    }
+    let output_layout = DeepSeekIndexerOutputLayout {
+        row_stride: u32::try_from(output_row_stride).map_err(|_| {
+            MlxError::InvalidArgument(
+                "deepseek_indexer: output row stride exceeds Metal uint indexing".into(),
+            )
+        })?,
+        column_offset: u32::try_from(output_column_offset).map_err(|_| {
+            MlxError::InvalidArgument(
+                "deepseek_indexer: output column offset exceeds Metal uint indexing".into(),
+            )
+        })?,
+    };
     validate_buffer(
         q,
         "q",
@@ -168,7 +234,7 @@ pub fn dispatch_deepseek_indexer(
         output,
         "output",
         DType::I32,
-        &[batch, queries, DEEPSEEK_INDEXER_TOP_K],
+        &[batch, queries, output_row_stride],
     )?;
 
     let score_pipeline =
@@ -197,6 +263,7 @@ pub fn dispatch_deepseek_indexer(
             (0, KernelArg::Bytes(as_bytes(params))),
             (1, KernelArg::Buffer(scratch)),
             (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&output_layout))),
         ],
         MTLSize::new((batch * queries) as u64, 1, 1),
         MTLSize::new(THREADS, 1, 1),

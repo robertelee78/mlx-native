@@ -15,6 +15,11 @@ struct DeepSeekIndexerParams {
     int offset;
 };
 
+struct DeepSeekIndexerOutputLayout {
+    uint row_stride;
+    uint column_offset;
+};
+
 constant uint IDX_HEADS = 64;
 constant uint IDX_DIM = 128;
 constant uint IDX_TOPK = 512;
@@ -88,12 +93,14 @@ kernel void deepseek_indexer_topk_i32(
         constant DeepSeekIndexerParams &p [[buffer(0)]],
         device float *scores               [[buffer(1)]],
         device int *output                 [[buffer(2)]],
+        constant DeepSeekIndexerOutputLayout &layout [[buffer(3)]],
         uint3 group                        [[threadgroup_position_in_grid]],
         uint tid                           [[thread_index_in_threadgroup]]) {
     const uint query = group.x % p.query_len;
     const uint batch = group.x / p.query_len;
     const ulong score_base = (ulong(batch) * p.query_len + query) * p.kv_len;
-    const ulong output_base = (ulong(batch) * p.query_len + query) * IDX_TOPK;
+    const ulong output_base =
+        (ulong(batch) * p.query_len + query) * layout.row_stride + layout.column_offset;
     const uint valid_count = min(p.kv_len, (p.start_pos + query + 1) / p.ratio);
 
     threadgroup float best_scores[IDX_THREADS];

@@ -18,7 +18,9 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
-use super::encode_helpers::{as_bytes, encode_threadgroups_with_args, KernelArg};
+use super::encode_helpers::{
+    as_bytes, encode_threadgroups_with_args, encode_threadgroups_with_args_and_shared, KernelArg,
+};
 
 /// MSL source for the dense GEMM kernel (embedded at compile time).
 pub static DENSE_GEMM_SHADER_SOURCE: &str = include_str!("../shaders/dense_gemm.metal");
@@ -30,6 +32,10 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("dense_matvec_f16w_f32io", DENSE_GEMM_SHADER_SOURCE);
     registry.register_source("dense_matvec_bf16w_f32io", DENSE_GEMM_SHADER_SOURCE);
     registry.register_source("dense_matvec_f32", DENSE_GEMM_SHADER_SOURCE);
+    registry.register_source(
+        "dense_matvec_f32_nsg4_exact_k4096",
+        DENSE_GEMM_SHADER_SOURCE,
+    );
 }
 
 /// MSL-compatible params struct for dense GEMM.
@@ -153,11 +159,7 @@ fn dispatch_matvec_f16(
     let n_simdgroup: u64 = 2;
     let rows_per_tg = n_dst * n_simdgroup; // 8
 
-    let threadgroups = MTLSize::new(
-        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
-        1,
-        1,
-    );
+    let threadgroups = MTLSize::new((params.n as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
     let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
 
     encode_threadgroups_with_args(
@@ -210,11 +212,7 @@ pub fn dispatch_dense_matvec_f16w_f32io(
     let n_simdgroup: u64 = 2;
     let rows_per_tg = n_dst * n_simdgroup;
 
-    let threadgroups = MTLSize::new(
-        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
-        1,
-        1,
-    );
+    let threadgroups = MTLSize::new((params.n as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
     let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
 
     encode_threadgroups_with_args(
@@ -269,11 +267,7 @@ pub fn dispatch_dense_matvec_bf16w_f32io(
     let n_simdgroup: u64 = 2;
     let rows_per_tg = n_dst * n_simdgroup;
 
-    let threadgroups = MTLSize::new(
-        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
-        1,
-        1,
-    );
+    let threadgroups = MTLSize::new((params.n as u64 + rows_per_tg - 1) / rows_per_tg, 1, 1);
     let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
 
     encode_threadgroups_with_args(
@@ -314,37 +308,61 @@ pub fn dispatch_dense_matvec_f32(
             "dense_matvec_f32: M must be 1 (decode only)".into(),
         ));
     }
-    let pipeline = registry.get_pipeline("dense_matvec_f32", device)?;
-
     let gpu_params = GpuDenseGemmParams {
         m: params.m,
         n: params.n,
         k: params.k,
     };
 
-    let n_dst: u64 = 4;
-    let n_simdgroup: u64 = 2;
-    let rows_per_tg = n_dst * n_simdgroup;
-
-    let threadgroups = MTLSize::new(
-        (params.n as u64 + rows_per_tg - 1) / rows_per_tg,
-        1,
-        1,
-    );
-    let threads_per_tg = MTLSize::new(32, n_simdgroup, 1);
-
-    encode_threadgroups_with_args(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(a)),
-            (1, KernelArg::Buffer(b)),
-            (2, KernelArg::Buffer(output)),
-            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
-        ],
-        threadgroups,
-        threads_per_tg,
-    );
+    if params.n == 256 && params.k == 4096 {
+        const ROWS_PER_TG: u64 = 2;
+        const SIMD_GROUPS: u64 = 4;
+        const K_STEPS: u64 = 32;
+        const SHARED_BYTES: u64 = ROWS_PER_TG * K_STEPS * 32 * 4;
+        let pipeline =
+            registry.get_pipeline("dense_matvec_f32_nsg4_exact_k4096", device)?;
+        let threadgroups = MTLSize::new(
+            (params.n as u64 + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            1,
+            1,
+        );
+        let threads_per_tg = MTLSize::new(32, SIMD_GROUPS, 1);
+        encode_threadgroups_with_args_and_shared(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(a)),
+                (1, KernelArg::Buffer(b)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            &[(0, SHARED_BYTES)],
+            threadgroups,
+            threads_per_tg,
+        );
+    } else {
+        let pipeline = registry.get_pipeline("dense_matvec_f32", device)?;
+        const ROWS_PER_TG: u64 = 8;
+        const SIMD_GROUPS: u64 = 2;
+        let threadgroups = MTLSize::new(
+            (params.n as u64 + ROWS_PER_TG - 1) / ROWS_PER_TG,
+            1,
+            1,
+        );
+        let threads_per_tg = MTLSize::new(32, SIMD_GROUPS, 1);
+        encode_threadgroups_with_args(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(a)),
+                (1, KernelArg::Buffer(b)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            threadgroups,
+            threads_per_tg,
+        );
+    }
 
     Ok(())
 }

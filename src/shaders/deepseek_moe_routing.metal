@@ -40,11 +40,17 @@ kernel void deepseek_moe_score_route_f32(
         device int *out_indices              [[buffer(3)]],
         device float *out_weights            [[buffer(4)]],
         uint token                           [[threadgroup_position_in_grid]],
-        uint tid                             [[thread_index_in_threadgroup]]) {
+        uint tid                             [[thread_index_in_threadgroup]],
+        ushort tiisg                         [[thread_index_in_simdgroup]],
+        ushort sgitg                         [[simdgroup_index_in_threadgroup]]) {
     if (token >= p.n_tokens) return;
     threadgroup float unbiased[DSV4_EXPERTS];
     threadgroup float selection[DSV4_EXPERTS];
-    threadgroup uint bad[DSV4_EXPERTS];
+    threadgroup uint group_bad[8];
+    threadgroup float group_best[8];
+    threadgroup uint group_best_id[8];
+    threadgroup int chosen[DSV4_TOP_K];
+    threadgroup float gathered[DSV4_TOP_K];
 
     const float logit = logits[ulong(token) * DSV4_EXPERTS + tid];
     const float learned_bias = bias[tid];
@@ -52,42 +58,74 @@ kernel void deepseek_moe_score_route_f32(
     const float selected_score = score + learned_bias;
     unbiased[tid] = score;
     selection[tid] = selected_score;
-    bad[tid] = (!isfinite(logit) || !isfinite(learned_bias)
-        || !isfinite(score) || !isfinite(selected_score)) ? 1u : 0u;
+    const bool bad = !isfinite(logit) || !isfinite(learned_bias)
+        || !isfinite(score) || !isfinite(selected_score);
+    if (tiisg == 0) {
+        group_bad[sgitg] = simd_any(bad) ? 1u : 0u;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = DSV4_EXPERTS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) bad[tid] += bad[tid + stride];
+    if (tid == 0) {
+        uint total_bad = 0;
+        for (uint group = 0; group < 8; ++group) {
+            total_bad += group_bad[group];
+        }
+        group_bad[0] = total_bad;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong out_base = ulong(token) * DSV4_TOP_K;
+    if (group_bad[0] != 0) {
+        if (tid == 0) dsv4_zero_route(out_indices, out_weights, out_base);
+        return;
+    }
+
+    // Six deterministic parallel tournaments. Each SIMD group reduces its
+    // 32 candidates, then SIMD group 0 reduces the eight group winners.
+    // Exact ties choose the lower expert ID, matching the serial reference.
+    for (uint slot = 0; slot < DSV4_TOP_K; ++slot) {
+        float best = selection[tid];
+        uint best_id = tid;
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            const float other = simd_shuffle_down(best, offset);
+            const uint other_id = simd_shuffle_down(best_id, offset);
+            const bool valid = tiisg + offset < 32u;
+            if (valid && (other > best || (other == best && other_id < best_id))) {
+                best = other;
+                best_id = other_id;
+            }
+        }
+        if (tiisg == 0) {
+            group_best[sgitg] = best;
+            group_best_id[sgitg] = best_id;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            float winner = tiisg < 8u ? group_best[tiisg] : -INFINITY;
+            uint winner_id = tiisg < 8u ? group_best_id[tiisg] : 0xFFFFFFFFu;
+            for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+                const float other = simd_shuffle_down(winner, offset);
+                const uint other_id = simd_shuffle_down(winner_id, offset);
+                const bool valid = tiisg + offset < 32u;
+                if (valid && (other > winner
+                    || (other == winner && other_id < winner_id))) {
+                    winner = other;
+                    winner_id = other_id;
+                }
+            }
+            if (tiisg == 0) {
+                chosen[slot] = int(winner_id);
+                gathered[slot] = unbiased[winner_id];
+                selection[winner_id] = -INFINITY;
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (tid == 0) {
-        const ulong out_base = ulong(token) * DSV4_TOP_K;
-        if (bad[0] != 0) {
-            dsv4_zero_route(out_indices, out_weights, out_base);
-            return;
-        }
-        int chosen[DSV4_TOP_K];
-        float gathered[DSV4_TOP_K];
-        for (uint slot = 0; slot < DSV4_TOP_K; ++slot) chosen[slot] = -1;
         float sum = 0.0f;
         for (uint slot = 0; slot < DSV4_TOP_K; ++slot) {
-            float best = -INFINITY;
-            int best_id = -1;
-            for (uint expert = 0; expert < DSV4_EXPERTS; ++expert) {
-                bool already = false;
-                for (uint prior = 0; prior < slot; ++prior) {
-                    already |= chosen[prior] == int(expert);
-                }
-                const float candidate = selection[expert];
-                if (!already && (candidate > best
-                    || (candidate == best && (best_id < 0 || int(expert) < best_id)))) {
-                    best = candidate;
-                    best_id = int(expert);
-                }
-            }
-            chosen[slot] = best_id;
-            gathered[slot] = unbiased[best_id];
             sum += gathered[slot];
         }
         if (!isfinite(sum) || sum <= 0.0f) {

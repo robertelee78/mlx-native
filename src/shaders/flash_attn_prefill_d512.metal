@@ -237,6 +237,7 @@ constant bool do_causal [[function_constant(301)]];
 // declaration for the full contract; same index 303 across both D=256
 // and D=512 so the dispatcher can set one bool and feed either kernel.
 constant bool has_blk  [[function_constant(303)]];
+constant bool has_sinks [[function_constant(304)]];
 
 constant int  fc_nsg   [[function_constant(322)]];
 
@@ -249,6 +250,7 @@ constant bool align_K_def  = is_function_constant_defined(align_K)  ? align_K  :
 constant bool has_mask_def = is_function_constant_defined(has_mask) ? has_mask : false;
 constant bool do_causal_def = is_function_constant_defined(do_causal) ? do_causal : false;
 constant bool has_blk_def  = is_function_constant_defined(has_blk)  ? has_blk  : false;
+constant bool has_sinks_def = is_function_constant_defined(has_sinks) ? has_sinks : false;
 constant int  nsg_def      = is_function_constant_defined(fc_nsg)   ? fc_nsg   : 8;
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -288,6 +290,7 @@ void flash_attn_prefill_d512_impl(
     const constant AttnMaskParams& mask_args,
     const device MaskT* mask_base,
     const device char*  blk_base,
+    const device float* sinks,
     threadgroup  half* shmem_f16,
     uint3  tgpig,
     ushort tiisg,
@@ -967,6 +970,28 @@ void flash_attn_prefill_d512_impl(
 
   // ── Final output write (ggml-metal.metal:6349-6371) ────────────────────
   //
+  // Learned per-head attention sink: denominator-only softmax mass, with
+  // the same online rescaling order as llama.cpp's native sink branch.
+  if (has_sinks_def) {
+    threadgroup float4* so4 = (threadgroup float4*)(so);
+    constexpr short PV4 = PV / 4;
+    constexpr short DV4 = DV / 4;
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+      const short j = jj * NSG + sgitg;
+      const float m = M[jj];
+      const float sink = tiisg == 0 ? sinks[iq2] : -FLT_MAX / 2.0f;
+
+      M[jj] = simd_max(max(M[jj], sink));
+      const float ms = exp(m - M[jj]);
+      const float vs = exp(sink - M[jj]);
+      S[jj] = S[jj] * ms + simd_sum(vs);
+
+      for (short i = tiisg; i < DV4; i += NW) {
+        so4[j * PV4 + i] *= ms;
+      }
+    }
+  }
+
   // Each simdgroup writes its NQ owned Q rows to device O, dividing by
   // S[jj] with the finite-sentinel guard: if S==0 (all masked), scale=0
   // so the output row is all-zero — matches llama.cpp:6358 and our D=256
@@ -1011,6 +1036,7 @@ void flash_attn_prefill_d512(
     const constant AttnMaskParams& mask_args [[buffer(5), function_constant(has_mask)]],
     const device MaskT* mask_base [[buffer(6), function_constant(has_mask)]],
     const device char*  blk_base  [[buffer(7), function_constant(has_blk)]],
+    const device float* sinks     [[buffer(8), function_constant(has_sinks)]],
     threadgroup  half* shmem_f16 [[threadgroup(0)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
@@ -1026,12 +1052,12 @@ void flash_attn_prefill_d512(
     case 4:
       flash_attn_prefill_d512_impl<T, MaskT, 4>(
           q_base, k_base, v_base, o_base, args,
-          mask_args, mask_base, blk_base, shmem_f16, tgpig, tiisg, sgitg);
+          mask_args, mask_base, blk_base, sinks, shmem_f16, tgpig, tiisg, sgitg);
       break;
     case 8:
       flash_attn_prefill_d512_impl<T, MaskT, 8>(
           q_base, k_base, v_base, o_base, args,
-          mask_args, mask_base, blk_base, shmem_f16, tgpig, tiisg, sgitg);
+          mask_args, mask_base, blk_base, sinks, shmem_f16, tgpig, tiisg, sgitg);
       break;
     default:
       // No-op on unsupported NSG.  The dispatcher only ever sets 4 or 8.

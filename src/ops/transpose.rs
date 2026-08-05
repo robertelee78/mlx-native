@@ -75,13 +75,15 @@ pub fn transpose_2d(
     if input.dtype() != dtype {
         return Err(MlxError::InvalidArgument(format!(
             "transpose_2d: input dtype {} != dtype param {}",
-            input.dtype(), dtype,
+            input.dtype(),
+            dtype,
         )));
     }
     if output.dtype() != dtype {
         return Err(MlxError::InvalidArgument(format!(
             "transpose_2d: output dtype {} != dtype param {}",
-            output.dtype(), dtype,
+            output.dtype(),
+            dtype,
         )));
     }
 
@@ -248,13 +250,15 @@ pub fn transpose_last2_bf16(
     if input.byte_len() < elem_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "transpose_last2_bf16: input buffer too small: need {} bytes, have {}",
-            elem_bytes, input.byte_len()
+            elem_bytes,
+            input.byte_len()
         )));
     }
     if output.byte_len() < elem_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "transpose_last2_bf16: output buffer too small: need {} bytes, have {}",
-            elem_bytes, output.byte_len()
+            elem_bytes,
+            output.byte_len()
         )));
     }
 
@@ -326,13 +330,15 @@ pub fn transpose_last2_f16(
     if input.byte_len() < elem_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "transpose_last2_f16: input buffer too small: need {} bytes, have {}",
-            elem_bytes, input.byte_len()
+            elem_bytes,
+            input.byte_len()
         )));
     }
     if output.byte_len() < elem_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "transpose_last2_f16: output buffer too small: need {} bytes, have {}",
-            elem_bytes, output.byte_len()
+            elem_bytes,
+            output.byte_len()
         )));
     }
 
@@ -434,6 +440,56 @@ pub fn permute_021_bf16(
     Ok(())
 }
 
+/// F16 sibling of [`permute_021_bf16`].
+pub fn permute_021_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    dim_a: usize,
+    dim_b: usize,
+    dim_c: usize,
+) -> Result<()> {
+    if dim_a == 0 || dim_b == 0 || dim_c == 0 {
+        return Err(MlxError::InvalidArgument(
+            "permute_021_f16: all dimensions must be > 0".into(),
+        ));
+    }
+    let elements = dim_a
+        .checked_mul(dim_b)
+        .and_then(|value| value.checked_mul(dim_c))
+        .ok_or_else(|| MlxError::InvalidArgument("permute_021_f16: shape overflow".into()))?;
+    let bytes = elements * 2;
+    if input.byte_len() < bytes || output.byte_len() < bytes {
+        return Err(MlxError::InvalidArgument(
+            "permute_021_f16: input or output buffer is too small".into(),
+        ));
+    }
+    let pipeline = registry.get_pipeline("permute_021_f16", device)?;
+    let params = GpuPermute021Params {
+        dim_a: dim_a as u32,
+        dim_b: dim_b as u32,
+        dim_c: dim_c as u32,
+    };
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(dim_c as u64, dim_b as u64, dim_a as u64),
+        MTLSize::new(
+            64.min(dim_c) as u64,
+            4.min(dim_b) as u64,
+            4.min(dim_a) as u64,
+        ),
+    );
+    Ok(())
+}
+
 /// Fused permute_021 + bf16→f32 cast.  Replaces the two-pass sequence
 /// `permute_021_bf16(bf16 → bf16) ; cast_bf16_to_f32(bf16 → f32)` with a
 /// single dispatch that reads bf16 in [A, B, C] order and writes f32 in
@@ -461,13 +517,15 @@ pub fn permute_021_bf16_to_f32(
     if input.byte_len() < in_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "permute_021_bf16_to_f32: input buffer too small: need {} bytes, have {}",
-            in_bytes, input.byte_len()
+            in_bytes,
+            input.byte_len()
         )));
     }
     if output.byte_len() < out_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "permute_021_bf16_to_f32: output buffer too small: need {} bytes, have {}",
-            out_bytes, output.byte_len()
+            out_bytes,
+            output.byte_len()
         )));
     }
 
@@ -537,13 +595,15 @@ pub fn permute_021_f32_to_f16(
     if input.byte_len() < in_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "permute_021_f32_to_f16: input buffer too small: need {} bytes, have {}",
-            in_bytes, input.byte_len()
+            in_bytes,
+            input.byte_len()
         )));
     }
     if output.byte_len() < out_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "permute_021_f32_to_f16: output buffer too small: need {} bytes, have {}",
-            out_bytes, output.byte_len()
+            out_bytes,
+            output.byte_len()
         )));
     }
 

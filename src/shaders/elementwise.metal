@@ -419,6 +419,20 @@ kernel void permute_021_bf16(
     output[out_idx] = input[in_idx];
 }
 
+kernel void permute_021_f16(
+    device const half* input  [[buffer(0)]],
+    device half*       output [[buffer(1)]],
+    constant Permute021Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    const uint b = gid.y;
+    const uint a = gid.z;
+    if (a >= params.dim_a || b >= params.dim_b || c >= params.dim_c) return;
+    const uint in_idx = a * (params.dim_b * params.dim_c) + b * params.dim_c + c;
+    const uint out_idx = b * (params.dim_a * params.dim_c) + a * params.dim_c + c;
+    output[out_idx] = input[in_idx];
+}
+
 kernel void transpose_2d_f32(
     device const float* input  [[buffer(0)]],
     device float*       output [[buffer(1)]],

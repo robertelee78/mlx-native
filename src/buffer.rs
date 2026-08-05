@@ -344,6 +344,72 @@ impl MlxBuffer {
         Ok(slice)
     }
 
+    /// View the logical tensor region as a typed slice.
+    ///
+    /// Unlike [`as_slice`](Self::as_slice), this honors `shape` and
+    /// `byte_offset`. It is intended for pooled tensors whose physical Metal
+    /// allocation may be larger than the logical tensor. Quantized buffers
+    /// whose shape describes dequantized dimensions should continue to use
+    /// `as_slice` for physical-byte access.
+    pub fn as_logical_slice<T: bytemuck::Pod>(&self) -> Result<&[T]> {
+        let (ptr, count) = self.logical_cpu_view::<T>()?;
+        // SAFETY: logical_cpu_view validates the complete range and alignment;
+        // the caller upholds the documented type and synchronization contract.
+        Ok(unsafe { std::slice::from_raw_parts(ptr as *const T, count) })
+    }
+
+    /// Mutable counterpart to [`as_logical_slice`](Self::as_logical_slice).
+    pub fn as_logical_mut_slice<T: bytemuck::Pod>(&mut self) -> Result<&mut [T]> {
+        let (ptr, count) = self.logical_cpu_view::<T>()?;
+        // SAFETY: same as as_logical_slice, plus `&mut self` provides the
+        // exclusive handle required by the mutable CPU-access contract.
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr as *mut T, count) })
+    }
+
+    fn logical_cpu_view<T: bytemuck::Pod>(&self) -> Result<(*mut u8, usize)> {
+        let elem_size = std::mem::size_of::<T>();
+        if elem_size == 0 {
+            return Err(MlxError::InvalidArgument(
+                "Cannot view buffer as zero-sized type".into(),
+            ));
+        }
+        let logical_bytes = self
+            .element_count()
+            .checked_mul(self.dtype.size_of())
+            .ok_or_else(|| {
+                MlxError::InvalidArgument("Buffer logical byte length overflow".into())
+            })?;
+        if logical_bytes % elem_size != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer logical byte length {logical_bytes} is not a multiple of element size {elem_size}"
+            )));
+        }
+        let offset = self.byte_offset as usize;
+        let end = offset.checked_add(logical_bytes).ok_or_else(|| {
+            MlxError::InvalidArgument("Buffer logical CPU view range overflow".into())
+        })?;
+        let allocation_len = self.byte_len();
+        if end > allocation_len {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer logical CPU view [{offset}, {end}) exceeds allocation length {allocation_len}"
+            )));
+        }
+        let base = self.contents_ptr();
+        if base.is_null() {
+            return Err(MlxError::BufferAllocationError {
+                bytes: logical_bytes,
+            });
+        }
+        let ptr = unsafe { (base as *mut u8).add(offset) };
+        if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer logical CPU view offset {offset} is not aligned for {}",
+                std::any::type_name::<T>()
+            )));
+        }
+        Ok((ptr, logical_bytes / elem_size))
+    }
+
     /// Overwrite the dtype and shape metadata.
     ///
     /// This does **not** re-allocate the Metal buffer — it only changes the

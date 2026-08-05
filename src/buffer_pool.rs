@@ -197,7 +197,10 @@ impl MlxBufferPool {
         // Track the handout so reset() can recycle it.  ARC clone is cheap.
         self.in_use.push((bucket, metal_buf.clone()));
 
-        Ok((MlxBuffer::from_raw(metal_buf, dtype, shape), added_residency))
+        Ok((
+            MlxBuffer::from_raw(metal_buf, dtype, shape),
+            added_residency,
+        ))
     }
 
     /// Return a single buffer to the pool's free list for future reuse.
@@ -301,11 +304,7 @@ impl MlxBufferPool {
     ///
     /// Returns `MlxError::InvalidArgument` if the buffer was allocated on a
     /// different `MlxDevice` than any previously registered buffer.
-    pub fn register_existing(
-        &mut self,
-        device: &MlxDevice,
-        buffer: &MlxBuffer,
-    ) -> Result<()> {
+    pub fn register_existing(&mut self, device: &MlxDevice, buffer: &MlxBuffer) -> Result<()> {
         // ADR-015 iter8e (Phase 3b): MlxDevice::alloc_buffer now
         // auto-registers each new buffer with the device's residency set
         // via Arc<MlxBufferStorage>. If this caller's buffer already owns
@@ -520,10 +519,20 @@ mod tests {
         // Cycle 1: allocate three buffers in different buckets, then drop them
         // (locals fall out of scope at the end of the block).
         let (ptr_a, ptr_b, ptr_c) = {
-            let buf_a = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc a");
-            let buf_b = pool.alloc(&device, 2048, DType::F32, vec![512]).expect("alloc b");
-            let buf_c = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc c");
-            (buf_a.contents_ptr(), buf_b.contents_ptr(), buf_c.contents_ptr())
+            let buf_a = pool
+                .alloc(&device, 1024, DType::F32, vec![256])
+                .expect("alloc a");
+            let buf_b = pool
+                .alloc(&device, 2048, DType::F32, vec![512])
+                .expect("alloc b");
+            let buf_c = pool
+                .alloc(&device, 1024, DType::F32, vec![256])
+                .expect("alloc c");
+            (
+                buf_a.contents_ptr(),
+                buf_b.contents_ptr(),
+                buf_c.contents_ptr(),
+            )
         };
         assert_eq!(pool.in_use_count(), 3);
         assert_eq!(pool.free_count(), 0);
@@ -535,8 +544,12 @@ mod tests {
 
         // Cycle 2: allocate compatible-bucket buffers, must reuse the same
         // underlying Metal buffers (contents_ptr equal).
-        let buf_d = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc d");
-        let buf_e = pool.alloc(&device, 2048, DType::F32, vec![512]).expect("alloc e");
+        let buf_d = pool
+            .alloc(&device, 1024, DType::F32, vec![256])
+            .expect("alloc d");
+        let buf_e = pool
+            .alloc(&device, 2048, DType::F32, vec![512])
+            .expect("alloc e");
         let ptr_d = buf_d.contents_ptr();
         let ptr_e = buf_e.contents_ptr();
 
@@ -545,13 +558,46 @@ mod tests {
         assert!(
             ptr_d == ptr_a || ptr_d == ptr_c,
             "buf_d {:?} must reuse one of a {:?} / c {:?}",
-            ptr_d, ptr_a, ptr_c,
+            ptr_d,
+            ptr_a,
+            ptr_c,
         );
         assert_eq!(ptr_e, ptr_b, "buf_e must reuse b (only 2048-bucket buffer)");
 
         // After cycle-2 alloc, free has 1 (the unused 1024-bucket buffer) + in_use 2.
         assert_eq!(pool.in_use_count(), 2);
         assert_eq!(pool.free_count(), 1);
+    }
+
+    #[test]
+    fn pooled_cpu_views_honor_logical_shape_and_slice_offset() {
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new();
+        let mut buffer = pool
+            .alloc(&device, 140, DType::I32, vec![35])
+            .expect("allocate non-power-of-two logical tensor");
+
+        assert_eq!(buffer.byte_len(), 256, "pool retains bucket capacity");
+        assert_eq!(
+            buffer
+                .as_logical_slice::<i32>()
+                .expect("logical view")
+                .len(),
+            35
+        );
+        buffer
+            .as_logical_mut_slice::<i32>()
+            .expect("logical mutable view")
+            .copy_from_slice(&[0_i32; 35]);
+
+        let mut tail = buffer.slice_view(4 * 4, 3);
+        tail.as_logical_mut_slice::<i32>()
+            .expect("offset mutable view")
+            .copy_from_slice(&[7, 8, 9]);
+        assert_eq!(
+            &buffer.as_logical_slice::<i32>().expect("parent view")[4..7],
+            &[7, 8, 9]
+        );
     }
 
     #[test]
@@ -690,7 +736,9 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let mut pool = MlxBufferPool::new();
 
-        let buf = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc");
+        let buf = pool
+            .alloc(&device, 1024, DType::F32, vec![256])
+            .expect("alloc");
         assert_eq!(pool.in_use_count(), 1);
         pool.release(buf);
         // release() does NOT remove from in_use; that's acceptable per the
@@ -699,7 +747,9 @@ mod tests {
         assert_eq!(pool.in_use_count(), 1);
 
         // Allocating again pulls from free first.
-        let _buf2 = pool.alloc(&device, 1024, DType::F32, vec![256]).expect("alloc 2");
+        let _buf2 = pool
+            .alloc(&device, 1024, DType::F32, vec![256])
+            .expect("alloc 2");
         assert_eq!(pool.free_count(), 0);
         assert_eq!(pool.in_use_count(), 2);
     }

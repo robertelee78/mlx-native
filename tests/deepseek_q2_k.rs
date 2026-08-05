@@ -4,7 +4,9 @@ use mlx_native::{
     gguf::{test_only_dequantize, GgufFile},
     ops::{
         embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams},
-        quantized_matmul_ggml::{dispatch_mm_for_test, dispatch_mm_simd_for_test},
+        quantized_matmul_ggml::{
+            dispatch_mm_for_test, dispatch_mm_simd_for_test, quantized_matmul_q2_k_batched_mv,
+        },
         quantized_matmul_id_ggml::{dispatch_id_mm_for_test, GgmlIdMmDispatchParams},
     },
     quantized_matmul_ggml, quantized_matmul_id_ggml, DType, GgmlQuantizedMatmulIdParams,
@@ -280,6 +282,93 @@ fn run_dense(rows: usize, force_mm: bool, force_simd: bool) {
 #[test]
 fn q2_k_dense_metal_decode_matches_reference() {
     run_dense(1, false, false);
+}
+
+#[test]
+fn q2_k_batched_mv_is_byte_identical_to_independent_dispatches() {
+    let batches = 3usize;
+    let n = 8usize;
+    let mut weights = Vec::with_capacity(batches * n * BLOCK_BYTES);
+    for batch in 0..batches {
+        for row in 0..n {
+            weights.extend(block((batch * n + row + 1) as u8));
+        }
+    }
+    let inputs = input(batches);
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    let mut weight = device
+        .alloc_buffer(weights.len(), DType::U8, vec![batches, n, QK_K])
+        .expect("batched weights");
+    weight
+        .as_mut_slice::<u8>()
+        .expect("weight bytes")
+        .copy_from_slice(&weights);
+    let mut input = device
+        .alloc_buffer(
+            inputs.len() * DType::F32.size_of(),
+            DType::F32,
+            vec![batches, 1, QK_K],
+        )
+        .expect("batched inputs");
+    input
+        .as_mut_slice::<f32>()
+        .expect("input values")
+        .copy_from_slice(&inputs);
+    let batched_output = device
+        .alloc_buffer(
+            batches * n * DType::F32.size_of(),
+            DType::F32,
+            vec![batches, 1, n],
+        )
+        .expect("batched output");
+    let serial_output = device
+        .alloc_buffer(
+            batches * n * DType::F32.size_of(),
+            DType::F32,
+            vec![batches, 1, n],
+        )
+        .expect("serial output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    quantized_matmul_q2_k_batched_mv(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &weight,
+        &batched_output,
+        batches as u32,
+        1,
+        n as u32,
+        QK_K as u32,
+    )
+    .expect("batched Q2_K matvec");
+    for batch in 0..batches {
+        let input_view = input.slice_view((batch * QK_K * DType::F32.size_of()) as u64, QK_K);
+        let weight_view = weight.slice_view((batch * n * BLOCK_BYTES) as u64, n * BLOCK_BYTES);
+        let output_view = serial_output.slice_view((batch * n * DType::F32.size_of()) as u64, n);
+        quantized_matmul_ggml(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_view,
+            &weight_view,
+            &output_view,
+            &GgmlQuantizedMatmulParams {
+                m: 1,
+                n: n as u32,
+                k: QK_K as u32,
+                ggml_type: GgmlType::Q2_K,
+            },
+        )
+        .expect("serial Q2_K matvec");
+    }
+    encoder.commit_and_wait().expect("GPU completion");
+    assert_eq!(
+        batched_output.as_slice::<f32>().expect("batched values"),
+        serial_output.as_slice::<f32>().expect("serial values")
+    );
 }
 
 #[test]

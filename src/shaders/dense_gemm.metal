@@ -410,6 +410,60 @@ kernel void dense_matvec_f32(
     }
 }
 
+// Cooperative DeepSeek-router variant that preserves the legacy kernel's
+// floating-point accumulation order exactly.  The four SIMD groups compute
+// individual float4 dot products in parallel and stage them as
+// [row][K-step][lane].  SIMD group 0 then accumulates those steps in the same
+// order as `dense_matvec_f32` before performing the same simd_sum reduction.
+//
+// This specialization is intentionally shape-bound to K=4096.  The host only
+// selects it for the DeepSeek router [256, 4096]; other F32 mat-vec shapes use
+// the general legacy kernel.
+kernel void dense_matvec_f32_nsg4_exact_k4096(
+    device const float*          A      [[buffer(0)]],
+    device const float*          B      [[buffer(1)]],
+    device float*                C      [[buffer(2)]],
+    constant DenseGemmParams&    params [[buffer(3)]],
+    threadgroup float*           shmem  [[threadgroup(0)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    ushort  tiisg [[thread_index_in_simdgroup]],
+    ushort  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 4;
+    constexpr short NW = 32;
+    constexpr short NR0 = 2;
+    constexpr short K_STEPS = 32; // 4096 / (32 lanes * float4)
+
+    const int K = (int)params.K;
+    const int N = (int)params.N;
+    const int r0 = (int)tgpig.x * NR0;
+
+    for (short row = 0; row < NR0; ++row) {
+        const int safe_row = min(r0 + (int)row, N - 1);
+        device const float* weights = B + (uint64_t)safe_row * (uint64_t)K;
+        for (short step = sgitg; step < K_STEPS; step += NSG) {
+            const int k = (int)tiisg * 4 + (int)step * NW * 4;
+            const float4 av = *((device const float4*)(A + k));
+            const float4 bv = *((device const float4*)(weights + k));
+            shmem[((int)row * K_STEPS + (int)step) * NW + (int)tiisg] = dot(av, bv);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (short row = 0; row < NR0; ++row) {
+            float acc = 0.0f;
+            for (short step = 0; step < K_STEPS; ++step) {
+                acc += shmem[((int)row * K_STEPS + (int)step) * NW + (int)tiisg];
+            }
+            acc = simd_sum(acc);
+            if (tiisg == 0 && r0 + row < N) {
+                C[r0 + row] = acc;
+            }
+        }
+    }
+}
+
 // ============================================================
 // Kernel 2: Fallback tiled GEMM for M>1
 // ============================================================

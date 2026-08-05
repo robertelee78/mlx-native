@@ -103,7 +103,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::{CapturedOpKind, CommandEncoder, KernelArg, as_bytes};
+use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::DType;
@@ -125,13 +125,11 @@ pub static FLASH_ATTN_PREFILL_D512_SHADER_SOURCE: &str =
 /// D=512 NSG-specialised, bf16 I/O, bf16 additive mask.
 pub const K_LLAMACPP_BF16_D512: &str = "flash_attn_prefill_llamacpp_bf16_d512";
 /// D=512 NSG-specialised, bf16 I/O, bool (`is_attended`) mask.
-pub const K_LLAMACPP_BF16_D512_BOOLMASK: &str =
-    "flash_attn_prefill_llamacpp_bf16_d512_boolmask";
+pub const K_LLAMACPP_BF16_D512_BOOLMASK: &str = "flash_attn_prefill_llamacpp_bf16_d512_boolmask";
 /// D=512 NSG-specialised, f16 I/O, f16 additive mask.
 pub const K_LLAMACPP_F16_D512: &str = "flash_attn_prefill_llamacpp_f16_d512";
 /// D=512 NSG-specialised, f16 I/O, bool mask.
-pub const K_LLAMACPP_F16_D512_BOOLMASK: &str =
-    "flash_attn_prefill_llamacpp_f16_d512_boolmask";
+pub const K_LLAMACPP_F16_D512_BOOLMASK: &str = "flash_attn_prefill_llamacpp_f16_d512_boolmask";
 
 /// All four kernel entry-point names registered by this module.
 pub const ALL_KERNEL_NAMES: &[&str] = &[
@@ -179,6 +177,8 @@ pub const NSG_D512: u32 = 8;
 /// `FC_flash_attn_ext_nsg` at `ggml-metal.metal:5735` =
 /// `FC_FLASH_ATTN_EXT + 22` = `300 + 22 = 322`.
 pub const FC_IDX_NSG: usize = 322;
+/// Bool function constant enabling denominator-only learned attention sinks.
+pub const FC_IDX_SINKS: usize = 304;
 
 /// Threadgroup memory footprint at NSG=8, DK=DV=512, bf16, is_q=0.
 /// See module doc + ADR-011-phase2-port-d512.md §2.3.
@@ -358,8 +358,57 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     nsg: u32,
-) -> Result<()>
-{
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
+        encoder, device, registry, q, k, v, mask, blk, None, out, params, nsg,
+    )
+}
+
+/// Dispatch BF16 D=512 prefill with native per-query-head attention sinks.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d512_with_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    sinks: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        mask,
+        None,
+        Some(sinks),
+        out,
+        params,
+        NSG_D512,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    blk: Option<&MlxBuffer>,
+    sinks: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+    nsg: u32,
+) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
     if params.head_dim != 512 {
         return Err(MlxError::InvalidArgument(format!(
@@ -400,6 +449,14 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
             )));
         }
     }
+    if let Some(s) = sinks {
+        if s.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_bf16_d512: sinks buffer must be F32, got {:?}",
+                s.dtype()
+            )));
+        }
+    }
 
     let batch = params.batch as usize;
     let h = params.n_heads as usize;
@@ -413,6 +470,9 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     validate_buffer_size(k, "K", batch * h_kv * kl * d)?;
     validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
     validate_buffer_size(out, "out", batch * h * ql * d)?;
+    if let Some(s) = sinks {
+        validate_buffer_size(s, "sinks", h)?;
+    }
     // A rank-2 mask `[qL, kL]` is the Wave 2D broadcast layout: one plane is
     // shared across all batches and heads (stride-0 in batch and head dims).
     // A rank-4 mask `[B, H, qL, kL]` is the per-head layout (back-compat).
@@ -441,6 +501,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     let align_k = kl_rem == 0;
     let has_mask = mask.is_some();
     let has_blk = blk.is_some();
+    let has_sinks = sinks.is_some();
     let do_causal = params.do_causal;
 
     // Validate blk buffer size when present.  Tile shape is fixed for D=512:
@@ -459,7 +520,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     // (=64), not BK=8.  So for D=512 the correct blk tile shape is
     // (BQ=8, BK=64).  Let's use that.
     let bq_main = 8_u32;
-    let bk_main = 64_u32;  // == NCPSG_D512: the main-kernel ic0 loop steps by C=64.
+    let bk_main = 64_u32; // == NCPSG_D512: the main-kernel ic0 loop steps by C=64.
 
     if let Some(b) = blk {
         let nq_tiles = ql.div_ceil(bq_main as usize);
@@ -481,7 +542,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     // point, not just a function constant).  When has_mask=false, the
     // additive-mask pipeline is compiled with has_mask=false, dead-code-
     // eliminating all mask accesses, and never binds buffers 5/6.
-    let kernel_name = K_LLAMACPP_BF16_D512;  // additive bf16 (or disabled) mask path
+    let kernel_name = K_LLAMACPP_BF16_D512; // additive bf16 (or disabled) mask path
 
     // ── Pipeline lookup (mixed bool+int function constants) ──────────────
     //
@@ -496,10 +557,9 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
             (300, has_mask),
             (301, do_causal),
             (303, has_blk),
+            (FC_IDX_SINKS, has_sinks),
         ],
-        &[
-            (FC_IDX_NSG, nsg as i32),
-        ],
+        &[(FC_IDX_NSG, nsg as i32)],
     )?;
 
     // ── Build AttnParams GPU struct ───────────────────────────────────────
@@ -551,11 +611,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     //   threads / TG = (32, nsg, 1)
     //
     // ne01 = qL, ne02 = H (query heads), ne03 = B.
-    let grid = MTLSize::new(
-        nq as u64,
-        params.n_heads as u64,
-        params.batch as u64,
-    );
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
     let tg_size = MTLSize::new(32, nsg as u64, 1);
 
     // ── Encode ─────────────────────────────────────────────────────────────
@@ -566,6 +622,10 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     // per-simdgroup dequant scratch, which we've dropped).  Using the
     // llama.cpp FATTN_SMEM(nsg=8) value for like-for-like memory behaviour.
     let tgmem = TGMEM_BYTES_D512 as u64;
+    // Metal requires a concrete binding value at encode time.  When the
+    // function constant disables sinks, buffer(8) is dead-code-eliminated;
+    // reusing Q avoids a dummy allocation for legacy callers.
+    let sinks_buf = sinks.unwrap_or(q);
 
     if has_mask {
         let mask_buf = mask.ok_or_else(|| {
@@ -607,6 +667,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
                     (5, KernelArg::Bytes(as_bytes(&mask_params))),
                     (6, KernelArg::Buffer(mask_buf)),
                     (7, KernelArg::Buffer(blk_buf)),
+                    (8, KernelArg::Buffer(sinks_buf)),
                 ],
                 &[(0, tgmem)],
                 grid,
@@ -623,6 +684,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
                     (4, KernelArg::Bytes(as_bytes(&attn_params))),
                     (5, KernelArg::Bytes(as_bytes(&mask_params))),
                     (6, KernelArg::Buffer(mask_buf)),
+                    (8, KernelArg::Buffer(sinks_buf)),
                     // buffer 7 absent — has_blk=false dead-codes blk refs.
                 ],
                 &[(0, tgmem)],
@@ -639,6 +701,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
                 (2, KernelArg::Buffer(v)),
                 (3, KernelArg::Buffer(out)),
                 (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                (8, KernelArg::Buffer(sinks_buf)),
                 // buffers 5, 6, 7 intentionally absent — has_mask=false +
                 // has_blk=false dead-code-eliminates mask + blk loads.
             ],
@@ -690,6 +753,36 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_blk(
     )
 }
 
+/// F16 D=512 prefill with native per-query-head attention sinks.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_f16_d512_with_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    sinks: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_f16_d512_with_nsg_blk_and_sinks(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        mask,
+        None,
+        Some(sinks),
+        out,
+        params,
+        NSG_D512,
+    )
+}
+
 /// Full F16 D=512 dispatcher with explicit NSG and optional blk.  The
 /// `_with_blk` variant above delegates here with `nsg = NSG_D512 = 8`.
 #[allow(clippy::too_many_arguments)]
@@ -702,6 +795,26 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
     v: &MlxBuffer,
     mask: Option<&MlxBuffer>,
     blk: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+    nsg: u32,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_f16_d512_with_nsg_blk_and_sinks(
+        encoder, device, registry, q, k, v, mask, blk, None, out, params, nsg,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_flash_attn_prefill_f16_d512_with_nsg_blk_and_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    blk: Option<&MlxBuffer>,
+    sinks: Option<&MlxBuffer>,
     out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     nsg: u32,
@@ -746,6 +859,14 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
             )));
         }
     }
+    if let Some(s) = sinks {
+        if s.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_flash_attn_prefill_f16_d512: sinks buffer must be F32, got {:?}",
+                s.dtype()
+            )));
+        }
+    }
 
     let batch = params.batch as usize;
     let h = params.n_heads as usize;
@@ -758,6 +879,9 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
     validate_buffer_size(k, "K", batch * h_kv * kl * d)?;
     validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
     validate_buffer_size(out, "out", batch * h * ql * d)?;
+    if let Some(s) = sinks {
+        validate_buffer_size(s, "sinks", h)?;
+    }
     let mask_is_rank2_broadcast = mask.is_some_and(|m| m.shape().len() == 2);
     if let Some(m) = mask {
         if mask_is_rank2_broadcast {
@@ -782,6 +906,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
     let align_k = kl_rem == 0;
     let has_mask = mask.is_some();
     let has_blk = blk.is_some();
+    let has_sinks = sinks.is_some();
     let do_causal = params.do_causal;
 
     let bq_main = 8_u32;
@@ -802,7 +927,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
     }
 
     // ── Kernel name ───────────────────────────────────────────────────────
-    let kernel_name = K_LLAMACPP_F16_D512;  // additive f16 (or disabled) mask path
+    let kernel_name = K_LLAMACPP_F16_D512; // additive f16 (or disabled) mask path
 
     let pipeline = registry.get_pipeline_with_constants(
         kernel_name,
@@ -813,10 +938,9 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
             (300, has_mask),
             (301, do_causal),
             (303, has_blk),
+            (FC_IDX_SINKS, has_sinks),
         ],
-        &[
-            (FC_IDX_NSG, nsg as i32),
-        ],
+        &[(FC_IDX_NSG, nsg as i32)],
     )?;
 
     let q_seq_stride = d as i64;
@@ -852,15 +976,12 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
         o_strides: [q_batch_stride, q_head_stride, q_seq_stride],
     };
 
-    let grid = MTLSize::new(
-        nq as u64,
-        params.n_heads as u64,
-        params.batch as u64,
-    );
+    let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
     let tg_size = MTLSize::new(32, nsg as u64, 1);
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);
     let tgmem = TGMEM_BYTES_D512 as u64;
+    let sinks_buf = sinks.unwrap_or(q);
 
     if has_mask {
         let mask_buf = mask.ok_or_else(|| {
@@ -897,6 +1018,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
                     (5, KernelArg::Bytes(as_bytes(&mask_params))),
                     (6, KernelArg::Buffer(mask_buf)),
                     (7, KernelArg::Buffer(blk_buf)),
+                    (8, KernelArg::Buffer(sinks_buf)),
                 ],
                 &[(0, tgmem)],
                 grid,
@@ -913,6 +1035,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
                     (4, KernelArg::Bytes(as_bytes(&attn_params))),
                     (5, KernelArg::Bytes(as_bytes(&mask_params))),
                     (6, KernelArg::Buffer(mask_buf)),
+                    (8, KernelArg::Buffer(sinks_buf)),
                 ],
                 &[(0, tgmem)],
                 grid,
@@ -928,6 +1051,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_with_nsg_and_blk(
                 (2, KernelArg::Buffer(v)),
                 (3, KernelArg::Buffer(out)),
                 (4, KernelArg::Bytes(as_bytes(&attn_params))),
+                (8, KernelArg::Buffer(sinks_buf)),
             ],
             &[(0, tgmem)],
             grid,
@@ -981,7 +1105,10 @@ mod tests {
                 name.starts_with("flash_attn_prefill_llamacpp_"),
                 "name must be prefixed with llamacpp marker: {name}"
             );
-            assert!(name.contains("d512"), "all D=512 names must contain d512: {name}");
+            assert!(
+                name.contains("d512"),
+                "all D=512 names must contain d512: {name}"
+            );
         }
     }
 

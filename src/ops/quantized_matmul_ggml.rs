@@ -15,7 +15,7 @@
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg, as_bytes};
+use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use std::sync::atomic::AtomicI8;
 
@@ -209,10 +209,7 @@ impl GgmlType {
         match self {
             // ADR-022 Phase 2 — Q5_K dense mm ported.
             // ADR-022 Phase 3 — Q4_K dense mm ported.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
@@ -234,10 +231,7 @@ impl GgmlType {
         match self {
             // ADR-022 Phase 2: Q5_K tensor mm landed.
             // ADR-022 Phase 3: Q4_K tensor mm landed.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
@@ -258,10 +252,7 @@ impl GgmlType {
     /// 9309-9431 (the GGML_METAL_HAS_TENSOR branch).
     fn mm_tensor_v2_kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
@@ -308,7 +299,14 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
             )
             .is_ok();
         if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
-            eprintln!("[mlx-native] tensor_mm probe: {}", if ok { "OK (using tensor variant)" } else { "FAILED (falling back to simdgroup MMA)" });
+            eprintln!(
+                "[mlx-native] tensor_mm probe: {}",
+                if ok {
+                    "OK (using tensor variant)"
+                } else {
+                    "FAILED (falling back to simdgroup MMA)"
+                }
+            );
         }
         ok
     })
@@ -363,22 +361,22 @@ struct GgmlMatvecGpuParams {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GgmlMatmulMmGpuParams {
-    ne00: i32,    // K
-    ne02: i32,    // batch(src0), always 1 for our projections
-    nb01: u64,    // bytes per weight row
-    nb02: u64,    // bytes per weight batch
-    nb03: u64,    // unused (always 0)
-    ne12: i32,    // batch(src1), always 1
-    _pad0: u32,   // align nb10 to 8
-    nb10: u64,    // = sizeof(float) = 4
-    nb11: u64,    // bytes per input row = K * sizeof(float)
-    nb12: u64,    // bytes per input batch = M * nb11
-    nb13: u64,    // unused
-    ne0: i32,     // N (output stride)
-    ne1: i32,     // M
-    r2: i16,      // 1
-    r3: i16,      // 1
-    _pad1: u32,   // trailing pad so sizeof == multiple of 8 (u64 align)
+    ne00: i32,  // K
+    ne02: i32,  // batch(src0), always 1 for our projections
+    nb01: u64,  // bytes per weight row
+    nb02: u64,  // bytes per weight batch
+    nb03: u64,  // unused (always 0)
+    ne12: i32,  // batch(src1), always 1
+    _pad0: u32, // align nb10 to 8
+    nb10: u64,  // = sizeof(float) = 4
+    nb11: u64,  // bytes per input row = K * sizeof(float)
+    nb12: u64,  // bytes per input batch = M * nb11
+    nb13: u64,  // unused
+    ne0: i32,   // N (output stride)
+    ne1: i32,   // M
+    r2: i16,    // 1
+    r3: i16,    // 1
+    _pad1: u32, // trailing pad so sizeof == multiple of 8 (u64 align)
 }
 
 /// Quantized matmul for GGML block format weights.
@@ -476,21 +474,25 @@ pub fn quantized_matmul_ggml(
         )));
     }
 
-    let expected_input_bytes =
-        (params.m as usize) * (params.k as usize) * DType::F32.size_of();
+    let expected_input_bytes = (params.m as usize) * (params.k as usize) * DType::F32.size_of();
     if input.byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "Input buffer too small: expected {} bytes for [{}x{}] f32, got {}",
-            expected_input_bytes, params.m, params.k, input.byte_len()
+            expected_input_bytes,
+            params.m,
+            params.k,
+            input.byte_len()
         )));
     }
 
-    let expected_output_bytes =
-        (params.m as usize) * (params.n as usize) * DType::F32.size_of();
+    let expected_output_bytes = (params.m as usize) * (params.n as usize) * DType::F32.size_of();
     if output.byte_len() < expected_output_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "Output buffer too small: expected {} bytes for [{}x{}] f32, got {}",
-            expected_output_bytes, params.m, params.n, output.byte_len()
+            expected_output_bytes,
+            params.m,
+            params.n,
+            output.byte_len()
         )));
     }
 
@@ -564,7 +566,10 @@ pub fn quantized_matmul_ggml(
         if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
             eprintln!(
                 "[mvN-route] Q6_K m={} n={} k={} → mN tiles={:?}",
-                params.m, params.n, params.k, mn_column_tiling(params.m as usize)
+                params.m,
+                params.n,
+                params.k,
+                mn_column_tiling(params.m as usize)
             );
         }
         return dispatch_mv_q6k_mn_adaptive(
@@ -590,14 +595,126 @@ pub fn quantized_matmul_ggml(
             ggml_type: params.ggml_type,
         };
         return crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
-            encoder, registry, device, weight, input, output, &ext_params,
+            encoder,
+            registry,
+            device,
+            weight,
+            input,
+            output,
+            &ext_params,
         );
     }
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
-        dispatch_mm(encoder, registry, device, input, weight, output, params, false)
+        dispatch_mm(
+            encoder, registry, device, input, weight, output, params, false,
+        )
     } else {
         dispatch_mv(encoder, registry, device, input, weight, output, params)
     }
+}
+
+/// Execute independent Q2_K matrix-vector products through the kernel's
+/// native batch dimension.
+///
+/// Layouts are input `[batch, m, k]`, weights `[batch, n, k]` in GGML Q2_K
+/// block storage, and output `[batch, m, n]`. This preserves the scalar
+/// Q2_K accumulation order while replacing `batch` identical dispatches with
+/// one three-dimensional Metal grid.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_q2_k_batched_mv(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    batch: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    if batch == 0 || m == 0 || n == 0 || k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "Q2_K batched MV dimensions must all be nonzero".into(),
+        ));
+    }
+    if m > MM_ROUTING_THRESHOLD {
+        return Err(MlxError::InvalidArgument(format!(
+            "Q2_K batched MV supports m <= {MM_ROUTING_THRESHOLD}, got {m}"
+        )));
+    }
+    if k % QK2_K != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "Q2_K batched MV input width {k} is not divisible by {QK2_K}"
+        )));
+    }
+    if input.dtype() != DType::F32 || weight.dtype() != DType::U8 || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "Q2_K batched MV requires F32/U8/F32 buffers, got {:?}/{:?}/{:?}",
+            input.dtype(),
+            weight.dtype(),
+            output.dtype()
+        )));
+    }
+    let checked_bytes = |dimensions: &[u32], element_bytes: usize, label: &str| -> Result<usize> {
+        dimensions
+            .iter()
+            .try_fold(element_bytes, |bytes, &dimension| {
+                bytes.checked_mul(dimension as usize).ok_or_else(|| {
+                    MlxError::InvalidArgument(format!(
+                        "Q2_K batched MV {label} byte length overflows"
+                    ))
+                })
+            })
+    };
+    let input_bytes = checked_bytes(&[batch, m, k], DType::F32.size_of(), "input")?;
+    let weight_bytes = checked_bytes(&[batch, n, k / QK2_K], BLOCK_Q2_K_BYTES as usize, "weight")?;
+    let output_bytes = checked_bytes(&[batch, m, n], DType::F32.size_of(), "output")?;
+    for (buffer, required, label) in [
+        (input, input_bytes, "input"),
+        (weight, weight_bytes, "weight"),
+        (output, output_bytes, "output"),
+    ] {
+        if buffer.byte_len() < required {
+            return Err(MlxError::InvalidArgument(format!(
+                "Q2_K batched MV {label} buffer needs {required} bytes, got {}",
+                buffer.byte_len()
+            )));
+        }
+    }
+
+    let batch_i64 = i64::from(batch);
+    let gpu_params = GgmlMatvecGpuParams {
+        ne00: i64::from(k),
+        ne01: i64::from(n),
+        ne02: batch_i64,
+        ne10: i64::from(k),
+        ne12: batch_i64,
+        ne0: i64::from(n),
+        ne1: i64::from(m),
+        r2: 1,
+        r3: 1,
+    };
+    let pipeline = registry.get_pipeline_with_constants(
+        GgmlType::Q2_K.kernel_name(),
+        device.metal_device(),
+        &[],
+        &[(700, batch as i32), (701, 1), (702, 1)],
+    )?;
+    encoder.dispatch_tracked_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[weight, input],
+        &[output],
+        metal::MTLSize::new(div_ceil(n as usize, 8) as u64, m as u64, batch as u64),
+        metal::MTLSize::new(2, 32, 1),
+    );
+    Ok(())
 }
 
 /// ADR-029 H29-speed: dispatch the V2 64×128 large-tile mm-tensor
@@ -652,22 +769,21 @@ pub fn dispatch_mm_v2_f16(
         _pad1: 0,
     };
 
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            "hf2q_mul_mm_tensor_v2_f16",
-            device.metal_device(),
-            &[],
-            &[(700, 1), (701, 1), (702, 1)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        "hf2q_mul_mm_tensor_v2_f16",
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
 
     const THREADS_PER_TG: u64 = 128;
-    let nra: u64 = 64;  // M_peer tile
+    let nra: u64 = 64; // M_peer tile
     let nrb: u64 = 128; // N_peer tile
     let tg_x = (m as u64 + nrb - 1) / nrb;
     let tg_y = (n as u64 + nra - 1) / nra;
     let threadgroups = metal::MTLSize::new(tg_x, tg_y, 1);
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
-    const SHMEM_BYTES: u64 = 4096;  // only A tile in shmem
+    const SHMEM_BYTES: u64 = 4096; // only A tile in shmem
 
     encoder.encode_threadgroups_with_args_and_shared(
         &pipeline,
@@ -704,7 +820,9 @@ pub fn dispatch_mm_for_test(
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     validate_mm_for_test(params)?;
-    dispatch_mm(encoder, registry, device, input, weight, output, params, false)
+    dispatch_mm(
+        encoder, registry, device, input, weight, output, params, false,
+    )
 }
 
 /// Test-only helper that forces the non-tensor simdgroup-MMA fallback.
@@ -721,7 +839,9 @@ pub fn dispatch_mm_simd_for_test(
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     validate_mm_for_test(params)?;
-    dispatch_mm(encoder, registry, device, input, weight, output, params, true)
+    dispatch_mm(
+        encoder, registry, device, input, weight, output, params, true,
+    )
 }
 
 fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
@@ -738,7 +858,8 @@ fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
         | GgmlType::IQ4_NL => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
-                "dispatch_mm_for_test does not support {:?}", other
+                "dispatch_mm_for_test does not support {:?}",
+                other
             )));
         }
     }
@@ -749,7 +870,8 @@ fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
     }
     if params.k % qk != 0 {
         return Err(MlxError::InvalidArgument(format!(
-            "K ({}) must be divisible by block QK ({})", params.k, qk
+            "K ({}) must be divisible by block QK ({})",
+            params.k, qk
         )));
     }
     Ok(())
@@ -799,13 +921,12 @@ fn dispatch_mv(
     // accessed again after pipeline lookup, so we can hold the &ComputePipelineState
     // reference across the rest of the function. Saves one objc retain/release
     // pair per dispatch.
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            kernel_name,
-            device.metal_device(),
-            &[],
-            &[(700, 1), (701, 1), (702, 1)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
 
     let gpu_params = GgmlMatvecGpuParams {
         ne00: params.k as i64,
@@ -850,11 +971,7 @@ fn dispatch_mv(
         (nth0, nth1, align)
     };
 
-    let threadgroups = metal::MTLSize::new(
-        div_ceil(n, align) as u64,
-        m as u64,
-        1,
-    );
+    let threadgroups = metal::MTLSize::new(div_ceil(n, align) as u64, m as u64, 1);
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
     if use_q8_0_nr2 {
@@ -924,7 +1041,16 @@ pub fn dispatch_mv_q6k_mn(
     r1ptg: usize,
 ) -> Result<()> {
     dispatch_mv_q6k_mn_chunk(
-        encoder, registry, device, input, weight, output, params, r1ptg, 0, params.m as usize,
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        r1ptg,
+        0,
+        params.m as usize,
     )
 }
 
@@ -1001,11 +1127,8 @@ fn dispatch_mv_q6k_mn_chunk(
     // nr0=2 rows/SG → 4 rows/TG (align=4 on N). grid.y tiles this chunk's
     // `width` columns by R1 (= 1 TG-row since width == r1ptg).
     let align = 4usize;
-    let threadgroups = metal::MTLSize::new(
-        div_ceil(n, align) as u64,
-        div_ceil(width, r1ptg) as u64,
-        1,
-    );
+    let threadgroups =
+        metal::MTLSize::new(div_ceil(n, align) as u64, div_ceil(width, r1ptg) as u64, 1);
     let threads_per_tg = metal::MTLSize::new(2, 32, 1);
 
     encoder.dispatch_tracked_threadgroups_with_args(
@@ -1137,10 +1260,10 @@ pub fn build_q6k_nr2_m1_record(
         pipeline,
         threadgroups,
         threads_per_tg,
-        threadgroup_mem: Vec::new(),  // NR2 path doesn't use shmem
+        threadgroup_mem: Vec::new(), // NR2 path doesn't use shmem
         params_bytes,
         params_slot: 3,
-        buffer_slots: vec![0, 1, 2],  // weight, input, output
+        buffer_slots: vec![0, 1, 2], // weight, input, output
         op_kind: CapturedOpKind::Other,
         kernel_name: "kernel_mul_mv_q6_K_f32_nr2".to_string(),
     }))
@@ -1187,13 +1310,12 @@ fn dispatch_mm(
     } else {
         params.ggml_type.mm_kernel_name()
     };
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            kernel_name,
-            device.metal_device(),
-            &[],
-            &[(700, 1), (701, 1), (702, 1)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -1233,11 +1355,11 @@ fn dispatch_mm(
         //     (hf2q-N = output features = params.n).
         // Only A goes through shmem: 64 × 32 halfs = 4096 B.  B is read
         // directly from device via the tensor view (no shmem staging).
-        let nra: u64 = 64;  // M_peer = hf2q-N
+        let nra: u64 = 64; // M_peer = hf2q-N
         let nrb: u64 = 128; // N_peer = hf2q-M
         (
-            (params.m as u64 + nrb - 1) / nrb,   // gx → N_peer = hf2q-M tiles
-            (params.n as u64 + nra - 1) / nra,   // gy → M_peer = hf2q-N tiles
+            (params.m as u64 + nrb - 1) / nrb, // gx → N_peer = hf2q-M tiles
+            (params.n as u64 + nra - 1) / nra, // gy → M_peer = hf2q-N tiles
             4096u64,
         )
     } else {
@@ -1300,19 +1422,19 @@ fn div_ceil(a: usize, b: usize) -> usize {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GgmlMatmulMmTensorPerm021GpuParams {
-    ne00: i32,   // K = n_heads * head_dim
+    ne00: i32, // K = n_heads * head_dim
     ne02: i32,
-    nb01: u64,   // bytes per weight row
+    nb01: u64, // bytes per weight row
     nb02: u64,
     nb03: u64,
     ne12: i32,
     _pad0: u32,
-    nb10: u64,   // = sizeof(bfloat) = 2
-    nb11: u64,   // unused (kept for struct symmetry)
+    nb10: u64, // = sizeof(bfloat) = 2
+    nb11: u64, // unused (kept for struct symmetry)
     nb12: u64,
     nb13: u64,
-    ne0: i32,    // N = hidden_size
-    ne1: i32,    // M = seq_len
+    ne0: i32, // N = hidden_size
+    ne1: i32, // M = seq_len
     r2: i16,
     r3: i16,
     // NO _pad between r3 and head_dim: Metal auto-aligns int32_t after
@@ -1405,23 +1527,23 @@ pub fn quantized_matmul_mm_tensor_perm021(
 
     // Input-buffer size check: n_heads * seq_len * head_dim * sizeof(bfloat).
     let n_heads = params.k / params.head_dim;
-    let expected_input_bytes = (n_heads as usize) * (params.m as usize)
-        * (params.head_dim as usize) * 2;
+    let expected_input_bytes =
+        (n_heads as usize) * (params.m as usize) * (params.head_dim as usize) * 2;
     if input_bf16.byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_mm_tensor_perm021: input_bf16 buffer too small \
              (have {}, need {})",
-            input_bf16.byte_len(), expected_input_bytes
+            input_bf16.byte_len(),
+            expected_input_bytes
         )));
     }
 
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            kernel_name,
-            device.metal_device(),
-            &[],
-            &[(700, 1), (701, 1), (702, 1)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -1523,13 +1645,14 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
     }
 
     let n_heads = params.k / params.head_dim;
-    let expected_input_bytes = (n_heads as usize) * (params.m as usize)
-        * (params.head_dim as usize) * 2;
+    let expected_input_bytes =
+        (n_heads as usize) * (params.m as usize) * (params.head_dim as usize) * 2;
     if input_bf16.byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_mm_tensor_perm021_f16: input_bf16 buffer too small \
              (have {}, need {})",
-            input_bf16.byte_len(), expected_input_bytes
+            input_bf16.byte_len(),
+            expected_input_bytes
         )));
     }
     let expected_weight_bytes = (params.n as usize) * (params.k as usize) * 2;
@@ -1537,18 +1660,20 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_mm_tensor_perm021_f16: weight_f16 buffer too small \
              (have {}, need {} bytes for [n={}, k={}] half)",
-            weight_f16.byte_len(), expected_weight_bytes, params.n, params.k
+            weight_f16.byte_len(),
+            expected_weight_bytes,
+            params.n,
+            params.k
         )));
     }
 
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            "kernel_mul_mm_f16_tensor_bf16_perm021",
-            device.metal_device(),
-            &[],
-            &[(700, 1), (701, 1), (702, 1)],
-        )?;
-    
+    let pipeline = registry.get_pipeline_with_constants(
+        "kernel_mul_mm_f16_tensor_bf16_perm021",
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
+
     // nb01 = bytes per F16 weight row = k * sizeof(half)
     let nb01: u64 = (params.k as u64) * 2;
 

@@ -108,7 +108,10 @@ fn test_dense_gemm_small_known() {
             assert!(
                 (actual - exp).abs() < 1e-2,
                 "GEMM mismatch at [{}, {}]: GPU={}, CPU={}",
-                i, j, actual, exp
+                i,
+                j,
+                actual,
+                exp
             );
         }
     }
@@ -232,26 +235,50 @@ fn test_dense_gemm_lm_head_like() {
     let b_f16: Vec<u16> = b_f32.iter().map(|&v| f32_to_f16(v)).collect();
 
     let mut a_buf = device
-        .alloc_buffer(m as usize * k as usize * 2, DType::F16, vec![m as usize, k as usize])
+        .alloc_buffer(
+            m as usize * k as usize * 2,
+            DType::F16,
+            vec![m as usize, k as usize],
+        )
         .expect("alloc A");
-    a_buf.as_mut_slice::<u16>().expect("write A").copy_from_slice(&a_f16);
+    a_buf
+        .as_mut_slice::<u16>()
+        .expect("write A")
+        .copy_from_slice(&a_f16);
 
     let mut b_buf = device
-        .alloc_buffer(n as usize * k as usize * 2, DType::F16, vec![n as usize, k as usize])
+        .alloc_buffer(
+            n as usize * k as usize * 2,
+            DType::F16,
+            vec![n as usize, k as usize],
+        )
         .expect("alloc B");
-    b_buf.as_mut_slice::<u16>().expect("write B").copy_from_slice(&b_f16);
+    b_buf
+        .as_mut_slice::<u16>()
+        .expect("write B")
+        .copy_from_slice(&b_f16);
 
     let c_buf = device
-        .alloc_buffer(m as usize * n as usize * 2, DType::F16, vec![m as usize, n as usize])
+        .alloc_buffer(
+            m as usize * n as usize * 2,
+            DType::F16,
+            vec![m as usize, n as usize],
+        )
         .expect("alloc C");
 
     let params = DenseGemmF16Params { m, n, k };
 
     let mut encoder = device.command_encoder().expect("encoder");
     dense_gemm::dispatch_dense_gemm_f16(
-        &mut encoder, &mut registry, device.metal_device(),
-        &a_buf, &b_buf, &c_buf, &params,
-    ).expect("dispatch");
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &a_buf,
+        &b_buf,
+        &c_buf,
+        &params,
+    )
+    .expect("dispatch");
     encoder.commit_and_wait().expect("commit_and_wait");
 
     let output_f16 = c_buf.as_slice::<u16>().expect("read C");
@@ -282,6 +309,79 @@ fn test_dense_gemm_lm_head_like() {
     assert!(
         rel_err < 0.05,
         "lm_head-like relative error too high: {:.4} (max_abs_err={:.4}, max_expected={:.4})",
-        rel_err, max_abs_err, max_expected
+        rel_err,
+        max_abs_err,
+        max_expected
     );
+}
+
+#[test]
+fn test_dense_matvec_f32_deepseek_router_shape() {
+    let (device, mut registry) = setup();
+    let m: u32 = 1;
+    let n: u32 = 256;
+    let k: u32 = 4096;
+    let a = pseudo_random_f32(0xD33F, k as usize);
+    let b = pseudo_random_f32(0x2A, (n * k) as usize);
+    let expected = cpu_gemm_abt(&a, &b, m as usize, n as usize, k as usize);
+
+    let mut a_buf = device
+        .alloc_buffer(a.len() * 4, DType::F32, vec![1, k as usize])
+        .expect("alloc F32 router input");
+    a_buf
+        .as_mut_slice::<f32>()
+        .expect("write F32 router input")
+        .copy_from_slice(&a);
+    let mut b_buf = device
+        .alloc_buffer(b.len() * 4, DType::F32, vec![n as usize, k as usize])
+        .expect("alloc F32 router weight");
+    b_buf
+        .as_mut_slice::<f32>()
+        .expect("write F32 router weight")
+        .copy_from_slice(&b);
+    let output = device
+        .alloc_buffer(n as usize * 4, DType::F32, vec![1, n as usize])
+        .expect("alloc F32 router output");
+    let params = DenseGemmF16Params { m, n, k };
+    let mut encoder = device.command_encoder().expect("encoder");
+    dense_gemm::dispatch_dense_matvec_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &a_buf,
+        &b_buf,
+        &output,
+        &params,
+    )
+    .expect("dispatch F32 router matvec");
+    encoder.commit_and_wait().expect("commit F32 router matvec");
+
+    let actual = output.as_slice::<f32>().expect("read F32 router output");
+    let max_abs = actual
+        .iter()
+        .zip(&expected)
+        .map(|(gpu, cpu)| (gpu - cpu).abs())
+        .fold(0.0_f32, f32::max);
+    let gpu_argmax = actual
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index);
+    let cpu_argmax = expected
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index);
+    let top_six = |values: &[f32]| {
+        let mut indexed = values.iter().copied().enumerate().collect::<Vec<_>>();
+        indexed.sort_by(|left, right| right.1.total_cmp(&left.1));
+        indexed
+            .into_iter()
+            .take(6)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    assert!(max_abs < 3.0e-3, "F32 router max abs error {max_abs}");
+    assert_eq!(gpu_argmax, cpu_argmax, "F32 router argmax drift");
+    assert_eq!(top_six(actual), top_six(&expected), "F32 router top-six drift");
 }

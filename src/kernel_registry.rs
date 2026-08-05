@@ -39,12 +39,12 @@ const EMBEDDED_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/defau
 /// A/B benching.
 fn precompiled_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        match std::env::var("MLX_PRECOMPILED_METALLIB").as_deref() {
+    *FLAG.get_or_init(
+        || match std::env::var("MLX_PRECOMPILED_METALLIB").as_deref() {
             Ok("0") | Ok("false") | Ok("off") => false,
             _ => true,
-        }
-    })
+        },
+    )
 }
 
 /// Returns `true` when the precompiled `.metallib` is consulted for
@@ -53,12 +53,12 @@ fn precompiled_enabled() -> bool {
 /// FCV path to use precompiled.  Default-ON.
 fn precompiled_fcv_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        match std::env::var("MLX_PRECOMPILED_METALLIB_FCV").as_deref() {
+    *FLAG.get_or_init(
+        || match std::env::var("MLX_PRECOMPILED_METALLIB_FCV").as_deref() {
             Ok("0") | Ok("false") | Ok("off") => false,
             _ => true,
-        }
-    })
+        },
+    )
 }
 
 // MTLDataType numeric values (from metal-rs argument.rs, confirmed in Apple Metal spec):
@@ -136,8 +136,7 @@ impl KernelRegistry {
         );
 
         // GGML block-format quantized mat-vec kernels (ADR-006 Phase 3)
-        let ggml_src: &'static str =
-            include_str!("shaders/quantized_matmul_ggml.metal");
+        let ggml_src: &'static str = include_str!("shaders/quantized_matmul_ggml.metal");
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q2_K_f32".into(), ggml_src);
@@ -170,8 +169,7 @@ impl KernelRegistry {
         // Used at prefill m > 8 to reuse each weight tile across a 32-row
         // block via threadgroup-staged simdgroup MMA, instead of re-reading
         // every block per prompt-token as the mv kernel does.
-        let ggml_mm_src: &'static str =
-            include_str!("shaders/quantized_matmul_mm.metal");
+        let ggml_mm_src: &'static str = include_str!("shaders/quantized_matmul_mm.metal");
         sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q2_K_f32".into(), ggml_mm_src);
@@ -197,8 +195,14 @@ impl KernelRegistry {
         let ggml_mm_tensor_src: &'static str =
             include_str!("shaders/quantized_matmul_mm_tensor.metal");
         sources.insert("kernel_mul_mm_q4_0_tensor_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q4_0_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q6_K_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_q4_0_tensor_bf16_perm021".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q6_K_tensor_bf16_perm021".into(),
+            ggml_mm_tensor_src,
+        );
         sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q2_K_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
@@ -209,7 +213,10 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q5_K_tensor_f32".into(), ggml_mm_tensor_src);
         // ADR-022 Phase 3 — Q4_K tensor mm + Q8_0 perm021.
         sources.insert("kernel_mul_mm_q4_K_tensor_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q8_0_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_q8_0_tensor_bf16_perm021".into(),
+            ggml_mm_tensor_src,
+        );
         // ADR-029 iter-30 H29-speed — F16-weight V2 large-tile mm.
         // Same source file as the V2 quantized variants; reads F16 weight
         // directly from device memory (no per-call dequant).  Used when
@@ -220,25 +227,51 @@ impl KernelRegistry {
         // populated, bypassing the per-call quantized dequant.  B-stage
         // (bfloat permuted [n_heads, seq_len, head_dim] input) is byte-
         // identical to the quantized variant.
-        sources.insert("kernel_mul_mm_f16_tensor_bf16_perm021".into(), ggml_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_f16_tensor_bf16_perm021".into(),
+            ggml_mm_tensor_src,
+        );
         // ADR-029 iter-23 H28-A — V2 large-tile tensor mm (NRA=64 M, NRB=128 N).
         // Same source file as V1 tensor mm; distinct kernel host names so the
         // dispatcher can pick V1 vs V2 at runtime via HF2Q_LARGE_TILE_MM.
-        sources.insert("kernel_mul_mm_q4_0_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q8_0_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q2_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q6_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q5_1_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_iq4_nl_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q5_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
-        sources.insert("kernel_mul_mm_q4_K_tensor_v2_f32".into(), ggml_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_q4_0_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q8_0_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q2_K_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q6_K_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q5_1_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_iq4_nl_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q5_K_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q4_K_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
         // ADR-029 iter-28 H29 — whole-tensor dequant from block_q → F16.
         // Used at model load to materialize an F16 shadow of attn/dense MLP
         // weights so the runtime dispatch can use kernel_mul_mm_f16_f32_*
         // (peer's gemma4 pattern).  Trades ~1 GB resident memory for 2-3×
         // faster per-call dense matmul at prefill.
-        let dequant_to_f16_src: &'static str =
-            include_str!("shaders/dequant_to_f16.metal");
+        let dequant_to_f16_src: &'static str = include_str!("shaders/dequant_to_f16.metal");
         sources.insert("hf2q_dequant_q4_0_to_f16".into(), dequant_to_f16_src);
         sources.insert("hf2q_dequant_q8_0_to_f16".into(), dequant_to_f16_src);
         sources.insert("hf2q_dequant_q5_1_to_f16".into(), dequant_to_f16_src);
@@ -277,12 +310,18 @@ impl KernelRegistry {
         // bfloat, no dequantize) differs.
         let dense_mm_bf16_tensor_src: &'static str =
             include_str!("shaders/dense_mm_bf16_tensor.metal");
-        sources.insert("hf2q_dense_mm_bf16_f32_tensor".into(), dense_mm_bf16_tensor_src);
+        sources.insert(
+            "hf2q_dense_mm_bf16_f32_tensor".into(),
+            dense_mm_bf16_tensor_src,
+        );
         // ADR-029 iter-80 H60: V2 large-tile variant (NRA=64, NRB=128).
         // Same source file (`dense_mm_bf16_tensor.metal`) — second host_name
         // entry resolves to the V2 kernel appended at the bottom of that
         // file. Picked at dispatch time when HF2Q_LARGE_TILE_MM=1.
-        sources.insert("hf2q_dense_mm_bf16_f32_tensor_v2".into(), dense_mm_bf16_tensor_src);
+        sources.insert(
+            "hf2q_dense_mm_bf16_f32_tensor_v2".into(),
+            dense_mm_bf16_tensor_src,
+        );
 
         // Dense f32×f32 → f32 tensor-API matmul (F32-everywhere
         // sibling of dense_mm_bf16_tensor).  Used by hf2q's ADR-005
@@ -294,7 +333,10 @@ impl KernelRegistry {
         // float-everywhere shmem staging.
         let dense_mm_f32_f32_tensor_src: &'static str =
             include_str!("shaders/dense_mm_f32_f32.metal");
-        sources.insert("hf2q_dense_mm_f32_f32_tensor".into(), dense_mm_f32_f32_tensor_src);
+        sources.insert(
+            "hf2q_dense_mm_f32_f32_tensor".into(),
+            dense_mm_f32_f32_tensor_src,
+        );
 
         // Dense f16×f32 → f32 tensor-API matmul (F16-staging sibling
         // of dense_mm_bf16_tensor).  Used by hf2q's ADR-005 Phase 2c
@@ -309,7 +351,10 @@ impl KernelRegistry {
         // shmem) — half and bfloat share 16-bit storage.
         let dense_mm_f16_tensor_src: &'static str =
             include_str!("shaders/dense_mm_f16_tensor.metal");
-        sources.insert("hf2q_dense_mm_f16_f32_tensor".into(), dense_mm_f16_tensor_src);
+        sources.insert(
+            "hf2q_dense_mm_f16_f32_tensor".into(),
+            dense_mm_f16_tensor_src,
+        );
 
         // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
         // for M=1 single-token decode.  Port of llama.cpp's
@@ -317,8 +362,7 @@ impl KernelRegistry {
         // Used in apply_linear_projection_f32 when seq_len=1 and the
         // weight matrix is BF16, replacing the MM kernel (~2× faster for
         // M=1 due to better memory bandwidth utilization per thread).
-        let dense_gemv_bf16_src: &'static str =
-            include_str!("shaders/dense_gemv_bf16.metal");
+        let dense_gemv_bf16_src: &'static str = include_str!("shaders/dense_gemv_bf16.metal");
         sources.insert("hf2q_dense_gemv_bf16_f32_4".into(), dense_gemv_bf16_src);
 
         // Fused scale-mask-softmax for the non-flash-attention prefill
@@ -326,8 +370,7 @@ impl KernelRegistry {
         // replaces three separate dispatches (scale, mask-add, softmax);
         // reads a bf16 mask (-INF at masked positions, matching
         // flash_attn_prefill_mask.metal) that is shared across heads.
-        let scale_mask_softmax_src: &'static str =
-            include_str!("shaders/scale_mask_softmax.metal");
+        let scale_mask_softmax_src: &'static str = include_str!("shaders/scale_mask_softmax.metal");
         sources.insert("scale_mask_softmax_f32".into(), scale_mask_softmax_src);
         // ADR-029 iter-93 H71: float4-vectorized variant for peer parity
         // with kernel_soft_max_f32_4. Same source file; v4 host_name resolves
@@ -341,8 +384,7 @@ impl KernelRegistry {
         );
 
         // Expert-routed (MoE) GGML block-format quantized matmul kernels
-        let ggml_id_src: &'static str =
-            include_str!("shaders/quantized_matmul_id_ggml.metal");
+        let ggml_id_src: &'static str = include_str!("shaders/quantized_matmul_id_ggml.metal");
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q2_K_f32".into(), ggml_id_src);
@@ -375,8 +417,7 @@ impl KernelRegistry {
         // per-expert routed-token lists, then mm_id stages a 64x32 expert
         // weight tile into threadgroup shmem and reuses it across a 32-row
         // block of that expert's routed tokens.
-        let ggml_id_mm_src: &'static str =
-            include_str!("shaders/quantized_matmul_id_mm.metal");
+        let ggml_id_mm_src: &'static str = include_str!("shaders/quantized_matmul_id_mm.metal");
         sources.insert("kernel_mul_mm_id_map0_ne20_1".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_6".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
@@ -398,7 +439,10 @@ impl KernelRegistry {
         // hf2q-vs-llama.cpp prefill gap at production Qwen MoE shapes.
         let fused_q6_k_mm_id_src: &'static str =
             include_str!("shaders/fused_gate_up_silu_mm_id_q6_K.metal");
-        sources.insert("kernel_fused_gate_up_silu_mm_id_q6_K_f32".into(), fused_q6_k_mm_id_src);
+        sources.insert(
+            "kernel_fused_gate_up_silu_mm_id_q6_K_f32".into(),
+            fused_q6_k_mm_id_src,
+        );
 
         // MoE-routed quantized matrix-matrix kernels — tensor API variant
         // (ADR-011 Phase 3 Wave P3b-tensor).  Uses the MPP tensor_ops
@@ -407,17 +451,41 @@ impl KernelRegistry {
         // matmul) and continues to use the simdgroup version.
         let ggml_id_mm_tensor_src: &'static str =
             include_str!("shaders/quantized_matmul_id_mm_tensor.metal");
-        sources.insert("kernel_mul_mm_id_q4_0_tensor_f32".into(), ggml_id_mm_tensor_src);
-        sources.insert("kernel_mul_mm_id_q8_0_tensor_f32".into(), ggml_id_mm_tensor_src);
-        sources.insert("kernel_mul_mm_id_q2_K_tensor_f32".into(), ggml_id_mm_tensor_src);
-        sources.insert("kernel_mul_mm_id_q6_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_id_q4_0_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_q8_0_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_q2_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_q6_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
         // ADR-013 P16 — Q4_K tensor-API mm_id.
-        sources.insert("kernel_mul_mm_id_q4_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_id_q4_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
         // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL tensor-API mm_id.
-        sources.insert("kernel_mul_mm_id_q5_1_tensor_f32".into(), ggml_id_mm_tensor_src);
-        sources.insert("kernel_mul_mm_id_iq4_nl_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_id_q5_1_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_iq4_nl_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
         // ADR-022 Phase 2 — Q5_K tensor-API mm_id.
-        sources.insert("kernel_mul_mm_id_q5_K_tensor_f32".into(), ggml_id_mm_tensor_src);
+        sources.insert(
+            "kernel_mul_mm_id_q5_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
 
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");
@@ -449,14 +517,13 @@ impl KernelRegistry {
         // Pre-pass that sorts tokens by expert assignment before the main
         // mm_id kernel. Ported from llama.cpp's kernel_mul_mm_id_map0; one
         // template specialization per supported ne20 (n_expert_used).
-        let moe_mm_id_map0_src: &'static str =
-            include_str!("shaders/moe_mm_id_map0.metal");
-        sources.insert("moe_mm_id_map0_ne20_1".into(),  moe_mm_id_map0_src);
-        sources.insert("moe_mm_id_map0_ne20_2".into(),  moe_mm_id_map0_src);
-        sources.insert("moe_mm_id_map0_ne20_4".into(),  moe_mm_id_map0_src);
-        sources.insert("moe_mm_id_map0_ne20_5".into(),  moe_mm_id_map0_src);
-        sources.insert("moe_mm_id_map0_ne20_6".into(),  moe_mm_id_map0_src);
-        sources.insert("moe_mm_id_map0_ne20_8".into(),  moe_mm_id_map0_src);
+        let moe_mm_id_map0_src: &'static str = include_str!("shaders/moe_mm_id_map0.metal");
+        sources.insert("moe_mm_id_map0_ne20_1".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_2".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_4".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_5".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_6".into(), moe_mm_id_map0_src);
+        sources.insert("moe_mm_id_map0_ne20_8".into(), moe_mm_id_map0_src);
         sources.insert("moe_mm_id_map0_ne20_10".into(), moe_mm_id_map0_src);
         sources.insert("moe_mm_id_map0_ne20_16".into(), moe_mm_id_map0_src);
         sources.insert("moe_mm_id_map0_ne20_22".into(), moe_mm_id_map0_src);
@@ -479,17 +546,17 @@ impl KernelRegistry {
             moe_dispatch_src,
         );
         // ADR-020 iter-11h-e3b: fused backward kernel for moe_swiglu_seq.
-        sources.insert(
-            "moe_swiglu_seq_backward_f32".into(),
-            moe_dispatch_src,
-        );
+        sources.insert("moe_swiglu_seq_backward_f32".into(), moe_dispatch_src);
 
         // Batched KV cache copy kernels
         let kv_cache_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
         sources.insert("kv_cache_copy_batch_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_batch_f32_to_f16".into(), kv_cache_src);
         // ADR-040 M4 — batched multi-seq F16-K copy (grid.z = N queries)
-        sources.insert("kv_cache_copy_batch_f32_to_f16_batched".into(), kv_cache_src);
+        sources.insert(
+            "kv_cache_copy_batch_f32_to_f16_batched".into(),
+            kv_cache_src,
+        );
         sources.insert("kv_cache_copy_seq_f32".into(), kv_cache_src);
         sources.insert("kv_cache_copy_seq_f32_to_f16".into(), kv_cache_src);
         // Wave P4.11 — fused K+V copy variants
@@ -497,12 +564,18 @@ impl KernelRegistry {
         sources.insert("kv_cache_copy_seq_f32_to_f16_kv_dual".into(), kv_cache_src);
         // ADR-028 iter-145 — fused single-position K+V copy variants (decode shape)
         sources.insert("kv_cache_copy_batch_f32_kv_dual".into(), kv_cache_src);
-        sources.insert("kv_cache_copy_batch_f32_to_f16_kv_dual".into(), kv_cache_src);
+        sources.insert(
+            "kv_cache_copy_batch_f32_to_f16_kv_dual".into(),
+            kv_cache_src,
+        );
         // bf16-source KV cache copy (Phase 2 bf16 activation path)
         sources.insert("kv_cache_copy_seq_bf16".into(), kv_cache_src);
         // ADR-030 iter-95 — bit-exact BF16→BF16 head-major cache copy for
         // Option A xlen verify (avoids F16 round-trip precision drift).
-        sources.insert("kv_cache_copy_seq_bf16_to_bf16_head_major".into(), kv_cache_src);
+        sources.insert(
+            "kv_cache_copy_seq_bf16_to_bf16_head_major".into(),
+            kv_cache_src,
+        );
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
@@ -523,6 +596,7 @@ impl KernelRegistry {
         sources.insert("embedding_gather_scale_f32".into(), elementwise_src);
         sources.insert("embedding_gather_scale_batch_f32".into(), elementwise_src);
         sources.insert("permute_021_bf16".into(), elementwise_src);
+        sources.insert("permute_021_f16".into(), elementwise_src);
         sources.insert("transpose_last2_bf16".into(), elementwise_src);
         sources.insert("transpose_last2_f16".into(), elementwise_src);
         sources.insert("permute_021_f32".into(), elementwise_src);
@@ -543,8 +617,7 @@ impl KernelRegistry {
         // Ten entry points; all backed by the same shader source.
         // Pipelines are compiled with function constants via
         // `get_pipeline_with_bool_constants` — not `get_pipeline`.
-        let flash_attn_prefill_src: &'static str =
-            include_str!("shaders/flash_attn_prefill.metal");
+        let flash_attn_prefill_src: &'static str = include_str!("shaders/flash_attn_prefill.metal");
         // D=256 variants (BQ=32, BK=16, WM=4, WN=1 — 128 threads/threadgroup)
         sources.insert(
             "steel_attention_float32_bq32_bk16_bd256_wm4_wn1_maskfloat32".into(),
@@ -592,8 +665,7 @@ impl KernelRegistry {
 
         // Flash attention vector kernels — SIMD-vectorized decode-path SDPA
         // (ported from llama.cpp flash_attn_ext_vec)
-        let flash_attn_vec_src: &'static str =
-            include_str!("shaders/flash_attn_vec.metal");
+        let flash_attn_vec_src: &'static str = include_str!("shaders/flash_attn_vec.metal");
         sources.insert("flash_attn_vec_dk256".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_dk512".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_reduce_dk128".into(), flash_attn_vec_src);
@@ -608,8 +680,7 @@ impl KernelRegistry {
         // flash_attn_vec consuming an explicit per-(query, kv_pos) mask
         // buffer instead of implicit causal. Reduce pass reuses
         // flash_attn_vec_reduce_* (identical output layout).
-        let tree_attention_src: &'static str =
-            include_str!("shaders/tree_attention.metal");
+        let tree_attention_src: &'static str = include_str!("shaders/tree_attention.metal");
         sources.insert("tree_attention_dk128".into(), tree_attention_src);
         sources.insert("tree_attention_dk256".into(), tree_attention_src);
         sources.insert("tree_attention_dk512".into(), tree_attention_src);
@@ -648,7 +719,10 @@ impl KernelRegistry {
         sources.insert("fused_post_ff_norm2_endlayer_f32_v2".into(), rms_norm_src);
         // ADR-028 iter-367: V2 fusion of moe_weighted_sum INTO Path A end-of-layer.
         // Eliminates 1 dispatch + moe_accum round-trip from gemma4 decode default.
-        sources.insert("fused_moe_wsum_post_ff_norm2_endlayer_f32_v2".into(), rms_norm_src);
+        sources.insert(
+            "fused_moe_wsum_post_ff_norm2_endlayer_f32_v2".into(),
+            rms_norm_src,
+        );
         sources.insert("rms_norm_no_scale_f32_dual_perm".into(), rms_norm_src);
         // Fused RMS norm + elementwise multiply kernels (Phase 4e.2)
         sources.insert("rms_norm_mul_f32".into(), rms_norm_src);
@@ -686,16 +760,14 @@ impl KernelRegistry {
         // host names share the same source; selection is by D_k via
         // `dispatch_gated_delta_net_decode`. Drop-in for the fused kernel
         // above when n_tokens=1.
-        let gdn_decode_src: &'static str =
-            include_str!("shaders/gated_delta_net_decode.metal");
+        let gdn_decode_src: &'static str = include_str!("shaders/gated_delta_net_decode.metal");
         sources.insert("gated_delta_net_decode_f32_1".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_f32_2".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_f32_4".into(), gdn_decode_src);
         // Wave 5b — chunk-parallel inter-chunk state-recurrence kernel
         // (the one new kernel in the chunk-parallel pipeline; spec source:
         // arXiv 2412.06464 §4 + FLA chunk_delta_h.py:43-298).
-        let gdn_chunk_src: &'static str =
-            include_str!("shaders/gated_delta_net_chunk.metal");
+        let gdn_chunk_src: &'static str = include_str!("shaders/gated_delta_net_chunk.metal");
         sources.insert(
             "gated_delta_net_chunk_inter_state_bf16".into(),
             gdn_chunk_src,
@@ -725,8 +797,7 @@ impl KernelRegistry {
         );
         // Wave 5b.1 iter 2 — chunk_scaled_dot_kkt kernel (input-side of
         // the chunk pipeline; spec source: FLA chunk_scaled_dot_kkt.py:36-99).
-        let gdn_kkt_src: &'static str =
-            include_str!("shaders/gated_delta_net_kkt.metal");
+        let gdn_kkt_src: &'static str = include_str!("shaders/gated_delta_net_kkt.metal");
         sources.insert("gated_delta_net_kkt_bf16".into(), gdn_kkt_src);
         // Wave 5b.1 iter 2 — recompute_w_u_fwd kernel (applies post-solve A
         // to (β·v) and (β·k·exp(g)) to produce w and u; spec source: FLA
@@ -739,8 +810,7 @@ impl KernelRegistry {
         );
         // Wave 5b.1 iter 3 — chunk_fwd_o kernel (per-chunk output: closes
         // the chunk pipeline; spec source: FLA chunk_o.py:42-138).
-        let gdn_chunk_o_src: &'static str =
-            include_str!("shaders/gated_delta_net_chunk_o.metal");
+        let gdn_chunk_o_src: &'static str = include_str!("shaders/gated_delta_net_chunk_o.metal");
         sources.insert("gated_delta_net_chunk_o_bf16".into(), gdn_chunk_o_src);
         // Wave 5b.1 iter 4 — orchestrator helper kernels:
         //   chunk_local_cumsum_g_f32      — per-chunk prefix sum on g [B, T, H]
@@ -748,10 +818,7 @@ impl KernelRegistry {
         //                                   on FLA's [B, T, H, BT] layout.
         let chunk_local_cumsum_g_src: &'static str =
             include_str!("shaders/chunk_local_cumsum_g.metal");
-        sources.insert(
-            "chunk_local_cumsum_g_f32".into(),
-            chunk_local_cumsum_g_src,
-        );
+        sources.insert("chunk_local_cumsum_g_f32".into(), chunk_local_cumsum_g_src);
         let chunk_tri_solve_invert_src: &'static str =
             include_str!("shaders/chunk_gated_delta_rule_tri_solve_invert.metal");
         sources.insert(
@@ -766,8 +833,7 @@ impl KernelRegistry {
         sources.insert("silu_mul_f32".into(), silu_mul_src);
         // ADR-033 §Pi Task #25 iter 16 — K-bank slice copy for K=256 → 2×K=128
         // bank-split chunk-scan path (Qwen3.6 head_dim=256 support).
-        let bank_slice_bf16_src: &'static str =
-            include_str!("shaders/bank_slice_bf16.metal");
+        let bank_slice_bf16_src: &'static str = include_str!("shaders/bank_slice_bf16.metal");
         sources.insert("bank_slice_bf16".into(), bank_slice_bf16_src);
         // ADR-033 §Pi Task #25 iter 17 — F32 variants (for h0 input and
         // final_state output) + concat (inverse of slice, for assembling
@@ -832,11 +898,9 @@ impl KernelRegistry {
         sources.insert("softmax_f32".into(), softmax_src);
         sources.insert("softmax_f16".into(), softmax_src);
         sources.insert("softmax_bf16".into(), softmax_src);
-        let softmax_backward_src: &'static str =
-            include_str!("shaders/softmax_backward.metal");
+        let softmax_backward_src: &'static str = include_str!("shaders/softmax_backward.metal");
         sources.insert("softmax_backward_f32".into(), softmax_backward_src);
-        let log_elementwise_src: &'static str =
-            include_str!("shaders/log_elementwise.metal");
+        let log_elementwise_src: &'static str = include_str!("shaders/log_elementwise.metal");
         sources.insert("log_f32".into(), log_elementwise_src);
         sources.insert("log_backward_f32".into(), log_elementwise_src);
         let row_sum_src: &'static str = include_str!("shaders/row_sum.metal");
@@ -851,91 +915,60 @@ impl KernelRegistry {
         // ADR-020 iter-10b: RMSNorm reverse-mode autograd kernels.
         // r_inv helper is reused by both backward kernels; dx and dw cover
         // the full backward identity for `y = x * rsqrt(mean(x²) + eps) * w`.
-        let rms_norm_backward_src: &'static str =
-            include_str!("shaders/rms_norm_backward.metal");
-        sources.insert(
-            "rms_norm_compute_rms_inv_f32".into(),
-            rms_norm_backward_src,
-        );
+        let rms_norm_backward_src: &'static str = include_str!("shaders/rms_norm_backward.metal");
+        sources.insert("rms_norm_compute_rms_inv_f32".into(), rms_norm_backward_src);
         sources.insert("rms_norm_backward_dx_f32".into(), rms_norm_backward_src);
         sources.insert("rms_norm_backward_dw_f32".into(), rms_norm_backward_src);
         // ADR-020 iter-11a: 2-D row-major slice + concat-by-column kernels.
         // Used by hf2q's multi-head SDPA on GpuTape (slice Q/K/V into
         // per-head views, run per-head SDPA, concat per-head contexts
         // back to full attention output).
-        let slice_concat_2d_src: &'static str =
-            include_str!("shaders/slice_concat_2d.metal");
+        let slice_concat_2d_src: &'static str = include_str!("shaders/slice_concat_2d.metal");
         sources.insert("slice_2d_cols_f32".into(), slice_concat_2d_src);
         sources.insert("copy_2d_cols_into_f32".into(), slice_concat_2d_src);
         // ADR-020 iter-11b: SiLU forward + backward kernels for GpuTape
         // SwiGLU FFN composition.
-        let silu_backward_src: &'static str =
-            include_str!("shaders/silu_backward.metal");
+        let silu_backward_src: &'static str = include_str!("shaders/silu_backward.metal");
         sources.insert("silu_f32".into(), silu_backward_src);
         sources.insert("silu_backward_f32".into(), silu_backward_src);
         // ADR-020 iter-11d: FP32 embedding lookup + scatter-add backward.
-        let embedding_autograd_src: &'static str =
-            include_str!("shaders/embedding_autograd.metal");
+        let embedding_autograd_src: &'static str = include_str!("shaders/embedding_autograd.metal");
         sources.insert("embedding_lookup_f32".into(), embedding_autograd_src);
-        sources.insert(
-            "embedding_scatter_add_f32".into(),
-            embedding_autograd_src,
-        );
+        sources.insert("embedding_scatter_add_f32".into(), embedding_autograd_src);
         // ADR-020 iter-13a: Adam optimizer step kernel for Track 2
         // DWQ-proper training loop.
-        let adam_update_src: &'static str =
-            include_str!("shaders/adam_update.metal");
+        let adam_update_src: &'static str = include_str!("shaders/adam_update.metal");
         sources.insert("adam_update_f32".into(), adam_update_src);
         // ADR-020 iter-13b: differentiable affine qdq kernels for the
         // DWQ-proper training loop.  Init + forward + backward (scales,
         // biases) — q_int is FROZEN, scales+biases learnable.
-        let qdq_affine_src: &'static str =
-            include_str!("shaders/qdq_affine.metal");
+        let qdq_affine_src: &'static str = include_str!("shaders/qdq_affine.metal");
         sources.insert("qdq_affine_init_f32".into(), qdq_affine_src);
         sources.insert("qdq_affine_forward_f32".into(), qdq_affine_src);
-        sources.insert(
-            "qdq_affine_backward_scales_f32".into(),
-            qdq_affine_src,
-        );
-        sources.insert(
-            "qdq_affine_backward_biases_f32".into(),
-            qdq_affine_src,
-        );
+        sources.insert("qdq_affine_backward_scales_f32".into(), qdq_affine_src);
+        sources.insert("qdq_affine_backward_biases_f32".into(), qdq_affine_src);
         // ADR-020 iter-15: fused affine quantized matmul for DWQ inference.
         // Per-element kernel; one thread per (m, n) output element.
         // Tiled + simdgroup-MMA variant lands in iter-15b.
-        let qmm_affine_src: &'static str =
-            include_str!("shaders/qmm_affine.metal");
+        let qmm_affine_src: &'static str = include_str!("shaders/qmm_affine.metal");
         sources.insert("qmm_affine_t_f32".into(), qmm_affine_src);
         // ADR-020 iter-15b: tiled variant — 16x16 thread block with
         // cooperative-load X/W tiles in threadgroup-shared memory for
         // 2-5x speedup over the per-element kernel.
-        let qmm_affine_tiled_src: &'static str =
-            include_str!("shaders/qmm_affine_tiled.metal");
-        sources.insert(
-            "qmm_affine_t_f32_tiled".into(),
-            qmm_affine_tiled_src,
-        );
+        let qmm_affine_tiled_src: &'static str = include_str!("shaders/qmm_affine_tiled.metal");
+        sources.insert("qmm_affine_t_f32_tiled".into(), qmm_affine_tiled_src);
         // ADR-020 iter-15c: simdgroup-MMA variant — uses Apple GPU
         // hardware `simdgroup_matrix<float, 8, 8>` MMA for the inner
         // reduction.  Per-tile algorithmic 8× over scalar tiled, lands
         // as ~3-4× wall after launch / load amortization.
-        let qmm_affine_simd_src: &'static str =
-            include_str!("shaders/qmm_affine_simd.metal");
-        sources.insert(
-            "qmm_affine_t_f32_simd".into(),
-            qmm_affine_simd_src,
-        );
+        let qmm_affine_simd_src: &'static str = include_str!("shaders/qmm_affine_simd.metal");
+        sources.insert("qmm_affine_t_f32_simd".into(), qmm_affine_simd_src);
         // ADR-020 iter-15c-2: 4-simdgroup-per-TG variant — 32×32
         // output tile, 4 simdgroups arranged as 2×2 grid each owning
         // a 16×16 sub-tile = 4 simdgroup_matrix accumulators.  Same
         // math as 15c-1, fuller warp-pool exploitation.
-        let qmm_affine_simd4_src: &'static str =
-            include_str!("shaders/qmm_affine_simd4.metal");
-        sources.insert(
-            "qmm_affine_t_f32_simd4".into(),
-            qmm_affine_simd4_src,
-        );
+        let qmm_affine_simd4_src: &'static str = include_str!("shaders/qmm_affine_simd4.metal");
+        sources.insert("qmm_affine_t_f32_simd4".into(), qmm_affine_simd4_src);
         // ADR-020 iter-15c-2b: gs=64 variant (mlx-lm dynamic_quant
         // canonical default).  Same 4-simdgroup geometry, BK=64
         // instead of 32 (= 8 sub-K-tiles per K-step instead of 4).
@@ -958,12 +991,8 @@ impl KernelRegistry {
         // convolution (forward + backward dx + backward dw).  Used by
         // GpuTape autograd for differentiable Qwen3.5MoE forward
         // (GatedDeltaNet's conv1d step).
-        let conv1d_dwc_src: &'static str =
-            include_str!("shaders/conv1d_depthwise_causal.metal");
-        sources.insert(
-            "conv1d_depthwise_causal_forward_f32".into(),
-            conv1d_dwc_src,
-        );
+        let conv1d_dwc_src: &'static str = include_str!("shaders/conv1d_depthwise_causal.metal");
+        sources.insert("conv1d_depthwise_causal_forward_f32".into(), conv1d_dwc_src);
         sources.insert(
             "conv1d_depthwise_causal_backward_dx_f32".into(),
             conv1d_dwc_src,
@@ -974,32 +1003,27 @@ impl KernelRegistry {
         );
         // ADR-020 iter-11h-c1: elementwise exp forward + backward.
         // Building block for GatedDeltaNet's alpha = exp(-g) state-decay.
-        let exp_src: &'static str =
-            include_str!("shaders/exp_elementwise.metal");
+        let exp_src: &'static str = include_str!("shaders/exp_elementwise.metal");
         sources.insert("exp_f32".into(), exp_src);
         sources.insert("exp_backward_f32".into(), exp_src);
         // ADR-020 iter-11h-c2: vector outer product (forward + dlhs +
         // drhs).  Building block for gated_delta_update's
         // outer(delta, k) state-update term.
-        let outer_src: &'static str =
-            include_str!("shaders/outer_product.metal");
+        let outer_src: &'static str = include_str!("shaders/outer_product.metal");
         sources.insert("outer_product_f32".into(), outer_src);
         sources.insert("outer_product_backward_lhs_f32".into(), outer_src);
         sources.insert("outer_product_backward_rhs_f32".into(), outer_src);
         // ADR-020 iter-11h-e1: take_along_axis (gather) + scatter-backward.
         // Building block for MoE router on GpuTape.
-        let taa_src: &'static str =
-            include_str!("shaders/take_along_axis.metal");
+        let taa_src: &'static str = include_str!("shaders/take_along_axis.metal");
         sources.insert("take_along_axis_f32".into(), taa_src);
         sources.insert("take_along_axis_backward_f32".into(), taa_src);
         // ADR-020 iter-11h-misc-1: elementwise divide forward + backward.
-        let div_src: &'static str =
-            include_str!("shaders/divide_elementwise.metal");
+        let div_src: &'static str = include_str!("shaders/divide_elementwise.metal");
         sources.insert("divide_f32".into(), div_src);
         sources.insert("divide_backward_f32".into(), div_src);
         // ADR-020 iter-11h-misc-3: elementwise sqrt forward + backward.
-        let sqrt_src: &'static str =
-            include_str!("shaders/sqrt_elementwise.metal");
+        let sqrt_src: &'static str = include_str!("shaders/sqrt_elementwise.metal");
         sources.insert("sqrt_f32".into(), sqrt_src);
         sources.insert("sqrt_backward_f32".into(), sqrt_src);
         let softcap_src: &'static str = include_str!("shaders/softcap.metal");
@@ -1009,8 +1033,7 @@ impl KernelRegistry {
 
         // Fused norm-add kernels — Gemma4 post-attention / post-FFN ordering:
         //   normed = rms_norm(input, weight, eps);  output = residual + normed
-        let fused_norm_add_src: &'static str =
-            include_str!("shaders/fused_norm_add_bf16.metal");
+        let fused_norm_add_src: &'static str = include_str!("shaders/fused_norm_add_bf16.metal");
         sources.insert("fused_norm_add_bf16".into(), fused_norm_add_src);
         sources.insert("fused_norm_add_no_weight_bf16".into(), fused_norm_add_src);
 
@@ -1031,8 +1054,7 @@ impl KernelRegistry {
         sources.insert("fused_head_norm_rope_batch_bf16".into(), fused_hnr_bf16_src);
 
         // Fused norm-add f32 kernels — post-attention / post-FFN / end-of-layer
-        let fused_norm_add_f32_src: &'static str =
-            include_str!("shaders/fused_norm_add_f32.metal");
+        let fused_norm_add_f32_src: &'static str = include_str!("shaders/fused_norm_add_f32.metal");
         sources.insert("fused_norm_add_f32".into(), fused_norm_add_f32_src);
         // ADR-028 iter-331 — float4 + simd_sum variant (peer-pattern,
         // ported from llama.cpp kernel_rms_norm_fuse_impl<float4, 3>).
@@ -1040,7 +1062,10 @@ impl KernelRegistry {
         // (default ON since iter-331; opt-out via =0/false/off).
         sources.insert("fused_norm_add_f32_v2".into(), fused_norm_add_f32_src);
         sources.insert("fused_residual_norm_f32".into(), fused_norm_add_f32_src);
-        sources.insert("fused_residual_norm_scalar_f32".into(), fused_norm_add_f32_src);
+        sources.insert(
+            "fused_residual_norm_scalar_f32".into(),
+            fused_norm_add_f32_src,
+        );
         sources.insert("fused_moe_routing_f32".into(), fused_norm_add_f32_src);
         // ADR-028 iter-363: V2 (simd_max + simd_sum) variant of MoE routing.
         sources.insert("fused_moe_routing_f32_v2".into(), fused_norm_add_f32_src);
@@ -1051,10 +1076,16 @@ impl KernelRegistry {
         // ADR-029 iter-175 Step 1j: batched-prefill V3 (same parallel
         // SG-tournament top-K as fused_moe_routing_f32_v3, applied per-token
         // within each TG of the batched dispatch).
-        sources.insert("fused_moe_routing_batch_f32_v3".into(), fused_norm_add_f32_src);
+        sources.insert(
+            "fused_moe_routing_batch_f32_v3".into(),
+            fused_norm_add_f32_src,
+        );
         sources.insert("fused_norm_add_scalar_f32".into(), fused_norm_add_f32_src);
         sources.insert("fused_moe_wsum_norm_add_f32".into(), fused_norm_add_f32_src);
-        sources.insert("fused_moe_wsum_dnorm_add_f32".into(), fused_norm_add_f32_src);
+        sources.insert(
+            "fused_moe_wsum_dnorm_add_f32".into(),
+            fused_norm_add_f32_src,
+        );
 
         // Argsort kernel (Story 2.3) — MoE top-K routing
         let argsort_src: &'static str = include_str!("shaders/argsort.metal");
@@ -1065,8 +1096,7 @@ impl KernelRegistry {
         sources.insert("gather_f32".into(), gather_src);
 
         // F32 KV cache copy kernel (Session merge S1+S2)
-        let kv_cache_copy_src: &'static str =
-            include_str!("shaders/kv_cache_copy.metal");
+        let kv_cache_copy_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
         sources.insert("kv_cache_copy".into(), kv_cache_copy_src);
         sources.insert("kv_cache_copy_f32".into(), kv_cache_copy_src);
 
@@ -1084,8 +1114,7 @@ impl KernelRegistry {
         // Tiled-GQA broadcast kernel (ADR-005 W-5b.19 — replaces hf2q CPU
         // tiled-replicate at gpu_delta_net::apply_gated_delta_net_chunk
         // GQA pre-expansion, ~497 ms / 10.4 ms-per-layer at PP4106).
-        let repeat_tiled_src: &'static str =
-            include_str!("shaders/repeat_tiled.metal");
+        let repeat_tiled_src: &'static str = include_str!("shaders/repeat_tiled.metal");
         sources.insert("repeat_tiled_f32".into(), repeat_tiled_src);
 
         // Dense F16 GEMM kernel (Story 2.6) — lm_head projection
@@ -1097,6 +1126,8 @@ impl KernelRegistry {
         sources.insert("dense_matvec_bf16w_f32io".into(), dense_gemm_src);
         // Pure F32 mat-vec: F32 weights × F32 input → F32 output (decode lm_head)
         sources.insert("dense_matvec_f32".into(), dense_gemm_src);
+        // Cooperative F32 mat-vec: 4 SIMD groups reduce 2 output rows together.
+        sources.insert("dense_matvec_f32_nsg4_exact_k4096".into(), dense_gemm_src);
 
         // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
@@ -1160,9 +1191,16 @@ impl KernelRegistry {
         // Combines flash_attn_vec_reduce + fwht_sign_undo_f32 into a single
         // dispatch, saving 1 dispatch + 1 forced barrier per layer per decode
         // token. Gated by env flag `HF2Q_TQ_HB_OUT_FUSED=1` in forward_mlx.rs.
-        let reduce_undo_src: &'static str = include_str!("shaders/flash_attn_vec_reduce_tq_hb_undo.metal");
-        sources.insert("flash_attn_vec_reduce_tq_hb_undo_dk256".into(), reduce_undo_src);
-        sources.insert("flash_attn_vec_reduce_tq_hb_undo_dk512".into(), reduce_undo_src);
+        let reduce_undo_src: &'static str =
+            include_str!("shaders/flash_attn_vec_reduce_tq_hb_undo.metal");
+        sources.insert(
+            "flash_attn_vec_reduce_tq_hb_undo_dk256".into(),
+            reduce_undo_src,
+        );
+        sources.insert(
+            "flash_attn_vec_reduce_tq_hb_undo_dk512".into(),
+            reduce_undo_src,
+        );
 
         // ADR-028 Phase 10d (iter-349): hybrid F16-K + TQ-HB-V SDPA kernel.
         // Same V-side codebook as flash_attn_vec_tq_hb (5/6/8-bit Lloyd-Max);
@@ -1176,8 +1214,12 @@ impl KernelRegistry {
 
         // ADR-029: verbatim llama.cpp peer port.
         // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.
-        let peer_port_src: &'static str = include_str!("shaders/flash_attn_vec_peer_port_f16.metal");
-        sources.insert("flash_attn_vec_peer_port_f16_dk256_dv256".into(), peer_port_src);
+        let peer_port_src: &'static str =
+            include_str!("shaders/flash_attn_vec_peer_port_f16.metal");
+        sources.insert(
+            "flash_attn_vec_peer_port_f16_dk256_dv256".into(),
+            peer_port_src,
+        );
 
         // ADR-029 iter-134: peer reduce kernel (verbatim port of ggml-metal.metal 7235-7275).
         // Pairs with the NWG=32 vec kernel to match peer's actual runtime dispatch.
@@ -1204,8 +1246,7 @@ impl KernelRegistry {
         let gpu_sample_src: &'static str =
             include_str!("shaders/gpu_sample_argmax_candidates.metal");
         sources.insert("gpu_sample_argmax_candidates".into(), gpu_sample_src);
-        let softmax_sample_src: &'static str =
-            include_str!("shaders/softmax_sample.metal");
+        let softmax_sample_src: &'static str = include_str!("shaders/softmax_sample.metal");
         sources.insert("softmax_sample_f32".into(), softmax_sample_src);
         // Top-K kernel for Q8 rerank: avoids full-logits readback.
         let top_k_src: &'static str = include_str!("shaders/top_k.metal");
@@ -1213,15 +1254,12 @@ impl KernelRegistry {
 
         // MoE GPU routing + weighted reduce (ADR-013 P13.3 perf).
         // Replaces CPU softmax+topk round-trip and CPU weighted accumulate.
-        let moe_stk_src: &'static str =
-            include_str!("shaders/moe_softmax_topk.metal");
+        let moe_stk_src: &'static str = include_str!("shaders/moe_softmax_topk.metal");
         sources.insert("moe_softmax_topk_f32".into(), moe_stk_src);
-        let moe_wr_src: &'static str =
-            include_str!("shaders/moe_weighted_reduce.metal");
+        let moe_wr_src: &'static str = include_str!("shaders/moe_weighted_reduce.metal");
         sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
         // DeepSeek-V4 Hyper-Connection split/reduce/expand kernels.
-        let deepseek_hc_src: &'static str =
-            include_str!("shaders/deepseek_hyper_connection.metal");
+        let deepseek_hc_src: &'static str = include_str!("shaders/deepseek_hyper_connection.metal");
         sources.insert("deepseek_hc_split_sinkhorn_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_head_weights_f32".into(), deepseek_hc_src);
         sources.insert("deepseek_hc_pre_f32".into(), deepseek_hc_src);
@@ -1265,11 +1303,28 @@ impl KernelRegistry {
         let deepseek_sparse_src: &'static str =
             include_str!("shaders/deepseek_sparse_attention.metal");
         sources.insert("deepseek_sparse_attention_bf16".into(), deepseek_sparse_src);
+        let deepseek_sparse_prefill_mask_src: &'static str =
+            include_str!("shaders/deepseek_sparse_prefill_mask.metal");
+        sources.insert(
+            "deepseek_sparse_prefill_mask_fill_bf16".into(),
+            deepseek_sparse_prefill_mask_src,
+        );
+        sources.insert(
+            "deepseek_sparse_prefill_mask_scatter_bf16".into(),
+            deepseek_sparse_prefill_mask_src,
+        );
+        sources.insert(
+            "deepseek_sparse_prefill_mask_fill_f16".into(),
+            deepseek_sparse_prefill_mask_src,
+        );
+        sources.insert(
+            "deepseek_sparse_prefill_mask_scatter_f16".into(),
+            deepseek_sparse_prefill_mask_src,
+        );
         let deepseek_rope_src: &'static str = include_str!("shaders/deepseek_tail_rope.metal");
         sources.insert("deepseek_tail_rope_f32_to_bf16".into(), deepseek_rope_src);
         sources.insert("deepseek_tail_rope_bf16".into(), deepseek_rope_src);
-        let sdpa_decode_src: &'static str =
-            include_str!("shaders/sdpa_decode.metal");
+        let sdpa_decode_src: &'static str = include_str!("shaders/sdpa_decode.metal");
         sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
         Self {
@@ -1286,10 +1341,7 @@ impl KernelRegistry {
     /// - The embedded blob is empty (build.rs skipped metallib build)
     /// - `device.new_library_with_data` failed previously
     /// - The previous load attempt already failed (no retry)
-    fn try_precompiled_lib(
-        &mut self,
-        device: &metal::DeviceRef,
-    ) -> Option<&metal::LibraryRef> {
+    fn try_precompiled_lib(&mut self, device: &metal::DeviceRef) -> Option<&metal::LibraryRef> {
         if !precompiled_enabled() {
             return None;
         }
@@ -1340,11 +1392,7 @@ impl KernelRegistry {
     /// Logs at debug level on failure to keep load-path quiet.
     ///
     /// Returns the count of pipelines successfully prewarmed.
-    pub fn prewarm_pipelines(
-        &mut self,
-        device: &metal::DeviceRef,
-        names: &[&str],
-    ) -> usize {
+    pub fn prewarm_pipelines(&mut self, device: &metal::DeviceRef, names: &[&str]) -> usize {
         let mut warmed = 0_usize;
         for name in names {
             // Skip if already cached.
@@ -1455,9 +1503,10 @@ impl KernelRegistry {
                 Some(f) => f,
                 None => {
                     // Slow path: compile the shader.
-                    let source = self.sources.get(name).ok_or_else(|| {
-                        MlxError::KernelNotFound(name.to_string())
-                    })?;
+                    let source = self
+                        .sources
+                        .get(name)
+                        .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
 
                     let compile_opts = metal::CompileOptions::new();
                     let library = device
@@ -1467,12 +1516,12 @@ impl KernelRegistry {
                             message: msg,
                         })?;
 
-                    library
-                        .get_function(name, None)
-                        .map_err(|msg| MlxError::ShaderCompilationError {
+                    library.get_function(name, None).map_err(|msg| {
+                        MlxError::ShaderCompilationError {
                             name: name.to_string(),
                             message: msg,
-                        })?
+                        }
+                    })?
                 }
             };
 
@@ -1510,9 +1559,9 @@ impl KernelRegistry {
 
         // At this point the pipeline is guaranteed to be in the cache.
         // We use `ok_or_else` instead of `expect` to satisfy the no-panic policy.
-        self.cache.get(name).ok_or_else(|| {
-            MlxError::KernelNotFound(name.to_string())
-        })
+        self.cache
+            .get(name)
+            .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))
     }
 
     /// Get a compiled compute pipeline for the named kernel, specialized with
@@ -1625,9 +1674,10 @@ impl KernelRegistry {
                 Some(f) => f,
                 None => {
                     // Slow path: compile the shader with function constant specialisation.
-                    let source = self.sources.get(name).ok_or_else(|| {
-                        MlxError::KernelNotFound(name.to_string())
-                    })?;
+                    let source = self
+                        .sources
+                        .get(name)
+                        .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
 
                     let compile_opts = metal::CompileOptions::new();
                     let library = device
@@ -1637,12 +1687,12 @@ impl KernelRegistry {
                             message: msg,
                         })?;
 
-                    library
-                        .get_function(name, Some(fcv))
-                        .map_err(|msg| MlxError::ShaderCompilationError {
+                    library.get_function(name, Some(fcv)).map_err(|msg| {
+                        MlxError::ShaderCompilationError {
                             name: name.to_string(),
                             message: msg,
-                        })?
+                        }
+                    })?
                 }
             };
 
@@ -1670,9 +1720,9 @@ impl KernelRegistry {
             self.cache.insert(cache_key.clone(), pipeline);
         }
 
-        self.cache.get(&cache_key).ok_or_else(|| {
-            MlxError::KernelNotFound(name.to_string())
-        })
+        self.cache
+            .get(&cache_key)
+            .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))
     }
 
     /// Get a compiled compute pipeline for the named kernel, specialized with
@@ -1775,8 +1825,8 @@ kernel void int_fc_test_kernel(
             .get_pipeline_with_constants(
                 "int_fc_test_kernel",
                 &device,
-                &[],                  // no bool constants
-                &[(100, 4_i32)],      // int constant index 100 = 4
+                &[],             // no bool constants
+                &[(100, 4_i32)], // int constant index 100 = 4
             )
             .expect("pipeline N=4 should compile") as *const _;
 
@@ -1787,12 +1837,7 @@ kernel void int_fc_test_kernel(
 
         // Compile with N=8 — must produce a SEPARATE pipeline.
         let p8_ptr = registry
-            .get_pipeline_with_constants(
-                "int_fc_test_kernel",
-                &device,
-                &[],
-                &[(100, 8_i32)],
-            )
+            .get_pipeline_with_constants("int_fc_test_kernel", &device, &[], &[(100, 8_i32)])
             .expect("pipeline N=8 should compile") as *const _;
 
         // Cache must have grown by exactly 1.
@@ -1811,12 +1856,7 @@ kernel void int_fc_test_kernel(
         // A second call with N=4 must return the SAME pipeline (cache hit, no
         // new compilation).
         let p4_again_ptr = registry
-            .get_pipeline_with_constants(
-                "int_fc_test_kernel",
-                &device,
-                &[],
-                &[(100, 4_i32)],
-            )
+            .get_pipeline_with_constants("int_fc_test_kernel", &device, &[], &[(100, 4_i32)])
             .expect("pipeline N=4 cache hit should succeed") as *const _;
 
         assert_eq!(
@@ -1910,12 +1950,7 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
         // We capture the label as an owned String to release the borrow on
         // the cache before fetching the next specialisation.
         let label_v7 = registry
-            .get_pipeline_with_constants(
-                "int_fc_test_kernel",
-                &device,
-                &[],
-                &[(100, 7_i32)],
-            )
+            .get_pipeline_with_constants("int_fc_test_kernel", &device, &[], &[(100, 7_i32)])
             .expect("specialised pipeline must compile")
             .label()
             .to_string();
@@ -1927,12 +1962,7 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
 
         // A second specialisation must produce a different label.
         let label_v13 = registry
-            .get_pipeline_with_constants(
-                "int_fc_test_kernel",
-                &device,
-                &[],
-                &[(100, 13_i32)],
-            )
+            .get_pipeline_with_constants("int_fc_test_kernel", &device, &[], &[(100, 13_i32)])
             .expect("second specialised pipeline must compile")
             .label()
             .to_string();

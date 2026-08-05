@@ -4,7 +4,7 @@
 
 use half::bf16;
 use mlx_native::ops::deepseek_indexer::{
-    dispatch_deepseek_indexer, DeepSeekIndexerParams, DEEPSEEK_INDEXER_HEADS,
+    dispatch_deepseek_indexer, dispatch_deepseek_indexer_into, DeepSeekIndexerParams, DEEPSEEK_INDEXER_HEADS,
     DEEPSEEK_INDEXER_HEAD_DIM, DEEPSEEK_INDEXER_RATIO, DEEPSEEK_INDEXER_TOP_K,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -20,6 +20,77 @@ fn bf16_values(len: usize, salt: usize, scale: f32) -> Vec<bf16> {
             bf16::from_f32(value * scale)
         })
         .collect()
+}
+
+#[test]
+fn strided_output_writes_only_the_requested_tail() {
+    let device = MlxDevice::new().unwrap();
+    let queries = 5;
+    let kv_len = 2;
+    let prefix = queries;
+    let stride = prefix + K;
+    let q = bf16_buffer(
+        &device,
+        &bf16_values(queries * H * D, 1, 0.003),
+        vec![1, queries, H, D],
+    );
+    let kv_values = bf16_values(kv_len * D, 2, 0.004);
+    let weights_values = vec![1.0; queries * H];
+    let expected = reference(
+        q.as_slice::<bf16>().unwrap(),
+        &kv_values,
+        &weights_values,
+        1,
+        queries,
+        kv_len,
+        0,
+        128,
+    );
+    let kv = bf16_buffer(&device, &kv_values, vec![1, kv_len, D]);
+    let weights = f32_buffer(&device, &weights_values, vec![1, queries, H]);
+    let scratch = f32_buffer(
+        &device,
+        &vec![0.0; queries * kv_len],
+        vec![1, queries, kv_len],
+    );
+    let mut output = device
+        .alloc_buffer(queries * stride * 4, DType::I32, vec![1, queries, stride])
+        .unwrap();
+    output.as_mut_slice::<i32>().unwrap().fill(77);
+    let params = DeepSeekIndexerParams {
+        batch: 1,
+        query_len: queries as u32,
+        kv_len: kv_len as u32,
+        start_pos: 0,
+        ratio: 4,
+        heads: H as u32,
+        head_dim: D as u32,
+        top_k: K as u32,
+        offset: 128,
+    };
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_deepseek_indexer_into(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q,
+        &kv,
+        &weights,
+        &scratch,
+        &output,
+        stride,
+        prefix,
+        &params,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    let actual = output.as_slice::<i32>().unwrap();
+    for query in 0..queries {
+        let row = &actual[query * stride..(query + 1) * stride];
+        assert!(row[..prefix].iter().all(|&value| value == 77));
+        assert_eq!(&row[prefix..], &expected[query * K..(query + 1) * K]);
+    }
 }
 
 fn bf16_buffer(device: &MlxDevice, data: &[bf16], shape: Vec<usize>) -> MlxBuffer {

@@ -380,11 +380,9 @@ pub fn dispatch_count() -> u64 {
 /// This gives a per-kernel breakdown comparable to llama.cpp's
 /// instrumented dispatch site for finding *which* kernels make up
 /// the per-token dispatch budget.
-fn pipeline_buckets()
-    -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
-    static BUCKETS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, u64>>,
-    > = std::sync::OnceLock::new();
+fn pipeline_buckets() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static BUCKETS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
     BUCKETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -571,10 +569,7 @@ fn pipeline_tg_mult_hint_enabled() -> bool {
 /// (Step 1r) so the offending kernel can be identified without a
 /// debugger.
 #[inline]
-fn assert_tg_size_multiple_of_32_if_hinted(
-    tg: MTLSize,
-    pipeline: &ComputePipelineStateRef,
-) {
+fn assert_tg_size_multiple_of_32_if_hinted(tg: MTLSize, pipeline: &ComputePipelineStateRef) {
     if !pipeline_tg_mult_hint_enabled() {
         return;
     }
@@ -588,7 +583,12 @@ fn assert_tg_size_multiple_of_32_if_hinted(
              {} mod 32 = {}.  Pipeline label: \"{}\".  Either fix the \
              dispatch site to use a multiple-of-32 threadgroup, or unset \
              HF2Q_PIPELINE_TG_MULT_HINT.",
-            tg.width, tg.height, tg.depth, total, total, total % 32,
+            tg.width,
+            tg.height,
+            tg.depth,
+            total,
+            total,
+            total % 32,
             label
         );
     }
@@ -705,8 +705,7 @@ fn issue_metal_buffer_barrier(encoder: &ComputeCommandEncoderRef) {
     // MTLBarrierScopeBuffers = 1 << 0 = 1.
     const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
     unsafe {
-        let _: () =
-            objc::msg_send![encoder, memoryBarrierWithScope: MTL_BARRIER_SCOPE_BUFFERS];
+        let _: () = objc::msg_send![encoder, memoryBarrierWithScope: MTL_BARRIER_SCOPE_BUFFERS];
     }
 }
 
@@ -903,7 +902,9 @@ impl CommandEncoder {
         residency_set: Option<ResidencySet>,
     ) -> Result<Self> {
         let cmd_buf = if unretained_refs_enabled() {
-            queue.new_command_buffer_with_unretained_references().to_owned()
+            queue
+                .new_command_buffer_with_unretained_references()
+                .to_owned()
         } else {
             queue.new_command_buffer().to_owned()
         };
@@ -984,9 +985,18 @@ impl CommandEncoder {
     ///
     /// Used by `GraphSession::track_dispatch` in recording mode to annotate
     /// dispatches that were called without a preceding `barrier_between`.
-    pub fn annotate_last_dispatch_if_missing(&mut self, reads: Vec<MemRange>, writes: Vec<MemRange>) {
+    pub fn annotate_last_dispatch_if_missing(
+        &mut self,
+        reads: Vec<MemRange>,
+        writes: Vec<MemRange>,
+    ) {
         if let Some(ref mut nodes) = self.capture {
-            if let Some(CapturedNode::Dispatch { reads: r, writes: w, .. }) = nodes.last_mut() {
+            if let Some(CapturedNode::Dispatch {
+                reads: r,
+                writes: w,
+                ..
+            }) = nodes.last_mut()
+            {
                 if r.is_empty() && !reads.is_empty() {
                     *r = reads;
                 }
@@ -1113,6 +1123,16 @@ impl CommandEncoder {
             }
             self.active_encoder = std::ptr::null();
         }
+    }
+
+    /// Commit and synchronously time the current profiling stage, then open
+    /// a fresh command buffer for subsequent work. This is deliberately a
+    /// diagnostic-only primitive: callers must gate it because the wait
+    /// defeats normal command-buffer pipelining.
+    pub fn profile_stage_boundary(&mut self, label: &str) -> Result<()> {
+        self.commit_and_wait_labeled(label)?;
+        self.reset_command_buffer();
+        Ok(())
     }
 
     /// Insert a memory barrier with scope `MTLBarrierScopeBuffers`.
@@ -1268,8 +1288,11 @@ impl CommandEncoder {
         if encode_trace_enabled() {
             eprintln!(
                 "[ENCODE-TRACE] DISPATCH(tg) enc={:p} pipeline={:p} tgs=({},{},{})",
-                encoder_ptr, pipeline as *const _,
-                threadgroups.width, threadgroups.height, threadgroups.depth
+                encoder_ptr,
+                pipeline as *const _,
+                threadgroups.width,
+                threadgroups.height,
+                threadgroups.depth
             );
         }
         encoder.set_compute_pipeline_state(pipeline);
@@ -1329,8 +1352,11 @@ impl CommandEncoder {
         if encode_trace_enabled() {
             eprintln!(
                 "[ENCODE-TRACE] DISPATCH(tg+sh) enc={:p} pipeline={:p} tgs=({},{},{})",
-                encoder_ptr, pipeline as *const _,
-                threadgroups.width, threadgroups.height, threadgroups.depth
+                encoder_ptr,
+                pipeline as *const _,
+                threadgroups.width,
+                threadgroups.height,
+                threadgroups.depth
             );
         }
         encoder.set_compute_pipeline_state(pipeline);
@@ -1421,8 +1447,11 @@ impl CommandEncoder {
         if encode_trace_enabled() {
             eprintln!(
                 "[ENCODE-TRACE] DISPATCH enc={:p} pipeline={:p} tgs=({},{},{})",
-                encoder_ptr, pipeline as *const _,
-                threadgroups.width, threadgroups.height, threadgroups.depth
+                encoder_ptr,
+                pipeline as *const _,
+                threadgroups.width,
+                threadgroups.height,
+                threadgroups.depth
             );
         }
         encoder.set_compute_pipeline_state(pipeline);
@@ -1469,8 +1498,11 @@ impl CommandEncoder {
         if encode_trace_enabled() {
             eprintln!(
                 "[ENCODE-TRACE] DISPATCH(args+sh) enc={:p} pipeline={:p} tgs=({},{},{})",
-                encoder_ptr, pipeline as *const _,
-                threadgroups.width, threadgroups.height, threadgroups.depth
+                encoder_ptr,
+                pipeline as *const _,
+                threadgroups.width,
+                threadgroups.height,
+                threadgroups.depth
             );
         }
         encoder.set_compute_pipeline_state(pipeline);
@@ -1761,11 +1793,7 @@ impl CommandEncoder {
     /// or rely on auto-barrier for dataflow correctness before this
     /// call, matching the contract of the unbaked dispatch_tracked_*
     /// family.
-    pub fn dispatch_record(
-        &mut self,
-        rec: &DispatchRecord,
-        runtime_buffers: &[&MlxBuffer],
-    ) {
+    pub fn dispatch_record(&mut self, rec: &DispatchRecord, runtime_buffers: &[&MlxBuffer]) {
         debug_assert_eq!(
             rec.buffer_slots.len(),
             runtime_buffers.len(),
@@ -1854,11 +1882,7 @@ impl CommandEncoder {
     /// applies the dispatch.  Mirrors lines 220-225 of
     /// `ggml-metal-ops.cpp` (`concurrency_check + concurrency_reset +
     /// concurrency_add` around each node).
-    fn maybe_auto_barrier(
-        &mut self,
-        reads: &[&MlxBuffer],
-        writes: &[&MlxBuffer],
-    ) {
+    fn maybe_auto_barrier(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
         if self.mem_ranges.check_dispatch(reads, writes) {
             // Concurrent — no barrier needed; just record the new ranges.
             self.mem_ranges.add_dispatch(reads, writes);
@@ -1939,15 +1963,14 @@ impl CommandEncoder {
         encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings {
             match binding {
-                RecordedBinding::Buffer { metal_buffer, offset } => {
+                RecordedBinding::Buffer {
+                    metal_buffer,
+                    offset,
+                } => {
                     encoder.set_buffer(*index, Some(metal_buffer), *offset);
                 }
                 RecordedBinding::Bytes(bytes) => {
-                    encoder.set_bytes(
-                        *index,
-                        bytes.len() as u64,
-                        bytes.as_ptr() as *const _,
-                    );
+                    encoder.set_bytes(*index, bytes.len() as u64, bytes.as_ptr() as *const _);
                 }
             }
         }
@@ -2149,11 +2172,7 @@ impl CommandEncoder {
     ///
     /// No-op when sampling is inactive or when `pre_idx` is `None`.
     #[inline]
-    fn sample_dispatch_post(
-        &mut self,
-        encoder: &ComputeCommandEncoderRef,
-        pre_idx: Option<u32>,
-    ) {
+    fn sample_dispatch_post(&mut self, encoder: &ComputeCommandEncoderRef, pre_idx: Option<u32>) {
         let i = match pre_idx {
             Some(v) => v,
             None => return,
@@ -2227,16 +2246,14 @@ impl CommandEncoder {
             let start_ns = crate::kernel_profile::convert_gpu_ticks_to_ns(start_raw);
             let end_ns = crate::kernel_profile::convert_gpu_ticks_to_ns(end_raw);
             let gpu_ns = end_ns.saturating_sub(start_ns);
-            crate::kernel_profile::record_dispatch(
-                crate::kernel_profile::DispatchEntry {
-                    cb_label: cb_label.to_string(),
-                    op_kind: meta.op_kind,
-                    dispatch_index: meta.dispatch_index,
-                    gpu_ns,
-                    start_gpu_ns: start_ns,
-                    end_gpu_ns: end_ns,
-                },
-            );
+            crate::kernel_profile::record_dispatch(crate::kernel_profile::DispatchEntry {
+                cb_label: cb_label.to_string(),
+                op_kind: meta.op_kind,
+                dispatch_index: meta.dispatch_index,
+                gpu_ns,
+                start_gpu_ns: start_ns,
+                end_gpu_ns: end_ns,
+            });
         }
         // Buffer dropped at end of scope releases the underlying
         // CounterSampleBuffer; per-CB lifetime correctly bounded.
@@ -2279,11 +2296,9 @@ impl CommandEncoder {
 
         match self.cmd_buf.status() {
             MTLCommandBufferStatus::Completed => Ok(()),
-            MTLCommandBufferStatus::Error => {
-                Err(MlxError::CommandBufferError(
-                    "GPU command buffer completed with error status".into(),
-                ))
-            }
+            MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
+                "GPU command buffer completed with error status".into(),
+            )),
             status => Err(MlxError::CommandBufferError(format!(
                 "Unexpected command buffer status after wait: {:?}",
                 status
@@ -2380,7 +2395,10 @@ impl CommandEncoder {
     /// `Command Buffer 0` placeholder.
     #[inline]
     fn apply_labels(&mut self, label: &str) {
-        debug_assert!(!label.is_empty(), "commit_*_labeled called with empty label");
+        debug_assert!(
+            !label.is_empty(),
+            "commit_*_labeled called with empty label"
+        );
         if label.is_empty() {
             return;
         }
@@ -2449,15 +2467,25 @@ impl CommandEncoder {
     /// HF2Q_GPU_BUSY gate is off.
     pub fn accumulate_gpu_busy(&self) {
         if *GPU_BUSY_ON {
-            let (gpu_start, gpu_end): (f64, f64) = unsafe {
-                let cb = &*self.cmd_buf;
-                let s: f64 = msg_send![cb, GPUStartTime];
-                let e: f64 = msg_send![cb, GPUEndTime];
-                (s, e)
-            };
-            let ns = ((gpu_end - gpu_start).max(0.0) * 1_000_000_000.0) as u64;
+            let ns = self.completed_gpu_interval_ns();
             GPU_BUSY_NS.fetch_add(ns, Ordering::Relaxed);
         }
+    }
+
+    /// Return this completed command buffer's GPU interval in nanoseconds.
+    ///
+    /// Call only after a successful completion wait. Unlike
+    /// [`Self::accumulate_gpu_busy`], this accessor is intentionally ungated
+    /// so an independent profiler can request stage timing without enabling
+    /// the process-wide accumulator.
+    pub fn completed_gpu_interval_ns(&self) -> u64 {
+        let (gpu_start, gpu_end): (f64, f64) = unsafe {
+            let cb = &*self.cmd_buf;
+            let s: f64 = msg_send![cb, GPUStartTime];
+            let e: f64 = msg_send![cb, GPUEndTime];
+            (s, e)
+        };
+        ((gpu_end - gpu_start).max(0.0) * 1_000_000_000.0) as u64
     }
 
     /// Block until a previously committed command buffer completes.

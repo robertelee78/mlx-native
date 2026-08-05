@@ -13,6 +13,8 @@ use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 
 const F32_TO_BF16_KERNEL: &str = "deepseek_tail_rope_f32_to_bf16";
 const BF16_KERNEL: &str = "deepseek_tail_rope_bf16";
+const F32_TO_F16_KERNEL: &str = "deepseek_tail_rope_f32_to_f16";
+const F16_TO_BF16_KERNEL: &str = "deepseek_tail_rope_f16_to_bf16";
 
 pub static DEEPSEEK_TAIL_ROPE_SHADER_SOURCE: &str =
     include_str!("../shaders/deepseek_tail_rope.metal");
@@ -20,6 +22,8 @@ pub static DEEPSEEK_TAIL_ROPE_SHADER_SOURCE: &str =
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(F32_TO_BF16_KERNEL, DEEPSEEK_TAIL_ROPE_SHADER_SOURCE);
     registry.register_source(BF16_KERNEL, DEEPSEEK_TAIL_ROPE_SHADER_SOURCE);
+    registry.register_source(F32_TO_F16_KERNEL, DEEPSEEK_TAIL_ROPE_SHADER_SOURCE);
+    registry.register_source(F16_TO_BF16_KERNEL, DEEPSEEK_TAIL_ROPE_SHADER_SOURCE);
 }
 
 #[repr(C)]
@@ -50,6 +54,7 @@ fn validate(
     frequencies: &MlxBuffer,
     params: &DeepSeekTailRopeParams,
     input_dtype: DType,
+    output_dtype: DType,
 ) -> Result<(usize, usize)> {
     if params.batch == 0 || params.seq_len == 0 || params.heads == 0 {
         return Err(MlxError::InvalidArgument(
@@ -80,15 +85,15 @@ fn validate(
             input.shape()
         )));
     }
-    if output.dtype() != DType::BF16 || output.shape() != shape {
+    if output.dtype() != output_dtype || output.shape() != shape {
         return Err(MlxError::InvalidArgument(format!(
-            "deepseek_tail_rope: output must be bf16 {shape:?}, got {} {:?}",
+            "deepseek_tail_rope: output must be {output_dtype} {shape:?}, got {} {:?}",
             output.dtype(),
             output.shape()
         )));
     }
     if input.byte_len() < elements * input_dtype.size_of()
-        || output.byte_len() < elements * DType::BF16.size_of()
+        || output.byte_len() < elements * output_dtype.size_of()
     {
         return Err(MlxError::InvalidArgument(
             "deepseek_tail_rope: input or output buffer is too short".into(),
@@ -129,10 +134,19 @@ fn dispatch(
     output: &MlxBuffer,
     params: &DeepSeekTailRopeParams,
     input_dtype: DType,
+    output_dtype: DType,
     kernel: &str,
 ) -> Result<()> {
     let (vectors, work_width) =
-        validate(input, output, positions, frequencies, params, input_dtype)?;
+        validate(
+            input,
+            output,
+            positions,
+            frequencies,
+            params,
+            input_dtype,
+            output_dtype,
+        )?;
     let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
     encode_with_args(
         encoder,
@@ -171,6 +185,7 @@ pub fn dispatch_deepseek_tail_rope_f32_to_bf16(
         output,
         params,
         DType::F32,
+        DType::BF16,
         F32_TO_BF16_KERNEL,
     )
 }
@@ -196,6 +211,60 @@ pub fn dispatch_deepseek_tail_rope_bf16(
         output,
         params,
         DType::BF16,
+        DType::BF16,
         BF16_KERNEL,
+    )
+}
+
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_deepseek_tail_rope_f32_to_f16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    positions: &MlxBuffer,
+    frequencies: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DeepSeekTailRopeParams,
+) -> Result<()> {
+    dispatch(
+        encoder,
+        registry,
+        device,
+        input,
+        positions,
+        frequencies,
+        output,
+        params,
+        DType::F32,
+        DType::F16,
+        F32_TO_F16_KERNEL,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_deepseek_tail_rope_f16_to_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    positions: &MlxBuffer,
+    frequencies: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DeepSeekTailRopeParams,
+) -> Result<()> {
+    dispatch(
+        encoder,
+        registry,
+        device,
+        input,
+        positions,
+        frequencies,
+        output,
+        params,
+        DType::F16,
+        DType::BF16,
+        F16_TO_BF16_KERNEL,
     )
 }
