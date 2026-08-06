@@ -1,0 +1,100 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact main-branch commit to publish
+        required: true
+        type: string
+      version:
+        description: Exact crate version to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      EXPECTED_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Verify immutable release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$EXPECTED_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$actual_sha" origin/main
+          actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$actual_version" = "$EXPECTED_VERSION"
+          test -n "$CARGO_REGISTRY_TOKEN"
+          git diff --exit-code
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Test exact source
+        run: cargo +stable test --locked -- --test-threads=1
+
+      - name: Package exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +stable package --locked
+          crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
+          test -s "$crate"
+          shasum -a 256 "$crate" | tee release-crate.sha256
+
+      - name: Publish exact package
+        run: cargo +stable publish --locked --token "$CARGO_REGISTRY_TOKEN"
+
+      - name: Verify crates.io bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk '{print $1}' release-crate.sha256)
+          downloaded="$RUNNER_TEMP/mlx-native-${EXPECTED_VERSION}.crate"
+          for _ in 1 2 3 4 5 6; do
+            if curl --fail --location --silent --show-error \
+              "https://crates.io/api/v1/crates/mlx-native/${EXPECTED_VERSION}/download" \
+              --output "$downloaded"; then
+              actual=$(shasum -a 256 "$downloaded" | awk '{print $1}')
+              test "$actual" = "$expected"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Tag and create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${EXPECTED_VERSION}"
+          git tag "$tag" "$EXPECTED_SHA"
+          git push origin "$tag"
+          gh release create "$tag" \
+            "target/package/mlx-native-${EXPECTED_VERSION}.crate" \
+            "release-crate.sha256" \
+            --target "$EXPECTED_SHA" \
+            --title "mlx-native ${EXPECTED_VERSION}" \
+            --generate-notes \
+            --verify-tag
