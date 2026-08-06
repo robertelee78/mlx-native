@@ -17,7 +17,8 @@
 // row to the correct expert's weight slice.
 //
 // Copyright the candle Authors and llama.cpp Authors.
-// See LICENSE-APACHE-candle in this directory.
+// See LICENSE-APACHE-candle and LICENSE-MIT-llamacpp in this directory.
+// The Q3_K additions are ported from llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -72,6 +73,15 @@ typedef struct {
 } block_q2_K;
 static_assert(sizeof(block_q2_K) == 2*sizeof(half) + QK_K/16 + QK_K/4,
               "wrong q2_K block size");
+
+typedef struct {
+    uint8_t hmask[QK_K/8];
+    uint8_t qs[QK_K/4];
+    uint8_t scales[12];
+    half    d;
+} block_q3_K;
+static_assert(sizeof(block_q3_K) == sizeof(half) + QK_K/4 + QK_K/8 + 12,
+              "wrong q3_K block size");
 
 // Q5_K: 256 values per block, 176 bytes per block.
 // Layout: [half d][half dmin][uint8_t scales[12]][uint8_t qh[32]][uint8_t qs[128]]
@@ -622,6 +632,118 @@ kernel void kernel_mul_mv_id_q2_K_f32(
 
     for (int row = 0; row < nr; ++row) {
         const float total = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row*p.ne0 + first_row + row] = total;
+        }
+    }
+}
+
+// Expert-routed port of current llama.cpp `kernel_mul_mv_q3_K_f32_impl`
+// (MIT), preserving its two rows per simdgroup and accumulator order.
+kernel void kernel_mul_mv_id_q3_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short nr = 2;
+    constexpr short nsg = 2;
+    const int output_row = int(tgpig.y);
+    if (output_row >= p.ne1) return;
+
+    const int nb = p.ne00/QK_K;
+    const uint token_idx = uint(output_row)/p.top_k;
+    const uint expert_id = ids[output_row];
+    const int first_row = (int(tgpig.x)*nsg + int(sgitg))*nr;
+    device const block_q3_K * x =
+        (device const block_q3_K *)(src0 + expert_id*p.expert_stride) + first_row*nb;
+    device const float * yy = src1 + token_idx*p.ne10;
+
+    float yl[32];
+    const short tid = tiisg/4;
+    const short ix  = tiisg%4;
+    const short ip  = tid/4;
+    const short il  = 2*((tid%4)/2);
+    const short ir  = tid%2;
+    const short l0  = 8*ir;
+    const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},
+                           {0x0004, 0x0400, 0x0008, 0x0800},
+                           {0x0010, 0x1000, 0x0020, 0x2000},
+                           {0x0040, 0x4000, 0x0080, 0x8000}};
+    const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00},
+                        {0x0030, 0x3000, 0x00c0, 0xc000}};
+    const ushort4 hm = mm[2*ip + il/2];
+    const short shift = 2*il;
+    const float v1 = il == 0 ? 4.f : 64.f;
+    const float v2 = 4.f*v1;
+    const uint16_t s_shift1 = 4*ip;
+    const uint16_t s_shift2 = s_shift1 + il;
+    const short q_offset = 32*ip + l0;
+    const short y_offset = 128*ip + 32*il + l0;
+    device const float * y1 = yy + ix*QK_K + y_offset;
+    float sumf1[nr] = {0.f};
+    float sumf2[nr] = {0.f};
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        for (short l = 0; l < 8; ++l) {
+            yl[l+ 0] = y1[l+ 0];
+            yl[l+ 8] = y1[l+16];
+            yl[l+16] = y1[l+32];
+            yl[l+24] = y1[l+48];
+        }
+        for (short row = 0; row < nr; ++row) {
+            device const block_q3_K * block = x + ib + row*nb;
+            device const uint16_t * q = (device const uint16_t *)(block->qs + q_offset);
+            device const uint16_t * h = (device const uint16_t *)(block->hmask + l0);
+            device const uint16_t * a = (device const uint16_t *)block->scales;
+            uint32_t scales32;
+            uint32_t aux32;
+            thread uint16_t * scales16 = (thread uint16_t *)&scales32;
+            thread const int8_t * scales = (thread const int8_t *)&scales32;
+            scales16[0] = a[4]; scales16[1] = a[5];
+            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
+            scales16[0] = a[il+0]; scales16[1] = a[il+1];
+            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
+
+            float s1=0.f, s2=0.f, s3=0.f, s4=0.f, s5=0.f, s6=0.f;
+            for (short l = 0; l < 8; l += 2) {
+                const int32_t qs = q[l/2];
+                s1 += yl[l+0]*(qs&qm[il/2][0]);
+                s2 += yl[l+1]*(qs&qm[il/2][1]);
+                s3 += ((h[l/2]&hm[0]) ? 0.f : yl[l+0]) + ((h[l/2]&hm[1]) ? 0.f : yl[l+1]);
+                s4 += yl[l+16]*(qs&qm[il/2][2]);
+                s5 += yl[l+17]*(qs&qm[il/2][3]);
+                s6 += ((h[l/2]&hm[2]) ? 0.f : yl[l+16]) + ((h[l/2]&hm[3]) ? 0.f : yl[l+17]);
+            }
+            float d1 = float(block->d)*(s1 + s2/256.f - s3*v1);
+            float d2 = float(block->d)*(s4 + s5/256.f - s6*v2);
+            sumf1[row] += d1*(scales[0]-32);
+            sumf2[row] += d2*(scales[2]-32);
+
+            s1=s2=s3=s4=s5=s6=0.f;
+            for (short l = 0; l < 8; l += 2) {
+                const int32_t qs = q[l/2+8];
+                s1 += yl[l+8]*(qs&qm[il/2][0]);
+                s2 += yl[l+9]*(qs&qm[il/2][1]);
+                s3 += ((h[l/2+8]&hm[0]) ? 0.f : yl[l+8]) + ((h[l/2+8]&hm[1]) ? 0.f : yl[l+9]);
+                s4 += yl[l+24]*(qs&qm[il/2][2]);
+                s5 += yl[l+25]*(qs&qm[il/2][3]);
+                s6 += ((h[l/2+8]&hm[2]) ? 0.f : yl[l+24]) + ((h[l/2+8]&hm[3]) ? 0.f : yl[l+25]);
+            }
+            d1 = float(block->d)*(s1 + s2/256.f - s3*v1);
+            d2 = float(block->d)*(s4 + s5/256.f - s6*v2);
+            sumf1[row] += d1*(scales[1]-32);
+            sumf2[row] += d2*(scales[3]-32);
+        }
+        y1 += 4*QK_K;
+    }
+
+    for (short row = 0; row < nr; ++row) {
+        const float total = simd_sum((sumf1[row] + 0.25f*sumf2[row])/(1 << shift));
         if (tiisg == 0 && first_row + row < p.ne01) {
             dst[output_row*p.ne0 + first_row + row] = total;
         }

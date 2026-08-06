@@ -50,6 +50,11 @@ const BLOCK_Q4_K_BYTES: u32 = 144;
 const QK2_K: u32 = 256;
 const BLOCK_Q2_K_BYTES: u32 = 84;
 
+/// Q3_K: 256 values per block, 110 bytes per block.
+/// Layout: hmask[32] + qs[64] + scales[12] + d(f16).
+const QK3_K: u32 = 256;
+const BLOCK_Q3_K_BYTES: u32 = 110;
+
 /// Q5_K: 256 values per block, 176 bytes per block.
 /// Block layout: d(fp16) + dmin(fp16) + scales[12] + qh[32] + qs[128] = 176.
 const QK5_K: u32 = 256;
@@ -104,6 +109,8 @@ pub enum GgmlType {
     Q8_0,
     /// 2-bit super-block quantization. 256 values per block, 84 bytes per block.
     Q2_K,
+    /// 3-bit super-block quantization. 256 values per block, 110 bytes per block.
+    Q3_K,
     /// 4-bit super-block quantization. 256 values per block, 144 bytes per block.
     Q4_K,
     /// 5-bit super-block quantization. 256 values per block, 176 bytes per block.
@@ -147,6 +154,7 @@ impl GgmlType {
             GgmlType::Q4_0 => QK4_0,
             GgmlType::Q8_0 => QK8_0,
             GgmlType::Q2_K => QK2_K,
+            GgmlType::Q3_K => QK3_K,
             GgmlType::Q4_K => QK4_K,
             GgmlType::Q5_K => QK5_K,
             GgmlType::Q6_K => QK6_K,
@@ -166,6 +174,7 @@ impl GgmlType {
             GgmlType::Q4_0 => BLOCK_Q4_0_BYTES,
             GgmlType::Q8_0 => BLOCK_Q8_0_BYTES,
             GgmlType::Q2_K => BLOCK_Q2_K_BYTES,
+            GgmlType::Q3_K => BLOCK_Q3_K_BYTES,
             GgmlType::Q4_K => BLOCK_Q4_K_BYTES,
             GgmlType::Q5_K => BLOCK_Q5_K_BYTES,
             GgmlType::Q6_K => BLOCK_Q6_K_BYTES,
@@ -186,6 +195,7 @@ impl GgmlType {
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
+            GgmlType::Q3_K => "kernel_mul_mv_q3_K_f32",
             // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp.
             GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
             // ADR-022 Phase 2 — Q5_K dense mv ported.
@@ -211,6 +221,7 @@ impl GgmlType {
             // ADR-022 Phase 3 — Q4_K dense mm ported.
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
+            GgmlType::Q3_K => "kernel_mul_mm_q3_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_f32",
@@ -233,6 +244,7 @@ impl GgmlType {
             // ADR-022 Phase 3: Q4_K tensor mm landed.
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
+            GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_f32",
@@ -254,6 +266,7 @@ impl GgmlType {
         match self {
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
+            GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_v2_f32",
@@ -431,6 +444,7 @@ pub fn quantized_matmul_ggml(
         GgmlType::Q4_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
+        | GgmlType::Q3_K
         | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -851,6 +865,7 @@ fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
         GgmlType::Q4_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
+        | GgmlType::Q3_K
         | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K
@@ -959,6 +974,7 @@ fn dispatch_mv(
         GgmlType::Q2_K => (2u64, 32u64, 8usize),
         // Q4_K / Q5_K (ADR-022 Phase 2) mirror Q6_K's 2-row-per-tg geometry.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        GgmlType::Q3_K => (2u64, 32u64, 4usize),
         _ => unreachable!(),
     };
     // ADR-028 —nr0=2 variant doubles rows-per-TG to 4.  Same

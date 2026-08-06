@@ -76,6 +76,7 @@ impl GgmlType {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_id_q2_K_f32",
+            GgmlType::Q3_K => "kernel_mul_mv_id_q3_K_f32",
             // ADR-013 P7 — Q4_K mv_id ported from llama.cpp
             // (ggml-metal.metal:10349) for dwq46/dwq48 MoE expert weights.
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
@@ -98,6 +99,7 @@ impl GgmlType {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_f32",
+            GgmlType::Q3_K => "kernel_mul_mm_id_q3_K_f32",
             // ADR-022 Phase 2 — Q5_K mm_id ported.
             GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
@@ -122,6 +124,7 @@ impl GgmlType {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
             GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_tensor_f32",
+            GgmlType::Q3_K => "kernel_mul_mm_id_q3_K_tensor_f32",
             // ADR-022 Phase 2 — Q5_K mm_id_tensor ported.
             GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_tensor_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32",
@@ -607,6 +610,7 @@ fn dispatch_id_mv(
         // (N_SIMDGROUP=2, N_DST=4, NWG=2) launch geometry.
         | GgmlType::IQ4_XS => (8u64, 8u64, 8usize),
         GgmlType::Q2_K => (2u64, 32u64, 8usize),
+        GgmlType::Q3_K => (2u64, 32u64, 4usize),
         // Q4_K, Q5_K, and Q6_K all use the 2-row-per-threadgroup (2, 32)
         // geometry.  ADR-013 P7 — Q4_K added; mirrors Q5_K (NSG=2,
         // 1 row per simdgroup; same kmask scale-decode).
@@ -1283,6 +1287,7 @@ pub fn dispatch_id_mm_for_test(
         GgmlType::Q4_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
+        | GgmlType::Q3_K
         | GgmlType::Q4_K
         | GgmlType::Q5_K
         | GgmlType::Q6_K

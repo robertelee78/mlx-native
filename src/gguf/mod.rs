@@ -70,6 +70,7 @@ const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q2_K: u32 = 10;
+const GGML_TYPE_Q3_K: u32 = 11;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
@@ -317,6 +318,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_Q5_1 => Ok(GgmlType::Q5_1),
         GGML_TYPE_Q8_0 => Ok(GgmlType::Q8_0),
         GGML_TYPE_Q2_K => Ok(GgmlType::Q2_K),
+        GGML_TYPE_Q3_K => Ok(GgmlType::Q3_K),
         GGML_TYPE_Q4_K => Ok(GgmlType::Q4_K),
         GGML_TYPE_Q5_K => Ok(GgmlType::Q5_K),
         GGML_TYPE_Q6_K => Ok(GgmlType::Q6_K),
@@ -509,6 +511,72 @@ fn dequantize_q2_k(data: &[u8], output: &mut [f32]) -> Result<()> {
             for lane in 0..16 {
                 let quant = (qs[q_offset + lane] >> shift) & 0x03;
                 out[group * 16 + lane] = scale_value * quant as f32 - min_value;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Dequantize GGML Q3_K super-blocks to f32.
+///
+/// Each 110-byte block stores 256 values as 16 groups of 16. `qs` carries
+/// the low two bits and `hmask` selects whether the decoded value is in
+/// `[0, 3]` or `[-4, -1]`. The 16 group scales are signed values represented
+/// by packed 6-bit integers biased by 32.
+///
+/// Layout and unpacking follow llama.cpp's MIT-licensed
+/// `block_q3_K` / `dequantize_row_q3_K` definitions.
+fn dequantize_q3_k(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 110;
+    const BLOCK_ELEMS: usize = 256;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "Q3_K data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "Q3_K output buffer too small".into(),
+        ));
+    }
+
+    for block_index in 0..num_blocks {
+        let block = &data[block_index * BLOCK_BYTES..(block_index + 1) * BLOCK_BYTES];
+        let hmask = &block[..32];
+        let qs = &block[32..96];
+        let scales = &block[96..108];
+        let d = f16_from_le_bytes([block[108], block[109]]);
+        let out = &mut output[block_index * BLOCK_ELEMS..(block_index + 1) * BLOCK_ELEMS];
+
+        for group in 0..16 {
+            let low = if group < 8 {
+                scales[group] & 0x0f
+            } else {
+                scales[group - 8] >> 4
+            };
+            let high = (scales[8 + group % 4] >> (2 * (group / 4))) & 0x03;
+            let group_scale = d * ((low | (high << 4)) as f32 - 32.0);
+
+            let half = group / 8;
+            let group_in_half = group % 8;
+            let q_offset = half * 32 + (group_in_half % 2) * 16;
+            let shift = 2 * (group_in_half / 2);
+            let high_mask = 1u8 << (group / 2);
+
+            for lane in 0..16 {
+                let low_bits = ((qs[q_offset + lane] >> shift) & 0x03) as i8;
+                let quant = low_bits
+                    - if hmask[(group_in_half % 2) * 16 + lane] & high_mask == 0 {
+                        4
+                    } else {
+                        0
+                    };
+                out[group * 16 + lane] = group_scale * quant as f32;
             }
         }
     }
@@ -1040,6 +1108,18 @@ pub fn test_only_dequantize(data: &[u8], ggml_type: GgmlType, output: &mut [f32]
     dequantize_to_f32(data, ggml_type, output)
 }
 
+/// Test-only export for pinning GGUF type-ID and byte-sizing contracts.
+#[doc(hidden)]
+pub fn test_only_ggml_type_from_u32(id: u32) -> Result<GgmlType> {
+    ggml_type_from_u32(id)
+}
+
+/// Test-only export for pinning quantized tensor byte sizing.
+#[doc(hidden)]
+pub fn test_only_compute_byte_len(shape: &[usize], ggml_type: GgmlType) -> Result<usize> {
+    compute_byte_len(shape, ggml_type)
+}
+
 /// Dequantize raw GGML block data to f32.
 fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Result<()> {
     match ggml_type {
@@ -1048,6 +1128,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::Q4_0 => dequantize_q4_0(data, output),
         GgmlType::Q8_0 => dequantize_q8_0(data, output),
         GgmlType::Q2_K => dequantize_q2_k(data, output),
+        GgmlType::Q3_K => dequantize_q3_k(data, output),
         GgmlType::Q4_K => dequantize_q4_k(data, output),
         GgmlType::Q6_K => dequantize_q6_k(data, output),
         GgmlType::Q5_K => dequantize_q5_k(data, output),
@@ -1328,6 +1409,7 @@ impl GgufFile {
             GgmlType::Q4_0
             | GgmlType::Q8_0
             | GgmlType::Q2_K
+            | GgmlType::Q3_K
             | GgmlType::Q4_K
             | GgmlType::Q5_K
             | GgmlType::Q6_K

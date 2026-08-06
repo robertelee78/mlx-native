@@ -12,6 +12,7 @@
 // dense tensor mm kernel.
 //
 // Portions derived from llama.cpp (MIT).  Copyright the llama.cpp Authors.
+// Q3_K source revision: llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -62,6 +63,15 @@ typedef struct {
     half    d;
     half    dmin;
 } block_q2_K;
+
+typedef struct {
+    uint8_t hmask[QK_K/8];
+    uint8_t qs[QK_K/4];
+    uint8_t scales[12];
+    half    d;
+} block_q3_K;
+static_assert(sizeof(block_q3_K) == sizeof(half) + QK_K/4 + QK_K/8 + 12,
+              "wrong q3_K block size");
 
 typedef struct {
     uint8_t ql[QK_K/2];
@@ -168,6 +178,33 @@ void dq_q2_K_id(device const block_q2_K * xb, short il, thread type4x4 & reg) {
     const float ml = min * (sc >> 4);
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    }
+}
+
+template <typename type4x4>
+void dq_q3_K_id(device const block_q3_K * xb, short il, thread type4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint8_t * q = xb->qs;
+    device const uint8_t * h = xb->hmask;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+    q += 32*(il/8) + 16*(il&1);
+    h += 16*(il&1);
+    const uint8_t m = 1 << (il/2);
+    const uint16_t kmask1 = (il/4)>1 ? ((il/4)>2 ? 192 : 48) : ((il/4)>0 ? 12 : 3);
+    const uint16_t kmask2 = il/8 ? 0xF0 : 0x0F;
+    const uint16_t scale_2 = scales[il%8];
+    const uint16_t scale_1 = scales[8 + il%4];
+    const int16_t dl_int = (il/4)&1
+        ? (scale_2&kmask2) | ((scale_1&kmask1) << 2)
+        : (scale_2&kmask2) | ((scale_1&kmask1) << 4);
+    float dl = il<8 ? d_all*(dl_int - 32.f) : d_all*(dl_int/16.f - 32.f);
+    const float ml = 4.f*dl;
+    il = (il/2)&3;
+    const half coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    const uint8_t mask = il>1 ? (il>2 ? 192 : 48) : (il>0 ? 12 : 3);
+    dl *= coef;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl*(q[i]&mask) - (h[i]&m ? 0.f : ml);
     }
 }
 
@@ -522,6 +559,12 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_q8_0, 2, dq_q8_0_id>(
 
 template [[host_name("kernel_mul_mm_id_q2_K_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_q2_K, QK_NL, dq_q2_K_id>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q3_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q3_K, QK_NL, dq_q3_K_id>(
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

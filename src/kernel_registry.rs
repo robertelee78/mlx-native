@@ -140,6 +140,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q2_K_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_q3_K_f32".into(), ggml_src);
         // ADR-028 iter-368: peer-style NSG=4 NR=2 variant (128 threads/TG).
         sources.insert("kernel_mul_mv_q8_0_f32_nr2".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
@@ -173,6 +174,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q2_K_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_q3_K_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q6_K_f32".into(), ggml_mm_src);
         // ADR-022 Phase 1 — dense Q5_1 / IQ4_NL mm.
         sources.insert("kernel_mul_mm_q5_1_f32".into(), ggml_mm_src);
@@ -205,6 +207,7 @@ impl KernelRegistry {
         );
         sources.insert("kernel_mul_mm_q8_0_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q2_K_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q3_K_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert("kernel_mul_mm_q6_K_tensor_f32".into(), ggml_mm_tensor_src);
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL tensor mm.
         sources.insert("kernel_mul_mm_q5_1_tensor_f32".into(), ggml_mm_tensor_src);
@@ -244,6 +247,10 @@ impl KernelRegistry {
         );
         sources.insert(
             "kernel_mul_mm_q2_K_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q3_K_tensor_v2_f32".into(),
             ggml_mm_tensor_src,
         );
         sources.insert(
@@ -388,6 +395,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q2_K_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q3_K_f32".into(), ggml_id_src);
         // ADR-013 P7 — Q4_K MoE expert-routed mat-vec (port of
         // llama.cpp's kernel_mul_mv_id_q4_K_f32 at ggml-metal.metal:10349).
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
@@ -424,6 +432,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q2_K_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_q3_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
         // ADR-013 P16 — Q4_K mm_id (port of llama.cpp ggml-metal.metal:10169).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
@@ -461,6 +470,10 @@ impl KernelRegistry {
         );
         sources.insert(
             "kernel_mul_mm_id_q2_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_q3_K_tensor_f32".into(),
             ggml_id_mm_tensor_src,
         );
         sources.insert(
