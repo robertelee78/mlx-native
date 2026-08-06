@@ -7,8 +7,8 @@
 //! same host f32 contract as the CPU oracle and cache it in a shared Metal
 //! buffer instead.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use metal::MTLResourceOptions;
 
@@ -24,10 +24,7 @@ struct RopeFreqCacheKey {
     pair_count: u32,
 }
 
-thread_local! {
-    static ROPE_FREQ_CACHE: RefCell<HashMap<RopeFreqCacheKey, MlxBuffer>> =
-        RefCell::new(HashMap::new());
-}
+static ROPE_FREQ_CACHE: OnceLock<Mutex<HashMap<RopeFreqCacheKey, MlxBuffer>>> = OnceLock::new();
 
 fn build_inv_freqs(freq_base: f32, denominator: u32, pair_count: u32) -> Vec<f32> {
     (0..pair_count)
@@ -41,8 +38,10 @@ fn build_inv_freqs(freq_base: f32, denominator: u32, pair_count: u32) -> Vec<f32
 /// Borrow a cached Metal buffer containing
 /// `freq_base^(-2 * pair / denominator)` for `pair in 0..pair_count`.
 ///
-/// The callback keeps the thread-local cache borrow scoped to the immediate
-/// encode operation, so callers cannot retain a reference after a cache clear.
+/// The process-lifetime cache retains every returned Metal buffer even if the
+/// encoding thread exits or an unretained command encoder moves to another
+/// thread before commit. The callback receives a cheap Arc-backed clone so the
+/// global mutex is not held while encoding.
 pub(crate) fn with_inv_freqs<R>(
     device: &metal::DeviceRef,
     freq_base: f32,
@@ -68,25 +67,28 @@ pub(crate) fn with_inv_freqs<R>(
         pair_count,
     };
 
-    ROPE_FREQ_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        if !cache.contains_key(&key) {
-            let inv_freqs = build_inv_freqs(freq_base, denominator, pair_count);
-            let byte_len = std::mem::size_of_val(inv_freqs.as_slice());
-            let metal_buf = device.new_buffer_with_data(
-                inv_freqs.as_ptr().cast(),
-                byte_len as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            cache.insert(
-                key,
-                MlxBuffer::from_raw(metal_buf, DType::F32, vec![pair_count as usize]),
-            );
-        }
-        Ok(f(cache.get(&key).expect(
-            "RoPE inverse-frequency cache entry inserted above",
-        )))
-    })
+    let inv_freqs = {
+        let mut cache = ROPE_FREQ_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| {
+                MlxError::CommandBufferError("RoPE frequency cache lock poisoned".into())
+            })?;
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                let values = build_inv_freqs(freq_base, denominator, pair_count);
+                let byte_len = std::mem::size_of_val(values.as_slice());
+                let metal_buf = device.new_buffer_with_data(
+                    values.as_ptr().cast(),
+                    byte_len as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                MlxBuffer::from_raw(metal_buf, DType::F32, vec![pair_count as usize])
+            })
+            .clone()
+    };
+    Ok(f(&inv_freqs))
 }
 
 #[cfg(test)]

@@ -343,9 +343,9 @@ function classes, but did not establish one cross-generation contract.
 
 **Decision:** Compute `freq_base^(-2 * pair / denominator)` once using the same
 host f32 contract as the CPU oracle, cache the tiny table in a shared Metal
-buffer keyed by device/base/shape, and bind it to all five generic RoPE
-kernels.  The GPU no longer evaluates `pow`; it multiplies positions by the
-table and retains explicit precise `sin`/`cos`.
+buffer in a process-lifetime cache keyed by device/base/shape, and bind it to
+all five generic RoPE kernels.  The GPU no longer evaluates `pow`; it
+multiplies positions by the table and retains explicit precise `sin`/`cos`.
 
 **Why:** The CPU oracle already defines its inverse frequencies with f32
 `powf`.  Supplying those exact f32 values removes the amplified,
@@ -357,11 +357,13 @@ hosted M1 run remains a mandatory falsifier before release.
 
 **Scope:** Tensor layout, exponents, pairing, positions, and public dispatch
 signatures are unchanged.  Params buffers must be host-readable shared memory,
-which is the existing `MlxBuffer` and hf2q usage contract.  The cache has no
-public early-clear operation, so entries cannot be dropped ahead of in-flight
-unretained command buffers.  This corrects the standard f32/f16/bf16 and NeoX
-bf16/f32 generic kernels only.  Other RoPE families require their own evidence
-before adopting the same mechanism; this decision does not assume they fail.
+which is the existing `MlxBuffer` and hf2q usage contract.  The global cache
+has no early-clear operation and survives encoding-thread exit, so its buffers
+remain valid for in-flight unretained command buffers.  The bounded cost is one
+tiny table per device/base/shape tuple for the process lifetime.  This corrects
+the standard f32/f16/bf16 and NeoX bf16/f32 generic kernels only.  Other RoPE
+families require their own evidence before adopting the same mechanism; this
+decision does not assume they fail.
 
 ---
 
