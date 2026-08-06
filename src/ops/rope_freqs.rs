@@ -93,7 +93,17 @@ pub(crate) fn with_inv_freqs<R>(
 
 #[cfg(test)]
 mod tests {
-    use super::build_inv_freqs;
+    use super::{build_inv_freqs, with_inv_freqs, ROPE_FREQ_CACHE};
+
+    fn cache_len() -> usize {
+        match ROPE_FREQ_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+        {
+            Ok(cache) => cache.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
 
     #[test]
     fn host_schedule_matches_f32_rope_definition() {
@@ -102,5 +112,18 @@ mod tests {
             let ratio = (2 * pair) as f32 / 16.0_f32;
             assert_eq!(freq, 1.0_f32 / 1_000_000.0_f32.powf(ratio));
         }
+    }
+
+    #[test]
+    fn process_cache_survives_encoding_thread_exit() {
+        let before = cache_len();
+        let worker = std::thread::spawn(|| {
+            let Ok(device) = crate::MlxDevice::new() else {
+                return false;
+            };
+            with_inv_freqs(device.metal_device(), 123_456.75_f32, 14, 7, |_| ()).is_ok()
+        });
+        assert!(matches!(worker.join(), Ok(true)));
+        assert_eq!(cache_len(), before + 1);
     }
 }
