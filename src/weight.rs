@@ -28,7 +28,6 @@ use std::fs;
 use std::path::Path;
 
 use memmap2::Mmap;
-use metal::MTLResourceOptions;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
@@ -452,13 +451,7 @@ pub fn safetensors_to_metal_buffer(
     }
 
     let byte_len = data.len();
-    let metal_buf = device
-        .metal_device()
-        .new_buffer(byte_len as u64, MTLResourceOptions::StorageModeShared);
-
-    if metal_buf.contents().is_null() {
-        return Err(MlxError::BufferAllocationError { bytes: byte_len });
-    }
+    let metal_buf = device.new_shared_buffer(byte_len)?;
 
     // Copy tensor bytes into the Metal buffer.
     // SAFETY: Metal guarantees the buffer contents pointer is valid for

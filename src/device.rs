@@ -4,7 +4,9 @@
 //! [`MlxDevice::new()`] and use it to allocate buffers and create
 //! command encoders.
 
+use metal::foreign_types::ForeignType;
 use metal::{CommandQueue, Device, MTLResourceOptions};
+use objc::{sel, sel_impl};
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
@@ -39,6 +41,36 @@ pub struct MlxDevice {
 crate::static_assertions_send_sync!(MlxDevice);
 
 impl MlxDevice {
+    /// Allocate an owned shared-memory Metal buffer without letting
+    /// `metal-rs` construct a `Buffer` from a null Objective-C pointer.
+    ///
+    /// `DeviceRef::new_buffer` returns `Buffer` directly, so an allocation
+    /// failure reaches `ForeignType::from_ptr` first and aborts on its
+    /// non-null assertion. Query the hard per-buffer limit up front, then
+    /// request the raw Objective-C object and classify `nil` as the typed
+    /// allocation error promised by mlx-native's public API.
+    pub(crate) fn new_shared_buffer(&self, byte_len: usize) -> Result<metal::Buffer> {
+        if byte_len == 0 || byte_len as u64 > self.device.max_buffer_length() as u64 {
+            return Err(MlxError::BufferAllocationError { bytes: byte_len });
+        }
+
+        let raw: *mut metal::MTLBuffer = unsafe {
+            objc::msg_send![
+                &*self.device,
+                newBufferWithLength: byte_len as u64
+                options: MTLResourceOptions::StorageModeShared
+            ]
+        };
+        if raw.is_null() {
+            return Err(MlxError::BufferAllocationError { bytes: byte_len });
+        }
+
+        // SAFETY: `newBufferWithLength:options:` returned a non-null owned
+        // (+1 retain-count) MTLBuffer. The wrapper assumes that ownership and
+        // releases it exactly once on drop.
+        Ok(unsafe { metal::Buffer::from_ptr(raw) })
+    }
+
     /// Initialize the Metal GPU device and create a command queue.
     ///
     /// Returns `Err(MlxError::DeviceNotFound)` if no Metal device is available
@@ -160,14 +192,7 @@ impl MlxDevice {
                 "Buffer byte length must be > 0".into(),
             ));
         }
-        let metal_buf = self
-            .device
-            .new_buffer(byte_len as u64, MTLResourceOptions::StorageModeShared);
-        // Metal returns a non-null buffer on success; a null pointer indicates
-        // failure (typically out-of-memory).
-        if metal_buf.contents().is_null() {
-            return Err(MlxError::BufferAllocationError { bytes: byte_len });
-        }
+        let metal_buf = self.new_shared_buffer(byte_len)?;
         // ADR-015 iter61a (broken-window B-W-1 fix): explicitly zero every
         // newly-allocated GPU buffer. `MTLResourceOptions::StorageModeShared`
         // does NOT guarantee zeroed pages on Apple Silicon — Metal's allocator

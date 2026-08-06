@@ -153,12 +153,7 @@ impl MlxBufferPool {
             Some(b) => b,
             None => {
                 // Fresh allocation at bucket size.
-                let raw = device
-                    .metal_device()
-                    .new_buffer(bucket as u64, metal::MTLResourceOptions::StorageModeShared);
-                if raw.contents().is_null() {
-                    return Err(MlxError::BufferAllocationError { bytes: bucket });
-                }
+                let raw = device.new_shared_buffer(bucket)?;
                 // ADR-015 iter61a-2 (broken-window B-W-1 residual fix): zero-init
                 // every fresh pool allocation. The same MTLResourceOptions::
                 // StorageModeShared recycling that affects MlxDevice::alloc_buffer

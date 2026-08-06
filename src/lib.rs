@@ -308,6 +308,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_buffer_alloc_over_device_limit_is_a_typed_error() {
+        let device = MlxDevice::new().expect("Metal device");
+        let max = device.metal_device().max_buffer_length() as usize;
+        let Some(oversized) = max.checked_add(1) else {
+            return;
+        };
+        let error = device
+            .alloc_buffer(oversized, DType::U8, vec![oversized])
+            .expect_err("oversized Metal buffer must fail before allocation");
+        assert!(matches!(
+            error,
+            MlxError::BufferAllocationError { bytes } if bytes == oversized
+        ));
+    }
+
     // ---- Additional: test kernel not found ----
     #[test]
     fn test_kernel_not_found() {

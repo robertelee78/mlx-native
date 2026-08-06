@@ -4447,7 +4447,8 @@ fn test_mask_rank2_broadcast_d256_multihead() {
 ///   - bf16 Q/K/V/O (n_heads = 1, head_dim = 256): 4 * 65536 * 256 * 2 B = 128 MB
 ///   - f32 K/V for CPU reference (last-row-only): 2 * 65536 * 256 * 4 B = 128 MB
 ///   - f32 mask row 65535 only: 65536 * 4 B = 256 KB
-///   - Total peak: ~9 GB GPU + ~256 MB CPU.
+///   - full-mask CPU readback performed below: another 8.6 GB
+///   - Total peak: ~9 GB GPU + ~8.9 GB CPU, before allocator overhead.
 ///
 /// CPU reference for the full GPU output would be 65536 * 33 M ops =
 /// 2.1 T ops at f32 — minutes on a single core.  Reference for the LAST
@@ -4462,6 +4463,7 @@ fn test_mask_rank2_broadcast_d256_multihead() {
 /// 65535 (the corrupted region).  Post-patch (i64/ulong cast in the two
 /// shaders): PASSES within the standard `BF16_GPU_ATOL / _RTOL` budget.
 #[test]
+#[ignore = "requires more than 18 GB of free unified memory; run explicitly on a capable Apple Silicon host"]
 fn flash_attn_prefill_pp65536_no_overflow_in_mask_indexing() {
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
