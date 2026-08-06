@@ -12,18 +12,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust-metal-train-forward-d256:
+  rust-metal-train:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
-      - name: Forward D256 shader isolation
-        run: >-
-          cargo +stable test --locked --test test_flash_attn_train
-          flash_attn_train_tests::test_d256_library_compiles_with_l_out --
-          --exact --test-threads=1
+      - name: Training shader compatibility
+        run: cargo +stable test --locked --test test_flash_attn_train -- --test-threads=1
 
   rust-metal:
     runs-on: macos-15

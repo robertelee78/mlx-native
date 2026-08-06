@@ -731,12 +731,21 @@ fn dispatch_bwd_inner(
         .alloc_buffer(kv_elems * 4, DType::F32, vec![kv_elems])
         .map_err(|e| MlxError::InvalidArgument(format!("flash_attn_train_bwd: alloc dV_f32: {e}")))?;
 
-    // ── tile geometry (same as forward) ───────────────────────────────────────
-    let nq = params.q_seq_len.div_ceil(BQ);
+    // ── tile geometry ─────────────────────────────────────────────────────────
+    // The D=256 backward shader uses a 16-row/two-simdgroup tile so its static
+    // threadgroup memory is 24 KiB instead of exactly the 32 KiB device limit.
+    // The exact-limit variant fails pipeline creation on M1 while D=64 keeps
+    // the original 32-row/four-simdgroup geometry.
+    let (bq, bwd_wm) = if head_dim_expected == 256 {
+        (16_u32, 2_u32)
+    } else {
+        (BQ, WM)
+    };
+    let nq = params.q_seq_len.div_ceil(bq);
     let nk = params.k_seq_len.div_ceil(BK);
-    let nq_aligned = params.q_seq_len / BQ;
+    let nq_aligned = params.q_seq_len / bq;
     let nk_aligned = params.k_seq_len / BK;
-    let ql_rem = params.q_seq_len % BQ;
+    let ql_rem = params.q_seq_len % bq;
     let kl_rem = params.k_seq_len % BK;
 
     let align_q = ql_rem == 0;
@@ -795,9 +804,9 @@ fn dispatch_bwd_inner(
         ],
     )?;
 
-    // Grid: (ceil(qL/BQ), H_q, B), tg_size: (32, WM, WN)
+    // Grid: (ceil(qL/bq), H_q, B), tg_size: (32, bwd_wm, WN)
     let grid = MTLSize::new(nq as u64, params.n_q_heads as u64, params.batch as u64);
-    let tg_size = MTLSize::new(32, WM as u64, WN as u64);
+    let tg_size = MTLSize::new(32, bwd_wm as u64, WN as u64);
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);
 

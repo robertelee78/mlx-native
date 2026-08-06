@@ -976,7 +976,16 @@ fn test_backward_kernel_names_and_library_compiles() {
             registry.get_pipeline(name, device.metal_device())
         };
         match result {
-            Ok(_) => eprintln!("test_backward_kernel_names_and_library_compiles: {name} OK"),
+            Ok(pipeline) => {
+                if name == "flash_attn_train_bwd_bf16_d256" {
+                    assert!(
+                        pipeline.static_threadgroup_memory_length() <= 24 * 1024,
+                        "D256 backward must retain M1 headroom: static threadgroup memory = {} bytes",
+                        pipeline.static_threadgroup_memory_length()
+                    );
+                }
+                eprintln!("test_backward_kernel_names_and_library_compiles: {name} OK");
+            }
             Err(e) => panic!("BWD pipeline compilation failed for {name}: {e:?}"),
         }
     }
@@ -1078,6 +1087,44 @@ fn test_backward_no_mask_d256_parity() {
     assert_close(&gpu_dq, &ref_dq, 5e-3, "bwd_d256_no_mask_dQ");
     assert_close(&gpu_dk, &ref_dk, 5e-3, "bwd_d256_no_mask_dK");
     assert_close(&gpu_dv, &ref_dv, 5e-3, "bwd_d256_no_mask_dV");
+}
+
+/// The M1-compatible D=256 backward tile is BQ=16. Exercise a one-row tail so
+/// the host alignment constants and the shader's safe Q-tile load stay bound
+/// to that geometry rather than the forward path's BQ=32.
+#[test]
+fn test_backward_no_mask_d256_unaligned_q_parity() {
+    let (device, mut registry) = setup();
+    flash_attn_train::register_bwd(&mut registry);
+
+    let batch = 1; let h = 1; let kv_h = 1; let ql = 17; let kl = 19; let d = 256;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_bf = f32_to_bf16(&pseudo_random_f32(SEED_VAL + 114, batch * h * ql * d));
+    let k_bf = f32_to_bf16(&pseudo_random_f32(SEED_VAL + 115, batch * kv_h * kl * d));
+    let v_bf = f32_to_bf16(&pseudo_random_f32(SEED_VAL + 116, batch * kv_h * kl * d));
+    let do_bf = f32_to_bf16(&pseudo_random_f32(SEED_VAL + 117, batch * h * ql * d));
+
+    let (gpu_dq, gpu_dk, gpu_dv) = run_train_bwd(
+        &device, &mut registry, &q_bf, &k_bf, &v_bf, None, &do_bf,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    let q_rt = bf16_to_f32(&q_bf);
+    let k_rt = bf16_to_f32(&k_bf);
+    let v_rt = bf16_to_f32(&v_bf);
+    let do_rt = bf16_to_f32(&do_bf);
+    let (_, ref_l) = oracle_for_bf16(
+        &q_bf, &k_bf, &v_bf, None, batch, h, kv_h, ql, kl, d, scale, false,
+    );
+    let (ref_dq, ref_dk, ref_dv) = sdpa_backward_reference_f32(
+        &q_rt, &k_rt, &v_rt, &ref_l, &do_rt, None,
+        batch, h, kv_h, ql, kl, d, scale, false,
+    );
+
+    assert_close(&gpu_dq, &ref_dq, 5e-3, "bwd_d256_unaligned_q_dQ");
+    assert_close(&gpu_dk, &ref_dk, 5e-3, "bwd_d256_unaligned_q_dK");
+    assert_close(&gpu_dv, &ref_dv, 5e-3, "bwd_d256_unaligned_q_dV");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

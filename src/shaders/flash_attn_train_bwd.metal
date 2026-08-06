@@ -181,12 +181,13 @@ struct BlockLoaderT {
 // It loops over all K-tiles to accumulate dQ (register), and atomically updates
 // the f32 dK and dV scratch buffers.
 //
-// Thread layout: (32, WM, WN) = 128 threads / 4 simdgroups.
+// Thread layout: (32, WM, WN), where WM is the number of simdgroups.
 // Score tile geometry:
 //   S = Q[BQ, D] @ K[BK, D]^T → S[BQ, BK]
-//   BQ=32, BK=16.
+//   D=64: BQ=32, BK=16, WM=4.
+//   D=256: BQ=16, BK=16, WM=2.
 //   Each simdgroup: TQ=1 Q-frag (8 rows) × TK_s=2 K-frags (16 cols).
-//   Full tile [32, 16] = 4 simdgroups × 8 rows × 16 cols.
+//   The simdgroups collectively cover the complete [BQ, 16] score tile.
 //
 // dQ tile: each simdgroup writes back dQ for its 8 Q-rows (BQ/WM).
 // dK/dV: accumulated into device f32 via atomic_fetch_add_explicit.
@@ -333,7 +334,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   // Each simdgroup owns tq_base = simd_group_id * 8 Q-rows.
   // Thread sm = row within 8-row frag → absolute Q-row = q_tile_base + tq_base + sm.
   constexpr short kFrag   = 8;
-  constexpr int   kNWarps = WM * WN;  // = 4
+  constexpr int   kNWarps = WM * WN;
 
   // Number of simdgroup-matrix D-fragments per thread.
   constexpr int TQ_s = BQ / (kNWarps * kFrag);  // must be 1 for this tile geometry
@@ -347,7 +348,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   const short  sm  = (short)((qid & 4) + ((simd_lane_id / 2) % 4));  // row in frag [0..7]
   const short  sn  = (short)((qid & 2) * 2 + (simd_lane_id % 2) * 2); // col in frag [0,2,4,6]
 
-  const short tq_base    = (short)simd_group_id * kFrag;  // 0, 8, 16, 24
+  const short tq_base    = (short)simd_group_id * kFrag;
   const int   q_abs_this = q_tile_base + (int)tq_base + (int)sm;
   const bool  row_valid  = (q_abs_this < qL);
 
@@ -600,6 +601,8 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   decltype(attention_train_bwd<io_t, bq, bk, bd, wm, wn>) \
   attention_train_bwd<io_t, bq, bk, bd, wm, wn>;
 
-// BQ=32, BK=16, WM=4, WN=1 — same tile geometry as forward.
+// D=64 retains the 32-row/four-simdgroup tile. D=256 uses a
+// 16-row/two-simdgroup tile, reducing static threadgroup memory from exactly
+// 32 KiB to 24 KiB so pipeline creation succeeds on M1-class GPUs.
 instantiate_bwd("flash_attn_train_bwd_bf16_d64",  bfloat16_t, 32, 16,  64, 4, 1)
-instantiate_bwd("flash_attn_train_bwd_bf16_d256", bfloat16_t, 32, 16, 256, 4, 1)
+instantiate_bwd("flash_attn_train_bwd_bf16_d256", bfloat16_t, 16, 16, 256, 2, 1)
