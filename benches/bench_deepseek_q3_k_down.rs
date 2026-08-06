@@ -1,12 +1,12 @@
-//! Q3_K DeepSeek-V4 expert-down decode and prefill benchmark.
+//! Q2_K versus Q3_K DeepSeek-V4 expert-down decode and prefill benchmark.
 //!
 //! Logical production shape: 256 experts, K=2048 expert intermediate,
 //! N=4096 hidden output. Decode flattens six selected expert activations;
 //! prefill models 64 tokens × top-k 6 as 384 routed activation rows.
 
 use mlx_native::{
-    quantized_matmul_id_ggml_pooled, DType, GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch,
-    KernelRegistry, MlxDevice,
+    quantized_matmul_ggml, quantized_matmul_id_ggml_pooled, DType, GgmlQuantizedMatmulIdParams,
+    GgmlQuantizedMatmulParams, GgmlType, IdMmScratch, KernelRegistry, MlxDevice,
 };
 
 const EXPERTS: u32 = 256;
@@ -22,6 +22,7 @@ fn bench_down(
     expert_stride: u64,
     routed_rows: u32,
     label: &str,
+    ggml_type: GgmlType,
 ) {
     let input = device
         .alloc_buffer(
@@ -59,7 +60,7 @@ fn bench_down(
         k: K,
         n_experts: EXPERTS,
         expert_stride,
-        ggml_type: GgmlType::Q3_K,
+        ggml_type,
     };
     let mut scratch = IdMmScratch::alloc(device, EXPERTS, routed_rows).expect("scratch");
 
@@ -101,7 +102,76 @@ fn bench_down(
     }
     samples.sort_by(f64::total_cmp);
     println!(
-        "Q3_K DeepSeek-V4 down {label}: rows={routed_rows} experts={EXPERTS} N={N} K={K} median={:.2} us p10={:.2} us p90={:.2} us",
+        "{ggml_type:?} DeepSeek-V4 down {label}: rows={routed_rows} experts={EXPERTS} N={N} K={K} median={:.2} us p10={:.2} us p90={:.2} us",
+        samples[samples.len() / 2],
+        samples[samples.len() / 10],
+        samples[samples.len() * 9 / 10],
+    );
+}
+
+fn bench_shared_down(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weight: &mlx_native::MlxBuffer,
+    rows: u32,
+    ggml_type: GgmlType,
+) {
+    let input = device
+        .alloc_buffer(
+            rows as usize * K as usize * 4,
+            DType::F32,
+            vec![rows as usize, K as usize],
+        )
+        .expect("shared input");
+    let output = device
+        .alloc_buffer(
+            rows as usize * N as usize * 4,
+            DType::F32,
+            vec![rows as usize, N as usize],
+        )
+        .expect("shared output");
+    let params = GgmlQuantizedMatmulParams {
+        m: rows,
+        n: N,
+        k: K,
+        ggml_type,
+    };
+    for _ in 0..WARMUP {
+        let mut encoder = device.command_encoder().expect("shared encoder");
+        quantized_matmul_ggml(
+            &mut encoder,
+            registry,
+            device,
+            &input,
+            weight,
+            &output,
+            &params,
+        )
+        .expect("shared warmup dispatch");
+        encoder.commit_and_wait().expect("shared warmup completion");
+    }
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let mut encoder = device.command_encoder().expect("shared encoder");
+        let started = std::time::Instant::now();
+        quantized_matmul_ggml(
+            &mut encoder,
+            registry,
+            device,
+            &input,
+            weight,
+            &output,
+            &params,
+        )
+        .expect("shared measured dispatch");
+        encoder
+            .commit_and_wait()
+            .expect("shared measured completion");
+        samples.push(started.elapsed().as_secs_f64() * 1e6);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "{ggml_type:?} DeepSeek-V4 shared down: rows={rows} N={N} K={K} median={:.2} us p10={:.2} us p90={:.2} us",
         samples[samples.len() / 2],
         samples[samples.len() / 10],
         samples[samples.len() * 9 / 10],
@@ -109,42 +179,59 @@ fn bench_down(
 }
 
 fn main() {
+    let prefill_tokens = std::env::var("HF2Q_Q3_BENCH_PREFILL_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(64);
+    let prefill_rows = prefill_tokens.checked_mul(6).expect("prefill row count");
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
-    let blocks_per_row = K as u64 / GgmlType::Q3_K.block_values() as u64;
-    let expert_stride = N as u64 * blocks_per_row * GgmlType::Q3_K.block_bytes() as u64;
-    let total_weight_bytes = EXPERTS as u64 * expert_stride;
-    let mut weight = device
-        .alloc_buffer(
-            total_weight_bytes as usize,
-            DType::U8,
-            vec![EXPERTS as usize, expert_stride as usize],
-        )
-        .expect("Q3_K expert weights");
-    weight
-        .as_mut_slice::<u8>()
-        .expect("Q3_K expert weight slice")
-        .fill(0);
+    for ggml_type in [GgmlType::Q2_K, GgmlType::Q3_K] {
+        let blocks_per_row = K as u64 / ggml_type.block_values() as u64;
+        let expert_stride = N as u64 * blocks_per_row * ggml_type.block_bytes() as u64;
+        let total_weight_bytes = EXPERTS as u64 * expert_stride;
+        let mut weight = device
+            .alloc_buffer(
+                total_weight_bytes as usize,
+                DType::U8,
+                vec![EXPERTS as usize, expert_stride as usize],
+            )
+            .expect("expert weights");
+        weight
+            .as_mut_slice::<u8>()
+            .expect("expert weight slice")
+            .fill(0);
 
-    println!(
-        "Q3_K DeepSeek-V4 expert-down weights: {:.2} MiB (per expert {:.2} MiB)",
-        total_weight_bytes as f64 / 1_048_576.0,
-        expert_stride as f64 / 1_048_576.0,
-    );
-    bench_down(
-        &device,
-        &mut registry,
-        &weight,
-        expert_stride,
-        6,
-        "decode-mv_id",
-    );
-    bench_down(
-        &device,
-        &mut registry,
-        &weight,
-        expert_stride,
-        64 * 6,
-        "prefill-mm_id",
-    );
+        println!(
+            "{ggml_type:?} DeepSeek-V4 expert-down weights: {:.2} MiB (per expert {:.2} MiB)",
+            total_weight_bytes as f64 / 1_048_576.0,
+            expert_stride as f64 / 1_048_576.0,
+        );
+        bench_down(
+            &device,
+            &mut registry,
+            &weight,
+            expert_stride,
+            6,
+            "decode-mv_id",
+            ggml_type,
+        );
+        bench_down(
+            &device,
+            &mut registry,
+            &weight,
+            expert_stride,
+            prefill_rows,
+            "prefill-mm_id",
+            ggml_type,
+        );
+        let shared_weight = weight.slice_view(0, expert_stride as usize);
+        bench_shared_down(
+            &device,
+            &mut registry,
+            &shared_weight,
+            prefill_tokens,
+            ggml_type,
+        );
+    }
 }

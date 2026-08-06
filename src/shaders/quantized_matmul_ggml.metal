@@ -807,12 +807,16 @@ kernel void kernel_mul_mv_q8_0_f32_nr2(
         }
 
         for (int row = 0; row < NR0; ++row) {
-            device const int8_t * qs = ax[row][ib].qs + il * NQ;
-            float sumq = 0.f;
-            for (int iq = 0; iq < NQ; ++iq) {
-                sumq += qs[iq] * yl[iq];
+            // The final NR0=2 tile may contain only one live output row.
+            // Do not dereference the one-past-end packed row in that case.
+            if (r0 + row < p.ne01) {
+                device const int8_t * qs = ax[row][ib].qs + il * NQ;
+                float sumq = 0.f;
+                for (int iq = 0; iq < NQ; ++iq) {
+                    sumq += qs[iq] * yl[iq];
+                }
+                sumf[row] += sumq * ax[row][ib].d;
             }
-            sumf[row] += sumq * ax[row][ib].d;
         }
 
         yb += NSG * NQ * QK8_0;

@@ -234,10 +234,20 @@ fn representative_0731_decode_selects_top512_of_640() {
 }
 
 #[test]
-fn mma_path_preserves_strongly_ordered_top512() {
+fn multi_block_topk_merge_matches_cpu_beyond_1024_candidates() {
+    // 1,472 candidates forces two 1,024-entry local top-k lists and the
+    // production merge kernel before finalization.
+    run_case(1, 1, 1_472, 5_887, 128);
+}
+
+#[test]
+fn first_multi_block_boundary_matches_cpu() {
+    run_case(1, 1, 1_025, 4_099, 257);
+}
+
+fn run_mma_strongly_ordered(kv_len: usize) {
     let device = MlxDevice::new().unwrap();
     let queries = 1;
-    let kv_len = 640;
     let q = bf16_buffer(
         &device,
         &vec![bf16::from_f32(0.01); queries * H * D],
@@ -245,10 +255,12 @@ fn mma_path_preserves_strongly_ordered_top512() {
     );
     let mut kv_values = Vec::with_capacity(kv_len * D);
     for candidate in 0..kv_len {
-        kv_values.extend(std::iter::repeat_n(
-            bf16::from_f32((candidate + 1) as f32 * 0.0001),
-            D,
-        ));
+        // Keep the selection boundary exactly representable in BF16 even
+        // for multi-thousand-entry cases. A linear 1e-4 ramp eventually
+        // collapses adjacent candidates to the same BF16 value and cannot
+        // prove that the block merge retained the correct top-K set.
+        let value = if candidate >= kv_len - K { 0.1 } else { 0.001 };
+        kv_values.extend(std::iter::repeat_n(bf16::from_f32(value), D));
     }
     let kv = bf16_buffer(&device, &kv_values, vec![1, kv_len, D]);
     let weights = f32_buffer(&device, &vec![1.0; H], vec![1, queries, H]);
@@ -268,7 +280,7 @@ fn mma_path_preserves_strongly_ordered_top512() {
         batch: 1,
         query_len: queries as u32,
         kv_len: kv_len as u32,
-        start_pos: 2559,
+        start_pos: (kv_len * DEEPSEEK_INDEXER_RATIO - 1) as u32,
         ratio: DEEPSEEK_INDEXER_RATIO as u32,
         heads: H as u32,
         head_dim: D as u32,
@@ -299,10 +311,20 @@ fn mma_path_preserves_strongly_ordered_top512() {
     // exactly the highest 512 candidates.
     let mut actual = output.as_slice::<i32>().unwrap().to_vec();
     actual.sort_unstable();
-    let expected = (128..640)
+    let expected = (kv_len - K..kv_len)
         .map(|index| index as i32 + 128)
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn mma_path_preserves_strongly_ordered_top512() {
+    run_mma_strongly_ordered(640);
+}
+
+#[test]
+fn mma_path_merges_three_blocks_at_2049_candidates() {
+    run_mma_strongly_ordered(2_049);
 }
 
 #[test]

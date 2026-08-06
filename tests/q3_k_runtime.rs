@@ -250,7 +250,7 @@ fn q3_k_dense_mv_simd_mm_and_tensor_mm_match_cpu() {
 fn q3_k_moe_mv_id_and_mm_id_match_cpu() {
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
-    let (n_experts, n, k) = (3usize, 67usize, 512usize);
+    let (n_experts, n, k) = (8usize, 67usize, 512usize);
     let mut packed = Vec::new();
     let mut weights = Vec::new();
     let mut expert_bytes = 0usize;
@@ -262,23 +262,24 @@ fn q3_k_moe_mv_id_and_mm_id_match_cpu() {
     }
     let weight_buf = upload_u8(&device, &packed);
 
-    let run = |n_tokens: usize, force_mm: bool, registry: &mut KernelRegistry| {
-        let top_k = 1usize;
+    let run = |n_tokens: usize, top_k: usize, force_mm: bool, registry: &mut KernelRegistry| {
         let input = input_values(n_tokens * k, 71 + n_tokens);
         let ids: Vec<u32> = (0..n_tokens)
-            .map(|token| ((token * 2 + 1) % n_experts) as u32)
+            .flat_map(|token| {
+                (0..top_k).map(move |slot| ((token * 2 + slot + 1) % n_experts) as u32)
+            })
             .collect();
-        let mut expected = vec![0.0f32; n_tokens * n];
-        for token in 0..n_tokens {
-            let expert = ids[token] as usize;
+        let mut expected = vec![0.0f32; n_tokens * top_k * n];
+        for (route, &expert) in ids.iter().enumerate() {
+            let token = route / top_k;
             let got = cpu_matmul(
                 &input[token * k..(token + 1) * k],
-                &weights[expert * n * k..(expert + 1) * n * k],
+                &weights[expert as usize * n * k..(expert as usize + 1) * n * k],
                 1,
                 n,
                 k,
             );
-            expected[token * n..(token + 1) * n].copy_from_slice(&got);
+            expected[route * n..(route + 1) * n].copy_from_slice(&got);
         }
 
         let input_buf = upload_f32(&device, &input, vec![n_tokens, k]);
@@ -286,7 +287,11 @@ fn q3_k_moe_mv_id_and_mm_id_match_cpu() {
             .alloc_buffer(ids.len() * 4, DType::U32, vec![ids.len()])
             .unwrap();
         ids_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
-        let output = upload_f32(&device, &vec![0.0; n_tokens * n], vec![n_tokens, n]);
+        let output = upload_f32(
+            &device,
+            &vec![0.0; n_tokens * top_k * n],
+            vec![n_tokens, top_k, n],
+        );
 
         if force_mm {
             let params = GgmlIdMmDispatchParams {
@@ -359,6 +364,8 @@ fn q3_k_moe_mv_id_and_mm_id_match_cpu() {
         }
     };
 
-    run(4, false, &mut registry);
-    run(16, true, &mut registry);
+    run(4, 1, false, &mut registry);
+    run(4, 6, false, &mut registry);
+    run(16, 1, true, &mut registry);
+    run(16, 6, true, &mut registry);
 }

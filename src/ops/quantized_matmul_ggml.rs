@@ -914,11 +914,12 @@ fn dispatch_mv(
     // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
         && cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2");
-    // ADR-028 —Q8_0 NSG=4 NR=2 (peer-style port).  Default-OFF
-    // until parity + bench validation; opt-in via `HF2Q_Q8_0_MV_NR2=1`.
-    // ADR-029: cached via AtomicI8.
+    // Q8_0 NSG=4 NR=2 is the peer-style llama.cpp geometry. Exact-output
+    // parity and DeepSeek-V4 end-to-end decode validation make it the
+    // production default; operators can retain the legacy kernel with
+    // `HF2Q_Q8_0_MV_NR2=0` / `=false` / `=off` for diagnostics.
     let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
-        && cached_env_eq_one(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2");
+        && cached_env_default_true(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2");
     let kernel_name = if use_q6k_nr2 {
         "kernel_mul_mv_q6_K_f32_nr2"
     } else if use_q8_0_nr2 {
@@ -993,7 +994,7 @@ fn dispatch_mv(
     if use_q8_0_nr2 {
         // Cross-SG reduction needs threadgroup memory: NR0 * NW * sizeof(float).
         let smem_bytes: u64 = 2 * 32 * std::mem::size_of::<f32>() as u64;
-        encoder.encode_threadgroups_with_args_and_shared(
+        encoder.dispatch_tracked_threadgroups_with_args_and_shared(
             &pipeline,
             &[
                 (0, KernelArg::Buffer(weight)),
@@ -1002,6 +1003,8 @@ fn dispatch_mv(
                 (3, KernelArg::Bytes(as_bytes(&gpu_params))),
             ],
             &[(0, smem_bytes)],
+            &[weight, input],
+            &[output],
             threadgroups,
             threads_per_tg,
         );

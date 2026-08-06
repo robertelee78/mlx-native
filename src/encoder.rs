@@ -19,6 +19,7 @@
 //! records a barrier sentinel.  Call `take_capture()` to extract the recorded
 //! graph for later replay via `ComputeGraph::encode_sequential()`.
 
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use metal::{
@@ -27,6 +28,7 @@ use metal::{
     MTLCommandBufferStatus, MTLCounterSamplingPoint, MTLDispatchType, MTLSize, MTLStorageMode,
     NSRange,
 };
+use objc::runtime::Object;
 #[allow(unused_imports)]
 use objc::{msg_send, sel, sel_impl};
 
@@ -826,6 +828,24 @@ pub struct CommandEncoder {
 /// worker threads via `dispatch_apply`, and is used for the dual-buffer
 /// pipeline where buf1 is encoded on a worker thread while buf0 executes.
 unsafe impl Send for CommandEncoder {}
+
+fn command_buffer_error_message(command_buffer: &metal::CommandBufferRef) -> String {
+    unsafe {
+        let error: *mut Object = msg_send![command_buffer, error];
+        if error.is_null() {
+            return "GPU command buffer completed with error status (no NSError)".into();
+        }
+        let description: *mut Object = msg_send![error, localizedDescription];
+        if description.is_null() {
+            return "GPU command buffer completed with error status (no description)".into();
+        }
+        let text: *const std::os::raw::c_char = msg_send![description, UTF8String];
+        if text.is_null() {
+            return "GPU command buffer completed with error status (invalid description)".into();
+        }
+        CStr::from_ptr(text).to_string_lossy().into_owned()
+    }
+}
 
 impl CommandEncoder {
     /// Create a new command encoder from the given command queue.
@@ -2297,7 +2317,7 @@ impl CommandEncoder {
         match self.cmd_buf.status() {
             MTLCommandBufferStatus::Completed => Ok(()),
             MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
-                "GPU command buffer completed with error status".into(),
+                command_buffer_error_message(&self.cmd_buf),
             )),
             status => Err(MlxError::CommandBufferError(format!(
                 "Unexpected command buffer status after wait: {:?}",
@@ -2501,7 +2521,7 @@ impl CommandEncoder {
         match self.cmd_buf.status() {
             MTLCommandBufferStatus::Completed => Ok(()),
             MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
-                "GPU command buffer completed with error status".into(),
+                command_buffer_error_message(&self.cmd_buf),
             )),
             status => Err(MlxError::CommandBufferError(format!(
                 "Unexpected command buffer status after wait: {:?}",
