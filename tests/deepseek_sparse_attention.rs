@@ -4,9 +4,9 @@
 
 use half::bf16;
 use mlx_native::ops::deepseek_sparse_attention::{
-    dispatch_deepseek_sparse_attention, dispatch_deepseek_sparse_attention_flash_decode, register,
-    DeepSeekSparseAttentionParams, DEEPSEEK_INDEX_TOP_K, DEEPSEEK_SPARSE_HEADS,
-    DEEPSEEK_SPARSE_HEAD_DIM,
+    dispatch_deepseek_sparse_attention, dispatch_deepseek_sparse_attention_flash_decode,
+    dispatch_deepseek_sparse_attention_flash_prefill, register, DeepSeekSparseAttentionParams,
+    DEEPSEEK_INDEX_TOP_K, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -168,6 +168,62 @@ fn run_case(batch: usize, queries: usize, kv_len: usize, indices: Vec<i32>) {
         );
     }
 
+    if top_k >= 384 {
+        let flash_batches = batch * queries;
+        let gathered = device
+            .alloc_buffer(
+                flash_batches * top_k * D * 2,
+                DType::BF16,
+                vec![batch, queries, top_k, D],
+            )
+            .unwrap();
+        let mask = device
+            .alloc_buffer(
+                flash_batches * top_k * 2,
+                DType::BF16,
+                vec![flash_batches, 1, top_k],
+            )
+            .unwrap();
+        let mut invalid_global = device
+            .alloc_buffer(batch * queries * 4, DType::U32, vec![batch, queries])
+            .unwrap();
+        invalid_global.as_mut_slice::<u32>().unwrap().fill(0);
+        let mut invalid_heads = device
+            .alloc_buffer(batch * queries * H * 4, DType::U32, vec![batch, queries, H])
+            .unwrap();
+        invalid_heads.as_mut_slice::<u32>().unwrap().fill(0);
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_deepseek_sparse_attention_flash_prefill(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q,
+            &kv,
+            &sinks,
+            &indices,
+            &gathered,
+            &mask,
+            &invalid_global,
+            &invalid_heads,
+            &output,
+            &params,
+        )
+        .expect("sparse flash prefill dispatch");
+        encoder
+            .commit_and_wait()
+            .expect("sparse flash prefill completion");
+        let flash_prefill = unsafe {
+            std::slice::from_raw_parts(output.contents_ptr() as *const bf16, expected.len())
+        };
+        for (i, (got, want)) in flash_prefill.iter().zip(expected.iter()).enumerate() {
+            let delta = (got.to_f32() - want.to_f32()).abs();
+            assert!(
+                delta <= 0.0025,
+                "sparse flash prefill output[{i}] delta={delta}: {got:?} != {want:?}"
+            );
+        }
+    }
+
     if queries == 1 && top_k >= 384 {
         let gathered = device
             .alloc_buffer(top_k * D * 2, DType::BF16, vec![1, 1, top_k, D])
@@ -226,6 +282,24 @@ fn representative_0731_decode_uses_64_by_512_and_topk_512() {
         .map(|i| ((i * 193 + 17) % 640) as i32)
         .collect();
     run_case(1, 1, 640, indices);
+}
+
+#[test]
+fn representative_multi_query_prefill_uses_query_specific_selected_masks() {
+    let queries = 3;
+    let top_k = 384;
+    let kv_len = 448;
+    let mut indices = Vec::with_capacity(queries * top_k);
+    for query in 0..queries {
+        for slot in 0..top_k {
+            indices.push(if slot == query * 17 {
+                -1
+            } else {
+                ((slot * 193 + query * 29 + 17) % kv_len) as i32
+            });
+        }
+    }
+    run_case(1, queries, kv_len, indices);
 }
 
 #[test]

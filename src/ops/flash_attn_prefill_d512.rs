@@ -506,11 +506,17 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     }
     // A rank-2 mask `[qL, kL]` is the Wave 2D broadcast layout: one plane is
     // shared across all batches and heads (stride-0 in batch and head dims).
+    // A rank-3 mask `[B, qL, kL]` is batch-specific and head-broadcast. This
+    // is used by DeepSeek sparse prefill, where every query row is presented
+    // to flash attention as a separate batch with its own selected-KV mask.
     // A rank-4 mask `[B, H, qL, kL]` is the per-head layout (back-compat).
     let mask_is_rank2_broadcast = mask.is_some_and(|m| m.shape().len() == 2);
+    let mask_is_rank3_batch_broadcast = mask.is_some_and(|m| m.shape().len() == 3);
     if let Some(m) = mask {
         if mask_is_rank2_broadcast {
             validate_buffer_size(m, "mask", ql * kl)?;
+        } else if mask_is_rank3_batch_broadcast {
+            validate_buffer_size(m, "mask", batch * ql * kl)?;
         } else {
             validate_buffer_size(m, "mask", batch * h * ql * kl)?;
         }
@@ -669,9 +675,12 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
         //   rank-2 `[qL, kL]` — broadcast across batch + heads: set batch_stride
         //   and head_stride to 0 so the shader re-reads the same plane for every
         //   (batch, head) pair.  The Metal shader already handles stride-0 correctly.
+        //   rank-3 `[B, qL, kL]` — distinct plane per batch, broadcast heads.
         //   rank-4 `[B, H, qL, kL]` — per-head layout (back-compat path).
         let (m_batch_stride, m_head_stride, m_ql_stride) = if mask_is_rank2_broadcast {
             (0_i64, 0_i64, kl as i64)
+        } else if mask_is_rank3_batch_broadcast {
+            ((ql * kl) as i64, 0_i64, kl as i64)
         } else {
             ((h * ql * kl) as i64, (ql * kl) as i64, kl as i64)
         };

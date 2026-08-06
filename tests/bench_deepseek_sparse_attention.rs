@@ -5,7 +5,8 @@
 
 use mlx_native::ops::deepseek_sparse_attention::{
     dispatch_deepseek_sparse_attention, dispatch_deepseek_sparse_attention_flash_decode,
-    DeepSeekSparseAttentionParams, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM,
+    dispatch_deepseek_sparse_attention_flash_prefill, DeepSeekSparseAttentionParams,
+    DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM,
 };
 use mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams;
 use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_bf16_d512_with_sinks;
@@ -227,5 +228,109 @@ fn benchmark_decode_and_prefill() {
                 gathered_flash_start.elapsed().as_secs_f64() * 1000.0 / RUNS as f64
             );
         }
+    }
+
+    const TILE_RUNS: usize = 10;
+    for queries in [64usize, 128, 256, 512, 1024] {
+        let top_k = 640usize;
+        let kv_len = 8192usize;
+        let q = device
+            .alloc_buffer(
+                queries * DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM * 2,
+                DType::BF16,
+                vec![1, queries, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM],
+            )
+            .unwrap();
+        let kv = device
+            .alloc_buffer(
+                kv_len * DEEPSEEK_SPARSE_HEAD_DIM * 2,
+                DType::BF16,
+                vec![1, kv_len, DEEPSEEK_SPARSE_HEAD_DIM],
+            )
+            .unwrap();
+        let sinks = device
+            .alloc_buffer(
+                DEEPSEEK_SPARSE_HEADS * 4,
+                DType::F32,
+                vec![DEEPSEEK_SPARSE_HEADS],
+            )
+            .unwrap();
+        let mut indices = device
+            .alloc_buffer(queries * top_k * 4, DType::I32, vec![1, queries, top_k])
+            .unwrap();
+        for (i, value) in indices
+            .as_mut_slice::<i32>()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            *value = (i % kv_len) as i32;
+        }
+        let gathered = device
+            .alloc_buffer(
+                queries * top_k * DEEPSEEK_SPARSE_HEAD_DIM * 2,
+                DType::BF16,
+                vec![1, queries, top_k, DEEPSEEK_SPARSE_HEAD_DIM],
+            )
+            .unwrap();
+        let mask = device
+            .alloc_buffer(queries * top_k * 2, DType::BF16, vec![queries, 1, top_k])
+            .unwrap();
+        let mut invalid_global = device
+            .alloc_buffer(queries * 4, DType::U32, vec![1, queries])
+            .unwrap();
+        invalid_global.as_mut_slice::<u32>().unwrap().fill(0);
+        let mut invalid_heads = device
+            .alloc_buffer(
+                queries * DEEPSEEK_SPARSE_HEADS * 4,
+                DType::U32,
+                vec![1, queries, DEEPSEEK_SPARSE_HEADS],
+            )
+            .unwrap();
+        invalid_heads.as_mut_slice::<u32>().unwrap().fill(0);
+        let output = device
+            .alloc_buffer(
+                queries * DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM * 2,
+                DType::BF16,
+                vec![1, queries, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM],
+            )
+            .unwrap();
+        let params = DeepSeekSparseAttentionParams {
+            batch: 1,
+            query_len: queries as u32,
+            kv_len: kv_len as u32,
+            top_k: top_k as u32,
+            heads: DEEPSEEK_SPARSE_HEADS as u32,
+            head_dim: DEEPSEEK_SPARSE_HEAD_DIM as u32,
+            scale: 1.0 / (DEEPSEEK_SPARSE_HEAD_DIM as f32).sqrt(),
+        };
+        let mut registry = KernelRegistry::new();
+        let start = Instant::now();
+        for _ in 0..TILE_RUNS {
+            let mut encoder = device.command_encoder().unwrap();
+            dispatch_deepseek_sparse_attention_flash_prefill(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &q,
+                &kv,
+                &sinks,
+                &indices,
+                &gathered,
+                &mask,
+                &invalid_global,
+                &invalid_heads,
+                &output,
+                &params,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "sparse_flash queries={queries} top_k={top_k} avg_ms={:.3} us_per_query={:.3}",
+            elapsed.as_secs_f64() * 1000.0 / TILE_RUNS as f64,
+            elapsed.as_secs_f64() * 1_000_000.0 / (TILE_RUNS * queries) as f64,
+        );
     }
 }

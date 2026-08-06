@@ -266,15 +266,18 @@ pub fn dispatch_deepseek_sparse_attention_with_scratch(
 }
 
 /// Gather selected shared-KV rows and run the llama.cpp-derived D=512 Flash
-/// Attention kernel for one-token decode. The selection is shared by all 64
-/// query heads, so gathering once lets the tiled kernel reuse each KV row
-/// across heads instead of issuing 64 independent random-read reductions.
+/// Attention kernel with each sparse query presented as an independent flash
+/// batch. The selection is shared by all 64 query heads, so gathering once
+/// lets the tiled kernel reuse each selected KV row across heads.
 ///
-/// `invalid_global` (`[1]`) and `invalid_heads` (`[64]`) must be U32 buffers
-/// zeroed by the caller before encoding. Invalid indices or non-finite KV
-/// values zero every output head; a non-finite query/sink zeros its head.
+/// This is the scalable sparse-prefill path: work after selection is
+/// `O(query_len * top_k)` rather than scanning the full compressed history.
+/// `invalid_global` (`[B,Q]`) and `invalid_heads` (`[B,Q,64]`) must be U32
+/// buffers zeroed by the caller before encoding. Invalid indices or non-finite
+/// KV values zero every output head for that query; a non-finite query/sink
+/// zeros only the affected head.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_deepseek_sparse_attention_flash_decode(
+pub fn dispatch_deepseek_sparse_attention_flash_prefill(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -290,45 +293,58 @@ pub fn dispatch_deepseek_sparse_attention_flash_decode(
     params: &DeepSeekSparseAttentionParams,
 ) -> Result<()> {
     let (batch, queries, kv_len) = validate_params(params)?;
-    if batch != 1 || queries != 1 {
-        return Err(MlxError::InvalidArgument(format!(
-            "deepseek_sparse_attention_flash_decode: requires batch=1 and query_len=1, got {batch}, {queries}"
-        )));
-    }
     let top_k = params.top_k as usize;
     validate_buffer(
         q,
         "q",
         DType::BF16,
-        &[1, 1, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM],
+        &[
+            batch,
+            queries,
+            DEEPSEEK_SPARSE_HEADS,
+            DEEPSEEK_SPARSE_HEAD_DIM,
+        ],
     )?;
     validate_buffer(
         kv,
         "kv",
         DType::BF16,
-        &[1, kv_len, DEEPSEEK_SPARSE_HEAD_DIM],
+        &[batch, kv_len, DEEPSEEK_SPARSE_HEAD_DIM],
     )?;
     validate_buffer(sinks, "sinks", DType::F32, &[DEEPSEEK_SPARSE_HEADS])?;
-    validate_buffer(indices, "indices", DType::I32, &[1, 1, top_k])?;
+    validate_buffer(indices, "indices", DType::I32, &[batch, queries, top_k])?;
     validate_buffer(
         gathered_kv,
         "gathered_kv",
         DType::BF16,
-        &[1, 1, top_k, DEEPSEEK_SPARSE_HEAD_DIM],
+        &[batch, queries, top_k, DEEPSEEK_SPARSE_HEAD_DIM],
     )?;
-    validate_buffer(mask, "mask", DType::BF16, &[1, top_k])?;
-    validate_buffer(invalid_global, "invalid_global", DType::U32, &[1])?;
+    let flash_batches = batch.checked_mul(queries).ok_or_else(|| {
+        MlxError::InvalidArgument("deepseek sparse flash batch count overflows usize".into())
+    })?;
+    validate_buffer(mask, "mask", DType::BF16, &[flash_batches, 1, top_k])?;
+    validate_buffer(
+        invalid_global,
+        "invalid_global",
+        DType::U32,
+        &[batch, queries],
+    )?;
     validate_buffer(
         invalid_heads,
         "invalid_heads",
         DType::U32,
-        &[DEEPSEEK_SPARSE_HEADS],
+        &[batch, queries, DEEPSEEK_SPARSE_HEADS],
     )?;
     validate_buffer(
         output,
         "output",
         DType::BF16,
-        &[1, 1, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM],
+        &[
+            batch,
+            queries,
+            DEEPSEEK_SPARSE_HEADS,
+            DEEPSEEK_SPARSE_HEAD_DIM,
+        ],
     )?;
 
     let validate_pipeline = registry.get_pipeline(
@@ -344,7 +360,7 @@ pub fn dispatch_deepseek_sparse_attention_flash_decode(
             (2, KernelArg::Buffer(sinks)),
             (3, KernelArg::Buffer(invalid_heads)),
         ],
-        MTLSize::new(DEEPSEEK_SPARSE_HEADS as u64, 1, 1),
+        MTLSize::new((flash_batches * DEEPSEEK_SPARSE_HEADS) as u64, 1, 1),
         MTLSize::new(THREADS, 1, 1),
     );
 
@@ -352,7 +368,7 @@ pub fn dispatch_deepseek_sparse_attention_flash_decode(
         DEEPSEEK_SPARSE_ATTENTION_GATHER_KERNEL,
         device.metal_device(),
     )?;
-    let gather_elements = top_k * DEEPSEEK_SPARSE_HEAD_DIM;
+    let gather_elements = flash_batches * top_k * DEEPSEEK_SPARSE_HEAD_DIM;
     encoder.set_op_kind(CapturedOpKind::Sdpa);
     encoder.encode_threadgroups_with_args(
         gather_pipeline,
@@ -385,7 +401,9 @@ pub fn dispatch_deepseek_sparse_attention_flash_decode(
             head_dim: DEEPSEEK_SPARSE_HEAD_DIM as u32,
             seq_len_q: 1,
             seq_len_k: params.top_k,
-            batch: 1,
+            batch: u32::try_from(flash_batches).map_err(|_| {
+                MlxError::InvalidArgument("deepseek sparse flash batch count exceeds u32".into())
+            })?,
             scale: params.scale,
             do_causal: false,
         },
@@ -396,17 +414,64 @@ pub fn dispatch_deepseek_sparse_attention_flash_decode(
         DEEPSEEK_SPARSE_ATTENTION_SANITIZE_KERNEL,
         device.metal_device(),
     )?;
-    let output_elements = DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM;
+    let output_elements = flash_batches * DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM;
     encoder.set_op_kind(CapturedOpKind::Sdpa);
     encoder.encode_threadgroups_with_args(
         sanitize_pipeline,
         &[
-            (0, KernelArg::Buffer(invalid_global)),
-            (1, KernelArg::Buffer(invalid_heads)),
-            (2, KernelArg::Buffer(output)),
+            (0, KernelArg::Bytes(as_bytes(params))),
+            (1, KernelArg::Buffer(invalid_global)),
+            (2, KernelArg::Buffer(invalid_heads)),
+            (3, KernelArg::Buffer(output)),
         ],
         MTLSize::new(output_elements.div_ceil(THREADS as usize) as u64, 1, 1),
         MTLSize::new(THREADS, 1, 1),
     );
+    encoder.memory_barrier();
     Ok(())
+}
+
+/// One-token compatibility wrapper over the scalable sparse-flash path.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_deepseek_sparse_attention_flash_decode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    kv: &MlxBuffer,
+    sinks: &MlxBuffer,
+    indices: &MlxBuffer,
+    gathered_kv: &MlxBuffer,
+    mask: &MlxBuffer,
+    invalid_global: &MlxBuffer,
+    invalid_heads: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &DeepSeekSparseAttentionParams,
+) -> Result<()> {
+    if params.batch != 1 || params.query_len != 1 {
+        return Err(MlxError::InvalidArgument(format!(
+            "deepseek_sparse_attention_flash_decode: requires batch=1 and query_len=1, got {}, {}",
+            params.batch, params.query_len,
+        )));
+    }
+    let top_k = params.top_k as usize;
+    let gathered = gathered_kv.with_shape(vec![1, 1, top_k, DEEPSEEK_SPARSE_HEAD_DIM])?;
+    let flash_mask = mask.with_shape(vec![1, 1, top_k])?;
+    let global = invalid_global.with_shape(vec![1, 1])?;
+    let heads = invalid_heads.with_shape(vec![1, 1, DEEPSEEK_SPARSE_HEADS])?;
+    dispatch_deepseek_sparse_attention_flash_prefill(
+        encoder,
+        registry,
+        device,
+        q,
+        kv,
+        sinks,
+        indices,
+        &gathered,
+        &flash_mask,
+        &global,
+        &heads,
+        output,
+        params,
+    )
 }

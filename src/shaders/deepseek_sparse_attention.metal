@@ -31,15 +31,16 @@ kernel void deepseek_sparse_attention_validate_q_bf16(
         device const bfloat *q                    [[buffer(1)]],
         device const float *sinks                 [[buffer(2)]],
         device atomic_uint *invalid_heads         [[buffer(3)]],
-        uint head                                 [[threadgroup_position_in_grid]],
+        uint head_group                           [[threadgroup_position_in_grid]],
         uint tid                                  [[thread_index_in_threadgroup]]) {
-    const ulong qbase = ulong(head) * DS_DIM;
+    const uint head = head_group % DS_HEADS;
+    const ulong qbase = ulong(head_group) * DS_DIM;
     uint invalid = tid == 0 && !isfinite(sinks[head]) ? 1u : 0u;
     for (uint feature = tid; feature < DS_DIM; feature += DS_THREADS) {
         invalid += !isfinite(float(q[qbase + feature])) ? 1u : 0u;
     }
     if (invalid != 0) {
-        atomic_store_explicit(&invalid_heads[head], 1u, memory_order_relaxed);
+        atomic_store_explicit(&invalid_heads[head_group], 1u, memory_order_relaxed);
     }
 }
 
@@ -51,38 +52,47 @@ kernel void deepseek_sparse_attention_gather_bf16(
         device bfloat *mask                        [[buffer(4)]],
         device atomic_uint *invalid_global         [[buffer(5)]],
         uint gid                                   [[thread_position_in_grid]]) {
-    const uint elements = p.top_k * DS_DIM;
+    const uint query_rows = p.batch * p.query_len;
+    const uint row_elements = p.top_k * DS_DIM;
+    const uint elements = query_rows * row_elements;
     if (gid >= elements) return;
-    const uint slot = gid / DS_DIM;
+    const uint row = gid / row_elements;
+    const uint within_row = gid % row_elements;
+    const uint batch = row / p.query_len;
+    const uint slot = within_row / DS_DIM;
     const uint feature = gid % DS_DIM;
-    const int selected = indices[slot];
+    const ulong index_offset = ulong(row) * p.top_k + slot;
+    const int selected = indices[index_offset];
     const bool sentinel = selected == -1;
     const bool index_bad = selected < -1 || selected >= int(p.kv_len);
     float value = 0.0f;
     if (!sentinel && !index_bad) {
-        value = float(kv[ulong(uint(selected)) * DS_DIM + feature]);
+        value = float(kv[(ulong(batch) * p.kv_len + uint(selected)) * DS_DIM + feature]);
     }
     const bool value_bad = !isfinite(value);
     gathered[gid] = bfloat(!index_bad && !value_bad ? value : 0.0f);
     if (feature == 0) {
-        mask[slot] = bfloat(sentinel ? -INFINITY : 0.0f);
+        mask[index_offset] = bfloat(sentinel ? -INFINITY : 0.0f);
     }
     if (index_bad || value_bad) {
-        atomic_store_explicit(invalid_global, 1u, memory_order_relaxed);
+        atomic_store_explicit(&invalid_global[row], 1u, memory_order_relaxed);
     }
 }
 
 kernel void deepseek_sparse_attention_sanitize_bf16(
-        device const atomic_uint *invalid_global [[buffer(0)]],
-        device const atomic_uint *invalid_heads  [[buffer(1)]],
-        device bfloat *output                     [[buffer(2)]],
+        constant DeepSeekSparseAttentionParams &p [[buffer(0)]],
+        device const atomic_uint *invalid_global  [[buffer(1)]],
+        device const atomic_uint *invalid_heads   [[buffer(2)]],
+        device bfloat *output                      [[buffer(3)]],
         uint gid                                  [[thread_position_in_grid]]) {
-    const uint elements = DS_HEADS * DS_DIM;
+    const uint head_groups = p.batch * p.query_len * DS_HEADS;
+    const uint elements = head_groups * DS_DIM;
     if (gid >= elements) return;
-    const uint head = gid / DS_DIM;
+    const uint head_group = gid / DS_DIM;
+    const uint row = head_group / DS_HEADS;
     const float value = float(output[gid]);
-    const bool invalid = atomic_load_explicit(invalid_global, memory_order_relaxed) != 0u
-        || atomic_load_explicit(&invalid_heads[head], memory_order_relaxed) != 0u
+    const bool invalid = atomic_load_explicit(&invalid_global[row], memory_order_relaxed) != 0u
+        || atomic_load_explicit(&invalid_heads[head_group], memory_order_relaxed) != 0u
         || !isfinite(value);
     if (invalid) output[gid] = bfloat(0.0f);
 }
