@@ -1,10 +1,9 @@
 //! Integration test for `GgufFile::load_tensor_into_pool`.
 //!
-//! Verifies the W-5b.7 residency-only registration path: a tensor loaded
-//! through the pool API ends up registered with the device residency set,
-//! the buffer is not bucket-rounded, and it remains valid after the pool
-//! is dropped (since the pool only borrows residency membership, not
-//! ownership of the underlying Metal buffer).
+//! Verifies the W-5b.7 direct-allocation path: a tensor loaded through the
+//! pool API is not bucket-rounded and remains valid after the pool is dropped.
+//! When the host grants Metal residency-set support, it also verifies that the
+//! allocation is registered with the device residency set.
 
 use std::io::Write;
 use std::sync::Mutex;
@@ -56,26 +55,28 @@ fn write_minimal_f32_gguf(path: &std::path::Path, name: &str, data: &[f32]) {
     f.flush().expect("flush");
 }
 
-fn active_residency_device() -> Option<MlxDevice> {
+fn metal_device() -> Option<MlxDevice> {
     reset_residency_env_cache_for_test();
     reset_residency_test_counters();
     std::env::remove_var("HF2Q_NO_RESIDENCY");
 
+    match MlxDevice::new() {
+        Ok(device) => Some(device),
+        Err(MlxError::DeviceNotFound) => None,
+        Err(err) => panic!("MlxDevice::new failed: {err}"),
+    }
+}
+
+fn active_residency_device() -> Option<MlxDevice> {
     if !macos_15_or_newer_for_test() {
         return None;
     }
 
-    match MlxDevice::new() {
-        Ok(device) => {
-            assert!(
-                device.residency_sets_enabled(),
-                "macOS 15+ device boot should enable residency sets",
-            );
-            Some(device)
-        }
-        Err(MlxError::DeviceNotFound) => None,
-        Err(err) => panic!("MlxDevice::new failed: {err}"),
-    }
+    // Virtualized Apple-Silicon runners can expose macOS 15 and a Metal
+    // device while rejecting MTLResidencySet creation. Residency is an
+    // optimization, so keep the exact-allocation test active on those hosts
+    // and gate only the residency-specific assertion on the actual capability.
+    metal_device().and_then(|device| device.residency_sets_enabled().then_some(device))
 }
 
 #[test]
@@ -89,10 +90,7 @@ fn load_tensor_into_pool_registers_with_residency_set() {
     // when combined with non-power-of-two element counts elsewhere; here
     // it happens to be 2^10 but the registration path doesn't care.
     let payload: Vec<f32> = (0..256).map(|i| i as f32 * 0.5).collect();
-    let tmp = std::env::temp_dir().join(format!(
-        "mlx_load_into_pool_{}.gguf",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("mlx_load_into_pool_{}.gguf", std::process::id()));
     write_minimal_f32_gguf(&tmp, "weight.test", &payload);
 
     let gguf = GgufFile::open(&tmp).expect("open mini gguf");
@@ -141,7 +139,7 @@ fn load_tensor_into_pool_does_not_bucket_round_irregular_size() {
     // Specifically exercise a size that would balloon under power-of-two
     // bucketing — the whole point of register_existing.
     let _guard = TEST_LOCK.lock().expect("test lock");
-    let Some(device) = active_residency_device() else {
+    let Some(device) = metal_device() else {
         return;
     };
 
