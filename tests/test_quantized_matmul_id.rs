@@ -92,7 +92,6 @@ fn dequant_matmul_ref(
     n: usize,
     k: usize,
     group_size: usize,
-    contract_dequant: bool,
 ) -> Vec<f32> {
     let num_groups_per_row = (k + group_size - 1) / group_size;
     let packs_per_row = (k + 7) / 8;
@@ -120,13 +119,9 @@ fn dequant_matmul_ref(
 
             // Dequantize using bf16 arithmetic to match the GPU kernel.
             let w_bf16 = f32_to_bf16(qval as f32);
-            let scale_bf16 = f32_to_bf16(scale);
-            let bias_bf16 = f32_to_bf16(bias);
-            let w_dequant = if contract_dequant {
-                bf16_to_f32(bf16_mul_add_contracted(w_bf16, scale_bf16, bias_bf16))
-            } else {
-                bf16_to_f32(bf16_mul_add_uncontracted(w_bf16, scale_bf16, bias_bf16))
-            };
+            let w_dequant = bf16_to_f32(
+                bf16_mul_add(w_bf16, f32_to_bf16(scale), f32_to_bf16(bias)),
+            );
 
             let x_bf16 = bf16_to_f32(f32_to_bf16(input_row[ki]));
             acc += (w_dequant as f64) * (x_bf16 as f64);
@@ -148,19 +143,11 @@ fn bf16_to_f32(v: u16) -> f32 {
     f32::from_bits((v as u32) << 16)
 }
 
-fn bf16_mul_add_uncontracted(a: u16, b: u16, c: u16) -> u16 {
+fn bf16_mul_add(a: u16, b: u16, c: u16) -> u16 {
     let fa = bf16_to_f32(a);
     let fb = bf16_to_f32(b);
     let fc = bf16_to_f32(c);
-    let rounded_product = bf16_to_f32(f32_to_bf16(fa * fb));
-    f32_to_bf16(rounded_product + fc)
-}
-
-fn bf16_mul_add_contracted(a: u16, b: u16, c: u16) -> u16 {
-    let fa = bf16_to_f32(a);
-    let fb = bf16_to_f32(b);
-    let fc = bf16_to_f32(c);
-    f32_to_bf16(fa.mul_add(fb, fc))
+    f32_to_bf16(fa * fb + fc)
 }
 
 /// Deterministic pseudo-random f32 values.
@@ -220,35 +207,25 @@ fn test_quantized_matmul_id_4bit_4tokens_8experts_top2() {
     // token 3 -> experts [4, 6]
     let ids_data: Vec<u32> = vec![0, 3, 1, 5, 2, 7, 4, 6];
 
-    // --- CPU references ---
-    // Metal permits contraction of the bf16 `q * scale + bias` expression.
-    // Apple GPU generations can therefore choose either the contracted or
-    // uncontracted rounding boundary. Keep both exact arithmetic oracles
-    // instead of weakening the tolerance enough to hide routing/layout bugs.
-    let routed_reference = |contract_dequant: bool| {
-        let mut reference = vec![0.0f32; n_tokens * n_expert_used * n];
-        for t in 0..n_tokens {
-            for s in 0..n_expert_used {
-                let expert_id = ids_data[t * n_expert_used + s] as usize;
-                let input_row = &input_data[t * k..(t + 1) * k];
-                let expert_out = dequant_matmul_ref(
-                    input_row,
-                    &expert_wb[expert_id],
-                    &expert_sc[expert_id],
-                    &expert_bi[expert_id],
-                    n,
-                    k,
-                    group_size,
-                    contract_dequant,
-                );
-                let base = (t * n_expert_used + s) * n;
-                reference[base..base + n].copy_from_slice(&expert_out);
-            }
+    // --- CPU reference ---
+    let mut ref_output = vec![0.0f32; n_tokens * n_expert_used * n];
+    for t in 0..n_tokens {
+        for s in 0..n_expert_used {
+            let expert_id = ids_data[t * n_expert_used + s] as usize;
+            let input_row = &input_data[t * k..(t + 1) * k];
+            let expert_out = dequant_matmul_ref(
+                input_row,
+                &expert_wb[expert_id],
+                &expert_sc[expert_id],
+                &expert_bi[expert_id],
+                n,
+                k,
+                group_size,
+            );
+            let base = (t * n_expert_used + s) * n;
+            ref_output[base..base + n].copy_from_slice(&expert_out);
         }
-        reference
-    };
-    let uncontracted_ref = routed_reference(false);
-    let contracted_ref = routed_reference(true);
+    }
 
     // --- GPU dispatch ---
     let mut input_buf = device
@@ -315,59 +292,26 @@ fn test_quantized_matmul_id_4bit_4tokens_8experts_top2() {
     encoder.commit_and_wait().expect("commit");
 
     let output: &[f32] = output_buf.as_slice().expect("read");
-    assert_eq!(output.len(), uncontracted_ref.len());
-    assert_eq!(output.len(), contracted_ref.len());
+    assert_eq!(output.len(), ref_output.len());
 
-    let max_delta = |reference: &[f32]| {
-        output
-            .iter()
-            .zip(reference)
-            .enumerate()
-            .map(|(index, (&gpu, &cpu))| (index, (gpu - cpu).abs()))
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .expect("non-empty output")
-    };
-    let (uncontracted_idx, uncontracted_delta) = max_delta(&uncontracted_ref);
-    let (contracted_idx, contracted_delta) = max_delta(&contracted_ref);
-    let oracle_spread = uncontracted_ref
-        .iter()
-        .zip(&contracted_ref)
-        .map(|(&uncontracted, &contracted)| (uncontracted - contracted).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        oracle_spread > 1e-3,
-        "fixture must distinguish contracted from uncontracted bf16 arithmetic",
-    );
-    let (oracle, max_idx, max_diff, reference) = if contracted_delta < uncontracted_delta {
-        (
-            "contracted",
-            contracted_idx,
-            contracted_delta,
-            &contracted_ref,
-        )
-    } else {
-        (
-            "uncontracted",
-            uncontracted_idx,
-            uncontracted_delta,
-            &uncontracted_ref,
-        )
-    };
+    let mut max_diff: f32 = 0.0;
+    let mut max_idx: usize = 0;
+    for i in 0..output.len() {
+        let diff = (output[i] - ref_output[i]).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            max_idx = i;
+        }
+    }
 
     eprintln!(
-        "quantized_matmul_id Q4: oracle={oracle}, max|delta|={:.3e} at idx {} \
-         (gpu={}, ref={}); alternate max|delta|={:.3e}",
-        max_diff,
-        max_idx,
-        output[max_idx],
-        reference[max_idx],
-        uncontracted_delta.max(contracted_delta),
+        "quantized_matmul_id Q4: max|delta|={:.3e} at idx {} (gpu={}, ref={})",
+        max_diff, max_idx, output[max_idx], ref_output[max_idx]
     );
     assert!(
         max_diff <= 1e-4,
-        "quantized_matmul_id Q4 matches neither legal bf16 contraction mode within 1e-4: \
-         contracted max|delta|={contracted_delta}, \
-         uncontracted max|delta|={uncontracted_delta}",
+        "quantized_matmul_id Q4 exceeds tolerance 1e-4: max|delta|={}",
+        max_diff
     );
 }
 

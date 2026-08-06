@@ -36,27 +36,36 @@ struct QuantizedMatmulParams {
 // then cast to float for dequantization arithmetic.
 
 // ---- Dequantization helpers ----
-// All dequant functions operate in bf16 arithmetic to match MLX's precision.
-// MLX dequantizes weights to bf16 (the model's native dtype), and multiplies
-// bf16 weights with bf16 inputs, accumulating products in f32.
-// Using bf16 dequant ensures our weight values match MLX's exactly.
+// MLX materializes dequantized weights and inputs in BF16, then accumulates
+// their products in F32. Do not rely on a `bfloat` temporary to force that
+// materialization: older Metal compiler/GPU pairs can retain an inline result
+// in F32. Round finite values to BF16 RNE explicitly through their bits.
+
+inline float round_f32_to_bf16_rne(float value) {
+    uint bits = as_type<uint>(value);
+    if ((bits & 0x7F800000u) == 0x7F800000u) {
+        return value;
+    }
+    uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    return as_type<float>((bits + rounding_bias) & 0xFFFF0000u);
+}
 
 // 4-bit: Extract the i-th 4-bit value from a packed uint32.
-inline bfloat dequant_4bit(uint packed, uint i, bfloat scale, bfloat bias) {
+inline float dequant_4bit(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (4 * i)) & 0xFu;
-    return bfloat(val) * scale + bias;
+    return round_f32_to_bf16_rne(float(val) * float(scale) + float(bias));
 }
 
 // 6-bit: Extract the i-th 6-bit value from a packed uint32 (4 values per uint32).
-inline bfloat dequant_6bit(uint packed, uint i, bfloat scale, bfloat bias) {
+inline float dequant_6bit(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (6 * i)) & 0x3Fu;
-    return bfloat(val) * scale + bias;
+    return round_f32_to_bf16_rne(float(val) * float(scale) + float(bias));
 }
 
 // 8-bit: Extract the i-th 8-bit value from a packed uint32 (4 values per uint32).
-inline bfloat dequant_8bit(uint packed, uint i, bfloat scale, bfloat bias) {
+inline float dequant_8bit(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (8 * i)) & 0xFFu;
-    return bfloat(val) * scale + bias;
+    return round_f32_to_bf16_rne(float(val) * float(scale) + float(bias));
 }
 
 // Main quantized matmul kernel (f32 output).
@@ -127,10 +136,10 @@ kernel void quantized_matmul(
             uint g = k / group_size;
             bfloat scale = as_type<bfloat>(scales[sb_base + g]);
             bfloat bias  = as_type<bfloat>(biases[sb_base + g]);
-            bfloat w = dequant_6bit(packed, in_triplet, scale, bias);
+            float w = dequant_6bit(packed, in_triplet, scale, bias);
 
-            bfloat x = bfloat(input[row * K + k]);
-            acc += float(w) * float(x);
+            float x = round_f32_to_bf16_rne(input[row * K + k]);
+            acc += w * x;
         }
     } else {
         // 4-bit and 8-bit: uint32 packed
@@ -147,15 +156,15 @@ kernel void quantized_matmul(
             bfloat scale = as_type<bfloat>(scales[sb_base + g]);
             bfloat bias  = as_type<bfloat>(biases[sb_base + g]);
 
-            bfloat w;
+            float w;
             if (bits == 4) {
                 w = dequant_4bit(packed, in_pack_idx, scale, bias);
             } else {
                 w = dequant_8bit(packed, in_pack_idx, scale, bias);
             }
 
-            bfloat x = bfloat(input[row * K + k]);
-            acc += float(w) * float(x);
+            float x = round_f32_to_bf16_rne(input[row * K + k]);
+            acc += w * x;
         }
     }
 

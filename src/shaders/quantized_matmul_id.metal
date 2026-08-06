@@ -41,21 +41,35 @@ struct QuantizedMatmulIdParams {
     uint expert_biases_stride; // uint16 elements per expert in biases buffer
 };
 
-// Dequantization helpers — identical to quantized_matmul.metal
+// Dequantization helpers — identical to quantized_matmul.metal.
+//
+// Do not rely on assigning the affine expression to a `bfloat` temporary to
+// materialize BF16. Older Metal compiler/GPU pairs can retain the inline value
+// in F32. Round the finite F32 value to BF16 RNE through its bits, then widen
+// it explicitly so every supported Apple GPU observes the same weight.
 
-inline bfloat dequant_4bit_id(uint packed, uint i, bfloat scale, bfloat bias) {
+inline float round_f32_to_bf16_rne_id(float value) {
+    uint bits = as_type<uint>(value);
+    if ((bits & 0x7F800000u) == 0x7F800000u) {
+        return value;
+    }
+    uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    return as_type<float>((bits + rounding_bias) & 0xFFFF0000u);
+}
+
+inline float dequant_4bit_id(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (4 * i)) & 0xFu;
-    return bfloat(val) * scale + bias;
+    return round_f32_to_bf16_rne_id(float(val) * float(scale) + float(bias));
 }
 
-inline bfloat dequant_6bit_id(uint packed, uint i, bfloat scale, bfloat bias) {
+inline float dequant_6bit_id(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (6 * i)) & 0x3Fu;
-    return bfloat(val) * scale + bias;
+    return round_f32_to_bf16_rne_id(float(val) * float(scale) + float(bias));
 }
 
-inline bfloat dequant_8bit_id(uint packed, uint i, bfloat scale, bfloat bias) {
+inline float dequant_8bit_id(uint packed, uint i, bfloat scale, bfloat bias) {
     uint val = (packed >> (8 * i)) & 0xFFu;
-    return bfloat(val) * scale + bias;
+    return round_f32_to_bf16_rne_id(float(val) * float(scale) + float(bias));
 }
 
 // Expert-routed quantized matmul kernel.
@@ -139,10 +153,10 @@ kernel void quantized_matmul_id(
             uint g = k / group_size;
             bfloat scale = as_type<bfloat>(s_expert[sb_base + g]);
             bfloat bias  = as_type<bfloat>(b_expert[sb_base + g]);
-            bfloat w = dequant_6bit_id(packed, in_triplet, scale, bias);
+            float w = dequant_6bit_id(packed, in_triplet, scale, bias);
 
-            bfloat x = bfloat(input[token * K + k]);
-            acc += float(w) * float(x);
+            float x = round_f32_to_bf16_rne_id(input[token * K + k]);
+            acc += w * x;
         }
     } else {
         // 4-bit and 8-bit: uint32 packed.
@@ -161,15 +175,15 @@ kernel void quantized_matmul_id(
             bfloat scale = as_type<bfloat>(s_expert[sb_base + g]);
             bfloat bias  = as_type<bfloat>(b_expert[sb_base + g]);
 
-            bfloat w;
+            float w;
             if (bits == 4) {
                 w = dequant_4bit_id(packed, in_pack_idx, scale, bias);
             } else {
                 w = dequant_8bit_id(packed, in_pack_idx, scale, bias);
             }
 
-            bfloat x = bfloat(input[token * K + k]);
-            acc += float(w) * float(x);
+            float x = round_f32_to_bf16_rne_id(input[token * K + k]);
+            acc += w * x;
         }
     }
 

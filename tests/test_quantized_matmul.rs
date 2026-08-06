@@ -5,8 +5,9 @@
 //!   - M=1, N=14336, K=4096 (decode, MLP projection)
 //!   - M=8, N=4096, K=4096 (prefill)
 //!
-//! CPU reference: dequantize weights to f32 (matching bf16 intermediate precision
-//! of the Metal shader), then matmul.
+//! CPU references mirror each Metal path: the scalar kernel materializes
+//! weights and inputs to BF16, while the SIMD kernel retains its affine
+//! dequantization in F32. Both accumulate the matmul in F32.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(target_vendor = "apple")]
@@ -123,23 +124,52 @@ fn quantize_8bit_group(values: &[f32]) -> (Vec<u8>, f32, f32) {
 // Dequantization helpers (matching the Metal shader's bf16 precision)
 // --------------------------------------------------------------------------
 
-fn dequant_4bit_value(packed_word: u32, idx: usize, scale_bf16: f32, bias_bf16: f32) -> f32 {
+fn dequant_4bit_value(
+    packed_word: u32,
+    idx: usize,
+    scale_bf16: f32,
+    bias_bf16: f32,
+    materialize_bf16: bool,
+) -> f32 {
     let val = (packed_word >> (4 * idx)) & 0xF;
-    // Match shader: bfloat(val) * scale + bias, then cast to f32
-    let w_bf16 = f32_to_bf16_f32(val as f32) * scale_bf16 + bias_bf16;
-    w_bf16
+    let dequantized = f32_to_bf16_f32(val as f32) * scale_bf16 + bias_bf16;
+    if materialize_bf16 {
+        f32_to_bf16_f32(dequantized)
+    } else {
+        dequantized
+    }
 }
 
-fn dequant_6bit_value(packed_triplet: u32, idx: usize, scale_bf16: f32, bias_bf16: f32) -> f32 {
+fn dequant_6bit_value(
+    packed_triplet: u32,
+    idx: usize,
+    scale_bf16: f32,
+    bias_bf16: f32,
+    materialize_bf16: bool,
+) -> f32 {
     let val = (packed_triplet >> (6 * idx)) & 0x3F;
-    let w_bf16 = f32_to_bf16_f32(val as f32) * scale_bf16 + bias_bf16;
-    w_bf16
+    let dequantized = f32_to_bf16_f32(val as f32) * scale_bf16 + bias_bf16;
+    if materialize_bf16 {
+        f32_to_bf16_f32(dequantized)
+    } else {
+        dequantized
+    }
 }
 
-fn dequant_8bit_value(packed_word: u32, idx: usize, scale_bf16: f32, bias_bf16: f32) -> f32 {
+fn dequant_8bit_value(
+    packed_word: u32,
+    idx: usize,
+    scale_bf16: f32,
+    bias_bf16: f32,
+    materialize_bf16: bool,
+) -> f32 {
     let val = (packed_word >> (8 * idx)) & 0xFF;
-    let w_bf16 = f32_to_bf16_f32(val as f32) * scale_bf16 + bias_bf16;
-    w_bf16
+    let dequantized = f32_to_bf16_f32(val as f32) * scale_bf16 + bias_bf16;
+    if materialize_bf16 {
+        f32_to_bf16_f32(dequantized)
+    } else {
+        dequantized
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -151,6 +181,8 @@ fn dequant_8bit_value(packed_word: u32, idx: usize, scale_bf16: f32, bias_bf16: 
 /// Weight layout: [N, K] packed, scales [N, num_groups], biases [N, num_groups]
 /// Input layout: [M, K] f32
 /// Output: [M, N] f32
+/// `materialize_bf16` selects the scalar kernel's explicit BF16 dequant
+/// contract; the SIMD path uses F32 affine dequantization.
 fn cpu_quantized_matmul(
     input: &[f32],
     weight_packed: &[u8],
@@ -161,6 +193,7 @@ fn cpu_quantized_matmul(
     n: usize,
     group_size: usize,
     bits: usize,
+    materialize_bf16: bool,
 ) -> Vec<f32> {
     let num_groups = (k + group_size - 1) / group_size;
     let mut output = vec![0.0f32; m * n];
@@ -190,7 +223,13 @@ fn cpu_quantized_matmul(
                             weight_packed[byte_off + 2],
                             weight_packed[byte_off + 3],
                         ]);
-                        dequant_4bit_value(packed, in_pack, scale_bf16, bias_bf16)
+                        dequant_4bit_value(
+                            packed,
+                            in_pack,
+                            scale_bf16,
+                            bias_bf16,
+                            materialize_bf16,
+                        )
                     }
                     6 => {
                         let triplets_per_row = (k + 3) / 4;
@@ -202,7 +241,13 @@ fn cpu_quantized_matmul(
                         let packed = (weight_packed[byte_off] as u32)
                             | ((weight_packed[byte_off + 1] as u32) << 8)
                             | ((weight_packed[byte_off + 2] as u32) << 16);
-                        dequant_6bit_value(packed, in_triplet, scale_bf16, bias_bf16)
+                        dequant_6bit_value(
+                            packed,
+                            in_triplet,
+                            scale_bf16,
+                            bias_bf16,
+                            materialize_bf16,
+                        )
                     }
                     8 => {
                         let values_per_pack = 4;
@@ -217,7 +262,13 @@ fn cpu_quantized_matmul(
                             weight_packed[byte_off + 2],
                             weight_packed[byte_off + 3],
                         ]);
-                        dequant_8bit_value(packed, in_pack, scale_bf16, bias_bf16)
+                        dequant_8bit_value(
+                            packed,
+                            in_pack,
+                            scale_bf16,
+                            bias_bf16,
+                            materialize_bf16,
+                        )
                     }
                     _ => panic!("unsupported bits {}", bits),
                 };
@@ -321,6 +372,7 @@ fn run_quantized_matmul_test(m: u32, n: u32, k: u32, bits: u32, group_size: u32,
         n as usize,
         group_size as usize,
         bits as usize,
+        true,
     );
 
     // Allocate GPU buffers
@@ -407,10 +459,9 @@ fn run_quantized_matmul_test(m: u32, n: u32, k: u32, bits: u32, group_size: u32,
         actual[max_diff_idx], expected[max_diff_idx]
     );
 
-    // Tolerance: the GPU accumulates bf16-dequantized products in f32 over K
-    // elements.  With K=4096 and bf16's ~0.5% relative error, the accumulated
-    // absolute error can reach ~0.1.  Use a tolerance proportional to K.
-    let tol = 0.1 * (k as f32 / 4096.0).max(1.0);
+    // The CPU and GPU now materialize the same BF16 values. Only F32
+    // accumulation order remains, so retain the existing SIMD parity band.
+    let tol = 5e-3;
     assert!(
         max_diff <= tol,
         "{test_name}: max|delta| = {max_diff} at index {max_diff_idx} exceeds tolerance {tol} \
@@ -506,6 +557,7 @@ fn run_quantized_matmul_simd_test(m: u32, n: u32, k: u32, bits: u32, group_size:
         n as usize,
         group_size as usize,
         bits as usize,
+        false,
     );
 
     let input_bytes = m as usize * k as usize * 4;

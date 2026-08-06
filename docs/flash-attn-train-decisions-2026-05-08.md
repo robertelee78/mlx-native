@@ -275,38 +275,39 @@ production inference hot-path metric under the priorities stated above.
 
 ---
 
-## D7. Cross-generation BF16 parity oracles → **Model both legal rounding boundaries**
+## D7. Cross-generation BF16 materialization → **Enforce one arithmetic contract**
 
-**Decision:** Cross-generation tests for the legacy affine BF16 quantized
-matmul accept neither a broad error band nor one host's lowering as universal.
-The routed Q4 fixture computes two exact CPU oracles: contracted
-`q * scale + bias` (one BF16 rounding after the fused expression) and
-uncontracted BF16 arithmetic (round the product to BF16, then add and round
-again).  GPU output must remain within the original `1e-4` tolerance of at
-least one complete oracle.  The fixture also requires the two oracles to differ
-by more than `1e-3`, so the alternative path cannot collapse into a vacuous
-duplicate.
+**Decision:** The legacy affine BF16 quantized matmul explicitly rounds finite
+dequantized weights and F32 inputs to BF16 round-to-nearest-even through their
+bit representation, then widens those materialized values for F32
+accumulation.  Both routed and non-routed shaders use the same helper.  The
+routed Q4 fixture keeps its single BF16 CPU oracle and original `1e-4`
+tolerance.
 
 **Why:** Exact-candidate run 31075724348 passed the M1 training suite and the
 residency-capability correction, then exposed a separate assumption in
 `test_quantized_matmul_id_4bit_4tokens_8experts_top2`.  The hosted M1 result
-differed from the original single-rounding CPU oracle by `3.507e-3`, while five
-M5 Max repetitions differed by only `1.192e-7`.  The Metal compiler reports FP
-contraction enabled for expressions and the Metal float ABI defaults to fast;
-the shader's operands and return type are BF16.  It is therefore incorrect for
-the test to require every Apple GPU/compiler pair to choose one intermediate
-BF16 rounding boundary.
+differed from the BF16 CPU oracle by `3.507e-3`, while five M5 Max repetitions
+differed by only `1.192e-7`.  A deterministic reconstruction of all 256 fixture
+outputs showed that retaining the computed `q * scale + bias` value in F32
+reproduces the M1 result exactly, including index 26 (`-0.3414669037` versus
+the BF16-materialized `-0.3379597664`).  The packing, routing, and input
+rounding were already correct.  The M1/Xcode 16.4 compiler/backend had elided
+the intended materialization of the inline `bfloat` return; M5/Xcode 26.6 had
+not.
 
-The replacement fixture separates the two CPU oracles by `6.554e-3` on the
-same deterministic data.  M5 Max matches the contracted oracle to
-`1.192e-7`.  A new exact-SHA M1 run must match one oracle within `1e-4`; merely
-raising the tolerance to cover the prior `3.507e-3` result is rejected because
-that could hide expert routing, stride, or packed-layout defects.
+The shader comments and existing CPU oracle already define BF16-materialized
+weights as the intended contract.  A dual-oracle experiment was therefore
+rejected: accepting the excess-precision result would make the implementation
+device-dependent.  Raising the tolerance was also rejected because it could
+hide expert routing, stride, or packed-layout defects.  Explicit RNE bit
+rounding makes the contract independent of compiler excess precision while
+preserving special values unchanged.
 
-**Scope:** No shader or product arithmetic changes.  This affine routed kernel
-is not used by hf2q's GGML Q2/Q3/Q4/Q5/Q6/Q8 inference paths; the correction is
-to its cross-generation test contract.  Full GGML and model-family regression
-coverage remains mandatory.
+**Scope:** The same correction is applied to the routed and non-routed affine
+shaders for API consistency.  hf2q serves separate GGML
+Q2/Q3/Q4/Q5/Q6/Q8 kernels, so this is not a DeepSeek inference hot-path change.
+Full affine, GGML, and model-family regression coverage remains mandatory.
 
 ---
 
