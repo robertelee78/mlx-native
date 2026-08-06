@@ -59,18 +59,30 @@ impl MlxDevice {
             }
             None
         } else {
-            let set = ResidencySet::new(&device)?;
-            if set.is_noop() {
-                if log_init {
-                    eprintln!("[mlx-native] residency sets = false (reason: macOS < 15.0)");
+            match ResidencySet::new(&device) {
+                Ok(set) if !set.is_noop() => {
+                    set.register_with_queue(&queue);
+                    if log_init {
+                        eprintln!("[mlx-native] residency sets = true");
+                    }
+                    Some(set)
                 }
-                None
-            } else {
-                set.register_with_queue(&queue);
-                if log_init {
-                    eprintln!("[mlx-native] residency sets = true");
+                Ok(_) => {
+                    if log_init {
+                        eprintln!("[mlx-native] residency sets = false (reason: unsupported)");
+                    }
+                    None
                 }
-                Some(set)
+                Err(error) => {
+                    // macOS reports the API as available on some virtualized
+                    // Apple-Silicon hosts but rejects residency-set creation.
+                    // Residency is an optimization, not a correctness
+                    // requirement, so retain the ordinary Metal path.
+                    if log_init {
+                        eprintln!("[mlx-native] residency sets = false (reason: {error})");
+                    }
+                    None
+                }
             }
         };
 
