@@ -1,5 +1,5 @@
-//! Dense f32 × f32 → f32 matmul using Apple M3+ tensor cores
-//! (`mpp::tensor_ops::matmul2d`).
+//! Dense f32 × f32 → f32 matmul using the optional Metal tensor API when
+//! available and a tiled simdgroup-MMA fallback otherwise.
 //!
 //! F32-everywhere sibling of [`crate::ops::dense_mm_bf16`] used by the
 //! ADR-005 iter-118 BF16-vs-F32 ViT attention A/B diagnostic on the
@@ -19,9 +19,10 @@
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::encoder::{CommandEncoder, KernelArg, as_bytes};
+use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::dense_mm_capability::{tensor_pipeline_available, DenseMmBackend};
 
 /// Host-side parameters for [`dense_matmul_f32_f32_tensor`].
 ///
@@ -49,25 +50,25 @@ pub struct DenseMmF32F32Params {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DenseMmF32F32TensorGpuParams {
-    ne00: i32,   // K (contract dim)
-    ne02: i32,   // src0 batch count
-    nb01: u64,   // src0 row stride (bytes)
-    nb02: u64,   // src0 batch stride (bytes)
-    nb03: u64,   // unused
-    ne12: i32,   // src1 batch count
+    ne00: i32, // K (contract dim)
+    ne02: i32, // src0 batch count
+    nb01: u64, // src0 row stride (bytes)
+    nb02: u64, // src0 batch stride (bytes)
+    nb03: u64, // unused
+    ne12: i32, // src1 batch count
     _pad0: u32,
-    nb10: u64,   // sizeof(float) = 4
-    nb11: u64,   // src1 row stride (bytes)
-    nb12: u64,   // src1 batch stride (bytes)
-    nb13: u64,   // unused
-    ne0: i32,    // N (output cols = src0 rows)
-    ne1: i32,    // M (output rows = src1 rows)
-    r2: i16,     // ne12 / ne02 (GQA head broadcast factor)
+    nb10: u64, // sizeof(float) = 4
+    nb11: u64, // src1 row stride (bytes)
+    nb12: u64, // src1 batch stride (bytes)
+    nb13: u64, // unused
+    ne0: i32,  // N (output cols = src0 rows)
+    ne1: i32,  // M (output rows = src1 rows)
+    r2: i16,   // ne12 / ne02 (GQA head broadcast factor)
     r3: i16,
     _pad1: u32,
 }
 
-/// Dense f32 × f32 → f32 matmul, tensor-API path.
+/// Dense f32 × f32 → f32 matmul with automatic tensor/simdgroup dispatch.
 ///
 /// Computes `output[b, m, n] = sum_k src0[b/r2, n, k] * src1[b, m, k]`
 /// for every `b` in `0..src1_batch`.  All buffers are f32; all
@@ -92,6 +93,28 @@ pub fn dense_matmul_f32_f32_tensor(
     dst: &MlxBuffer,
     params: &DenseMmF32F32Params,
 ) -> Result<()> {
+    dense_matmul_f32_f32_with_backend(
+        encoder,
+        registry,
+        device,
+        src0,
+        src1,
+        dst,
+        params,
+        DenseMmBackend::Auto,
+    )
+}
+
+pub(super) fn dense_matmul_f32_f32_with_backend(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    src0: &MlxBuffer,
+    src1: &MlxBuffer,
+    dst: &MlxBuffer,
+    params: &DenseMmF32F32Params,
+    backend: DenseMmBackend,
+) -> Result<()> {
     if params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "dense_matmul_f32_f32_tensor: M, N, K must all be > 0".into(),
@@ -115,6 +138,12 @@ pub fn dense_matmul_f32_f32_tensor(
             params.src1_batch, params.src0_batch
         )));
     }
+    let broadcast = params.src1_batch / params.src0_batch;
+    if broadcast > i16::MAX as u32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dense_matmul_f32_f32_tensor: GQA broadcast ratio ({broadcast}) exceeds i16::MAX"
+        )));
+    }
 
     let f32_sz = DType::F32.size_of();
 
@@ -124,7 +153,11 @@ pub fn dense_matmul_f32_f32_tensor(
         return Err(MlxError::InvalidArgument(format!(
             "dense_matmul_f32_f32_tensor: src0 too small: expected {} bytes for \
              [{}x{}x{}] f32, got {}",
-            expected_src0_bytes, params.src0_batch, params.n, params.k, src0.byte_len()
+            expected_src0_bytes,
+            params.src0_batch,
+            params.n,
+            params.k,
+            src0.byte_len()
         )));
     }
     let expected_src1_bytes =
@@ -133,7 +166,11 @@ pub fn dense_matmul_f32_f32_tensor(
         return Err(MlxError::InvalidArgument(format!(
             "dense_matmul_f32_f32_tensor: src1 too small: expected {} bytes for \
              [{}x{}x{}] f32, got {}",
-            expected_src1_bytes, params.src1_batch, params.m, params.k, src1.byte_len()
+            expected_src1_bytes,
+            params.src1_batch,
+            params.m,
+            params.k,
+            src1.byte_len()
         )));
     }
     let expected_dst_bytes =
@@ -142,18 +179,28 @@ pub fn dense_matmul_f32_f32_tensor(
         return Err(MlxError::InvalidArgument(format!(
             "dense_matmul_f32_f32_tensor: dst too small: expected {} bytes for \
              [{}x{}x{}] f32, got {}",
-            expected_dst_bytes, params.src1_batch, params.m, params.n, dst.byte_len()
+            expected_dst_bytes,
+            params.src1_batch,
+            params.m,
+            params.n,
+            dst.byte_len()
         )));
     }
 
-    let pipeline = registry
-        .get_pipeline("hf2q_dense_mm_f32_f32_tensor", device.metal_device())?;
+    let use_tensor =
+        tensor_pipeline_available(backend, "hf2q_dense_mm_f32_f32_tensor", registry, device)?;
+    let kernel_name = if use_tensor {
+        "hf2q_dense_mm_f32_f32_tensor"
+    } else {
+        "hf2q_dense_mm_f32_f32_fallback"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
-    let nb01 = (params.k as u64) * (f32_sz as u64);                 // src0 row
-    let nb02 = (params.n as u64) * nb01;                             // src0 batch
-    let nb11 = (params.k as u64) * (f32_sz as u64);                 // src1 row
-    let nb12 = (params.m as u64) * nb11;                             // src1 batch
-    let r2 = (params.src1_batch / params.src0_batch) as i16;
+    let nb01 = (params.k as u64) * (f32_sz as u64); // src0 row
+    let nb02 = (params.n as u64) * nb01; // src0 batch
+    let nb11 = (params.k as u64) * (f32_sz as u64); // src1 row
+    let nb12 = (params.m as u64) * nb11; // src1 batch
+    let r2 = broadcast as i16;
 
     let gpu_params = DenseMmF32F32TensorGpuParams {
         ne00: params.k as i32,
@@ -173,6 +220,28 @@ pub fn dense_matmul_f32_f32_tensor(
         r3: 1,
         _pad1: 0,
     };
+
+    if !use_tensor {
+        const NR0: u64 = 64;
+        const NR1: u64 = 32;
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+                (1, KernelArg::Buffer(src0)),
+                (2, KernelArg::Buffer(src1)),
+                (3, KernelArg::Buffer(dst)),
+            ],
+            &[(0, 12288)],
+            metal::MTLSize::new(
+                (params.m as u64 + NR1 - 1) / NR1,
+                (params.n as u64 + NR0 - 1) / NR0,
+                params.src1_batch as u64,
+            ),
+            metal::MTLSize::new(128, 1, 1),
+        );
+        return Ok(());
+    }
 
     // Tile geometry mirrors the BF16 sibling.
     //   sa: 64 * 32 * 4 = 8 KB

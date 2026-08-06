@@ -96,6 +96,10 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 pub struct KernelRegistry {
     /// Cached pipelines keyed by kernel function name.
     cache: HashMap<String, ComputePipelineState>,
+    /// Stable optional-pipeline capability results for this registry/device.
+    /// A registry already caches device-specific pipeline objects, so its
+    /// capability decisions have the same lifetime and identity scope.
+    optional_pipeline_capabilities: HashMap<String, bool>,
     /// MSL source text keyed by kernel function name.
     ///
     /// Populated at construction time with all embedded shader sources.
@@ -371,6 +375,25 @@ impl KernelRegistry {
         sources.insert(
             "hf2q_dense_mm_f16_f32_tensor".into(),
             dense_mm_f16_tensor_src,
+        );
+
+        // Portable dense fallbacks for Apple GPUs / SDKs where the optional
+        // MetalPerformancePrimitives tensor API cannot be compiled.  These
+        // sources deliberately avoid `<metal_tensor>` so an omitted tensor
+        // shader in a partial precompiled metallib never turns into a failed
+        // runtime source compilation.
+        let dense_mm_fallback_src: &'static str = include_str!("shaders/dense_mm_fallback.metal");
+        sources.insert(
+            "hf2q_dense_mm_bf16_f32_fallback".into(),
+            dense_mm_fallback_src,
+        );
+        sources.insert(
+            "hf2q_dense_mm_f16_f32_fallback".into(),
+            dense_mm_fallback_src,
+        );
+        sources.insert(
+            "hf2q_dense_mm_f32_f32_fallback".into(),
+            dense_mm_fallback_src,
         );
 
         // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
@@ -1386,6 +1409,7 @@ impl KernelRegistry {
 
         Self {
             cache: HashMap::new(),
+            optional_pipeline_capabilities: HashMap::new(),
             sources,
             precompiled_lib: None,
             precompiled_load_attempted: false,
@@ -1430,7 +1454,36 @@ impl KernelRegistry {
         let name = name.into();
         // Invalidate any cached pipeline for this name since the source changed.
         self.cache.remove(&name);
+        self.optional_pipeline_capabilities.remove(&name);
         self.sources.insert(name, source);
+    }
+
+    /// Probe and cache an optional pipeline capability for this registry's
+    /// device.  Only errors explicitly classified as an unavailable optional
+    /// capability become `Ok(false)`; every other failure is propagated and
+    /// is deliberately not cached.
+    pub(crate) fn probe_optional_pipeline<F>(
+        &mut self,
+        name: &str,
+        device: &metal::DeviceRef,
+        unavailable: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&MlxError) -> bool,
+    {
+        if let Some(&available) = self.optional_pipeline_capabilities.get(name) {
+            return Ok(available);
+        }
+
+        let probe = self.get_pipeline(name, device).map(|_| ());
+        let available = match probe {
+            Ok(()) => true,
+            Err(error) if unavailable(&error) => false,
+            Err(error) => return Err(error),
+        };
+        self.optional_pipeline_capabilities
+            .insert(name.to_string(), available);
+        Ok(available)
     }
 
     /// ADR-033 §Pi Task #20 iter 11 (2026-05-23) — eagerly compile a list

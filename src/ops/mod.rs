@@ -19,6 +19,9 @@ pub mod deepseek_tail_rope;
 pub mod dense_gemm;
 pub mod dense_gemv_bf16;
 pub mod dense_mm_bf16;
+mod dense_mm_capability;
+#[cfg(test)]
+mod dense_mm_fallback_tests;
 pub mod dense_mm_f16;
 pub mod dense_mm_f32_f32;
 pub mod dequant_to_f16;

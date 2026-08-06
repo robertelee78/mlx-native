@@ -15,14 +15,10 @@
 //   2. scores @ V -> out  (V is src0 bf16 weight; scores is src1 f32
 //      input after softmax)
 //
-// The non-tensor simdgroup MMA fallback is intentionally NOT included
-// — mlx-native targets M3+ where tensor-ops is always available, and
-// keeping the kernel single-path avoids the two-branch duplication
-// llama.cpp carries for backward compatibility.  If a pre-M3 user ever
-// runs this build, kernel compile will fail cleanly and the host-side
-// dispatcher (dense_matmul_bf16_f32_tensor_mm) returns an error, and
-// the caller must use a different attention path (flash-attn or simd
-// MMA mat-mul).
+// The tensor source stays single-purpose.  Host dispatch probes this pipeline
+// once and selects dense_mm_fallback.metal when the SDK or GPU does not expose
+// the optional tensor API, so a missing <metal_tensor> capability is not a
+// runtime inference failure.
 //
 // ne02 / r2 broadcast:  hf2q's grouped-query attention has nh heads
 // attending but nkv shared KV heads.  The attention mat-muls iterate
