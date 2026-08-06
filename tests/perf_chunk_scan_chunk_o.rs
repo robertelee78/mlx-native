@@ -16,11 +16,15 @@
 //! - Single-process, single-threadgroup test (no inter-test isolation
 //!   needed; the kernel is stateless across dispatches).
 //! - Buffer allocation hoisted out of the timed loop.
-//! - First 5 dispatches warm the pipeline cache (excluded from the median).
+//! - First 25 dispatches warm the pipeline cache and bring the target GPU out
+//!   of its idle power state (excluded from the median).
 //! - 50 timed dispatches; median used as the wall-time statistic (robust
 //!   to OS-jitter outliers).
 //! - Wall = `command_buffer.commit + wait_until_completed` per dispatch
 //!   (the natural client-observable latency, same as the bench harness).
+//! - The absolute threshold is calibrated for Apple M5 Max and is enforced
+//!   only on that device. Other Metal devices still exercise this operation
+//!   through correctness tests, but cannot be compared to an M5 baseline.
 //!
 //! # Why this RED test exists
 //!
@@ -63,7 +67,7 @@ const K: u32 = 128;
 const V: u32 = 128;
 const BT: u32 = 64;
 
-const WARMUP_DISPATCHES: usize = 5;
+const WARMUP_DISPATCHES: usize = 25;
 const TIMED_DISPATCHES: usize = 50;
 
 /// 3× speedup vs 2.155 ms baseline = 718 µs; +0.3% jitter headroom = 720 µs.
@@ -105,6 +109,14 @@ fn chunk_o_simdgroup_matrix_speedup() {
             return;
         }
     };
+    let device_name = device.name();
+    if !device_name.contains("M5 Max") {
+        eprintln!(
+            "Metal device `{device_name}` is not the M5 Max calibration target — \
+             skipping the hardware-specific chunk_o latency gate"
+        );
+        return;
+    }
     let mut registry = KernelRegistry::new();
     gated_delta_net_chunk_o::register(&mut registry);
 
