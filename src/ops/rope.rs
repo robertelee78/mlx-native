@@ -42,11 +42,6 @@ fn freq_base_from_params(params_buf: &MlxBuffer, family: &str) -> Result<f32> {
     Ok(freq_base)
 }
 
-/// Release the current thread's cached inverse-frequency tables.
-pub fn clear_rope_freq_cache() {
-    super::rope_freqs::clear_cache();
-}
-
 /// Dispatch a RoPE operation on the GPU.
 ///
 /// # Arguments
@@ -56,7 +51,9 @@ pub fn clear_rope_freq_cache() {
 /// * `device`       - Metal device for pipeline compilation.
 /// * `input`        - Input buffer of shape `[seq_len, head_dim]` (f32 or f16).
 /// * `output`       - Output buffer (same dtype and shape as input).
-/// * `params_buf`   - Params buffer containing `[theta, head_dim, 0, 0]` as f32.
+/// * `params_buf`   - Host-readable shared params buffer containing
+///   `[theta, head_dim, 0, 0]` as f32. It must not be GPU-produced or mutated
+///   concurrently; the dispatcher reads `theta` to select the cached table.
 /// * `positions_buf` - Positions buffer containing `[pos_0, pos_1, ...]` as u32.
 /// * `seq_len`      - Number of sequence positions.
 /// * `head_dim`     - Dimension of each head (must be even).
@@ -178,7 +175,9 @@ struct GpuRopeNeoxParams {
 /// * `device`        - Metal device for pipeline compilation.
 /// * `input`         - Input buffer of shape `[seq_len * n_heads, head_dim]` (bf16).
 /// * `output`        - Output buffer (same shape and dtype as input).
-/// * `params_buf`    - Params buffer containing `[theta, head_dim, rope_dim, 0]` as f32.
+/// * `params_buf`    - Host-readable shared params buffer containing
+///   `[theta, head_dim, rope_dim, 0]` as f32. It must be immutable while the
+///   dispatch is encoded.
 /// * `positions_buf` - Positions buffer containing `[pos_0, pos_1, ...]` as u32 (length = seq_len).
 /// * `seq_len`       - Number of sequence positions.
 /// * `n_heads`       - Number of attention heads.
@@ -302,7 +301,9 @@ struct GpuRopeNeoxF32Params {
 /// * `device`        - Metal device for pipeline compilation.
 /// * `input`         - Input buffer of shape `[seq_len * n_heads, head_dim]` (f32).
 /// * `output`        - Output buffer (same shape and dtype as input).
-/// * `params_buf`    - Params buffer containing `[theta, head_dim, rope_dim, 0]` as f32.
+/// * `params_buf`    - Host-readable shared params buffer containing
+///   `[theta, head_dim, rope_dim, 0]` as f32. It must be immutable while the
+///   dispatch is encoded.
 /// * `positions_buf` - Positions buffer containing `[pos_0, pos_1, ...]` as u32 (length = seq_len).
 /// * `freq_factors`  - Optional freq_factors buffer of shape `[rope_dim/2]` (f32).
 ///                     Pass `None` for standard RoPE (equivalent to all-ones).

@@ -4,7 +4,8 @@
 //! for `pow`, even through Metal's `precise` namespace.  Multiplying that small
 //! difference by a long-context position can move the final rotation far enough
 //! to change model output.  Compute the tiny, shape-stable table once with the
-//! host's f32 contract and cache it in a shared Metal buffer instead.
+//! same host f32 contract as the CPU oracle and cache it in a shared Metal
+//! buffer instead.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -86,11 +87,6 @@ pub(crate) fn with_inv_freqs<R>(
             "RoPE inverse-frequency cache entry inserted above",
         )))
     })
-}
-
-/// Release this thread's tiny RoPE inverse-frequency buffers.
-pub fn clear_cache() {
-    ROPE_FREQ_CACHE.with(|cell| cell.borrow_mut().clear());
 }
 
 #[cfg(test)]

@@ -341,11 +341,11 @@ function classes, but did not establish one cross-generation contract.
 
 ## D9. Generic RoPE inverse-frequency portability → **Cache host f32 tables**
 
-**Decision:** Compute `freq_base^(-2 * pair / denominator)` once using Rust's
-host f32 contract, cache the tiny table in a shared Metal buffer keyed by
-device/base/shape, and bind it to all five generic RoPE kernels.  The GPU no
-longer evaluates `pow`; it multiplies positions by the table and retains
-explicit precise `sin`/`cos`.
+**Decision:** Compute `freq_base^(-2 * pair / denominator)` once using the same
+host f32 contract as the CPU oracle, cache the tiny table in a shared Metal
+buffer keyed by device/base/shape, and bind it to all five generic RoPE
+kernels.  The GPU no longer evaluates `pow`; it multiplies positions by the
+table and retains explicit precise `sin`/`cos`.
 
 **Why:** The CPU oracle already defines its inverse frequencies with f32
 `powf`.  Supplying those exact f32 values removes the amplified,
@@ -356,7 +356,10 @@ runtime-source paths pass the unchanged theta-1e6 fixture locally; a fresh
 hosted M1 run remains a mandatory falsifier before release.
 
 **Scope:** Tensor layout, exponents, pairing, positions, and public dispatch
-signatures are unchanged.  This corrects the standard f32/f16/bf16 and NeoX
+signatures are unchanged.  Params buffers must be host-readable shared memory,
+which is the existing `MlxBuffer` and hf2q usage contract.  The cache has no
+public early-clear operation, so entries cannot be dropped ahead of in-flight
+unretained command buffers.  This corrects the standard f32/f16/bf16 and NeoX
 bf16/f32 generic kernels only.  Other RoPE families require their own evidence
 before adopting the same mechanism; this decision does not assume they fail.
 
