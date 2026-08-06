@@ -12,6 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-metal-train-isolation:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Training shader isolation
+        run: cargo +stable test --locked --test test_flash_attn_train -- --test-threads=1
+
   rust-metal:
     runs-on: macos-15
     timeout-minutes: 30
