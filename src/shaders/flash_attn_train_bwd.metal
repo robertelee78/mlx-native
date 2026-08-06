@@ -185,9 +185,9 @@ struct BlockLoaderT {
 // Score tile geometry:
 //   S = Q[BQ, D] @ K[BK, D]^T → S[BQ, BK]
 //   D=64: BQ=32, BK=16, WM=4.
-//   D=256: BQ=16, BK=16, WM=2.
-//   Each simdgroup: TQ=1 Q-frag (8 rows) × TK_s=2 K-frags (16 cols).
-//   The simdgroups collectively cover the complete [BQ, 16] score tile.
+//   D=256: BQ=16, BK=8, WM=2.
+//   Each simdgroup owns one 8-row Q fragment and the complete BK columns.
+//   The simdgroups collectively cover the complete [BQ, BK] score tile.
 //
 // dQ tile: each simdgroup writes back dQ for its 8 Q-rows (BQ/WM).
 // dK/dV: accumulated into device f32 via atomic_fetch_add_explicit.
@@ -250,47 +250,17 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   //            LDV = BD + padV.  Total: BK * (BD + padV) elements.
   //            Loaded by BlockLoaderT<BK, BD, kDstStrRow=LDV, kDstStrCol=1, ...>.
   //
-  // dO is accessed directly from device memory (not loaded into shmem) to
-  // avoid a second BQ-sized tile that would push D=256 above the 32 KB TGM limit.
+  // dO is read directly from device memory, and all three staged tensors use
+  // row-major zero-padding layouts. For the D=256 specialization (BQ=16,
+  // BK=8), the static budget is:
+  //   Q_smem: 16 * 256 * 2 = 8192 bytes
+  //   K_smem:  8 * 256 * 2 = 4096 bytes
+  //   V_smem:  8 * 256 * 2 = 4096 bytes
+  //   Total:                  16384 bytes
+  // BK=8 also halves the score, probability, and gradient vectors compared
+  // with the M1-incompatible BK=16 specialization.
   //
-  // TGM budget (bf16, D=256):
-  //   Q_smem:  32 * 264 * 2 = 16896 bytes
-  //   K_smem:  24 * 256 * 2 = 12288 bytes
-  //   V_smem:  16 * 264 * 2 = 8448 bytes
-  //   Total  = 37632 bytes  ← still over 32 KB!
-  //
-  // To stay under 32 KB, share K and V in a single KV_smem buffer just like
-  // the forward kernel (they are NOT used at the same time in the scalar loop:
-  // K is used for S and dQ, V is used for dP and dV — but they ARE interleaved
-  // within the same K-tile iteration).
-  //
-  // Since K and V are both needed within one K-tile iteration, they cannot share
-  // a single buffer.  Instead use a smaller tile for dO: access dO from device
-  // memory via a per-thread register load (BD floats per row, one row per thread).
-  // This eliminates the dO_smem entirely.
-  //
-  // Final TGM budget (bf16, D=256):
-  //   Q_smem:  32 * 264 * 2 = 16896 bytes
-  //   K_smem:  24 * 256 * 2 = 12288 bytes  ← (BK+padK)*BD
-  //   V_smem:  16 * 264 * 2 = 8448 bytes   ← BK*(BD+padV)
-  //   Total  = 37632 bytes  — STILL over!
-  //
-  // Further reduction: K and V CAN share a buffer if loaded sequentially and
-  // the K data is no longer needed when V is accessed.  In the scalar backward:
-  //   S requires K (not V).  dP requires V (not K).  dS needs only P and D.
-  //   dQ requires K (after S and P are computed).  dK/dV require K and V.
-  //
-  // K is needed for: S computation and dQ accumulation (both in the same K-tile iter).
-  // V is needed for: dP computation and dV accumulation.
-  // → K and V are BOTH needed within the same K-tile iteration.  Cannot share.
-  //
-  // Alternative: reduce padK/padV to 0 (no padding).
-  //   Q_smem:  32 * 256 * 2 = 16384 bytes
-  //   K_smem:  16 * 256 * 2 = 8192 bytes   (row-major, no column-major trick)
-  //   V_smem:  16 * 256 * 2 = 8192 bytes
-  //   Total  = 32768 bytes  ← EXACTLY at the 32 KB limit.
-  //
-  // Use row-major for both K_smem and V_smem with zero padding:
+  // Use row-major K and V with zero padding:
   //   K_smem[k_row * BD + d_col] = K[k_row][d_col]  (row-major, LDK=BD)
   //   V_smem[v_row * BD + d_col] = V[v_row][d_col]  (row-major, LDV=BD)
   //
@@ -300,8 +270,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   // Access in scalar loops: K[k][d] = K_smem[k*BD + d].
   //                          V[k][d] = V_smem[k*BD + d].
   //
-  // Q_smem: LDQ = BD (no padding at D=256 to stay at limit).
-  // Total: 32*256*2 + 16*256*2 + 16*256*2 = 16384 + 8192 + 8192 = 32768 bytes. ✓
+  // Q_smem uses the same no-padding row-major layout.
 
   constexpr short LDQ = BD;          // Q_smem: row-major, no padding
   constexpr short LDK = BD;          // K_smem: row-major, no padding
@@ -601,8 +570,8 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   decltype(attention_train_bwd<io_t, bq, bk, bd, wm, wn>) \
   attention_train_bwd<io_t, bq, bk, bd, wm, wn>;
 
-// D=64 retains the 32-row/four-simdgroup tile. D=256 uses a
-// 16-row/two-simdgroup tile, reducing static threadgroup memory from exactly
-// 32 KiB to 24 KiB so pipeline creation succeeds on M1-class GPUs.
+// D=64 retains the 32-row/16-key/four-simdgroup tile. D=256 uses a
+// 16-row/eight-key/two-simdgroup tile, reducing static threadgroup memory from
+// exactly 32 KiB to 16 KiB and halving its per-thread BK working set.
 instantiate_bwd("flash_attn_train_bwd_bf16_d64",  bfloat16_t, 32, 16,  64, 4, 1)
-instantiate_bwd("flash_attn_train_bwd_bf16_d256", bfloat16_t, 16, 16, 256, 2, 1)
+instantiate_bwd("flash_attn_train_bwd_bf16_d256", bfloat16_t, 16,  8, 256, 2, 1)

@@ -979,8 +979,8 @@ fn test_backward_kernel_names_and_library_compiles() {
             Ok(pipeline) => {
                 if name == "flash_attn_train_bwd_bf16_d256" {
                     assert!(
-                        pipeline.static_threadgroup_memory_length() <= 24 * 1024,
-                        "D256 backward must retain M1 headroom: static threadgroup memory = {} bytes",
+                        pipeline.static_threadgroup_memory_length() <= 16 * 1024,
+                        "D256 backward must retain M1 memory and working-set headroom: static threadgroup memory = {} bytes",
                         pipeline.static_threadgroup_memory_length()
                     );
                 }

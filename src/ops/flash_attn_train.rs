@@ -732,21 +732,22 @@ fn dispatch_bwd_inner(
         .map_err(|e| MlxError::InvalidArgument(format!("flash_attn_train_bwd: alloc dV_f32: {e}")))?;
 
     // ── tile geometry ─────────────────────────────────────────────────────────
-    // The D=256 backward shader uses a 16-row/two-simdgroup tile so its static
-    // threadgroup memory is 24 KiB instead of exactly the 32 KiB device limit.
-    // The exact-limit variant fails pipeline creation on M1 while D=64 keeps
-    // the original 32-row/four-simdgroup geometry.
-    let (bq, bwd_wm) = if head_dim_expected == 256 {
-        (16_u32, 2_u32)
+    // The D=256 backward shader uses a 16-row/eight-key/two-simdgroup tile.
+    // Besides reducing static threadgroup memory from 32 KiB to 16 KiB, BK=8
+    // halves the per-thread score/gradient working set. The 24 KiB BQ=16,
+    // BK=16 variant still failed pipeline creation on M1. D=64 retains the
+    // original 32-row/16-key/four-simdgroup geometry.
+    let (bq, bwd_bk, bwd_wm) = if head_dim_expected == 256 {
+        (16_u32, 8_u32, 2_u32)
     } else {
-        (BQ, WM)
+        (BQ, BK, WM)
     };
     let nq = params.q_seq_len.div_ceil(bq);
-    let nk = params.k_seq_len.div_ceil(BK);
+    let nk = params.k_seq_len.div_ceil(bwd_bk);
     let nq_aligned = params.q_seq_len / bq;
-    let nk_aligned = params.k_seq_len / BK;
+    let nk_aligned = params.k_seq_len / bwd_bk;
     let ql_rem = params.q_seq_len % bq;
-    let kl_rem = params.k_seq_len % BK;
+    let kl_rem = params.k_seq_len % bwd_bk;
 
     let align_q = ql_rem == 0;
     let align_k = kl_rem == 0;
