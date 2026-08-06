@@ -11,6 +11,7 @@ using namespace metal;
 ///   buffer(1): output  — float array of shape [seq_len, head_dim]
 ///   buffer(2): params  — float4: (theta, head_dim_f, seq_len_f, 0)
 ///   buffer(3): positions — uint array of shape [seq_len]
+///   buffer(4): inv_freqs — host-precomputed float array [head_dim/2]
 ///
 /// Each thread processes one pair (2 elements) at coordinate (pair_idx, seq_idx).
 /// Grid: (head_dim / 2, seq_len, 1)
@@ -18,19 +19,20 @@ using namespace metal;
 /// RoPE positions routinely put the trigonometric argument outside [-pi, pi].
 /// Metal's fast sin/cos accuracy is only bounded inside that interval, and its
 /// range-reduction error differs across Apple GPU generations.  Select precise
-/// transcendentals explicitly so precompiled and runtime-source paths share one
-/// position-encoding contract regardless of the surrounding compiler flags.
+/// trig explicitly.  `pow` is not evaluated on the GPU: even its precise form
+/// has a bounded implementation-dependent error that is amplified by position,
+/// so the host supplies a cached deterministic inverse-frequency table.
 
 kernel void rope_f32(
     device const float *input      [[buffer(0)]],
     device float       *output     [[buffer(1)]],
     device const float *params     [[buffer(2)]],
     device const uint  *positions  [[buffer(3)]],
+    device const float *inv_freqs  [[buffer(4)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     const uint pair_idx  = tid.x;             // which pair within the head
     const uint seq_idx   = tid.y;             // which position in the sequence
-    const float theta    = params[0];
     const uint head_dim  = uint(params[1]);
     const uint half_dim  = head_dim / 2;
 
@@ -42,9 +44,7 @@ kernel void rope_f32(
     // Compute the rotation angle:
     //   freq = theta^(-2 * pair_idx / head_dim)
     //   angle = pos * freq
-    const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / precise::pow(theta, dim_ratio);
-    const float angle = float(pos) * freq;
+    const float angle = float(pos) * inv_freqs[pair_idx];
 
     const float cos_a = precise::cos(angle);
     const float sin_a = precise::sin(angle);
@@ -64,11 +64,11 @@ kernel void rope_f16(
     device half        *output     [[buffer(1)]],
     device const float *params     [[buffer(2)]],
     device const uint  *positions  [[buffer(3)]],
+    device const float *inv_freqs  [[buffer(4)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     const uint pair_idx  = tid.x;
     const uint seq_idx   = tid.y;
-    const float theta    = params[0];
     const uint head_dim  = uint(params[1]);
     const uint half_dim  = head_dim / 2;
 
@@ -76,9 +76,7 @@ kernel void rope_f16(
 
     const uint pos = positions[seq_idx];
 
-    const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / precise::pow(theta, dim_ratio);
-    const float angle = float(pos) * freq;
+    const float angle = float(pos) * inv_freqs[pair_idx];
 
     const float cos_a = precise::cos(angle);
     const float sin_a = precise::sin(angle);
@@ -97,11 +95,11 @@ kernel void rope_bf16(
     device bfloat       *output     [[buffer(1)]],
     device const float  *params     [[buffer(2)]],
     device const uint   *positions  [[buffer(3)]],
+    device const float  *inv_freqs  [[buffer(4)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     const uint pair_idx  = tid.x;
     const uint seq_idx   = tid.y;
-    const float theta    = params[0];
     const uint head_dim  = uint(params[1]);
     const uint half_dim  = head_dim / 2;
 
@@ -109,9 +107,7 @@ kernel void rope_bf16(
 
     const uint pos = positions[seq_idx];
 
-    const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / precise::pow(theta, dim_ratio);
-    const float angle = float(pos) * freq;
+    const float angle = float(pos) * inv_freqs[pair_idx];
 
     const float cos_a = precise::cos(angle);
     const float sin_a = precise::sin(angle);
@@ -139,6 +135,7 @@ kernel void rope_bf16(
 ///   buffer(2): params    — float4: (theta, head_dim_f, rope_dim_f, 0)
 ///   buffer(3): positions — uint array of shape [seq_len]
 ///   buffer(4): rope_params — uint2: (n_heads, 0)
+///   buffer(5): inv_freqs — host-precomputed float array [rope_dim/2]
 ///
 /// Grid: (rope_dim / 2, n_rows, 1)
 /// Each thread processes one pair: (input[row, pair_idx], input[row, pair_idx + half_rope])
@@ -149,11 +146,11 @@ kernel void rope_neox_bf16(
     device const float  *params      [[buffer(2)]],
     device const uint   *positions   [[buffer(3)]],
     device const uint   *rope_params [[buffer(4)]],
+    device const float  *inv_freqs   [[buffer(5)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     const uint pair_idx   = tid.x;          // which pair within rope_dim/2
     const uint row_idx    = tid.y;          // which row (flattened seq_len * n_heads)
-    const float theta     = params[0];
     const uint head_dim   = uint(params[1]);
     const uint rope_dim   = uint(params[2]);
     const uint half_dim   = head_dim / 2;   // MLX pairs (d[i], d[i + head_dim/2])
@@ -169,9 +166,7 @@ kernel void rope_neox_bf16(
     // Compute the rotation angle.
     // Denominator is head_dim (not rope_dim) to match mlx-lm's ProportionalRoPE:
     //   exponents = arange(0, rotated_dims, 2) / dims  (dims = full head_dim)
-    const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / precise::pow(theta, dim_ratio);
-    const float angle = float(pos) * freq;
+    const float angle = float(pos) * inv_freqs[pair_idx];
 
     const float cos_a = precise::cos(angle);
     const float sin_a = precise::sin(angle);
@@ -219,6 +214,7 @@ kernel void rope_neox_bf16(
 ///   buffer(3): positions     — uint array of shape [seq_len]
 ///   buffer(4): rope_params   — uint2: (n_heads, has_freq_factors)
 ///   buffer(5): freq_factors  — float array of shape [rope_dim/2] (or nullptr when unused)
+///   buffer(6): inv_freqs     — host-precomputed float array [rope_dim/2]
 ///
 /// Grid: (rope_dim / 2, n_rows, 1)
 /// Each thread processes one pair: (input[row, pair_idx], input[row, pair_idx + half_dim])
@@ -230,11 +226,11 @@ kernel void rope_neox_f32(
     device const uint  *positions    [[buffer(3)]],
     device const uint  *rope_params  [[buffer(4)]],
     device const float *freq_factors [[buffer(5)]],
+    device const float *inv_freqs    [[buffer(6)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     const uint pair_idx   = tid.x;          // which pair within rope_dim/2
     const uint row_idx    = tid.y;          // which row (flattened seq_len * n_heads)
-    const float theta     = params[0];
     const uint head_dim   = uint(params[1]);
     const uint rope_dim   = uint(params[2]);
     const uint half_dim   = head_dim / 2;   // split point for neox pairing
@@ -251,8 +247,7 @@ kernel void rope_neox_f32(
     // Compute the rotation angle.
     // Denominator is head_dim (not rope_dim) to match mlx-lm's ProportionalRoPE:
     //   exponents = arange(0, rotated_dims, 2) / dims  (dims = full head_dim)
-    const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    float freq = float(pos) / precise::pow(theta, dim_ratio);
+    float freq = float(pos) * inv_freqs[pair_idx];
 
     // Apply freq_factors if present: divide the base frequency by freq_factors[pair_idx]
     if (has_ff != 0u) {

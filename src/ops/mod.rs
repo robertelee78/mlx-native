@@ -72,6 +72,7 @@ pub mod quantized_matmul_id_ggml;
 pub mod repeat_tiled;
 pub mod rms_norm;
 pub mod rope;
+mod rope_freqs;
 pub mod rope_multi;
 pub mod rope_train;
 pub mod row_sum;

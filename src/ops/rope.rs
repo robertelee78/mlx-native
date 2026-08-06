@@ -12,6 +12,9 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
+use super::rope_freqs::with_inv_freqs;
+
 /// MSL source for the RoPE kernels (embedded at compile time).
 pub static ROPE_SHADER_SOURCE: &str = include_str!("../shaders/rope.metal");
 
@@ -22,6 +25,26 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("rope_bf16", ROPE_SHADER_SOURCE);
     registry.register_source("rope_neox_bf16", ROPE_SHADER_SOURCE);
     registry.register_source("rope_neox_f32", ROPE_SHADER_SOURCE);
+}
+
+fn freq_base_from_params(params_buf: &MlxBuffer, family: &str) -> Result<f32> {
+    if params_buf.dtype() != DType::F32 || params_buf.element_count() < 1 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{family} params must contain at least one f32 freq_base value"
+        )));
+    }
+    let freq_base = params_buf.as_logical_slice::<f32>()?[0];
+    if !freq_base.is_finite() || freq_base <= 0.0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{family} freq_base must be finite and positive, got {freq_base}"
+        )));
+    }
+    Ok(freq_base)
+}
+
+/// Release the current thread's cached inverse-frequency tables.
+pub fn clear_rope_freq_cache() {
+    super::rope_freqs::clear_cache();
 }
 
 /// Dispatch a RoPE operation on the GPU.
@@ -112,17 +135,22 @@ pub fn dispatch_rope(
     let tg_x = std::cmp::min(64, half_dim as u64);
     let tg_y = std::cmp::min(4, seq_len as u64);
 
-    encoder.encode(
-        pipeline,
-        &[
-            (0, input),
-            (1, output),
-            (2, params_buf),
-            (3, positions_buf),
-        ],
-        MTLSize::new(half_dim as u64, seq_len as u64, 1),
-        MTLSize::new(tg_x, tg_y, 1),
-    );
+    let freq_base = freq_base_from_params(params_buf, "RoPE")?;
+    with_inv_freqs(device, freq_base, head_dim, half_dim, |inv_freqs| {
+        encode_with_args(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(input)),
+                (1, KernelArg::Buffer(output)),
+                (2, KernelArg::Buffer(params_buf)),
+                (3, KernelArg::Buffer(positions_buf)),
+                (4, KernelArg::Buffer(inv_freqs)),
+            ],
+            MTLSize::new(half_dim as u64, seq_len as u64, 1),
+            MTLSize::new(tg_x, tg_y, 1),
+        );
+    })?;
 
     Ok(())
 }
@@ -174,8 +202,6 @@ pub fn dispatch_rope_neox_bf16(
     head_dim: u32,
     rope_dim: u32,
 ) -> Result<()> {
-    use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
-
     if rope_dim % 2 != 0 {
         return Err(MlxError::InvalidArgument(format!(
             "RoPE neox rope_dim must be even, got {}",
@@ -227,19 +253,23 @@ pub fn dispatch_rope_neox_bf16(
     let tg_x = std::cmp::min(64, half_rope as u64);
     let tg_y = std::cmp::min(4, n_rows as u64);
 
-    encode_with_args(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(input)),
-            (1, KernelArg::Buffer(output)),
-            (2, KernelArg::Buffer(params_buf)),
-            (3, KernelArg::Buffer(positions_buf)),
-            (4, KernelArg::Bytes(as_bytes(&gpu_rope_params))),
-        ],
-        MTLSize::new(half_rope as u64, n_rows as u64, 1),
-        MTLSize::new(tg_x, tg_y, 1),
-    );
+    let freq_base = freq_base_from_params(params_buf, "RoPE neox bf16")?;
+    with_inv_freqs(device, freq_base, head_dim, half_rope, |inv_freqs| {
+        encode_with_args(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(input)),
+                (1, KernelArg::Buffer(output)),
+                (2, KernelArg::Buffer(params_buf)),
+                (3, KernelArg::Buffer(positions_buf)),
+                (4, KernelArg::Bytes(as_bytes(&gpu_rope_params))),
+                (5, KernelArg::Buffer(inv_freqs)),
+            ],
+            MTLSize::new(half_rope as u64, n_rows as u64, 1),
+            MTLSize::new(tg_x, tg_y, 1),
+        );
+    })?;
 
     Ok(())
 }
@@ -299,8 +329,6 @@ pub fn dispatch_rope_neox_f32(
     head_dim: u32,
     rope_dim: u32,
 ) -> Result<()> {
-    use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
-
     if rope_dim % 2 != 0 {
         return Err(MlxError::InvalidArgument(format!(
             "RoPE neox f32 rope_dim must be even, got {}",
@@ -358,20 +386,24 @@ pub fn dispatch_rope_neox_f32(
     let tg_x = std::cmp::min(64, half_rope as u64);
     let tg_y = std::cmp::min(4, n_rows as u64);
 
-    encode_with_args(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(input)),
-            (1, KernelArg::Buffer(output)),
-            (2, KernelArg::Buffer(params_buf)),
-            (3, KernelArg::Buffer(positions_buf)),
-            (4, KernelArg::Bytes(as_bytes(&gpu_rope_params))),
-            (5, KernelArg::Buffer(ff_buf)),
-        ],
-        MTLSize::new(half_rope as u64, n_rows as u64, 1),
-        MTLSize::new(tg_x, tg_y, 1),
-    );
+    let freq_base = freq_base_from_params(params_buf, "RoPE neox f32")?;
+    with_inv_freqs(device, freq_base, head_dim, half_rope, |inv_freqs| {
+        encode_with_args(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(input)),
+                (1, KernelArg::Buffer(output)),
+                (2, KernelArg::Buffer(params_buf)),
+                (3, KernelArg::Buffer(positions_buf)),
+                (4, KernelArg::Bytes(as_bytes(&gpu_rope_params))),
+                (5, KernelArg::Buffer(ff_buf)),
+                (6, KernelArg::Buffer(inv_freqs)),
+            ],
+            MTLSize::new(half_rope as u64, n_rows as u64, 1),
+            MTLSize::new(tg_x, tg_y, 1),
+        );
+    })?;
 
     Ok(())
 }

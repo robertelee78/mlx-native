@@ -1894,7 +1894,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deepseek_tail_rope_is_the_only_precise_math_kernel_family() {
+    fn deepseek_tail_rope_is_only_family_requiring_precise_compile_option() {
         for name in [
             "deepseek_tail_rope_f32_to_bf16",
             "deepseek_tail_rope_bf16",

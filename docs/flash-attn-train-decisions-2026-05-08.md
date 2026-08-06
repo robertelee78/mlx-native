@@ -311,38 +311,60 @@ Full affine, GGML, and model-family regression coverage remains mandatory.
 
 ---
 
-## D8. Generic RoPE transcendental portability → **Request precise math in source**
+## D8. Generic RoPE transcendental portability → **Precise-only candidate rejected**
 
-**Decision:** Every `pow`, `sin`, and `cos` used by the generic `rope.metal`
-kernel family selects Metal's `precise::` implementation explicitly.  The
-existing CPU-reference tolerance remains unchanged.
+**Decision:** Retain explicit precise trigonometry, but reject device-side
+`precise::pow` as the inverse-frequency contract.  The existing CPU-reference
+tolerance remains unchanged.
 
 **Why:** Exact-candidate run 31077715900 proved the D6 training and D7 affine
 corrections on hosted M1, then exposed a separate long-standing generic RoPE
 assumption.  At position 2048 and theta 1e6, `rope_f32` returned `1.1819264`
 where the CPU reference returned `1.1818851` (absolute error `4.1246e-5`, over
 the existing `1e-5` gate).  The generic shader was compiled with Metal's
-default fast math; only `deepseek_tail_rope.metal` opted into precise FP32
-math.  Apple's Metal Shading Language numerical-compliance tables bound fast
-`sin`/`cos` only inside `[-pi, pi]` and state that error is larger outside that
-domain, while the precise implementations are bounded to four ULP for
-`sin`/`cos` and sixteen ULP for `pow`.
+default fast math.  Apple's Metal Shading Language numerical-compliance tables
+bound fast `sin`/`cos` only inside `[-pi, pi]` and state that error is larger
+outside that domain, while the precise implementations are bounded to four
+ULP for `sin`/`cos` and sixteen ULP for `pow`.
 
 Raising the test tolerance was rejected because it would accept
-generation-dependent position encodings.  An explicit source-level selection
-also keeps precompiled metallib and runtime-source fallback semantics aligned,
-independent of their surrounding compiler options.
+generation-dependent position encodings.  Run 31079074369 then falsified the
+complete precise-only candidate on the same M1: at pair 1, position 2048, the
+output differed by `2.2128e-5`.  `precise::pow` is bounded, not bit-identical
+across implementations; its error is inverted and multiplied by position
+before trigonometry.  Source selection aligned precompiled and runtime-source
+function classes, but did not establish one cross-generation contract.
 
-**Scope:** This changes only generic RoPE transcendental evaluation.  It does
-not change tensor layout, frequency exponents, pairing convention, or the
-already-precise DeepSeek tail-RoPE implementation.  Model-family parity and a
-fresh hosted M1 run remain mandatory before release.
+**Scope:** D8 records the falsification and is not itself release authority.
+
+---
+
+## D9. Generic RoPE inverse-frequency portability → **Cache host f32 tables**
+
+**Decision:** Compute `freq_base^(-2 * pair / denominator)` once using Rust's
+host f32 contract, cache the tiny table in a shared Metal buffer keyed by
+device/base/shape, and bind it to all five generic RoPE kernels.  The GPU no
+longer evaluates `pow`; it multiplies positions by the table and retains
+explicit precise `sin`/`cos`.
+
+**Why:** The CPU oracle already defines its inverse frequencies with f32
+`powf`.  Supplying those exact f32 values removes the amplified,
+generation-dependent operation while avoiding per-dispatch CPU work and GPU
+transcendental cost.  The table is at most `head_dim / 2` floats for these
+kernels and is reused across decode turns.  Both the embedded-metallib and
+runtime-source paths pass the unchanged theta-1e6 fixture locally; a fresh
+hosted M1 run remains a mandatory falsifier before release.
+
+**Scope:** Tensor layout, exponents, pairing, positions, and public dispatch
+signatures are unchanged.  This corrects the standard f32/f16/bf16 and NeoX
+bf16/f32 generic kernels only.  Other RoPE families require their own evidence
+before adopting the same mechanism; this decision does not assume they fail.
 
 ---
 
 ## Phase 1 unblocked
 
-With these eight decisions resolved, Phase 1 has no remaining
+With these nine decisions resolved, Phase 1 has no remaining
 architectural input required.  Implementer's worklist:
 
 1. New file `src/ops/rope.rs` + `src/shaders/rope_forward.metal` +

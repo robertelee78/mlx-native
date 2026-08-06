@@ -39,6 +39,123 @@ fn setup() -> (MlxDevice, KernelRegistry) {
     (device, registry)
 }
 
+fn run_low_precision_long_theta(dtype: DType) {
+    let (device, mut registry) = setup();
+    let theta = 1_000_000.0_f32;
+    let seq_len = 1_u32;
+    let head_dim = 16_u32;
+    let input_data: Vec<f32> = (0..head_dim as usize)
+        .map(|i| ((i as f32) * 0.3).sin())
+        .collect();
+    let positions = [2048_u32];
+
+    let mut input = device
+        .alloc_buffer(
+            head_dim as usize * dtype.size_of(),
+            dtype,
+            vec![1, head_dim as usize],
+        )
+        .expect("alloc low-precision input");
+    let output = device
+        .alloc_buffer(
+            head_dim as usize * dtype.size_of(),
+            dtype,
+            vec![1, head_dim as usize],
+        )
+        .expect("alloc low-precision output");
+    match dtype {
+        DType::F16 => input
+            .as_mut_slice::<half::f16>()
+            .expect("f16 input")
+            .iter_mut()
+            .zip(&input_data)
+            .for_each(|(dst, &src)| *dst = half::f16::from_f32(src)),
+        DType::BF16 => input
+            .as_mut_slice::<half::bf16>()
+            .expect("bf16 input")
+            .iter_mut()
+            .zip(&input_data)
+            .for_each(|(dst, &src)| *dst = half::bf16::from_f32(src)),
+        other => panic!("unexpected low-precision dtype {other}"),
+    }
+
+    let mut params = device
+        .alloc_buffer(16, DType::F32, vec![4])
+        .expect("alloc params");
+    params
+        .as_mut_slice::<f32>()
+        .expect("params")
+        .copy_from_slice(&[theta, head_dim as f32, 0.0, 0.0]);
+    let mut positions_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .expect("alloc positions");
+    positions_buf.as_mut_slice::<u32>().expect("positions")[0] = positions[0];
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    mlx_native::ops::rope::dispatch_rope(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input,
+        &output,
+        &params,
+        &positions_buf,
+        seq_len,
+        head_dim,
+    )
+    .expect("dispatch low-precision rope");
+    encoder.commit_and_wait().expect("commit");
+
+    let quantized_input: Vec<f32> = match dtype {
+        DType::F16 => input
+            .as_slice::<half::f16>()
+            .expect("read f16 input")
+            .iter()
+            .map(|v| v.to_f32())
+            .collect(),
+        DType::BF16 => input
+            .as_slice::<half::bf16>()
+            .expect("read bf16 input")
+            .iter()
+            .map(|v| v.to_f32())
+            .collect(),
+        _ => unreachable!(),
+    };
+    let expected = rope_ref(&quantized_input, &positions, head_dim as usize, theta);
+    let actual: Vec<f32> = match dtype {
+        DType::F16 => output
+            .as_slice::<half::f16>()
+            .expect("read f16 output")
+            .iter()
+            .map(|v| v.to_f32())
+            .collect(),
+        DType::BF16 => output
+            .as_slice::<half::bf16>()
+            .expect("read bf16 output")
+            .iter()
+            .map(|v| v.to_f32())
+            .collect(),
+        _ => unreachable!(),
+    };
+    let tolerance = if dtype == DType::F16 { 1.0e-3 } else { 8.0e-3 };
+    for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (got - want).abs() <= tolerance,
+            "{dtype} long-theta RoPE mismatch at {index}: expected={want}, got={got}"
+        );
+    }
+}
+
+#[test]
+fn test_rope_f16_theta_1000000() {
+    run_low_precision_long_theta(DType::F16);
+}
+
+#[test]
+fn test_rope_bf16_theta_1000000() {
+    run_low_precision_long_theta(DType::BF16);
+}
+
 #[test]
 fn test_rope_f32_theta_10000() {
     let (device, mut registry) = setup();
