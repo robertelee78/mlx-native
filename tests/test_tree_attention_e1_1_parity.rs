@@ -991,6 +991,26 @@ fn adr_037_e1_3_fixed_square_dk256_long_prefix_2026_05_22() {
     );
 }
 
+#[test]
+fn tree_attention_tail_does_not_read_past_short_kv_capacity_2026_08_06() {
+    // Regression: the main kernel processes KV in C=32 rows. A logical
+    // mask guarded positions [kv_seq_len, 32), but the old QK and V loops
+    // still dereferenced those rows. With this production-shaped short
+    // tree, capacity is exactly 3, so any tail load is physically OOB.
+    assert_fixed_square_matches_cpu(
+        4,
+        2,
+        128,
+        0,
+        2,
+        3,
+        1.0 / (128.0_f32).sqrt(),
+        0x2026_0806,
+        1e-2,
+        "dk128 short-capacity tail (kv=capacity=3 < C=32)",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Phase E1.4 — dynamic asymmetric tree vs CPU reference
 // --------------------------------------------------------------------------

@@ -192,9 +192,17 @@ kernel void tree_attention_impl(
 
             FOR_UNROLL (short cc = 0; cc < C; ++cc) {
                 float partial = 0.0f;
-                FOR_UNROLL (short ii = 0; ii < DK4 / NL; ++ii) {
-                    partial += dot(float4(pk4[cc * DK4 + ii * NL]),
-                                   float4(pq4[ii * NL]));
+                // The final C-wide chunk may extend beyond both kv_seq_len
+                // and kv_capacity (for example a short tree verification
+                // with capacity < C). The mask suppresses those logical
+                // positions, but it cannot make an out-of-bounds K load
+                // safe. Do not dereference a row that is outside the valid
+                // KV prefix.
+                if (ic + (uint)cc < kv_seq_len) {
+                    FOR_UNROLL (short ii = 0; ii < DK4 / NL; ++ii) {
+                        partial += dot(float4(pk4[cc * DK4 + ii * NL]),
+                                       float4(pq4[ii * NL]));
+                    }
                 }
                 mqk[cc] = simd_sum(partial);
             }
@@ -236,8 +244,13 @@ kernel void tree_attention_impl(
 
             FOR_UNROLL (short cc = 0; cc < C; ++cc) {
                 float weight = ss[cc];
-                FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
-                    lo[ii] += float4(pv4[cc * DV4 + ii * NL]) * weight;
+                // Mirror the K-side tail guard. A masked weight of zero is
+                // not sufficient: evaluating pv4 first is still an invalid
+                // device-memory read when the tail crosses capacity.
+                if (ic + (uint)cc < kv_seq_len) {
+                    FOR_UNROLL (short ii = 0; ii < DV4 / NL; ++ii) {
+                        lo[ii] += float4(pv4[cc * DV4 + ii * NL]) * weight;
+                    }
                 }
             }
 
