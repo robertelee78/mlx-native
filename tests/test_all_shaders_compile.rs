@@ -11,7 +11,11 @@
 //!
 //! This test closes that gap by compiling every `.metal` file in `src/shaders/`
 //! at test time via `xcrun -sdk macosx metal -c`. Any compile error fails the
-//! test loud; any future iter-68-style typo is caught before it ships.
+//! test loud; any future iter-68-style typo is caught before it ships. The one
+//! capability exception is an SDK that does not provide `<metal_tensor>`: only
+//! sources that explicitly include that header may report that exact missing-
+//! header error. Those optional accelerators are runtime-probed and have
+//! non-tensor fallbacks on older Apple GPUs.
 //!
 //! Warnings (unused variables, etc.) are tolerated — they do not affect
 //! pipeline registration. Only actual compile errors (non-zero exit code +
@@ -35,6 +39,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+fn is_unavailable_metal_tensor_capability(source: &str, stderr: &str) -> bool {
+    source.contains("#include <metal_tensor>")
+        && stderr.contains("fatal error: 'metal_tensor' file not found")
+}
+
 #[test]
 fn all_metal_shaders_compile_via_xcrun() {
     let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
@@ -46,6 +55,7 @@ fn all_metal_shaders_compile_via_xcrun() {
 
     let mut compiled = 0;
     let mut errors: Vec<String> = Vec::new();
+    let mut unavailable_tensor_shaders: Vec<String> = Vec::new();
 
     for entry in fs::read_dir(&shader_dir).expect("read src/shaders/") {
         let path = entry.expect("dir entry").path();
@@ -72,7 +82,12 @@ fn all_metal_shaders_compile_via_xcrun() {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            errors.push(format!("=== COMPILE ERROR: {name} ===\n{stderr}"));
+            let source = fs::read_to_string(&path).expect("read Metal source after compile error");
+            if is_unavailable_metal_tensor_capability(&source, &stderr) {
+                unavailable_tensor_shaders.push(name);
+            } else {
+                errors.push(format!("=== COMPILE ERROR: {name} ===\n{stderr}"));
+            }
         }
     }
 
@@ -92,7 +107,34 @@ fn all_metal_shaders_compile_via_xcrun() {
     }
 
     eprintln!(
-        "all_metal_shaders_compile_via_xcrun: {} shaders compile clean",
-        compiled
+        "all_metal_shaders_compile_via_xcrun: {} shaders checked; {} tensor shaders unavailable on this SDK",
+        compiled,
+        unavailable_tensor_shaders.len(),
     );
+    if !unavailable_tensor_shaders.is_empty() {
+        eprintln!(
+            "optional <metal_tensor> capability unavailable for: {}",
+            unavailable_tensor_shaders.join(", ")
+        );
+    }
+}
+
+#[test]
+fn capability_exception_is_exact_and_fail_closed() {
+    let tensor_source = "#include <metal_stdlib>\n#include <metal_tensor>\nkernel void k() {}";
+    let ordinary_source = "#include <metal_stdlib>\nkernel void k() {}";
+    let missing_header = "fatal error: 'metal_tensor' file not found";
+
+    assert!(is_unavailable_metal_tensor_capability(
+        tensor_source,
+        missing_header
+    ));
+    assert!(!is_unavailable_metal_tensor_capability(
+        ordinary_source,
+        missing_header
+    ));
+    assert!(!is_unavailable_metal_tensor_capability(
+        tensor_source,
+        "error: use of undeclared identifier 'broken_kernel'"
+    ));
 }
