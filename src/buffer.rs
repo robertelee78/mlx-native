@@ -7,6 +7,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use memmap2::Mmap;
 use metal::Buffer as MetalBuffer;
 
 use crate::dtypes::DType;
@@ -42,6 +43,9 @@ pub struct MlxBuffer {
     /// Byte offset into the underlying Metal buffer (for slice views).
     /// Zero for normally-allocated buffers.
     byte_offset: u64,
+    /// Number of bytes belonging to this logical buffer view. This differs
+    /// from the page-rounded Metal allocation length for file-backed tensors.
+    data_byte_len: usize,
 }
 
 /// Owns a single Metal buffer allocation plus an optional residency-set
@@ -61,8 +65,13 @@ pub struct MlxBuffer {
 /// storm (~880 commits/decode-token in iter8d/8e) into
 /// at most one commit per CB submission.
 pub(crate) struct MlxBufferStorage {
+    // Keep the Metal object before `file_backing`: Rust drops fields in
+    // declaration order after `Drop::drop`, so Metal releases its no-copy
+    // view before the mmap that supplies the bytes is unmapped.
     inner: MetalBuffer,
     residency_set: Option<ResidencySet>,
+    file_backing: Option<Arc<Mmap>>,
+    cpu_writable: bool,
 }
 
 impl Drop for MlxBufferStorage {
@@ -95,6 +104,7 @@ impl Clone for MlxBuffer {
             dtype: self.dtype,
             shape: self.shape.clone(),
             byte_offset: self.byte_offset,
+            data_byte_len: self.data_byte_len,
         }
     }
 }
@@ -120,14 +130,18 @@ impl MlxBuffer {
     /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer) or
     /// [`MlxBufferPool::register_existing`](crate::MlxBufferPool::register_existing).
     pub fn from_raw(inner: MetalBuffer, dtype: DType, shape: Vec<usize>) -> Self {
+        let data_byte_len = inner.length() as usize;
         Self {
             storage: Arc::new(MlxBufferStorage {
                 inner,
                 residency_set: None,
+                file_backing: None,
+                cpu_writable: true,
             }),
             dtype,
             shape,
             byte_offset: 0,
+            data_byte_len,
         }
     }
 
@@ -155,22 +169,104 @@ impl MlxBuffer {
         // llama.cpp's ggml-metal-device.m:1378-1382 pattern.
         residency_set.add_allocation(&inner);
 
+        let data_byte_len = inner.length() as usize;
         Self {
             storage: Arc::new(MlxBufferStorage {
                 inner,
                 residency_set: Some(residency_set),
+                file_backing: None,
+                cpu_writable: true,
             }),
             dtype,
             shape,
             byte_offset: 0,
+            data_byte_len,
         }
+    }
+
+    /// Wrap a read-only file mapping in a no-copy Metal buffer.
+    ///
+    /// `byte_offset` identifies the tensor's first byte inside the page-aligned
+    /// Metal view. The mapping is retained by the shared storage so clones and
+    /// slice views cannot outlive the file-backed bytes.
+    pub(crate) fn from_file_mapping(
+        inner: MetalBuffer,
+        dtype: DType,
+        shape: Vec<usize>,
+        byte_offset: u64,
+        data_byte_len: usize,
+        file_backing: Arc<Mmap>,
+        residency_set: Option<ResidencySet>,
+    ) -> Self {
+        if let Some(set) = residency_set.as_ref() {
+            set.add_allocation(&inner);
+        }
+
+        Self {
+            storage: Arc::new(MlxBufferStorage {
+                inner,
+                residency_set,
+                file_backing: Some(file_backing),
+                cpu_writable: false,
+            }),
+            dtype,
+            shape,
+            byte_offset,
+            data_byte_len,
+        }
+    }
+
+    /// Create a typed byte-range view into this buffer's logical data region.
+    ///
+    /// This is used by GGUF segment mappings: a small number of large Metal
+    /// resources own the file mappings, while each tensor carries its own
+    /// dtype, shape, offset, and packed byte length.
+    pub(crate) fn data_view(
+        &self,
+        relative_byte_offset: usize,
+        data_byte_len: usize,
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<Self> {
+        let relative_end = relative_byte_offset
+            .checked_add(data_byte_len)
+            .ok_or_else(|| MlxError::InvalidArgument("Buffer data view range overflow".into()))?;
+        if relative_end > self.data_byte_len {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer data view [{relative_byte_offset}, {relative_end}) exceeds logical data length {}",
+                self.data_byte_len
+            )));
+        }
+        let byte_offset = self
+            .byte_offset
+            .checked_add(relative_byte_offset as u64)
+            .ok_or_else(|| MlxError::InvalidArgument("Buffer data view offset overflow".into()))?;
+        let physical_end = usize::try_from(byte_offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(data_byte_len))
+            .ok_or_else(|| MlxError::InvalidArgument("Buffer data view range overflow".into()))?;
+        if physical_end > self.byte_len() {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer data view ends at {physical_end}, beyond Metal length {}",
+                self.byte_len()
+            )));
+        }
+
+        Ok(Self {
+            storage: self.storage.clone(),
+            dtype,
+            shape,
+            byte_offset,
+            data_byte_len,
+        })
     }
 
     /// Create a zero-copy slice view of this buffer.
     ///
     /// Returns a new `MlxBuffer` that shares the same underlying Metal buffer
-    /// but starts at `byte_offset` bytes from the beginning and contains
-    /// `n_elements` elements of type `dtype`. No data is copied.
+    /// but starts at `byte_offset` bytes from this handle's logical data start
+    /// and contains `n_elements` elements of type `dtype`. Nested views
+    /// therefore compose their offsets. No data is copied.
     ///
     /// The slice view shares the parent's residency-set guard via the
     /// `Arc<MlxBufferStorage>`, so it does NOT trigger a second
@@ -182,23 +278,35 @@ impl MlxBuffer {
     ///
     /// # Panics
     ///
-    /// Panics if `byte_offset + n_elements * dtype.size_of() > self.inner.length()`.
+    /// Panics if `byte_offset + n_elements * dtype.size_of()` exceeds this
+    /// handle's logical data region.
     #[inline]
     pub fn slice_view(&self, byte_offset: u64, n_elements: usize) -> Self {
-        let end = byte_offset as usize + n_elements * self.dtype.size_of();
+        let view_byte_len = n_elements
+            .checked_mul(self.dtype.size_of())
+            .expect("slice_view: byte length overflow");
+        let relative_end = usize::try_from(byte_offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(view_byte_len))
+            .expect("slice_view: range overflow");
         assert!(
-            end <= self.storage.inner.length() as usize,
-            "slice_view: out of bounds (byte_offset={}, n_elements={}, dtype_size={}, buf_len={})",
+            relative_end <= self.data_byte_len,
+            "slice_view: out of logical bounds (byte_offset={}, n_elements={}, dtype_size={}, data_len={})",
             byte_offset,
             n_elements,
             self.dtype.size_of(),
-            self.storage.inner.length()
+            self.data_byte_len
         );
+        let absolute_byte_offset = self
+            .byte_offset
+            .checked_add(byte_offset)
+            .expect("slice_view: absolute offset overflow");
         Self {
             storage: self.storage.clone(),
             dtype: self.dtype,
             shape: vec![n_elements],
-            byte_offset,
+            byte_offset: absolute_byte_offset,
+            data_byte_len: view_byte_len,
         }
     }
 
@@ -220,6 +328,15 @@ impl MlxBuffer {
     #[inline]
     pub fn byte_len(&self) -> usize {
         self.storage.inner.length() as usize
+    }
+
+    /// Byte length of the logical data region represented by this handle.
+    ///
+    /// Owned allocations normally match [`byte_len`](Self::byte_len).
+    /// File-backed buffers exclude page-alignment prefix and suffix bytes.
+    #[inline]
+    pub fn data_byte_len(&self) -> usize {
+        self.data_byte_len
     }
 
     /// Number of elements (product of shape dimensions, or `byte_len / dtype.size_of()`).
@@ -254,6 +371,18 @@ impl MlxBuffer {
         self.byte_offset
     }
 
+    /// Whether the Metal buffer reads directly from a file mapping.
+    #[inline]
+    pub fn is_file_backed(&self) -> bool {
+        self.storage.file_backing.is_some()
+    }
+
+    /// Whether typed CPU mutation is supported for this allocation.
+    #[inline]
+    pub fn is_cpu_writable(&self) -> bool {
+        self.storage.cpu_writable
+    }
+
     /// Consume self and return the inner `metal::Buffer` (used by buffer pool).
     ///
     /// If this is the last clone of the underlying `Arc<MlxBufferStorage>`,
@@ -281,9 +410,12 @@ impl MlxBuffer {
 
     // ---- typed CPU access (zero-copy on unified memory) ----
 
-    /// View the buffer contents as a typed slice.
+    /// View this handle's logical data region as a typed slice.
     ///
-    /// Returns an error if the buffer byte length is not an exact multiple of
+    /// This honors [`byte_offset`](Self::byte_offset) and
+    /// [`data_byte_len`](Self::data_byte_len), so tensor and nested slice
+    /// views never expose page-alignment bytes or adjacent tensors. Returns an
+    /// error if the logical data length is not an exact multiple of
     /// `size_of::<T>()`.
     ///
     /// # Safety contract
@@ -298,20 +430,28 @@ impl MlxBuffer {
                 "Cannot view buffer as zero-sized type".into(),
             ));
         }
-        let byte_len = self.byte_len();
+        let byte_len = self.data_byte_len;
         if byte_len % elem_size != 0 {
             return Err(MlxError::InvalidArgument(format!(
                 "Buffer byte length {byte_len} is not a multiple of element size {elem_size}"
             )));
         }
-        let ptr = self.contents_ptr();
-        if ptr.is_null() {
+        let base = self.contents_ptr();
+        if base.is_null() {
             return Err(MlxError::BufferAllocationError { bytes: byte_len });
         }
+        let ptr = unsafe { (base as *const u8).add(self.byte_offset as usize) };
+        if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer data offset {} is not aligned for {}",
+                self.byte_offset,
+                std::any::type_name::<T>()
+            )));
+        }
         let count = byte_len / elem_size;
-        // SAFETY: Metal guarantees the pointer is valid for `byte_len` bytes and
-        // properly aligned for any type on Apple Silicon shared memory.  The
-        // caller upholds the type-match and no-concurrent-GPU-write contract.
+        // SAFETY: the handle's construction validates that byte_offset plus
+        // data_byte_len remains within the Metal allocation. The alignment
+        // check above and caller's type/synchronization contract cover T.
         let slice = unsafe { std::slice::from_raw_parts(ptr as *const T, count) };
         Ok(slice)
     }
@@ -322,21 +462,34 @@ impl MlxBuffer {
     /// must ensure exclusive access (no other references to this buffer's memory
     /// exist).
     pub fn as_mut_slice<T: bytemuck::Pod>(&mut self) -> Result<&mut [T]> {
+        if !self.storage.cpu_writable {
+            return Err(MlxError::InvalidArgument(
+                "Cannot mutate a read-only file-backed buffer".into(),
+            ));
+        }
         let elem_size = std::mem::size_of::<T>();
         if elem_size == 0 {
             return Err(MlxError::InvalidArgument(
                 "Cannot view buffer as zero-sized type".into(),
             ));
         }
-        let byte_len = self.byte_len();
+        let byte_len = self.data_byte_len;
         if byte_len % elem_size != 0 {
             return Err(MlxError::InvalidArgument(format!(
                 "Buffer byte length {byte_len} is not a multiple of element size {elem_size}"
             )));
         }
-        let ptr = self.contents_ptr();
-        if ptr.is_null() {
+        let base = self.contents_ptr();
+        if base.is_null() {
             return Err(MlxError::BufferAllocationError { bytes: byte_len });
+        }
+        let ptr = unsafe { (base as *mut u8).add(self.byte_offset as usize) };
+        if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer data offset {} is not aligned for {}",
+                self.byte_offset,
+                std::any::type_name::<T>()
+            )));
         }
         let count = byte_len / elem_size;
         // SAFETY: same as as_slice, plus caller ensures exclusive mutable access.
@@ -360,6 +513,11 @@ impl MlxBuffer {
 
     /// Mutable counterpart to [`as_logical_slice`](Self::as_logical_slice).
     pub fn as_logical_mut_slice<T: bytemuck::Pod>(&mut self) -> Result<&mut [T]> {
+        if !self.storage.cpu_writable {
+            return Err(MlxError::InvalidArgument(
+                "Cannot mutate a read-only file-backed buffer".into(),
+            ));
+        }
         let (ptr, count) = self.logical_cpu_view::<T>()?;
         // SAFETY: same as as_logical_slice, plus `&mut self` provides the
         // exclusive handle required by the mutable CPU-access contract.
@@ -382,6 +540,12 @@ impl MlxBuffer {
         if logical_bytes % elem_size != 0 {
             return Err(MlxError::InvalidArgument(format!(
                 "Buffer logical byte length {logical_bytes} is not a multiple of element size {elem_size}"
+            )));
+        }
+        if logical_bytes > self.data_byte_len {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer logical byte length {logical_bytes} exceeds data length {}",
+                self.data_byte_len
             )));
         }
         let offset = self.byte_offset as usize;
@@ -448,6 +612,7 @@ impl MlxBuffer {
             dtype: self.dtype,
             shape,
             byte_offset: self.byte_offset,
+            data_byte_len: self.data_byte_len,
         })
     }
 }
@@ -458,6 +623,9 @@ impl fmt::Debug for MlxBuffer {
             .field("dtype", &self.dtype)
             .field("shape", &self.shape)
             .field("byte_len", &self.byte_len())
+            .field("data_byte_len", &self.data_byte_len())
+            .field("byte_offset", &self.byte_offset)
+            .field("file_backed", &self.is_file_backed())
             .finish()
     }
 }

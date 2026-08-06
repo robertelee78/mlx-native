@@ -14,7 +14,7 @@ use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::flash_attn_prefill::FlashAttnPrefillParams;
-use crate::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_bf16_d512_with_sinks;
+use crate::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks;
 
 pub const DEEPSEEK_SPARSE_HEADS: usize = 64;
 pub const DEEPSEEK_SPARSE_HEAD_DIM: usize = 512;
@@ -385,21 +385,21 @@ pub fn dispatch_deepseek_sparse_attention_flash_prefill(
     );
     encoder.memory_barrier();
 
-    dispatch_flash_attn_prefill_bf16_d512_with_sinks(
+    dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks(
         encoder,
         device,
         registry,
         q,
         gathered_kv,
         gathered_kv,
-        Some(mask),
+        mask,
         sinks,
         output,
         &FlashAttnPrefillParams {
-            n_heads: DEEPSEEK_SPARSE_HEADS as u32,
+            n_heads: 8,
             n_kv_heads: 1,
             head_dim: DEEPSEEK_SPARSE_HEAD_DIM as u32,
-            seq_len_q: 1,
+            seq_len_q: 8,
             seq_len_k: params.top_k,
             batch: u32::try_from(flash_batches).map_err(|_| {
                 MlxError::InvalidArgument("deepseek sparse flash batch count exceeds u32".into())

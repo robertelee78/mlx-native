@@ -8,6 +8,11 @@ use mlx_native::ops::deepseek_sparse_attention::{
     dispatch_deepseek_sparse_attention_flash_prefill, register, DeepSeekSparseAttentionParams,
     DEEPSEEK_INDEX_TOP_K, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM,
 };
+use mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams;
+use mlx_native::ops::flash_attn_prefill_d512::{
+    dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks,
+    dispatch_flash_attn_prefill_bf16_d512_with_sinks,
+};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 const H: usize = DEEPSEEK_SPARSE_HEADS;
@@ -419,4 +424,106 @@ fn malformed_shapes_dtypes_and_params_are_rejected_before_encoding() {
         &params,
     )
     .is_err());
+}
+
+#[test]
+fn heads_as_rows_is_bit_exact_to_one_head_per_tile() {
+    const QUERIES: usize = 16;
+    const TOP_K: usize = 640;
+
+    let device = MlxDevice::new().unwrap();
+    let q = bf16_buffer(
+        &device,
+        &data(QUERIES * H * D, 11, 0.0015),
+        vec![QUERIES, H, D],
+    );
+    let gathered = bf16_buffer(
+        &device,
+        &data(QUERIES * TOP_K * D, 13, 0.002),
+        vec![QUERIES, 1, TOP_K, D],
+    );
+    let sinks = f32_buffer(
+        &device,
+        &(0..H)
+            .map(|head| head as f32 * 0.007 - 0.2)
+            .collect::<Vec<_>>(),
+        vec![H],
+    );
+    let mask_values = (0..QUERIES * TOP_K)
+        .map(|i| {
+            if i % 97 == 0 {
+                bf16::NEG_INFINITY
+            } else {
+                bf16::ZERO
+            }
+        })
+        .collect::<Vec<_>>();
+    let mask = bf16_buffer(&device, &mask_values, vec![QUERIES, 1, TOP_K]);
+    let legacy_out = device
+        .alloc_buffer(QUERIES * H * D * 2, DType::BF16, vec![QUERIES, H, D])
+        .unwrap();
+    let packed_out = device
+        .alloc_buffer(QUERIES * H * D * 2, DType::BF16, vec![QUERIES, H, D])
+        .unwrap();
+    let legacy_params = FlashAttnPrefillParams {
+        n_heads: H as u32,
+        n_kv_heads: 1,
+        head_dim: D as u32,
+        seq_len_q: 1,
+        seq_len_k: TOP_K as u32,
+        batch: QUERIES as u32,
+        scale: 1.0 / (D as f32).sqrt(),
+        do_causal: false,
+    };
+    let packed_params = FlashAttnPrefillParams {
+        n_heads: 8,
+        seq_len_q: 8,
+        ..legacy_params
+    };
+    let mut registry = KernelRegistry::new();
+
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_flash_attn_prefill_bf16_d512_with_sinks(
+        &mut encoder,
+        &device,
+        &mut registry,
+        &q,
+        &gathered,
+        &gathered,
+        Some(&mask),
+        &sinks,
+        &legacy_out,
+        &legacy_params,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks(
+        &mut encoder,
+        &device,
+        &mut registry,
+        &q,
+        &gathered,
+        &gathered,
+        &mask,
+        &sinks,
+        &packed_out,
+        &packed_params,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+
+    let elements = QUERIES * H * D;
+    let legacy =
+        unsafe { std::slice::from_raw_parts(legacy_out.contents_ptr() as *const bf16, elements) };
+    let packed =
+        unsafe { std::slice::from_raw_parts(packed_out.contents_ptr() as *const bf16, elements) };
+    for (index, (legacy, packed)) in legacy.iter().zip(packed).enumerate() {
+        assert_eq!(
+            legacy.to_bits(),
+            packed.to_bits(),
+            "heads-as-rows output diverged at element {index}"
+        );
+    }
 }

@@ -254,7 +254,7 @@ fn ranges_from_buffers(bufs: &[&MlxBuffer]) -> Vec<MemRange> {
     bufs.iter()
         .map(|b| {
             let base = b.contents_ptr() as usize + b.byte_offset() as usize;
-            let extent = (b.byte_len()).saturating_sub(b.byte_offset() as usize);
+            let extent = b.data_byte_len();
             (base, base + extent)
         })
         .collect()

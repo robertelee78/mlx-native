@@ -19,9 +19,10 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use half::f16;
+use memmap2::{Mmap, MmapOptions};
 
 use crate::ops::quantized_matmul_ggml::GgmlType;
 use crate::{DType, MlxBuffer, MlxBufferPool, MlxDevice, MlxError, Result};
@@ -164,6 +165,67 @@ pub struct GgufFile {
     /// Absolute byte offset in the file where tensor data begins.
     tensor_data_offset: u64,
     reader: Mutex<BufReader<std::fs::File>>,
+}
+
+/// File-backed Metal segments and typed tensor views for one GGUF/device pair.
+///
+/// Large models are split only when they exceed Metal's per-buffer limit.
+/// Individual tensors are views into these shared resources, matching the
+/// resource topology used by llama.cpp's Metal mmap loader.
+pub struct GgufMappedTensorSet<'a> {
+    gguf: &'a GgufFile,
+    segments: Vec<MappedTensorSegment>,
+}
+
+struct MappedTensorSegment {
+    file_start: usize,
+    file_end: usize,
+    buffer: MlxBuffer,
+}
+
+impl GgufMappedTensorSet<'_> {
+    /// Return a typed view of a raw GGUF tensor without allocating or copying
+    /// its payload.
+    pub fn load_tensor(&self, name: &str) -> Result<MlxBuffer> {
+        let info = self.gguf.tensors.get(name).ok_or_else(|| {
+            MlxError::GgufParseError(format!("tensor '{name}' not found in GGUF file"))
+        })?;
+        let file_start = self
+            .gguf
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(format!(
+                    "tensor '{}' file offset does not fit this host",
+                    info.name
+                ))
+            })?;
+        let file_end = file_start.checked_add(info.byte_len).ok_or_else(|| {
+            MlxError::InvalidArgument(format!("tensor '{}' file range overflow", info.name))
+        })?;
+        let segment = self
+            .segments
+            .iter()
+            .find(|segment| segment.file_start <= file_start && file_end <= segment.file_end)
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(format!(
+                    "tensor '{}' is not contained in a mapped GGUF segment",
+                    info.name
+                ))
+            })?;
+        segment.buffer.data_view(
+            file_start - segment.file_start,
+            info.byte_len,
+            raw_tensor_dtype(info.ggml_type),
+            info.shape.clone(),
+        )
+    }
+
+    /// Number of shared Metal resources backing all tensor views.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -759,8 +821,8 @@ fn dequantize_q4_k(data: &[u8], output: &mut [f32]) -> Result<()> {
 
         let d = f16_from_le_bytes([block[0], block[1]]);
         let dmin = f16_from_le_bytes([block[2], block[3]]);
-        let scales = &block[4..16];   // 12 bytes
-        let qs = &block[16..144];     // 128 bytes
+        let scales = &block[4..16]; // 12 bytes
+        let qs = &block[16..144]; // 128 bytes
 
         let out = &mut output[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
 
@@ -849,11 +911,9 @@ fn dequantize_q6_k(data: &[u8], output: &mut [f32]) -> Result<()> {
                 let is = l / 16; // 0 for l in 0..16, 1 for l in 16..32
 
                 let q1 = ((ql_base[l] & 0xF) | ((qh_base[l] & 3) << 4)) as i8 - 32_i8;
-                let q2 = ((ql_base[l + 32] & 0xF) | (((qh_base[l] >> 2) & 3) << 4)) as i8
-                    - 32_i8;
+                let q2 = ((ql_base[l + 32] & 0xF) | (((qh_base[l] >> 2) & 3) << 4)) as i8 - 32_i8;
                 let q3 = ((ql_base[l] >> 4) | (((qh_base[l] >> 4) & 3) << 4)) as i8 - 32_i8;
-                let q4 = ((ql_base[l + 32] >> 4) | (((qh_base[l] >> 6) & 3) << 4)) as i8
-                    - 32_i8;
+                let q4 = ((ql_base[l + 32] >> 4) | (((qh_base[l] >> 6) & 3) << 4)) as i8 - 32_i8;
 
                 out_base[l] = d * sc_base[is] as i8 as f32 * q1 as f32;
                 out_base[l + 32] = d * sc_base[is + 2] as i8 as f32 * q2 as f32;
@@ -868,9 +928,7 @@ fn dequantize_q6_k(data: &[u8], output: &mut [f32]) -> Result<()> {
 /// Dequantize F16 data to F32.
 fn dequantize_f16(data: &[u8], output: &mut [f32]) -> Result<()> {
     if data.len() % 2 != 0 {
-        return Err(MlxError::GgufParseError(
-            "F16 data length not even".into(),
-        ));
+        return Err(MlxError::GgufParseError("F16 data length not even".into()));
     }
     let count = data.len() / 2;
     if output.len() < count {
@@ -1236,14 +1294,12 @@ impl GgufFile {
             shape.reverse();
 
             let ggml_type_id = read_u32(&mut reader)?;
-            let ggml_type = ggml_type_from_u32(ggml_type_id).map_err(|e| {
-                MlxError::GgufParseError(format!("tensor '{name}': {e}"))
-            })?;
+            let ggml_type = ggml_type_from_u32(ggml_type_id)
+                .map_err(|e| MlxError::GgufParseError(format!("tensor '{name}': {e}")))?;
 
             let offset = read_u64(&mut reader)?;
-            let byte_len = compute_byte_len(&shape, ggml_type).map_err(|e| {
-                MlxError::GgufParseError(format!("tensor '{name}': {e}"))
-            })?;
+            let byte_len = compute_byte_len(&shape, ggml_type)
+                .map_err(|e| MlxError::GgufParseError(format!("tensor '{name}': {e}")))?;
 
             tensors.insert(
                 name.clone(),
@@ -1360,6 +1416,147 @@ impl GgufFile {
         Ok(buf)
     }
 
+    /// Map one tensor through its own virtual-address range.
+    ///
+    /// Metal resources must not overlap in virtual memory. Multiple tensors
+    /// commonly share one file page, so reusing a whole-file mapping for every
+    /// tensor would create aliased `MTLBuffer` resources. Independent mmap
+    /// views retain file-backed paging while giving each resource a distinct
+    /// address range.
+    fn tensor_mapping(&self, abs_offset: usize, byte_len: usize) -> Result<(Arc<Mmap>, usize)> {
+        let page_size = host_page_size()?;
+        let abs_end = abs_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| MlxError::InvalidArgument("GGUF tensor file range overflow".into()))?;
+        let aligned_start = abs_offset / page_size * page_size;
+        let offset_in_mapping = abs_offset - aligned_start;
+        let mapping_len = offset_in_mapping.checked_add(byte_len).ok_or_else(|| {
+            MlxError::InvalidArgument("GGUF tensor mapping length overflow".into())
+        })?;
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MlxError::GgufParseError("reader mutex poisoned".into()))?;
+        let file_len = reader
+            .get_ref()
+            .metadata()
+            .map_err(|e| MlxError::IoError(format!("stat GGUF before mapping: {e}")))?
+            .len();
+        if u64::try_from(abs_end).map_or(true, |end| end > file_len) {
+            return Err(MlxError::GgufParseError(format!(
+                "GGUF tensor range [{abs_offset}, {abs_end}) exceeds file length {file_len}"
+            )));
+        }
+        // SAFETY: `aligned_start` is page-aligned, the complete logical range
+        // was checked against the current file length above, and the read-only
+        // mapping owns its virtual range independently of the file descriptor.
+        let mapping = unsafe {
+            MmapOptions::new()
+                .offset(aligned_start as u64)
+                .len(mapping_len)
+                .map(reader.get_ref())
+        }
+        .map_err(|e| MlxError::IoError(format!("map GGUF tensor range: {e}")))?;
+        Ok((Arc::new(mapping), offset_in_mapping))
+    }
+
+    /// Map all GGUF tensor payloads into the minimum practical number of
+    /// no-copy Metal resources for this device.
+    ///
+    /// The returned buffers are read-only weight views. Callers must not bind
+    /// them as kernel outputs or otherwise request GPU writes to the mapped
+    /// file pages.
+    pub fn map_tensor_data<'a>(&'a self, device: &MlxDevice) -> Result<GgufMappedTensorSet<'a>> {
+        let page_size = host_page_size()?;
+        let max_buffer_len = usize::try_from(device.metal_device().max_buffer_length())
+            .map_err(|_| MlxError::InvalidArgument("Metal buffer limit exceeds usize".into()))?;
+        if max_buffer_len <= page_size * 2 {
+            return Err(MlxError::BufferAllocationError {
+                bytes: max_buffer_len,
+            });
+        }
+
+        let mut infos: Vec<&TensorInfo> = self.tensors.values().collect();
+        infos.sort_by_key(|info| info.offset);
+        if infos.is_empty() {
+            return Err(MlxError::GgufParseError(
+                "cannot map a GGUF with no tensors".into(),
+            ));
+        }
+
+        let absolute_range = |info: &TensorInfo| -> Result<(usize, usize)> {
+            let start = self
+                .tensor_data_offset
+                .checked_add(info.offset)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| {
+                    MlxError::InvalidArgument(format!(
+                        "tensor '{}' file offset does not fit this host",
+                        info.name
+                    ))
+                })?;
+            let end = start.checked_add(info.byte_len).ok_or_else(|| {
+                MlxError::InvalidArgument(format!("tensor '{}' file range overflow", info.name))
+            })?;
+            Ok((start, end))
+        };
+        let metal_span = |start: usize, end: usize| -> Result<usize> {
+            let aligned_start = start / page_size * page_size;
+            let aligned_end = end
+                .checked_add(page_size - 1)
+                .ok_or_else(|| MlxError::InvalidArgument("Mapped range overflow".into()))?
+                / page_size
+                * page_size;
+            Ok(aligned_end - aligned_start)
+        };
+
+        let (mut range_start, mut range_end) = absolute_range(infos[0])?;
+        if metal_span(range_start, range_end)? > max_buffer_len {
+            return Err(MlxError::BufferAllocationError {
+                bytes: range_end - range_start,
+            });
+        }
+        let mut ranges = Vec::new();
+        for info in infos.into_iter().skip(1) {
+            let (tensor_start, tensor_end) = absolute_range(info)?;
+            if metal_span(range_start, tensor_end)? <= max_buffer_len {
+                range_end = range_end.max(tensor_end);
+            } else {
+                ranges.push((range_start, range_end));
+                range_start = tensor_start;
+                range_end = tensor_end;
+                if metal_span(range_start, range_end)? > max_buffer_len {
+                    return Err(MlxError::BufferAllocationError {
+                        bytes: range_end - range_start,
+                    });
+                }
+            }
+        }
+        ranges.push((range_start, range_end));
+
+        let mut segments = Vec::with_capacity(ranges.len());
+        for (file_start, file_end) in ranges {
+            let data_len = file_end - file_start;
+            let (mapping, offset_in_mapping) = self.tensor_mapping(file_start, data_len)?;
+            let buffer = device.map_file_buffer(
+                mapping,
+                offset_in_mapping,
+                data_len,
+                DType::U8,
+                vec![data_len],
+            )?;
+            segments.push(MappedTensorSegment {
+                file_start,
+                file_end,
+                buffer,
+            });
+        }
+        Ok(GgufMappedTensorSet {
+            gguf: self,
+            segments,
+        })
+    }
+
     /// Load a tensor as a raw buffer on the Metal device.
     ///
     /// For quantized types (Q4_0, Q8_0, Q4_K, Q6_K) the buffer contains raw
@@ -1445,6 +1642,40 @@ impl GgufFile {
         }
     }
 
+    /// Load a raw tensor as a read-only, file-backed Metal buffer.
+    ///
+    /// This avoids copying GGUF weights into anonymous memory. Quantized
+    /// tensors retain their packed GGML bytes as `U8`; F32, F16, and I32 keep
+    /// their native dtype. The returned buffer owns a shared mapping reference
+    /// and remains valid after `GgufFile` and the on-disk directory entry are
+    /// dropped. It must only be bound as a kernel input; GPU writes to the
+    /// read-only mapped pages are unsupported.
+    pub fn load_tensor_mapped(&self, name: &str, device: &MlxDevice) -> Result<MlxBuffer> {
+        let info = self.tensors.get(name).ok_or_else(|| {
+            MlxError::GgufParseError(format!("tensor '{name}' not found in GGUF file"))
+        })?;
+        let dtype = raw_tensor_dtype(info.ggml_type);
+        let abs_offset = self
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(format!(
+                    "tensor '{}' file offset does not fit this host",
+                    info.name
+                ))
+            })?;
+
+        let (mapping, offset_in_mapping) = self.tensor_mapping(abs_offset, info.byte_len)?;
+        device.map_file_buffer(
+            mapping,
+            offset_in_mapping,
+            info.byte_len,
+            dtype,
+            info.shape.clone(),
+        )
+    }
+
     /// Load a tensor, dequantizing to F32 on the CPU, then upload to the
     /// Metal device.
     ///
@@ -1470,8 +1701,7 @@ impl GgufFile {
         }
 
         let f32_byte_len = total_elements * 4;
-        let mut buf =
-            device.alloc_buffer(f32_byte_len, DType::F32, info.shape.clone())?;
+        let mut buf = device.alloc_buffer(f32_byte_len, DType::F32, info.shape.clone())?;
 
         {
             let out_slice: &mut [f32] = buf.as_mut_slice()?;
@@ -1531,6 +1761,41 @@ impl GgufFile {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+
+fn raw_tensor_dtype(ggml_type: GgmlType) -> DType {
+    match ggml_type {
+        GgmlType::F32 => DType::F32,
+        GgmlType::F16 => DType::F16,
+        GgmlType::I32 => DType::I32,
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q2_K
+        | GgmlType::Q3_K
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K
+        | GgmlType::I16
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL
+        | GgmlType::IQ4_XS => DType::U8,
+    }
+}
+
+fn host_page_size() -> Result<usize> {
+    extern "C" {
+        fn getpagesize() -> std::ffi::c_int;
+    }
+
+    // SAFETY: `getpagesize` has no arguments or side effects and is available
+    // on every macOS version supported by mlx-native.
+    let size = unsafe { getpagesize() };
+    if size <= 0 {
+        return Err(MlxError::InvalidArgument(
+            "Operating system reported an invalid page size".into(),
+        ));
+    }
+    Ok(size as usize)
+}
 
 /// Round `offset` up to the next multiple of `alignment`.
 fn align_offset(offset: u64, alignment: u64) -> u64 {

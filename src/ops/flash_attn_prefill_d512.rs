@@ -179,6 +179,8 @@ pub const NSG_D512: u32 = 8;
 pub const FC_IDX_NSG: usize = 322;
 /// Bool function constant enabling denominator-only learned attention sinks.
 pub const FC_IDX_SINKS: usize = 304;
+/// Bool function constant selecting one learned sink per query row.
+pub const FC_IDX_SINKS_PER_QUERY_ROW: usize = 305;
 
 /// Threadgroup memory footprint at NSG=8, DK=DV=512, bf16, is_q=0.
 /// See module doc + ADR-011-phase2-port-d512.md §2.3.
@@ -360,7 +362,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     nsg: u32,
 ) -> Result<()> {
     dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
-        encoder, device, registry, q, k, v, mask, blk, None, out, params, nsg,
+        encoder, device, registry, q, k, v, mask, blk, None, out, params, nsg, false,
     )
 }
 
@@ -391,6 +393,44 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_sinks(
         out,
         params,
         NSG_D512,
+        false,
+    )
+}
+
+/// Dispatch DeepSeek sparse prefill with eight physical query heads packed
+/// into each D=512 flash-attention query tile.
+///
+/// The caller's contiguous `[batch, 64, 512]` query/output storage is viewed
+/// as `[batch, 8, 8, 512]` without copying. The rank-3 mask is `[batch, 1,
+/// seq_len_k]` and is broadcast across both logical heads and query rows.
+/// Learned sinks remain physical-head-specific (`8 * 8 = 64` values).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: &MlxBuffer,
+    sinks: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        Some(mask),
+        None,
+        Some(sinks),
+        out,
+        params,
+        NSG_D512,
+        true,
     )
 }
 
@@ -422,6 +462,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks(
         out,
         params,
         NSG_D512,
+        false,
     )
 }
 
@@ -439,6 +480,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     nsg: u32,
+    heads_as_rows: bool,
 ) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
     if params.head_dim != 512 {
@@ -460,6 +502,20 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
         ));
     }
     validate_params_d512(params)?;
+    if heads_as_rows
+        && (params.seq_len_q != NQPSG_D512
+            || nsg != NSG_D512
+            || params.n_heads != 8
+            || params.n_kv_heads != 1
+            || mask.is_none()
+            || sinks.is_none()
+            || blk.is_some())
+    {
+        return Err(MlxError::InvalidArgument(
+            "flash_attn_prefill_d512 heads-as-rows requires qL=8, nsg=8, H=8, H_kv=1, mask+sinks, and no blk"
+                .into(),
+        ));
+    }
 
     // All buffers must be BF16 for this dispatcher.
     for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
@@ -502,7 +558,8 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     validate_buffer_size(v, "V", batch * h_kv * kl * d)?;
     validate_buffer_size(out, "out", batch * h * ql * d)?;
     if let Some(s) = sinks {
-        validate_buffer_size(s, "sinks", h)?;
+        let sink_count = if heads_as_rows { h * ql } else { h };
+        validate_buffer_size(s, "sinks", sink_count)?;
     }
     // A rank-2 mask `[qL, kL]` is the Wave 2D broadcast layout: one plane is
     // shared across all batches and heads (stride-0 in batch and head dims).
@@ -516,7 +573,8 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
         if mask_is_rank2_broadcast {
             validate_buffer_size(m, "mask", ql * kl)?;
         } else if mask_is_rank3_batch_broadcast {
-            validate_buffer_size(m, "mask", batch * ql * kl)?;
+            let mask_rows = if heads_as_rows { 1 } else { ql };
+            validate_buffer_size(m, "mask", batch * mask_rows * kl)?;
         } else {
             validate_buffer_size(m, "mask", batch * h * ql * kl)?;
         }
@@ -595,6 +653,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
             (301, do_causal),
             (303, has_blk),
             (FC_IDX_SINKS, has_sinks),
+            (FC_IDX_SINKS_PER_QUERY_ROW, heads_as_rows),
         ],
         &[(FC_IDX_NSG, nsg as i32)],
     )?;
@@ -680,7 +739,11 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
         let (m_batch_stride, m_head_stride, m_ql_stride) = if mask_is_rank2_broadcast {
             (0_i64, 0_i64, kl as i64)
         } else if mask_is_rank3_batch_broadcast {
-            ((ql * kl) as i64, 0_i64, kl as i64)
+            if heads_as_rows {
+                (kl as i64, 0_i64, 0_i64)
+            } else {
+                ((ql * kl) as i64, 0_i64, kl as i64)
+            }
         } else {
             ((h * ql * kl) as i64, (ql * kl) as i64, kl as i64)
         };

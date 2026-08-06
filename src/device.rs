@@ -4,6 +4,9 @@
 //! [`MlxDevice::new()`] and use it to allocate buffers and create
 //! command encoders.
 
+use std::sync::Arc;
+
+use memmap2::Mmap;
 use metal::foreign_types::ForeignType;
 use metal::{CommandQueue, Device, MTLResourceOptions};
 use objc::{sel, sel_impl};
@@ -69,6 +72,85 @@ impl MlxDevice {
         // (+1 retain-count) MTLBuffer. The wrapper assumes that ownership and
         // releases it exactly once on drop.
         Ok(unsafe { metal::Buffer::from_ptr(raw) })
+    }
+
+    /// Create a read-only Metal view over bytes in a file mapping.
+    ///
+    /// Metal requires the host pointer and resource length to be page-aligned.
+    /// GGUF tensor offsets are normally only 32-byte aligned, so the resource
+    /// starts at the preceding page and the returned [`MlxBuffer`] carries the
+    /// remaining offset for kernel bindings.
+    pub(crate) fn map_file_buffer(
+        &self,
+        file_backing: Arc<Mmap>,
+        file_offset: usize,
+        byte_len: usize,
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<MlxBuffer> {
+        if byte_len == 0 {
+            return Err(MlxError::InvalidArgument(
+                "File-backed buffer byte length must be > 0".into(),
+            ));
+        }
+        let logical_end = file_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| MlxError::InvalidArgument("File-backed buffer range overflow".into()))?;
+        if logical_end > file_backing.len() {
+            return Err(MlxError::InvalidArgument(format!(
+                "File-backed buffer range [{file_offset}, {logical_end}) exceeds mapping length {}",
+                file_backing.len()
+            )));
+        }
+
+        let page_size = host_page_size()?;
+        let aligned_start = file_offset / page_size * page_size;
+        let aligned_end = logical_end
+            .checked_add(page_size - 1)
+            .ok_or_else(|| MlxError::InvalidArgument("Mapped range alignment overflow".into()))?
+            / page_size
+            * page_size;
+        let mapped_len = aligned_end - aligned_start;
+        if mapped_len as u64 > self.device.max_buffer_length() as u64 {
+            return Err(MlxError::BufferAllocationError { bytes: mapped_len });
+        }
+
+        // SAFETY: `aligned_start` is within the mapping and page-aligned. The
+        // mmap owns the final partial page even when its public slice length
+        // ends before `aligned_end`; kernels are constrained to `byte_len`.
+        let mapped_ptr = unsafe { file_backing.as_ptr().add(aligned_start) };
+        if (mapped_ptr as usize) % page_size != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Mapped file pointer is not aligned to the host page size {page_size}"
+            )));
+        }
+
+        let deallocator: *mut objc::runtime::Object = std::ptr::null_mut();
+        let raw: *mut metal::MTLBuffer = unsafe {
+            objc::msg_send![
+                &*self.device,
+                newBufferWithBytesNoCopy: mapped_ptr as *const std::ffi::c_void
+                length: mapped_len as u64
+                options: MTLResourceOptions::StorageModeShared
+                deallocator: deallocator
+            ]
+        };
+        if raw.is_null() {
+            return Err(MlxError::BufferAllocationError { bytes: mapped_len });
+        }
+
+        // SAFETY: the Objective-C initializer returned a non-null owned Metal
+        // buffer. `MlxBufferStorage` releases it before dropping `file_backing`.
+        let metal_buf = unsafe { metal::Buffer::from_ptr(raw) };
+        Ok(MlxBuffer::from_file_mapping(
+            metal_buf,
+            dtype,
+            shape,
+            (file_offset - aligned_start) as u64,
+            byte_len,
+            file_backing,
+            self.residency_set.clone(),
+        ))
     }
 
     /// Initialize the Metal GPU device and create a command queue.
@@ -266,6 +348,22 @@ impl MlxDevice {
     pub fn name(&self) -> String {
         self.device.name().to_string()
     }
+}
+
+fn host_page_size() -> Result<usize> {
+    extern "C" {
+        fn getpagesize() -> std::ffi::c_int;
+    }
+
+    // SAFETY: `getpagesize` has no arguments or side effects and is available
+    // on every macOS version supported by mlx-native.
+    let size = unsafe { getpagesize() };
+    if size <= 0 {
+        return Err(MlxError::InvalidArgument(
+            "Operating system reported an invalid page size".into(),
+        ));
+    }
+    Ok(size as usize)
 }
 
 impl std::fmt::Debug for MlxDevice {

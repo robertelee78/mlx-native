@@ -2,7 +2,10 @@
 
 #![cfg(target_vendor = "apple")]
 
-use mlx_native::ops::deepseek_indexer::{dispatch_deepseek_indexer, DeepSeekIndexerParams};
+use mlx_native::ops::deepseek_indexer::{
+    deepseek_indexer_topk_scratch_elements, dispatch_deepseek_indexer,
+    dispatch_deepseek_indexer_into_mma, DeepSeekIndexerParams,
+};
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 use std::time::Instant;
 
@@ -69,5 +72,81 @@ fn benchmark_prefill_and_production_decode() {
             "queries={queries} kv={kv_len} avg_ms={:.3}",
             start.elapsed().as_secs_f64() * 100.0
         );
+    }
+}
+
+#[test]
+#[ignore = "performance gate"]
+fn benchmark_production_mma_long_prefill() {
+    let device = MlxDevice::new().unwrap();
+    for kv_len in [512usize, 2048, 4096, 6912] {
+        let queries = 2048usize;
+        let start_pos = kv_len * 4 - queries;
+        let q = device
+            .alloc_buffer(
+                queries * 64 * 128 * 2,
+                DType::BF16,
+                vec![1, queries, 64, 128],
+            )
+            .unwrap();
+        let kv = device
+            .alloc_buffer(kv_len * 128 * 2, DType::BF16, vec![1, kv_len, 128])
+            .unwrap();
+        let weights = device
+            .alloc_buffer(queries * 64 * 4, DType::F32, vec![1, queries, 64])
+            .unwrap();
+        let scratch = device
+            .alloc_buffer(queries * kv_len * 4, DType::F32, vec![1, queries, kv_len])
+            .unwrap();
+        let topk_elements = deepseek_indexer_topk_scratch_elements(1, queries, kv_len).unwrap();
+        let topk_scratch = device
+            .alloc_buffer(
+                topk_elements * 4,
+                DType::I32,
+                vec![1, queries, topk_elements / queries],
+            )
+            .unwrap();
+        let output = device
+            .alloc_buffer(queries * 640 * 4, DType::I32, vec![1, queries, 640])
+            .unwrap();
+        let params = DeepSeekIndexerParams {
+            batch: 1,
+            query_len: queries as u32,
+            kv_len: kv_len as u32,
+            start_pos: start_pos as u32,
+            ratio: 4,
+            heads: 64,
+            head_dim: 128,
+            top_k: 512,
+            offset: 128,
+        };
+        let mut registry = KernelRegistry::new();
+
+        for iteration in 0..6 {
+            let start = Instant::now();
+            let mut encoder = device.command_encoder().unwrap();
+            dispatch_deepseek_indexer_into_mma(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &q,
+                &kv,
+                &weights,
+                &scratch,
+                &topk_scratch,
+                &output,
+                640,
+                128,
+                &params,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+            if iteration > 0 {
+                println!(
+                    "mma queries={queries} kv={kv_len} iteration={iteration} ms={:.3}",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
     }
 }

@@ -211,7 +211,14 @@ impl MlxBufferPool {
     /// buffer; the duplication wastes a free-list slot but is not a memory
     /// leak — both clones drop together once popped).  Pick one pattern per
     /// arena cycle.
+    ///
+    /// File-backed buffers are external immutable resources, not pool
+    /// allocations. Passing one to `release` drops that handle instead of
+    /// retaining a Metal view after its mmap owner is gone.
     pub fn release(&mut self, buffer: MlxBuffer) {
+        if buffer.is_file_backed() {
+            return;
+        }
         let bucket = bucket_size(buffer.byte_len());
         let metal_buf = buffer.into_inner();
         self.free.entry(bucket).or_default().push(metal_buf);

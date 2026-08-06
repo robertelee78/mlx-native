@@ -238,6 +238,10 @@ constant bool do_causal [[function_constant(301)]];
 // and D=512 so the dispatcher can set one bool and feed either kernel.
 constant bool has_blk  [[function_constant(303)]];
 constant bool has_sinks [[function_constant(304)]];
+// DeepSeek sparse prefill can pack eight physical query heads into the
+// kernel's eight query rows. In that mode each row needs its own learned
+// sink instead of sharing the logical-head sink.
+constant bool sinks_per_query_row [[function_constant(305)]];
 
 constant int  fc_nsg   [[function_constant(322)]];
 
@@ -251,6 +255,8 @@ constant bool has_mask_def = is_function_constant_defined(has_mask) ? has_mask :
 constant bool do_causal_def = is_function_constant_defined(do_causal) ? do_causal : false;
 constant bool has_blk_def  = is_function_constant_defined(has_blk)  ? has_blk  : false;
 constant bool has_sinks_def = is_function_constant_defined(has_sinks) ? has_sinks : false;
+constant bool sinks_per_query_row_def =
+    is_function_constant_defined(sinks_per_query_row) ? sinks_per_query_row : false;
 constant int  nsg_def      = is_function_constant_defined(fc_nsg)   ? fc_nsg   : 8;
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -979,7 +985,10 @@ void flash_attn_prefill_d512_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
       const short j = jj * NSG + sgitg;
       const float m = M[jj];
-      const float sink = tiisg == 0 ? sinks[iq2] : -FLT_MAX / 2.0f;
+      const ulong sink_index = sinks_per_query_row_def
+          ? (ulong)iq2 * (ulong)args.qL + (ulong)(iq1 + j)
+          : (ulong)iq2;
+      const float sink = tiisg == 0 ? sinks[sink_index] : -FLT_MAX / 2.0f;
 
       M[jj] = simd_max(max(M[jj], sink));
       const float ms = exp(m - M[jj]);
