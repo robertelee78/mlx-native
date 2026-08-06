@@ -14,8 +14,15 @@ pub const DEEPSEEK_INDEXER_HEAD_DIM: usize = 128;
 pub const DEEPSEEK_INDEXER_TOP_K: usize = 512;
 pub const DEEPSEEK_INDEXER_RATIO: usize = 4;
 pub const DEEPSEEK_INDEXER_SCORE_KERNEL: &str = "deepseek_indexer_score_bf16";
-pub const DEEPSEEK_INDEXER_TOPK_KERNEL: &str = "deepseek_indexer_topk_i32";
-const THREADS: u64 = 256;
+pub const DEEPSEEK_INDEXER_SCORE_MMA_KERNEL: &str = "deepseek_indexer_score_mma_bf16";
+pub const DEEPSEEK_INDEXER_TOPK_BLOCK_KERNEL: &str = "deepseek_indexer_topk_block_i32";
+pub const DEEPSEEK_INDEXER_TOPK_MERGE_KERNEL: &str = "deepseek_indexer_topk_merge_i32";
+pub const DEEPSEEK_INDEXER_TOPK_FINALIZE_KERNEL: &str = "deepseek_indexer_topk_finalize_i32";
+const SCORE_THREADS: u64 = 256;
+const SCORE_KEYS_PER_GROUP: usize = 64;
+const SCORE_QUERIES_PER_GROUP: usize = 8;
+const TOPK_BLOCK_THREADS: usize = 1024;
+const TOPK_MERGE_THREADS: u64 = 256;
 
 pub static DEEPSEEK_INDEXER_SHADER_SOURCE: &str = include_str!("../shaders/deepseek_indexer.metal");
 
@@ -24,7 +31,22 @@ pub fn register(registry: &mut KernelRegistry) {
         DEEPSEEK_INDEXER_SCORE_KERNEL,
         DEEPSEEK_INDEXER_SHADER_SOURCE,
     );
-    registry.register_source(DEEPSEEK_INDEXER_TOPK_KERNEL, DEEPSEEK_INDEXER_SHADER_SOURCE);
+    registry.register_source(
+        DEEPSEEK_INDEXER_SCORE_MMA_KERNEL,
+        DEEPSEEK_INDEXER_SHADER_SOURCE,
+    );
+    registry.register_source(
+        DEEPSEEK_INDEXER_TOPK_BLOCK_KERNEL,
+        DEEPSEEK_INDEXER_SHADER_SOURCE,
+    );
+    registry.register_source(
+        DEEPSEEK_INDEXER_TOPK_MERGE_KERNEL,
+        DEEPSEEK_INDEXER_SHADER_SOURCE,
+    );
+    registry.register_source(
+        DEEPSEEK_INDEXER_TOPK_FINALIZE_KERNEL,
+        DEEPSEEK_INDEXER_SHADER_SOURCE,
+    );
 }
 
 #[repr(C)]
@@ -46,6 +68,25 @@ pub struct DeepSeekIndexerParams {
 struct DeepSeekIndexerOutputLayout {
     row_stride: u32,
     column_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct DeepSeekIndexerTopKPlan {
+    block_threads: u32,
+    block_count: u32,
+    list_count: u32,
+    scratch_row_stride: u32,
+}
+
+/// I32 elements required by the optimized top-k ping-pong workspace.
+pub fn deepseek_indexer_topk_scratch_elements(
+    batch: usize,
+    queries: usize,
+    kv_len: usize,
+) -> Result<usize> {
+    let block_count = kv_len.div_ceil(TOPK_BLOCK_THREADS);
+    checked_shape(&[batch, queries, 2, block_count, DEEPSEEK_INDEXER_TOP_K])
 }
 
 fn checked_shape(dims: &[usize]) -> Result<usize> {
@@ -141,6 +182,13 @@ pub fn dispatch_deepseek_indexer(
     output: &MlxBuffer,
     params: &DeepSeekIndexerParams,
 ) -> Result<()> {
+    let (batch, queries, kv_len) = validate_params(params)?;
+    let topk_elements = deepseek_indexer_topk_scratch_elements(batch, queries, kv_len)?;
+    let topk_scratch = device.alloc_buffer(
+        topk_elements * DType::I32.size_of(),
+        DType::I32,
+        vec![batch, queries, topk_elements / (batch * queries)],
+    )?;
     dispatch_deepseek_indexer_into(
         encoder,
         registry,
@@ -149,6 +197,7 @@ pub fn dispatch_deepseek_indexer(
         kv,
         weights,
         scratch,
+        &topk_scratch,
         output,
         DEEPSEEK_INDEXER_TOP_K,
         0,
@@ -171,10 +220,82 @@ pub fn dispatch_deepseek_indexer_into(
     kv: &MlxBuffer,
     weights: &MlxBuffer,
     scratch: &MlxBuffer,
+    topk_scratch: &MlxBuffer,
     output: &MlxBuffer,
     output_row_stride: usize,
     output_column_offset: usize,
     params: &DeepSeekIndexerParams,
+) -> Result<()> {
+    dispatch_deepseek_indexer_into_with_score_kernel(
+        encoder,
+        registry,
+        device,
+        q,
+        kv,
+        weights,
+        scratch,
+        topk_scratch,
+        output,
+        output_row_stride,
+        output_column_offset,
+        params,
+        DEEPSEEK_INDEXER_SCORE_KERNEL,
+    )
+}
+
+/// Encode the indexer with the same half-staged simdgroup-MMA arithmetic
+/// used by llama.cpp's Metal lightning-indexer kernel.
+///
+/// The ordinary [`dispatch_deepseek_indexer_into`] entry point remains the
+/// BF16-to-F32 reference path. Model runtimes that need production throughput
+/// can opt into this explicitly without consulting process-global state.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_deepseek_indexer_into_mma(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    kv: &MlxBuffer,
+    weights: &MlxBuffer,
+    scratch: &MlxBuffer,
+    topk_scratch: &MlxBuffer,
+    output: &MlxBuffer,
+    output_row_stride: usize,
+    output_column_offset: usize,
+    params: &DeepSeekIndexerParams,
+) -> Result<()> {
+    dispatch_deepseek_indexer_into_with_score_kernel(
+        encoder,
+        registry,
+        device,
+        q,
+        kv,
+        weights,
+        scratch,
+        topk_scratch,
+        output,
+        output_row_stride,
+        output_column_offset,
+        params,
+        DEEPSEEK_INDEXER_SCORE_MMA_KERNEL,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_deepseek_indexer_into_with_score_kernel(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    kv: &MlxBuffer,
+    weights: &MlxBuffer,
+    scratch: &MlxBuffer,
+    topk_scratch: &MlxBuffer,
+    output: &MlxBuffer,
+    output_row_stride: usize,
+    output_column_offset: usize,
+    params: &DeepSeekIndexerParams,
+    score_kernel: &str,
 ) -> Result<()> {
     let (batch, queries, kv_len) = validate_params(params)?;
     let tail_end = output_column_offset
@@ -225,6 +346,18 @@ pub fn dispatch_deepseek_indexer_into(
         &[batch, queries, DEEPSEEK_INDEXER_HEADS],
     )?;
     validate_buffer(scratch, "scratch", DType::F32, &[batch, queries, kv_len])?;
+    let block_count = kv_len.div_ceil(TOPK_BLOCK_THREADS);
+    let scratch_row_stride = block_count
+        .checked_mul(DEEPSEEK_INDEXER_TOP_K)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("deepseek_indexer: top-k row stride overflows".into())
+        })?;
+    validate_buffer(
+        topk_scratch,
+        "topk_scratch",
+        DType::I32,
+        &[batch, queries, 2 * scratch_row_stride],
+    )?;
     validate_buffer(
         output,
         "output",
@@ -232,36 +365,145 @@ pub fn dispatch_deepseek_indexer_into(
         &[batch, queries, output_row_stride],
     )?;
 
-    let score_pipeline =
-        registry.get_pipeline(DEEPSEEK_INDEXER_SCORE_KERNEL, device.metal_device())?;
+    let score_pipeline = registry.get_pipeline(score_kernel, device.metal_device())?;
     encoder.set_op_kind(CapturedOpKind::Other);
-    encoder.encode_threadgroups_with_args(
-        score_pipeline,
-        &[
-            (0, KernelArg::Bytes(as_bytes(params))),
-            (1, KernelArg::Buffer(q)),
-            (2, KernelArg::Buffer(kv)),
-            (3, KernelArg::Buffer(weights)),
-            (4, KernelArg::Buffer(scratch)),
-        ],
-        MTLSize::new((batch * queries * kv_len) as u64, 1, 1),
-        MTLSize::new(THREADS, 1, 1),
-    );
-    // The command encoder uses concurrent dispatch. Top-k consumes scores
-    // written above, so this dependency must be explicit.
+    let score_params = DeepSeekIndexerParams {
+        batch: 1,
+        ..*params
+    };
+    for batch_index in 0..batch {
+        let q_view = q
+            .slice_view(
+                (batch_index
+                    * queries
+                    * DEEPSEEK_INDEXER_HEADS
+                    * DEEPSEEK_INDEXER_HEAD_DIM
+                    * DType::BF16.size_of()) as u64,
+                queries * DEEPSEEK_INDEXER_HEADS * DEEPSEEK_INDEXER_HEAD_DIM,
+            )
+            .with_shape(vec![
+                1,
+                queries,
+                DEEPSEEK_INDEXER_HEADS,
+                DEEPSEEK_INDEXER_HEAD_DIM,
+            ])?;
+        let kv_view = kv
+            .slice_view(
+                (batch_index * kv_len * DEEPSEEK_INDEXER_HEAD_DIM * DType::BF16.size_of()) as u64,
+                kv_len * DEEPSEEK_INDEXER_HEAD_DIM,
+            )
+            .with_shape(vec![1, kv_len, DEEPSEEK_INDEXER_HEAD_DIM])?;
+        let weights_view = weights
+            .slice_view(
+                (batch_index * queries * DEEPSEEK_INDEXER_HEADS * DType::F32.size_of()) as u64,
+                queries * DEEPSEEK_INDEXER_HEADS,
+            )
+            .with_shape(vec![1, queries, DEEPSEEK_INDEXER_HEADS])?;
+        let scratch_view = scratch
+            .slice_view(
+                (batch_index * queries * kv_len * DType::F32.size_of()) as u64,
+                queries * kv_len,
+            )
+            .with_shape(vec![1, queries, kv_len])?;
+        encoder.encode_threadgroups_with_args(
+            score_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&score_params))),
+                (1, KernelArg::Buffer(&q_view)),
+                (2, KernelArg::Buffer(&kv_view)),
+                (3, KernelArg::Buffer(&weights_view)),
+                (4, KernelArg::Buffer(&scratch_view)),
+            ],
+            MTLSize::new(
+                kv_len.div_ceil(SCORE_KEYS_PER_GROUP) as u64,
+                queries.div_ceil(SCORE_QUERIES_PER_GROUP) as u64,
+                1,
+            ),
+            MTLSize::new(SCORE_THREADS, 1, 1),
+        );
+    }
     encoder.memory_barrier();
-    let topk_pipeline =
-        registry.get_pipeline(DEEPSEEK_INDEXER_TOPK_KERNEL, device.metal_device())?;
-    encoder.encode_threadgroups_with_args(
-        topk_pipeline,
+
+    let plan = DeepSeekIndexerTopKPlan {
+        block_threads: TOPK_BLOCK_THREADS as u32,
+        block_count: block_count as u32,
+        list_count: block_count as u32,
+        scratch_row_stride: scratch_row_stride as u32,
+    };
+    let bank_elements = batch * queries * scratch_row_stride;
+    let bank_a = topk_scratch
+        .slice_view(0, bank_elements)
+        .with_shape(vec![bank_elements])?;
+    let bank_b = topk_scratch
+        .slice_view((bank_elements * DType::I32.size_of()) as u64, bank_elements)
+        .with_shape(vec![bank_elements])?;
+    let block_pipeline =
+        registry.get_pipeline(DEEPSEEK_INDEXER_TOPK_BLOCK_KERNEL, device.metal_device())?;
+    if block_pipeline.max_total_threads_per_threadgroup() < TOPK_BLOCK_THREADS as u64 {
+        return Err(MlxError::InvalidArgument(format!(
+            "deepseek_indexer: Metal pipeline supports only {} top-k threads; {TOPK_BLOCK_THREADS} required",
+            block_pipeline.max_total_threads_per_threadgroup()
+        )));
+    }
+    encoder.encode_threadgroups_with_args_and_shared(
+        block_pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(params))),
-            (1, KernelArg::Buffer(scratch)),
-            (2, KernelArg::Buffer(output)),
-            (3, KernelArg::Bytes(as_bytes(&output_layout))),
+            (1, KernelArg::Bytes(as_bytes(&plan))),
+            (2, KernelArg::Buffer(scratch)),
+            (3, KernelArg::Buffer(&bank_a)),
         ],
-        MTLSize::new((batch * queries) as u64, 1, 1),
-        MTLSize::new(THREADS, 1, 1),
+        &[(0, (TOPK_BLOCK_THREADS * DType::I32.size_of()) as u64)],
+        MTLSize::new((batch * queries * block_count) as u64, 1, 1),
+        MTLSize::new(TOPK_BLOCK_THREADS as u64, 1, 1),
+    );
+    encoder.memory_barrier();
+
+    let merge_pipeline =
+        registry.get_pipeline(DEEPSEEK_INDEXER_TOPK_MERGE_KERNEL, device.metal_device())?;
+    let mut list_count = block_count;
+    let mut input = &bank_a;
+    let mut merge_output = &bank_b;
+    while list_count > 1 {
+        let merge_plan = DeepSeekIndexerTopKPlan {
+            list_count: list_count as u32,
+            ..plan
+        };
+        let merged_lists = list_count.div_ceil(2);
+        encoder.encode_threadgroups_with_args(
+            merge_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(params))),
+                (1, KernelArg::Bytes(as_bytes(&merge_plan))),
+                (2, KernelArg::Buffer(scratch)),
+                (3, KernelArg::Buffer(input)),
+                (4, KernelArg::Buffer(merge_output)),
+            ],
+            MTLSize::new((batch * queries * merged_lists) as u64, 1, 1),
+            MTLSize::new(TOPK_MERGE_THREADS, 1, 1),
+        );
+        encoder.memory_barrier();
+        std::mem::swap(&mut input, &mut merge_output);
+        list_count = merged_lists;
+    }
+
+    let final_plan = DeepSeekIndexerTopKPlan {
+        list_count: 1,
+        ..plan
+    };
+    let finalize_pipeline =
+        registry.get_pipeline(DEEPSEEK_INDEXER_TOPK_FINALIZE_KERNEL, device.metal_device())?;
+    encoder.encode_with_args(
+        finalize_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(params))),
+            (1, KernelArg::Bytes(as_bytes(&final_plan))),
+            (2, KernelArg::Bytes(as_bytes(&output_layout))),
+            (3, KernelArg::Buffer(input)),
+            (4, KernelArg::Buffer(output)),
+        ],
+        MTLSize::new(DEEPSEEK_INDEXER_TOP_K as u64, (batch * queries) as u64, 1),
+        MTLSize::new(256, 1, 1),
     );
     Ok(())
 }

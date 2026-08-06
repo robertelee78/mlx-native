@@ -4,9 +4,11 @@
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::ops::deepseek_sparse_attention::{
-    dispatch_deepseek_sparse_attention, DeepSeekSparseAttentionParams, DEEPSEEK_SPARSE_HEADS,
-    DEEPSEEK_SPARSE_HEAD_DIM,
+    dispatch_deepseek_sparse_attention, dispatch_deepseek_sparse_attention_flash_decode,
+    DeepSeekSparseAttentionParams, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM,
 };
+use mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams;
+use mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_bf16_d512_with_sinks;
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 use std::time::Instant;
 
@@ -14,9 +16,13 @@ use std::time::Instant;
 #[ignore = "performance gate"]
 fn benchmark_decode_and_prefill() {
     let device = MlxDevice::new().unwrap();
-    for queries in [1usize, 17] {
-        let kv_len = 640usize;
-        let top_k = 512usize;
+    const RUNS: usize = 100;
+    for (queries, kv_len, top_k) in [
+        (1usize, 640usize, 512usize),
+        (1, 640, 640),
+        (1, 1024, 174),
+        (17, 640, 512),
+    ] {
         let q = device
             .alloc_buffer(
                 queries * DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM * 2,
@@ -66,8 +72,24 @@ fn benchmark_decode_and_prefill() {
             scale: 1.0 / (DEEPSEEK_SPARSE_HEAD_DIM as f32).sqrt(),
         };
         let mut registry = KernelRegistry::new();
+        {
+            let mut encoder = device.command_encoder().unwrap();
+            dispatch_deepseek_sparse_attention(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &q,
+                &kv,
+                &sinks,
+                &indices,
+                &output,
+                &params,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+        }
         let start = Instant::now();
-        for _ in 0..10 {
+        for _ in 0..RUNS {
             let mut encoder = device.command_encoder().unwrap();
             dispatch_deepseek_sparse_attention(
                 &mut encoder,
@@ -84,8 +106,126 @@ fn benchmark_decode_and_prefill() {
             encoder.commit_and_wait().unwrap();
         }
         println!(
-            "queries={queries} avg_ms={:.3}",
-            start.elapsed().as_secs_f64() * 100.0
+            "queries={queries} kv={kv_len} top_k={top_k} avg_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0 / RUNS as f64
         );
+
+        if queries == 1 {
+            let gathered = device
+                .alloc_buffer(
+                    top_k * DEEPSEEK_SPARSE_HEAD_DIM * 2,
+                    DType::BF16,
+                    vec![1, 1, top_k, DEEPSEEK_SPARSE_HEAD_DIM],
+                )
+                .unwrap();
+            let flash_params = FlashAttnPrefillParams {
+                n_heads: DEEPSEEK_SPARSE_HEADS as u32,
+                n_kv_heads: 1,
+                head_dim: DEEPSEEK_SPARSE_HEAD_DIM as u32,
+                seq_len_q: 1,
+                seq_len_k: top_k as u32,
+                batch: 1,
+                scale: params.scale,
+                do_causal: false,
+            };
+            {
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_flash_attn_prefill_bf16_d512_with_sinks(
+                    &mut encoder,
+                    &device,
+                    &mut registry,
+                    &q,
+                    &gathered,
+                    &gathered,
+                    None,
+                    &sinks,
+                    &output,
+                    &flash_params,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+            }
+            let flash_start = Instant::now();
+            for _ in 0..RUNS {
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_flash_attn_prefill_bf16_d512_with_sinks(
+                    &mut encoder,
+                    &device,
+                    &mut registry,
+                    &q,
+                    &gathered,
+                    &gathered,
+                    None,
+                    &sinks,
+                    &output,
+                    &flash_params,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+            }
+            println!(
+                "queries={queries} gathered_kv={top_k} flash_avg_ms={:.3}",
+                flash_start.elapsed().as_secs_f64() * 1000.0 / RUNS as f64
+            );
+
+            let mask = device
+                .alloc_buffer(top_k * 2, DType::BF16, vec![1, top_k])
+                .unwrap();
+            let mut invalid_global = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+            invalid_global.as_mut_slice::<u32>().unwrap().fill(0);
+            let mut invalid_heads = device
+                .alloc_buffer(
+                    DEEPSEEK_SPARSE_HEADS * 4,
+                    DType::U32,
+                    vec![DEEPSEEK_SPARSE_HEADS],
+                )
+                .unwrap();
+            invalid_heads.as_mut_slice::<u32>().unwrap().fill(0);
+            {
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_deepseek_sparse_attention_flash_decode(
+                    &mut encoder,
+                    &mut registry,
+                    &device,
+                    &q,
+                    &kv,
+                    &sinks,
+                    &indices,
+                    &gathered,
+                    &mask,
+                    &invalid_global,
+                    &invalid_heads,
+                    &output,
+                    &params,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+            }
+            let gathered_flash_start = Instant::now();
+            for _ in 0..RUNS {
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_deepseek_sparse_attention_flash_decode(
+                    &mut encoder,
+                    &mut registry,
+                    &device,
+                    &q,
+                    &kv,
+                    &sinks,
+                    &indices,
+                    &gathered,
+                    &mask,
+                    &invalid_global,
+                    &invalid_heads,
+                    &output,
+                    &params,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+            }
+            println!(
+                "queries={queries} kv={kv_len} top_k={top_k} gather_flash_avg_ms={:.3}",
+                gathered_flash_start.elapsed().as_secs_f64() * 1000.0 / RUNS as f64
+            );
+        }
     }
 }

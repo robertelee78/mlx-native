@@ -10,7 +10,13 @@ use std::time::Instant;
 #[ignore = "performance gate"]
 fn benchmark_prefill_and_production_decode() {
     let device = MlxDevice::new().unwrap();
-    for (queries, kv_len, start_pos) in [(128usize, 32usize, 0usize), (1, 640, 2559)] {
+    for (queries, kv_len, start_pos) in [
+        (128usize, 32usize, 0usize),
+        (512, 128, 0),
+        (1024, 256, 0),
+        (1, 640, 2559),
+        (1, 1472, 5887),
+    ] {
         let q = device
             .alloc_buffer(
                 queries * 64 * 128 * 2,

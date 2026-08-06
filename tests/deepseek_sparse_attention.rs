@@ -4,8 +4,9 @@
 
 use half::bf16;
 use mlx_native::ops::deepseek_sparse_attention::{
-    dispatch_deepseek_sparse_attention, register, DeepSeekSparseAttentionParams,
-    DEEPSEEK_INDEX_TOP_K, DEEPSEEK_SPARSE_HEADS, DEEPSEEK_SPARSE_HEAD_DIM,
+    dispatch_deepseek_sparse_attention, dispatch_deepseek_sparse_attention_flash_decode, register,
+    DeepSeekSparseAttentionParams, DEEPSEEK_INDEX_TOP_K, DEEPSEEK_SPARSE_HEADS,
+    DEEPSEEK_SPARSE_HEAD_DIM,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -165,6 +166,47 @@ fn run_case(batch: usize, queries: usize, kv_len: usize, indices: Vec<i32>) {
             delta <= 0.0025,
             "output[{i}] delta={delta}: {got:?} != {want:?}"
         );
+    }
+
+    if queries == 1 && top_k >= 384 {
+        let gathered = device
+            .alloc_buffer(top_k * D * 2, DType::BF16, vec![1, 1, top_k, D])
+            .unwrap();
+        let mask = device
+            .alloc_buffer(top_k * 2, DType::BF16, vec![1, top_k])
+            .unwrap();
+        let mut invalid_global = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+        invalid_global.as_mut_slice::<u32>().unwrap().fill(0);
+        let mut invalid_heads = device.alloc_buffer(H * 4, DType::U32, vec![H]).unwrap();
+        invalid_heads.as_mut_slice::<u32>().unwrap().fill(0);
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_deepseek_sparse_attention_flash_decode(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q,
+            &kv,
+            &sinks,
+            &indices,
+            &gathered,
+            &mask,
+            &invalid_global,
+            &invalid_heads,
+            &output,
+            &params,
+        )
+        .expect("flash dispatch");
+        encoder.commit_and_wait().expect("flash completion");
+        let flash = unsafe {
+            std::slice::from_raw_parts(output.contents_ptr() as *const bf16, expected.len())
+        };
+        for (i, (got, want)) in flash.iter().zip(expected.iter()).enumerate() {
+            let delta = (got.to_f32() - want.to_f32()).abs();
+            assert!(
+                delta <= 0.0025,
+                "flash output[{i}] delta={delta}: {got:?} != {want:?}"
+            );
+        }
     }
 }
 

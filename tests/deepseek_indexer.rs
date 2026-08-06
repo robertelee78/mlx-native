@@ -4,7 +4,8 @@
 
 use half::bf16;
 use mlx_native::ops::deepseek_indexer::{
-    dispatch_deepseek_indexer, dispatch_deepseek_indexer_into, DeepSeekIndexerParams,
+    deepseek_indexer_topk_scratch_elements, dispatch_deepseek_indexer,
+    dispatch_deepseek_indexer_into, dispatch_deepseek_indexer_into_mma, DeepSeekIndexerParams,
     DEEPSEEK_INDEXER_HEADS, DEEPSEEK_INDEXER_HEAD_DIM, DEEPSEEK_INDEXER_RATIO,
     DEEPSEEK_INDEXER_TOP_K,
 };
@@ -54,6 +55,14 @@ fn strided_output_writes_only_the_requested_tail() {
         &vec![0.0; queries * kv_len],
         vec![1, queries, kv_len],
     );
+    let topk_elements = deepseek_indexer_topk_scratch_elements(1, queries, kv_len).unwrap();
+    let topk_scratch = device
+        .alloc_buffer(
+            topk_elements * 4,
+            DType::I32,
+            vec![1, queries, topk_elements / queries],
+        )
+        .unwrap();
     let mut output = device
         .alloc_buffer(queries * stride * 4, DType::I32, vec![1, queries, stride])
         .unwrap();
@@ -79,6 +88,7 @@ fn strided_output_writes_only_the_requested_tail() {
         &kv,
         &weights,
         &scratch,
+        &topk_scratch,
         &output,
         stride,
         prefix,
@@ -221,6 +231,78 @@ fn prefill_and_decode_match_cpu_with_causal_sentinels_and_offset() {
 #[test]
 fn representative_0731_decode_selects_top512_of_640() {
     run_case(1, 1, 640, 2559, 128);
+}
+
+#[test]
+fn mma_path_preserves_strongly_ordered_top512() {
+    let device = MlxDevice::new().unwrap();
+    let queries = 1;
+    let kv_len = 640;
+    let q = bf16_buffer(
+        &device,
+        &vec![bf16::from_f32(0.01); queries * H * D],
+        vec![1, queries, H, D],
+    );
+    let mut kv_values = Vec::with_capacity(kv_len * D);
+    for candidate in 0..kv_len {
+        kv_values.extend(std::iter::repeat_n(
+            bf16::from_f32((candidate + 1) as f32 * 0.0001),
+            D,
+        ));
+    }
+    let kv = bf16_buffer(&device, &kv_values, vec![1, kv_len, D]);
+    let weights = f32_buffer(&device, &vec![1.0; H], vec![1, queries, H]);
+    let scratch = f32_buffer(&device, &vec![0.0; kv_len], vec![1, queries, kv_len]);
+    let topk_elements = deepseek_indexer_topk_scratch_elements(1, queries, kv_len).unwrap();
+    let topk_scratch = device
+        .alloc_buffer(
+            topk_elements * DType::I32.size_of(),
+            DType::I32,
+            vec![1, queries, topk_elements],
+        )
+        .unwrap();
+    let output = device
+        .alloc_buffer(K * DType::I32.size_of(), DType::I32, vec![1, queries, K])
+        .unwrap();
+    let params = DeepSeekIndexerParams {
+        batch: 1,
+        query_len: queries as u32,
+        kv_len: kv_len as u32,
+        start_pos: 2559,
+        ratio: DEEPSEEK_INDEXER_RATIO as u32,
+        heads: H as u32,
+        head_dim: D as u32,
+        top_k: K as u32,
+        offset: 128,
+    };
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_deepseek_indexer_into_mma(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q,
+        &kv,
+        &weights,
+        &scratch,
+        &topk_scratch,
+        &output,
+        K,
+        0,
+        &params,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    // Half staging intentionally collapses some adjacent low-magnitude
+    // candidates to equal scores. The deterministic tie order is therefore
+    // not a strict reverse sequence, but the selected top-512 set must remain
+    // exactly the highest 512 candidates.
+    let mut actual = output.as_slice::<i32>().unwrap().to_vec();
+    actual.sort_unstable();
+    let expected = (128..640)
+        .map(|index| index as i32 + 128)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 #[test]

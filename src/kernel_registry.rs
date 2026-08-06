@@ -1279,7 +1279,22 @@ impl KernelRegistry {
         sources.insert("deepseek_compressor_bf16".into(), deepseek_compressor_src);
         let deepseek_indexer_src: &'static str = include_str!("shaders/deepseek_indexer.metal");
         sources.insert("deepseek_indexer_score_bf16".into(), deepseek_indexer_src);
-        sources.insert("deepseek_indexer_topk_i32".into(), deepseek_indexer_src);
+        sources.insert(
+            "deepseek_indexer_score_mma_bf16".into(),
+            deepseek_indexer_src,
+        );
+        sources.insert(
+            "deepseek_indexer_topk_block_i32".into(),
+            deepseek_indexer_src,
+        );
+        sources.insert(
+            "deepseek_indexer_topk_merge_i32".into(),
+            deepseek_indexer_src,
+        );
+        sources.insert(
+            "deepseek_indexer_topk_finalize_i32".into(),
+            deepseek_indexer_src,
+        );
         let deepseek_moe_routing_src: &'static str =
             include_str!("shaders/deepseek_moe_routing.metal");
         sources.insert(
@@ -1302,7 +1317,26 @@ impl KernelRegistry {
         );
         let deepseek_sparse_src: &'static str =
             include_str!("shaders/deepseek_sparse_attention.metal");
-        sources.insert("deepseek_sparse_attention_bf16".into(), deepseek_sparse_src);
+        sources.insert(
+            "deepseek_sparse_attention_score_bf16".into(),
+            deepseek_sparse_src,
+        );
+        sources.insert(
+            "deepseek_sparse_attention_reduce_bf16".into(),
+            deepseek_sparse_src,
+        );
+        sources.insert(
+            "deepseek_sparse_attention_validate_q_bf16".into(),
+            deepseek_sparse_src,
+        );
+        sources.insert(
+            "deepseek_sparse_attention_gather_bf16".into(),
+            deepseek_sparse_src,
+        );
+        sources.insert(
+            "deepseek_sparse_attention_sanitize_bf16".into(),
+            deepseek_sparse_src,
+        );
         let deepseek_sparse_prefill_mask_src: &'static str =
             include_str!("shaders/deepseek_sparse_prefill_mask.metal");
         sources.insert(
