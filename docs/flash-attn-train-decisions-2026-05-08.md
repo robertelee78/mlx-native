@@ -311,9 +311,38 @@ Full affine, GGML, and model-family regression coverage remains mandatory.
 
 ---
 
+## D8. Generic RoPE transcendental portability → **Request precise math in source**
+
+**Decision:** Every `pow`, `sin`, and `cos` used by the generic `rope.metal`
+kernel family selects Metal's `precise::` implementation explicitly.  The
+existing CPU-reference tolerance remains unchanged.
+
+**Why:** Exact-candidate run 31077715900 proved the D6 training and D7 affine
+corrections on hosted M1, then exposed a separate long-standing generic RoPE
+assumption.  At position 2048 and theta 1e6, `rope_f32` returned `1.1819264`
+where the CPU reference returned `1.1818851` (absolute error `4.1246e-5`, over
+the existing `1e-5` gate).  The generic shader was compiled with Metal's
+default fast math; only `deepseek_tail_rope.metal` opted into precise FP32
+math.  Apple's Metal Shading Language numerical-compliance tables bound fast
+`sin`/`cos` only inside `[-pi, pi]` and state that error is larger outside that
+domain, while the precise implementations are bounded to four ULP for
+`sin`/`cos` and sixteen ULP for `pow`.
+
+Raising the test tolerance was rejected because it would accept
+generation-dependent position encodings.  An explicit source-level selection
+also keeps precompiled metallib and runtime-source fallback semantics aligned,
+independent of their surrounding compiler options.
+
+**Scope:** This changes only generic RoPE transcendental evaluation.  It does
+not change tensor layout, frequency exponents, pairing convention, or the
+already-precise DeepSeek tail-RoPE implementation.  Model-family parity and a
+fresh hosted M1 run remain mandatory before release.
+
+---
+
 ## Phase 1 unblocked
 
-With these seven decisions resolved, Phase 1 has no remaining
+With these eight decisions resolved, Phase 1 has no remaining
 architectural input required.  Implementer's worklist:
 
 1. New file `src/ops/rope.rs` + `src/shaders/rope_forward.metal` +

@@ -14,6 +14,12 @@ using namespace metal;
 ///
 /// Each thread processes one pair (2 elements) at coordinate (pair_idx, seq_idx).
 /// Grid: (head_dim / 2, seq_len, 1)
+///
+/// RoPE positions routinely put the trigonometric argument outside [-pi, pi].
+/// Metal's fast sin/cos accuracy is only bounded inside that interval, and its
+/// range-reduction error differs across Apple GPU generations.  Select precise
+/// transcendentals explicitly so precompiled and runtime-source paths share one
+/// position-encoding contract regardless of the surrounding compiler flags.
 
 kernel void rope_f32(
     device const float *input      [[buffer(0)]],
@@ -37,11 +43,11 @@ kernel void rope_f32(
     //   freq = theta^(-2 * pair_idx / head_dim)
     //   angle = pos * freq
     const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / pow(theta, dim_ratio);
+    const float freq = 1.0f / precise::pow(theta, dim_ratio);
     const float angle = float(pos) * freq;
 
-    const float cos_a = cos(angle);
-    const float sin_a = sin(angle);
+    const float cos_a = precise::cos(angle);
+    const float sin_a = precise::sin(angle);
 
     // Index into the flat [seq_len, head_dim] array
     const uint base = seq_idx * head_dim + 2 * pair_idx;
@@ -71,11 +77,11 @@ kernel void rope_f16(
     const uint pos = positions[seq_idx];
 
     const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / pow(theta, dim_ratio);
+    const float freq = 1.0f / precise::pow(theta, dim_ratio);
     const float angle = float(pos) * freq;
 
-    const float cos_a = cos(angle);
-    const float sin_a = sin(angle);
+    const float cos_a = precise::cos(angle);
+    const float sin_a = precise::sin(angle);
 
     const uint base = seq_idx * head_dim + 2 * pair_idx;
     // Promote to f32 for computation, store back as f16
@@ -104,11 +110,11 @@ kernel void rope_bf16(
     const uint pos = positions[seq_idx];
 
     const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / pow(theta, dim_ratio);
+    const float freq = 1.0f / precise::pow(theta, dim_ratio);
     const float angle = float(pos) * freq;
 
-    const float cos_a = cos(angle);
-    const float sin_a = sin(angle);
+    const float cos_a = precise::cos(angle);
+    const float sin_a = precise::sin(angle);
 
     const uint base = seq_idx * head_dim + 2 * pair_idx;
     // Promote to f32 for computation, store back as bfloat16
@@ -164,11 +170,11 @@ kernel void rope_neox_bf16(
     // Denominator is head_dim (not rope_dim) to match mlx-lm's ProportionalRoPE:
     //   exponents = arange(0, rotated_dims, 2) / dims  (dims = full head_dim)
     const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    const float freq = 1.0f / pow(theta, dim_ratio);
+    const float freq = 1.0f / precise::pow(theta, dim_ratio);
     const float angle = float(pos) * freq;
 
-    const float cos_a = cos(angle);
-    const float sin_a = sin(angle);
+    const float cos_a = precise::cos(angle);
+    const float sin_a = precise::sin(angle);
 
     // Neox/split indexing: pair (d[pair_idx], d[pair_idx + half_dim])
     // MLX uses half_dim = head_dim/2 as the split point, NOT rope_dim/2.
@@ -246,15 +252,15 @@ kernel void rope_neox_f32(
     // Denominator is head_dim (not rope_dim) to match mlx-lm's ProportionalRoPE:
     //   exponents = arange(0, rotated_dims, 2) / dims  (dims = full head_dim)
     const float dim_ratio = float(2 * pair_idx) / float(head_dim);
-    float freq = float(pos) / pow(theta, dim_ratio);
+    float freq = float(pos) / precise::pow(theta, dim_ratio);
 
     // Apply freq_factors if present: divide the base frequency by freq_factors[pair_idx]
     if (has_ff != 0u) {
         freq /= freq_factors[pair_idx];
     }
 
-    const float cos_a = cos(freq);
-    const float sin_a = sin(freq);
+    const float cos_a = precise::cos(freq);
+    const float sin_a = precise::sin(freq);
 
     // Neox/split indexing: pair (d[pair_idx], d[pair_idx + half_dim])
     const uint base = row_idx * head_dim;
