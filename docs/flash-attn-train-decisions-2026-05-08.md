@@ -233,9 +233,51 @@ default tape behavior — no changes needed.
 
 ---
 
+## D6. Apple GPU-family pipeline portability → **Bound D/TD loop unrolling and test on M1**
+
+**Decision:** The D=256 backward specialization uses BQ=16, BK=8, and
+WM=2 (16 KiB static threadgroup memory).  Loops whose trip count scales
+with D or TD use `clang loop unroll(disable)`; the small BK loops and
+cooperative loaders remain fully unrolled.  CI permanently runs the full
+17-test training suite on the standard `macos-15` M1 runner in a fresh
+process.
+
+**Why:** A clean M5 Max is not evidence that a Metal pipeline will compile
+on every supported Apple GPU family.  The hosted M1 falsification sequence
+on 2026-08-05 isolated this kernel and then varied one resource class at a
+time:
+
+1. Run 31073334511 reproduced the failure in a fresh training-only job: the
+   D=64 backward pipeline compiled, then D=256 backward pipeline creation
+   failed and poisoned later runtime compilations.
+2. Run 31073508561 proved the D=256 *forward* pipeline independently passes
+   on the same runner, narrowing the defect to backward D=256.
+3. Run 31073940688 reduced the backward tile from an exact 32 KiB footprint
+   to 24 KiB; D=256 pipeline creation still failed.
+4. Run 31074394566 further reduced it to BQ=16/BK=8/WM=2 and 16 KiB, also
+   halving the score/gradient BK working set; pipeline creation still failed.
+5. Run 31074696750 kept the 16 KiB tile and bounded the six D/TD-scaled
+   unrolled loops.  The exact D=256 pipeline and all 17 training tests passed
+   on M1.  Local M5 parity remained within the existing tolerance (maximum
+   observed errors: dQ 1.1452e-4, dK 1.8290e-4, dV 1.4993e-3).
+
+The evidence therefore rejects the original "threadgroup memory only"
+hypothesis.  Excessive compile-time expansion was also required to explain
+the failure.  The conservative BK=8 configuration stays until a separately
+benchmarked BK=16 candidate passes the same M1 gate; this record does not
+claim BK=8 is independently necessary.
+
+**Scope:** This is a calibration/training kernel.  No hf2q forward, prefill,
+decode, KV-cache, or other inference shader is changed.  D64 backward shares
+the bounded-loop template and may trade some training throughput for portable
+compilation; correctness tests remain green.  Training-kernel speed is not a
+production inference hot-path metric under the priorities stated above.
+
+---
+
 ## Phase 1 unblocked
 
-With these five decisions resolved, Phase 1 has no remaining
+With these six decisions resolved, Phase 1 has no remaining
 architectural input required.  Implementer's worklist:
 
 1. New file `src/ops/rope.rs` + `src/shaders/rope_forward.metal` +
