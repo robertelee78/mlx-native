@@ -62,7 +62,17 @@ jobs:
           shasum -a 256 "$crate" | tee "$RUNNER_TEMP/release-crate.sha256"
 
       - name: Publish exact package
-        run: cargo +stable publish --locked --token "$CARGO_REGISTRY_TOKEN"
+        shell: bash
+        run: |
+          set -euo pipefail
+          published="$RUNNER_TEMP/mlx-native-${EXPECTED_VERSION}-published.crate"
+          if curl --fail --location --silent --show-error \
+            "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
+            --output "$published"; then
+            echo "mlx-native ${EXPECTED_VERSION} is already published; verifying exact bytes"
+          else
+            cargo +stable publish --locked --token "$CARGO_REGISTRY_TOKEN"
+          fi
 
       - name: Verify crates.io bytes
         shell: bash
@@ -70,9 +80,9 @@ jobs:
           set -euo pipefail
           expected=$(awk '{print $1}' "$RUNNER_TEMP/release-crate.sha256")
           downloaded="$RUNNER_TEMP/mlx-native-${EXPECTED_VERSION}.crate"
-          for _ in 1 2 3 4 5 6; do
+          for _ in $(seq 1 24); do
             if curl --fail --location --silent --show-error \
-              "https://crates.io/api/v1/crates/mlx-native/${EXPECTED_VERSION}/download" \
+              "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
               --output "$downloaded"; then
               actual=$(shasum -a 256 "$downloaded" | awk '{print $1}')
               test "$actual" = "$expected"
