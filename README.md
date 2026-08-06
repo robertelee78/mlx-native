@@ -34,7 +34,7 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 - **Apple Silicon only.** No CPU, no CUDA, no WASM. If you need to ship cross-platform, this is the wrong layer.
 - **No autograd.** A growing set of backward + optimizer kernels exists — SiLU / RMSNorm / softmax / log / row-sum / embedding-scatter / exp / divide / sqrt / outer-product / conv1d-depthwise-causal / MoE-weighted-sum / MoE-SwiGLU backward, differentiable affine qdq, Adam step, and `flash_attn_train` (forward + backward through attention with dQ/dK/dV) — but you wire the training loop yourself; there is no `Var` / `VarMap` / autodiff / `Module` system.
-- **GGML matmul coverage is the inference subset, not the full set.** Q4_0, Q8_0, Q6_K have full mat-vec / mat-mat / tensor-mm and expert-routed variants. Q4_K and Q5_K have dense mat-vec / mat-mat plus expert-routed (`mm_id`) variants. Q5_1 and IQ4_NL have dense and expert-routed variants. Q4_1, Q5_0, Q8_1, Q2_K, Q3_K, Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
+- **GGML matmul coverage is the inference subset, not the full set.** Q2_K, Q3_K, Q4_0, Q8_0, and Q6_K have dense mat-vec / mat-mat plus expert-routed variants; the production shapes also use tensor-core paths where implemented. Q4_K and Q5_K have dense mat-vec / mat-mat plus expert-routed (`mm_id`) variants. Q5_1 and IQ4_NL have dense and expert-routed variants. Q4_1, Q5_0, Q8_1, and Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
 - **No high-level model code.** This is a kernel library; the consumer (e.g. hf2q) builds the actual transformer forward pass.
 
 ## Status
@@ -45,6 +45,7 @@ Supported model families used in production:
 - **Qwen3 / Qwen3.5 / Qwen3.6** (dense + MoE, GGUF)
 - **Qwen3-VL** (vision-tower kernels: im2col / bilinear-resize / 2×2 block-merge / feature-concat + `RopeMultiMode::Vision`)
 - **Gemma 4** (dense, with SWA + softcap, GQA)
+- **DeepSeek V4 Flash 0731** (compressed sparse attention + MoE kernels)
 - **BERT-style** embeddings (bge-small-en-v1.5)
 - Generic transformer kernels for custom architectures
 
