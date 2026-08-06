@@ -140,8 +140,22 @@ fn main() {
     for metal_path in &metal_files {
         let stem = metal_path.file_stem().unwrap().to_string_lossy().to_string();
         let air_path = air_dir.join(format!("{stem}.air"));
-        let output = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", "-O3", "-c"])
+        let mut command = Command::new("xcrun");
+        command.args(["-sdk", "macosx", "metal", "-O3"]);
+        // RoPE sees angles near 1e6 radians at the trained context limit.
+        // Default Metal FP32 transcendentals are the `fast` variants and
+        // diverge materially between Apple GPU generations at that range.
+        // Keep this tiny, latency-insensitive kernel on precise FP32 math so
+        // long-context position encoding remains source-reference stable.
+        if stem == "deepseek_tail_rope" {
+            command.args([
+                "-fno-fast-math",
+                "-fmetal-math-mode=safe",
+                "-fmetal-math-fp32-functions=precise",
+            ]);
+        }
+        let output = command
+            .arg("-c")
             .arg(metal_path)
             .arg("-o")
             .arg(&air_path)

@@ -61,6 +61,16 @@ fn precompiled_fcv_enabled() -> bool {
     )
 }
 
+/// Kernels whose FP32 transcendental accuracy is part of model correctness.
+///
+/// DeepSeek tail RoPE reaches angles near 1e6 radians. Apple's default fast
+/// transcendental path has measurably different range-reduction error across
+/// M-series generations, so source-compiled fallback libraries must opt out of
+/// fast math just as the precompiled build does in `build.rs`.
+fn requires_precise_fp32_math(name: &str) -> bool {
+    name.starts_with("deepseek_tail_rope_")
+}
+
 // MTLDataType numeric values (from metal-rs argument.rs, confirmed in Apple Metal spec):
 //   Int  = 29
 //   Bool = 53
@@ -1556,6 +1566,9 @@ impl KernelRegistry {
                         .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
 
                     let compile_opts = metal::CompileOptions::new();
+                    if requires_precise_fp32_math(name) {
+                        compile_opts.set_fast_math_enabled(false);
+                    }
                     let library = device
                         .new_library_with_source(source, &compile_opts)
                         .map_err(|msg| MlxError::ShaderCompilationError {
@@ -1727,6 +1740,9 @@ impl KernelRegistry {
                         .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
 
                     let compile_opts = metal::CompileOptions::new();
+                    if requires_precise_fp32_math(name) {
+                        compile_opts.set_fast_math_enabled(false);
+                    }
                     let library = device
                         .new_library_with_source(source, &compile_opts)
                         .map_err(|msg| MlxError::ShaderCompilationError {
@@ -1823,6 +1839,20 @@ impl Default for KernelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_tail_rope_is_the_only_precise_math_kernel_family() {
+        for name in [
+            "deepseek_tail_rope_f32_to_bf16",
+            "deepseek_tail_rope_bf16",
+            "deepseek_tail_rope_f32_to_f16",
+            "deepseek_tail_rope_f16_to_bf16",
+        ] {
+            assert!(requires_precise_fp32_math(name), "{name}");
+        }
+        assert!(!requires_precise_fp32_math("deepseek_indexer_scores"));
+        assert!(!requires_precise_fp32_math("rope_neox_f32"));
+    }
 
     /// Minimal Metal shader that uses a single int function constant.
     ///
