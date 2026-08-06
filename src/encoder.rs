@@ -2101,32 +2101,71 @@ impl CommandEncoder {
             }
             return;
         }
-        let counter_sets = device.counter_sets();
-        let timestamp_set = counter_sets
-            .iter()
-            .find(|c: &&metal::CounterSet| c.name().eq_ignore_ascii_case("timestamp"));
-        let timestamp_set = match timestamp_set {
-            Some(s) => s,
-            None => {
-                // Risk R1: device does not expose a timestamp set.
-                // Log once and degrade to no-op (sample_buffer stays None).
-                if TIMESTAMP_SET_WARN_LOGGED
-                    .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    eprintln!(
-                        "[mlx-native] MLX_PROFILE_DISPATCH=1 ignored: \
-                         device {:?} exposes no MTLCommonCounterSetTimestamp",
-                        device.name()
-                    );
-                }
-                return;
+        // `metal` 0.33's `DeviceRef::counter_sets()` unconditionally sends
+        // `count` to the returned NSArray. Some otherwise counter-capable
+        // Apple GPUs (hosted M1 reproduced this) return Objective-C nil here;
+        // messaging `count` through that wrapper aborts before Rust can
+        // degrade gracefully. Inspect the nullable API directly and retain no
+        // borrowed wrapper beyond descriptor construction.
+        let counter_sets: *mut Object = unsafe { msg_send![device, counterSets] };
+        if counter_sets.is_null() {
+            if TIMESTAMP_SET_WARN_LOGGED
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                eprintln!(
+                    "[mlx-native] MLX_PROFILE_DISPATCH=1 ignored: \
+                     device {:?} returned nil from MTLDevice.counterSets",
+                    device.name()
+                );
             }
-        };
+            return;
+        }
+        let counter_set_count: metal::NSUInteger = unsafe { msg_send![counter_sets, count] };
+        let mut timestamp_set: *mut Object = std::ptr::null_mut();
+        for index in 0..counter_set_count {
+            let candidate: *mut Object = unsafe { msg_send![counter_sets, objectAtIndex: index] };
+            if candidate.is_null() {
+                continue;
+            }
+            let name: *mut Object = unsafe { msg_send![candidate, name] };
+            if name.is_null() {
+                continue;
+            }
+            let utf8: *const std::os::raw::c_char = unsafe { msg_send![name, UTF8String] };
+            if !utf8.is_null()
+                && unsafe { CStr::from_ptr(utf8) }
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("timestamp")
+            {
+                timestamp_set = candidate;
+                break;
+            }
+        }
+        if timestamp_set.is_null() {
+            // Risk R1: device does not expose a timestamp set.
+            // Log once and degrade to no-op (sample_buffer stays None).
+            if TIMESTAMP_SET_WARN_LOGGED
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                eprintln!(
+                    "[mlx-native] MLX_PROFILE_DISPATCH=1 ignored: \
+                     device {:?} exposes no MTLCommonCounterSetTimestamp",
+                    device.name()
+                );
+            }
+            return;
+        }
         // Build descriptor.  StorageMode::Shared is required by
         // resolveCounterRange (MTLCounters.h:185-188).
         let descriptor = CounterSampleBufferDescriptor::new();
-        descriptor.set_counter_set(timestamp_set);
+        // SAFETY: `timestamp_set` is a non-null `id<MTLCounterSet>` returned
+        // by the live NSArray above. `setCounterSet:` retains it for the
+        // descriptor, and this reference is used only for that call.
+        let timestamp_set_ref: &metal::CounterSetRef =
+            unsafe { &*(timestamp_set as *const metal::CounterSetRef) };
+        descriptor.set_counter_set(timestamp_set_ref);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
         descriptor.set_label("mlx_native.dispatch_samples");
         descriptor.set_sample_count(MAX_SAMPLES_PER_CB);
