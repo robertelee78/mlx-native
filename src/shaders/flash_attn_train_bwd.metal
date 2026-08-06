@@ -70,6 +70,7 @@ using namespace metal;
 
 #define STEEL_CONST static constant constexpr const
 #define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+#define STEEL_PRAGMA_NOUNROLL _Pragma("clang loop unroll(disable)")
 
 // ─── bfloat16 compat shim ────────────────────────────────────────────────────
 #if defined(__HAVE_BFLOAT__)
@@ -331,7 +332,9 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
   // Shape: [TQ_s=1, TD] per simdgroup.
   // This thread owns dQ[q_abs_this, d_col] for d_col ∈ {sn + id*kFrag, sn+1 + id*kFrag}.
   float dQ_acc[TD][2];
-  STEEL_PRAGMA_UNROLL
+  // TD reaches 32 at D=256. Keeping this loop rolled avoids materializing the
+  // complete accumulator initialization in the M1 pipeline compiler.
+  STEEL_PRAGMA_NOUNROLL
   for (int id = 0; id < TD; id++) { dQ_acc[id][0] = 0.f; dQ_acc[id][1] = 0.f; }
 
   // Shmem offsets are computed inline in the scalar loops below; no pre-computed
@@ -409,7 +412,9 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
     STEEL_PRAGMA_UNROLL
     for (short k = 0; k < BK; k++) {
       float acc = 0.f;
-      STEEL_PRAGMA_UNROLL
+      // Full-unrolling 256 FMAs for every BK lane expands the D=256 pipeline
+      // aggressively; retain the constant-bound runtime loop on all devices.
+      STEEL_PRAGMA_NOUNROLL
       for (short d = 0; d < BD; d++) {
         acc += float(Q_smem[(tq_base+sm)*LDQ + d]) * float(K_smem[k*LDK + d]);
       }
@@ -457,7 +462,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
     STEEL_PRAGMA_UNROLL
     for (short k = 0; k < BK; k++) {
       float acc = 0.f;
-      STEEL_PRAGMA_UNROLL
+      STEEL_PRAGMA_NOUNROLL
       for (short d = 0; d < BD; d++) {
         acc += float(do_row_ptr[d]) * float(V_smem[k*LDV + d]);
       }
@@ -473,7 +478,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
 
     // dQ[q_abs_this][d] += scale * sum_k dS[k] * K[k][d].
     // dQ_acc[id][0/1] accumulates for d = id*kFrag+sn and id*kFrag+sn+1.
-    STEEL_PRAGMA_UNROLL
+    STEEL_PRAGMA_NOUNROLL
     for (short id = 0; id < TD; id++) {
       const short d0 = id * kFrag + sn;
       const short d1 = d0 + 1;
@@ -515,7 +520,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
         const float ds_k = dS_vec[k];
         const long row_elem = kv_row_base_elems + (long)k_abs * D;
 
-        STEEL_PRAGMA_UNROLL
+        STEEL_PRAGMA_NOUNROLL
         for (short d = 0; d < BD; d++) {
           const float q_val  = float(Q_smem[(tq_base+sm)*LDQ + d]);
           const float do_val = float(do_row_ptr[d]);
@@ -540,7 +545,7 @@ template <typename T, int BQ, int BK, int BD, int WM, int WN>
       + (long)h_q * (long)(qL * D)
       + (long)q_abs_this * D;
 
-  STEEL_PRAGMA_UNROLL
+  STEEL_PRAGMA_NOUNROLL
   for (short id = 0; id < TD; id++) {
     const short d0 = id * kFrag + sn;
     const short d1 = d0 + 1;
