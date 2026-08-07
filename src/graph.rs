@@ -1167,6 +1167,74 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode independent GGML block-format matrix products through one
+    /// three-dimensional Metal MM dispatch.
+    pub fn quantized_matmul_ggml_batched_mm(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml_batched_mm(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+        )
+    }
+
+    /// Encode independent GGML block-format matrix products from an
+    /// explicitly-strided F32 input view through one Metal MM dispatch.
+    pub fn quantized_matmul_ggml_batched_mm_strided_input(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulParams,
+        input_strides: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulInputStrides,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml_batched_mm_strided_input(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+            input_strides,
+        )
+    }
+
+    /// Encode independent GGML block-format matrix-vector products through
+    /// one three-dimensional Metal dispatch.
+    pub fn quantized_matmul_ggml_batched_mv(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml_batched_mv(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+        )
+    }
+
     /// Gather GGML Q2_K embedding rows directly into F32 activations.
     pub fn embedding_gather_q2_k(
         &mut self,
@@ -1281,6 +1349,36 @@ impl<'a> GraphSession<'a> {
         params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
     ) -> Result<()> {
         ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            scratch,
+            params,
+        )
+    }
+
+    /// Slotted-input variant of [`Self::quantized_matmul_id_ggml_pooled`].
+    ///
+    /// The input is `[n_tokens, top_k, K]`, with one activation row per
+    /// routed expert slot. This entry point is restricted to the `mm_id`
+    /// route; small matrix-vector calls retain the shared-per-token API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_id_ggml_pooled_slotted(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        output: &MlxBuffer,
+        scratch: &mut ops::quantized_matmul_id_ggml::IdMmScratch,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled_slotted(
             &mut self.encoder,
             registry,
             device,

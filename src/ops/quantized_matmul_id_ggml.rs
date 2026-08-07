@@ -392,6 +392,77 @@ pub fn quantized_matmul_id_ggml_pooled(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    quantized_matmul_id_ggml_pooled_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        IdMmInputLayout::SharedPerToken,
+    )
+}
+
+/// Pooled `mm_id` dispatch for input laid out as
+/// `[n_tokens, top_k, K]` instead of one shared row per token.
+///
+/// This serves MoE down projections whose activation already has one
+/// distinct row per routed expert slot. The Metal `mm_id` kernels natively
+/// support the slot and token strides, so preserving the shape avoids
+/// flattening `top_k` into the token dimension and over-dispatching the
+/// expert grid by that factor.
+///
+/// The slotted contract is matrix-matrix only. Calls at or below the `mm_id`
+/// routing threshold are rejected instead of entering the flat `mv_id` path
+/// with incompatible input addressing.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_slotted(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    quantized_matmul_id_ggml_pooled_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        IdMmInputLayout::Slotted,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdMmInputLayout {
+    SharedPerToken,
+    Slotted,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantized_matmul_id_ggml_pooled_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    input_layout: IdMmInputLayout,
+) -> Result<()> {
     // Mirror the validation + routing logic from `quantized_matmul_id_ggml`
     // so the pooled path has identical correctness invariants.  (We keep
     // the two entry points separate rather than extracting a shared inner
@@ -422,12 +493,20 @@ pub fn quantized_matmul_id_ggml_pooled(
         )));
     }
 
-    let expected_input_bytes =
-        (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of();
+    let input_rows = match input_layout {
+        IdMmInputLayout::SharedPerToken => params.n_tokens as usize,
+        IdMmInputLayout::Slotted => (params.n_tokens as usize)
+            .checked_mul(params.top_k as usize)
+            .ok_or_else(|| MlxError::InvalidArgument("slotted input row count overflow".into()))?,
+    };
+    let expected_input_bytes = input_rows
+        .checked_mul(params.k as usize)
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("input byte count overflow".into()))?;
     if input.byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_id_ggml_pooled: input buffer too small: expected {} bytes for [{} x {}] f32, got {}",
-            expected_input_bytes, params.n_tokens, params.k, input.byte_len()
+            "quantized_matmul_id_ggml_pooled: input buffer too small: expected {} bytes for [{} x {}] f32 {:?} input, got {}",
+            expected_input_bytes, input_rows, params.k, input_layout, input.byte_len()
         )));
     }
 
@@ -490,13 +569,30 @@ pub fn quantized_matmul_id_ggml_pooled(
                 params.n_experts,
             );
         }
-        return dispatch_id_mm_pooled(
-            encoder, registry, device, input, weight, ids, output,
-            scratch, params,
+        return dispatch_id_mm_pooled_with_layout(
+            encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            scratch,
+            params,
+            input_layout,
         );
     }
 
-    dispatch_id_mv(encoder, registry, device, input, weight, ids, output, params)
+    if input_layout == IdMmInputLayout::Slotted {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled_slotted requires the mm_id route: n_tokens={} threshold={} top_k={} k={}",
+            params.n_tokens, mm_id_routing_threshold(), params.top_k, params.k,
+        )));
+    }
+
+    dispatch_id_mv(
+        encoder, registry, device, input, weight, ids, output, params,
+    )
 }
 
 /// The n_tokens threshold at which `quantized_matmul_id_ggml` switches
@@ -1091,6 +1187,33 @@ fn dispatch_id_mm_pooled(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    dispatch_id_mm_pooled_with_layout(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        IdMmInputLayout::SharedPerToken,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_id_mm_pooled_with_layout(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    input_layout: IdMmInputLayout,
+) -> Result<()> {
     scratch.check_capacity(params.n_experts, params.n_tokens)?;
 
     // Translate the dispatcher-facing params to the mm_id internal dispatch
@@ -1106,10 +1229,18 @@ fn dispatch_id_mm_pooled(
         ggml_type: params.ggml_type,
     };
 
-    dispatch_id_mm_for_test(
-        encoder, registry, device,
-        input, weight, ids,
-        &mut scratch.htpe, &mut scratch.hids, output, &dispatch,
+    dispatch_id_mm_with_layout(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        &mut scratch.htpe,
+        &mut scratch.hids,
+        output,
+        &dispatch,
+        input_layout,
     )
 }
 
@@ -1277,6 +1408,35 @@ pub fn dispatch_id_mm_for_test(
     hids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
+) -> Result<()> {
+    dispatch_id_mm_with_layout(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        htpe,
+        hids,
+        output,
+        params,
+        IdMmInputLayout::SharedPerToken,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_id_mm_with_layout(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+    input_layout: IdMmInputLayout,
 ) -> Result<()> {
     let qk = params.ggml_type.block_values();
 
@@ -1448,17 +1608,22 @@ pub fn dispatch_id_mm_for_test(
 
     let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
     let row_bytes = (params.k as u64) * (DType::F32.size_of() as u64);
+    let (slot_stride, token_stride) = match input_layout {
+        IdMmInputLayout::SharedPerToken => (0, row_bytes),
+        IdMmInputLayout::Slotted => (
+            row_bytes,
+            row_bytes
+                .checked_mul(params.top_k as u64)
+                .ok_or_else(|| MlxError::InvalidArgument("slotted token stride overflow".into()))?,
+        ),
+    };
 
-    // Input layout: `[n_tokens, K]` f32 flat.  There is ONE input row per
-    // token (shared across all top_k slots), so:
-    //   * nb11 (slot stride) = 0 — the kernel advances by `i11 * nb11`
-    //     inside the K loop; zero means every slot reads the same token row.
-    //   * nb12 (token stride) = K * 4.
-    //
-    // This differs from llama.cpp's upstream MUL_MAT_ID where `src1` has
-    // shape `[K, n_expert_used, n_tokens]` (pre-replicated per slot),
-    // making `nb11 = K * 4` and `nb12 = top_k * K * 4` there.  Our mv_id
-    // port uses the flat `[n_tokens, K]` layout and so does mm_id.
+    // The normal input layout is `[n_tokens, K]`: nb11=0 shares one input
+    // row across every expert slot and nb12=K*4 advances by token. Slotted
+    // MoE down inputs are `[n_tokens, top_k, K]`: nb11=K*4 advances by slot
+    // and nb12=top_k*K*4 advances by token. The latter matches llama.cpp's
+    // upstream MUL_MAT_ID addressing without forcing callers to flatten
+    // top_k into the token count.
     let mm_params = GgmlIdMmMmGpuParams {
         ne00: params.k as i32,
         ne02: params.n_experts as i32,
@@ -1468,8 +1633,8 @@ pub fn dispatch_id_mm_for_test(
         ne11: params.top_k as i32,
         _pad0: 0,
         nb10: DType::F32.size_of() as u64,
-        nb11: 0,             // no slot dim in our input
-        nb12: row_bytes,     // per-token stride
+        nb11: slot_stride,
+        nb12: token_stride,
         nb13: 0,
         ne20: params.top_k as i32,
         ne21: params.n_tokens as i32,

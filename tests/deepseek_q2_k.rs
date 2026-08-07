@@ -9,8 +9,9 @@ use mlx_native::{
         },
         quantized_matmul_id_ggml::{dispatch_id_mm_for_test, GgmlIdMmDispatchParams},
     },
-    quantized_matmul_ggml, quantized_matmul_id_ggml, DType, GgmlQuantizedMatmulIdParams,
-    GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxDevice,
+    quantized_matmul_ggml, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
+    quantized_matmul_id_ggml_pooled_slotted, DType, GgmlQuantizedMatmulIdParams,
+    GgmlQuantizedMatmulParams, GgmlType, IdMmScratch, KernelRegistry, MlxDevice,
 };
 
 const QK_K: usize = 256;
@@ -518,4 +519,116 @@ fn q2_k_expert_mm_id_top_k_6_matches_reference() {
 #[test]
 fn q2_k_public_prefill_top_k_6_matches_reference() {
     run_expert(33, 6, 8, false);
+}
+
+#[test]
+fn q2_k_slotted_down_mm_is_byte_identical_to_flattened_rows() {
+    let tokens = 33usize;
+    let top_k = 6usize;
+    let experts = 8usize;
+    let n = 8usize;
+    let routed_rows = tokens * top_k;
+
+    let mut weights = Vec::new();
+    for expert in 0..experts {
+        for row in 0..n {
+            weights.extend(block((expert * n + row + 1) as u8));
+        }
+    }
+    let routed_input = input(routed_rows);
+    let ids: Vec<u32> = (0..tokens)
+        .flat_map(|token| (0..top_k).map(move |slot| ((token * 3 + slot) % experts) as u32))
+        .collect();
+
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    let mut weight_buf = device
+        .alloc_buffer(weights.len(), DType::U8, vec![weights.len()])
+        .expect("weight");
+    weight_buf
+        .as_mut_slice::<u8>()
+        .expect("weight slice")
+        .copy_from_slice(&weights);
+    let mut input_buf = device
+        .alloc_buffer(
+            routed_input.len() * 4,
+            DType::F32,
+            vec![tokens, top_k, QK_K],
+        )
+        .expect("slotted input");
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("input slice")
+        .copy_from_slice(&routed_input);
+    let mut ids_buf = device
+        .alloc_buffer(ids.len() * 4, DType::U32, vec![tokens, top_k])
+        .expect("ids");
+    ids_buf
+        .as_mut_slice::<u32>()
+        .expect("ids slice")
+        .copy_from_slice(&ids);
+    let flat_output = device
+        .alloc_buffer(routed_rows * n * 4, DType::F32, vec![routed_rows, n])
+        .expect("flat output");
+    let slotted_output = device
+        .alloc_buffer(routed_rows * n * 4, DType::F32, vec![tokens, top_k, n])
+        .expect("slotted output");
+
+    let flat_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: routed_rows as u32,
+        top_k: 1,
+        n: n as u32,
+        k: QK_K as u32,
+        n_experts: experts as u32,
+        expert_stride: (n * BLOCK_BYTES) as u64,
+        ggml_type: GgmlType::Q2_K,
+    };
+    let slotted_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: tokens as u32,
+        top_k: top_k as u32,
+        ..flat_params
+    };
+    let mut flat_scratch =
+        IdMmScratch::alloc(&device, experts as u32, routed_rows as u32).expect("flat scratch");
+    let mut slotted_scratch =
+        IdMmScratch::alloc(&device, experts as u32, tokens as u32).expect("slotted scratch");
+
+    let mut flat_encoder = device.command_encoder().expect("flat encoder");
+    quantized_matmul_id_ggml_pooled(
+        &mut flat_encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &ids_buf,
+        &flat_output,
+        &mut flat_scratch,
+        &flat_params,
+    )
+    .expect("flattened Q2_K down mm_id");
+    flat_encoder.commit_and_wait().expect("flat GPU completion");
+
+    let mut slotted_encoder = device.command_encoder().expect("slotted encoder");
+    quantized_matmul_id_ggml_pooled_slotted(
+        &mut slotted_encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &ids_buf,
+        &slotted_output,
+        &mut slotted_scratch,
+        &slotted_params,
+    )
+    .expect("slotted Q2_K down mm_id");
+    slotted_encoder
+        .commit_and_wait()
+        .expect("slotted GPU completion");
+
+    assert_eq!(
+        slotted_output
+            .as_slice::<f32>()
+            .expect("slotted output values"),
+        flat_output.as_slice::<f32>().expect("flat output values")
+    );
 }
