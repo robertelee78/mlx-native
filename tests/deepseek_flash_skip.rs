@@ -10,18 +10,17 @@ use mlx_native::ops::flash_attn_prefill_blk::{
     self, dispatch_flash_attn_prefill_blk, dispatch_flash_attn_prefill_blk_f16, BlkParams,
 };
 use mlx_native::ops::flash_attn_prefill_d512::{
-    self, dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks,
+    self, dispatch_flash_attn_prefill_bf16_d512_token_major_with_blk_and_sinks,
+    dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks,
     dispatch_flash_attn_prefill_bf16_d512_with_sinks,
     dispatch_flash_attn_prefill_f16_d512_with_blk_and_sinks,
     dispatch_flash_attn_prefill_f16_d512_with_sinks,
 };
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 
-fn run_d512_skip_map_parity(dtype: DType) {
+fn run_d512_skip_map_parity(dtype: DType, rows: usize, kv_len: usize) {
     let device = MlxDevice::new().unwrap();
-    let rows = 16usize;
     let heads = 64usize;
-    let kv_len = 512usize;
     let head_dim = 512usize;
     let top_k = 130usize;
 
@@ -54,6 +53,28 @@ fn run_d512_skip_map_parity(dtype: DType) {
         }
         other => panic!("unsupported test dtype {other:?}"),
     }
+    let q_token_major = if dtype == DType::BF16 {
+        let mut token_major = device
+            .alloc_buffer(
+                heads * rows * head_dim * 2,
+                dtype,
+                vec![1, rows, heads, head_dim],
+            )
+            .unwrap();
+        let source = q.as_slice::<bf16>().unwrap();
+        let destination = token_major.as_mut_slice::<bf16>().unwrap();
+        for row in 0..rows {
+            for head in 0..heads {
+                let source_offset = (head * rows + row) * head_dim;
+                let destination_offset = (row * heads + head) * head_dim;
+                destination[destination_offset..destination_offset + head_dim]
+                    .copy_from_slice(&source[source_offset..source_offset + head_dim]);
+            }
+        }
+        Some(token_major)
+    } else {
+        None
+    };
     let mut sinks = device
         .alloc_buffer(heads * 4, DType::F32, vec![heads])
         .unwrap();
@@ -159,6 +180,15 @@ fn run_d512_skip_map_parity(dtype: DType) {
             vec![1, heads, rows, head_dim],
         )
         .unwrap();
+    let out_token_major = (dtype == DType::BF16).then(|| {
+        device
+            .alloc_buffer(
+                heads * rows * head_dim * 2,
+                dtype,
+                vec![1, rows, heads, head_dim],
+            )
+            .unwrap()
+    });
     let params = FlashAttnPrefillParams {
         n_heads: heads as u32,
         n_kv_heads: 1,
@@ -234,6 +264,43 @@ fn run_d512_skip_map_parity(dtype: DType) {
     .unwrap();
     skipped.commit_and_wait().unwrap();
 
+    if let (Some(q_token_major), Some(out_token_major)) =
+        (q_token_major.as_ref(), out_token_major.as_ref())
+    {
+        let mut token_major = device.command_encoder().unwrap();
+        dispatch_flash_attn_prefill_bf16_d512_token_major_with_blk_and_sinks(
+            &mut token_major,
+            &device,
+            &mut registry,
+            q_token_major,
+            &kv,
+            &kv,
+            &mask,
+            &blk,
+            &sinks,
+            out_token_major,
+            &params,
+        )
+        .unwrap();
+        token_major.commit_and_wait().unwrap();
+
+        let head_major = out_with.as_slice::<bf16>().unwrap();
+        let token_major = out_token_major.as_slice::<bf16>().unwrap();
+        for row in 0..rows {
+            for head in 0..heads {
+                let head_offset = (head * rows + row) * head_dim;
+                let token_offset = (row * heads + head) * head_dim;
+                for feature in 0..head_dim {
+                    assert_eq!(
+                        head_major[head_offset + feature].to_bits(),
+                        token_major[token_offset + feature].to_bits(),
+                        "BF16 D512 token-major output drift at row {row}, head {head}, feature {feature}"
+                    );
+                }
+            }
+        }
+    }
+
     match dtype {
         DType::F16 => {
             let plain_values = out_without.as_slice::<f16>().unwrap();
@@ -265,10 +332,11 @@ fn run_d512_skip_map_parity(dtype: DType) {
 
 #[test]
 fn f16_d512_skip_map_is_byte_identical_with_sinks() {
-    run_d512_skip_map_parity(DType::F16);
+    run_d512_skip_map_parity(DType::F16, 16, 512);
 }
 
 #[test]
 fn bf16_d512_skip_map_is_byte_identical_with_sinks() {
-    run_d512_skip_map_parity(DType::BF16);
+    run_d512_skip_map_parity(DType::BF16, 16, 512);
+    run_d512_skip_map_parity(DType::BF16, 13, 517);
 }

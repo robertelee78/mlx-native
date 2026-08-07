@@ -8,7 +8,48 @@ use mlx_native::ops::deepseek_sparse_prefill_mask::{
 use mlx_native::ops::flash_attn_prefill_blk::{
     dispatch_flash_attn_prefill_blk_f16, BlkParams,
 };
-use mlx_native::{DType, KernelRegistry, MlxDevice};
+use mlx_native::{CapturedNode, DType, KernelRegistry, MlxDevice};
+
+#[test]
+fn capture_annotates_fill_and_scatter_dependencies() {
+    let device = MlxDevice::new().unwrap();
+    let indices = device
+        .alloc_buffer(4, DType::I32, vec![1, 1, 1])
+        .unwrap();
+    let mask = device
+        .alloc_buffer(8, DType::BF16, vec![1, 1, 1, 4])
+        .unwrap();
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    dispatch_deepseek_sparse_prefill_mask(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &indices,
+        &mask,
+        &DeepSeekSparsePrefillMaskParams {
+            batch: 1,
+            query_len: 1,
+            kv_len: 4,
+            top_k: 1,
+            heads: 1,
+        },
+    )
+    .unwrap();
+
+    let captured = encoder.take_capture().unwrap();
+    assert_eq!(captured.len(), 3);
+    for (index, node) in captured.iter().enumerate() {
+        match node {
+            CapturedNode::Dispatch { reads, writes, .. } => {
+                assert!(!reads.is_empty(), "dispatch {index} is missing reads");
+                assert!(!writes.is_empty(), "dispatch {index} is missing writes");
+            }
+            CapturedNode::Barrier => assert_eq!(index, 1),
+        }
+    }
+}
 
 #[test]
 fn selected_positions_form_additive_mask() {

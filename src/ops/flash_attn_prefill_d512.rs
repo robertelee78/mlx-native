@@ -362,7 +362,20 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_and_blk(
     nsg: u32,
 ) -> Result<()> {
     dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
-        encoder, device, registry, q, k, v, mask, blk, None, out, params, nsg, false,
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        mask,
+        blk,
+        None,
+        out,
+        params,
+        nsg,
+        false,
+        QueryOutputLayout::HeadMajor,
     )
 }
 
@@ -394,6 +407,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_sinks(
         params,
         NSG_D512,
         false,
+        QueryOutputLayout::HeadMajor,
     )
 }
 
@@ -431,6 +445,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks(
         params,
         NSG_D512,
         true,
+        QueryOutputLayout::HeadMajor,
     )
 }
 
@@ -463,7 +478,52 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks(
         params,
         NSG_D512,
         false,
+        QueryOutputLayout::HeadMajor,
     )
+}
+
+/// BF16 D=512 prefill over token-major Q/O storage `[B, Q, H, D]`.
+///
+/// K/V retain the standard head-major `[B, H_kv, K, D]` layout. This is the
+/// stride-aware sibling of
+/// [`dispatch_flash_attn_prefill_bf16_d512_with_blk_and_sinks`]; it changes
+/// only Q/O addressing and preserves the kernel's accumulation order.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d512_token_major_with_blk_and_sinks(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: &MlxBuffer,
+    blk: &MlxBuffer,
+    sinks: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        Some(mask),
+        Some(blk),
+        Some(sinks),
+        out,
+        params,
+        NSG_D512,
+        false,
+        QueryOutputLayout::TokenMajor,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryOutputLayout {
+    HeadMajor,
+    TokenMajor,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -481,6 +541,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     params: &FlashAttnPrefillParams,
     nsg: u32,
     heads_as_rows: bool,
+    query_output_layout: QueryOutputLayout,
 ) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
     if params.head_dim != 512 {
@@ -660,16 +721,17 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
 
     // ── Build AttnParams GPU struct ───────────────────────────────────────
     //
-    // Strides for layout [B, H, L, D] where the innermost (D) stride is 1:
-    //   seq stride   = D
-    //   head stride  = L * D
-    //   batch stride = H * L * D
+    // Strides where the innermost (D) stride is 1. Q/O may be either
+    // head-major `[B, H, L, D]` or token-major `[B, L, H, D]`; K/V retain
+    // the standard head-major layout.
     //
     // Q/O use (H, qL); K/V use (H_kv, kL).
 
-    let q_seq_stride = d as i64;
-    let q_head_stride = (ql * d) as i64;
     let q_batch_stride = (h * ql * d) as i64;
+    let (q_head_stride, q_seq_stride) = match query_output_layout {
+        QueryOutputLayout::HeadMajor => ((ql * d) as i64, d as i64),
+        QueryOutputLayout::TokenMajor => (d as i64, (h * d) as i64),
+    };
 
     let kv_seq_stride = d as i64;
     let kv_head_stride = (kl * d) as i64;
@@ -722,6 +784,24 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     // function constant disables sinks, buffer(8) is dead-code-eliminated;
     // reusing Q avoids a dummy allocation for legacy callers.
     let sinks_buf = sinks.unwrap_or(q);
+
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start = buffer.contents_ptr() as usize;
+            (start, start + buffer.byte_len())
+        };
+        let mut reads = vec![range(q), range(k), range(v)];
+        if let Some(mask) = mask {
+            reads.push(range(mask));
+        }
+        if let Some(blk) = blk {
+            reads.push(range(blk));
+        }
+        if let Some(sinks) = sinks {
+            reads.push(range(sinks));
+        }
+        encoder.set_pending_buffer_ranges(reads, vec![range(out)]);
+    }
 
     if has_mask {
         let mask_buf = mask.ok_or_else(|| {

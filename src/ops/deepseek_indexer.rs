@@ -116,6 +116,11 @@ fn validate_buffer(buf: &MlxBuffer, name: &str, dtype: DType, shape: &[usize]) -
     Ok(())
 }
 
+fn buffer_range(buffer: &MlxBuffer) -> (usize, usize) {
+    let start = buffer.contents_ptr() as usize;
+    (start, start + buffer.byte_len())
+}
+
 fn validate_params(p: &DeepSeekIndexerParams) -> Result<(usize, usize, usize)> {
     if p.batch == 0 || p.query_len == 0 || p.kv_len == 0 {
         return Err(MlxError::InvalidArgument(
@@ -405,6 +410,16 @@ fn dispatch_deepseek_indexer_into_with_score_kernel(
                 queries * kv_len,
             )
             .with_shape(vec![1, queries, kv_len])?;
+        if encoder.is_capturing() {
+            encoder.set_pending_buffer_ranges(
+                vec![
+                    buffer_range(&q_view),
+                    buffer_range(&kv_view),
+                    buffer_range(&weights_view),
+                ],
+                vec![buffer_range(&scratch_view)],
+            );
+        }
         encoder.encode_threadgroups_with_args(
             score_pipeline,
             &[
@@ -445,6 +460,12 @@ fn dispatch_deepseek_indexer_into_with_score_kernel(
             block_pipeline.max_total_threads_per_threadgroup()
         )));
     }
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![buffer_range(scratch)],
+            vec![buffer_range(&bank_a)],
+        );
+    }
     encoder.encode_threadgroups_with_args_and_shared(
         block_pipeline,
         &[
@@ -470,6 +491,12 @@ fn dispatch_deepseek_indexer_into_with_score_kernel(
             ..plan
         };
         let merged_lists = list_count.div_ceil(2);
+        if encoder.is_capturing() {
+            encoder.set_pending_buffer_ranges(
+                vec![buffer_range(scratch), buffer_range(input)],
+                vec![buffer_range(merge_output)],
+            );
+        }
         encoder.encode_threadgroups_with_args(
             merge_pipeline,
             &[
@@ -493,6 +520,12 @@ fn dispatch_deepseek_indexer_into_with_score_kernel(
     };
     let finalize_pipeline =
         registry.get_pipeline(DEEPSEEK_INDEXER_TOPK_FINALIZE_KERNEL, device.metal_device())?;
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![buffer_range(input)],
+            vec![buffer_range(output)],
+        );
+    }
     encoder.encode_with_args(
         finalize_pipeline,
         &[

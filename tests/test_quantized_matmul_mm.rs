@@ -21,7 +21,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(target_vendor = "apple")]
 
-use mlx_native::{DType, GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxDevice};
+use mlx_native::{
+    DType, GgmlBatchedQuantizedMatmulParams, GgmlQuantizedMatmulParams, GgmlType, KernelRegistry,
+    MlxDevice,
+};
 
 // --------------------------------------------------------------------------
 // PRNG (matches test_quantized_matmul_ggml.rs)
@@ -303,6 +306,176 @@ fn run_mm_gpu(
     run_qmatmul_path(DispatchPath::Mm, m, n, k, ggml_type, weight_bytes, input)
 }
 
+fn run_batched_mm_gpu(
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    ggml_type: GgmlType,
+    weight_bytes: &[u8],
+    input: &[f32],
+) -> Vec<f32> {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let mut input_buf = device
+        .alloc_buffer(input.len() * 4, DType::F32, vec![batch, m, k])
+        .expect("alloc batched input");
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("batched input mut slice")
+        .copy_from_slice(input);
+    let mut weight_buf = device
+        .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
+        .expect("alloc batched weight");
+    weight_buf
+        .as_mut_slice::<u8>()
+        .expect("batched weight mut slice")
+        .copy_from_slice(weight_bytes);
+    let output_buf = device
+        .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+        .expect("alloc batched output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    mlx_native::quantized_matmul_ggml_batched_mm(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        &GgmlBatchedQuantizedMatmulParams {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        },
+    )
+    .expect("batched MM dispatch");
+    encoder.commit_and_wait().expect("batched GPU execution");
+    output_buf
+        .as_slice::<f32>()
+        .expect("read batched output")
+        .to_vec()
+}
+
+fn run_batched_mm_strided_input_gpu(
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    ggml_type: GgmlType,
+    weight_bytes: &[u8],
+    input: &[f32],
+    row_bytes: u64,
+    batch_bytes: u64,
+) -> Vec<f32> {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let mut input_buf = device
+        .alloc_buffer(input.len() * 4, DType::F32, vec![input.len()])
+        .expect("alloc strided batched input");
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("strided batched input mut slice")
+        .copy_from_slice(input);
+    let mut weight_buf = device
+        .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
+        .expect("alloc strided batched weight");
+    weight_buf
+        .as_mut_slice::<u8>()
+        .expect("strided batched weight mut slice")
+        .copy_from_slice(weight_bytes);
+    let output_buf = device
+        .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+        .expect("alloc strided batched output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    mlx_native::quantized_matmul_ggml_batched_mm_strided_input(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        &GgmlBatchedQuantizedMatmulParams {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        },
+        &mlx_native::GgmlBatchedQuantizedMatmulInputStrides {
+            row_bytes,
+            batch_bytes,
+        },
+    )
+    .expect("strided batched MM dispatch");
+    encoder
+        .commit_and_wait()
+        .expect("strided batched GPU execution");
+    output_buf
+        .as_slice::<f32>()
+        .expect("read strided batched output")
+        .to_vec()
+}
+
+fn run_batched_mv_gpu(
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    ggml_type: GgmlType,
+    weight_bytes: &[u8],
+    input: &[f32],
+) -> Vec<f32> {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let mut input_buf = device
+        .alloc_buffer(input.len() * 4, DType::F32, vec![batch, m, k])
+        .expect("alloc batched MV input");
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("batched MV input mut slice")
+        .copy_from_slice(input);
+    let mut weight_buf = device
+        .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
+        .expect("alloc batched MV weight");
+    weight_buf
+        .as_mut_slice::<u8>()
+        .expect("batched MV weight mut slice")
+        .copy_from_slice(weight_bytes);
+    let output_buf = device
+        .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+        .expect("alloc batched MV output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    mlx_native::quantized_matmul_ggml_batched_mv(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        &GgmlBatchedQuantizedMatmulParams {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        },
+    )
+    .expect("batched MV dispatch");
+    encoder.commit_and_wait().expect("batched MV GPU execution");
+    output_buf
+        .as_slice::<f32>()
+        .expect("read batched MV output")
+        .to_vec()
+}
+
 // --------------------------------------------------------------------------
 // Verification helper: pack a random weight matrix, run mv row-by-row
 // (reference) and mm batched (under test), check outputs agree.
@@ -489,6 +662,178 @@ fn test_q8_0_mm_matches_mv_irregular() {
     // FP16 A-tile precision bound: ~2 × sqrt(256) × eps_fp16 ≈ 1.5e-2.
     check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 2e-2,
         "Q8_0 mm matches mv, M=17 N=72 K=256 (partial tiles)");
+}
+
+#[test]
+fn test_q8_0_batched_mm_is_byte_identical_to_independent_dispatches() {
+    let batch = 3usize;
+    let m = 17usize;
+    let n = 72usize;
+    let k = 256usize;
+
+    let weights_f32 = pseudo_random_f32(0xB47C, batch * n * k);
+    let mut weight_bytes = Vec::new();
+    for row in 0..batch * n {
+        weight_bytes.extend_from_slice(&pack_q8_0(&weights_f32[row * k..(row + 1) * k]));
+    }
+    let input = pseudo_random_f32(0x3D6D, batch * m * k);
+
+    let mut reference = Vec::with_capacity(batch * m * n);
+    let weight_stride = weight_bytes.len() / batch;
+    let input_stride = m * k;
+    for group in 0..batch {
+        reference.extend_from_slice(&run_mm_gpu(
+            m,
+            n,
+            k,
+            GgmlType::Q8_0,
+            &weight_bytes[group * weight_stride..(group + 1) * weight_stride],
+            &input[group * input_stride..(group + 1) * input_stride],
+        ));
+    }
+
+    let batched = run_batched_mm_gpu(batch, m, n, k, GgmlType::Q8_0, &weight_bytes, &input);
+    let reference_bits: Vec<u32> = reference.iter().map(|value| value.to_bits()).collect();
+    let batched_bits: Vec<u32> = batched.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(
+        batched_bits, reference_bits,
+        "native batch addressing changed Q8_0 MM output bytes"
+    );
+}
+
+#[test]
+fn test_q8_0_strided_token_major_batched_mm_is_byte_identical_to_packed() {
+    let batch = 3usize;
+    let m = 17usize;
+    let n = 72usize;
+    let k = 256usize;
+
+    let weights_f32 = pseudo_random_f32(0xB47E, batch * n * k);
+    let mut weight_bytes = Vec::new();
+    for row in 0..batch * n {
+        weight_bytes.extend_from_slice(&pack_q8_0(&weights_f32[row * k..(row + 1) * k]));
+    }
+    let packed_input = pseudo_random_f32(0x3D6F, batch * m * k);
+    let mut token_major_input = vec![0.0f32; packed_input.len()];
+    for row in 0..m {
+        for group in 0..batch {
+            let packed_start = (group * m + row) * k;
+            let token_major_start = (row * batch + group) * k;
+            token_major_input[token_major_start..token_major_start + k]
+                .copy_from_slice(&packed_input[packed_start..packed_start + k]);
+        }
+    }
+
+    let packed = run_batched_mm_gpu(
+        batch,
+        m,
+        n,
+        k,
+        GgmlType::Q8_0,
+        &weight_bytes,
+        &packed_input,
+    );
+    let strided = run_batched_mm_strided_input_gpu(
+        batch,
+        m,
+        n,
+        k,
+        GgmlType::Q8_0,
+        &weight_bytes,
+        &token_major_input,
+        (batch * k * DType::F32.size_of()) as u64,
+        (k * DType::F32.size_of()) as u64,
+    );
+    let packed_bits: Vec<u32> = packed.iter().map(|value| value.to_bits()).collect();
+    let strided_bits: Vec<u32> = strided.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(
+        strided_bits, packed_bits,
+        "token-major input strides changed Q8_0 MM output bytes"
+    );
+}
+
+#[test]
+fn test_q8_0_strided_batched_mm_rejects_non_vector_aligned_strides() {
+    let batch = 2usize;
+    let m = 17usize;
+    let n = 72usize;
+    let k = 256usize;
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    let input_buf = device
+        .alloc_buffer(batch * m * k * 4, DType::F32, vec![batch, m, k])
+        .expect("alloc strided batched input");
+    let weight_bytes = batch * n * (k / 32) * 34;
+    let weight_buf = device
+        .alloc_buffer(weight_bytes, DType::U8, vec![weight_bytes])
+        .expect("alloc strided batched weight");
+    let output_buf = device
+        .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+        .expect("alloc strided batched output");
+    let mut encoder = device.command_encoder().expect("encoder");
+
+    let error = mlx_native::quantized_matmul_ggml_batched_mm_strided_input(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        &GgmlBatchedQuantizedMatmulParams {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type: GgmlType::Q8_0,
+        },
+        &mlx_native::GgmlBatchedQuantizedMatmulInputStrides {
+            row_bytes: (k * 4 + 4) as u64,
+            batch_bytes: (k * 4) as u64,
+        },
+    )
+    .expect_err("non-vector-aligned input stride must fail before dispatch");
+
+    assert!(
+        error.to_string().contains("32-byte aligned"),
+        "unexpected stride validation error: {error}"
+    );
+}
+
+#[test]
+fn test_q8_0_batched_mv_is_byte_identical_to_independent_dispatches() {
+    let batch = 3usize;
+    let m = 1usize;
+    let n = 72usize;
+    let k = 256usize;
+
+    let weights_f32 = pseudo_random_f32(0xB47D, batch * n * k);
+    let mut weight_bytes = Vec::new();
+    for row in 0..batch * n {
+        weight_bytes.extend_from_slice(&pack_q8_0(&weights_f32[row * k..(row + 1) * k]));
+    }
+    let input = pseudo_random_f32(0x3D6E, batch * m * k);
+
+    let mut reference = Vec::with_capacity(batch * m * n);
+    let weight_stride = weight_bytes.len() / batch;
+    let input_stride = m * k;
+    for group in 0..batch {
+        reference.extend_from_slice(&run_mv_gpu(
+            m,
+            n,
+            k,
+            GgmlType::Q8_0,
+            &weight_bytes[group * weight_stride..(group + 1) * weight_stride],
+            &input[group * input_stride..(group + 1) * input_stride],
+        ));
+    }
+
+    let batched = run_batched_mv_gpu(batch, m, n, k, GgmlType::Q8_0, &weight_bytes, &input);
+    let reference_bits: Vec<u32> = reference.iter().map(|value| value.to_bits()).collect();
+    let batched_bits: Vec<u32> = batched.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(
+        batched_bits, reference_bits,
+        "native batch addressing changed Q8_0 MV output bytes"
+    );
 }
 
 // ==========================================================================

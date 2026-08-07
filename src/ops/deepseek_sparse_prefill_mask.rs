@@ -165,6 +165,14 @@ fn dispatch_typed(
 
     let fill = registry.get_pipeline(fill_kernel, device.metal_device())?;
     encoder.set_op_kind(CapturedOpKind::Other);
+    if encoder.is_capturing() {
+        let mask_start = mask.contents_ptr() as usize;
+        let mask_range = (mask_start, mask_start + mask.byte_len());
+        // The fill overwrites the whole mask. Treat the reused scratch buffer
+        // conservatively as both read and written so graph reordering cannot
+        // move this initialization across an earlier use of the same arena.
+        encoder.set_pending_buffer_ranges(vec![mask_range], vec![mask_range]);
+    }
     encoder.encode_with_args(
         fill,
         &[
@@ -177,6 +185,18 @@ fn dispatch_typed(
     encoder.memory_barrier();
     let scatter_elements = checked_product(&[batch, queries, top_k, mask_heads])?;
     let scatter = registry.get_pipeline(scatter_kernel, device.metal_device())?;
+    if encoder.is_capturing() {
+        let indices_start = indices.contents_ptr() as usize;
+        let mask_start = mask.contents_ptr() as usize;
+        let mask_range = (mask_start, mask_start + mask.byte_len());
+        encoder.set_pending_buffer_ranges(
+            vec![
+                (indices_start, indices_start + indices.byte_len()),
+                mask_range,
+            ],
+            vec![mask_range],
+        );
+    }
     encoder.encode_with_args(
         scatter,
         &[

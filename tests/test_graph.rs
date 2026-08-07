@@ -32,6 +32,70 @@ fn setup() -> (MlxDevice, KernelRegistry) {
     (device, registry)
 }
 
+#[test]
+fn reorder_refuses_incomplete_capture_metadata() {
+    let (device, mut registry) = setup();
+    let n = 4;
+    let bytes = n * std::mem::size_of::<f32>();
+    let a = device.alloc_buffer(bytes, DType::F32, vec![n]).unwrap();
+    let b = device.alloc_buffer(bytes, DType::F32, vec![n]).unwrap();
+    let output = device.alloc_buffer(bytes, DType::F32, vec![n]).unwrap();
+    let executor = GraphExecutor::new(device.clone());
+    let mut session = executor.begin_recorded().unwrap();
+    mlx_native::ops::elementwise::elementwise_add(
+        session.encoder_mut(),
+        &mut registry,
+        device.metal_device(),
+        &a,
+        &b,
+        &output,
+        n,
+        DType::F32,
+    )
+    .unwrap();
+
+    let error = session.finish_with_reorder().unwrap_err();
+    assert!(error.to_string().contains("lack complete buffer ranges"));
+}
+
+#[test]
+fn reorder_only_path_preserves_annotated_result() {
+    let (device, mut registry) = setup();
+    let n = 4;
+    let bytes = n * std::mem::size_of::<f32>();
+    let mut a = device.alloc_buffer(bytes, DType::F32, vec![n]).unwrap();
+    let mut b = device.alloc_buffer(bytes, DType::F32, vec![n]).unwrap();
+    let output = device.alloc_buffer(bytes, DType::F32, vec![n]).unwrap();
+    a.as_mut_slice::<f32>()
+        .unwrap()
+        .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+    b.as_mut_slice::<f32>()
+        .unwrap()
+        .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+    let executor = GraphExecutor::new(device.clone());
+    let mut session = executor.begin_recorded().unwrap();
+    session.barrier_between(&[&a, &b], &[&output]);
+    session
+        .elementwise_add(
+            &mut registry,
+            device.metal_device(),
+            &a,
+            &b,
+            &output,
+            n,
+            DType::F32,
+        )
+        .unwrap();
+
+    let (reordered, barriers) = session.finish_with_reorder().unwrap();
+    assert_eq!(reordered, 0);
+    assert_eq!(barriers, 0);
+    assert_eq!(
+        output.as_slice::<f32>().unwrap(),
+        &[6.0, 8.0, 10.0, 12.0]
+    );
+}
+
 // --------------------------------------------------------------------------
 // Test 1: Single op through GraphSession matches direct dispatch
 // --------------------------------------------------------------------------

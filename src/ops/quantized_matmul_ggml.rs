@@ -346,6 +346,32 @@ pub struct GgmlQuantizedMatmulParams {
     pub ggml_type: GgmlType,
 }
 
+/// Parameters for independent batched GGML block-format matrix products.
+///
+/// Buffers use contiguous `[batch, m, k]` input, `[batch, n, k]` weight,
+/// and `[batch, m, n]` output layouts. Each batch entry is an independent
+/// matrix product; no weight or activation broadcasting is performed.
+#[derive(Debug, Clone, Copy)]
+pub struct GgmlBatchedQuantizedMatmulParams {
+    pub batch: u32,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub ggml_type: GgmlType,
+}
+
+/// Byte strides for an F32 batched-MM input view.
+///
+/// `row_bytes` advances between logical input rows and `batch_bytes`
+/// advances between independent products. This supports both packed
+/// `[batch, m, k]` storage and interleaved token-major `[m, batch, k]`
+/// storage without materializing a permutation.
+#[derive(Debug, Clone, Copy)]
+pub struct GgmlBatchedQuantizedMatmulInputStrides {
+    pub row_bytes: u64,
+    pub batch_bytes: u64,
+}
+
 /// GPU-side params struct — must match the Metal shader's `GgmlMatvecParams`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -620,20 +646,294 @@ pub fn quantized_matmul_ggml(
     }
     if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
         dispatch_mm(
-            encoder, registry, device, input, weight, output, params, false,
+            encoder, registry, device, input, weight, output, params, 1, None, false,
         )
     } else {
         dispatch_mv(encoder, registry, device, input, weight, output, params)
     }
 }
 
-/// Execute independent Q2_K matrix-vector products through the kernel's
+/// Execute independent quantized matrix products through the MM kernel's
 /// native batch dimension.
 ///
-/// Layouts are input `[batch, m, k]`, weights `[batch, n, k]` in GGML Q2_K
-/// block storage, and output `[batch, m, n]`. This preserves the scalar
-/// Q2_K accumulation order while replacing `batch` identical dispatches with
-/// one three-dimensional Metal grid.
+/// This is the GGML/Metal 3-D `mul_mat` contract used for grouped
+/// projections: one command dispatch spans `batch` independent products while
+/// preserving the same per-product MM arithmetic as `quantized_matmul_ggml`.
+/// The current entry point is deliberately MM-only (`m > 8`); small batches
+/// retain their format-specific mat-vec routing through the scalar API.
+pub fn quantized_matmul_ggml_batched_mm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+) -> Result<()> {
+    let element_bytes = DType::F32.size_of() as u64;
+    let row_bytes = u64::from(params.k)
+        .checked_mul(element_bytes)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("batched quantized MM input row stride overflows".into())
+        })?;
+    let batch_bytes = row_bytes.checked_mul(u64::from(params.m)).ok_or_else(|| {
+        MlxError::InvalidArgument("batched quantized MM input batch stride overflows".into())
+    })?;
+    quantized_matmul_ggml_batched_mm_strided_input(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        &GgmlBatchedQuantizedMatmulInputStrides {
+            row_bytes,
+            batch_bytes,
+        },
+    )
+}
+
+/// Execute independent quantized matrix products from an explicitly-strided
+/// F32 input view through the MM kernel's native batch dimension.
+pub fn quantized_matmul_ggml_batched_mm_strided_input(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+    input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
+) -> Result<()> {
+    if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "batched quantized MM dimensions must all be nonzero".into(),
+        ));
+    }
+    if params.m <= MM_ROUTING_THRESHOLD {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MM requires m > {MM_ROUTING_THRESHOLD}, got {}",
+            params.m
+        )));
+    }
+    if matches!(params.ggml_type, GgmlType::IQ4_XS) {
+        return Err(MlxError::InvalidArgument(
+            "batched quantized MM does not support IQ4_XS".into(),
+        ));
+    }
+    if input.dtype() != DType::F32 || weight.dtype() != DType::U8 || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MM requires F32/U8/F32 buffers, got {:?}/{:?}/{:?}",
+            input.dtype(),
+            weight.dtype(),
+            output.dtype()
+        )));
+    }
+
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "K ({}) must be divisible by block QK ({qk})",
+            params.k
+        )));
+    }
+    let checked_bytes = |dimensions: &[u32], element_bytes: usize, label: &str| -> Result<usize> {
+        dimensions
+            .iter()
+            .try_fold(element_bytes, |bytes, &dimension| {
+                bytes.checked_mul(dimension as usize).ok_or_else(|| {
+                    MlxError::InvalidArgument(format!(
+                        "batched quantized MM {label} byte length overflows"
+                    ))
+                })
+            })
+    };
+    let element_bytes = DType::F32.size_of() as u64;
+    let logical_row_bytes = u64::from(params.k)
+        .checked_mul(element_bytes)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("batched quantized MM input row length overflows".into())
+        })?;
+    const INPUT_STRIDE_ALIGNMENT_BYTES: u64 = 32;
+    if input_strides.row_bytes < logical_row_bytes
+        || input_strides.batch_bytes < logical_row_bytes
+        || input_strides.row_bytes % INPUT_STRIDE_ALIGNMENT_BYTES != 0
+        || input_strides.batch_bytes % INPUT_STRIDE_ALIGNMENT_BYTES != 0
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MM input strides must be {INPUT_STRIDE_ALIGNMENT_BYTES}-byte aligned and at least one logical row ({logical_row_bytes} bytes), got row={} batch={}",
+            input_strides.row_bytes, input_strides.batch_bytes
+        )));
+    }
+    let input_bytes_u64 = u64::from(params.batch - 1)
+        .checked_mul(input_strides.batch_bytes)
+        .and_then(|bytes| {
+            u64::from(params.m - 1)
+                .checked_mul(input_strides.row_bytes)
+                .and_then(|rows| bytes.checked_add(rows))
+        })
+        .and_then(|bytes| bytes.checked_add(logical_row_bytes))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("batched quantized MM strided input range overflows".into())
+        })?;
+    let input_bytes = usize::try_from(input_bytes_u64).map_err(|_| {
+        MlxError::InvalidArgument(
+            "batched quantized MM strided input range exceeds address space".into(),
+        )
+    })?;
+    let weight_bytes = checked_bytes(
+        &[params.batch, params.n, params.k / qk],
+        params.ggml_type.block_bytes() as usize,
+        "weight",
+    )?;
+    let output_bytes = checked_bytes(
+        &[params.batch, params.m, params.n],
+        DType::F32.size_of(),
+        "output",
+    )?;
+    for (buffer, required, label) in [
+        (input, input_bytes, "input"),
+        (weight, weight_bytes, "weight"),
+        (output, output_bytes, "output"),
+    ] {
+        if buffer.byte_len() < required {
+            return Err(MlxError::InvalidArgument(format!(
+                "batched quantized MM {label} buffer needs {required} bytes, got {}",
+                buffer.byte_len()
+            )));
+        }
+    }
+
+    let scalar = GgmlQuantizedMatmulParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+        ggml_type: params.ggml_type,
+    };
+    dispatch_mm(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        &scalar,
+        params.batch,
+        Some(input_strides),
+        false,
+    )
+}
+
+/// Execute independent matrix-vector products through the GGML kernel's
+/// native batch dimension.
+///
+/// Layouts are input `[batch, m, k]`, weights `[batch, n, k]` in GGML block
+/// storage, and output `[batch, m, n]`. Each z-grid slice executes the same
+/// format-specific mat-vec kernel and accumulation order as an independent
+/// `quantized_matmul_ggml` call.
+pub fn quantized_matmul_ggml_batched_mv(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+) -> Result<()> {
+    if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "batched quantized MV dimensions must all be nonzero".into(),
+        ));
+    }
+    if params.m > MM_ROUTING_THRESHOLD {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MV supports m <= {MM_ROUTING_THRESHOLD}, got {}",
+            params.m
+        )));
+    }
+    if matches!(
+        params.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32
+    ) {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MV does not support {:?}",
+            params.ggml_type
+        )));
+    }
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MV input width {} is not divisible by {qk}",
+            params.k
+        )));
+    }
+    if input.dtype() != DType::F32 || weight.dtype() != DType::U8 || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "batched quantized MV requires F32/U8/F32 buffers, got {:?}/{:?}/{:?}",
+            input.dtype(),
+            weight.dtype(),
+            output.dtype()
+        )));
+    }
+    let checked_bytes = |dimensions: &[u32], element_bytes: usize, label: &str| -> Result<usize> {
+        dimensions
+            .iter()
+            .try_fold(element_bytes, |bytes, &dimension| {
+                bytes.checked_mul(dimension as usize).ok_or_else(|| {
+                    MlxError::InvalidArgument(format!(
+                        "batched quantized MV {label} byte length overflows"
+                    ))
+                })
+            })
+    };
+    let input_bytes = checked_bytes(
+        &[params.batch, params.m, params.k],
+        DType::F32.size_of(),
+        "input",
+    )?;
+    let weight_bytes = checked_bytes(
+        &[params.batch, params.n, params.k / qk],
+        params.ggml_type.block_bytes() as usize,
+        "weight",
+    )?;
+    let output_bytes = checked_bytes(
+        &[params.batch, params.m, params.n],
+        DType::F32.size_of(),
+        "output",
+    )?;
+    for (buffer, required, label) in [
+        (input, input_bytes, "input"),
+        (weight, weight_bytes, "weight"),
+        (output, output_bytes, "output"),
+    ] {
+        if buffer.byte_len() < required {
+            return Err(MlxError::InvalidArgument(format!(
+                "batched quantized MV {label} buffer needs {required} bytes, got {}",
+                buffer.byte_len()
+            )));
+        }
+    }
+
+    let scalar = GgmlQuantizedMatmulParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+        ggml_type: params.ggml_type,
+    };
+    dispatch_mv_batched(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        &scalar,
+        params.batch,
+    )
+}
+
+/// Compatibility entry point for the original DeepSeek Q2_K grouped matvec.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_matmul_q2_k_batched_mv(
     encoder: &mut CommandEncoder,
@@ -647,88 +947,21 @@ pub fn quantized_matmul_q2_k_batched_mv(
     n: u32,
     k: u32,
 ) -> Result<()> {
-    if batch == 0 || m == 0 || n == 0 || k == 0 {
-        return Err(MlxError::InvalidArgument(
-            "Q2_K batched MV dimensions must all be nonzero".into(),
-        ));
-    }
-    if m > MM_ROUTING_THRESHOLD {
-        return Err(MlxError::InvalidArgument(format!(
-            "Q2_K batched MV supports m <= {MM_ROUTING_THRESHOLD}, got {m}"
-        )));
-    }
-    if k % QK2_K != 0 {
-        return Err(MlxError::InvalidArgument(format!(
-            "Q2_K batched MV input width {k} is not divisible by {QK2_K}"
-        )));
-    }
-    if input.dtype() != DType::F32 || weight.dtype() != DType::U8 || output.dtype() != DType::F32 {
-        return Err(MlxError::InvalidArgument(format!(
-            "Q2_K batched MV requires F32/U8/F32 buffers, got {:?}/{:?}/{:?}",
-            input.dtype(),
-            weight.dtype(),
-            output.dtype()
-        )));
-    }
-    let checked_bytes = |dimensions: &[u32], element_bytes: usize, label: &str| -> Result<usize> {
-        dimensions
-            .iter()
-            .try_fold(element_bytes, |bytes, &dimension| {
-                bytes.checked_mul(dimension as usize).ok_or_else(|| {
-                    MlxError::InvalidArgument(format!(
-                        "Q2_K batched MV {label} byte length overflows"
-                    ))
-                })
-            })
-    };
-    let input_bytes = checked_bytes(&[batch, m, k], DType::F32.size_of(), "input")?;
-    let weight_bytes = checked_bytes(&[batch, n, k / QK2_K], BLOCK_Q2_K_BYTES as usize, "weight")?;
-    let output_bytes = checked_bytes(&[batch, m, n], DType::F32.size_of(), "output")?;
-    for (buffer, required, label) in [
-        (input, input_bytes, "input"),
-        (weight, weight_bytes, "weight"),
-        (output, output_bytes, "output"),
-    ] {
-        if buffer.byte_len() < required {
-            return Err(MlxError::InvalidArgument(format!(
-                "Q2_K batched MV {label} buffer needs {required} bytes, got {}",
-                buffer.byte_len()
-            )));
-        }
-    }
-
-    let batch_i64 = i64::from(batch);
-    let gpu_params = GgmlMatvecGpuParams {
-        ne00: i64::from(k),
-        ne01: i64::from(n),
-        ne02: batch_i64,
-        ne10: i64::from(k),
-        ne12: batch_i64,
-        ne0: i64::from(n),
-        ne1: i64::from(m),
-        r2: 1,
-        r3: 1,
-    };
-    let pipeline = registry.get_pipeline_with_constants(
-        GgmlType::Q2_K.kernel_name(),
-        device.metal_device(),
-        &[],
-        &[(700, batch as i32), (701, 1), (702, 1)],
-    )?;
-    encoder.dispatch_tracked_threadgroups_with_args(
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(weight)),
-            (1, KernelArg::Buffer(input)),
-            (2, KernelArg::Buffer(output)),
-            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
-        ],
-        &[weight, input],
-        &[output],
-        metal::MTLSize::new(div_ceil(n as usize, 8) as u64, m as u64, batch as u64),
-        metal::MTLSize::new(2, 32, 1),
-    );
-    Ok(())
+    quantized_matmul_ggml_batched_mv(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        &GgmlBatchedQuantizedMatmulParams {
+            batch,
+            m,
+            n,
+            k,
+            ggml_type: GgmlType::Q2_K,
+        },
+    )
 }
 
 /// ADR-029 H29-speed: dispatch the V2 64×128 large-tile mm-tensor
@@ -835,7 +1068,7 @@ pub fn dispatch_mm_for_test(
 ) -> Result<()> {
     validate_mm_for_test(params)?;
     dispatch_mm(
-        encoder, registry, device, input, weight, output, params, false,
+        encoder, registry, device, input, weight, output, params, 1, None, false,
     )
 }
 
@@ -854,7 +1087,7 @@ pub fn dispatch_mm_simd_for_test(
 ) -> Result<()> {
     validate_mm_for_test(params)?;
     dispatch_mm(
-        encoder, registry, device, input, weight, output, params, true,
+        encoder, registry, device, input, weight, output, params, 1, None, true,
     )
 }
 
@@ -903,6 +1136,22 @@ fn dispatch_mv(
     output: &MlxBuffer, // ADR-028: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    dispatch_mv_batched(
+        encoder, registry, device, input, weight, output, params, 1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mv_batched(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    batch: u32,
+) -> Result<()> {
     // ADR-028 —nr0=2 variant for q6_K mat-vec.  Peer pattern:
     // 4 rows/TG (vs baseline's 2) + cached `yl[16]` (vs no cache + device
     // re-reads).  Bit-exact-equivalent to the baseline at HEAD (parity
@@ -929,10 +1178,8 @@ fn dispatch_mv(
     };
     // ADR-029 H93: PSO-specialize batch divisors (ne12/r2/r3) at
     // function-constant slots 700/701/702. Peer-grounded port of llama.cpp
-    // commit da4495332. Hardcoded =1 here matches the gpu_params below
-    // (current mlx-native usage is always single-batch); compiler folds
-    // `im % 1 → 0` and `i12 / 1 → i12` at PSO compile, eliminating
-    // ~3 expensive integer divisions per thread per dispatch.
+    // commit da4495332. `ne12=batch` specializes the z-grid divisor for both
+    // the ordinary batch=1 path and independent grouped products.
     // The redundant .clone() is omitted — registry is not
     // accessed again after pipeline lookup, so we can hold the &ComputePipelineState
     // reference across the rest of the function. Saves one objc retain/release
@@ -941,15 +1188,16 @@ fn dispatch_mv(
         kernel_name,
         device.metal_device(),
         &[],
-        &[(700, 1), (701, 1), (702, 1)],
+        &[(700, batch as i32), (701, 1), (702, 1)],
     )?;
 
+    let batch_i64 = i64::from(batch);
     let gpu_params = GgmlMatvecGpuParams {
         ne00: params.k as i64,
         ne01: params.n as i64,
-        ne02: 1,
+        ne02: batch_i64,
         ne10: params.k as i64,
-        ne12: 1,
+        ne12: batch_i64,
         ne0: params.n as i64,
         ne1: params.m as i64,
         r2: 1,
@@ -988,7 +1236,7 @@ fn dispatch_mv(
         (nth0, nth1, align)
     };
 
-    let threadgroups = metal::MTLSize::new(div_ceil(n, align) as u64, m as u64, 1);
+    let threadgroups = metal::MTLSize::new(div_ceil(n, align) as u64, m as u64, batch as u64);
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
     if use_q8_0_nr2 {
@@ -1300,6 +1548,8 @@ fn dispatch_mm(
     weight: &MlxBuffer,
     output: &MlxBuffer, // ADR-028: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
+    batch: u32,
+    input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
     force_simd: bool,
 ) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
@@ -1340,19 +1590,22 @@ fn dispatch_mm(
     let block_bytes = params.ggml_type.block_bytes();
     let blocks_per_row = params.k / qk;
     let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
-    let nb11 = (params.k as u64) * DType::F32.size_of() as u64;
+    let packed_row_bytes = (params.k as u64) * DType::F32.size_of() as u64;
+    let (nb11, nb12) = input_strides
+        .map(|strides| (strides.row_bytes, strides.batch_bytes))
+        .unwrap_or((packed_row_bytes, packed_row_bytes * params.m as u64));
 
     let gpu_params = GgmlMatmulMmGpuParams {
         ne00: params.k as i32,
-        ne02: 1,
+        ne02: batch as i32,
         nb01,
         nb02: nb01 * (params.n as u64),
         nb03: 0,
-        ne12: 1,
+        ne12: batch as i32,
         _pad0: 0,
         nb10: DType::F32.size_of() as u64,
         nb11,
-        nb12: nb11 * (params.m as u64),
+        nb12,
         nb13: 0,
         ne0: params.n as i32,
         ne1: params.m as i32,
@@ -1393,7 +1646,7 @@ fn dispatch_mm(
         )
     };
 
-    let threadgroups = metal::MTLSize::new(tg_x, tg_y, 1);
+    let threadgroups = metal::MTLSize::new(tg_x, tg_y, batch as u64);
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(

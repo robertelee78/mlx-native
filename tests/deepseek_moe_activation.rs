@@ -7,7 +7,7 @@ use mlx_native::ops::deepseek_moe_activation::{
     DEEPSEEK_MOE_INTER_DIM,
 };
 use mlx_native::ops::deepseek_moe_routing::{DEEPSEEK_MOE_EXPERTS, DEEPSEEK_MOE_TOP_K};
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CapturedNode, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 const I: usize = DEEPSEEK_MOE_INTER_DIM;
 const H: usize = DEEPSEEK_MOE_HIDDEN_DIM;
@@ -57,6 +57,38 @@ fn assert_close(got: &[f32], want: &[f32], tolerance: f32) {
             delta <= tolerance,
             "value[{index}] delta={delta}: {got} != {want}"
         );
+    }
+}
+
+#[test]
+fn capture_annotates_swiglu_dependencies() {
+    let device = MlxDevice::new().unwrap();
+    let gate = empty_f32(&device, vec![1, I]);
+    let up = empty_f32(&device, vec![1, I]);
+    let output = empty_f32(&device, vec![1, I]);
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    dispatch_deepseek_moe_swiglu(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &gate,
+        &up,
+        None,
+        &output,
+        1,
+    )
+    .unwrap();
+
+    let captured = encoder.take_capture().unwrap();
+    assert_eq!(captured.len(), 1);
+    match &captured[0] {
+        CapturedNode::Dispatch { reads, writes, .. } => {
+            assert_eq!(reads.len(), 2);
+            assert_eq!(writes.len(), 1);
+        }
+        CapturedNode::Barrier => panic!("expected SwiGLU dispatch"),
     }
 }
 

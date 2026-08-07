@@ -112,10 +112,13 @@ pub use ops::embedding_q8_0::{embedding_gather_q8_0, EmbeddingQ8_0Params};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
     dispatch_mm_for_test, dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive,
-    quantized_matmul_ggml, quantized_matmul_mm_tensor_perm021,
+    quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
+    quantized_matmul_ggml_batched_mm_strided_input, quantized_matmul_ggml_batched_mv,
+    quantized_matmul_mm_tensor_perm021,
     quantized_matmul_mm_tensor_perm021_f16,
-    GgmlQuantizedMatmulParams, GgmlQuantizedMatmulPerm021Params, GgmlType,
-    MM_ROUTING_THRESHOLD,
+    GgmlBatchedQuantizedMatmulInputStrides, GgmlBatchedQuantizedMatmulParams,
+    GgmlQuantizedMatmulParams,
+    GgmlQuantizedMatmulPerm021Params, GgmlType, MM_ROUTING_THRESHOLD,
 };
 pub use ops::mul_mv_ext::{mul_mv_ext_dispatch, MulMvExtParams};
 pub use ops::quantized_matmul_id::{
@@ -123,7 +126,7 @@ pub use ops::quantized_matmul_id::{
 };
 pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_swiglu_q4_0,
+    quantized_matmul_id_ggml_pooled_slotted, quantized_matmul_id_swiglu_q4_0,
     GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, IdMmScratch,
     MM_ID_ROUTING_THRESHOLD,
 };

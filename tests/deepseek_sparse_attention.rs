@@ -13,7 +13,7 @@ use mlx_native::ops::flash_attn_prefill_d512::{
     dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks,
     dispatch_flash_attn_prefill_bf16_d512_with_sinks,
 };
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CapturedNode, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 const H: usize = DEEPSEEK_SPARSE_HEADS;
 const D: usize = DEEPSEEK_SPARSE_HEAD_DIM;
@@ -55,6 +55,98 @@ fn i32_buffer(device: &MlxDevice, values: &[i32], shape: Vec<usize>) -> MlxBuffe
         .expect("allocate i32");
     buffer.as_mut_slice().unwrap().copy_from_slice(values);
     buffer
+}
+
+#[test]
+fn capture_annotates_sparse_gather_flash_and_sanitize() {
+    let device = MlxDevice::new().unwrap();
+    let batch = 1;
+    let queries = 1;
+    let kv_len = 4;
+    let top_k = 4;
+    let q = bf16_buffer(
+        &device,
+        &vec![bf16::ZERO; batch * queries * H * D],
+        vec![batch, queries, H, D],
+    );
+    let kv = bf16_buffer(
+        &device,
+        &vec![bf16::ZERO; batch * kv_len * D],
+        vec![batch, kv_len, D],
+    );
+    let sinks = f32_buffer(&device, &vec![0.0; H], vec![H]);
+    let indices = i32_buffer(
+        &device,
+        &(0..top_k as i32).collect::<Vec<_>>(),
+        vec![batch, queries, top_k],
+    );
+    let gathered = device
+        .alloc_buffer(
+            batch * queries * top_k * D * 2,
+            DType::BF16,
+            vec![batch, queries, top_k, D],
+        )
+        .unwrap();
+    let mask = device
+        .alloc_buffer(top_k * 2, DType::BF16, vec![batch * queries, 1, top_k])
+        .unwrap();
+    let invalid_global = device
+        .alloc_buffer(4, DType::U32, vec![batch, queries])
+        .unwrap();
+    let invalid_heads = device
+        .alloc_buffer(H * 4, DType::U32, vec![batch, queries, H])
+        .unwrap();
+    let output = device
+        .alloc_buffer(
+            batch * queries * H * D * 2,
+            DType::BF16,
+            vec![batch, queries, H, D],
+        )
+        .unwrap();
+    let params = DeepSeekSparseAttentionParams {
+        batch: batch as u32,
+        query_len: queries as u32,
+        kv_len: kv_len as u32,
+        top_k: top_k as u32,
+        heads: H as u32,
+        head_dim: D as u32,
+        scale: 1.0 / (D as f32).sqrt(),
+    };
+    let mut registry = KernelRegistry::new();
+    register(&mut registry);
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    dispatch_deepseek_sparse_attention_flash_prefill(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q,
+        &kv,
+        &sinks,
+        &indices,
+        &gathered,
+        &mask,
+        &invalid_global,
+        &invalid_heads,
+        &output,
+        &params,
+    )
+    .unwrap();
+
+    let captured = encoder.take_capture().unwrap();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|node| matches!(node, CapturedNode::Dispatch { .. }))
+            .count(),
+        4
+    );
+    for (index, node) in captured.iter().enumerate() {
+        if let CapturedNode::Dispatch { reads, writes, .. } = node {
+            assert!(!reads.is_empty(), "dispatch {index} is missing reads");
+            assert!(!writes.is_empty(), "dispatch {index} is missing writes");
+        }
+    }
 }
 
 fn reference(

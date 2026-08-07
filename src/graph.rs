@@ -42,7 +42,7 @@ use metal::foreign_types::ForeignType;
 
 use crate::device::MlxDevice;
 use crate::encoder::{CapturedNode, CapturedOpKind, CommandEncoder, MemRange, RecordedBinding};
-use crate::error::Result;
+use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops;
 
@@ -1167,6 +1167,74 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode independent GGML block-format matrix products through one
+    /// three-dimensional Metal MM dispatch.
+    pub fn quantized_matmul_ggml_batched_mm(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml_batched_mm(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+        )
+    }
+
+    /// Encode independent GGML block-format matrix products from an
+    /// explicitly-strided F32 input view through one Metal MM dispatch.
+    pub fn quantized_matmul_ggml_batched_mm_strided_input(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulParams,
+        input_strides: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulInputStrides,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml_batched_mm_strided_input(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+            input_strides,
+        )
+    }
+
+    /// Encode independent GGML block-format matrix-vector products through
+    /// one three-dimensional Metal dispatch.
+    pub fn quantized_matmul_ggml_batched_mv(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::quantized_matmul_ggml::GgmlBatchedQuantizedMatmulParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_ggml::quantized_matmul_ggml_batched_mv(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            params,
+        )
+    }
+
     /// Gather GGML Q2_K embedding rows directly into F32 activations.
     pub fn embedding_gather_q2_k(
         &mut self,
@@ -1281,6 +1349,36 @@ impl<'a> GraphSession<'a> {
         params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
     ) -> Result<()> {
         ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            scratch,
+            params,
+        )
+    }
+
+    /// Slotted-input variant of [`Self::quantized_matmul_id_ggml_pooled`].
+    ///
+    /// The input is `[n_tokens, top_k, K]`, with one activation row per
+    /// routed expert slot. This entry point is restricted to the `mm_id`
+    /// route; small matrix-vector calls retain the shared-per-token API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_id_ggml_pooled_slotted(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        output: &MlxBuffer,
+        scratch: &mut ops::quantized_matmul_id_ggml::IdMmScratch,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled_slotted(
             &mut self.encoder,
             registry,
             device,
@@ -1722,6 +1820,48 @@ impl<'a> GraphSession<'a> {
             }
         }
         self.encoder.commit_and_wait()
+    }
+
+    /// Recompute barriers after a reorder-only graph optimization pass.
+    ///
+    /// This path fails closed when even one captured dispatch lacks complete
+    /// read/write ranges. It intentionally does not run arithmetic fusion, so
+    /// callers can measure scheduling independently from numerical changes.
+    /// Returns `(nodes_reordered, barriers_emitted)`.
+    pub fn finish_with_reorder(mut self) -> Result<(u32, u32)> {
+        let mut reordered = 0;
+        let mut barriers = 0;
+        if self.recording {
+            if let Some(nodes) = self.encoder.take_capture() {
+                let mut graph = ComputeGraph::from_nodes(nodes);
+                let unannotated = graph.unannotated_dispatch_count();
+                if unannotated != 0 {
+                    let pipelines = graph
+                        .nodes()
+                        .iter()
+                        .filter_map(|node| match node {
+                            CapturedNode::Dispatch {
+                                pipeline,
+                                reads,
+                                writes,
+                                ..
+                            } if reads.is_empty() || writes.is_empty() => {
+                                Some(pipeline.label().to_owned())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    return Err(MlxError::InvalidArgument(format!(
+                        "graph reorder refused: {unannotated} of {} dispatches lack complete buffer ranges: {pipelines:?}",
+                        graph.dispatch_count(),
+                    )));
+                }
+                reordered = graph.reorder();
+                barriers = graph.encode_with_barriers(&mut self.encoder);
+            }
+        }
+        self.encoder.commit_and_wait()?;
+        Ok((reordered, barriers))
     }
 
     /// Commit the command buffer WITHOUT waiting.

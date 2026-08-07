@@ -101,7 +101,34 @@ impl MlxBufferPool {
         dtype: DType,
         shape: Vec<usize>,
     ) -> Result<MlxBuffer> {
-        let (buffer, added_residency) = self.alloc_inner(device, byte_len, dtype, shape)?;
+        let (buffer, added_residency) = self.alloc_inner(device, byte_len, dtype, shape, true)?;
+        if added_residency {
+            if let Some(set) = self.residency_set.as_ref() {
+                set.commit();
+            }
+        }
+        Ok(buffer)
+    }
+
+    /// Allocate a buffer without clearing a fresh Metal allocation.
+    ///
+    /// This has the same arena tracking, residency registration, and reuse
+    /// behavior as [`alloc`](Self::alloc), but the contents of a newly
+    /// allocated buffer are unspecified. Reused pool buffers are already not
+    /// cleared between arena cycles.
+    ///
+    /// Callers must fully initialize every logical byte that any CPU or GPU
+    /// operation can read. Prefer [`alloc`](Self::alloc) unless complete
+    /// producer coverage has been established for the entire graph that uses
+    /// the buffer.
+    pub fn alloc_uninitialized(
+        &mut self,
+        device: &MlxDevice,
+        byte_len: usize,
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<MlxBuffer> {
+        let (buffer, added_residency) = self.alloc_inner(device, byte_len, dtype, shape, false)?;
         if added_residency {
             if let Some(set) = self.residency_set.as_ref() {
                 set.commit();
@@ -119,7 +146,7 @@ impl MlxBufferPool {
         let mut added_residency = false;
 
         for (byte_len, dtype, shape) in requests {
-            let (buffer, added) = self.alloc_inner(device, byte_len, dtype, shape)?;
+            let (buffer, added) = self.alloc_inner(device, byte_len, dtype, shape, true)?;
             added_residency |= added;
             buffers.push(buffer);
         }
@@ -139,6 +166,7 @@ impl MlxBufferPool {
         byte_len: usize,
         dtype: DType,
         shape: Vec<usize>,
+        zero_fresh: bool,
     ) -> Result<(MlxBuffer, bool)> {
         let bucket = bucket_size(byte_len);
         let mut added_residency = false;
@@ -154,8 +182,9 @@ impl MlxBufferPool {
             None => {
                 // Fresh allocation at bucket size.
                 let raw = device.new_shared_buffer(bucket)?;
-                // ADR-015 iter61a-2 (broken-window B-W-1 residual fix): zero-init
-                // every fresh pool allocation. The same MTLResourceOptions::
+                // ADR-015 iter61a-2 (broken-window B-W-1 residual fix): `alloc`
+                // and `alloc_batch` zero-init every fresh pool allocation. The
+                // same MTLResourceOptions::
                 // StorageModeShared recycling that affects MlxDevice::alloc_buffer
                 // (closed in iter61a, src/device.rs) ALSO affects the pool's
                 // fresh-allocation path. iter61a closed device-direct allocations
@@ -170,10 +199,9 @@ impl MlxBufferPool {
                 // 248044/248044 logits differing — far above kernel-reduction
                 // ULP noise, consistent with structural memory contamination.
                 //
-                // Cost: one memset per fresh allocation. Reused buffers (the
-                // steady-state hot path after warm-up) skip this entirely
-                // because their bytes are valid producer outputs from prior
-                // pool cycles.
+                // Cost: one memset per fresh allocation. Reused buffers skip
+                // this entirely. `alloc_uninitialized` also skips it for
+                // graphs whose callers have proven complete producer coverage.
                 //
                 // Safety: `raw.contents()` is non-null (verified above), points
                 // to exactly `bucket` bytes of `StorageModeShared` memory we
@@ -181,8 +209,10 @@ impl MlxBufferPool {
                 // not yet wrapped in `MlxBuffer` and not yet in `in_use` /
                 // residency set, so no other thread or GPU dispatch references
                 // it. Writing zero bytes is well-defined for any DType.
-                unsafe {
-                    std::ptr::write_bytes(raw.contents() as *mut u8, 0, bucket);
+                if zero_fresh {
+                    unsafe {
+                        std::ptr::write_bytes(raw.contents() as *mut u8, 0, bucket);
+                    }
                 }
                 added_residency = self.register_residency_allocation(device, &raw)?;
                 raw
@@ -569,6 +599,50 @@ mod tests {
         // After cycle-2 alloc, free has 1 (the unused 1024-bucket buffer) + in_use 2.
         assert_eq!(pool.in_use_count(), 2);
         assert_eq!(pool.free_count(), 1);
+    }
+
+    #[test]
+    fn allocation_initialization_contracts_are_explicit() {
+        let device = MlxDevice::new().expect("device");
+
+        let mut zeroed_pool = MlxBufferPool::new();
+        let zeroed = zeroed_pool
+            .alloc(&device, 37, DType::U8, vec![37])
+            .expect("allocate zeroed buffer");
+        assert!(
+            zeroed
+                .as_logical_slice::<u8>()
+                .expect("read zeroed buffer")
+                .iter()
+                .all(|&byte| byte == 0),
+            "alloc must clear every logical byte of a fresh allocation"
+        );
+
+        let mut uninitialized_pool = MlxBufferPool::new();
+        let original_ptr = {
+            let mut buffer = uninitialized_pool
+                .alloc_uninitialized(&device, 37, DType::U8, vec![37])
+                .expect("allocate uninitialized buffer");
+            buffer
+                .as_logical_mut_slice::<u8>()
+                .expect("write uninitialized buffer")
+                .fill(0x5a);
+            buffer.contents_ptr()
+        };
+        uninitialized_pool.reset();
+
+        let reused = uninitialized_pool
+            .alloc_uninitialized(&device, 37, DType::U8, vec![37])
+            .expect("reuse uninitialized buffer");
+        assert_eq!(reused.contents_ptr(), original_ptr);
+        assert!(
+            reused
+                .as_logical_slice::<u8>()
+                .expect("read reused buffer")
+                .iter()
+                .all(|&byte| byte == 0x5a),
+            "alloc_uninitialized must preserve the pool's no-clear reuse behavior"
+        );
     }
 
     #[test]
