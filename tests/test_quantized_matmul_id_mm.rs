@@ -15,9 +15,69 @@
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::{
-    DType, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GgmlType,
+    CapturedNode, DType, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GgmlType,
     KernelRegistry, MlxDevice,
 };
+
+#[test]
+fn mm_id_capture_annotates_both_dispatches() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    let input = device
+        .alloc_buffer(32 * 4, DType::F32, vec![1, 32])
+        .unwrap();
+    let weight = device
+        .alloc_buffer(32 * 34, DType::U8, vec![32 * 34])
+        .unwrap();
+    let ids = device.alloc_buffer(4, DType::U32, vec![1, 1]).unwrap();
+    let htpe = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+    let hids = device.alloc_buffer(4, DType::U32, vec![1, 1]).unwrap();
+    let output = device
+        .alloc_buffer(32 * 4, DType::F32, vec![1, 1, 32])
+        .unwrap();
+    let params = GgmlIdMmDispatchParams {
+        n_tokens: 1,
+        top_k: 1,
+        n: 32,
+        k: 32,
+        n_experts: 1,
+        expert_stride: (32 * 34) as u64,
+        ggml_type: GgmlType::Q8_0,
+    };
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    mlx_native::dispatch_id_mm_for_test(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &weight,
+        &ids,
+        &htpe,
+        &hids,
+        &output,
+        &params,
+    )
+    .unwrap();
+
+    let captured = encoder.take_capture().unwrap();
+    assert_eq!(captured.len(), 3);
+    match &captured[0] {
+        CapturedNode::Dispatch { reads, writes, .. } => {
+            assert_eq!(reads.len(), 1);
+            assert_eq!(writes.len(), 2);
+        }
+        CapturedNode::Barrier => panic!("expected map dispatch"),
+    }
+    assert!(matches!(captured[1], CapturedNode::Barrier));
+    match &captured[2] {
+        CapturedNode::Dispatch { reads, writes, .. } => {
+            assert_eq!(reads.len(), 4);
+            assert_eq!(writes.len(), 1);
+        }
+        CapturedNode::Barrier => panic!("expected expert matmul dispatch"),
+    }
+}
 
 // --------------------------------------------------------------------------
 // PRNG + block pack helpers (copied from existing test files to keep this

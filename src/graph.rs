@@ -42,7 +42,7 @@ use metal::foreign_types::ForeignType;
 
 use crate::device::MlxDevice;
 use crate::encoder::{CapturedNode, CapturedOpKind, CommandEncoder, MemRange, RecordedBinding};
-use crate::error::Result;
+use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops;
 
@@ -1820,6 +1820,48 @@ impl<'a> GraphSession<'a> {
             }
         }
         self.encoder.commit_and_wait()
+    }
+
+    /// Recompute barriers after a reorder-only graph optimization pass.
+    ///
+    /// This path fails closed when even one captured dispatch lacks complete
+    /// read/write ranges. It intentionally does not run arithmetic fusion, so
+    /// callers can measure scheduling independently from numerical changes.
+    /// Returns `(nodes_reordered, barriers_emitted)`.
+    pub fn finish_with_reorder(mut self) -> Result<(u32, u32)> {
+        let mut reordered = 0;
+        let mut barriers = 0;
+        if self.recording {
+            if let Some(nodes) = self.encoder.take_capture() {
+                let mut graph = ComputeGraph::from_nodes(nodes);
+                let unannotated = graph.unannotated_dispatch_count();
+                if unannotated != 0 {
+                    let pipelines = graph
+                        .nodes()
+                        .iter()
+                        .filter_map(|node| match node {
+                            CapturedNode::Dispatch {
+                                pipeline,
+                                reads,
+                                writes,
+                                ..
+                            } if reads.is_empty() || writes.is_empty() => {
+                                Some(pipeline.label().to_owned())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    return Err(MlxError::InvalidArgument(format!(
+                        "graph reorder refused: {unannotated} of {} dispatches lack complete buffer ranges: {pipelines:?}",
+                        graph.dispatch_count(),
+                    )));
+                }
+                reordered = graph.reorder();
+                barriers = graph.encode_with_barriers(&mut self.encoder);
+            }
+        }
+        self.encoder.commit_and_wait()?;
+        Ok((reordered, barriers))
     }
 
     /// Commit the command buffer WITHOUT waiting.

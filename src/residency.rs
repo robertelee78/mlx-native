@@ -6,7 +6,7 @@
 use std::ffi::CStr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use metal::{BufferRef as MTLBufferRef, CommandQueueRef, DeviceRef};
 use objc::runtime::{Class, Object, BOOL, YES};
@@ -49,6 +49,7 @@ enum ResidencySetInner {
         /// `ggml-metal-device.m:1378-1382` (batch addAllocation in loop,
         /// commit ONCE at the end of the batch).
         pending: AtomicBool,
+        heartbeat_ticks: AtomicUsize,
     },
     Noop,
 }
@@ -110,7 +111,8 @@ impl ResidencySet {
             // NUL-terminated; NSString reads up to the NUL.
             let label_ptr = b"mlx_native_default\0".as_ptr() as *const i8;
             if let Some(nsstring_class) = Class::get("NSString") {
-                let label_ns: *mut Object = msg_send![nsstring_class, stringWithUTF8String: label_ptr];
+                let label_ns: *mut Object =
+                    msg_send![nsstring_class, stringWithUTF8String: label_ptr];
                 if !label_ns.is_null() {
                     let _: () = msg_send![descriptor, setLabel: label_ns];
                 }
@@ -132,13 +134,26 @@ impl ResidencySet {
                 ));
             }
 
-            Ok(Self {
-                inner: Arc::new(ResidencySetInner::Active {
-                    object: ObjcResidencySet { ptr: set },
-                    lock: Mutex::new(()),
-                    pending: AtomicBool::new(false),
-                }),
-            })
+            let inner = Arc::new(ResidencySetInner::Active {
+                object: ObjcResidencySet { ptr: set },
+                lock: Mutex::new(()),
+                pending: AtomicBool::new(false),
+                heartbeat_ticks: AtomicUsize::new(residency_heartbeat_ticks()),
+            });
+            spawn_residency_heartbeat(&inner);
+            Ok(Self { inner })
+        }
+    }
+
+    pub(crate) fn keep_alive(&self) {
+        let ResidencySetInner::Active {
+            heartbeat_ticks, ..
+        } = &*self.inner
+        else {
+            return;
+        };
+        if *RESIDENCY_HEARTBEAT_KEEP_ALIVE_SECONDS > 0 {
+            heartbeat_ticks.store(residency_heartbeat_ticks(), Ordering::Release);
         }
     }
 
@@ -177,11 +192,10 @@ impl ResidencySet {
     pub(crate) fn remove_allocation(&self, buffer: &MTLBufferRef) {
         self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, removeAllocation: buffer];
-            let _ = TEST_ALLOCATION_COUNT.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |count| count.checked_sub(1),
-            );
+            let _ =
+                TEST_ALLOCATION_COUNT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
             pending.store(true, Ordering::Release);
         });
     }
@@ -247,7 +261,13 @@ impl ResidencySet {
     }
 
     fn with_active_set(&self, f: impl FnOnce(*mut Object, &AtomicBool)) {
-        let ResidencySetInner::Active { object, lock, pending } = &*self.inner else {
+        let ResidencySetInner::Active {
+            object,
+            lock,
+            pending,
+            ..
+        } = &*self.inner
+        else {
             return;
         };
 
@@ -255,6 +275,63 @@ impl ResidencySet {
             f(object.ptr, pending);
         }
     }
+}
+
+const RESIDENCY_HEARTBEAT_INTERVAL_MS: u64 = 5;
+// Match the pinned llama.cpp Metal residency lifecycle: refresh active sets
+// every 5 ms for three minutes after GPU work. Zero disables the heartbeat.
+static RESIDENCY_HEARTBEAT_KEEP_ALIVE_SECONDS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(180)
+});
+
+fn residency_heartbeat_ticks() -> usize {
+    residency_heartbeat_ticks_for(*RESIDENCY_HEARTBEAT_KEEP_ALIVE_SECONDS)
+}
+
+fn residency_heartbeat_ticks_for(seconds: usize) -> usize {
+    seconds.saturating_mul(1000) / RESIDENCY_HEARTBEAT_INTERVAL_MS as usize
+}
+
+fn spawn_residency_heartbeat(inner: &Arc<ResidencySetInner>) {
+    if *RESIDENCY_HEARTBEAT_KEEP_ALIVE_SECONDS == 0 {
+        return;
+    }
+    let weak = Arc::downgrade(inner);
+    let _ = std::thread::Builder::new()
+        .name("mlx-residency-heartbeat".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(
+                RESIDENCY_HEARTBEAT_INTERVAL_MS,
+            ));
+            let Some(inner) = weak.upgrade() else {
+                break;
+            };
+            let ResidencySetInner::Active {
+                object,
+                lock,
+                heartbeat_ticks,
+                ..
+            } = &*inner
+            else {
+                break;
+            };
+            if heartbeat_ticks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ticks| {
+                    ticks.checked_sub(1)
+                })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(_guard) = lock.lock() {
+                unsafe {
+                    let _: () = msg_send![object.ptr, requestResidency];
+                }
+            };
+        });
 }
 
 /// Whether the process opted out of residency sets via `HF2Q_NO_RESIDENCY=1`.
@@ -344,5 +421,17 @@ unsafe fn ns_error_message(error: *mut Object) -> String {
         }
 
         CStr::from_ptr(text).to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residency_heartbeat_uses_five_millisecond_ticks() {
+        assert_eq!(residency_heartbeat_ticks_for(0), 0);
+        assert_eq!(residency_heartbeat_ticks_for(1), 200);
+        assert_eq!(residency_heartbeat_ticks_for(180), 36_000);
     }
 }

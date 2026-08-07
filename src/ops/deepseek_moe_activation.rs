@@ -110,6 +110,17 @@ pub fn dispatch_deepseek_moe_swiglu(
     };
     let weights_or_dummy = selected_weights.unwrap_or(gate);
     let pipeline = registry.get_pipeline(DEEPSEEK_MOE_SWIGLU_KERNEL, device.metal_device())?;
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start = buffer.contents_ptr() as usize;
+            (start, start + buffer.byte_len())
+        };
+        let mut reads = vec![range(gate), range(up)];
+        if let Some(weights) = selected_weights {
+            reads.push(range(weights));
+        }
+        encoder.set_pending_buffer_ranges(reads, vec![range(output)]);
+    }
     encoder.encode_threadgroups_with_args(
         pipeline,
         &[

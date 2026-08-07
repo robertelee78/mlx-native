@@ -94,6 +94,11 @@ fn validate_buffer(buf: &MlxBuffer, name: &str, dtype: DType, shape: &[usize]) -
     Ok(())
 }
 
+fn buffer_range(buffer: &MlxBuffer) -> (usize, usize) {
+    let start = buffer.contents_ptr() as usize;
+    (start, start + buffer.byte_len())
+}
+
 fn validate_params(params: &DeepSeekSparseAttentionParams) -> Result<(usize, usize, usize)> {
     if params.batch == 0 || params.query_len == 0 || params.kv_len == 0 || params.top_k == 0 {
         return Err(MlxError::InvalidArgument(
@@ -231,6 +236,12 @@ pub fn dispatch_deepseek_sparse_attention_with_scratch(
     let head_groups = batch * queries * DEEPSEEK_SPARSE_HEADS;
     let blocks_per_head = (params.top_k as usize).div_ceil(SLOTS_PER_GROUP);
     encoder.set_op_kind(CapturedOpKind::Sdpa);
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![buffer_range(q), buffer_range(kv), buffer_range(indices)],
+            vec![buffer_range(scratch)],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         score_pipeline,
         &[
@@ -249,6 +260,17 @@ pub fn dispatch_deepseek_sparse_attention_with_scratch(
         device.metal_device(),
     )?;
     encoder.set_op_kind(CapturedOpKind::Sdpa);
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![
+                buffer_range(kv),
+                buffer_range(sinks),
+                buffer_range(indices),
+                buffer_range(scratch),
+            ],
+            vec![buffer_range(output)],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         reduce_pipeline,
         &[
@@ -352,6 +374,12 @@ pub fn dispatch_deepseek_sparse_attention_flash_prefill(
         device.metal_device(),
     )?;
     encoder.set_op_kind(CapturedOpKind::Sdpa);
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![buffer_range(q), buffer_range(sinks)],
+            vec![buffer_range(invalid_heads)],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         validate_pipeline,
         &[
@@ -370,6 +398,16 @@ pub fn dispatch_deepseek_sparse_attention_flash_prefill(
     )?;
     let gather_elements = flash_batches * top_k * DEEPSEEK_SPARSE_HEAD_DIM;
     encoder.set_op_kind(CapturedOpKind::Sdpa);
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![buffer_range(kv), buffer_range(indices)],
+            vec![
+                buffer_range(gathered_kv),
+                buffer_range(mask),
+                buffer_range(invalid_global),
+            ],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         gather_pipeline,
         &[
@@ -416,6 +454,16 @@ pub fn dispatch_deepseek_sparse_attention_flash_prefill(
     )?;
     let output_elements = flash_batches * DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM;
     encoder.set_op_kind(CapturedOpKind::Sdpa);
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![
+                buffer_range(invalid_global),
+                buffer_range(invalid_heads),
+                buffer_range(output),
+            ],
+            vec![buffer_range(output)],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         sanitize_pipeline,
         &[

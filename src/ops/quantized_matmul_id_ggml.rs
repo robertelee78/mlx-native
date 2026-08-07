@@ -1568,6 +1568,16 @@ fn dispatch_id_mm_with_layout(
     let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
     let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
 
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start = buffer.contents_ptr() as usize;
+            (start, start + buffer.byte_len())
+        };
+        encoder.set_pending_buffer_ranges(
+            vec![range(ids)],
+            vec![range(htpe), range(hids)],
+        );
+    }
     encoder.encode_threadgroups_with_args_and_shared(
         map0_pipeline,
         &[
@@ -1674,6 +1684,16 @@ fn dispatch_id_mm_with_layout(
 
     const MM_SHMEM_BYTES: u64 = 8192;
 
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start = buffer.contents_ptr() as usize;
+            (start, start + buffer.byte_len())
+        };
+        encoder.set_pending_buffer_ranges(
+            vec![range(weight), range(input), range(htpe), range(hids)],
+            vec![range(output)],
+        );
+    }
     encoder.encode_threadgroups_with_args_and_shared(
         mm_pipeline,
         &[

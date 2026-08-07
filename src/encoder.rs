@@ -2024,6 +2024,7 @@ impl CommandEncoder {
     #[inline]
     fn flush_residency_pending(&self) {
         if let Some(set) = self.residency_set.as_ref() {
+            set.keep_alive();
             set.flush_pending();
         }
     }

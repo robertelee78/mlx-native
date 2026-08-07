@@ -9,11 +9,85 @@ use mlx_native::ops::deepseek_indexer::{
     DEEPSEEK_INDEXER_HEADS, DEEPSEEK_INDEXER_HEAD_DIM, DEEPSEEK_INDEXER_RATIO,
     DEEPSEEK_INDEXER_TOP_K,
 };
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CapturedNode, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 const H: usize = DEEPSEEK_INDEXER_HEADS;
 const D: usize = DEEPSEEK_INDEXER_HEAD_DIM;
 const K: usize = DEEPSEEK_INDEXER_TOP_K;
+
+#[test]
+fn capture_annotates_score_topk_merge_and_finalize() {
+    let device = MlxDevice::new().unwrap();
+    let queries = 1;
+    let kv_len = 2_049;
+    let q = bf16_buffer(
+        &device,
+        &vec![bf16::ZERO; queries * H * D],
+        vec![1, queries, H, D],
+    );
+    let kv = bf16_buffer(
+        &device,
+        &vec![bf16::ZERO; kv_len * D],
+        vec![1, kv_len, D],
+    );
+    let weights = f32_buffer(&device, &vec![1.0; H], vec![1, queries, H]);
+    let scratch = f32_buffer(&device, &vec![0.0; kv_len], vec![1, queries, kv_len]);
+    let topk_elements = deepseek_indexer_topk_scratch_elements(1, queries, kv_len).unwrap();
+    let topk_scratch = device
+        .alloc_buffer(
+            topk_elements * DType::I32.size_of(),
+            DType::I32,
+            vec![1, queries, topk_elements],
+        )
+        .unwrap();
+    let output = device
+        .alloc_buffer(K * DType::I32.size_of(), DType::I32, vec![1, queries, K])
+        .unwrap();
+    let params = DeepSeekIndexerParams {
+        batch: 1,
+        query_len: queries as u32,
+        kv_len: kv_len as u32,
+        start_pos: (kv_len * DEEPSEEK_INDEXER_RATIO - 1) as u32,
+        ratio: DEEPSEEK_INDEXER_RATIO as u32,
+        heads: H as u32,
+        head_dim: D as u32,
+        top_k: K as u32,
+        offset: 0,
+    };
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    dispatch_deepseek_indexer_into_mma(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q,
+        &kv,
+        &weights,
+        &scratch,
+        &topk_scratch,
+        &output,
+        K,
+        0,
+        &params,
+    )
+    .unwrap();
+
+    let captured = encoder.take_capture().unwrap();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|node| matches!(node, CapturedNode::Dispatch { .. }))
+            .count(),
+        5
+    );
+    for (index, node) in captured.iter().enumerate() {
+        if let CapturedNode::Dispatch { reads, writes, .. } = node {
+            assert!(!reads.is_empty(), "dispatch {index} is missing reads");
+            assert!(!writes.is_empty(), "dispatch {index} is missing writes");
+        }
+    }
+}
 
 fn bf16_values(len: usize, salt: usize, scale: f32) -> Vec<bf16> {
     (0..len)
