@@ -804,7 +804,11 @@ kernel void flash_attn_vec_hybrid_batched_impl(
     const ushort iq1 = tgpig[0];  // query index (0 for decode)
     const uint   sp_b      = seq_pos_arr[iq1];
     const uint   slot_b    = slot_id_arr[iq1];
+    // mask_type=2: sliding ring storage; mask_type=3: sliding linear
+    // staging storage. Both apply the same logical window, but only type 2
+    // remaps physical ring rows.
     const bool   is_ring_b = (params.mask_type == 2u);
+    const bool   is_sliding_b = is_ring_b || (params.mask_type == 3u);
     const uint   ksl_b     = is_ring_b ? min(sp_b + 1u, params.kv_capacity) : (sp_b + 1u);
     const uint   rs_b      = (is_ring_b && ksl_b >= params.kv_capacity) ? ((sp_b + 1u) % params.kv_capacity) : 0u;
     constexpr ushort npp_b = (DK == 512) ? 2 : 1;
@@ -911,7 +915,7 @@ kernel void flash_attn_vec_hybrid_batched_impl(
     const bool is_d512 = (DK > 256);
 
     uint window_start_logical = 0;
-    if (params.mask_type == 2 && params.sliding_window > 0 && kv_seq_len > params.sliding_window) {
+    if (is_sliding_b && params.sliding_window > 0 && kv_seq_len > params.sliding_window) {
         window_start_logical = kv_seq_len - params.sliding_window;
     }
 

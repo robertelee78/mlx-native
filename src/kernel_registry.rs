@@ -622,6 +622,7 @@ impl KernelRegistry {
             "kv_cache_copy_seq_bf16_to_bf16_head_major".into(),
             kv_cache_src,
         );
+        sources.insert("kv_cache_linearize_ring_bytes".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
@@ -1224,6 +1225,7 @@ impl KernelRegistry {
         // hf2q's TQ-aware prefill SDPA path (current per-position kernel
         // requires cur_len separate dispatches).
         sources.insert("tq_dequantize_hb_kv_seq".into(), tq_dq_src);
+        sources.insert("tq_dequantize_hb_kv_seq_f16".into(), tq_dq_src);
 
         // iter-24: native higher-bit (5/6/8-bit) TQ SDPA kernel (byte-packed K/V)
         let tq_hb_src: &'static str = include_str!("shaders/flash_attn_vec_tq_hb.metal");

@@ -319,6 +319,38 @@ impl MlxDevice {
         }
     }
 
+    /// Allocate a shared Metal buffer for a producer that overwrites every
+    /// byte before any consumer can observe it.
+    ///
+    /// Unlike [`Self::alloc_buffer`], this method deliberately skips both the
+    /// eager CPU zero-fill and residency-set registration. Metal can therefore
+    /// reserve a large virtual resource without committing untouched pages or
+    /// residency-pinning the complete logical allocation. Command buffers
+    /// retain resources they reference; the caller must enforce a separate
+    /// physical-memory budget for pages it actually writes.
+    ///
+    /// # Safety
+    ///
+    /// Every byte that can be read by the CPU or GPU must be written first. A
+    /// partially written buffer must be dropped and must not escape through a
+    /// success or recovery path. This is unsuitable for recurrent state,
+    /// accumulation targets, scratch read before full initialization, or any
+    /// tensor whose unwritten bytes are semantically zero.
+    pub unsafe fn alloc_buffer_for_overwrite(
+        &self,
+        byte_len: usize,
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<MlxBuffer> {
+        if byte_len == 0 {
+            return Err(MlxError::InvalidArgument(
+                "Buffer byte length must be > 0".into(),
+            ));
+        }
+        let metal_buf = self.new_shared_buffer(byte_len)?;
+        Ok(MlxBuffer::from_raw(metal_buf, dtype, shape))
+    }
+
     /// Borrow the underlying `metal::Device` for direct Metal API calls
     /// (e.g. kernel compilation in [`KernelRegistry`](crate::KernelRegistry)).
     #[inline]

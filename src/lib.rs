@@ -312,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn test_overwrite_buffer_rejects_zero_length() {
+        let device = MlxDevice::new().expect("Metal device");
+        // SAFETY: the call fails before returning a buffer.
+        let error = unsafe { device.alloc_buffer_for_overwrite(0, DType::U8, vec![]) }
+            .expect_err("zero-length overwrite allocation must fail");
+        assert!(matches!(error, MlxError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_overwrite_buffer_is_not_residency_managed() {
+        let device = MlxDevice::new().expect("Metal device");
+        // SAFETY: the test never reads the allocation; it only inspects its
+        // metadata and residency ownership before dropping it.
+        let buffer = unsafe {
+            device
+                .alloc_buffer_for_overwrite(64 * 1024, DType::U8, vec![64 * 1024])
+                .expect("overwrite allocation")
+        };
+        assert_eq!(buffer.byte_len(), 64 * 1024);
+        assert!(
+            buffer.residency_set().is_none(),
+            "lazy overwrite buffers must not pin their entire virtual range"
+        );
+    }
+
+    #[test]
     fn test_buffer_alloc_over_device_limit_is_a_typed_error() {
         let device = MlxDevice::new().expect("Metal device");
         let max = device.metal_device().max_buffer_length() as usize;

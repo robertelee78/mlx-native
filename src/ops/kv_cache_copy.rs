@@ -23,6 +23,10 @@ pub static KV_CACHE_COPY_SHADER_SOURCE: &str = include_str!("../shaders/kv_cache
 /// Register KV cache copy shader source with the given kernel registry.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("kv_cache_copy", KV_CACHE_COPY_SHADER_SOURCE);
+    registry.register_source(
+        "kv_cache_linearize_ring_bytes",
+        KV_CACHE_COPY_SHADER_SOURCE,
+    );
 }
 
 /// Dispatch a GPU copy from a source bf16 buffer into a KV cache buffer.
@@ -945,4 +949,151 @@ pub fn dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major(
     );
 
     Ok(())
+}
+
+/// Linearize the newest rows from a head-major ring into a head-major staging
+/// buffer without a CPU synchronization or model-specific dtype conversion.
+///
+/// Each position contains `row_bytes` opaque bytes. This makes the primitive
+/// reusable for F16 K, packed/F16 V, and F32 norm payloads while retaining the
+/// same `[head, capacity, row]` addressing contract.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_linearize_ring_bytes(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    dst: &MlxBuffer,
+    n_heads: u32,
+    src_capacity: u32,
+    dst_capacity: u32,
+    history_len: u32,
+    logical_end: u32,
+    row_bytes: u32,
+) -> Result<()> {
+    if n_heads == 0 || history_len == 0 || row_bytes == 0 {
+        return Ok(());
+    }
+    if src_capacity == 0 || dst_capacity == 0 {
+        return Err(MlxError::InvalidArgument(
+            "kv_cache_linearize_ring_bytes: capacities must be > 0".into(),
+        ));
+    }
+    if history_len > src_capacity || history_len > dst_capacity {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_linearize_ring_bytes: history_len ({history_len}) exceeds source ({src_capacity}) or destination ({dst_capacity}) capacity"
+        )));
+    }
+    if logical_end < history_len {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_linearize_ring_bytes: logical_end ({logical_end}) < history_len ({history_len})"
+        )));
+    }
+    let src_required = n_heads as u64 * src_capacity as u64 * row_bytes as u64;
+    let dst_required = n_heads as u64 * dst_capacity as u64 * row_bytes as u64;
+    if (src.byte_len() as u64) < src_required || (dst.byte_len() as u64) < dst_required {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_linearize_ring_bytes: buffers too small (src {} < {src_required} or dst {} < {dst_required})",
+            src.byte_len(),
+            dst.byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_linearize_ring_bytes", device)?;
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let src_capacity_bytes = src_capacity.to_ne_bytes();
+    let dst_capacity_bytes = dst_capacity.to_ne_bytes();
+    let history_len_bytes = history_len.to_ne_bytes();
+    let logical_end_bytes = logical_end.to_ne_bytes();
+    let row_bytes_bytes = row_bytes.to_ne_bytes();
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(dst)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&src_capacity_bytes)),
+            (4, KernelArg::Bytes(&dst_capacity_bytes)),
+            (5, KernelArg::Bytes(&history_len_bytes)),
+            (6, KernelArg::Bytes(&logical_end_bytes)),
+            (7, KernelArg::Bytes(&row_bytes_bytes)),
+        ],
+        MTLSize::new(row_bytes as u64, n_heads as u64, history_len as u64),
+        MTLSize::new(std::cmp::min(256, row_bytes as u64), 1, 1),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod linearize_tests {
+    use super::*;
+    use crate::{DType, MlxDevice};
+
+    #[test]
+    fn linearize_ring_bytes_preserves_head_major_chronology() {
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping: no Metal device: {error}");
+                return;
+            }
+        };
+        let mut registry = KernelRegistry::new();
+        let n_heads = 2u32;
+        let src_capacity = 5u32;
+        let dst_capacity = 6u32;
+        let row_bytes = 3u32;
+        let history_len = 4u32;
+        let logical_end = 8u32;
+
+        let src_len = (n_heads * src_capacity * row_bytes) as usize;
+        let mut src = device
+            .alloc_buffer(src_len, DType::U8, vec![src_len])
+            .expect("source");
+        for head in 0..n_heads {
+            for slot in 0..src_capacity {
+                for byte in 0..row_bytes {
+                    let index = ((head * src_capacity + slot) * row_bytes + byte) as usize;
+                    src.as_mut_slice::<u8>().unwrap()[index] =
+                        (head * 80 + slot * 10 + byte) as u8;
+                }
+            }
+        }
+        let dst_len = (n_heads * dst_capacity * row_bytes) as usize;
+        let dst = device
+            .alloc_buffer(dst_len, DType::U8, vec![dst_len])
+            .expect("destination");
+
+        let mut encoder = device.command_encoder().expect("encoder");
+        dispatch_kv_cache_linearize_ring_bytes(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &src,
+            &dst,
+            n_heads,
+            src_capacity,
+            dst_capacity,
+            history_len,
+            logical_end,
+            row_bytes,
+        )
+        .expect("dispatch");
+        encoder.commit_and_wait().expect("commit");
+
+        let actual = dst.as_slice::<u8>().expect("destination slice");
+        for head in 0..n_heads {
+            for history_index in 0..history_len {
+                let logical_position = logical_end - history_len + history_index;
+                let source_slot = logical_position % src_capacity;
+                for byte in 0..row_bytes {
+                    let dst_index =
+                        ((head * dst_capacity + history_index) * row_bytes + byte) as usize;
+                    let expected = (head * 80 + source_slot * 10 + byte) as u8;
+                    assert_eq!(actual[dst_index], expected);
+                }
+            }
+        }
+    }
 }

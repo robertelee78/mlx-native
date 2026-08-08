@@ -425,3 +425,32 @@ kernel void kv_cache_copy_seq_bf16_to_bf16_head_major(
     // BF16 → BF16: bit-exact copy.  No rounding.
     cache[dst_idx] = src[src_idx];
 }
+
+/// Copy the newest `history_len` rows from a head-major ring into the start
+/// of a head-major linear staging buffer. The payload is byte-addressed so the
+/// same kernel handles F16 K, packed/F16 V, and F32 norm rows.
+///
+/// `logical_end` is the exclusive logical position already resident in the
+/// ring. Destination rows `[0, history_len)` are chronological, oldest first.
+kernel void kv_cache_linearize_ring_bytes(
+    device const uint8_t* src             [[buffer(0)]],
+    device       uint8_t* dst             [[buffer(1)]],
+    constant uint&        n_heads         [[buffer(2)]],
+    constant uint&        src_capacity    [[buffer(3)]],
+    constant uint&        dst_capacity    [[buffer(4)]],
+    constant uint&        history_len     [[buffer(5)]],
+    constant uint&        logical_end     [[buffer(6)]],
+    constant uint&        row_bytes       [[buffer(7)]],
+    uint3 tid [[thread_position_in_grid]])
+{
+    const uint byte_idx = tid.x;
+    const uint head = tid.y;
+    const uint history_idx = tid.z;
+    if (byte_idx >= row_bytes || head >= n_heads || history_idx >= history_len) return;
+
+    const uint logical_pos = logical_end - history_len + history_idx;
+    const uint src_slot = logical_pos % src_capacity;
+    const uint src_idx = (head * src_capacity + src_slot) * row_bytes + byte_idx;
+    const uint dst_idx = (head * dst_capacity + history_idx) * row_bytes + byte_idx;
+    dst[dst_idx] = src[src_idx];
+}

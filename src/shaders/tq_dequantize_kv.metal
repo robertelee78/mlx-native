@@ -379,3 +379,49 @@ kernel void tq_dequantize_hb_kv_seq(
         dst_pos[tiitg] = centroid * scale_norm;
     }
 }
+
+// F16-output sibling used by tiled prefill-resume attention.  Persistent KV
+// remains TQ-HB compressed; only the active layer/range is expanded.  The
+// dequantization formula and head-major layout are identical to the F32
+// variant above, with a single final half rounding at the store.
+kernel void tq_dequantize_hb_kv_seq_f16(
+    device const uint8_t               *packed [[buffer(0)]],
+    device const float                 *norms  [[buffer(1)]],
+    device       half                  *dst    [[buffer(2)]],
+    constant TqDequantizeHbKvSeqParams &params [[buffer(3)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    uint   tiitg [[thread_index_in_threadgroup]])
+{
+    const uint kv_head = tgpig[0];
+    const uint tok_idx = tgpig[1];
+    if (kv_head >= params.num_kv_heads || tok_idx >= params.n_tokens) return;
+
+    const uint pos = params.start_pos + tok_idx;
+    const uint hd = params.head_dim;
+    const uint cap = params.cache_capacity;
+    const float inv_sqrt_hd = rsqrt(float(hd));
+    const float sf = params.scale_factor_d512;
+    const bool is_d512 = hd > 256;
+
+    device const uint8_t *packed_pos = packed + kv_head * cap * hd + pos * hd;
+    const uint npp = params.norms_per_pos;
+    device const float *norms_pos = norms + kv_head * cap * npp + pos * npp;
+    device half *dst_pos = dst + kv_head * params.n_tokens * hd + tok_idx * hd;
+
+    if (tiitg < hd) {
+        uint block_idx = is_d512 ? tiitg / 256u : 0u;
+        block_idx = min(block_idx, npp - 1u);
+        const float norm = norms_pos[block_idx];
+        const float scale_norm = is_d512 ? norm / sf : norm * inv_sqrt_hd;
+        const uint idx = packed_pos[tiitg];
+        float centroid;
+        if (params.codebook_bits == 5u) {
+            centroid = CODEBOOK_5BIT_DQ[idx & 0x1Fu];
+        } else if (params.codebook_bits == 6u) {
+            centroid = CODEBOOK_6BIT_DQ[idx & 0x3Fu];
+        } else {
+            centroid = CODEBOOK_8BIT_DQ[idx];
+        }
+        dst_pos[tiitg] = half(centroid * scale_norm);
+    }
+}

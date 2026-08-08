@@ -124,6 +124,28 @@ kernel void flash_attn_prefill_mask_fill_bf16(
     }
 }
 
+kernel void flash_attn_prefill_mask_fill_f16(
+    device half* mask                                      [[buffer(0)]],
+    constant FlashAttnPrefillMaskParams& params            [[buffer(1)]],
+    uint q_row                                             [[threadgroup_position_in_grid]],
+    uint tid                                               [[thread_index_in_threadgroup]],
+    uint tg_size                                           [[threads_per_threadgroup]])
+{
+    const uint seq_len_k = params.seq_len_k;
+    const int q_abs = int(q_row + params.q_abs_offset);
+    const int n_swa = params.n_swa;
+    const bool causal = params.causal != 0u;
+    const uint row_offset = q_row * seq_len_k;
+    for (uint k_pos = tid; k_pos < seq_len_k; k_pos += tg_size) {
+        const int kp = int(k_pos);
+        const bool future = causal && kp > q_abs;
+        const bool outside_window = n_swa > 0 && (q_abs - kp) >= n_swa;
+        mask[row_offset + k_pos] = future || outside_window
+            ? half(-INFINITY)
+            : half(0.0f);
+    }
+}
+
 // ── Block-diagonal variant (ADR-040 iter-G(a) cross-slot prefill) ───────────
 //
 // Builds the additive mask for N concatenated sequences in one [T, T] buffer,

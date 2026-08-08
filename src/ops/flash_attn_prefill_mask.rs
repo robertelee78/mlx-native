@@ -88,6 +88,8 @@ pub static FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE: &str =
 
 /// Kernel entry point for the bf16 mask-fill kernel.
 pub const K_FILL_BF16: &str = "flash_attn_prefill_mask_fill_bf16";
+/// F16 sibling used by peer-aligned tiled resume attention.
+pub const K_FILL_F16: &str = "flash_attn_prefill_mask_fill_f16";
 
 /// Kernel entry point for the block-diagonal (multi-sequence) bf16 mask-fill
 /// kernel (ADR-040 iter-G(a) cross-slot prefill).
@@ -100,6 +102,7 @@ pub const K_FILL_BLOCKDIAG_BF16: &str = "flash_attn_prefill_mask_fill_blockdiag_
 /// shader source, so one registration covers both).
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(K_FILL_BF16, FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE);
+    registry.register_source(K_FILL_F16, FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE);
     registry.register_source(K_FILL_BLOCKDIAG_BF16, FLASH_ATTN_PREFILL_MASK_SHADER_SOURCE);
 }
 
@@ -267,6 +270,58 @@ pub fn build_sdpa_mask_bf16(
     Ok(mask)
 }
 
+/// F16-output sibling of [`build_sdpa_mask_bf16`]. Mask values are only exact
+/// zero and negative infinity, so the predicate is identical while matching
+/// the F16 tiled-attention dispatcher contract.
+pub fn build_sdpa_mask_f16(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    encoder: &mut CommandEncoder,
+    params: &SdpaMaskParams,
+) -> Result<MlxBuffer> {
+    if params.seq_len_q == 0 || params.seq_len_k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "build_sdpa_mask_f16: sequence lengths must be > 0".into(),
+        ));
+    }
+    if params.window_size == Some(0) {
+        return Err(MlxError::InvalidArgument(
+            "build_sdpa_mask_f16: window_size=Some(0) is not allowed".into(),
+        ));
+    }
+    let total = (params.seq_len_q as usize)
+        .checked_mul(params.seq_len_k as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("build_sdpa_mask_f16: mask size overflow".into()))?;
+    let mask = device.alloc_buffer(
+        total
+            .checked_mul(2)
+            .ok_or_else(|| MlxError::InvalidArgument("build_sdpa_mask_f16: mask size overflow".into()))?,
+        DType::F16,
+        vec![params.seq_len_q as usize, params.seq_len_k as usize],
+    )?;
+    let fill_params = MaskFillParamsGpu {
+        seq_len_k: params.seq_len_k,
+        q_abs_offset: params.q_abs_offset,
+        n_swa: params
+            .window_size
+            .map(|w| w.min(i32::MAX as u32) as i32)
+            .unwrap_or(-1),
+        causal: u32::from(params.causal),
+    };
+    let pipeline = registry.get_pipeline(K_FILL_F16, device.metal_device())?;
+    let tg_x = params.seq_len_k.next_power_of_two().max(32).min(256);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(&mask)),
+            (1, KernelArg::Bytes(as_bytes(&fill_params))),
+        ],
+        MTLSize::new(params.seq_len_q as u64, 1, 1),
+        MTLSize::new(tg_x as u64, 1, 1),
+    );
+    Ok(mask)
+}
+
 /// Shader-side parameter struct for the block-diagonal mask fill.  Mirrors
 /// `BlockDiagMaskParams` in `flash_attn_prefill_mask.metal`.
 #[repr(C)]
@@ -422,5 +477,42 @@ mod tests {
         // directly inspect the internal map, but the registration must not
         // panic and the kernel name constant is stable.
         assert_eq!(K_FILL_BF16, "flash_attn_prefill_mask_fill_bf16");
+    }
+
+    #[test]
+    fn test_f16_mask_matches_bf16_predicate_exactly() {
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping: no Metal device: {error}");
+                return;
+            }
+        };
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        for params in [
+            SdpaMaskParams { seq_len_q: 5, seq_len_k: 13, window_size: None, causal: true, q_abs_offset: 7 },
+            SdpaMaskParams { seq_len_q: 6, seq_len_k: 17, window_size: Some(4), causal: true, q_abs_offset: 9 },
+            SdpaMaskParams { seq_len_q: 3, seq_len_k: 11, window_size: Some(5), causal: false, q_abs_offset: 4 },
+        ] {
+            let mut encoder = device.command_encoder().expect("encoder");
+            let bf16 = build_sdpa_mask_bf16(&device, &mut registry, &mut encoder, &params)
+                .expect("BF16 mask");
+            let f16 = build_sdpa_mask_f16(&device, &mut registry, &mut encoder, &params)
+                .expect("F16 mask");
+            encoder.commit_and_wait().expect("commit");
+            let bf16_values = bf16.as_slice::<half::bf16>().expect("BF16 slice");
+            let f16_values = f16.as_slice::<half::f16>().expect("F16 slice");
+            assert_eq!(bf16_values.len(), f16_values.len());
+            for (index, (&bf16_value, &f16_value)) in bf16_values.iter().zip(f16_values).enumerate() {
+                let bf16_masked = bf16_value.to_f32().is_infinite() && bf16_value.to_f32().is_sign_negative();
+                let f16_masked = f16_value.to_f32().is_infinite() && f16_value.to_f32().is_sign_negative();
+                assert_eq!(f16_masked, bf16_masked, "params={params:?} index={index}");
+                if !f16_masked {
+                    assert_eq!(f16_value.to_bits(), half::f16::ZERO.to_bits());
+                    assert_eq!(bf16_value.to_bits(), half::bf16::ZERO.to_bits());
+                }
+            }
+        }
     }
 }
