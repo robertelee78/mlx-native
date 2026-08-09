@@ -483,10 +483,10 @@ impl EncoderSession {
     ///
     /// # Label
     ///
-    /// `label`'s `Some(value)` arm overwrites `stage_label` and
-    /// propagates via `commit_labeled`'s `apply_labels` chain — same as
-    /// calling [`Self::begin_stage`] before this. `None` keeps any
-    /// previously-set `begin_stage` label intact.
+    /// `label`'s `Some(value)` arm overwrites `stage_label`; the fenced commit
+    /// then applies that value through the same label helper used by ordinary
+    /// commits. This is equivalent to calling [`Self::begin_stage`] first.
+    /// `None` keeps any previously-set `begin_stage` label intact.
     ///
     /// # Counter semantics
     ///
@@ -503,13 +503,11 @@ impl EncoderSession {
         if self.drained {
             return Ok(());
         }
-        // Apply the label argument before committing so commit_labeled
-        // (called below) propagates the latest value to the CB. Note
-        // that the encoder.rs:1968 apply_labels writes to the active
-        // compute encoder iff one is open — at this point one IS open
-        // (we have not yet ended it), so the encoder picks up the label
-        // before end_encoding fires. After end_encoding the CB still
-        // has its label set (set on the CB itself, not the encoder).
+        // Apply the label argument before committing. The inner fenced
+        // commit applies it to both the command buffer and the still-active
+        // compute encoder before endEncoding, matching the ordinary labeled
+        // commit paths. After endEncoding the command buffer retains its own
+        // label while the completed encoder's copied label is cleared.
         if let Some(l) = label {
             self.stage_label.clear();
             self.stage_label.push_str(l);
@@ -600,9 +598,7 @@ impl EncoderSession {
         // Snapshot the wait-event metadata BEFORE rotating cmd_buf so
         // we encode the wait on the NEW CB.
         let wait_metadata = if self.fence_pending {
-            self.event
-                .as_ref()
-                .map(|ev| (ev.clone(), self.event_value))
+            self.event.as_ref().map(|ev| (ev.clone(), self.event_value))
         } else {
             None
         };

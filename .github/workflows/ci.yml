@@ -32,4 +32,17 @@ jobs:
       - name: Test
         run: cargo +stable test --locked -- --test-threads=1
       - name: Package
-        run: cargo +stable package --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +stable package --locked
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          crate="target/package/mlx-native-${version}.crate"
+          unpacked="$RUNNER_TEMP/packed-crate"
+          mkdir -p "$unpacked"
+          tar -xzf "$crate" -C "$unpacked"
+          cargo +stable test --locked \
+            --manifest-path "$unpacked/mlx-native-${version}/Cargo.toml" \
+            --test command_buffer_autorelease \
+            --test test_cb_label_propagation \
+            -- --test-threads=1

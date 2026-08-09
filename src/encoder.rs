@@ -20,6 +20,8 @@
 //! graph for later replay via `ComputeGraph::encode_sequential()`.
 
 use std::ffi::CStr;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use metal::{
@@ -711,6 +713,37 @@ fn issue_metal_buffer_barrier(encoder: &ComputeCommandEncoderRef) {
     }
 }
 
+/// Owned Metal command buffer whose Rust-owned Objective-C release is scoped.
+///
+/// Metal label setters copy/retain their NSString values until the labeled
+/// owner is destroyed. Pooling only the setter drains the input temporary but
+/// does not scope autorelease work triggered while releasing the labeled
+/// command buffer. Long-lived pool-less Rust workers therefore need the owner
+/// release itself inside a narrow autorelease pool as well.
+struct PooledCommandBuffer(ManuallyDrop<CommandBuffer>);
+
+impl PooledCommandBuffer {
+    fn new(command_buffer: CommandBuffer) -> Self {
+        Self(ManuallyDrop::new(command_buffer))
+    }
+}
+
+impl Deref for PooledCommandBuffer {
+    type Target = CommandBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for PooledCommandBuffer {
+    fn drop(&mut self) {
+        objc::rc::autoreleasepool(|| unsafe {
+            ManuallyDrop::drop(&mut self.0);
+        });
+    }
+}
+
 /// A batched compute command encoder.
 ///
 /// Keeps a single Metal `ComputeCommandEncoder` alive across multiple
@@ -728,7 +761,7 @@ fn issue_metal_buffer_barrier(encoder: &ComputeCommandEncoderRef) {
 /// enc.commit_and_wait()?;
 /// ```
 pub struct CommandEncoder {
-    cmd_buf: CommandBuffer,
+    cmd_buf: PooledCommandBuffer,
     /// Owned clone of the originating command queue.
     ///
     /// ADR-019: stored at `new_with_residency` time so
@@ -939,7 +972,7 @@ impl CommandEncoder {
         });
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            cmd_buf,
+            cmd_buf: PooledCommandBuffer::new(cmd_buf),
             queue: queue.to_owned(),
             active_encoder: std::ptr::null(),
             capture: None,
@@ -1136,17 +1169,22 @@ impl CommandEncoder {
     #[inline]
     fn end_active_encoder(&mut self) {
         if !self.active_encoder.is_null() {
-            // SAFETY: the pointer was obtained from cmd_buf.new_compute_command_encoder()
-            // and has not been ended yet.
-            unsafe { &*self.active_encoder }.end_encoding();
-            // ADR-040 §0.21c-track2: balance the +1 `retain` taken in
-            // get_or_create_encoder (the encoder is no longer needed after
-            // end_encoding). SAFETY: active_encoder is the non-null pointer we
-            // retained; this drops our strong ref.
             let enc = self.active_encoder;
-            unsafe {
+            // SAFETY: the pointer was obtained from
+            // cmd_buf.new_compute_command_encoder(), retained exactly once,
+            // and has not been ended yet. Scope both endEncoding and the
+            // balancing release so autorelease work owned by Metal labels is
+            // drained on pool-less inference workers.
+            objc::rc::autoreleasepool(|| unsafe {
+                (&*enc).end_encoding();
+                // Metal's trace row captures the encoder label at
+                // endEncoding. Clear the copied NSString immediately after
+                // that boundary so completed encoders do not retain one
+                // CFString each for the lifetime of a pool-less worker.
+                let nil_label: *const Object = std::ptr::null();
+                let _: () = msg_send![enc, setLabel: nil_label];
                 let _: () = msg_send![enc, release];
-            }
+            });
             self.active_encoder = std::ptr::null();
         }
     }
@@ -2066,7 +2104,7 @@ impl CommandEncoder {
         // exposes `CommandQueue::device` but not `CommandBuffer::device`,
         // so we go through ObjC directly).
         let device: &metal::DeviceRef = unsafe {
-            let cb = &*self.cmd_buf;
+            let cb = &**self.cmd_buf;
             msg_send![cb, device]
         };
         // ADR-015 —Apple Silicon hardware constraint (NEW Risk
@@ -2174,11 +2212,11 @@ impl CommandEncoder {
             unsafe { &*(timestamp_set as *const metal::CounterSetRef) };
         descriptor.set_counter_set(timestamp_set_ref);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
-        // metal-rs creates an autoreleased NSString for the label. Keep the
-        // future dispatch-counter path safe on pool-less worker threads too.
-        objc::rc::autoreleasepool(|| {
-            descriptor.set_label("mlx_native.dispatch_samples");
-        });
+        // Do not attach an Objective-C label here. This descriptor is
+        // allocated once per profiled command buffer, while the profiler's
+        // durable identity already comes from Rust-owned dispatch metadata.
+        // A Metal `copy` label would add another high-rate CFString owner on
+        // pool-less inference workers without improving the exported table.
         descriptor.set_sample_count(MAX_SAMPLES_PER_CB);
         match device.new_counter_sample_buffer_with_descriptor(&descriptor) {
             Ok(buf) => {
@@ -2293,7 +2331,7 @@ impl CommandEncoder {
         let mut cpu_t: u64 = 0;
         let mut gpu_t: u64 = 0;
         let device: &metal::DeviceRef = unsafe {
-            let cb = &*self.cmd_buf;
+            let cb = &**self.cmd_buf;
             msg_send![cb, device]
         };
         device.sample_timestamps(&mut cpu_t, &mut gpu_t);
@@ -2355,7 +2393,7 @@ impl CommandEncoder {
         // ADR-040 §0.21 — accumulate GPU-busy time (gated; 2 ObjC reads/sync).
         if *GPU_BUSY_ON {
             let (gpu_start, gpu_end): (f64, f64) = unsafe {
-                let cb = &*self.cmd_buf;
+                let cb = &**self.cmd_buf;
                 let s: f64 = msg_send![cb, GPUStartTime];
                 let e: f64 = msg_send![cb, GPUEndTime];
                 (s, e)
@@ -2399,10 +2437,9 @@ impl CommandEncoder {
         // `metal-gpu-submission-to-command-buffer-id` (sub_id ↔ encoder_id) →
         // `metal-gpu-execution-points` (per-dispatch start/end), this enables
         // per-phase µs/token attribution comparing hf2q vs llama side-by-side
-        // (label attribution path).  Cost is a single ObjC
-        // msg_send per CB submission — sub-µs on M5 Max — and a no-op when
-        // xctrace isn't recording, so this is unconditionally safe to call on
-        // the production decode hot path.
+        // (label attribution path). Cost is one or two bounded ObjC label
+        // setters per CB submission (CB plus an active compute encoder) and
+        // keeps traces attributable without requiring profile-mode execution.
         self.apply_labels(label);
         // ADR-015:record GPU time AND resolve per-dispatch samples
         // when either env gate is set.  Per-dispatch sampling force-enables
@@ -2458,7 +2495,8 @@ impl CommandEncoder {
     /// `metal-application-encoders-list` table picks up the label on the
     /// row emitted at the encoder's `endEncoding` / CB submission boundary.
     /// Single ObjC `msg_send` per call (two if an encoder is active); sub-µs
-    /// on M5 Max; no-op when xctrace isn't recording.
+    /// on M5 Max. The setters execute whether or not xctrace is recording so
+    /// an external capture can attach without changing the graph.
     ///
     /// Skipped (debug-only assert) if `label` is empty — empty labels would
     /// produce an indistinguishable trace row from the metal-rs default
@@ -2473,10 +2511,10 @@ impl CommandEncoder {
             return;
         }
         // metal-rs creates an autoreleased NSString for every `set_label`
-        // call.  Both Metal properties are `copy`, so their setters consume
-        // the value synchronously and no temporary NSString escapes this
-        // pool.  Without the pool, a pool-less inference thread accumulated
-        // one CFString per setter for the lifetime of the worker.
+        // call. Both Metal properties are `copy`, so this pool drains the
+        // setter inputs only. The copied CB label is bounded by
+        // PooledCommandBuffer destruction; the copied compute-encoder label
+        // is cleared immediately after endEncoding in end_active_encoder.
         objc::rc::autoreleasepool(|| {
             self.cmd_buf.set_label(label);
             if !self.active_encoder.is_null() {
@@ -2512,7 +2550,7 @@ impl CommandEncoder {
         // CFTimeInterval (double precision seconds).  See
         // https://developer.apple.com/documentation/metal/mtlcommandbuffer/1639925-gpustarttime
         let (gpu_start, gpu_end): (f64, f64) = unsafe {
-            let cb = &*self.cmd_buf;
+            let cb = &**self.cmd_buf;
             let s: f64 = msg_send![cb, GPUStartTime];
             let e: f64 = msg_send![cb, GPUEndTime];
             (s, e)
@@ -2556,7 +2594,7 @@ impl CommandEncoder {
     /// the process-wide accumulator.
     pub fn completed_gpu_interval_ns(&self) -> u64 {
         let (gpu_start, gpu_end): (f64, f64) = unsafe {
-            let cb = &*self.cmd_buf;
+            let cb = &**self.cmd_buf;
             let s: f64 = msg_send![cb, GPUStartTime];
             let e: f64 = msg_send![cb, GPUEndTime];
             (s, e)
@@ -2673,7 +2711,7 @@ impl CommandEncoder {
             }
         });
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
-        self.cmd_buf = cmd_buf;
+        self.cmd_buf = PooledCommandBuffer::new(cmd_buf);
         // Per-CB scratch state — every field that's documented as being
         // bounded by a CB lifetime resets here.
         self.active_encoder = std::ptr::null();
@@ -2759,15 +2797,13 @@ impl CommandEncoder {
     /// between the encoder-end and the CB-commit boundaries that
     /// `commit_labeled` would otherwise serialize. Sequence:
     ///
-    /// 1. End the persistent compute encoder (so `encodeSignalEvent:` is
-    ///    encoded at CB-level, not encoder-level — Metal validates that
-    ///    `encodeSignalEvent:` outside any encoder pass is the only
-    ///    legal placement).
-    /// 2. Apply `label` (when `Some`) to the CB. Note: at this point
-    ///    the encoder is already ended, so the encoder's own
-    ///    `setLabel:` is a no-op site — only the CB label propagates.
-    ///    `last_label` and per-dispatch profiling keep working as
-    ///    documented.
+    /// 1. Apply `label` (when `Some`) to the command buffer and the still-open
+    ///    compute encoder, matching the ordinary labeled commit paths.
+    /// 2. End the persistent compute encoder so `encodeSignalEvent:` is
+    ///    encoded at CB-level, not encoder-level. Metal validates that
+    ///    `encodeSignalEvent:` outside any encoder pass is the only legal
+    ///    placement. Ending also captures and then clears the encoder label;
+    ///    the command buffer retains its own copy for submission tracing.
     /// 3. Encode `encodeSignalEvent:event:value:new_value` at CB-level.
     /// 4. Flush the residency-set pending staging (matches the
     ///    `commit_labeled` / `commit` flush at encoder.rs:2004).
@@ -2790,15 +2826,17 @@ impl CommandEncoder {
         new_value: u64,
         label: Option<&str>,
     ) {
-        // Step 1: end the active compute encoder. encode_signal_event's
-        // debug_assert requires this be done first.
-        self.end_active_encoder();
-        // Step 2: apply the CB label so xctrace MST attribution still
-        // works on the fenced CB. apply_labels' debug_assert against
-        // empty labels matches commit_labeled's semantics.
+        // Step 1: apply the label while the compute encoder is still active,
+        // matching commit_labeled / commit_and_wait_labeled. Instruments
+        // snapshots the encoder label at endEncoding; applying it afterward
+        // would label only the command buffer and silently lose per-encoder
+        // attribution for fenced stages.
         if let Some(l) = label {
             self.apply_labels(l);
         }
+        // Step 2: end the active compute encoder. encode_signal_event's
+        // debug_assert requires this be done before the CB-level signal.
+        self.end_active_encoder();
         // Step 3: encode the signal at CB-level.
         self.cmd_buf.encode_signal_event(event, new_value);
         // Step 4 + 5: same as commit() — flush residency staging, then
