@@ -37,7 +37,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 
@@ -56,6 +56,16 @@ fn enable_dispatch_profile() {
             std::env::set_var("MLX_PROFILE_CB", "1");
         }
     });
+}
+
+/// The profiler tables and their reset operation are process-global. Cargo
+/// runs tests in this integration binary concurrently by default, so every
+/// test that records/resets profiler state must share one lock.
+fn profile_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Whether the device supports `AtDispatchBoundary` counter sampling.
@@ -94,6 +104,7 @@ fn make_inc_kernel() -> (KernelRegistry, &'static str) {
 
 #[test]
 fn per_dispatch_sampling_records_nonzero_ns() {
+    let _guard = profile_test_lock();
     enable_dispatch_profile();
     mlx_native::kernel_profile::reset();
 
@@ -217,6 +228,7 @@ fn per_dispatch_sampling_records_nonzero_ns() {
 
 #[test]
 fn per_dispatch_dump_is_grouped_by_cb_label() {
+    let _guard = profile_test_lock();
     enable_dispatch_profile();
     mlx_native::kernel_profile::reset();
 
@@ -279,6 +291,7 @@ fn per_dispatch_dump_is_grouped_by_cb_label() {
 
 #[test]
 fn op_kind_label_propagates_into_dispatch_entry() {
+    let _guard = profile_test_lock();
     enable_dispatch_profile();
     mlx_native::kernel_profile::reset();
 

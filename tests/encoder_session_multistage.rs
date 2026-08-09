@@ -168,9 +168,14 @@ fn test_session_fence_stage_then_reset_then_begin_stage() {
     assert!(sess.has_event(), "event lazy-allocated by first fence");
     assert_eq!(sess.fence_value(), 1, "fence_value bumped to 1");
 
-    // Snapshot the stage-1 CB label so we can later assert the
-    // rotation produced a different CB. The label was set by
-    // fence_stage(Some("phase.iter89e2b_stage1.fence")).
+    // Snapshot the stage-1 CB identity so we can later assert that reset
+    // rotated the underlying Metal object.  Do not use `label()` for this:
+    // `MTLCommandBuffer.label` is nullable, while metal-rs exposes it as
+    // `&str` and therefore cannot safely represent a fresh unlabeled CB.
+    let cb_stage1 = sess.metal_command_buffer().as_ref() as *const metal::CommandBufferRef;
+
+    // The submitted stage-1 CB was explicitly labeled by fence_stage, so
+    // reading that label remains valid and separately pins propagation.
     let cb_label_stage1: String = sess.metal_command_buffer().label().to_string();
     assert_eq!(
         cb_label_stage1, "phase.iter89e2b_stage1.fence",
@@ -188,11 +193,10 @@ fn test_session_fence_stage_then_reset_then_begin_stage() {
         "fence_value persists across reset (it is the high-water mark)"
     );
 
-    // Fresh CB has empty label until begin_stage / commit propagate.
-    let cb_label_post_reset: String = sess.metal_command_buffer().label().to_string();
+    let cb_stage2 = sess.metal_command_buffer().as_ref() as *const metal::CommandBufferRef;
     assert_ne!(
-        cb_label_post_reset, "phase.iter89e2b_stage1.fence",
-        "reset_for_next_stage must rotate to a fresh MTLCommandBuffer (no carryover label)"
+        cb_stage2, cb_stage1,
+        "reset_for_next_stage must rotate to a fresh MTLCommandBuffer"
     );
 
     // Stage 2.
