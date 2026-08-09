@@ -128,9 +128,12 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 | `GgufFile` / `TensorInfo` | GGUF model file mmap + metadata |
 | `SafetensorsFile` | Safetensors mmap + tensor loading |
 
-Hot-path command-buffer and compute-encoder factories, plus their label
-temporaries, are scoped so those autoreleased Metal objects and NSStrings
-cannot accumulate on pool-less long-lived Rust workers.
+Hot-path command-buffer and compute-encoder factories are scoped for pool-less
+long-lived Rust workers. Command-buffer destruction is likewise scoped, and
+compute-encoder labels are cleared immediately after `endEncoding` captures
+their trace row. The isolated regression proves bounded command-buffer,
+CFString, and autorelease-pool populations across repeated labeled sync and
+async waves.
 See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-native/blob/main/docs/command-buffer-autorelease-lifetime-2026-08-08.md).
 
 ## GPU operations

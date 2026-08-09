@@ -22,7 +22,7 @@ concurrency:
 jobs:
   publish:
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       EXPECTED_SHA: ${{ inputs.commit_sha }}
@@ -40,7 +40,8 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          git merge-base --is-ancestor "$actual_sha" origin/main
+          main_sha=$(git rev-parse origin/main)
+          test "$actual_sha" = "$main_sha"
           actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$actual_version" = "$EXPECTED_VERSION"
           test -n "$CARGO_REGISTRY_TOKEN"
@@ -50,7 +51,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal
 
       - name: Test exact source
-        run: cargo +stable test --locked -- --test-threads=1
+        run: cargo +stable test --locked --all-features -- --test-threads=1
 
       - name: Package exact source
         shell: bash
@@ -60,6 +61,18 @@ jobs:
           crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
           test -s "$crate"
           shasum -a 256 "$crate" | tee "$RUNNER_TEMP/release-crate.sha256"
+
+      - name: Test packed archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
+          unpacked="$RUNNER_TEMP/packed-crate"
+          mkdir -p "$unpacked"
+          tar -xzf "$crate" -C "$unpacked"
+          cargo +stable test --locked --all-features \
+            --manifest-path "$unpacked/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
+            -- --test-threads=1
 
       - name: Publish exact package
         shell: bash
@@ -91,6 +104,20 @@ jobs:
             sleep 5
           done
           exit 1
+
+      - name: Test downloaded registry archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          downloaded="$RUNNER_TEMP/mlx-native-${EXPECTED_VERSION}.crate"
+          unpacked="$RUNNER_TEMP/registry-crate"
+          mkdir -p "$unpacked"
+          tar -xzf "$downloaded" -C "$unpacked"
+          cargo +stable test --locked \
+            --manifest-path "$unpacked/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
+            --test command_buffer_autorelease \
+            --test test_cb_label_propagation \
+            -- --test-threads=1
 
       - name: Tag and create GitHub release
         env:
