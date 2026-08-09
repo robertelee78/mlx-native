@@ -46,9 +46,9 @@
 //! `AtDispatchBoundary` support.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
 /// Per-label accumulator entry.
 #[derive(Clone, Debug, Default)]
@@ -285,8 +285,16 @@ pub fn convert_gpu_ticks_to_ns(gpu_ticks: u64) -> u64 {
 mod tests {
     use super::*;
 
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn record_dump_reset_cycle() {
+        let _guard = test_lock();
         reset();
         record("A", 100);
         record("A", 200);
@@ -307,6 +315,7 @@ mod tests {
 
     #[test]
     fn dispatch_record_dump_reset_cycle() {
+        let _guard = test_lock();
         reset();
         record_dispatch(DispatchEntry {
             cb_label: "layer.attn[0]".into(),
@@ -350,12 +359,14 @@ mod tests {
 
     #[test]
     fn dispatch_dump_empty_when_no_entries() {
+        let _guard = test_lock();
         reset();
         assert!(dump_dispatches().is_empty());
     }
 
     #[test]
     fn convert_gpu_ticks_default_one_to_one() {
+        let _guard = test_lock();
         // After reset(), no pair → 1:1 fallback.
         reset();
         assert_eq!(convert_gpu_ticks_to_ns(12_345), 12_345);
@@ -363,6 +374,7 @@ mod tests {
 
     #[test]
     fn convert_gpu_ticks_with_recorded_pair() {
+        let _guard = test_lock();
         reset();
         // Suppose 1 GPU tick = 2 ns → cpu_ns / gpu_ticks = 2.0.
         record_clock_pair(2_000, 1_000);
@@ -372,6 +384,7 @@ mod tests {
 
     #[test]
     fn convert_gpu_ticks_zero_pair_is_one_to_one() {
+        let _guard = test_lock();
         reset();
         // Exactly-zero pair acts as "unrecorded".
         record_clock_pair(0, 1_000);

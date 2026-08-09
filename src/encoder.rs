@@ -921,13 +921,22 @@ impl CommandEncoder {
         queue: &CommandQueue,
         residency_set: Option<ResidencySet>,
     ) -> Result<Self> {
-        let cmd_buf = if unretained_refs_enabled() {
-            queue
-                .new_command_buffer_with_unretained_references()
-                .to_owned()
-        } else {
-            queue.new_command_buffer().to_owned()
-        };
+        // `-[MTLCommandQueue commandBuffer*]` follows Cocoa's autorelease
+        // convention. Long-lived Rust inference threads do not otherwise
+        // have a per-request autorelease-pool boundary, so retaining the
+        // returned object with `to_owned()` alone leaves the autoreleased
+        // reference (and every resource retained by the completed CB) alive
+        // indefinitely. Drain that temporary reference immediately while
+        // preserving the owned retain returned from this closure.
+        let cmd_buf = objc::rc::autoreleasepool(|| {
+            if unretained_refs_enabled() {
+                queue
+                    .new_command_buffer_with_unretained_references()
+                    .to_owned()
+            } else {
+                queue.new_command_buffer().to_owned()
+            }
+        });
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             cmd_buf,
@@ -1104,22 +1113,19 @@ impl CommandEncoder {
             } else {
                 MTLDispatchType::Concurrent
             };
-            let encoder = self
-                .cmd_buf
-                .compute_command_encoder_with_dispatch_type(dispatch_type);
-            // ADR-040 §0.21c-track2 ROOT FIX (codex): `compute_command_encoder_*`
-            // returns a borrowed `&ComputeCommandEncoderRef` to an AUTORELEASED
-            // object (metal-rs commandbuffer.rs warning / gfx-rs/metal-rs#128).
-            // We hold this pointer across many Rust calls (and an autorelease-pool
-            // drain can release it out from under us), so messages sent through it
-            // — including `memoryBarrierWithScope:` — are NOT guaranteed to land on
-            // a live, owned encoder, defeating cross-dispatch ordering. llama RETAINS
-            // its concurrent encoder (`[res->obj retain]`, released at end). Match
-            // that: take a strong +1 ref now, balanced by `release` in
-            // `end_active_encoder`. Keeps MTLDispatchTypeConcurrent +
-            // memoryBarrierWithScope unchanged.
-            let _: () = unsafe { msg_send![encoder, retain] };
-            self.active_encoder = encoder as *const ComputeCommandEncoderRef;
+            // ADR-040 §0.21c-track2 ROOT FIX (codex):
+            // `compute_command_encoder_*` returns a borrowed reference to an
+            // AUTORELEASED object (metal-rs commandbuffer.rs warning /
+            // gfx-rs/metal-rs#128). Take the explicit +1 retain inside a
+            // local pool, then drain the temporary autorelease immediately.
+            // The +1 remains balanced by `release` in `end_active_encoder`.
+            self.active_encoder = objc::rc::autoreleasepool(|| {
+                let encoder = self
+                    .cmd_buf
+                    .compute_command_encoder_with_dispatch_type(dispatch_type);
+                let _: () = unsafe { msg_send![encoder, retain] };
+                encoder as *const ComputeCommandEncoderRef
+            });
         }
         // SAFETY: active_encoder is non-null and points to a valid encoder
         // owned by cmd_buf.
@@ -2168,7 +2174,11 @@ impl CommandEncoder {
             unsafe { &*(timestamp_set as *const metal::CounterSetRef) };
         descriptor.set_counter_set(timestamp_set_ref);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
-        descriptor.set_label("mlx_native.dispatch_samples");
+        // metal-rs creates an autoreleased NSString for the label. Keep the
+        // future dispatch-counter path safe on pool-less worker threads too.
+        objc::rc::autoreleasepool(|| {
+            descriptor.set_label("mlx_native.dispatch_samples");
+        });
         descriptor.set_sample_count(MAX_SAMPLES_PER_CB);
         match device.new_counter_sample_buffer_with_descriptor(&descriptor) {
             Ok(buf) => {
@@ -2462,14 +2472,20 @@ impl CommandEncoder {
         if label.is_empty() {
             return;
         }
-        self.cmd_buf.set_label(label);
-        if !self.active_encoder.is_null() {
-            // SAFETY: active_encoder is non-null and points to a live encoder
-            // owned by cmd_buf — same invariant as get_or_create_encoder /
-            // memory_barrier.  set_label is a single property write on the
-            // ObjC object; safe before endEncoding.
-            unsafe { &*self.active_encoder }.set_label(label);
-        }
+        // metal-rs creates an autoreleased NSString for every `set_label`
+        // call.  Both Metal properties are `copy`, so their setters consume
+        // the value synchronously and no temporary NSString escapes this
+        // pool.  Without the pool, a pool-less inference thread accumulated
+        // one CFString per setter for the lifetime of the worker.
+        objc::rc::autoreleasepool(|| {
+            self.cmd_buf.set_label(label);
+            if !self.active_encoder.is_null() {
+                // SAFETY: active_encoder is non-null and points to a live
+                // encoder owned by cmd_buf — same invariant as
+                // get_or_create_encoder / memory_barrier.
+                unsafe { &*self.active_encoder }.set_label(label);
+            }
+        });
         // ADR-015:capture the most recent label for per-dispatch
         // entries.  Cheap String allocation — only happens at CB commit
         // boundaries, not per dispatch.
@@ -2647,13 +2663,15 @@ impl CommandEncoder {
             "reset_command_buffer: active_encoder should be null after \
              end_active_encoder — caller should commit before reset"
         );
-        let cmd_buf = if unretained_refs_enabled() {
-            self.queue
-                .new_command_buffer_with_unretained_references()
-                .to_owned()
-        } else {
-            self.queue.new_command_buffer().to_owned()
-        };
+        let cmd_buf = objc::rc::autoreleasepool(|| {
+            if unretained_refs_enabled() {
+                self.queue
+                    .new_command_buffer_with_unretained_references()
+                    .to_owned()
+            } else {
+                self.queue.new_command_buffer().to_owned()
+            }
+        });
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         self.cmd_buf = cmd_buf;
         // Per-CB scratch state — every field that's documented as being
