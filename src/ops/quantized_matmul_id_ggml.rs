@@ -406,6 +406,236 @@ pub fn quantized_matmul_id_ggml_pooled(
     )
 }
 
+/// Encode two matrix-matrix expert projections that share one routing
+/// schedule.
+///
+/// This is the family-neutral MoE gate/up primitive: both projections use the
+/// same input, expert ids, quantization, and matrix shape, but may use distinct
+/// weights and outputs. The first projection builds the per-expert routed-row
+/// schedule; the second reuses it in the same command encoder. Their ordinary
+/// `mm_id` kernels may therefore overlap after the schedule barrier without
+/// duplicating `map0` or exposing schedule identity to the caller.
+///
+/// The pair API is intentionally matrix-matrix only. Decode-sized calls retain
+/// the existing matrix-vector route and are measured separately. Output ranges
+/// must not overlap because the two projection kernels may execute
+/// concurrently.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_pair(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    first_weight: &MlxBuffer,
+    second_weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    first_output: &MlxBuffer,
+    second_output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    if params.n_tokens <= mm_id_routing_threshold()
+        || !has_mm_id_map0(params.top_k)
+        || params.k < 32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled_pair requires the mm_id route: n_tokens={} threshold={} top_k={} k={}",
+            params.n_tokens,
+            mm_id_routing_threshold(),
+            params.top_k,
+            params.k,
+        )));
+    }
+    if params.n == 0 || params.n_experts == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled_pair requires N and n_experts > 0".into(),
+        ));
+    }
+
+    // Validate both projections' distinct buffers before encoding the first
+    // projection, so a malformed pair cannot leave partial work in the
+    // caller's command encoder.
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "K ({}) must be divisible by block QK ({})",
+            params.k, qk,
+        )));
+    }
+    let blocks_per_row = params.k / qk;
+    let per_expert_bytes = (params.n as usize)
+        .checked_mul(blocks_per_row as usize)
+        .and_then(|rows| rows.checked_mul(params.ggml_type.block_bytes() as usize))
+        .ok_or_else(|| MlxError::InvalidArgument("pair weight byte count overflow".into()))?;
+    if (params.expert_stride as usize) < per_expert_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "expert_stride ({}) < per_expert_bytes ({})",
+            params.expert_stride, per_expert_bytes,
+        )));
+    }
+    let last_expert_offset = (params.n_experts.saturating_sub(1) as usize)
+        .checked_mul(params.expert_stride as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("pair expert stride overflow".into()))?;
+    let total_weight_bytes = last_expert_offset
+        .checked_add(per_expert_bytes)
+        .ok_or_else(|| MlxError::InvalidArgument("pair total weight byte count overflow".into()))?;
+    for (name, weight) in [("first", first_weight), ("second", second_weight)] {
+        if weight.data_byte_len() < total_weight_bytes {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {name} weight buffer too small: expected {} bytes, got {}",
+                total_weight_bytes,
+                weight.data_byte_len(),
+            )));
+        }
+    }
+    let expected_output_bytes = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .and_then(|rows| rows.checked_mul(params.n as usize))
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("pair output byte count overflow".into()))?;
+    for (name, output) in [("first", first_output), ("second", second_output)] {
+        if output.data_byte_len() < expected_output_bytes {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {name} output buffer too small: expected {} bytes, got {}",
+                expected_output_bytes,
+                output.data_byte_len(),
+            )));
+        }
+    }
+
+    let expected_input_bytes = (params.n_tokens as usize)
+        .checked_mul(params.k as usize)
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("pair input byte count overflow".into()))?;
+    if input.data_byte_len() < expected_input_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled_pair input buffer too small: expected {} bytes, got {}",
+            expected_input_bytes,
+            input.data_byte_len(),
+        )));
+    }
+    let expected_ids_bytes = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .and_then(|elements| elements.checked_mul(DType::U32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("pair ids byte count overflow".into()))?;
+    if ids.data_byte_len() < expected_ids_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_pooled_pair ids buffer too small: expected {} bytes, got {}",
+            expected_ids_bytes,
+            ids.data_byte_len(),
+        )));
+    }
+    scratch.check_capacity(params.n_experts, params.n_tokens)?;
+    let expected_htpe_bytes = (params.n_experts as usize)
+        .checked_mul(DType::U32.size_of())
+        .ok_or_else(|| MlxError::InvalidArgument("pair htpe byte count overflow".into()))?;
+    let expected_hids_bytes = (params.n_experts as usize)
+        .checked_mul(params.n_tokens as usize)
+        .and_then(|elements| elements.checked_mul(DType::U32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("pair hids byte count overflow".into()))?;
+    for (name, buffer, expected) in [
+        ("htpe", &scratch.htpe, expected_htpe_bytes),
+        ("hids", &scratch.hids, expected_hids_bytes),
+    ] {
+        if buffer.data_byte_len() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {name} scratch buffer too small: expected {} bytes, got {}",
+                expected,
+                buffer.data_byte_len(),
+            )));
+        }
+    }
+
+    let range = |buffer: &MlxBuffer, extent: usize| {
+        let start = (buffer.contents_ptr() as usize)
+            .saturating_add(buffer.byte_offset() as usize);
+        (start, start.saturating_add(extent))
+    };
+    let overlaps = |left: (usize, usize), right: (usize, usize)| {
+        left.0 < right.1 && right.0 < left.1
+    };
+    let first_output_range = range(first_output, expected_output_bytes);
+    let second_output_range = range(second_output, expected_output_bytes);
+    if overlaps(first_output_range, second_output_range) {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled_pair output ranges must not overlap".into(),
+        ));
+    }
+    let scratch_ranges = [
+        ("htpe", range(&scratch.htpe, expected_htpe_bytes)),
+        ("hids", range(&scratch.hids, expected_hids_bytes)),
+    ];
+    if overlaps(scratch_ranges[0].1, scratch_ranges[1].1) {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled_pair scratch ranges must not overlap".into(),
+        ));
+    }
+    let immutable_read_ranges = [
+        ("input", range(input, expected_input_bytes)),
+        ("first weight", range(first_weight, total_weight_bytes)),
+        ("second weight", range(second_weight, total_weight_bytes)),
+        ("ids", range(ids, expected_ids_bytes)),
+    ];
+    for (scratch_name, scratch_range) in scratch_ranges {
+        if let Some((read_name, _)) = immutable_read_ranges
+            .iter()
+            .find(|(_, read_range)| overlaps(scratch_range, *read_range))
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {scratch_name} scratch range must not overlap {read_name}",
+            )));
+        }
+    }
+    let read_ranges = [
+        immutable_read_ranges[0],
+        immutable_read_ranges[1],
+        immutable_read_ranges[2],
+        immutable_read_ranges[3],
+        ("htpe scratch", scratch_ranges[0].1),
+        ("hids scratch", scratch_ranges[1].1),
+    ];
+    for (output_name, output_range) in [
+        ("first", first_output_range),
+        ("second", second_output_range),
+    ] {
+        if let Some((read_name, _)) = read_ranges
+            .iter()
+            .find(|(_, read_range)| overlaps(output_range, *read_range))
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {output_name} output range must not overlap {read_name}",
+            )));
+        }
+    }
+
+    dispatch_id_mm_pooled_with_layout(
+        encoder,
+        registry,
+        device,
+        input,
+        first_weight,
+        ids,
+        first_output,
+        scratch,
+        params,
+        IdMmInputLayout::SharedPerToken,
+        false,
+    )?;
+    dispatch_id_mm_pooled_with_layout(
+        encoder,
+        registry,
+        device,
+        input,
+        second_weight,
+        ids,
+        second_output,
+        scratch,
+        params,
+        IdMmInputLayout::SharedPerToken,
+        true,
+    )
+}
+
 /// Pooled `mm_id` dispatch for input laid out as
 /// `[n_tokens, top_k, K]` instead of one shared row per token.
 ///
@@ -580,6 +810,7 @@ fn quantized_matmul_id_ggml_pooled_impl(
             scratch,
             params,
             input_layout,
+            false,
         );
     }
 
@@ -1198,6 +1429,7 @@ fn dispatch_id_mm_pooled(
         scratch,
         params,
         IdMmInputLayout::SharedPerToken,
+        false,
     )
 }
 
@@ -1213,6 +1445,7 @@ fn dispatch_id_mm_pooled_with_layout(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
     input_layout: IdMmInputLayout,
+    schedule_prepared: bool,
 ) -> Result<()> {
     scratch.check_capacity(params.n_experts, params.n_tokens)?;
 
@@ -1241,6 +1474,7 @@ fn dispatch_id_mm_pooled_with_layout(
         output,
         &dispatch,
         input_layout,
+        schedule_prepared,
     )
 }
 
@@ -1421,6 +1655,52 @@ pub fn dispatch_id_mm_for_test(
         output,
         params,
         IdMmInputLayout::SharedPerToken,
+        false,
+    )
+}
+
+/// Test-only helper: run `_id` matrix-matrix using a routing schedule that a
+/// preceding [`dispatch_id_mm_for_test`] call prepared in the same scratch
+/// buffers.
+///
+/// This isolates the large-prefill schedule-reuse hypothesis without changing
+/// production routing. The preceding call and this call must use the exact
+/// same `ids`, `n_tokens`, `top_k`, `n_experts`, `htpe`, and `hids`. They must
+/// be encoded into the same command encoder (the first call's map0 barrier
+/// orders schedule construction), or the first encoder must have completed.
+/// Gate and up projections may differ in weight buffer and expert stride but
+/// must otherwise have compatible projection shapes.
+///
+/// Violating that contract can read a stale routing schedule. Production
+/// callers must use [`quantized_matmul_id_ggml_pooled_pair`], which owns both
+/// projections and does not expose schedule identity or lifetime.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_id_mm_with_prepared_schedule_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+) -> Result<()> {
+    dispatch_id_mm_with_layout(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        htpe,
+        hids,
+        output,
+        params,
+        IdMmInputLayout::SharedPerToken,
+        true,
     )
 }
 
@@ -1437,6 +1717,7 @@ fn dispatch_id_mm_with_layout(
     output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
     input_layout: IdMmInputLayout,
+    schedule_prepared: bool,
 ) -> Result<()> {
     let qk = params.ggml_type.block_values();
 
@@ -1540,63 +1821,65 @@ fn dispatch_id_mm_with_layout(
     // expert).  Without ne20_1 the top_k=1 caller falls back to mv_id
     // and re-reads each expert's weights once per (seq_len*top_k) row —
     // ~50% of prefill time wasted on weight re-reads.
-    let map0_kernel_name = match params.top_k {
-        1 => "kernel_mul_mm_id_map0_ne20_1",
-        6 => "kernel_mul_mm_id_map0_ne20_6",
-        8 => "kernel_mul_mm_id_map0_ne20_8",
-        other => return Err(MlxError::InvalidArgument(format!(
-            "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
-            other
-        ))),
-    };
-    let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
-
-    let map0_params = GgmlIdMmMap0GpuParams {
-        ne10: params.n.try_into().map_err(|_| {
-            MlxError::InvalidArgument("N out of i32 range".into())
-        })?,
-        ne11: params.top_k as i32,
-        nb11: 0,
-        nb12: 0,
-        ne21: params.n_tokens as i32,
-        ne20: params.top_k as i32,
-        nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
-    };
-
-    let map0_shmem =
-        (params.n_experts as u64) * (params.top_k as u64) * std::mem::size_of::<u16>() as u64;
-    let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
-    let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
-
-    if encoder.is_capturing() {
-        let range = |buffer: &MlxBuffer| {
-            let start = buffer.contents_ptr() as usize;
-            (start, start + buffer.byte_len())
+    if !schedule_prepared {
+        let map0_kernel_name = match params.top_k {
+            1 => "kernel_mul_mm_id_map0_ne20_1",
+            6 => "kernel_mul_mm_id_map0_ne20_6",
+            8 => "kernel_mul_mm_id_map0_ne20_8",
+            other => return Err(MlxError::InvalidArgument(format!(
+                "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
+                other
+            ))),
         };
-        encoder.set_pending_buffer_ranges(
-            vec![range(ids)],
-            vec![range(htpe), range(hids)],
-        );
-    }
-    encoder.encode_threadgroups_with_args_and_shared(
-        map0_pipeline,
-        &[
-            (0, KernelArg::Bytes(as_bytes(&map0_params))),
-            (1, KernelArg::Buffer(ids)),
-            (2, KernelArg::Buffer(htpe)),
-            (3, KernelArg::Buffer(hids)),
-        ],
-        &[(0, map0_shmem)],
-        map0_threadgroups,
-        map0_threads,
-    );
+        let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
 
-    // Memory barrier: the mm kernel reads htpe + hids, map0 wrote them.
-    // Without this, Metal's concurrent-dispatch compute encoder lets the
-    // two dispatches overlap — mm would read zeros (all-expert early-exit).
-    // llama.cpp does the same via `ggml_metal_op_concurrency_reset`
-    // (ggml-metal-ops.cpp:2353).
-    encoder.memory_barrier();
+        let map0_params = GgmlIdMmMap0GpuParams {
+            ne10: params.n.try_into().map_err(|_| {
+                MlxError::InvalidArgument("N out of i32 range".into())
+            })?,
+            ne11: params.top_k as i32,
+            nb11: 0,
+            nb12: 0,
+            ne21: params.n_tokens as i32,
+            ne20: params.top_k as i32,
+            nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
+        };
+
+        let map0_shmem =
+            (params.n_experts as u64) * (params.top_k as u64) * std::mem::size_of::<u16>() as u64;
+        let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
+        let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
+
+        if encoder.is_capturing() {
+            let range = |buffer: &MlxBuffer| {
+                let start = buffer.contents_ptr() as usize;
+                (start, start + buffer.byte_len())
+            };
+            encoder.set_pending_buffer_ranges(
+                vec![range(ids)],
+                vec![range(htpe), range(hids)],
+            );
+        }
+        encoder.encode_threadgroups_with_args_and_shared(
+            map0_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&map0_params))),
+                (1, KernelArg::Buffer(ids)),
+                (2, KernelArg::Buffer(htpe)),
+                (3, KernelArg::Buffer(hids)),
+            ],
+            &[(0, map0_shmem)],
+            map0_threadgroups,
+            map0_threads,
+        );
+
+        // Memory barrier: the mm kernel reads htpe + hids, map0 wrote them.
+        // Without this, Metal's concurrent-dispatch compute encoder lets the
+        // two dispatches overlap — mm would read zeros (all-expert early-exit).
+        // llama.cpp does the same via `ggml_metal_op_concurrency_reset`
+        // (ggml-metal-ops.cpp:2353).
+        encoder.memory_barrier();
+    }
 
     // ---- Stage 2: mm_id — matmul with the per-expert lists ----
     //

@@ -7,11 +7,11 @@ use mlx_native::{
         quantized_matmul_ggml::{
             dispatch_mm_for_test, dispatch_mm_simd_for_test, quantized_matmul_q2_k_batched_mv,
         },
-        quantized_matmul_id_ggml::{dispatch_id_mm_for_test, GgmlIdMmDispatchParams},
     },
     quantized_matmul_ggml, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_ggml_pooled_slotted, DType, GgmlQuantizedMatmulIdParams,
-    GgmlQuantizedMatmulParams, GgmlType, IdMmScratch, KernelRegistry, MlxDevice,
+    quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_slotted, DType,
+    GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlType, IdMmScratch, KernelRegistry,
+    MlxDevice,
 };
 
 const QK_K: usize = 256;
@@ -439,6 +439,9 @@ fn run_expert(tokens: usize, top_k: usize, experts: usize, force_mm: bool) {
     let output_buf = device
         .alloc_buffer(expected.len() * 4, DType::F32, vec![expected.len()])
         .expect("output");
+    let prepared_output_buf = device
+        .alloc_buffer(expected.len() * 4, DType::F32, vec![expected.len()])
+        .expect("prepared output");
     let params = GgmlQuantizedMatmulIdParams {
         n_tokens: tokens as u32,
         top_k: top_k as u32,
@@ -450,34 +453,22 @@ fn run_expert(tokens: usize, top_k: usize, experts: usize, force_mm: bool) {
     };
     let mut encoder = device.command_encoder().expect("encoder");
     if force_mm {
-        let htpe = device
-            .alloc_buffer(experts * 4, DType::U32, vec![experts])
-            .expect("htpe");
-        let hids = device
-            .alloc_buffer(experts * tokens * 4, DType::U32, vec![experts, tokens])
-            .expect("hids");
-        let mm_params = GgmlIdMmDispatchParams {
-            n_tokens: tokens as u32,
-            top_k: top_k as u32,
-            n: n as u32,
-            k: QK_K as u32,
-            n_experts: experts as u32,
-            expert_stride: (n * BLOCK_BYTES) as u64,
-            ggml_type: GgmlType::Q2_K,
-        };
-        dispatch_id_mm_for_test(
+        let mut scratch =
+            IdMmScratch::alloc(&device, experts as u32, tokens as u32).expect("pair scratch");
+        quantized_matmul_id_ggml_pooled_pair(
             &mut encoder,
             &mut registry,
             &device,
             &input_buf,
             &weight_buf,
+            &weight_buf,
             &ids_buf,
-            &htpe,
-            &hids,
             &output_buf,
-            &mm_params,
+            &prepared_output_buf,
+            &mut scratch,
+            &params,
         )
-        .expect("Q2_K expert forced Metal MM_ID");
+        .expect("Q2_K paired expert Metal MM_ID");
     } else {
         quantized_matmul_id_ggml(
             &mut encoder,
@@ -493,6 +484,15 @@ fn run_expert(tokens: usize, top_k: usize, experts: usize, force_mm: bool) {
     }
     encoder.commit_and_wait().expect("GPU completion");
     let actual = output_buf.as_slice::<f32>().expect("output slice");
+    if force_mm {
+        assert_eq!(
+            prepared_output_buf
+                .as_slice::<f32>()
+                .expect("prepared output slice"),
+            actual,
+            "Q2_K prepared schedule must preserve ordinary mm_id output bit-for-bit"
+        );
+    }
     let tolerance = if force_mm || (tokens > 32 && matches!(top_k, 1 | 6 | 8)) {
         1e-2
     } else {

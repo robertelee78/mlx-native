@@ -154,7 +154,7 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL (top_k>1 MoE mat-vec + tensor-mm where implemented)
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
 - **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`
-- **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` / `_id_into` (top_k=1 tensor-mm fast path; `_into` accepts caller-provided output buffer)
+- **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` / `_id_into` (top_k=1 tensor-mm fast path; `_into` accepts caller-provided output buffer); `quantized_matmul_id_ggml_pooled_pair` reuses one large-prefill routing schedule across two compatible expert projections
 - **Dense BF16**: `dense_mm_bf16_tensor`, `dense_gemv_bf16_f32` (M=1 decode)
 - **Dense F16**: `dense_gemm_f16`, `dense_matvec_f16`
 

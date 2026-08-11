@@ -10,11 +10,17 @@
 //! test). Math differs only in FMA reorder within the simdgroup MMA;
 //! silu_mul is element-wise so no cross-element drift.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, non_snake_case)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    non_snake_case
+)]
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_for_test, dispatch_id_mm_fused_gate_up_silu_for_test, GgmlIdMmDispatchParams,
+    dispatch_id_mm_for_test, dispatch_id_mm_fused_gate_up_silu_for_test,
+    dispatch_id_mm_with_prepared_schedule_for_test, GgmlIdMmDispatchParams,
 };
 use mlx_native::{DType, GgmlType, KernelRegistry, MlxDevice};
 
@@ -84,10 +90,8 @@ fn pack_q6_K(values: &[f32]) -> Vec<u8> {
                 let v96 = q6[base + l + 96];
                 ql[ip * 64 + l] = (v0 & 0xF) | ((v64 & 0xF) << 4);
                 ql[ip * 64 + l + 32] = (v32 & 0xF) | ((v96 & 0xF) << 4);
-                qh[ip * 32 + l] = (v0 >> 4)
-                    | ((v32 >> 4) << 2)
-                    | ((v64 >> 4) << 4)
-                    | ((v96 >> 4) << 6);
+                qh[ip * 32 + l] =
+                    (v0 >> 4) | ((v32 >> 4) << 2) | ((v64 >> 4) << 4) | ((v96 >> 4) << 6);
             }
         }
 
@@ -196,10 +200,7 @@ fn run_fused_mm_id_q6_K_parity(
     let mut ids_buf = device
         .alloc_buffer(total_rows * 4, DType::U32, vec![total_rows])
         .unwrap();
-    ids_buf
-        .as_mut_slice::<u32>()
-        .unwrap()
-        .copy_from_slice(&ids);
+    ids_buf.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
 
     let dispatch = GgmlIdMmDispatchParams {
         n_tokens: n_tokens as u32,
@@ -283,6 +284,70 @@ fn run_fused_mm_id_q6_K_parity(
         let g = tmp_gate[i];
         let u = tmp_up[i];
         out_ref[i] = (g / (1.0f32 + (-g).exp())) * u;
+    }
+
+    // ---- Schedule reuse: one map0, two ordinary mm_id projections ----
+    // This preserves the proven tensor/simdgroup kernels and shares only the
+    // device-built expert schedule between gate and up.
+    {
+        let s = htpe_buf.as_mut_slice::<u32>().unwrap();
+        for v in s.iter_mut() {
+            *v = 0;
+        }
+    }
+    let mut prepared_gate_buf = device
+        .alloc_buffer(total_rows * n * 4, DType::F32, vec![total_rows * n])
+        .unwrap();
+    let mut prepared_up_buf = device
+        .alloc_buffer(total_rows * n * 4, DType::F32, vec![total_rows * n])
+        .unwrap();
+    {
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_id_mm_for_test(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &gate_buf,
+            &ids_buf,
+            &mut htpe_buf,
+            &mut hids_buf,
+            &mut prepared_gate_buf,
+            &dispatch,
+        )
+        .unwrap();
+        dispatch_id_mm_with_prepared_schedule_for_test(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_buf,
+            &up_buf,
+            &ids_buf,
+            &mut htpe_buf,
+            &mut hids_buf,
+            &mut prepared_up_buf,
+            &dispatch,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+    }
+    let prepared_gate: &[f32] = prepared_gate_buf.as_slice().unwrap();
+    let prepared_up: &[f32] = prepared_up_buf.as_slice().unwrap();
+    assert_eq!(tmp_gate.len(), prepared_gate.len());
+    assert_eq!(tmp_up.len(), prepared_up.len());
+    for (i, (reference, prepared)) in tmp_gate.iter().zip(prepared_gate).enumerate() {
+        assert_eq!(
+            reference.to_bits(),
+            prepared.to_bits(),
+            "prepared gate schedule changed output at {i}: {reference} vs {prepared}"
+        );
+    }
+    for (i, (reference, prepared)) in tmp_up.iter().zip(prepared_up).enumerate() {
+        assert_eq!(
+            reference.to_bits(),
+            prepared.to_bits(),
+            "prepared up schedule changed output at {i}: {reference} vs {prepared}"
+        );
     }
 
     // ---- Under test: fused single-dispatch ----
