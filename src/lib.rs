@@ -126,9 +126,9 @@ pub use ops::quantized_matmul_id::{
 };
 pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_ggml_pooled_slotted, quantized_matmul_id_swiglu_q4_0,
-    GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, IdMmScratch,
-    MM_ID_ROUTING_THRESHOLD,
+    quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_slotted,
+    quantized_matmul_id_swiglu_q4_0, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams,
+    IdMmScratch, MM_ID_ROUTING_THRESHOLD,
 };
 
 // Re-export weight loading utilities.

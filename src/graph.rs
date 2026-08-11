@@ -1361,6 +1361,37 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode two shared-input expert projections using one prepared routing
+    /// schedule. See [`ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled_pair`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_id_ggml_pooled_pair(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        first_weight: &MlxBuffer,
+        second_weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        first_output: &MlxBuffer,
+        second_output: &MlxBuffer,
+        scratch: &mut ops::quantized_matmul_id_ggml::IdMmScratch,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled_pair(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            first_weight,
+            second_weight,
+            ids,
+            first_output,
+            second_output,
+            scratch,
+            params,
+        )
+    }
+
     /// Slotted-input variant of [`Self::quantized_matmul_id_ggml_pooled`].
     ///
     /// The input is `[n_tokens, top_k, K]`, with one activation row per

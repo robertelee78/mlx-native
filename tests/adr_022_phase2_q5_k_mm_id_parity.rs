@@ -10,11 +10,9 @@
 //! Comparing mm_id output against mv_id at the same shape isolates
 //! mm_id as the only variable.
 
-use mlx_native::ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_for_test, quantized_matmul_id_ggml, GgmlIdMmDispatchParams,
-};
 use mlx_native::{
-    DType, GgmlQuantizedMatmulIdParams, GgmlType, KernelRegistry, MlxDevice,
+    quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled_pair, DType,
+    GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch, KernelRegistry, MlxDevice,
 };
 
 const QK_K: usize = 256;
@@ -63,7 +61,11 @@ fn ref_quantize_q5_k_block(row: &[f32]) -> Vec<u8> {
     }
     let max_scale = sub_d.iter().cloned().fold(0.0_f32, f32::max);
     let max_min = sub_m.iter().cloned().fold(0.0_f32, f32::max);
-    let d_super = if max_scale == 0.0 { 0.0 } else { max_scale / 63.0 };
+    let d_super = if max_scale == 0.0 {
+        0.0
+    } else {
+        max_scale / 63.0
+    };
     let dmin_super = if max_min == 0.0 { 0.0 } else { max_min / 63.0 };
 
     let mut scales_packed = [0u8; 12];
@@ -269,13 +271,13 @@ fn run_q5_k_mm_id_vs_mv_id(
         .unwrap();
         enc.commit_and_wait().unwrap();
         let chunk_slice: &[f32] = chunk_out.as_slice().unwrap();
-        mv_output[tok_off * top_k * n..(tok_off + chunk) * top_k * n]
-            .copy_from_slice(chunk_slice);
+        mv_output[tok_off * top_k * n..(tok_off + chunk) * top_k * n].copy_from_slice(chunk_slice);
         tok_off += chunk;
     }
 
-    // mm_id under test (force via dispatch_id_mm_for_test).
-    let dispatch = GgmlIdMmDispatchParams {
+    // The paired public entry point must preserve the existing Q5_K mm_id
+    // result while reusing one routing schedule for both projections.
+    let dispatch = GgmlQuantizedMatmulIdParams {
         n_tokens: n_tokens as u32,
         top_k: top_k as u32,
         n: n as u32,
@@ -284,20 +286,12 @@ fn run_q5_k_mm_id_vs_mv_id(
         expert_stride: per_expert_bytes as u64,
         ggml_type: GgmlType::Q5_K,
     };
-    let mut htpe = device
-        .alloc_buffer(dispatch.htpe_bytes(), DType::U32, vec![n_experts])
-        .unwrap();
-    let mut hids = device
-        .alloc_buffer(dispatch.hids_bytes(), DType::U32, vec![n_experts, n_tokens])
-        .unwrap();
-    for v in htpe.as_mut_slice::<u32>().unwrap().iter_mut() {
-        *v = 0;
-    }
-    for v in hids.as_mut_slice::<u32>().unwrap().iter_mut() {
-        *v = 0;
-    }
+    let mut scratch = IdMmScratch::alloc(&device, n_experts as u32, n_tokens as u32).unwrap();
 
     let mut mm_output_buf = device
+        .alloc_buffer(total_rows * n * 4, DType::F32, vec![total_rows * n])
+        .unwrap();
+    let prepared_output_buf = device
         .alloc_buffer(total_rows * n * 4, DType::F32, vec![total_rows * n])
         .unwrap();
     for v in mm_output_buf.as_mut_slice::<f32>().unwrap().iter_mut() {
@@ -306,16 +300,17 @@ fn run_q5_k_mm_id_vs_mv_id(
 
     {
         let mut enc = device.command_encoder().unwrap();
-        dispatch_id_mm_for_test(
+        quantized_matmul_id_ggml_pooled_pair(
             &mut enc,
             &mut registry,
             &device,
             &input_buf,
             &weight_buf,
+            &weight_buf,
             &ids_buf,
-            &mut htpe,
-            &mut hids,
             &mut mm_output_buf,
+            &prepared_output_buf,
+            &mut scratch,
             &dispatch,
         )
         .unwrap();
@@ -323,6 +318,11 @@ fn run_q5_k_mm_id_vs_mv_id(
     }
 
     let mm_out: &[f32] = mm_output_buf.as_slice().unwrap();
+    assert_eq!(
+        prepared_output_buf.as_slice::<f32>().unwrap(),
+        mm_out,
+        "Q5_K prepared schedule must preserve ordinary mm_id output bit-for-bit"
+    );
     eprintln!(
         "[adr-022 phase-2 Q5_K mm_id parity] first GPU mm_id: {:?}",
         &mm_out[..mm_out.len().min(8)]
