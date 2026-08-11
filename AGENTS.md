@@ -7,7 +7,7 @@ It owns GPU buffers, command encoding, kernel registration, GGUF-backed weight
 views, and reusable Metal operations. It is not a TypeScript application and
 does not use Node.js for its build or runtime.
 
-The crate targets Rust 1.81 or newer. `Cargo.toml`, `Cargo.lock`, the Rust
+The crate targets Rust 1.82 or newer. `Cargo.toml`, `Cargo.lock`, the Rust
 source, Metal shaders, tests, and checked-in technical notes are authoritative.
 
 Start with:

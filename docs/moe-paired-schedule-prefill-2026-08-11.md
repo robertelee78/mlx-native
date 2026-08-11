@@ -2,10 +2,12 @@
 
 Date: 2026-08-11
 
-Status: implementation candidate; focused Metal parity and microbenchmark pass
-on implementation commit `a496053a5b8fca1bf27b405c78cff8f771396069`
-rebased onto public mlx-native 0.10.7. PR CI, release packaging, and downstream
-hf2q integration remain pending.
+Status: accepted family-neutral primitive included in the mlx-native 0.10.8
+release candidate. Focused Metal parity and microbenchmark passed on
+implementation commit `a496053a5b8fca1bf27b405c78cff8f771396069`,
+rebased onto public mlx-native 0.10.7 and merged by PR #5. Public availability
+is authoritative only after the exact 0.10.8 registry and GitHub bytes verify;
+downstream hf2q integration and end-to-end acceptance remain pending.
 
 ## Decision
 

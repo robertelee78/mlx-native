@@ -20,9 +20,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.96.0 --profile minimal
       - name: Training shader compatibility
-        run: cargo +stable test --locked --test test_flash_attn_train -- --test-threads=1
+        run: cargo +1.96.0 test --locked --test test_flash_attn_train -- --test-threads=1
 
   rust-metal:
     runs-on: macos-15
@@ -32,24 +32,28 @@ jobs:
         with:
           persist-credentials: false
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup toolchain install 1.82.0 --profile minimal
+      - name: Minimum supported Rust
+        run: cargo +1.82.0 check --locked --lib
       - name: Security audit
         run: |
-          cargo install cargo-audit --locked --version 0.22.2
-          cargo audit
+          cargo +1.96.0 install cargo-audit --locked --version 0.22.2
+          cargo +1.96.0 audit
       - name: Test
-        run: cargo +stable test --locked -- --test-threads=1
+        run: cargo +1.96.0 test --locked -- --test-threads=1
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          cargo +stable package --locked
+          cargo +1.96.0 package --locked
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           crate="target/package/mlx-native-${version}.crate"
           unpacked="$RUNNER_TEMP/packed-crate"
           mkdir -p "$unpacked"
           tar -xzf "$crate" -C "$unpacked"
-          cargo +stable test --locked \
+          cargo +1.96.0 test --locked \
             --manifest-path "$unpacked/mlx-native-${version}/Cargo.toml" \
             --test command_buffer_autorelease \
             --test test_cb_label_propagation \
