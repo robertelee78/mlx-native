@@ -24,14 +24,14 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify immutable release identity
         shell: bash
@@ -44,11 +44,15 @@ jobs:
           test "$actual_sha" = "$main_sha"
           actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$actual_version" = "$EXPECTED_VERSION"
-          test -n "$CARGO_REGISTRY_TOKEN"
           git diff --exit-code
 
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
 
       - name: Test exact source
         run: cargo +stable test --locked --all-features -- --test-threads=1
@@ -75,9 +79,12 @@ jobs:
             -- --test-threads=1
 
       - name: Publish exact package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$CARGO_REGISTRY_TOKEN"
           published="$RUNNER_TEMP/mlx-native-${EXPECTED_VERSION}-published.crate"
           if curl --fail --location --silent --show-error \
             "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
@@ -126,12 +133,47 @@ jobs:
         run: |
           set -euo pipefail
           tag="v${EXPECTED_VERSION}"
-          git tag "$tag" "$EXPECTED_SHA"
-          git push origin "$tag"
-          gh release create "$tag" \
+          if tag_sha=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" \
+            --jq '.object.sha' 2>/dev/null); then
+            test "$tag_sha" = "$EXPECTED_SHA"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${tag}" \
+              -f sha="$EXPECTED_SHA" >/dev/null
+          fi
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --target "$EXPECTED_SHA" \
+              --title "mlx-native ${EXPECTED_VERSION}" \
+              --generate-notes \
+              --verify-tag
+          fi
+          gh release upload "$tag" \
             "target/package/mlx-native-${EXPECTED_VERSION}.crate" \
             "$RUNNER_TEMP/release-crate.sha256" \
-            --target "$EXPECTED_SHA" \
-            --title "mlx-native ${EXPECTED_VERSION}" \
-            --generate-notes \
-            --verify-tag
+            --clobber
+
+      - name: Verify GitHub release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(awk '{print $1}' "$RUNNER_TEMP/release-crate.sha256")
+          tag="v${EXPECTED_VERSION}"
+          downloaded_dir="$RUNNER_TEMP/github-release"
+          mkdir -p "$downloaded_dir"
+          gh release download "$tag" \
+            --pattern "mlx-native-${EXPECTED_VERSION}.crate" \
+            --pattern "release-crate.sha256" \
+            --dir "$downloaded_dir"
+          actual=$(shasum -a 256 \
+            "$downloaded_dir/mlx-native-${EXPECTED_VERSION}.crate" | awk '{print $1}')
+          test "$actual" = "$expected"
+          checksum="$downloaded_dir/release-crate.sha256"
+          test "$(grep -cve '^[[:space:]]*$' "$checksum")" -eq 1
+          test "$(awk 'NF {print $1}' "$checksum")" = "$expected"
+          test "$(awk 'NF {print $2}' "$checksum")" = \
+            "target/package/mlx-native-${EXPECTED_VERSION}.crate"

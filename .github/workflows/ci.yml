@@ -16,7 +16,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Training shader compatibility
@@ -24,11 +26,17 @@ jobs:
 
   rust-metal:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
       - name: Test
         run: cargo +stable test --locked -- --test-threads=1
       - name: Package

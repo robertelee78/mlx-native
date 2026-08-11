@@ -19,6 +19,7 @@
 //! records a barrier sentinel.  Call `take_capture()` to extract the recorded
 //! graph for later replay via `ComputeGraph::encode_sequential()`.
 
+use std::cell::Cell;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
@@ -713,18 +714,31 @@ fn issue_metal_buffer_barrier(encoder: &ComputeCommandEncoderRef) {
     }
 }
 
-/// Owned Metal command buffer whose Rust-owned Objective-C release is scoped.
+/// Owned Metal command buffer whose label-sensitive Objective-C release is scoped.
 ///
 /// Metal label setters copy/retain their NSString values until the labeled
 /// owner is destroyed. Pooling only the setter drains the input temporary but
 /// does not scope autorelease work triggered while releasing the labeled
-/// command buffer. Long-lived pool-less Rust workers therefore need the owner
-/// release itself inside a narrow autorelease pool as well.
-struct PooledCommandBuffer(ManuallyDrop<CommandBuffer>);
+/// command buffer. Long-lived pool-less Rust workers therefore need labeled or
+/// externally exposed owners to release inside a narrow autorelease pool. A
+/// command buffer that stays on mlx-native's unlabeled path has no copied
+/// NSString owner and can take the direct release path.
+struct PooledCommandBuffer {
+    command_buffer: ManuallyDrop<CommandBuffer>,
+    pool_drop_required: Cell<bool>,
+}
 
 impl PooledCommandBuffer {
     fn new(command_buffer: CommandBuffer) -> Self {
-        Self(ManuallyDrop::new(command_buffer))
+        Self {
+            command_buffer: ManuallyDrop::new(command_buffer),
+            pool_drop_required: Cell::new(false),
+        }
+    }
+
+    #[inline]
+    fn require_pooled_drop(&self) {
+        self.pool_drop_required.set(true);
     }
 }
 
@@ -732,15 +746,24 @@ impl Deref for PooledCommandBuffer {
     type Target = CommandBuffer;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.command_buffer
     }
 }
 
 impl Drop for PooledCommandBuffer {
     fn drop(&mut self) {
-        objc::rc::autoreleasepool(|| unsafe {
-            ManuallyDrop::drop(&mut self.0);
-        });
+        if self.pool_drop_required.get() {
+            objc::rc::autoreleasepool(|| unsafe {
+                ManuallyDrop::drop(&mut self.command_buffer);
+            });
+        } else {
+            // Factory autoreleases were already drained at construction. An
+            // unlabeled, non-escaped owner has no copied NSString lifetime to
+            // discharge, so avoid a high-rate empty pool boundary.
+            unsafe {
+                ManuallyDrop::drop(&mut self.command_buffer);
+            }
+        }
     }
 }
 
@@ -2510,6 +2533,7 @@ impl CommandEncoder {
         if label.is_empty() {
             return;
         }
+        self.cmd_buf.require_pooled_drop();
         // metal-rs creates an autoreleased NSString for every `set_label`
         // call. Both Metal properties are `copy`, so this pool drains the
         // setter inputs only. The copied CB label is bounded by
@@ -2625,8 +2649,12 @@ impl CommandEncoder {
     }
 
     /// Borrow the underlying Metal command buffer.
+    ///
+    /// The caller can attach Objective-C properties (including labels), so
+    /// conservatively scope this owner's eventual release.
     #[inline]
     pub fn metal_command_buffer(&self) -> &CommandBuffer {
+        self.cmd_buf.require_pooled_drop();
         &self.cmd_buf
     }
 

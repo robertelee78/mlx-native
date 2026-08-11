@@ -129,8 +129,9 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 | `SafetensorsFile` | Safetensors mmap + tensor loading |
 
 Hot-path command-buffer and compute-encoder factories are scoped for pool-less
-long-lived Rust workers. Command-buffer destruction is likewise scoped, and
-compute-encoder labels are cleared immediately after `endEncoding` captures
+long-lived Rust workers. Labeled or externally exposed command buffers scope
+their destruction; unlabeled internal buffers take the direct release path.
+Compute-encoder labels are cleared immediately after `endEncoding` captures
 their trace row. The isolated regression proves bounded command-buffer,
 CFString, and autorelease-pool populations across repeated labeled sync and
 async waves.

@@ -1,6 +1,6 @@
 # Metal command-buffer and label lifetime
 
-Status: accepted for the `0.10.6` release candidate; downstream exact-artifact
+Status: accepted for the `0.10.7` release candidate; downstream exact-artifact
 hardware validation remains required.
 
 ## Failure
@@ -35,8 +35,12 @@ The Rust-owned or explicit retain occurs inside the pool and survives its
 drain. Temporary Objective-C factory claims do not escape. Metal's label
 properties copy their values during the setter, so draining only the input
 temporary is insufficient: the copied label lives until its Metal owner
-releases or replaces it. `PooledCommandBuffer` therefore scopes every
-Rust-owned command-buffer destruction, including rotation, and
+releases or replaces it. `PooledCommandBuffer` therefore scopes destruction
+after a label is attached or the raw command buffer is exposed to a caller.
+Internal unlabeled command buffers have no copied NSString owner and use direct
+release after their factory autorelease has already been drained. This avoids
+an empty autorelease-pool boundary on the high-rate unlabeled graph path while
+preserving the conservative boundary for public escape hatches. In both cases,
 `end_active_encoder` clears the compute-encoder label with `setLabel:nil`
 immediately after `endEncoding` captures the trace row and before releasing the
 explicit retain. This preserves command-buffer and encoder attribution while
@@ -79,6 +83,17 @@ arm retained exactly one per commit. Clearing the encoder label after
 `endEncoding` made all six production/control arms flat across both 10,000-CB
 waves while the unpooled negative control continued to fail.
 
+The initial `0.10.6` implementation conservatively pooled every Rust-owned
+command-buffer destruction. A same-host downstream A/B on the 100.05 GiB
+DeepSeek-V4 artifact showed that this penalized its unlabeled GraphSession path:
+the exact four-agent 6,685-token gate exceeded the unchanged 55-second client
+bound, while the label-sensitive `0.10.7` candidate completed all four cold
+requests in 50--53 seconds and then reused exactly 6,677 tokens for cached,
+automatic-tool, SSE-tool, and tool-result turns. The same candidate's six-mode
+heap test reported zero live command buffers and zero CFString or pool-page
+growth at all three checkpoints, including `unlabeled-async` and both public
+label escape controls.
+
 A fresh Metal System Trace of the final candidate shape then recorded all
 three semantic paths with identical `cmdbuffer-label` and `encoder-label`
 values: synchronous `phase.iter16_smoke_token`, asynchronous
@@ -107,7 +122,7 @@ objects, versus 37,999 before. The subsequent agent gate exposed a separate
 deterministic CFString rise from 6,658 to 54,243 while labels remained outside
 a pool. Published `0.10.5` reproduced essentially the same slope
 (6,850 → 54,336 → 101,820), proving that setter-local pools alone did not close
-it. The `0.10.6` candidate's model-free heap gate closes both label-owner slopes;
+it. The `0.10.7` candidate's model-free heap gate closes both label-owner slopes;
 registry publication and downstream exact-pin Qwen/Gemma/DeepSeek hardware
 gates remain separate authority.
 
