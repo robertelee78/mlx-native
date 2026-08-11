@@ -2,8 +2,10 @@
 
 Date: 2026-08-11
 
-Status: implementation candidate; focused Metal parity and microbenchmark pass,
-exact-commit packaging and downstream hf2q integration remain pending.
+Status: implementation candidate; focused Metal parity and microbenchmark pass
+on implementation commit `a496053a5b8fca1bf27b405c78cff8f771396069`
+rebased onto public mlx-native 0.10.7. PR CI, release packaging, and downstream
+hf2q integration remain pending.
 
 ## Decision
 
@@ -58,14 +60,14 @@ reuse and projection overlap.
 
 | Family shape | Quant | Tokens | Independent | Paired | Speedup |
 |---|---:|---:|---:|---:|---:|
-| Qwen3.6, K=2048, N=512, 256 experts, top-k 8 | Q5_K | 64 | 1.176 ms | 1.099 ms | 1.0699x |
-| same | Q5_K | 256 | 1.613 ms | 1.542 ms | 1.0457x |
-| same | Q5_K | 1024 | 1.831 ms | 1.751 ms | 1.0456x |
-| same | Q5_K | 2048 | 3.204 ms | 3.067 ms | 1.0445x |
-| DeepSeek-V4, K=4096, N=2048, 256 experts, top-k 6 | Q2_K | 64 | 4.346 ms | 4.209 ms | 1.0326x |
-| same | Q2_K | 256 | 7.643 ms | 7.558 ms | 1.0112x |
-| same | Q2_K | 1024 | 8.527 ms | 8.446 ms | 1.0096x |
-| same | Q2_K | 2048 | 16.289 ms | 16.132 ms | 1.0098x |
+| Qwen3.6, K=2048, N=512, 256 experts, top-k 8 | Q5_K | 64 | 1.203 ms | 1.109 ms | 1.0847x |
+| same | Q5_K | 256 | 1.609 ms | 1.549 ms | 1.0387x |
+| same | Q5_K | 1024 | 1.829 ms | 1.753 ms | 1.0432x |
+| same | Q5_K | 2048 | 3.215 ms | 3.059 ms | 1.0511x |
+| DeepSeek-V4, K=4096, N=2048, 256 experts, top-k 6 | Q2_K | 64 | 4.332 ms | 4.233 ms | 1.0233x |
+| same | Q2_K | 256 | 7.648 ms | 7.568 ms | 1.0106x |
+| same | Q2_K | 1024 | 8.524 ms | 8.451 ms | 1.0086x |
+| same | Q2_K | 2048 | 16.282 ms | 16.139 ms | 1.0088x |
 
 The focused result is positive at every tested prefill size, with a larger
 relative benefit for the smaller Qwen projection. It is not an end-to-end
