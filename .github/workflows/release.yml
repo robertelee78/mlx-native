@@ -48,7 +48,7 @@ jobs:
 
       - name: Toolchain
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install 1.96.0 --profile minimal
           rustup toolchain install 1.82.0 --profile minimal
 
       - name: Minimum supported Rust
@@ -56,17 +56,17 @@ jobs:
 
       - name: Security audit
         run: |
-          cargo install cargo-audit --locked --version 0.22.2
-          cargo audit
+          cargo +1.96.0 install cargo-audit --locked --version 0.22.2
+          cargo +1.96.0 audit
 
       - name: Test exact source
-        run: cargo +stable test --locked --all-features -- --test-threads=1
+        run: cargo +1.96.0 test --locked --all-features -- --test-threads=1
 
       - name: Package exact source
         shell: bash
         run: |
           set -euo pipefail
-          cargo +stable package --locked
+          cargo +1.96.0 package --locked
           crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
           test -s "$crate"
           shasum -a 256 "$crate" | tee "$RUNNER_TEMP/release-crate.sha256"
@@ -79,7 +79,7 @@ jobs:
           unpacked="$RUNNER_TEMP/packed-crate"
           mkdir -p "$unpacked"
           tar -xzf "$crate" -C "$unpacked"
-          cargo +stable test --locked --all-features \
+          cargo +1.96.0 test --locked --all-features \
             --manifest-path "$unpacked/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
             -- --test-threads=1
 
@@ -96,7 +96,7 @@ jobs:
             --output "$published"; then
             echo "mlx-native ${EXPECTED_VERSION} is already published; verifying exact bytes"
           else
-            cargo +stable publish --locked --token "$CARGO_REGISTRY_TOKEN"
+            cargo +1.96.0 publish --locked --token "$CARGO_REGISTRY_TOKEN"
           fi
 
       - name: Verify crates.io bytes
@@ -125,7 +125,7 @@ jobs:
           unpacked="$RUNNER_TEMP/registry-crate"
           mkdir -p "$unpacked"
           tar -xzf "$downloaded" -C "$unpacked"
-          cargo +stable test --locked \
+          cargo +1.96.0 test --locked \
             --manifest-path "$unpacked/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
             --test command_buffer_autorelease \
             --test test_cb_label_propagation \
