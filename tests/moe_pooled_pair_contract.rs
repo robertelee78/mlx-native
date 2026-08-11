@@ -103,6 +103,54 @@ fn pooled_pair_rejects_overlapping_outputs_and_decode_sized_work() {
         other => panic!("pair output/read alias must fail before encoding: {other:?}"),
     }
 
+    let mut aliased_scratch =
+        IdMmScratch::alloc(&device, N_EXPERTS, N_TOKENS).expect("aliased routing scratch");
+    aliased_scratch.htpe = input.clone();
+    let mut encoder = device
+        .command_encoder()
+        .expect("scratch/read-alias encoder");
+    match quantized_matmul_id_ggml_pooled_pair(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &weight,
+        &weight,
+        &ids,
+        &first_output,
+        &second_output,
+        &mut aliased_scratch,
+        &params(N_TOKENS),
+    ) {
+        Err(MlxError::InvalidArgument(message)) => {
+            assert!(message.contains("scratch range must not overlap input"));
+        }
+        other => panic!("pair scratch/read alias must fail before encoding: {other:?}"),
+    }
+
+    let mut overlapping_scratch =
+        IdMmScratch::alloc(&device, N_EXPERTS, N_TOKENS).expect("overlapping routing scratch");
+    overlapping_scratch.htpe = overlapping_scratch.hids.clone();
+    let mut encoder = device.command_encoder().expect("scratch-overlap encoder");
+    match quantized_matmul_id_ggml_pooled_pair(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &weight,
+        &weight,
+        &ids,
+        &first_output,
+        &second_output,
+        &mut overlapping_scratch,
+        &params(N_TOKENS),
+    ) {
+        Err(MlxError::InvalidArgument(message)) => {
+            assert!(message.contains("scratch ranges must not overlap"));
+        }
+        other => panic!("overlapping pair scratch must fail before encoding: {other:?}"),
+    }
+
     let mut encoder = device.command_encoder().expect("decode encoder");
     match quantized_matmul_id_ggml_pooled_pair(
         &mut encoder,

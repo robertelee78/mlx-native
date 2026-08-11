@@ -85,6 +85,8 @@ tokens-per-second claim.
   and matrix shape. Distinct weights and outputs are passed atomically.
 - Output write ranges must not overlap. Weight/output extents are validated
   before the first projection is encoded.
+- The caller-owned routing scratch must not overlap itself or any input, ids,
+  or weight read range; malformed replacement buffers fail before encoding.
 - Scratch capacity and all existing `mm_id` validation remain load-bearing.
 
 ## Remaining acceptance work

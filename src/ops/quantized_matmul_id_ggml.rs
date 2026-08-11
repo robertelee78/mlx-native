@@ -526,6 +526,25 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
         )));
     }
     scratch.check_capacity(params.n_experts, params.n_tokens)?;
+    let expected_htpe_bytes = (params.n_experts as usize)
+        .checked_mul(DType::U32.size_of())
+        .ok_or_else(|| MlxError::InvalidArgument("pair htpe byte count overflow".into()))?;
+    let expected_hids_bytes = (params.n_experts as usize)
+        .checked_mul(params.n_tokens as usize)
+        .and_then(|elements| elements.checked_mul(DType::U32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("pair hids byte count overflow".into()))?;
+    for (name, buffer, expected) in [
+        ("htpe", &scratch.htpe, expected_htpe_bytes),
+        ("hids", &scratch.hids, expected_hids_bytes),
+    ] {
+        if buffer.data_byte_len() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {name} scratch buffer too small: expected {} bytes, got {}",
+                expected,
+                buffer.data_byte_len(),
+            )));
+        }
+    }
 
     let range = |buffer: &MlxBuffer, extent: usize| {
         let start = (buffer.contents_ptr() as usize)
@@ -542,13 +561,38 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
             "quantized_matmul_id_ggml_pooled_pair output ranges must not overlap".into(),
         ));
     }
-    let read_ranges = [
+    let scratch_ranges = [
+        ("htpe", range(&scratch.htpe, expected_htpe_bytes)),
+        ("hids", range(&scratch.hids, expected_hids_bytes)),
+    ];
+    if overlaps(scratch_ranges[0].1, scratch_ranges[1].1) {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_id_ggml_pooled_pair scratch ranges must not overlap".into(),
+        ));
+    }
+    let immutable_read_ranges = [
         ("input", range(input, expected_input_bytes)),
         ("first weight", range(first_weight, total_weight_bytes)),
         ("second weight", range(second_weight, total_weight_bytes)),
         ("ids", range(ids, expected_ids_bytes)),
-        ("htpe scratch", range(&scratch.htpe, scratch.htpe.data_byte_len())),
-        ("hids scratch", range(&scratch.hids, scratch.hids.data_byte_len())),
+    ];
+    for (scratch_name, scratch_range) in scratch_ranges {
+        if let Some((read_name, _)) = immutable_read_ranges
+            .iter()
+            .find(|(_, read_range)| overlaps(scratch_range, *read_range))
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "quantized_matmul_id_ggml_pooled_pair {scratch_name} scratch range must not overlap {read_name}",
+            )));
+        }
+    }
+    let read_ranges = [
+        immutable_read_ranges[0],
+        immutable_read_ranges[1],
+        immutable_read_ranges[2],
+        immutable_read_ranges[3],
+        ("htpe scratch", scratch_ranges[0].1),
+        ("hids scratch", scratch_ranges[1].1),
     ];
     for (output_name, output_range) in [
         ("first", first_output_range),
