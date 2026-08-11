@@ -47,7 +47,12 @@ jobs:
           git diff --exit-code
 
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install 1.82.0 --profile minimal
+
+      - name: Minimum supported Rust
+        run: cargo +1.82.0 check --locked --lib
 
       - name: Security audit
         run: |
