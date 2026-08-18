@@ -1,8 +1,9 @@
 # GQA-cooperative TQ-HB decode attention
 
 Date: 2026-08-17; evidence refreshed 2026-08-18
-Status: Q2 isolated-kernel candidate only; merge, publication, and downstream
-hf2q end-to-end gates are pending
+Status: Q2 primitive merged on `main` and included in the 0.10.9 release
+candidate; registry publication and downstream hf2q end-to-end gates are
+pending
 
 ## Problem and hypothesis
 
@@ -89,8 +90,8 @@ process-to-process sustained-load dispersion was not measured.
 
 Before enabling this primitive in hf2q:
 
-1. Merge the candidate, publish and byte-verify a new `mlx-native` crate; the
-   current open PR and a local Cargo patch are not landed results.
+1. Publish and byte-verify `mlx-native` 0.10.9. The merged source is not yet a
+   consumable hf2q dependency until the immutable registry artifact verifies.
 2. Run Qwen3.8-27B at short and approximately 105K context with identical
    prompt, sampling, cache, and artifact settings.
 3. Require exact greedy output/tool semantics, at least 15% end-to-end decode
