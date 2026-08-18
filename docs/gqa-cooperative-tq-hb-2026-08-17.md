@@ -1,9 +1,9 @@
 # GQA-cooperative TQ-HB decode attention
 
 Date: 2026-08-17; evidence refreshed 2026-08-18
-Status: Q2 primitive published in `mlx-native` 0.10.9; register-resident-Q
-follow-up has passed isolated and downstream spike gates but is not yet
-published
+Status: register-resident-Q follow-up merged on `main` and included in the
+0.10.10 release candidate; registry publication and downstream exact-artifact
+gates are pending
 
 ## Problem and hypothesis
 
