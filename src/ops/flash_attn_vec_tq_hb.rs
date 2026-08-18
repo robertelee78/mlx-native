@@ -34,10 +34,6 @@ pub fn register(registry: &mut KernelRegistry) {
         "flash_attn_vec_tq_hb_gqa_q2_dk256",
         FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
     );
-    registry.register_source(
-        "flash_attn_vec_tq_hb_gqa_q3_dk256",
-        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
-    );
     // ADR-040 M-SPEED-LC: batched multi-sequence variant (same source file —
     // the batched kernel template is appended to flash_attn_vec_tq_hb.metal).
     registry.register_source(
@@ -58,23 +54,46 @@ pub fn register(registry: &mut KernelRegistry) {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum GqaTile {
     Q2,
-    Q3,
 }
 
 impl GqaTile {
     fn width(self) -> u32 {
         match self {
             Self::Q2 => 2,
-            Self::Q3 => 3,
         }
     }
 
     fn kernel_name(self) -> &'static str {
         match self {
             Self::Q2 => "flash_attn_vec_tq_hb_gqa_q2_dk256",
-            Self::Q3 => "flash_attn_vec_tq_hb_gqa_q3_dk256",
         }
     }
+}
+
+/// Compile the selected GQA-specialized pipeline before the first decode.
+///
+/// TQ-HB uses an integer Metal function constant for its codebook width, so
+/// the generic bool-only registry prewarm API cannot compile this variant.
+/// Model runtimes should call this during their ordinary warmup window when
+/// they intend to select the cooperative kernel only at longer KV lengths.
+pub fn prewarm_gqa_tile(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    codebook_bits: u32,
+    tile: GqaTile,
+) -> Result<()> {
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "prewarm_gqa_tile: codebook_bits must be 5, 6, or 8, got {codebook_bits}"
+        )));
+    }
+    registry.get_pipeline_with_constants(
+        tile.kernel_name(),
+        device,
+        &[],
+        &[(50usize, codebook_bits as i32)],
+    )?;
+    Ok(())
 }
 
 /// Parameters for the HB TQ flash attention vector kernel.

@@ -169,9 +169,7 @@ fn run_case(kv_seq_len: u32, nsg: u32, codebook_bits: u32, tile: GqaTile) {
 fn qwen38_q2_matches_legacy_at_boundaries_and_nsg_modes() {
     for &(kv_seq_len, nsg) in &[(1, 1), (31, 1), (32, 1), (33, 1), (128, 4)] {
         for codebook_bits in [5, 6, 8] {
-            for tile in [GqaTile::Q2, GqaTile::Q3] {
-                run_case(kv_seq_len, nsg, codebook_bits, tile);
-            }
+            run_case(kv_seq_len, nsg, codebook_bits, GqaTile::Q2);
         }
     }
 }
@@ -180,7 +178,6 @@ fn qwen38_q2_matches_legacy_at_boundaries_and_nsg_modes() {
 enum Variant {
     Legacy,
     Q2,
-    Q3,
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -253,7 +250,7 @@ fn bench_qwen38_gqa_tiles() {
                     &tmp,
                     &params,
                 ),
-                Variant::Q2 | Variant::Q3 => flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_gqa(
+                Variant::Q2 => flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_gqa(
                     &mut encoder,
                     &mut registry,
                     &device,
@@ -265,11 +262,7 @@ fn bench_qwen38_gqa_tiles() {
                     &output,
                     &tmp,
                     &params,
-                    match variant {
-                        Variant::Q2 => GqaTile::Q2,
-                        Variant::Q3 => GqaTile::Q3,
-                        Variant::Legacy => unreachable!(),
-                    },
+                    GqaTile::Q2,
                 ),
             }
             .expect("benchmark dispatch");
@@ -280,18 +273,18 @@ fn bench_qwen38_gqa_tiles() {
             )
         };
 
-        for variant in [Variant::Legacy, Variant::Q2, Variant::Q3] {
+        for variant in [Variant::Legacy, Variant::Q2] {
             for _ in 0..8 {
                 let _ = run(variant);
             }
         }
 
-        let mut gpu = [Vec::new(), Vec::new(), Vec::new()];
-        let mut wall = [Vec::new(), Vec::new(), Vec::new()];
+        let mut gpu = [Vec::new(), Vec::new()];
+        let mut wall = [Vec::new(), Vec::new()];
         for block in 0..7 {
-            let variants = [Variant::Legacy, Variant::Q2, Variant::Q3];
-            for offset in 0..3 {
-                let index = (block + offset) % 3;
+            let variants = [Variant::Legacy, Variant::Q2];
+            for offset in 0..2 {
+                let index = (block + offset) % 2;
                 let (gpu_ms, wall_ms) = run(variants[index]);
                 gpu[index].push(gpu_ms);
                 wall[index].push(wall_ms);
@@ -299,14 +292,11 @@ fn bench_qwen38_gqa_tiles() {
         }
         let legacy_gpu = median(&mut gpu[0]);
         let q2_gpu = median(&mut gpu[1]);
-        let q3_gpu = median(&mut gpu[2]);
         let legacy_wall = median(&mut wall[0]);
         let q2_wall = median(&mut wall[1]);
-        let q3_wall = median(&mut wall[2]);
         eprintln!(
-            "GQA_BENCH kL={kv_seq_len} legacy_gpu_ms={legacy_gpu:.4} q2_gpu_ms={q2_gpu:.4} q3_gpu_ms={q3_gpu:.4} q2_gpu_speedup={:.3} q3_gpu_speedup={:.3} legacy_wall_ms={legacy_wall:.4} q2_wall_ms={q2_wall:.4} q3_wall_ms={q3_wall:.4}",
+            "GQA_BENCH kL={kv_seq_len} legacy_gpu_ms={legacy_gpu:.4} q2_gpu_ms={q2_gpu:.4} q2_gpu_speedup={:.3} legacy_wall_ms={legacy_wall:.4} q2_wall_ms={q2_wall:.4}",
             legacy_gpu / q2_gpu,
-            legacy_gpu / q3_gpu,
         );
     }
 }

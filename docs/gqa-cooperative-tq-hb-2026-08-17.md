@@ -18,12 +18,14 @@ K/V load and codebook lookup are then shared across the query-head tile.
 ## Implemented primitive
 
 `flash_attn_vec_tq_hb_gqa` is an explicit, family-neutral D=256 primitive with
-two variants: `GqaTile::Q2` and `GqaTile::Q3`. The first version accepts only
+the measured `GqaTile::Q2` variant. The first version accepts only
 full, unmasked attention with caller-rotated Q, `ring_start=0`, and
 `softcap=0`. Callers outside that contract must retain the scalar kernel.
 
-At NSG=4, Q2 uses 11,264 bytes of threadgroup memory and Q3 uses 16,896 bytes.
-Q3 saves more logical K/V work but reduces occupancy more sharply.
+At NSG=4, Q2 uses 11,264 bytes of threadgroup memory. The spike also measured
+Q3 at 16,896 bytes, but Q3's occupancy cost outweighed its additional reuse;
+the rejected Q3 specialization is retained only in the spike commit, not the
+landing diff.
 
 ## Correctness evidence
 
@@ -31,7 +33,7 @@ The focused Metal test compares every output `f32::to_bits()` against the
 scalar production kernel for Qwen3.8 geometry Hq=24, Hkv=4, D=256 across:
 
 - TQ codebook bits 5, 6, and 8;
-- Q2 and Q3;
+- the landing Q2 kernel (the isolated spike also covered Q3);
 - NSG 1 and 4;
 - sequence lengths 1, 31, 32, 33, and 128.
 

@@ -987,13 +987,8 @@ kernel void flash_attn_vec_tq_hb_gqa_impl(
 }
 
 typedef decltype(flash_attn_vec_tq_hb_gqa_impl<2>) flash_attn_vec_tq_hb_gqa_q2_t;
-typedef decltype(flash_attn_vec_tq_hb_gqa_impl<3>) flash_attn_vec_tq_hb_gqa_q3_t;
-
 template [[host_name("flash_attn_vec_tq_hb_gqa_q2_dk256")]]
 kernel flash_attn_vec_tq_hb_gqa_q2_t flash_attn_vec_tq_hb_gqa_impl<2>;
-
-template [[host_name("flash_attn_vec_tq_hb_gqa_q3_dk256")]]
-kernel flash_attn_vec_tq_hb_gqa_q3_t flash_attn_vec_tq_hb_gqa_impl<3>;
 
 // ---------------------------------------------------------------------------
 // ADR-040 M-SPEED-LC — batched-decode params: adds n_queries.
