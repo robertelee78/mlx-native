@@ -158,6 +158,16 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - **Dense BF16**: `dense_mm_bf16_tensor`, `dense_gemv_bf16_f32` (M=1 decode)
 - **Dense F16**: `dense_gemm_f16`, `dense_matvec_f16`
 
+Before an artifact producer or model graph claims a packed-affine route, query
+`packed_affine_capability(PackedAffineRequest)`. The versioned, serializable
+result distinguishes executable scalar fallbacks from routes specialized for
+the requested decode-QMV, prompt-QMM, width-N, or embedding-gather regime. It
+reports dense row-wise SIMD for supported 4/8-bit layouts, the 6-bit dense
+scalar fallback, the BF16 expert-offset route, the F32 expert-ID route, and F32
+4/6-bit embedding gathers. Unsupported requests include a typed rejection code.
+This is an execution contract, not a throughput estimate—measure the exact
+shape on the target Apple Silicon device.
+
 ### Normalization
 - `rms_norm` — RMS normalization (f32 + triple-output variants)
 - `l2_norm` — L2 normalization

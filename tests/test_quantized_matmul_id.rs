@@ -2,7 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use mlx_native::ops::quantized_matmul_id::{quantized_matmul_id, QuantizedMatmulIdParams};
+use mlx_native::ops::quantized_matmul_id::{
+    quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
+};
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 
 fn setup() -> (MlxDevice, KernelRegistry) {
@@ -377,4 +379,82 @@ fn test_quantized_matmul_id_unsupported_bits_error() {
         },
     );
     assert!(result.is_err(), "bits=3 should error");
+}
+
+#[test]
+fn test_quantized_matmul_id_into_rejects_wrong_io_dtypes() {
+    let (device, mut registry) = setup();
+    let f32_buf = device
+        .alloc_buffer(256, DType::F32, vec![64])
+        .expect("f32 buf");
+    let bf16_buf = device
+        .alloc_buffer(256, DType::BF16, vec![128])
+        .expect("bf16 buf");
+    let u32_buf = device
+        .alloc_buffer(256, DType::U32, vec![64])
+        .expect("u32 buf");
+    let params = QuantizedMatmulIdParams {
+        m: 1,
+        k: 64,
+        n: 32,
+        group_size: 32,
+        bits: 4,
+        n_expert_used: 1,
+        num_experts: 1,
+    };
+
+    let mut encoder = device.command_encoder().expect("enc");
+    let wrong_input = quantized_matmul_id_into(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &bf16_buf,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &u32_buf,
+        &f32_buf,
+        &params,
+    )
+    .expect_err("BF16 input must be rejected");
+    assert!(
+        wrong_input.to_string().contains("input must be f32"),
+        "unexpected error: {wrong_input}"
+    );
+
+    let wrong_ids = quantized_matmul_id_into(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &params,
+    )
+    .expect_err("F32 ids must be rejected");
+    assert!(
+        wrong_ids.to_string().contains("ids must be u32"),
+        "unexpected error: {wrong_ids}"
+    );
+
+    let wrong_output = quantized_matmul_id_into(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &f32_buf,
+        &u32_buf,
+        &bf16_buf,
+        &params,
+    )
+    .expect_err("BF16 output must be rejected");
+    assert!(
+        wrong_output.to_string().contains("output must be f32"),
+        "unexpected error: {wrong_output}"
+    );
 }

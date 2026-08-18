@@ -48,6 +48,7 @@
 mod error;
 mod buffer;
 mod buffer_pool;
+pub mod affine_capability;
 mod device;
 mod dtypes;
 mod encoder;
@@ -68,6 +69,12 @@ pub mod weight;
 
 // ---- public re-exports ----
 pub use buffer::MlxBuffer;
+pub use affine_capability::{
+    packed_affine_capability, AffineExecutionRegime, AffineIoDType, AffineOperation,
+    PackedAffineCapability, PackedAffineKernelRoute, PackedAffineRejectionCode,
+    PackedAffineRequest,
+    PACKED_AFFINE_CAPABILITY_SCHEMA_VERSION,
+};
 pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
 pub use dtypes::DType;
