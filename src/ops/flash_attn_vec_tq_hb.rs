@@ -22,12 +22,59 @@ pub static FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE: &str =
 
 /// Register HB TQ flash attention vector shader source.
 pub fn register(registry: &mut KernelRegistry) {
-    registry.register_source("flash_attn_vec_tq_hb_dk256", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
-    registry.register_source("flash_attn_vec_tq_hb_dk512", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
+    registry.register_source(
+        "flash_attn_vec_tq_hb_dk256",
+        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "flash_attn_vec_tq_hb_dk512",
+        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "flash_attn_vec_tq_hb_gqa_q2_dk256",
+        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "flash_attn_vec_tq_hb_gqa_q3_dk256",
+        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
+    );
     // ADR-040 M-SPEED-LC: batched multi-sequence variant (same source file —
     // the batched kernel template is appended to flash_attn_vec_tq_hb.metal).
-    registry.register_source("flash_attn_vec_tq_hb_batched_dk256", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
-    registry.register_source("flash_attn_vec_tq_hb_batched_dk512", FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE);
+    registry.register_source(
+        "flash_attn_vec_tq_hb_batched_dk256",
+        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "flash_attn_vec_tq_hb_batched_dk512",
+        FLASH_ATTN_VEC_TQ_HB_SHADER_SOURCE,
+    );
+}
+
+/// Number of query heads that cooperatively reuse one packed K/V tile.
+///
+/// The caller must choose a tile that divides the model's query-heads-per-KV
+/// group. This explicit API keeps model-specific crossover policy out of the
+/// family-neutral Metal primitive.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GqaTile {
+    Q2,
+    Q3,
+}
+
+impl GqaTile {
+    fn width(self) -> u32 {
+        match self {
+            Self::Q2 => 2,
+            Self::Q3 => 3,
+        }
+    }
+
+    fn kernel_name(self) -> &'static str {
+        match self {
+            Self::Q2 => "flash_attn_vec_tq_hb_gqa_q2_dk256",
+            Self::Q3 => "flash_attn_vec_tq_hb_gqa_q3_dk256",
+        }
+    }
 }
 
 /// Parameters for the HB TQ flash attention vector kernel.
@@ -174,7 +221,8 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 // 2026-05-20: pulled cache static to module level so tests can invalidate
 // between env::set_var calls. Initial value -1 means "not yet parsed".
 #[doc(hidden)]
-pub(crate) static CACHED_TQ_NSG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+pub(crate) static CACHED_TQ_NSG: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
 
 pub fn compute_nsg(kv_seq_len: u32) -> u32 {
     // ADR-029: cache parsed override.
@@ -212,7 +260,11 @@ pub fn compute_nsg(kv_seq_len: u32) -> u32 {
     // Why NSG=4 not NSG=2: bench shows NSG=4 strictly beats NSG=2 at all
     // kL > 1024 (we measured 4096: NSG=2=184µs vs NSG=4=113µs).
     // Why not NSG > 4: validate_params caps at 4 (kernel NSG_MAX=4 ms_arr).
-    if kv_seq_len > 1024 { 4 } else { 1 }
+    if kv_seq_len > 1024 {
+        4
+    } else {
+        1
+    }
 }
 
 fn compute_nwg(kv_seq_len: u32) -> u32 {
@@ -241,7 +293,11 @@ fn compute_nwg(kv_seq_len: u32) -> u32 {
     // measured +4.7% production decode at long context.
     // No coherence change: FA-vec-tq-hb produces byte-identical
     // output regardless of nwg.
-    if kv_seq_len > 512 { 32 } else { 16 }
+    if kv_seq_len > 512 {
+        32
+    } else {
+        16
+    }
 }
 
 /// Dispatch HB TQ flash attention vector kernel (5/6/8-bit byte-packed K/V).
@@ -291,22 +347,23 @@ pub fn flash_attn_vec_tq_hb(
     let kernel_name = match head_dim {
         256 => "flash_attn_vec_tq_hb_dk256",
         512 => "flash_attn_vec_tq_hb_dk512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_tq_hb: unsupported head_dim {head_dim}"
-        ))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "flash_attn_vec_tq_hb: unsupported head_dim {head_dim}"
+            )))
+        }
     };
     // ADR-028: pass cbits as a Metal function constant for
     // compile-time specialization (eliminates the per-element if-else
     // chain in dequant_hb_float4 — measured +8.5%).
     // Index 50 must match `[[function_constant(50)]]` in the shader.
     let cbits_const = (params.codebook_bits as i32, 50usize);
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            kernel_name,
-            device.metal_device(),
-            &[],
-            &[(cbits_const.1, cbits_const.0)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(cbits_const.1, cbits_const.0)],
+    )?;
 
     let pk = pad2(head_dim as usize, 128);
     let pv = pad2(head_dim as usize, 128);
@@ -351,7 +408,9 @@ pub fn flash_attn_vec_tq_hb(
     if nwg > 1 {
         encoder.memory_barrier();
 
-        let reduce_params = FlashAttnVecReduceParamsGpu { nrows: params.num_heads };
+        let reduce_params = FlashAttnVecReduceParamsGpu {
+            nrows: params.num_heads,
+        };
 
         let reduce_kernel = match head_dim {
             256 => "flash_attn_vec_reduce_dk256",
@@ -373,6 +432,134 @@ pub fn flash_attn_vec_tq_hb(
             ],
             reduce_tg,
             reduce_tg_size,
+        );
+    }
+
+    Ok(())
+}
+
+/// Dispatch D=256 TQ-HB decode attention cooperatively by GQA KV-head group.
+///
+/// Unlike [`flash_attn_vec_tq_hb`], one workgroup computes two or three query
+/// heads that share a KV head. Each packed K/V word and codebook lookup is
+/// therefore reused across those query heads. Per-head dot, online-softmax,
+/// split-K, and final-reduction order remains identical to the scalar kernel.
+///
+/// This narrow first version intentionally rejects masks, rings, softcap,
+/// fused Q rotation, and D=512. Callers must fall back to the scalar primitive
+/// outside the proven contract.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_tq_hb_gqa(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    tile: GqaTile,
+) -> Result<()> {
+    validate_params(params)?;
+    if params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_tq_hb_gqa: head_dim must be 256, got {}",
+            params.head_dim
+        )));
+    }
+    if params.mask_type != 0
+        || params.sliding_window != 0
+        || params.ring_start != 0
+        || params.softcap != 0.0
+        || params.fuse_fwht_pre != 0
+    {
+        return Err(MlxError::InvalidArgument(
+            "flash_attn_vec_tq_hb_gqa: v1 requires full unmasked attention, ring_start=0, softcap=0, and caller-rotated Q".into(),
+        ));
+    }
+    let tile_width = tile.width();
+    let heads_per_kv = params.num_heads / params.num_kv_heads;
+    if heads_per_kv % tile_width != 0 || params.num_heads % tile_width != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_tq_hb_gqa: tile {tile_width} must divide heads_per_kv {heads_per_kv} and num_heads {}",
+            params.num_heads
+        )));
+    }
+
+    let nwg = compute_nwg(params.kv_seq_len);
+    let gpu_params = FlashAttnVecTqHbParamsGpu {
+        n_heads: params.num_heads,
+        n_kv_heads: params.num_kv_heads,
+        head_dim: params.head_dim,
+        kv_seq_len: params.kv_seq_len,
+        kv_capacity: params.kv_capacity,
+        scale: params.scale,
+        mask_type: params.mask_type,
+        sliding_window: params.sliding_window,
+        softcap: params.softcap,
+        nwg,
+        ring_start: params.ring_start,
+        scale_factor_d512: params.scale_factor_d512,
+        codebook_bits: params.codebook_bits,
+        fuse_fwht_pre: params.fuse_fwht_pre,
+        nsg: params.nsg,
+    };
+    let cbits_const = (params.codebook_bits as i32, 50usize);
+    let pipeline = registry.get_pipeline_with_constants(
+        tile.kernel_name(),
+        device.metal_device(),
+        &[],
+        &[(cbits_const.1, cbits_const.0)],
+    )?;
+
+    let tile_width = tile_width as usize;
+    let pk = pad2(params.head_dim as usize, 128);
+    let pv = pad2(params.head_dim as usize, 128);
+    let sh = 4 * 32;
+    let nsg = params.nsg as usize;
+    let shmem_halfs = tile_width * pk + tile_width * nsg * (sh + 2 * pv);
+    let shmem_bytes = shmem_halfs * 2;
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+    let threadgroups = MTLSize::new(1, (params.num_heads / tile.width()) as u64, nwg as u64);
+    let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
+    let dst_buf = if nwg == 1 { output } else { tmp };
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(q)),
+            (2, KernelArg::Buffer(k_packed)),
+            (3, KernelArg::Buffer(k_norms)),
+            (4, KernelArg::Buffer(v_packed)),
+            (5, KernelArg::Buffer(v_norms)),
+            (6, KernelArg::Buffer(dst_buf)),
+        ],
+        &[(0, shmem_bytes as u64)],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    if nwg > 1 {
+        encoder.memory_barrier();
+        let reduce_params = FlashAttnVecReduceParamsGpu {
+            nrows: params.num_heads,
+        };
+        let reduce_pipeline =
+            registry.get_pipeline("flash_attn_vec_reduce_dk256", device.metal_device())?;
+        encoder.encode_threadgroups_with_args(
+            reduce_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                (1, KernelArg::Buffer(tmp)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Bytes(as_bytes(&nwg))),
+            ],
+            MTLSize::new(params.num_heads as u64, 1, 1),
+            MTLSize::new(32 * nwg as u64, 1, 1),
         );
     }
 
@@ -446,18 +633,19 @@ pub fn flash_attn_vec_tq_hb_with_fused_undo(
     let kernel_name = match head_dim {
         256 => "flash_attn_vec_tq_hb_dk256",
         512 => "flash_attn_vec_tq_hb_dk512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_tq_hb_with_fused_undo: unsupported head_dim {head_dim}"
-        ))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "flash_attn_vec_tq_hb_with_fused_undo: unsupported head_dim {head_dim}"
+            )))
+        }
     };
     let cbits_const = (params.codebook_bits as i32, 50usize);
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            kernel_name,
-            device.metal_device(),
-            &[],
-            &[(cbits_const.1, cbits_const.0)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(cbits_const.1, cbits_const.0)],
+    )?;
 
     let pk = pad2(head_dim as usize, 128);
     let pv = pad2(head_dim as usize, 128);
@@ -495,9 +683,14 @@ pub fn flash_attn_vec_tq_hb_with_fused_undo(
         // H3 fusion: use reduce_tq_hb_undo (writes inverse-rotated output
         // directly to `output`).
         crate::ops::flash_attn_vec_reduce_tq_hb_undo::dispatch_flash_attn_vec_reduce_tq_hb_undo(
-            encoder, registry, device,
-            tmp, output,
-            params.num_heads, head_dim, nwg,
+            encoder,
+            registry,
+            device,
+            tmp,
+            output,
+            params.num_heads,
+            head_dim,
+            nwg,
         )?;
     } else {
         // NWG=1 path: SDPA wrote final output directly to `output` in the
@@ -507,8 +700,12 @@ pub fn flash_attn_vec_tq_hb_with_fused_undo(
         // mirror the legacy behavior for safety.
         encoder.memory_barrier();
         crate::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-            encoder, registry, device.metal_device(),
-            output, params.num_heads, head_dim,
+            encoder,
+            registry,
+            device.metal_device(),
+            output,
+            params.num_heads,
+            head_dim,
         )?;
     }
 
@@ -635,18 +832,19 @@ pub fn flash_attn_vec_tq_hb_batched(
     let kernel_name = match head_dim {
         256 => "flash_attn_vec_tq_hb_batched_dk256",
         512 => "flash_attn_vec_tq_hb_batched_dk512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_tq_hb_batched: unsupported head_dim {head_dim}"
-        ))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "flash_attn_vec_tq_hb_batched: unsupported head_dim {head_dim}"
+            )))
+        }
     };
     let cbits_const = (params.codebook_bits as i32, 50usize);
-    let pipeline = registry
-        .get_pipeline_with_constants(
-            kernel_name,
-            device.metal_device(),
-            &[],
-            &[(cbits_const.1, cbits_const.0)],
-        )?;
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(cbits_const.1, cbits_const.0)],
+    )?;
 
     let pk = pad2(head_dim as usize, 128);
     let pv = pad2(head_dim as usize, 128);
@@ -686,9 +884,14 @@ pub fn flash_attn_vec_tq_hb_batched(
         // nrows = n_q * heads — see rustdoc above for the row-independence
         // evidence that justifies reusing this kernel unchanged.
         crate::ops::flash_attn_vec_reduce_tq_hb_undo::dispatch_flash_attn_vec_reduce_tq_hb_undo(
-            encoder, registry, device,
-            tmp, output,
-            n_q * params.num_heads, head_dim, nwg,
+            encoder,
+            registry,
+            device,
+            tmp,
+            output,
+            n_q * params.num_heads,
+            head_dim,
+            nwg,
         )?;
     } else {
         // NWG=1 path: SDPA wrote final output directly to `output` in the
@@ -696,8 +899,12 @@ pub fn flash_attn_vec_tq_hb_batched(
         // n_q*num_heads rows to preserve the H3 caller contract.
         encoder.memory_barrier();
         crate::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-            encoder, registry, device.metal_device(),
-            output, n_q * params.num_heads, head_dim,
+            encoder,
+            registry,
+            device.metal_device(),
+            output,
+            n_q * params.num_heads,
+            head_dim,
         )?;
     }
 
@@ -733,7 +940,7 @@ mod tests {
             softcap: 0.0,
             ring_start: 0,
             scale_factor_d512: 1.0,
-            codebook_bits: 4,  // invalid
+            codebook_bits: 4, // invalid
             fuse_fwht_pre: 0,
             nsg: 1,
         };
@@ -766,10 +973,19 @@ mod tests {
     #[test]
     fn test_validate_nsg_zero_rejected() {
         let p = FlashAttnVecTqHbParams {
-            num_heads: 8, num_kv_heads: 4, head_dim: 256,
-            kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
-            sliding_window: 0, softcap: 0.0, ring_start: 0,
-            scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
+            num_heads: 8,
+            num_kv_heads: 4,
+            head_dim: 256,
+            kv_seq_len: 64,
+            kv_capacity: 1024,
+            scale: 1.0,
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+            fuse_fwht_pre: 0,
             nsg: 0,
         };
         assert!(validate_params(&p).is_err(), "nsg=0 must reject");
@@ -781,13 +997,25 @@ mod tests {
         // covers non-pow2 in [1, 4], plus the > 4 cap rejection.
         for nsg in [3u32, 5, 6, 7, 9, 16, 31, 33] {
             let p = FlashAttnVecTqHbParams {
-                num_heads: 8, num_kv_heads: 4, head_dim: 256,
-                kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
-                sliding_window: 0, softcap: 0.0, ring_start: 0,
-                scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
+                num_heads: 8,
+                num_kv_heads: 4,
+                head_dim: 256,
+                kv_seq_len: 64,
+                kv_capacity: 1024,
+                scale: 1.0,
+                mask_type: 0,
+                sliding_window: 0,
+                softcap: 0.0,
+                ring_start: 0,
+                scale_factor_d512: 1.0,
+                codebook_bits: 8,
+                fuse_fwht_pre: 0,
                 nsg,
             };
-            assert!(validate_params(&p).is_err(), "nsg={nsg} must reject (not pow-2 or > 4)");
+            assert!(
+                validate_params(&p).is_err(),
+                "nsg={nsg} must reject (not pow-2 or > 4)"
+            );
         }
     }
 
@@ -796,13 +1024,25 @@ mod tests {
         // ADR-028: only {1, 2, 4} accepted (matches kernel cap).
         for nsg in [1u32, 2, 4] {
             let p = FlashAttnVecTqHbParams {
-                num_heads: 8, num_kv_heads: 4, head_dim: 256,
-                kv_seq_len: 64, kv_capacity: 1024, scale: 1.0, mask_type: 0,
-                sliding_window: 0, softcap: 0.0, ring_start: 0,
-                scale_factor_d512: 1.0, codebook_bits: 8, fuse_fwht_pre: 0,
+                num_heads: 8,
+                num_kv_heads: 4,
+                head_dim: 256,
+                kv_seq_len: 64,
+                kv_capacity: 1024,
+                scale: 1.0,
+                mask_type: 0,
+                sliding_window: 0,
+                softcap: 0.0,
+                ring_start: 0,
+                scale_factor_d512: 1.0,
+                codebook_bits: 8,
+                fuse_fwht_pre: 0,
                 nsg,
             };
-            assert!(validate_params(&p).is_ok(), "nsg={nsg} (pow-2 ≤ 4) must accept");
+            assert!(
+                validate_params(&p).is_ok(),
+                "nsg={nsg} (pow-2 ≤ 4) must accept"
+            );
         }
     }
 
@@ -819,11 +1059,19 @@ mod tests {
         std::env::remove_var("HF2Q_TQ_NSG");
         // Below threshold: NSG=1 (cross-simdgroup reduce overhead dominates).
         for kl in [1u32, 64, 256, 1024] {
-            assert_eq!(compute_nsg(kl), 1, "compute_nsg({kl}) must be 1 (kL ≤ 1024)");
+            assert_eq!(
+                compute_nsg(kl),
+                1,
+                "compute_nsg({kl}) must be 1 (kL ≤ 1024)"
+            );
         }
         // Above threshold: NSG=4 (engaged for ≥1.83× speedup at kL=4096+).
         for kl in [1025u32, 1536, 2048, 4096, 8192, 16384] {
-            assert_eq!(compute_nsg(kl), 4, "compute_nsg({kl}) must be 4 (kL > 1024)");
+            assert_eq!(
+                compute_nsg(kl),
+                4,
+                "compute_nsg({kl}) must be 4 (kL > 1024)"
+            );
         }
     }
 
