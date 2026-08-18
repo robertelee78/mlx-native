@@ -536,11 +536,10 @@ pub fn flash_attn_vec_tq_hb_gqa(
     )?;
 
     let tile_width = tile_width as usize;
-    let pk = pad2(params.head_dim as usize, 128);
     let pv = pad2(params.head_dim as usize, 128);
     let sh = 4 * 32;
     let nsg = params.nsg as usize;
-    let shmem_halfs = tile_width * pk + tile_width * nsg * (sh + 2 * pv);
+    let shmem_halfs = tile_width * nsg * (sh + 2 * pv);
     let shmem_bytes = shmem_halfs * 2;
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);

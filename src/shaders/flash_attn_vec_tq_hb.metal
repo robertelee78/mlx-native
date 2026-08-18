@@ -755,8 +755,6 @@ kernel void flash_attn_vec_tq_hb_gqa_impl(
     constexpr short DV4 = DV / 4;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NL = NW;
-    constexpr short PK = PAD2(DK, 128);
-    constexpr short PK4 = PK / 4;
     constexpr short PV = PAD2(DV, 128);
     constexpr short SH = 4 * C;
 
@@ -772,18 +770,20 @@ kernel void flash_attn_vec_tq_hb_gqa_impl(
     const uint kv_head = q_base / heads_per_kv;
     const ushort tx = tiisg;
 
-    // [TILE_Q*PK Q] [TILE_Q*NSG*SH score] [TILE_Q*NSG*2*PV output]
-    threadgroup half4 *sq4 = (threadgroup half4 *)shmem;
-    const uint score_half_base = TILE_Q * PK;
-    const uint output_half_base = score_half_base + TILE_Q * NSG * SH;
+    // [TILE_Q*NSG*SH score] [TILE_Q*NSG*2*PV output]. Each lane retains its
+    // small Q slice in registers, avoiding repeated threadgroup reads in the
+    // KV-position loop and keeping Q2 below the 3-way 32 KiB occupancy bound.
+    const uint score_half_base = 0;
+    const uint output_half_base = TILE_Q * NSG * SH;
+    half4 q_local[TILE_Q][DK4 / NL];
 
-    // Caller-rotated Q only. All simdgroups make the same writes, matching
-    // the scalar kernel's established shared-Q initialization contract.
+    // Caller-rotated Q only. Every simdgroup loads the same lane-local values.
     for (short ql = 0; ql < TILE_Q; ++ql) {
-        threadgroup half4 *sq_q = sq4 + ql * PK4;
-        for (ushort i = tiisg; i < PK4; i += NW) {
-            float4 qval = *((device const float4 *)(Q + (q_base + ql) * DK + i * 4));
-            sq_q[i] = half4(qval);
+        for (short ii = 0; ii < DK4 / NL; ++ii) {
+            const uint q_index = (uint)tiisg + (uint)ii * NL;
+            const float4 qval =
+                *((device const float4 *)(Q + (q_base + ql) * DK + q_index * 4u));
+            q_local[ql][ii] = half4(qval);
         }
 
         threadgroup float *ss_q =
@@ -838,9 +838,7 @@ kernel void flash_attn_vec_tq_hb_gqa_impl(
                 const float4 k_val =
                     dequant_hb_float4(k_base, (uint)(ii * NL) * 4u, k_sn, cbits);
                 for (short ql = 0; ql < TILE_Q; ++ql) {
-                    threadgroup const half4 *pq_q =
-                        sq4 + ql * PK4 + tx;
-                    partial[ql] += dot(k_val, float4(pq_q[ii * NL]));
+                    partial[ql] += dot(k_val, float4(q_local[ql][ii]));
                 }
             }
             for (short ql = 0; ql < TILE_Q; ++ql) {
