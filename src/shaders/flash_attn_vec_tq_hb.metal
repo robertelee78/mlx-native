@@ -723,6 +723,274 @@ template [[host_name("flash_attn_vec_tq_hb_dk512")]]
 kernel flash_attn_vec_tq_hb_t flash_attn_vec_tq_hb_impl<512, 512>;
 
 // ---------------------------------------------------------------------------
+// KV-head-cooperative GQA decode kernel (D=256, TILE_Q=2).
+//
+// The scalar kernel above maps one workgroup to one query head, which makes
+// all Hq/Hkv query heads independently load and dequantize the same packed KV
+// stream. This kernel maps one workgroup to a query-head tile wholly contained
+// inside one GQA group. Packed K/V words and codebook centroids are loaded once
+// and reused across TILE_Q independent dot/softmax/output accumulators.
+//
+// The v1 dispatcher deliberately admits only full, non-ring, caller-rotated
+// D=256 attention. Per-head arithmetic and split-K reduction order match the
+// scalar kernel; the only changed ordering is interleaving independent heads.
+// ---------------------------------------------------------------------------
+template<short TILE_Q>
+kernel void flash_attn_vec_tq_hb_gqa_impl(
+    constant FlashAttnVecTqHbParams  &params      [[buffer(0)]],
+    device const float               *Q           [[buffer(1)]],
+    device const uint8_t             *K_packed    [[buffer(2)]],
+    device const float               *K_norms     [[buffer(3)]],
+    device const uint8_t             *V_packed    [[buffer(4)]],
+    device const float               *V_norms     [[buffer(5)]],
+    device       float               *dst         [[buffer(6)]],
+    threadgroup  half                *shmem       [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr short DK = 256;
+    constexpr short DV = 256;
+    constexpr short DK4 = DK / 4;
+    constexpr short DV4 = DV / 4;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NL = NW;
+    constexpr short PK = PAD2(DK, 128);
+    constexpr short PK4 = PK / 4;
+    constexpr short PV = PAD2(DV, 128);
+    constexpr short SH = 4 * C;
+
+    static_assert(TILE_Q == 2, "GQA tile must be 2");
+    static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
+    static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
+
+    const uint NWG = params.nwg;
+    const uint NSG = params.nsg;
+    const ushort iwg = tgpig[2] % NWG;
+    const uint q_base = tgpig[1] * TILE_Q;
+    const uint heads_per_kv = params.n_heads / params.n_kv_heads;
+    const uint kv_head = q_base / heads_per_kv;
+    const ushort tx = tiisg;
+
+    // [TILE_Q*PK Q] [TILE_Q*NSG*SH score] [TILE_Q*NSG*2*PV output]
+    threadgroup half4 *sq4 = (threadgroup half4 *)shmem;
+    const uint score_half_base = TILE_Q * PK;
+    const uint output_half_base = score_half_base + TILE_Q * NSG * SH;
+
+    // Caller-rotated Q only. All simdgroups make the same writes, matching
+    // the scalar kernel's established shared-Q initialization contract.
+    for (short ql = 0; ql < TILE_Q; ++ql) {
+        threadgroup half4 *sq_q = sq4 + ql * PK4;
+        for (ushort i = tiisg; i < PK4; i += NW) {
+            float4 qval = *((device const float4 *)(Q + (q_base + ql) * DK + i * 4));
+            sq_q[i] = half4(qval);
+        }
+
+        threadgroup float *ss_q =
+            (threadgroup float *)(shmem + score_half_base +
+                                  ((uint)ql * NSG + (uint)sgitg) * SH);
+        threadgroup float4 *so_q =
+            (threadgroup float4 *)(shmem + output_half_base +
+                                   ((uint)ql * NSG + (uint)sgitg) * 2u * PV);
+        for (ushort i = tiisg; i < SH / 4; i += NW) ss_q[i] = 0.0f;
+        for (short i = 0; i < DV4 / NL; ++i) so_q[tiisg + i * NL] = float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[TILE_Q];
+    float M[TILE_Q];
+    for (short ql = 0; ql < TILE_Q; ++ql) {
+        S[ql] = 0.0f;
+        M[ql] = -FLT_MAX / 2;
+    }
+
+    const uint kv_seq_len = params.kv_seq_len;
+    const uint kv_capacity = params.kv_capacity;
+    const uint cbits = params.codebook_bits;
+    const float inv_sqrt_d = rsqrt(float(DK));
+
+    for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
+        const uint ic = ic0 * C;
+        if (ic >= kv_seq_len) break;
+
+        // Q*K^T. Each lane loads a packed K float4 once and accumulates the
+        // same dot-product order into every independent query head.
+        for (short cc = 0; cc < C; ++cc) {
+            const uint kv_pos = ic + cc;
+            if (kv_pos >= kv_seq_len) {
+                if (tx == cc) {
+                    for (short ql = 0; ql < TILE_Q; ++ql) {
+                        threadgroup float *ss_q =
+                            (threadgroup float *)(shmem + score_half_base +
+                                                  ((uint)ql * NSG + (uint)sgitg) * SH);
+                        ss_q[cc] = -65504.0f;
+                    }
+                }
+                continue;
+            }
+
+            const float k_sn = K_norms[kv_head * kv_capacity + kv_pos] * inv_sqrt_d;
+            device const uint8_t *k_base =
+                K_packed + (kv_head * kv_capacity + kv_pos) * DK + tx * 4u;
+            float partial[TILE_Q];
+            for (short ql = 0; ql < TILE_Q; ++ql) partial[ql] = 0.0f;
+            for (short ii = 0; ii < DK4 / NL; ++ii) {
+                const float4 k_val =
+                    dequant_hb_float4(k_base, (uint)(ii * NL) * 4u, k_sn, cbits);
+                for (short ql = 0; ql < TILE_Q; ++ql) {
+                    threadgroup const half4 *pq_q =
+                        sq4 + ql * PK4 + tx;
+                    partial[ql] += dot(k_val, float4(pq_q[ii * NL]));
+                }
+            }
+            for (short ql = 0; ql < TILE_Q; ++ql) {
+                const float score = simd_sum(partial[ql]);
+                if (tx == cc) {
+                    threadgroup float *ss_q =
+                        (threadgroup float *)(shmem + score_half_base +
+                                              ((uint)ql * NSG + (uint)sgitg) * SH);
+                    ss_q[cc] = score * params.scale;
+                }
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Independent online softmax state for each query head.
+        for (short ql = 0; ql < TILE_Q; ++ql) {
+            threadgroup float *ss_q =
+                (threadgroup float *)(shmem + score_half_base +
+                                      ((uint)ql * NSG + (uint)sgitg) * SH);
+            threadgroup float4 *so_q =
+                (threadgroup float4 *)(shmem + output_half_base +
+                                       ((uint)ql * NSG + (uint)sgitg) * 2u * PV) + tiisg;
+            const float m_old = M[ql];
+            const float s_new = ss_q[tiisg];
+            M[ql] = simd_max(max(M[ql], s_new));
+            const float ms = exp(m_old - M[ql]);
+            const float vs = exp(s_new - M[ql]);
+            S[ql] = S[ql] * ms + simd_sum(vs);
+            ss_q[tiisg] = vs;
+            for (short ii = 0; ii < DV4 / NL; ++ii) so_q[ii * NL] *= ms;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O += softmax*V. Load/decode the centroid vector once, then preserve
+        // the scalar kernel's per-query `(centroid * norm * weight)` order.
+        float4 lo[TILE_Q][DV4 / NL];
+        for (short ql = 0; ql < TILE_Q; ++ql) {
+            for (short ii = 0; ii < DV4 / NL; ++ii) lo[ql][ii] = float4(0.0f);
+        }
+        for (short cc = 0; cc < C; ++cc) {
+            const uint kv_pos = ic + cc;
+            if (kv_pos >= kv_seq_len) continue;
+            const float v_norm = V_norms[kv_head * kv_capacity + kv_pos];
+            device const uint8_t *v_base =
+                V_packed + (kv_head * kv_capacity + kv_pos) * DV + tx * 4u;
+            for (short ii = 0; ii < DV4 / NL; ++ii) {
+                const float4 centroid =
+                    dequant_hb_float4(v_base, (uint)(ii * NL) * 4u, 1.0f, cbits);
+                for (short ql = 0; ql < TILE_Q; ++ql) {
+                    threadgroup const float *ss_q =
+                        (threadgroup const float *)(shmem + score_half_base +
+                                                    ((uint)ql * NSG + (uint)sgitg) * SH);
+                    const float v_sw = v_norm * inv_sqrt_d * ss_q[cc];
+                    lo[ql][ii] += centroid * v_sw;
+                }
+            }
+        }
+        for (short ql = 0; ql < TILE_Q; ++ql) {
+            threadgroup float4 *so_q =
+                (threadgroup float4 *)(shmem + output_half_base +
+                                       ((uint)ql * NSG + (uint)sgitg) * 2u * PV) + tiisg;
+            for (short ii = 0; ii < DV4 / NL; ++ii) so_q[ii * NL] += lo[ql][ii];
+        }
+    }
+
+    for (short ql = 0; ql < TILE_Q; ++ql) {
+        if (tiisg == 0) {
+            threadgroup float *ss_q =
+                (threadgroup float *)(shmem + score_half_base +
+                                      ((uint)ql * NSG + (uint)sgitg) * SH);
+            ss_q[0] = S[ql];
+            ss_q[1] = M[ql];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Merge simdgroup-local online-softmax states in the same j order as the
+    // scalar kernel, independently for each query head.
+    if (NSG > 1u && sgitg == 0) {
+        constexpr ushort NSG_MAX = 4;
+        for (short ql = 0; ql < TILE_Q; ++ql) {
+            float ms_arr[NSG_MAX];
+            float m_global = -FLT_MAX / 2;
+            for (ushort j = 0; j < NSG; ++j) {
+                threadgroup const float *ss_j =
+                    (threadgroup const float *)(shmem + score_half_base +
+                                                ((uint)ql * NSG + (uint)j) * SH);
+                m_global = max(m_global, ss_j[1]);
+            }
+            float s_total = 0.0f;
+            for (ushort j = 0; j < NSG; ++j) {
+                threadgroup const float *ss_j =
+                    (threadgroup const float *)(shmem + score_half_base +
+                                                ((uint)ql * NSG + (uint)j) * SH);
+                ms_arr[j] = exp(ss_j[1] - m_global);
+                s_total += ss_j[0] * ms_arr[j];
+            }
+            threadgroup float4 *so_0 =
+                (threadgroup float4 *)(shmem + output_half_base +
+                                       (uint)ql * NSG * 2u * PV);
+            for (ushort i = tiisg; i < DV4; i += NW) {
+                float4 acc = float4(0.0f);
+                for (ushort j = 0; j < NSG; ++j) {
+                    threadgroup const float4 *so_j =
+                        (threadgroup const float4 *)(shmem + output_half_base +
+                                                     ((uint)ql * NSG + (uint)j) * 2u * PV);
+                    acc += so_j[i] * ms_arr[j];
+                }
+                so_0[i] = acc;
+            }
+            if (tiisg == 0) {
+                threadgroup float *ss_0 =
+                    (threadgroup float *)(shmem + score_half_base +
+                                          (uint)ql * NSG * SH);
+                ss_0[0] = s_total;
+                ss_0[1] = m_global;
+            }
+            S[ql] = s_total;
+            M[ql] = m_global;
+        }
+    }
+
+    if (sgitg == 0) {
+        const int64_t nrows = params.n_heads;
+        const uint NWG_val = params.nwg;
+        device float4 *dst4 = (device float4 *)dst;
+        for (short ql = 0; ql < TILE_Q; ++ql) {
+            const int64_t rid = q_base + ql;
+            threadgroup const float4 *so_0 =
+                (threadgroup const float4 *)(shmem + output_half_base +
+                                             (uint)ql * NSG * 2u * PV);
+            const float inv_S =
+                (NWG_val == 1) ? ((S[ql] == 0.0f) ? 0.0f : 1.0f / S[ql]) : 1.0f;
+            for (ushort i = tiisg; i < DV4; i += NW) {
+                dst4[rid * DV4 * NWG_val + NWG_val * i + iwg] = so_0[i] * inv_S;
+            }
+            if (NWG_val > 1 && tiisg == 0) {
+                device float *dst1 = dst + nrows * DV * NWG_val;
+                dst1[rid * (2 * NWG_val) + 2 * iwg] = S[ql];
+                dst1[rid * (2 * NWG_val) + 2 * iwg + 1] = M[ql];
+            }
+        }
+    }
+}
+
+typedef decltype(flash_attn_vec_tq_hb_gqa_impl<2>) flash_attn_vec_tq_hb_gqa_q2_t;
+template [[host_name("flash_attn_vec_tq_hb_gqa_q2_dk256")]]
+kernel flash_attn_vec_tq_hb_gqa_q2_t flash_attn_vec_tq_hb_gqa_impl<2>;
+
+// ---------------------------------------------------------------------------
 // ADR-040 M-SPEED-LC — batched-decode params: adds n_queries.
 //
 // Kept as a SEPARATE struct from FlashAttnVecTqHbParams above (the one used by
