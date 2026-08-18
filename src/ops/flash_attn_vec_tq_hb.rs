@@ -459,10 +459,10 @@ pub fn flash_attn_vec_tq_hb(
 
 /// Dispatch D=256 TQ-HB decode attention cooperatively by GQA KV-head group.
 ///
-/// Unlike [`flash_attn_vec_tq_hb`], one workgroup computes two or three query
-/// heads that share a KV head. Each packed K/V word and codebook lookup is
-/// therefore reused across those query heads. Per-head dot, online-softmax,
-/// split-K, and final-reduction order remains identical to the scalar kernel.
+/// Unlike [`flash_attn_vec_tq_hb`], one workgroup computes two query heads that
+/// share a KV head. Each packed K/V word and codebook lookup is therefore
+/// reused across those query heads. Per-head dot, online-softmax, split-K, and
+/// final-reduction order remains identical to the scalar kernel.
 ///
 /// This narrow first version intentionally rejects masks, rings, softcap,
 /// fused Q rotation, and D=512. Callers must fall back to the scalar primitive

@@ -174,6 +174,58 @@ fn qwen38_q2_matches_legacy_at_boundaries_and_nsg_modes() {
     }
 }
 
+#[test]
+fn qwen38_q2_matches_legacy_across_multiple_kv_chunks() {
+    // TQ8 is the Qwen3.8 production cache width. kL=2,049 exercises the
+    // NSG=2 crossover with one simdgroup processing a second 32-token chunk;
+    // kL=8,192 exercises two chunks per simdgroup at the long-context NSG=4
+    // policy used by the downstream dispatcher.
+    for &(kv_seq_len, nsg) in &[(2_049, 2), (8_192, 4)] {
+        run_case(kv_seq_len, nsg, 8, GqaTile::Q2);
+    }
+}
+
+#[test]
+fn qwen38_q2_prewarm_accepts_supported_codebooks() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_vec_tq_hb::register(&mut registry);
+
+    for codebook_bits in [5, 6, 8] {
+        flash_attn_vec_tq_hb::prewarm_gqa_tile(
+            &mut registry,
+            device.metal_device(),
+            codebook_bits,
+            GqaTile::Q2,
+        )
+        .unwrap_or_else(|error| panic!("TQ{codebook_bits} Q2 prewarm should compile: {error}"));
+    }
+}
+
+#[test]
+fn qwen38_q2_prewarm_rejects_unsupported_codebooks() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    flash_attn_vec_tq_hb::register(&mut registry);
+
+    for codebook_bits in [0, 4, 7, 9] {
+        let error = flash_attn_vec_tq_hb::prewarm_gqa_tile(
+            &mut registry,
+            device.metal_device(),
+            codebook_bits,
+            GqaTile::Q2,
+        )
+        .expect_err("unsupported codebook width must fail before compilation");
+        assert!(
+            matches!(&error, mlx_native::MlxError::InvalidArgument(message)
+            if message == &format!(
+                "prewarm_gqa_tile: codebook_bits must be 5, 6, or 8, got {codebook_bits}"
+            )),
+            "unexpected TQ{codebook_bits} prewarm error: {error}"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Variant {
     Legacy,
@@ -183,6 +235,13 @@ enum Variant {
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
+}
+
+fn range(values: &[f64]) -> (f64, f64) {
+    values.iter().copied().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+    )
 }
 
 #[test]
@@ -267,10 +326,17 @@ fn bench_qwen38_gqa_tiles() {
             }
             .expect("benchmark dispatch");
             let (gpu_start, gpu_end) = encoder.commit_wait_with_gpu_time().expect("GPU time");
-            (
-                (gpu_end - gpu_start) * 1_000.0,
-                wall_start.elapsed().as_secs_f64() * 1_000.0,
-            )
+            let gpu_ms = (gpu_end - gpu_start) * 1_000.0;
+            let wall_ms = wall_start.elapsed().as_secs_f64() * 1_000.0;
+            assert!(
+                gpu_ms.is_finite() && gpu_ms > 0.0,
+                "{variant:?} produced invalid GPU timing {gpu_ms:?} ms at kL={kv_seq_len}"
+            );
+            assert!(
+                wall_ms.is_finite() && wall_ms > 0.0,
+                "{variant:?} produced invalid wall timing {wall_ms:?} ms at kL={kv_seq_len}"
+            );
+            (gpu_ms, wall_ms)
         };
 
         for variant in [Variant::Legacy, Variant::Q2] {
@@ -290,13 +356,21 @@ fn bench_qwen38_gqa_tiles() {
                 wall[index].push(wall_ms);
             }
         }
+        let (legacy_gpu_min, legacy_gpu_max) = range(&gpu[0]);
+        let (q2_gpu_min, q2_gpu_max) = range(&gpu[1]);
+        let (legacy_wall_min, legacy_wall_max) = range(&wall[0]);
+        let (q2_wall_min, q2_wall_max) = range(&wall[1]);
         let legacy_gpu = median(&mut gpu[0]);
         let q2_gpu = median(&mut gpu[1]);
         let legacy_wall = median(&mut wall[0]);
         let q2_wall = median(&mut wall[1]);
+        let q2_gpu_speedup = legacy_gpu / q2_gpu;
+        assert!(
+            q2_gpu_speedup.is_finite(),
+            "invalid Q2 GPU speedup {q2_gpu_speedup:?} at kL={kv_seq_len}"
+        );
         eprintln!(
-            "GQA_BENCH kL={kv_seq_len} legacy_gpu_ms={legacy_gpu:.4} q2_gpu_ms={q2_gpu:.4} q2_gpu_speedup={:.3} legacy_wall_ms={legacy_wall:.4} q2_wall_ms={q2_wall:.4}",
-            legacy_gpu / q2_gpu,
+            "GQA_BENCH kL={kv_seq_len} legacy_gpu_ms={legacy_gpu:.4} legacy_gpu_range_ms={legacy_gpu_min:.4}..{legacy_gpu_max:.4} q2_gpu_ms={q2_gpu:.4} q2_gpu_range_ms={q2_gpu_min:.4}..{q2_gpu_max:.4} q2_gpu_speedup={q2_gpu_speedup:.3} legacy_wall_ms={legacy_wall:.4} legacy_wall_range_ms={legacy_wall_min:.4}..{legacy_wall_max:.4} q2_wall_ms={q2_wall:.4} q2_wall_range_ms={q2_wall_min:.4}..{q2_wall_max:.4}",
         );
     }
 }
@@ -375,18 +449,29 @@ fn bench_qwen38_q2_sustained_1000_steps() {
         let started = std::time::Instant::now();
         encoder.commit_and_wait().expect("sustained completion");
         if step >= 8 {
-            step_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            assert!(
+                elapsed_ms.is_finite() && elapsed_ms > 0.0,
+                "invalid sustained step timing {elapsed_ms:?} ms at step {step}"
+            );
+            step_ms.push(elapsed_ms);
         }
     }
 
     let quarter = STEPS / 4;
     let mut first = step_ms[..quarter].to_vec();
     let mut last = step_ms[(STEPS - quarter)..].to_vec();
+    let (first_min, first_max) = range(&first);
+    let (last_min, last_max) = range(&last);
     let first_p50 = median(&mut first);
     let last_p50 = median(&mut last);
     let ratio = last_p50 / first_p50;
+    assert!(
+        ratio.is_finite(),
+        "invalid sustained thermal ratio {ratio:?}"
+    );
     eprintln!(
-        "GQA_SUSTAINED steps={STEPS} layers_per_step={LAYERS_PER_STEP} first_quarter_p50_ms={first_p50:.4} last_quarter_p50_ms={last_p50:.4} thermal_ratio={ratio:.3}"
+        "GQA_SUSTAINED steps={STEPS} layers_per_step={LAYERS_PER_STEP} first_quarter_p50_ms={first_p50:.4} first_quarter_range_ms={first_min:.4}..{first_max:.4} last_quarter_p50_ms={last_p50:.4} last_quarter_range_ms={last_min:.4}..{last_max:.4} thermal_ratio={ratio:.3}"
     );
     assert!(
         ratio <= 1.15,

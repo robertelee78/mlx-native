@@ -723,7 +723,7 @@ template [[host_name("flash_attn_vec_tq_hb_dk512")]]
 kernel flash_attn_vec_tq_hb_t flash_attn_vec_tq_hb_impl<512, 512>;
 
 // ---------------------------------------------------------------------------
-// KV-head-cooperative GQA decode kernel (D=256, TILE_Q=2/3).
+// KV-head-cooperative GQA decode kernel (D=256, TILE_Q=2).
 //
 // The scalar kernel above maps one workgroup to one query head, which makes
 // all Hq/Hkv query heads independently load and dequantize the same packed KV
@@ -760,7 +760,7 @@ kernel void flash_attn_vec_tq_hb_gqa_impl(
     constexpr short PV = PAD2(DV, 128);
     constexpr short SH = 4 * C;
 
-    static_assert(TILE_Q == 2 || TILE_Q == 3, "GQA tile must be 2 or 3");
+    static_assert(TILE_Q == 2, "GQA tile must be 2");
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
