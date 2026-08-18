@@ -6,7 +6,9 @@
 
 use metal::MTLSize;
 
+use crate::affine_capability::packed_row_quantum;
 use crate::buffer::MlxBuffer;
+use crate::dtypes::DType;
 use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
@@ -59,6 +61,7 @@ struct GpuEmbeddingParams {
 /// * `embed_dim` is zero
 /// * `group_size` is zero
 /// * `embed_dim` is not divisible by `group_size`
+/// * `embed_dim` is not divisible by the selected bit width's packing quantum
 /// * `n_tokens` is zero
 /// * Output buffer is too small
 #[allow(clippy::too_many_arguments)]
@@ -96,10 +99,30 @@ pub fn embedding_gather(
             params.embed_dim, params.group_size
         )));
     }
+    let packing_quantum = packed_row_quantum(params.bits as u32)
+        .expect("embedding bit widths were validated above") as usize;
+    if params.embed_dim % packing_quantum != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_gather: {}-bit embed_dim ({}) must be divisible by its {}-value packing quantum",
+            params.bits, params.embed_dim, packing_quantum
+        )));
+    }
     if params.n_tokens == 0 {
         return Err(MlxError::InvalidArgument(
             "embedding_gather: n_tokens must be > 0".into(),
         ));
+    }
+    if token_ids.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_gather: token_ids must be u32, got {}",
+            token_ids.dtype()
+        )));
+    }
+    if output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_gather: output must be f32, got {}",
+            output.dtype()
+        )));
     }
 
     let expected_output_bytes = params.n_tokens * params.embed_dim * std::mem::size_of::<f32>();

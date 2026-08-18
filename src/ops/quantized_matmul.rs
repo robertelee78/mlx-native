@@ -3,9 +3,13 @@
 //! Encodes a GPU compute command that performs:
 //!   output[row][col] = sum_k(dequant(weight[col][k]) * input[row][k])
 //!
-//! Weights are stored in packed quantized format (4-bit or 6-bit) with per-group
+//! Weights are stored in packed quantized format (4-bit, 6-bit, or 8-bit) with per-group
 //! bf16 scales and biases for affine dequantization.
 
+use crate::affine_capability::{
+    packed_affine_capability, AffineExecutionRegime, AffineIoDType, AffineOperation,
+    PackedAffineCapability, PackedAffineKernelRoute, PackedAffineRequest,
+};
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
@@ -113,6 +117,13 @@ pub fn quantized_matmul(
     biases: &MlxBuffer,
     params: &QuantizedMatmulParams,
 ) -> Result<MlxBuffer> {
+    if input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul: input must be f32, got {}",
+            input.dtype()
+        )));
+    }
+
     // --- Validate bits ---
     if params.bits != 4 && params.bits != 6 && params.bits != 8 {
         return Err(MlxError::InvalidArgument(format!(
@@ -236,37 +247,40 @@ pub fn quantized_matmul(
 /// The SIMD path requires:
 ///   - bits is 4 or 8 (not 6)
 ///   - N is divisible by 8 (results_per_simdgroup * num_simdgroups)
-///   - K is divisible by block_size:
-///     - 4-bit: K % 256 == 0 (block_size = 8 values/thread * 32 SIMD = 256, qmv)
-///     - 8-bit: K % 256 == 0 (block_size = 8 * 32 = 256)
+///   - K is divisible by the dtype/bit-width-specific SIMD block size
+///   - group_size divides the SIMD block, is a multiple of values/thread, and
+///     does not exceed the block size
 ///
 /// NOTE: The f32 SIMD kernel uses qmv params (values_per_thread=8) not qmv_fast,
 /// because K=2816 (Gemma 4 hidden_size) is 256-aligned but not 512-aligned.
 /// The bf16 SIMD kernels use qmv_fast (values_per_thread=16, block_size=512).
-/// Check alignment for f32 SIMD kernel (qmv: values_per_thread=8, block_size=256).
-fn can_use_simd_kernel(params: &QuantizedMatmulParams) -> bool {
-    let bn = 8u32; // num_simdgroups * results_per_simdgroup
-    if params.n % bn != 0 {
-        return false;
-    }
-    match params.bits {
-        4 => params.k % 256 == 0,  // qmv: block_size = 8 * 32 = 256
-        8 => params.k % 256 == 0,
-        _ => false,
-    }
+fn matmul_capability(
+    params: &QuantizedMatmulParams,
+    operation: AffineOperation,
+    io_dtype: AffineIoDType,
+) -> PackedAffineCapability {
+    let regime = if params.m == 1 {
+        AffineExecutionRegime::DecodeQmv
+    } else {
+        AffineExecutionRegime::PromptQmm
+    };
+    packed_affine_capability(PackedAffineRequest {
+        operation,
+        regime,
+        io_dtype,
+        bits: params.bits,
+        group_size: params.group_size,
+        m: params.m,
+        n: params.n,
+        k: params.k,
+        has_biases: true,
+    })
 }
 
-/// Check alignment for bf16 SIMD kernel (qmv_fast: values_per_thread=16, block_size=512).
-fn can_use_simd_kernel_bf16(params: &QuantizedMatmulParams) -> bool {
-    let bn = 8u32;
-    if params.n % bn != 0 {
-        return false;
-    }
-    match params.bits {
-        4 => params.k % 512 == 0,  // qmv_fast: block_size = 16 * 32 = 512
-        8 => params.k % 256 == 0,
-        _ => false,
-    }
+/// Check alignment for f32 SIMD kernel (qmv: values_per_thread=8, block_size=256).
+fn can_use_simd_kernel(params: &QuantizedMatmulParams) -> bool {
+    let capability = matmul_capability(params, AffineOperation::Dense, AffineIoDType::F32);
+    capability.route == Some(PackedAffineKernelRoute::DenseRowWiseSimdF32)
 }
 
 /// Encode a quantized matrix-vector multiply using the SIMD-cooperative kernel
@@ -295,6 +309,13 @@ pub fn quantized_matmul_simd(
     biases: &MlxBuffer,
     params: &QuantizedMatmulParams,
 ) -> Result<MlxBuffer> {
+    if input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_simd: input must be f32, got {}",
+            input.dtype()
+        )));
+    }
+
     // Fall back to scalar kernel if dimensions don't support SIMD path.
     if !can_use_simd_kernel(params) {
         return quantized_matmul(encoder, registry, device, input, weight, scales, biases, params);
@@ -471,9 +492,31 @@ pub fn dispatch_quantized_matmul_simd_bf16(
     biases: &MlxBuffer,
     params: &QuantizedMatmulParams,
 ) -> Result<MlxBuffer> {
+    let capability = matmul_capability(params, AffineOperation::Dense, AffineIoDType::Bf16);
+    if !capability.executable {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_quantized_matmul_simd_bf16: {}",
+            capability.diagnostic
+        )));
+    }
+    if !matches!(input.dtype(), DType::BF16 | DType::F32) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_quantized_matmul_simd_bf16: input must be bf16 or f32 for the scalar fallback, got {}",
+            input.dtype()
+        )));
+    }
+    if capability.route == Some(PackedAffineKernelRoute::DenseRowWiseSimdBf16)
+        && input.dtype() != DType::BF16
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_quantized_matmul_simd_bf16: SIMD input must be bf16, got {}",
+            input.dtype()
+        )));
+    }
+
     // Fall back to f32 cast+scalar path for shapes where bf16 SIMD (qmv_fast)
     // alignment is not met (e.g. K=2816 is 256-aligned but not 512-aligned).
-    if !can_use_simd_kernel_bf16(params) {
+    if capability.route != Some(PackedAffineKernelRoute::DenseRowWiseSimdBf16) {
         let n_in = (params.m as usize) * (params.k as usize);
         let f32_input = if input.dtype() == DType::BF16 {
             let f32_buf = device.alloc_buffer(n_in * DType::F32.size_of(), DType::F32, vec![params.m as usize, params.k as usize])?;
@@ -482,12 +525,14 @@ pub fn dispatch_quantized_matmul_simd_bf16(
                 input, &f32_buf, n_in,
                 crate::ops::elementwise::CastDirection::BF16ToF32,
             )?;
+            encoder.memory_barrier();
             Some(f32_buf)
         } else {
             None
         };
         let actual_input = f32_input.as_ref().unwrap_or(input);
         let f32_result = quantized_matmul(encoder, registry, device, actual_input, packed_weights, scales, biases, params)?;
+        encoder.memory_barrier();
         // Cast f32 output back to bf16
         let n_out = (params.m as usize) * (params.n as usize);
         let bf16_out = device.alloc_buffer(n_out * DType::BF16.size_of(), DType::BF16, vec![params.m as usize, params.n as usize])?;
@@ -497,41 +542,6 @@ pub fn dispatch_quantized_matmul_simd_bf16(
             crate::ops::elementwise::CastDirection::F32ToBF16,
         )?;
         return Ok(bf16_out);
-    }
-
-    // 6-bit: already handled by the !can_use_simd_kernel_bf16 fallback above
-    // which routes through quantized_matmul (scalar GPU kernel that supports 6-bit).
-    // But add an explicit check to be safe.
-    if params.bits == 6 {
-        // Route through the same fallback path as non-SIMD-aligned dimensions
-        let n_in = (params.m as usize) * (params.k as usize);
-        let f32_input = if input.dtype() == DType::BF16 {
-            let f32_buf = device.alloc_buffer(n_in * DType::F32.size_of(), DType::F32, vec![params.m as usize, params.k as usize])?;
-            crate::ops::elementwise::cast(
-                encoder, registry, device.metal_device(),
-                input, &f32_buf, n_in,
-                crate::ops::elementwise::CastDirection::BF16ToF32,
-            )?;
-            Some(f32_buf)
-        } else {
-            None
-        };
-        let actual_input = f32_input.as_ref().unwrap_or(input);
-        let f32_result = quantized_matmul(encoder, registry, device, actual_input, packed_weights, scales, biases, params)?;
-        let n_out = (params.m as usize) * (params.n as usize);
-        let bf16_out = device.alloc_buffer(n_out * DType::BF16.size_of(), DType::BF16, vec![params.m as usize, params.n as usize])?;
-        crate::ops::elementwise::cast(
-            encoder, registry, device.metal_device(),
-            &f32_result, &bf16_out, n_out,
-            crate::ops::elementwise::CastDirection::F32ToBF16,
-        )?;
-        return Ok(bf16_out);
-    }
-    if params.bits != 4 && params.bits != 8 {
-        return Err(MlxError::InvalidArgument(format!(
-            "bf16 SIMD kernel: unsupported bits value {}; only 4, 6, and 8 are supported",
-            params.bits
-        )));
     }
     if params.m == 0 || params.k == 0 || params.n == 0 || params.group_size == 0 {
         return Err(MlxError::InvalidArgument(
@@ -663,11 +673,24 @@ pub fn dispatch_quantized_matmul_simd_bf16_expert(
 ) -> Result<MlxBuffer> {
     // Expert-offset path requires bf16 SIMD (qmv_fast) alignment; no fallback
     // because the scalar kernel doesn't understand 3D expert packing.
-    if !can_use_simd_kernel_bf16(params) {
-        return Err(MlxError::InvalidArgument(
-            "dispatch_quantized_matmul_simd_bf16_expert: dimensions do not satisfy bf16 SIMD \
-             alignment requirements (N%8==0 and K%512==0 for 4-bit, K%256==0 for 8-bit)".into(),
-        ));
+    let capability = matmul_capability(
+        params,
+        AffineOperation::ExpertOffset,
+        AffineIoDType::Bf16,
+    );
+    if capability.route
+        != Some(PackedAffineKernelRoute::ExpertOffsetRowWiseSimdBf16)
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_quantized_matmul_simd_bf16_expert: {}",
+            capability.diagnostic
+        )));
+    }
+    if input.dtype() != DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_quantized_matmul_simd_bf16_expert: input must be bf16, got {}",
+            input.dtype()
+        )));
     }
 
     if params.bits != 4 && params.bits != 8 {
@@ -1011,6 +1034,14 @@ mod tests {
     fn read_f32(buf: &MlxBuffer) -> Vec<f32> {
         let slice: &[f32] = buf.as_slice().expect("as_slice");
         slice.to_vec()
+    }
+
+    fn read_bf16(buf: &MlxBuffer) -> Vec<f32> {
+        let slice: &[u16] = buf.as_slice().expect("as_slice");
+        slice
+            .iter()
+            .map(|&bits| f32::from_bits((bits as u32) << 16))
+            .collect()
     }
 
     /// Test 4-bit quantized matmul with a small known example.
@@ -1403,5 +1434,129 @@ mod tests {
             (result[0] - 10.0).abs() < tol,
             "output[0]={}, expected ~10.0", result[0]
         );
+    }
+
+    #[test]
+    fn test_bf16_group_size_boundary_matches_scalar_and_simd_routes() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let m = 1u32;
+        let k = 512u32;
+        let n = 8u32;
+        let bits = 4u32;
+        let f32_input = f32_buffer(
+            &device,
+            vec![m as usize, k as usize],
+            &vec![1.0; k as usize],
+        );
+        let bf16_input = bf16_buffer(
+            &device,
+            vec![m as usize, k as usize],
+            &vec![1.0; k as usize],
+        );
+        let weight = pack_4bit_buffer(&device, n as usize, k as usize, &vec![1; (n * k) as usize]);
+
+        for (group_size, expected_route) in [
+            (8, PackedAffineKernelRoute::DenseScalarViaF32),
+            (16, PackedAffineKernelRoute::DenseRowWiseSimdBf16),
+        ] {
+            let params = QuantizedMatmulParams {
+                m,
+                k,
+                n,
+                group_size,
+                bits,
+            };
+            let groups = (n * k / group_size) as usize;
+            let scales = bf16_buffer(&device, vec![groups], &vec![0.5; groups]);
+            let biases = bf16_buffer(&device, vec![groups], &vec![0.25; groups]);
+            let capability =
+                matmul_capability(&params, AffineOperation::Dense, AffineIoDType::Bf16);
+            assert_eq!(capability.route, Some(expected_route));
+
+            let mut scalar_encoder = device.command_encoder().expect("scalar encoder");
+            let scalar = quantized_matmul(
+                &mut scalar_encoder,
+                &mut registry,
+                &device,
+                &f32_input,
+                &weight,
+                &scales,
+                &biases,
+                &params,
+            )
+            .expect("scalar reference");
+            scalar_encoder.commit_and_wait().expect("scalar commit");
+
+            let mut selected_encoder = device.command_encoder().expect("selected encoder");
+            let selected = dispatch_quantized_matmul_simd_bf16(
+                &mut selected_encoder,
+                &mut registry,
+                &device,
+                &bf16_input,
+                &weight,
+                &scales,
+                &biases,
+                &params,
+            )
+            .expect("capability-selected route");
+            selected_encoder.commit_and_wait().expect("selected commit");
+
+            let scalar = read_f32(&scalar);
+            let selected = read_bf16(&selected);
+            assert_eq!(scalar.len(), selected.len());
+            for (index, (reference, actual)) in scalar.iter().zip(&selected).enumerate() {
+                assert!(
+                    (reference - actual).abs() <= 1.0,
+                    "group_size={group_size} index={index}: scalar={reference}, selected={actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_affine_matmul_dispatchers_reject_wrong_input_dtypes() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let params = QuantizedMatmulParams {
+            m: 1,
+            k: 512,
+            n: 8,
+            group_size: 16,
+            bits: 4,
+        };
+        let f32_input = f32_buffer(&device, vec![1, 512], &vec![1.0; 512]);
+        let bf16_input = bf16_buffer(&device, vec![1, 512], &vec![1.0; 512]);
+        let weight = pack_4bit_buffer(&device, 8, 512, &vec![1; 8 * 512]);
+        let scales = bf16_buffer(&device, vec![256], &vec![0.5; 256]);
+        let biases = bf16_buffer(&device, vec![256], &vec![0.25; 256]);
+
+        let mut scalar_encoder = device.command_encoder().expect("scalar encoder");
+        let scalar_error = quantized_matmul(
+            &mut scalar_encoder,
+            &mut registry,
+            &device,
+            &bf16_input,
+            &weight,
+            &scales,
+            &biases,
+            &params,
+        )
+        .expect_err("scalar route must reject non-f32 input");
+        assert!(scalar_error.to_string().contains("input must be f32"));
+
+        let mut bf16_encoder = device.command_encoder().expect("bf16 encoder");
+        let bf16_error = dispatch_quantized_matmul_simd_bf16(
+            &mut bf16_encoder,
+            &mut registry,
+            &device,
+            &f32_input,
+            &weight,
+            &scales,
+            &biases,
+            &params,
+        )
+        .expect_err("bf16 SIMD route must reject f32 input");
+        assert!(bf16_error.to_string().contains("SIMD input must be bf16"));
     }
 }

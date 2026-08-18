@@ -318,3 +318,85 @@ fn test_embedding_gather_group_not_divisible() {
     );
     assert!(result.is_err(), "embed_dim not divisible by group_size should error");
 }
+
+#[test]
+fn test_embedding_gather_rejects_truncated_packing_rows() {
+    let (device, mut registry) = setup();
+
+    let buf = device.alloc_buffer(64, DType::U32, vec![16]).expect("buf");
+    let out = device.alloc_buffer(64, DType::F32, vec![16]).expect("out");
+
+    for (bits, embed_dim, group_size) in [(4, 12, 4), (6, 6, 2)] {
+        let mut encoder = device.command_encoder().expect("enc");
+        let result = embedding_gather(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &buf,
+            &buf,
+            &buf,
+            &buf,
+            &out,
+            &EmbeddingGatherParams {
+                embed_dim,
+                group_size,
+                bits,
+                n_tokens: 1,
+            },
+        );
+
+        let message = match result {
+            Ok(()) => {
+                panic!("bits={bits} embed_dim={embed_dim} should reject a packing-incomplete row")
+            }
+            Err(message) => message,
+        };
+        assert!(
+            message.to_string().contains("packing quantum"),
+            "bits={bits} embed_dim={embed_dim}: unexpected error: {message}"
+        );
+    }
+}
+
+#[test]
+fn test_embedding_gather_rejects_wrong_io_dtypes() {
+    let (device, mut registry) = setup();
+    let buf = device.alloc_buffer(64, DType::U32, vec![16]).expect("buf");
+    let wrong_ids = device.alloc_buffer(4, DType::F32, vec![1]).expect("ids");
+    let wrong_output = device.alloc_buffer(32, DType::U32, vec![8]).expect("out");
+    let params = EmbeddingGatherParams {
+        embed_dim: 8,
+        group_size: 8,
+        bits: 4,
+        n_tokens: 1,
+    };
+
+    let mut encoder = device.command_encoder().expect("enc");
+    let ids_error = embedding_gather(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &buf,
+        &buf,
+        &buf,
+        &wrong_ids,
+        &wrong_output,
+        &params,
+    )
+    .expect_err("non-u32 token ids must fail");
+    assert!(ids_error.to_string().contains("token_ids must be u32"));
+
+    let output_error = embedding_gather(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &buf,
+        &buf,
+        &buf,
+        &buf,
+        &wrong_output,
+        &params,
+    )
+    .expect_err("non-f32 output must fail");
+    assert!(output_error.to_string().contains("output must be f32"));
+}

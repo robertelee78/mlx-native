@@ -118,6 +118,19 @@ pub fn quantized_matmul_id(
     ids: &MlxBuffer,
     params: &QuantizedMatmulIdParams,
 ) -> Result<MlxBuffer> {
+    if input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id: input must be f32, got {}",
+            input.dtype()
+        )));
+    }
+    if ids.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id: ids must be u32, got {}",
+            ids.dtype()
+        )));
+    }
+
     // --- Validate bits ---
     if params.bits != 4 && params.bits != 6 && params.bits != 8 {
         return Err(MlxError::InvalidArgument(format!(
@@ -271,8 +284,8 @@ pub fn quantized_matmul_id(
 /// output, validation checks `output.byte_len() >= M *
 /// n_expert_used * N * sizeof(f32)`.
 ///
-/// Unsupported `bits`/dimension combinations return the same
-/// `MlxError::InvalidArgument` errors as the parent.
+/// Invalid I/O dtypes and unsupported `bits`/dimension combinations return
+/// `MlxError::InvalidArgument` before any command is encoded.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_matmul_id_into(
     encoder: &mut CommandEncoder,
@@ -286,6 +299,25 @@ pub fn quantized_matmul_id_into(
     output: &MlxBuffer,
     params: &QuantizedMatmulIdParams,
 ) -> Result<()> {
+    if input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: input must be f32, got {}",
+            input.dtype()
+        )));
+    }
+    if ids.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: ids must be u32, got {}",
+            ids.dtype()
+        )));
+    }
+    if output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_into: output must be f32, got {}",
+            output.dtype()
+        )));
+    }
+
     if params.bits != 4 && params.bits != 6 && params.bits != 8 {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_into: unsupported bits value {}; only 4, 6, and 8 are supported",

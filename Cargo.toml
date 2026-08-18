@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.10.10"
+version = "0.10.11"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
@@ -12,7 +12,7 @@ documentation = "https://docs.rs/mlx-native"
 readme = "README.md"
 keywords = ["metal", "gpu", "mlx", "inference", "apple-silicon"]
 categories = ["os::macos-apis", "science"]
-exclude = [".claude/", ".agents/", "AGENTS.md", "CLAUDE.md.pre-ruflo", "_bmad/", "_bmad-output/", "docs/", "!docs/command-buffer-autorelease-lifetime-2026-08-08.md", ".github/"]
+exclude = [".claude/", ".agents/", "AGENTS.md", "CLAUDE.md.pre-ruflo", "_bmad/", "_bmad-output/", "docs/", "!docs/command-buffer-autorelease-lifetime-2026-08-08.md", ".github/", "**/*.bak"]
 
 [package.metadata.docs.rs]
 default-target = "aarch64-apple-darwin"
