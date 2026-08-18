@@ -37,6 +37,8 @@ scalar production kernel for Qwen3.8 geometry Hq=24, Hkv=4, D=256 across:
   128, spanning NSG 1 and 4;
 - TQ8 at kL=2,049/NSG=2 and kL=8,192/NSG=4, where each case processes
   multiple 32-token KV chunks in at least one simdgroup;
+- TQ8 at kL=128 with a larger 256-token physical capacity, proving the
+  capacity-strided cache layout remains bit-identical;
 - valid prewarm compilation for TQ5, TQ6, and TQ8;
 - fail-fast prewarm rejection for codebook widths 0, 4, 7, and 9.
 

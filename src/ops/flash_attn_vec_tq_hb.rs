@@ -52,6 +52,7 @@ pub fn register(registry: &mut KernelRegistry) {
 /// group. This explicit API keeps model-specific crossover policy out of the
 /// family-neutral Metal primitive.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum GqaTile {
     Q2,
 }
@@ -73,7 +74,7 @@ impl GqaTile {
 /// Compile the selected GQA-specialized pipeline before the first decode.
 ///
 /// TQ-HB uses an integer Metal function constant for its codebook width, so
-/// the generic bool-only registry prewarm API cannot compile this variant.
+/// this uses the registry's typed function-constant pipeline path directly.
 /// Model runtimes should call this during their ordinary warmup window when
 /// they intend to select the cooperative kernel only at longer KV lengths.
 pub fn prewarm_gqa_tile(

@@ -58,12 +58,22 @@ fn u8_buffer(device: &MlxDevice, values: &[u8], shape: Vec<usize>) -> mlx_native
 }
 
 fn run_case(kv_seq_len: u32, nsg: u32, codebook_bits: u32, tile: GqaTile) {
+    run_case_with_capacity(kv_seq_len, kv_seq_len, nsg, codebook_bits, tile);
+}
+
+fn run_case_with_capacity(
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    nsg: u32,
+    codebook_bits: u32,
+    tile: GqaTile,
+) {
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
     flash_attn_vec_tq_hb::register(&mut registry);
     mlx_native::ops::flash_attn_vec::register(&mut registry);
 
-    let cap = kv_seq_len as usize;
+    let cap = kv_capacity as usize;
     let mut rng = Xor::new(0xC001_D00D ^ kv_seq_len as u64 ^ ((nsg as u64) << 32));
     let q: Vec<f32> = (0..(NH * HD)).map(|_| rng.signed()).collect();
     let kv_elements = NKV as usize * cap * HD as usize;
@@ -107,7 +117,7 @@ fn run_case(kv_seq_len: u32, nsg: u32, codebook_bits: u32, tile: GqaTile) {
         num_kv_heads: NKV,
         head_dim: HD,
         kv_seq_len,
-        kv_capacity: kv_seq_len,
+        kv_capacity,
         scale: 1.0 / (HD as f32).sqrt(),
         mask_type: 0,
         sliding_window: 0,
@@ -172,6 +182,7 @@ fn qwen38_q2_matches_legacy_at_boundaries_and_nsg_modes() {
             run_case(kv_seq_len, nsg, codebook_bits, GqaTile::Q2);
         }
     }
+    run_case_with_capacity(128, 256, 4, 8, GqaTile::Q2);
 }
 
 #[test]
