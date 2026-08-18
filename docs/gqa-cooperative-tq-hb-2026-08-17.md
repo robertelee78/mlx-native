@@ -1,9 +1,8 @@
 # GQA-cooperative TQ-HB decode attention
 
 Date: 2026-08-17; evidence refreshed 2026-08-18
-Status: Q2 primitive merged on `main` and included in the 0.10.9 release
-candidate; registry publication and downstream hf2q end-to-end gates are
-pending
+Status: Q2 primitive published in `mlx-native` 0.10.9; downstream hf2q
+end-to-end gates are pending
 
 ## Problem and hypothesis
 
@@ -90,14 +89,20 @@ process-to-process sustained-load dispersion was not measured.
 
 Before enabling this primitive in hf2q:
 
-1. Publish and byte-verify `mlx-native` 0.10.9. The merged source is not yet a
-   consumable hf2q dependency until the immutable registry artifact verifies.
-2. Run Qwen3.8-27B at short and approximately 105K context with identical
+1. Run Qwen3.8-27B at short and approximately 105K context with identical
    prompt, sampling, cache, and artifact settings.
-3. Require exact greedy output/tool semantics, at least 15% end-to-end decode
+2. Require exact greedy output/tool semantics, at least 15% end-to-end decode
    improvement at 105K, and no more than 2% short-context regression. If the
    short gate fails, hf2q must route to the scalar kernel below a measured
    crossover.
+
+The immutable dependency gate is complete. Release workflow
+`32120737230` tested exact source and the packed archive, published version
+0.10.9, retested the downloaded registry archive, and verified both release
+surfaces. Tag `v0.10.9` resolves to
+`2bdf51b8b94a10aefc51a8a756b6e83f17773fa9`; crates.io and the GitHub release
+asset are byte-identical with SHA-256
+`5eb643eb35bcf582202a4534bdd4baa609ff51d8ca5c4203ce5cf2683e9ed323`.
 
 The two-dimensional query-position x query-head verifier needed for
 speculative decoding is a separate follow-up. It must earn its own parity and
