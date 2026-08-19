@@ -134,6 +134,16 @@ fn expected_prefill_state(
         }
     }
     let offset = if overlap { ratio } else { 0 };
+    if cutoff >= ratio {
+        for token in 0..ratio {
+            copy(
+                offset + token,
+                cutoff - ratio + token,
+                &mut kv_state,
+                &mut score_state,
+            );
+        }
+    }
     for token in cutoff..seq {
         copy(
             offset + token - cutoff,
@@ -170,6 +180,17 @@ fn assert_state(got: &[f32], want: &[f32], label: &str) {
     for (index, (got, want)) in got.iter().zip(want).enumerate() {
         assert!(
             got.to_bits() == want.to_bits() || (got - want).abs() <= 1e-6,
+            "{label}[{index}] {got} != {want}"
+        );
+    }
+}
+
+fn assert_state_exact(got: &[f32], want: &[f32], label: &str) {
+    assert_eq!(got.len(), want.len());
+    for (index, (got, want)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
             "{label}[{index}] {got} != {want}"
         );
     }
@@ -371,10 +392,59 @@ fn run_ratio_case(ratio: usize, dim: usize, prefill: usize, total: usize) {
         &expected_score_state,
         "batched append score state",
     );
+    assert_state_exact(
+        batched_kv_state.as_slice().unwrap(),
+        kv_state.as_slice().unwrap(),
+        "aligned append versus token-wise kv state",
+    );
+    assert_state_exact(
+        batched_score_state.as_slice().unwrap(),
+        score_state.as_slice().unwrap(),
+        "aligned append versus token-wise score state",
+    );
     assert_bf16_equal(
         &read_bf16(&batched_cache, cache_len * dim),
         &read_bf16(&cache, cache_len * dim),
         "batched append cache",
+    );
+
+    let direct_kv_state = f32_buffer(
+        &device,
+        &vec![7.0; state_len],
+        vec![1, coff * ratio, projected],
+    );
+    let direct_score_state = f32_buffer(
+        &device,
+        &vec![7.0; state_len],
+        vec![1, coff * ratio, projected],
+    );
+    let direct_cache = bf16_buffer(
+        &device,
+        &vec![bf16::ZERO; cache_len * dim],
+        vec![1, cache_len, dim],
+    );
+    let _direct_output = dispatch(
+        0,
+        total,
+        &direct_kv_state,
+        &direct_score_state,
+        &direct_cache,
+        &mut registry,
+    );
+    assert_state_exact(
+        direct_kv_state.as_slice().unwrap(),
+        batched_kv_state.as_slice().unwrap(),
+        "one-shot versus aligned append kv state",
+    );
+    assert_state_exact(
+        direct_score_state.as_slice().unwrap(),
+        batched_score_state.as_slice().unwrap(),
+        "one-shot versus aligned append score state",
+    );
+    assert_bf16_equal(
+        &read_bf16(&direct_cache, cache_len * dim),
+        &read_bf16(&batched_cache, cache_len * dim),
+        "one-shot versus aligned append cache",
     );
 }
 

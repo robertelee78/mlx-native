@@ -325,40 +325,40 @@ kernel void deepseek_compressor_bf16(
         return;
     }
 
-    // Prefill owns state initialization/update in block zero. Other blocks
-    // consume input directly, so no cross-threadgroup state dependency exists.
+    // Prefill owns state initialization/update in block zero. Publish the
+    // complete token-serial ring image: inactive current slots retain the
+    // corresponding row from the latest completed group. Other blocks consume
+    // input directly, so no cross-threadgroup state dependency exists.
     if (p.start_pos == 0 && block == 0) {
-        const uint state_count = coff * p.ratio * projected;
-        for (uint i = tid; i < state_count; i += COMP_THREADS) {
-            kv_state[state_batch + i] = 0.0f;
-            score_state[state_batch + i] = -INFINITY;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint cutoff = p.seq_len - p.seq_len % p.ratio;
         const uint remainder = p.seq_len - cutoff;
-        if (overlap && cutoff >= p.ratio) {
-            const uint copy_count = p.ratio * projected;
-            for (uint i = tid; i < copy_count; i += COMP_THREADS) {
-                const uint token_in_block = i / projected;
-                const uint feature = i % projected;
-                const ulong src = input_batch + ulong(cutoff - p.ratio + token_in_block) * projected + feature;
+        const bool has_completed = cutoff >= p.ratio;
+        const uint completed_start = has_completed ? cutoff - p.ratio : 0;
+        const uint state_count = coff * p.ratio * projected;
+        for (uint i = tid; i < state_count; i += COMP_THREADS) {
+            const uint state_row = i / projected;
+            const uint feature = i % projected;
+            const uint token = state_row % p.ratio;
+            const bool current_half = !overlap || state_row >= p.ratio;
+            uint source_row = 0;
+            bool has_source = false;
+            if (current_half && token < remainder) {
+                source_row = cutoff + token;
+                has_source = true;
+            } else if (has_completed) {
+                source_row = completed_start + token;
+                has_source = true;
+            }
+            if (has_source) {
+                const ulong src = input_batch + ulong(source_row) * projected + feature;
                 const float v = kv[src];
-                const float s = score[src] + ape[token_in_block * projected + feature];
+                const float s = score[src] + ape[token * projected + feature];
                 kv_state[state_batch + i] = safe_state_value(v);
                 score_state[state_batch + i] = isfinite(s) && isfinite(v) ? s : NAN;
+            } else {
+                kv_state[state_batch + i] = 0.0f;
+                score_state[state_batch + i] = -INFINITY;
             }
-        }
-        const uint offset = overlap ? p.ratio : 0;
-        const uint copy_count = remainder * projected;
-        for (uint i = tid; i < copy_count; i += COMP_THREADS) {
-            const uint token = i / projected;
-            const uint feature = i % projected;
-            const ulong src = input_batch + ulong(cutoff + token) * projected + feature;
-            const ulong dst = state_batch + ulong(offset + token) * projected + feature;
-            const float v = kv[src];
-            const float s = score[src] + ape[token * projected + feature];
-            kv_state[dst] = safe_state_value(v);
-            score_state[dst] = isfinite(s) && isfinite(v) ? s : NAN;
         }
     }
 
