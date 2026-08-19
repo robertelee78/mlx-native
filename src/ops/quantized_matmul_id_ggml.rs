@@ -13,8 +13,12 @@
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::dtypes::DType;
-use crate::encoder::{CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg, as_bytes};
+use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
+use crate::ggml_capability::{
+    ggml_expert_bytes, plan_expert_auto_route, ExpertAutoPlan, GgmlRoutingPolicy,
+    GgmlTensorMmPreference,
+};
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_id_mv.
@@ -27,24 +31,32 @@ use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
+fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
+    factors.iter().try_fold(1usize, |total, factor| {
+        total.checked_mul(*factor).ok_or_else(|| {
+            MlxError::InvalidArgument(format!("quantized_matmul_id_ggml: {label} size overflow"))
+        })
+    })
+}
+
 // ---- GPU params struct ----
 
 /// GPU-side params struct — must match the Metal shader's `GgmlMatvecIdParams`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GgmlMatvecIdGpuParams {
-    ne00: i64,           // K
-    ne01: i64,           // N
-    ne02: i64,           // 1 (unused)
-    ne10: i64,           // K
-    ne12: i64,           // 1 (unused)
-    ne0: i64,            // N (output stride)
-    ne1: i64,            // total output rows = n_tokens * top_k
-    r2: u32,             // 1
-    r3: u32,             // 1
-    top_k: u32,          // experts per token
-    n_tokens: u32,       // number of input tokens
-    expert_stride: i64,  // bytes between expert weight slices
+    ne00: i64,          // K
+    ne01: i64,          // N
+    ne02: i64,          // 1 (unused)
+    ne10: i64,          // K
+    ne12: i64,          // 1 (unused)
+    ne0: i64,           // N (output stride)
+    ne1: i64,           // total output rows = n_tokens * top_k
+    r2: u32,            // 1
+    r3: u32,            // 1
+    top_k: u32,         // experts per token
+    n_tokens: u32,      // number of input tokens
+    expert_stride: i64, // bytes between expert weight slices
 }
 
 // ---- Public types ----
@@ -148,6 +160,23 @@ fn has_mm_id_map0(top_k: u32) -> bool {
     matches!(top_k, 1 | 6 | 8)
 }
 
+fn required_expert_weight_bytes(
+    ggml_type: GgmlType,
+    n_experts: u32,
+    n: u32,
+    k: u32,
+    expert_stride: u64,
+) -> Result<usize> {
+    if expert_stride > i64::MAX as u64 {
+        return Err(MlxError::InvalidArgument(
+            "expert stride exceeds the signed Metal kernel ABI".into(),
+        ));
+    }
+    let bytes = ggml_expert_bytes(ggml_type, n_experts, n, k, expert_stride)?;
+    usize::try_from(bytes)
+        .map_err(|_| MlxError::InvalidArgument("expert GGUF bytes exceed usize".into()))
+}
+
 /// One-shot probe for mm_id tensor-API availability.  Cached separately
 /// from the dense-mm probe in quantized_matmul_ggml.rs because these are
 /// distinct shader files; whichever runs first pays its own compile cost.
@@ -155,24 +184,35 @@ static TENSOR_MM_ID_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::
 
 fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     *TENSOR_MM_ID_AVAILABLE.get_or_init(|| {
-        // ADR-013 P17 — env-gate to force the simdgroup variant for A/B
-        // bench. llama.cpp does NOT use a tensor-API path for K-quants
-        // (only f32/f16/bf16), so for Q4_K/Q5_K/Q6_K the tensor variant
-        // is our addition and may be slower than the simdgroup MMA path.
-        if std::env::var("HF2Q_DISABLE_TENSOR_MM_ID").is_ok() {
-            if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
-                eprintln!("[mlx-native] tensor_mm_id: DISABLED via HF2Q_DISABLE_TENSOR_MM_ID");
-            }
-            return false;
-        }
         let ok = registry
             .get_pipeline("kernel_mul_mm_id_q4_0_tensor_f32", device.metal_device())
             .is_ok();
         if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
-            eprintln!("[mlx-native] tensor_mm_id probe: {}", if ok { "OK (using tensor variant for MoE)" } else { "FAILED (falling back to simdgroup MMA)" });
+            eprintln!(
+                "[mlx-native] tensor_mm_id probe: {}",
+                if ok {
+                    "OK (using tensor variant for MoE)"
+                } else {
+                    "FAILED (falling back to simdgroup MMA)"
+                }
+            );
         }
         ok
     })
+}
+
+fn expert_routing_policy_from_environment() -> GgmlRoutingPolicy {
+    GgmlRoutingPolicy {
+        expert_mm_threshold: mm_id_routing_threshold(),
+        expert_q6k_mv_nr2: cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2"),
+        expert_q8_0_mv_nr2: cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2"),
+        expert_tensor_mm: if std::env::var("HF2Q_DISABLE_TENSOR_MM_ID").is_ok() {
+            GgmlTensorMmPreference::ForceSimd
+        } else {
+            GgmlTensorMmPreference::AutoProbe
+        },
+        ..GgmlRoutingPolicy::default()
+    }
 }
 
 /// Encode an expert-routed GGML quantized matrix-vector multiply.
@@ -210,8 +250,27 @@ pub fn quantized_matmul_id_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    let routing = expert_routing_policy_from_environment();
+    quantized_matmul_id_ggml_with_policy(
+        encoder, registry, device, input, weight, ids, output, params, &routing,
+    )
+}
+
+/// Expert auto-dispatch under an explicit receipt-bindable routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
     quantized_matmul_id_ggml_impl(
-        encoder, registry, device, input, weight, ids, output, params, false,
+        encoder, registry, device, input, weight, ids, output, params, false, routing,
     )
 }
 
@@ -235,8 +294,27 @@ pub fn quantized_matmul_id_ggml_mv(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    let routing = expert_routing_policy_from_environment();
+    quantized_matmul_id_ggml_mv_with_policy(
+        encoder, registry, device, input, weight, ids, output, params, &routing,
+    )
+}
+
+/// Forced expert matvec under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
     quantized_matmul_id_ggml_impl(
-        encoder, registry, device, input, weight, ids, output, params, true,
+        encoder, registry, device, input, weight, ids, output, params, true, routing,
     )
 }
 
@@ -251,9 +329,9 @@ fn quantized_matmul_id_ggml_impl(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
     force_mv: bool,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     let qk = params.ggml_type.block_values();
-    let block_bytes = params.ggml_type.block_bytes();
 
     // --- Validate dimensions ---
     if params.n_tokens == 0 || params.k == 0 || params.n == 0 {
@@ -261,9 +339,9 @@ fn quantized_matmul_id_ggml_impl(
             "quantized_matmul_id_ggml: n_tokens, K, and N must all be > 0".into(),
         ));
     }
-    if params.top_k == 0 {
+    if params.top_k == 0 || params.top_k > params.n_experts {
         return Err(MlxError::InvalidArgument(
-            "quantized_matmul_id_ggml: top_k must be > 0".into(),
+            "quantized_matmul_id_ggml: top_k must be in 1..=n_experts".into(),
         ));
     }
     if params.n_experts == 0 {
@@ -279,49 +357,54 @@ fn quantized_matmul_id_ggml_impl(
     }
 
     // --- Validate buffer sizes ---
-    let expected_input_bytes =
-        (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of();
-    if input.byte_len() < expected_input_bytes {
+    let expected_input_bytes = checked_byte_extent(
+        "input",
+        &[
+            params.n_tokens as usize,
+            params.k as usize,
+            DType::F32.size_of(),
+        ],
+    )?;
+    if input.data_byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml: input buffer too small: expected {} bytes for [{} x {}] f32, got {}",
-            expected_input_bytes, params.n_tokens, params.k, input.byte_len()
+            expected_input_bytes, params.n_tokens, params.k, input.data_byte_len()
         )));
     }
 
-    let blocks_per_row = params.k / qk;
-    let per_expert_bytes =
-        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
-
-    // Validate expert_stride is sane
-    if params.expert_stride < per_expert_bytes as u64 {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_id_ggml: expert_stride ({}) < per_expert_bytes ({})",
-            params.expert_stride, per_expert_bytes
-        )));
-    }
-
-    let total_weight_bytes = per_expert_bytes * (params.n_experts as usize);
-    if weight.byte_len() < total_weight_bytes {
+    let total_weight_bytes = required_expert_weight_bytes(
+        params.ggml_type,
+        params.n_experts,
+        params.n,
+        params.k,
+        params.expert_stride,
+    )?;
+    if weight.data_byte_len() < total_weight_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml: weight buffer too small: expected {} bytes for {} experts, got {}",
-            total_weight_bytes, params.n_experts, weight.byte_len()
+            total_weight_bytes, params.n_experts, weight.data_byte_len()
         )));
     }
 
-    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
-    let expected_ids_bytes = total_rows * DType::U32.size_of();
-    if ids.byte_len() < expected_ids_bytes {
+    let total_rows = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("expert row count overflow".into()))?;
+    let expected_ids_bytes = checked_byte_extent("ids", &[total_rows, DType::U32.size_of()])?;
+    if ids.data_byte_len() < expected_ids_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml: ids buffer too small: expected {} bytes for [{} * {}] u32, got {}",
-            expected_ids_bytes, params.n_tokens, params.top_k, ids.byte_len()
+            expected_ids_bytes, params.n_tokens, params.top_k, ids.data_byte_len()
         )));
     }
 
-    let expected_output_bytes = total_rows * (params.n as usize) * DType::F32.size_of();
-    if output.byte_len() < expected_output_bytes {
+    let expected_output_bytes = checked_byte_extent(
+        "output",
+        &[total_rows, params.n as usize, DType::F32.size_of()],
+    )?;
+    if output.data_byte_len() < expected_output_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml: output buffer too small: expected {} bytes for [{} x {}] f32, got {}",
-            expected_output_bytes, total_rows, params.n, output.byte_len()
+            expected_output_bytes, total_rows, params.n, output.data_byte_len()
         )));
     }
 
@@ -344,10 +427,8 @@ fn quantized_matmul_id_ggml_impl(
     //   * K < 32 (mm tile requires NK=32)
     // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
     // ADR-022 Phase 2 — Q5_K mm_id ported.
-    if !force_mv
-        && params.n_tokens > mm_id_routing_threshold()
-        && has_mm_id_map0(params.top_k)
-        && params.k >= 32
+    if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, force_mv, routing)
+        == ExpertAutoPlan::Mm
     {
         // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
         // engages on prefill. `HF2Q_LOG_MM_ID_ROUTE=1` enables the line.
@@ -364,11 +445,13 @@ fn quantized_matmul_id_ggml_impl(
             );
         }
         return dispatch_id_mm(
-            encoder, registry, device, input, weight, ids, output, params,
+            encoder, registry, device, input, weight, ids, output, params, routing,
         );
     }
 
-    dispatch_id_mv(encoder, registry, device, input, weight, ids, output, params)
+    dispatch_id_mv(
+        encoder, registry, device, input, weight, ids, output, params, routing,
+    )
 }
 
 /// Same contract as `quantized_matmul_id_ggml`, but takes caller-owned
@@ -392,6 +475,26 @@ pub fn quantized_matmul_id_ggml_pooled(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    let routing = expert_routing_policy_from_environment();
+    quantized_matmul_id_ggml_pooled_with_policy(
+        encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
+    )
+}
+
+/// Caller-scratch expert dispatch under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
     quantized_matmul_id_ggml_pooled_impl(
         encoder,
         registry,
@@ -403,6 +506,7 @@ pub fn quantized_matmul_id_ggml_pooled(
         scratch,
         params,
         IdMmInputLayout::SharedPerToken,
+        routing,
     )
 }
 
@@ -434,21 +538,57 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    if params.n_tokens <= mm_id_routing_threshold()
-        || !has_mm_id_map0(params.top_k)
-        || params.k < 32
+    let routing = expert_routing_policy_from_environment();
+    quantized_matmul_id_ggml_pooled_pair_with_policy(
+        encoder,
+        registry,
+        device,
+        input,
+        first_weight,
+        second_weight,
+        ids,
+        first_output,
+        second_output,
+        scratch,
+        params,
+        &routing,
+    )
+}
+
+/// Paired expert-MM dispatch under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_pair_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    first_weight: &MlxBuffer,
+    second_weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    first_output: &MlxBuffer,
+    second_output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
+    if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, false, routing)
+        != ExpertAutoPlan::Mm
     {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_pooled_pair requires the mm_id route: n_tokens={} threshold={} top_k={} k={}",
             params.n_tokens,
-            mm_id_routing_threshold(),
+            routing.expert_mm_threshold,
             params.top_k,
             params.k,
         )));
     }
-    if params.n == 0 || params.n_experts == 0 {
+    if params.n == 0
+        || params.n_experts == 0
+        || params.top_k == 0
+        || params.top_k > params.n_experts
+    {
         return Err(MlxError::InvalidArgument(
-            "quantized_matmul_id_ggml_pooled_pair requires N and n_experts > 0".into(),
+            "quantized_matmul_id_ggml_pooled_pair requires N > 0 and top_k in 1..=n_experts".into(),
         ));
     }
 
@@ -462,23 +602,13 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
             params.k, qk,
         )));
     }
-    let blocks_per_row = params.k / qk;
-    let per_expert_bytes = (params.n as usize)
-        .checked_mul(blocks_per_row as usize)
-        .and_then(|rows| rows.checked_mul(params.ggml_type.block_bytes() as usize))
-        .ok_or_else(|| MlxError::InvalidArgument("pair weight byte count overflow".into()))?;
-    if (params.expert_stride as usize) < per_expert_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "expert_stride ({}) < per_expert_bytes ({})",
-            params.expert_stride, per_expert_bytes,
-        )));
-    }
-    let last_expert_offset = (params.n_experts.saturating_sub(1) as usize)
-        .checked_mul(params.expert_stride as usize)
-        .ok_or_else(|| MlxError::InvalidArgument("pair expert stride overflow".into()))?;
-    let total_weight_bytes = last_expert_offset
-        .checked_add(per_expert_bytes)
-        .ok_or_else(|| MlxError::InvalidArgument("pair total weight byte count overflow".into()))?;
+    let total_weight_bytes = required_expert_weight_bytes(
+        params.ggml_type,
+        params.n_experts,
+        params.n,
+        params.k,
+        params.expert_stride,
+    )?;
     for (name, weight) in [("first", first_weight), ("second", second_weight)] {
         if weight.data_byte_len() < total_weight_bytes {
             return Err(MlxError::InvalidArgument(format!(
@@ -547,13 +677,11 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
     }
 
     let range = |buffer: &MlxBuffer, extent: usize| {
-        let start = (buffer.contents_ptr() as usize)
-            .saturating_add(buffer.byte_offset() as usize);
+        let start = (buffer.contents_ptr() as usize).saturating_add(buffer.byte_offset() as usize);
         (start, start.saturating_add(extent))
     };
-    let overlaps = |left: (usize, usize), right: (usize, usize)| {
-        left.0 < right.1 && right.0 < left.1
-    };
+    let overlaps =
+        |left: (usize, usize), right: (usize, usize)| left.0 < right.1 && right.0 < left.1;
     let first_output_range = range(first_output, expected_output_bytes);
     let second_output_range = range(second_output, expected_output_bytes);
     if overlaps(first_output_range, second_output_range) {
@@ -620,6 +748,7 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
         params,
         IdMmInputLayout::SharedPerToken,
         false,
+        routing,
     )?;
     dispatch_id_mm_pooled_with_layout(
         encoder,
@@ -633,6 +762,7 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
         params,
         IdMmInputLayout::SharedPerToken,
         true,
+        routing,
     )
 }
 
@@ -660,6 +790,26 @@ pub fn quantized_matmul_id_ggml_pooled_slotted(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
+    let routing = expert_routing_policy_from_environment();
+    quantized_matmul_id_ggml_pooled_slotted_with_policy(
+        encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
+    )
+}
+
+/// Slotted caller-scratch expert MM under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_slotted_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
     quantized_matmul_id_ggml_pooled_impl(
         encoder,
         registry,
@@ -671,6 +821,7 @@ pub fn quantized_matmul_id_ggml_pooled_slotted(
         scratch,
         params,
         IdMmInputLayout::Slotted,
+        routing,
     )
 }
 
@@ -692,6 +843,7 @@ fn quantized_matmul_id_ggml_pooled_impl(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
     input_layout: IdMmInputLayout,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     // Mirror the validation + routing logic from `quantized_matmul_id_ggml`
     // so the pooled path has identical correctness invariants.  (We keep
@@ -699,16 +851,15 @@ fn quantized_matmul_id_ggml_pooled_impl(
     // because the scratch is only relevant on the mm_id branch — lifting
     // scratch into the mv branch would add unused parameters.)
     let qk = params.ggml_type.block_values();
-    let block_bytes = params.ggml_type.block_bytes();
 
     if params.n_tokens == 0 || params.k == 0 || params.n == 0 {
         return Err(MlxError::InvalidArgument(
             "quantized_matmul_id_ggml_pooled: n_tokens, K, and N must all be > 0".into(),
         ));
     }
-    if params.top_k == 0 {
+    if params.top_k == 0 || params.top_k > params.n_experts {
         return Err(MlxError::InvalidArgument(
-            "quantized_matmul_id_ggml_pooled: top_k must be > 0".into(),
+            "quantized_matmul_id_ggml_pooled: top_k must be in 1..=n_experts".into(),
         ));
     }
     if params.n_experts == 0 {
@@ -733,46 +884,46 @@ fn quantized_matmul_id_ggml_pooled_impl(
         .checked_mul(params.k as usize)
         .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
         .ok_or_else(|| MlxError::InvalidArgument("input byte count overflow".into()))?;
-    if input.byte_len() < expected_input_bytes {
+    if input.data_byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_pooled: input buffer too small: expected {} bytes for [{} x {}] f32 {:?} input, got {}",
-            expected_input_bytes, input_rows, params.k, input_layout, input.byte_len()
+            expected_input_bytes, input_rows, params.k, input_layout, input.data_byte_len()
         )));
     }
 
-    let blocks_per_row = params.k / qk;
-    let per_expert_bytes =
-        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
-
-    if params.expert_stride < per_expert_bytes as u64 {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_id_ggml_pooled: expert_stride ({}) < per_expert_bytes ({})",
-            params.expert_stride, per_expert_bytes
-        )));
-    }
-
-    let total_weight_bytes = per_expert_bytes * (params.n_experts as usize);
-    if weight.byte_len() < total_weight_bytes {
+    let total_weight_bytes = required_expert_weight_bytes(
+        params.ggml_type,
+        params.n_experts,
+        params.n,
+        params.k,
+        params.expert_stride,
+    )?;
+    if weight.data_byte_len() < total_weight_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_pooled: weight buffer too small: expected {} bytes for {} experts, got {}",
-            total_weight_bytes, params.n_experts, weight.byte_len()
+            total_weight_bytes, params.n_experts, weight.data_byte_len()
         )));
     }
 
-    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
-    let expected_ids_bytes = total_rows * DType::U32.size_of();
-    if ids.byte_len() < expected_ids_bytes {
+    let total_rows = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("expert row count overflow".into()))?;
+    let expected_ids_bytes = checked_byte_extent("ids", &[total_rows, DType::U32.size_of()])?;
+    if ids.data_byte_len() < expected_ids_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_pooled: ids buffer too small: expected {} bytes for [{} * {}] u32, got {}",
-            expected_ids_bytes, params.n_tokens, params.top_k, ids.byte_len()
+            expected_ids_bytes, params.n_tokens, params.top_k, ids.data_byte_len()
         )));
     }
 
-    let expected_output_bytes = total_rows * (params.n as usize) * DType::F32.size_of();
-    if output.byte_len() < expected_output_bytes {
+    let expected_output_bytes = checked_byte_extent(
+        "output",
+        &[total_rows, params.n as usize, DType::F32.size_of()],
+    )?;
+    if output.data_byte_len() < expected_output_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_pooled: output buffer too small: expected {} bytes for [{} x {}] f32, got {}",
-            expected_output_bytes, total_rows, params.n, output.byte_len()
+            expected_output_bytes, total_rows, params.n, output.data_byte_len()
         )));
     }
 
@@ -783,9 +934,8 @@ fn quantized_matmul_id_ggml_pooled_impl(
     // ADR-022 AC-4: env-gated trace (HF2Q_LOG_MM_ID_ROUTE=1) confirms mm_id
     // engagement on the qwen35 prefill path which goes through this pooled
     // entry, not the auto entry above.
-    if params.n_tokens > mm_id_routing_threshold()
-        && has_mm_id_map0(params.top_k)
-        && params.k >= 32
+    if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, false, routing)
+        == ExpertAutoPlan::Mm
     {
         if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
             eprintln!(
@@ -811,18 +961,19 @@ fn quantized_matmul_id_ggml_pooled_impl(
             params,
             input_layout,
             false,
+            routing,
         );
     }
 
     if input_layout == IdMmInputLayout::Slotted {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_pooled_slotted requires the mm_id route: n_tokens={} threshold={} top_k={} k={}",
-            params.n_tokens, mm_id_routing_threshold(), params.top_k, params.k,
+            params.n_tokens, routing.expert_mm_threshold, params.top_k, params.k,
         )));
     }
 
     dispatch_id_mv(
-        encoder, registry, device, input, weight, ids, output, params,
+        encoder, registry, device, input, weight, ids, output, params, routing,
     )
 }
 
@@ -871,6 +1022,7 @@ fn dispatch_id_mv(
     ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
 
@@ -879,15 +1031,13 @@ fn dispatch_id_mv(
     //
     // ADR-028 default-flipped to ON (operator REFRAME #2).
     // Opt out with `HF2Q_Q6K_ID_MV_NR2=0` / `=false` / `=off`.
-    let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
-        && cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2");
+    let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K) && routing.expert_q6k_mv_nr2;
     // ADR-029 — nr0=2 nsg=4 variant for q8_0 _id mat-vec.
     // Matches peer's N_R0_Q8_0=2 + N_SG_Q8_0=4 in ggml-metal-impl.h:27,40.
     // gemma4 APEX-Q5_K_M MoE down_exps is Q8_0 → 30 dispatches/decode-tok
     // on this path.  Opt-in via `HF2Q_Q8_0_ID_MV_NR2=1`; default-off
     // until coherence + bench validation. Cached via AtomicI8.
-    let use_q8_0_id_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
-        && cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2");
+    let use_q8_0_id_nr2 = matches!(params.ggml_type, GgmlType::Q8_0) && routing.expert_q8_0_mv_nr2;
     let kernel_name = if use_q6k_id_nr2 {
         "kernel_mul_mv_id_q6_K_f32_nr2"
     } else if use_q8_0_id_nr2 {
@@ -974,11 +1124,7 @@ fn dispatch_id_mv(
     // this dispatch shape better via y than z — 7th confirmed static-
     // evidence kernel hypothesis falsified per
     // `project_metal_compiler_auto_optimizes_static_levers.md`.
-    let threadgroups = metal::MTLSize::new(
-        div_ceil(n, align) as u64,
-        m as u64,
-        1,
-    );
+    let threadgroups = metal::MTLSize::new(div_ceil(n, align) as u64, m as u64, 1);
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
     if use_q8_0_id_nr2 {
@@ -1054,6 +1200,11 @@ pub fn build_q6k_id_nr2_m1_record(
     top_k: u32,
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
+    if expert_stride > i64::MAX as u64 {
+        return Err(MlxError::InvalidArgument(
+            "expert stride exceeds the signed Metal kernel ABI".into(),
+        ));
+    }
     // Only bakeable when the NR2 variant is the selected one — same
     // gate as `dispatch_id_mv`'s `use_q6k_id_nr2` branch.
     if !cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2") {
@@ -1087,11 +1238,8 @@ pub fn build_q6k_id_nr2_m1_record(
     // Q6_K_ID NR2: align=4 rows per TG, threads = (nth0=2, nth1=32, 1)
     // (matches `dispatch_id_mv`'s Q6_K NR2 branch override).
     const ALIGN: u32 = 4;
-    let threadgroups = metal::MTLSize::new(
-        div_ceil(n as usize, ALIGN as usize) as u64,
-        top_k as u64,
-        1,
-    );
+    let threadgroups =
+        metal::MTLSize::new(div_ceil(n as usize, ALIGN as usize) as u64, top_k as u64, 1);
     let threads_per_tg = metal::MTLSize::new(2, 32, 1);
 
     Ok(Some(DispatchRecord {
@@ -1148,6 +1296,11 @@ pub fn build_q8_0_id_decode_record(
     real_top_k: u32,
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
+    if expert_stride > i64::MAX as u64 {
+        return Err(MlxError::InvalidArgument(
+            "expert stride exceeds the signed Metal kernel ABI".into(),
+        ));
+    }
     // Only bakeable when the regular (non-NR2) Q8_0_ID kernel is selected.
     // Mirrors the negation of `dispatch_id_mv`'s `use_q8_0_id_nr2` branch.
     if cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2") {
@@ -1254,14 +1407,14 @@ pub fn quantized_matmul_id_swiglu_q4_0(
     let qk = GgmlType::Q4_0.block_values();
 
     // --- Validate dimensions (mirror quantized_matmul_id_ggml) ---
-    if params.n_tokens == 0 || params.k == 0 || params.n == 0 {
+    if params.n_tokens == 0 || params.k == 0 || params.n == 0 || params.n_experts == 0 {
         return Err(MlxError::InvalidArgument(
-            "quantized_matmul_id_swiglu_q4_0: n_tokens, K, and N must all be > 0".into(),
+            "quantized_matmul_id_swiglu_q4_0: n_tokens, K, N, and n_experts must all be > 0".into(),
         ));
     }
-    if params.top_k == 0 {
+    if params.top_k == 0 || params.top_k > params.n_experts {
         return Err(MlxError::InvalidArgument(
-            "quantized_matmul_id_swiglu_q4_0: top_k must be > 0".into(),
+            "quantized_matmul_id_swiglu_q4_0: top_k must be in 1..=n_experts".into(),
         ));
     }
     if params.k % qk != 0 {
@@ -1271,32 +1424,65 @@ pub fn quantized_matmul_id_swiglu_q4_0(
         )));
     }
 
-    let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
-    let expected_in_bytes = total_rows * (params.k as usize) * DType::F32.size_of();
-    if gate.byte_len() < expected_in_bytes {
+    let expected_weight_bytes = required_expert_weight_bytes(
+        params.ggml_type,
+        params.n_experts,
+        params.n,
+        params.k,
+        params.expert_stride,
+    )?;
+    if weight.data_byte_len() < expected_weight_bytes {
         return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_id_swiglu_q4_0: gate buffer too small: expected {} bytes, got {}",
-            expected_in_bytes, gate.byte_len()
-        )));
-    }
-    if up.byte_len() < expected_in_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_id_swiglu_q4_0: up buffer too small: expected {} bytes, got {}",
-            expected_in_bytes, up.byte_len()
-        )));
-    }
-    let expected_out_bytes = total_rows * (params.n as usize) * DType::F32.size_of();
-    if output.byte_len() < expected_out_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_id_swiglu_q4_0: output buffer too small: expected {} bytes, got {}",
-            expected_out_bytes, output.byte_len()
+            "quantized_matmul_id_swiglu_q4_0: weight buffer too small: expected {} bytes, got {}",
+            expected_weight_bytes,
+            weight.data_byte_len(),
         )));
     }
 
-    let pipeline = registry.get_pipeline(
-        "kernel_mul_mv_id_q4_0_f32_swiglu",
-        device.metal_device(),
+    let total_rows = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("expert row count overflow".into()))?;
+    let expected_in_bytes = checked_byte_extent(
+        "swiglu input",
+        &[total_rows, params.k as usize, DType::F32.size_of()],
     )?;
+    if gate.data_byte_len() < expected_in_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: gate buffer too small: expected {} bytes, got {}",
+            expected_in_bytes,
+            gate.data_byte_len()
+        )));
+    }
+    if up.data_byte_len() < expected_in_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: up buffer too small: expected {} bytes, got {}",
+            expected_in_bytes,
+            up.data_byte_len()
+        )));
+    }
+    let expected_out_bytes = checked_byte_extent(
+        "swiglu output",
+        &[total_rows, params.n as usize, DType::F32.size_of()],
+    )?;
+    if output.data_byte_len() < expected_out_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: output buffer too small: expected {} bytes, got {}",
+            expected_out_bytes,
+            output.data_byte_len()
+        )));
+    }
+    let expected_ids_bytes =
+        checked_byte_extent("swiglu ids", &[total_rows, DType::U32.size_of()])?;
+    if ids.data_byte_len() < expected_ids_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_swiglu_q4_0: ids buffer too small: expected {} bytes, got {}",
+            expected_ids_bytes,
+            ids.data_byte_len(),
+        )));
+    }
+
+    let pipeline =
+        registry.get_pipeline("kernel_mul_mv_id_q4_0_f32_swiglu", device.metal_device())?;
 
     let gpu_params = GgmlMatvecIdGpuParams {
         ne00: params.k as i64,
@@ -1317,11 +1503,7 @@ pub fn quantized_matmul_id_swiglu_q4_0(
     let (nth0, nth1, align) = (8u64, 8u64, 8usize);
     let n = params.n as usize;
     let m = total_rows;
-    let threadgroups = metal::MTLSize::new(
-        div_ceil(n, align) as u64,
-        m as u64,
-        1,
-    );
+    let threadgroups = metal::MTLSize::new(div_ceil(n, align) as u64, m as u64, 1);
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
     encoder.encode_threadgroups_with_args(
@@ -1364,11 +1546,7 @@ pub struct IdMmScratch {
 
 impl IdMmScratch {
     /// Allocate scratch sized to `n_experts * max_n_tokens` u32s.
-    pub fn alloc(
-        device: &MlxDevice,
-        n_experts: u32,
-        max_n_tokens: u32,
-    ) -> Result<Self> {
+    pub fn alloc(device: &MlxDevice, n_experts: u32, max_n_tokens: u32) -> Result<Self> {
         let htpe = device.alloc_buffer(
             (n_experts as usize) * DType::U32.size_of(),
             DType::U32,
@@ -1417,6 +1595,7 @@ fn dispatch_id_mm_pooled(
     output: &MlxBuffer,
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     dispatch_id_mm_pooled_with_layout(
         encoder,
@@ -1430,6 +1609,7 @@ fn dispatch_id_mm_pooled(
         params,
         IdMmInputLayout::SharedPerToken,
         false,
+        routing,
     )
 }
 
@@ -1446,6 +1626,7 @@ fn dispatch_id_mm_pooled_with_layout(
     params: &GgmlQuantizedMatmulIdParams,
     input_layout: IdMmInputLayout,
     schedule_prepared: bool,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     scratch.check_capacity(params.n_experts, params.n_tokens)?;
 
@@ -1475,6 +1656,7 @@ fn dispatch_id_mm_pooled_with_layout(
         &dispatch,
         input_layout,
         schedule_prepared,
+        routing,
     )
 }
 
@@ -1493,12 +1675,20 @@ fn dispatch_id_mm(
     ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     let mut scratch = IdMmScratch::alloc(device, params.n_experts, params.n_tokens)?;
     dispatch_id_mm_pooled(
-        encoder, registry, device,
-        input, weight, ids, output,
-        &mut scratch, params,
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        &mut scratch,
+        params,
+        routing,
     )
 }
 
@@ -1534,13 +1724,13 @@ fn div_ceil(a: usize, b: usize) -> usize {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GgmlIdMmMap0GpuParams {
-    ne10: i32,       // unused, kept for struct symmetry
-    ne11: i32,       // n_expert_used (bcast, == ne20)
-    nb11: u64,       // unused
-    nb12: u64,       // unused
-    ne21: i32,       // n_tokens
-    ne20: i32,       // n_expert_used (top_k)
-    nb21: u64,       // bytes per token in the ids table (= ne20 * sizeof(i32))
+    ne10: i32, // unused, kept for struct symmetry
+    ne11: i32, // n_expert_used (bcast, == ne20)
+    nb11: u64, // unused
+    nb12: u64, // unused
+    ne21: i32, // n_tokens
+    ne20: i32, // n_expert_used (top_k)
+    nb21: u64, // bytes per token in the ids table (= ne20 * sizeof(i32))
 }
 
 /// Host-side params for the `_id` mm kernel.
@@ -1550,21 +1740,21 @@ struct GgmlIdMmMap0GpuParams {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GgmlIdMmMmGpuParams {
-    ne00: i32,   // K
-    ne02: i32,   // n_experts
-    nb01: u64,   // bytes per weight row (within one expert's slab)
-    nb02: u64,   // bytes per expert weight slab (= nb01 * N)
+    ne00: i32, // K
+    ne02: i32, // n_experts
+    nb01: u64, // bytes per weight row (within one expert's slab)
+    nb02: u64, // bytes per expert weight slab (= nb01 * N)
     nb03: u64,
-    ne11: i32,   // n_expert_used (bcast)
+    ne11: i32, // n_expert_used (bcast)
     _pad0: u32,
-    nb10: u64,   // = sizeof(float)
-    nb11: u64,   // bytes per input row (= K * 4)
-    nb12: u64,   // bytes per input batch (= n_tokens * nb11)
+    nb10: u64, // = sizeof(float)
+    nb11: u64, // bytes per input row (= K * 4)
+    nb12: u64, // bytes per input batch (= n_tokens * nb11)
     nb13: u64,
-    ne20: i32,   // n_expert_used (top_k)
-    ne21: i32,   // n_tokens
-    ne0: i32,    // N (per-expert output rows)
-    ne1: i32,    // batch stride (== ne20 for our packed layout)
+    ne20: i32, // n_expert_used (top_k)
+    ne21: i32, // n_tokens
+    ne0: i32,  // N (per-expert output rows)
+    ne1: i32,  // batch stride (== ne20 for our packed layout)
     r2: i16,
     r3: i16,
     _pad1: u32,
@@ -1643,6 +1833,7 @@ pub fn dispatch_id_mm_for_test(
     output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
 ) -> Result<()> {
+    let routing = GgmlRoutingPolicy::default();
     dispatch_id_mm_with_layout(
         encoder,
         registry,
@@ -1656,6 +1847,7 @@ pub fn dispatch_id_mm_for_test(
         params,
         IdMmInputLayout::SharedPerToken,
         false,
+        &routing,
     )
 }
 
@@ -1688,6 +1880,7 @@ pub fn dispatch_id_mm_with_prepared_schedule_for_test(
     output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
 ) -> Result<()> {
+    let routing = GgmlRoutingPolicy::default();
     dispatch_id_mm_with_layout(
         encoder,
         registry,
@@ -1701,6 +1894,7 @@ pub fn dispatch_id_mm_with_prepared_schedule_for_test(
         params,
         IdMmInputLayout::SharedPerToken,
         true,
+        &routing,
     )
 }
 
@@ -1718,6 +1912,7 @@ fn dispatch_id_mm_with_layout(
     params: &GgmlIdMmDispatchParams,
     input_layout: IdMmInputLayout,
     schedule_prepared: bool,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     let qk = params.ggml_type.block_values();
 
@@ -1737,12 +1932,16 @@ fn dispatch_id_mm_with_layout(
         | GgmlType::IQ4_XS => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
-                "dispatch_id_mm_for_test does not support {:?}", other
+                "dispatch_id_mm_for_test does not support {:?}",
+                other
             )));
         }
     }
-    if params.n_tokens == 0 || params.k == 0 || params.n == 0
-        || params.top_k == 0 || params.n_experts == 0
+    if params.n_tokens == 0
+        || params.k == 0
+        || params.n == 0
+        || params.top_k == 0
+        || params.n_experts == 0
     {
         return Err(MlxError::InvalidArgument(
             "n_tokens, K, N, top_k, n_experts must all be > 0".into(),
@@ -1750,7 +1949,8 @@ fn dispatch_id_mm_with_layout(
     }
     if params.k % qk != 0 {
         return Err(MlxError::InvalidArgument(format!(
-            "K ({}) must be divisible by block QK ({})", params.k, qk
+            "K ({}) must be divisible by block QK ({})",
+            params.k, qk
         )));
     }
 
@@ -1765,22 +1965,21 @@ fn dispatch_id_mm_with_layout(
 
     let blocks_per_row = params.k / qk;
     let block_bytes = params.ggml_type.block_bytes();
-    let per_expert_bytes =
-        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
-
-    if (params.expert_stride as usize) < per_expert_bytes {
+    let total_weight_bytes = required_expert_weight_bytes(
+        params.ggml_type,
+        params.n_experts,
+        params.n,
+        params.k,
+        params.expert_stride,
+    )?;
+    if weight.data_byte_len() < total_weight_bytes {
         return Err(MlxError::InvalidArgument(format!(
-            "expert_stride ({}) < per_expert_bytes ({})",
-            params.expert_stride, per_expert_bytes
+            "dispatch_id_mm_for_test: weight buffer too small: expected {} bytes, got {}",
+            total_weight_bytes,
+            weight.data_byte_len(),
         )));
     }
-
-    if weight.byte_len() < per_expert_bytes * params.n_experts as usize {
-        return Err(MlxError::InvalidArgument(
-            "dispatch_id_mm_for_test: weight buffer too small".into(),
-        ));
-    }
-    if input.byte_len()
+    if input.data_byte_len()
         < (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of()
     {
         return Err(MlxError::InvalidArgument(
@@ -1788,22 +1987,22 @@ fn dispatch_id_mm_with_layout(
         ));
     }
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
-    if ids.byte_len() < total_rows * DType::U32.size_of() {
+    if ids.data_byte_len() < total_rows * DType::U32.size_of() {
         return Err(MlxError::InvalidArgument(
             "dispatch_id_mm_for_test: ids buffer too small".into(),
         ));
     }
-    if output.byte_len() < total_rows * (params.n as usize) * DType::F32.size_of() {
+    if output.data_byte_len() < total_rows * (params.n as usize) * DType::F32.size_of() {
         return Err(MlxError::InvalidArgument(
             "dispatch_id_mm_for_test: output buffer too small".into(),
         ));
     }
-    if htpe.byte_len() < params.htpe_bytes() {
+    if htpe.data_byte_len() < params.htpe_bytes() {
         return Err(MlxError::InvalidArgument(
             "dispatch_id_mm_for_test: htpe buffer too small".into(),
         ));
     }
-    if hids.byte_len() < params.hids_bytes() {
+    if hids.data_byte_len() < params.hids_bytes() {
         return Err(MlxError::InvalidArgument(
             "dispatch_id_mm_for_test: hids buffer too small".into(),
         ));
@@ -1826,17 +2025,27 @@ fn dispatch_id_mm_with_layout(
             1 => "kernel_mul_mm_id_map0_ne20_1",
             6 => "kernel_mul_mm_id_map0_ne20_6",
             8 => "kernel_mul_mm_id_map0_ne20_8",
-            other => return Err(MlxError::InvalidArgument(format!(
-                "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
-                other
-            ))),
+            other => {
+                return Err(MlxError::InvalidArgument(format!(
+                    "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
+                    other
+                )))
+            }
         };
         let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
+        if u64::from(params.n_experts) > map0_pipeline.max_total_threads_per_threadgroup() {
+            return Err(MlxError::InvalidArgument(format!(
+                "n_experts ({}) exceeds map0 pipeline threadgroup limit ({})",
+                params.n_experts,
+                map0_pipeline.max_total_threads_per_threadgroup(),
+            )));
+        }
 
         let map0_params = GgmlIdMmMap0GpuParams {
-            ne10: params.n.try_into().map_err(|_| {
-                MlxError::InvalidArgument("N out of i32 range".into())
-            })?,
+            ne10: params
+                .n
+                .try_into()
+                .map_err(|_| MlxError::InvalidArgument("N out of i32 range".into()))?,
             ne11: params.top_k as i32,
             nb11: 0,
             nb12: 0,
@@ -1852,13 +2061,11 @@ fn dispatch_id_mm_with_layout(
 
         if encoder.is_capturing() {
             let range = |buffer: &MlxBuffer| {
-                let start = buffer.contents_ptr() as usize;
-                (start, start + buffer.byte_len())
+                let start =
+                    (buffer.contents_ptr() as usize).saturating_add(buffer.byte_offset() as usize);
+                (start, start.saturating_add(buffer.data_byte_len()))
             };
-            encoder.set_pending_buffer_ranges(
-                vec![range(ids)],
-                vec![range(htpe), range(hids)],
-            );
+            encoder.set_pending_buffer_ranges(vec![range(ids)], vec![range(htpe), range(hids)]);
         }
         encoder.encode_threadgroups_with_args_and_shared(
             map0_pipeline,
@@ -1886,7 +2093,8 @@ fn dispatch_id_mm_with_layout(
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // mm_id variant on M3+.  The probe caches the decision after the
     // first dispatch; subsequent calls are branch-free.
-    let use_tensor = probe_tensor_mm_id(registry, device);
+    let use_tensor = routing.expert_tensor_mm == GgmlTensorMmPreference::AutoProbe
+        && probe_tensor_mm_id(registry, device);
     // Fall through to the simdgroup variant when the per-type tensor
     // kernel isn't shipped — e.g. IQ4_XS (ADR-033 §Pi Task #20 shipped
     // the simdgroup variant only; tensor-API variant deferred as a
@@ -1969,8 +2177,9 @@ fn dispatch_id_mm_with_layout(
 
     if encoder.is_capturing() {
         let range = |buffer: &MlxBuffer| {
-            let start = buffer.contents_ptr() as usize;
-            (start, start + buffer.byte_len())
+            let start =
+                (buffer.contents_ptr() as usize).saturating_add(buffer.byte_offset() as usize);
+            (start, start.saturating_add(buffer.data_byte_len()))
         };
         encoder.set_pending_buffer_ranges(
             vec![range(weight), range(input), range(htpe), range(hids)],
@@ -2082,27 +2291,24 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
 
     let blocks_per_row = params.k / qk;
     let block_bytes = params.ggml_type.block_bytes();
-    let per_expert_bytes =
-        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
-
-    if (params.expert_stride as usize) < per_expert_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "expert_stride ({}) < per_expert_bytes ({})",
-            params.expert_stride, per_expert_bytes
-        )));
-    }
-    let expected_w = per_expert_bytes * params.n_experts as usize;
-    if gate_w.byte_len() < expected_w {
+    let expected_w = required_expert_weight_bytes(
+        params.ggml_type,
+        params.n_experts,
+        params.n,
+        params.k,
+        params.expert_stride,
+    )?;
+    if gate_w.data_byte_len() < expected_w {
         return Err(MlxError::InvalidArgument(
             "fused dispatch: gate_w buffer too small".into(),
         ));
     }
-    if up_w.byte_len() < expected_w {
+    if up_w.data_byte_len() < expected_w {
         return Err(MlxError::InvalidArgument(
             "fused dispatch: up_w buffer too small".into(),
         ));
     }
-    if input.byte_len()
+    if input.data_byte_len()
         < (params.n_tokens as usize) * (params.k as usize) * DType::F32.size_of()
     {
         return Err(MlxError::InvalidArgument(
@@ -2110,22 +2316,22 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
         ));
     }
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
-    if ids.byte_len() < total_rows * DType::U32.size_of() {
+    if ids.data_byte_len() < total_rows * DType::U32.size_of() {
         return Err(MlxError::InvalidArgument(
             "fused dispatch: ids buffer too small".into(),
         ));
     }
-    if output.byte_len() < total_rows * (params.n as usize) * DType::F32.size_of() {
+    if output.data_byte_len() < total_rows * (params.n as usize) * DType::F32.size_of() {
         return Err(MlxError::InvalidArgument(
             "fused dispatch: output buffer too small".into(),
         ));
     }
-    if htpe.byte_len() < params.htpe_bytes() {
+    if htpe.data_byte_len() < params.htpe_bytes() {
         return Err(MlxError::InvalidArgument(
             "fused dispatch: htpe buffer too small".into(),
         ));
     }
-    if hids.byte_len() < params.hids_bytes() {
+    if hids.data_byte_len() < params.hids_bytes() {
         return Err(MlxError::InvalidArgument(
             "fused dispatch: hids buffer too small".into(),
         ));
@@ -2178,8 +2384,10 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
     encoder.memory_barrier();
 
     // ---- Stage 2: fused mm_id ----
-    let mm_pipeline =
-        registry.get_pipeline("kernel_fused_gate_up_silu_mm_id_q6_K_f32", device.metal_device())?;
+    let mm_pipeline = registry.get_pipeline(
+        "kernel_fused_gate_up_silu_mm_id_q6_K_f32",
+        device.metal_device(),
+    )?;
 
     let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
     let row_bytes = (params.k as u64) * (DType::F32.size_of() as u64);
@@ -2235,4 +2443,26 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn padded_expert_stack_requires_last_stride_plus_matrix() {
+        let matrix = ggml_expert_bytes(GgmlType::Q4_0, 1, 64, 256, 9_216).unwrap();
+        assert_eq!(matrix, 9_216);
+        assert_eq!(
+            required_expert_weight_bytes(GgmlType::Q4_0, 3, 64, 256, 12_288).unwrap(),
+            33_792
+        );
+    }
+
+    #[test]
+    fn expert_stack_rejects_stride_smaller_than_one_matrix() {
+        let error = required_expert_weight_bytes(GgmlType::Q4_0, 3, 64, 256, 9_215)
+            .expect_err("undersized stride must fail");
+        assert!(error.to_string().contains("smaller than one matrix"));
+    }
 }

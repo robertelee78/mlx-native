@@ -150,8 +150,8 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
 
 ### Matrix multiplication
-- **GGUF formats**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, I16 — mat-vec + mul_mm kernels (peer-parity with llama.cpp inference subset; tensor-core paths where implemented)
-- **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL (top_k>1 MoE mat-vec + tensor-mm where implemented)
+- **GGUF formats**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS — mat-vec + mul_mm kernels where implemented (peer-parity with llama.cpp inference subset; tensor-core paths where implemented)
+- **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS (top_k>1 MoE mat-vec + tensor-mm where implemented)
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
 - **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`
 - **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` / `_id_into` (top_k=1 tensor-mm fast path; `_into` accepts caller-provided output buffer); `quantized_matmul_id_ggml_pooled_pair` reuses one large-prefill routing schedule across two compatible expert projections
@@ -167,6 +167,19 @@ scalar fallback, the BF16 expert-offset route, the F32 expert-ID route, and F32
 4/6-bit embedding gathers. Unsupported requests include a typed rejection code.
 This is an execution contract, not a throughput estimate—measure the exact
 shape on the target Apple Silicon device.
+
+GGUF artifact producers and mixed-precision allocators should likewise query
+`ggml_capability(GgmlCapabilityRequest)`. Its serializable response exposes
+the dense, batched, permuted-output, fused gate/up, expert schedule, and
+embedding route for an exact public entry point, shape, workload regime, and
+explicit routing policy. Correct but non-specialized fallbacks are explicit—
+for example, prompt-shaped dense IQ4_XS is executable through matvec but has no
+dense-MM route. The matching `*_with_policy` dispatch APIs consume that exact
+policy rather than rereading environment overrides. Device selection between
+tensor-API and simdgroup MM kernels remains labeled runtime-trace and measured
+kernel-profile evidence, not an inferred speed claim.
+See [the GGUF execution capability decision](docs/gguf-execution-capability-2026-08-19.md)
+for allocator boundaries and remaining device-proof requirements.
 
 ### Normalization
 - `rms_norm` — RMS normalization (f32 + triple-output variants)

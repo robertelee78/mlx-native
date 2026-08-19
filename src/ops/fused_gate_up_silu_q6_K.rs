@@ -31,10 +31,10 @@ struct FusedGateUpSiluQ6_KParams {
     ne02: i64,
     ne10: i64,
     ne12: i64,
-    ne0:  i64,
-    ne1:  i64,
-    r2:   u32,
-    r3:   u32,
+    ne0: i64,
+    ne1: i64,
+    r2: u32,
+    r3: u32,
 }
 
 #[allow(non_camel_case_types)]
@@ -82,10 +82,23 @@ pub fn dispatch_fused_gate_up_silu_q6_K(
 
     let super_blocks_per_row = args.hidden_size / QK_K;
     let weight_bytes = (args.intermediate_size as usize)
-        * (super_blocks_per_row as usize)
-        * (BLOCK_Q6_K_BYTES as usize);
-    let input_bytes = (args.hidden_size as usize) * (args.m as usize) * 4;
-    let output_bytes = (args.intermediate_size as usize) * (args.m as usize) * 4;
+        .checked_mul(super_blocks_per_row as usize)
+        .and_then(|value| value.checked_mul(BLOCK_Q6_K_BYTES as usize))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_q6_K: weight size overflow".into())
+        })?;
+    let input_bytes = (args.hidden_size as usize)
+        .checked_mul(args.m as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_q6_K: input size overflow".into())
+        })?;
+    let output_bytes = (args.intermediate_size as usize)
+        .checked_mul(args.m as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_q6_K: output size overflow".into())
+        })?;
 
     for (name, buf, expected) in [
         ("gate_w", gate_w, weight_bytes),
@@ -93,10 +106,10 @@ pub fn dispatch_fused_gate_up_silu_q6_K(
         ("input", input, input_bytes),
         ("output", output, output_bytes),
     ] {
-        if buf.byte_len() < expected {
+        if buf.data_byte_len() < expected {
             return Err(MlxError::InvalidArgument(format!(
                 "fused_gate_up_silu_q6_K: {name} too small: need {expected} bytes, have {}",
-                buf.byte_len()
+                buf.data_byte_len()
             )));
         }
     }
@@ -114,20 +127,16 @@ pub fn dispatch_fused_gate_up_silu_q6_K(
         ne02: 1,
         ne10: args.hidden_size as i64,
         ne12: 1,
-        ne0:  args.intermediate_size as i64,
-        ne1:  args.m as i64,
-        r2:   1,
-        r3:   1,
+        ne0: args.intermediate_size as i64,
+        ne1: args.m as i64,
+        r2: 1,
+        r3: 1,
     };
 
     // Geometry: matches kernel_mul_mv_q6_K_f32. 2 SG × 32 threads = 64
     // threads/TG, 1 row/SG → 2 rows/TG. (Different from Q4_K/Q5_K's
     // 2 rows/SG → 4 rows/TG geometry.)
-    let threadgroups = MTLSize::new(
-        ((args.intermediate_size as u64) + 1) / 2,
-        args.m as u64,
-        1,
-    );
+    let threadgroups = MTLSize::new(((args.intermediate_size as u64) + 1) / 2, args.m as u64, 1);
     let threads_per_tg = MTLSize::new(2, 32, 1);
 
     encoder.encode_threadgroups_with_args(
