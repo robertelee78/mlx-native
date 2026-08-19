@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.10.12"
+version = "0.10.13"
 dependencies = [
  "bytemuck",
  "criterion",
