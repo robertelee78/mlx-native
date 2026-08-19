@@ -1,5 +1,8 @@
 # GGUF mapping and DeepSeek sparse-prefill decision — 2026-08-06
 
+**Status:** Implemented
+**Updated:** 2026-08-19
+
 ## Scope and ownership
 
 `mlx-native` owns the reusable Metal mechanisms in this change:
@@ -110,3 +113,37 @@ solve the tile utilization correctly; BF16-to-F16 conversion around attention
 did not beat the accepted path; and temporary index-overlap instrumentation was
 removed after it answered the diagnostic question. The long-prefill indexer
 benchmark and packed-attention benchmark remain as opt-in performance receipts.
+
+## D=512 non-aligned KV-tail determinism — 2026-08-19
+
+The layer-major cohort-prefill spike in hf2q should have been numerically
+identical to serial prefill, but the first prototype diverged at layer 3 on the
+last row of a 255-row cohort. Replacing only the gathered K/V scratch contents
+with zeros restored parity. A smaller Metal regression then isolated the
+mechanism: with `kL=641`, two identical logical K/V views produced different
+output when bytes beyond the view were changed from zero to NaN.
+
+The D=512 kernel loaded each final 8-row K/V matrix fragment before masking
+rows beyond `kL`. The accepted correction preserves the existing aligned fast
+path. Only the final partial block is populated lane-by-lane, with valid rows
+loaded in the original matrix layout and nonexistent rows set to zero before
+the same matrix-multiply and online-softmax sequence. There is no dispatcher,
+model-policy, or public-API change.
+
+Correctness evidence on an Apple M5 Max 40-core GPU:
+
+- all 63 non-zero remainders modulo 64 are guard-independent under both NSG=4
+  and NSG=8;
+- separate `top_k=385` and `top_k=417` sparse-attention cases (tail
+  remainders 1 and 33) match the independent CPU reference;
+- the complete sparse-attention suite passes 10/10 and the D=512 flash-prefill
+  suite passes 11/11;
+- the hf2q DeepSeek-V4 real-artifact gate passes all 43 layers bit-for-bit at
+  255 cohort rows, with both cache positions ending at 255.
+
+The same downstream gate measured serial prefill at 1,339.917 ms and cohort
+prefill at 1,129.545 ms, a 1.1862x speedup. The mlx-native production-aligned
+benchmark is neutral within noise: three-run medians were 15.569 ms on
+v0.10.11 and 15.560 ms with this correction; the packed-flash component was
+9.834 ms and 9.812 ms respectively. Registry publication and the exact hf2q
+dependency pin remain separate release gates.
