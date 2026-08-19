@@ -729,8 +729,36 @@ void flash_attn_prefill_d512_impl(
           simdgroup_load(mq[0], sq + 0 * 8 + 16 * i, DK);
           simdgroup_load(mq[1], sq + 1 * 8 + 16 * i, DK);
 
-          simdgroup_load(mk[0], pk + 0 * 8 + 16 * i, NS10, 0, true);
-          simdgroup_load(mk[1], pk + 1 * 8 + 16 * i, NS10, 0, true);
+          const int kv_row_base = ic + (int)sgitg * 8 + (int)cc * 8 * NSG;
+          if (align_K_def || kv_row_base + 8 <= args.kL) {
+            simdgroup_load(mk[0], pk + 0 * 8 + 16 * i, NS10, 0, true);
+            simdgroup_load(mk[1], pk + 1 * 8 + 16 * i, NS10, 0, true);
+          } else {
+            // A logical mask applied after QK cannot make an out-of-range
+            // matrix load safe.  Populate the lane-owned matrix elements
+            // directly for the one partial 8-row block in the final C=64
+            // chunk, substituting zero without dereferencing invalid rows.
+            // The lane mapping is the same one used by simdgroup_load(...,
+            // transpose=true), so valid rows retain the existing MMA order.
+            const short qid = tiisg / 4;
+            const short sm = (qid & 4) + (tiisg / 2) % 4;
+            const short sn = (qid & 2) * 2 + (tiisg % 2) * 2;
+            const int row0 = kv_row_base + sn;
+            const int row1 = row0 + 1;
+            FOR_UNROLL (short frag = 0; frag < 2; ++frag) {
+              const int dim = 16 * i + 8 * frag + sm;
+              T value0 = T(0);
+              T value1 = T(0);
+              if (row0 < args.kL) {
+                value0 = k_head[(ulong)row0 * (ulong)NS10 + (ulong)dim];
+              }
+              if (row1 < args.kL) {
+                value1 = k_head[(ulong)row1 * (ulong)NS10 + (ulong)dim];
+              }
+              mk[frag].thread_elements()[0] = value0;
+              mk[frag].thread_elements()[1] = value1;
+            }
+          }
 
           simdgroup_barrier(mem_flags::mem_none);
 
@@ -946,10 +974,40 @@ void flash_attn_prefill_d512_impl(
           FOR_UNROLL (short ii = 0; ii < NO / 2; ++ii) {
             simdgroup_matrix<T, 8, 8> mv[4];
 
-            simdgroup_load(mv[0], pv + 0 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
-            simdgroup_load(mv[1], pv + 8 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
-            simdgroup_load(mv[2], pv + 0 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
-            simdgroup_load(mv[3], pv + 8 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+            const int kv_row_base0 = ic + (int)cc * 16;
+            const int kv_row_base1 = kv_row_base0 + 8;
+            const int dim_base0 = (int)sgitg * 8 + 16 * (int)ii * NSG;
+            const int dim_base1 = dim_base0 + 8 * NSG;
+            if (align_K_def || kv_row_base1 + 8 <= args.kL) {
+              simdgroup_load(mv[0], pv + 0 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
+              simdgroup_load(mv[1], pv + 8 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
+              simdgroup_load(mv[2], pv + 0 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+              simdgroup_load(mv[3], pv + 8 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+            } else {
+              // Mirror the QK tail defense for V.  A zero softmax weight is
+              // not sufficient protection because the operand load happens
+              // before the multiply (and NaN * 0 is still NaN).
+              const short qid = tiisg / 4;
+              const short sm = (qid & 4) + (tiisg / 2) % 4;
+              const short sn = (qid & 2) * 2 + (tiisg % 2) * 2;
+              const int row_bases[2] = {kv_row_base0, kv_row_base1};
+              const int dim_bases[2] = {dim_base0, dim_base1};
+              FOR_UNROLL (short row_frag = 0; row_frag < 2; ++row_frag) {
+                const int row = row_bases[row_frag] + sm;
+                FOR_UNROLL (short dim_frag = 0; dim_frag < 2; ++dim_frag) {
+                  const int dim0 = dim_bases[dim_frag] + sn;
+                  T value0 = T(0);
+                  T value1 = T(0);
+                  if (row < args.kL) {
+                    value0 = v_head[(ulong)row * (ulong)NS20 + (ulong)dim0];
+                    value1 = v_head[(ulong)row * (ulong)NS20 + (ulong)(dim0 + 1)];
+                  }
+                  const short frag = row_frag * 2 + dim_frag;
+                  mv[frag].thread_elements()[0] = value0;
+                  mv[frag].thread_elements()[1] = value1;
+                }
+              }
+            }
 
             simdgroup_multiply_accumulate(lo[2 * ii + 0], vs[0], mv[0], lo[2 * ii + 0]);
             simdgroup_multiply_accumulate(lo[2 * ii + 1], vs[0], mv[1], lo[2 * ii + 1]);

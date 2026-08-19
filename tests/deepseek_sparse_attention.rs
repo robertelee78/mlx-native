@@ -11,6 +11,7 @@ use mlx_native::ops::deepseek_sparse_attention::{
 use mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams;
 use mlx_native::ops::flash_attn_prefill_d512::{
     dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks,
+    dispatch_flash_attn_prefill_bf16_d512_with_nsg,
     dispatch_flash_attn_prefill_bf16_d512_with_sinks,
 };
 use mlx_native::{CapturedNode, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -39,6 +40,39 @@ fn bf16_buffer(device: &MlxDevice, values: &[bf16], shape: Vec<usize>) -> MlxBuf
         );
     }
     buffer
+}
+
+fn guarded_bf16_view(
+    device: &MlxDevice,
+    values: &[bf16],
+    shape: Vec<usize>,
+    guard: bf16,
+) -> MlxBuffer {
+    const GUARD_ROWS: usize = 64;
+    let guard_elements = GUARD_ROWS * D;
+    let buffer = device
+        .alloc_buffer(
+            (values.len() + guard_elements) * 2,
+            DType::BF16,
+            vec![values.len() + guard_elements],
+        )
+        .expect("allocate guarded bf16");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            values.as_ptr(),
+            buffer.contents_ptr() as *mut bf16,
+            values.len(),
+        );
+        std::slice::from_raw_parts_mut(
+            (buffer.contents_ptr() as *mut bf16).add(values.len()),
+            guard_elements,
+        )
+        .fill(guard);
+    }
+    buffer
+        .slice_view(0, values.len())
+        .with_shape(shape)
+        .expect("shape guarded logical view")
 }
 
 fn f32_buffer(device: &MlxDevice, values: &[f32], shape: Vec<usize>) -> MlxBuffer {
@@ -400,6 +434,17 @@ fn representative_multi_query_prefill_uses_query_specific_selected_masks() {
 }
 
 #[test]
+fn non_aligned_flash_tail_matches_independent_cpu_reference() {
+    let kv_len = 448;
+    for top_k in [385, 417] {
+        let indices = (0..top_k)
+            .map(|slot| ((slot * 193 + 17) % kv_len) as i32)
+            .collect();
+        run_case(1, 1, kv_len, indices);
+    }
+}
+
+#[test]
 fn all_sentinel_and_bad_dynamic_values_fail_closed() {
     run_case(1, 1, 3, vec![-1; 8]);
 
@@ -521,7 +566,8 @@ fn malformed_shapes_dtypes_and_params_are_rejected_before_encoding() {
 #[test]
 fn heads_as_rows_is_bit_exact_to_one_head_per_tile() {
     const QUERIES: usize = 16;
-    const TOP_K: usize = 640;
+    // Exercise the bounded final KV tile as well as the packed head mapping.
+    const TOP_K: usize = 641;
 
     let device = MlxDevice::new().unwrap();
     let q = bf16_buffer(
@@ -617,5 +663,172 @@ fn heads_as_rows_is_bit_exact_to_one_head_per_tile() {
             packed.to_bits(),
             "heads-as-rows output diverged at element {index}"
         );
+    }
+}
+
+#[test]
+fn heads_as_rows_non_aligned_kv_tail_is_guard_independent() {
+    const QUERIES: usize = 1;
+    const TOP_K: usize = 641;
+
+    let device = MlxDevice::new().unwrap();
+    let q = bf16_buffer(
+        &device,
+        &data(QUERIES * H * D, 17, 0.0015),
+        vec![QUERIES, H, D],
+    );
+    let logical_gathered = data(QUERIES * TOP_K * D, 19, 0.002);
+    let gathered_zero_guard = guarded_bf16_view(
+        &device,
+        &logical_gathered,
+        vec![QUERIES, 1, TOP_K, D],
+        bf16::ZERO,
+    );
+    let gathered_nan_guard = guarded_bf16_view(
+        &device,
+        &logical_gathered,
+        vec![QUERIES, 1, TOP_K, D],
+        bf16::NAN,
+    );
+    let sinks = f32_buffer(
+        &device,
+        &(0..H)
+            .map(|head| head as f32 * 0.007 - 0.2)
+            .collect::<Vec<_>>(),
+        vec![H],
+    );
+    let mask = bf16_buffer(
+        &device,
+        &vec![bf16::ZERO; QUERIES * TOP_K],
+        vec![QUERIES, 1, TOP_K],
+    );
+    let zero_guard_out = device
+        .alloc_buffer(QUERIES * H * D * 2, DType::BF16, vec![QUERIES, H, D])
+        .unwrap();
+    let nan_guard_out = device
+        .alloc_buffer(QUERIES * H * D * 2, DType::BF16, vec![QUERIES, H, D])
+        .unwrap();
+    let params = FlashAttnPrefillParams {
+        n_heads: 8,
+        n_kv_heads: 1,
+        head_dim: D as u32,
+        seq_len_q: 8,
+        seq_len_k: TOP_K as u32,
+        batch: QUERIES as u32,
+        scale: 1.0 / (D as f32).sqrt(),
+        do_causal: false,
+    };
+    let mut registry = KernelRegistry::new();
+
+    for (gathered, output) in [
+        (&gathered_zero_guard, &zero_guard_out),
+        (&gathered_nan_guard, &nan_guard_out),
+    ] {
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_flash_attn_prefill_bf16_d512_heads_as_rows_with_sinks(
+            &mut encoder,
+            &device,
+            &mut registry,
+            &q,
+            gathered,
+            gathered,
+            &mask,
+            &sinks,
+            output,
+            &params,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+    }
+
+    let elements = QUERIES * H * D;
+    let zero_guard = unsafe {
+        std::slice::from_raw_parts(zero_guard_out.contents_ptr() as *const bf16, elements)
+    };
+    let nan_guard = unsafe {
+        std::slice::from_raw_parts(nan_guard_out.contents_ptr() as *const bf16, elements)
+    };
+    for (index, (zero_guard, nan_guard)) in zero_guard.iter().zip(nan_guard).enumerate() {
+        assert_eq!(
+            zero_guard.to_bits(),
+            nan_guard.to_bits(),
+            "output depends on bytes past the logical KV view at element {index}: zero_guard={zero_guard:?} nan_guard={nan_guard:?}"
+        );
+    }
+}
+
+#[test]
+fn every_non_aligned_kv_remainder_is_guard_independent_for_nsg4_and_nsg8() {
+    const QL: usize = 8;
+    const HEADS: usize = 8;
+
+    let device = MlxDevice::new().unwrap();
+    let q = bf16_buffer(
+        &device,
+        &data(HEADS * QL * D, 23, 0.0015),
+        vec![1, HEADS, QL, D],
+    );
+    let mut registry = KernelRegistry::new();
+
+    for nsg in [4, 8] {
+        for remainder in 1..64 {
+            let kv_len = 64 + remainder;
+            let logical_kv = data(kv_len * D, remainder + nsg as usize, 0.002);
+            let zero_guard =
+                guarded_bf16_view(&device, &logical_kv, vec![1, 1, kv_len, D], bf16::ZERO);
+            let nan_guard =
+                guarded_bf16_view(&device, &logical_kv, vec![1, 1, kv_len, D], bf16::NAN);
+            let zero_guard_out = device
+                .alloc_buffer(HEADS * QL * D * 2, DType::BF16, vec![1, HEADS, QL, D])
+                .unwrap();
+            let nan_guard_out = device
+                .alloc_buffer(HEADS * QL * D * 2, DType::BF16, vec![1, HEADS, QL, D])
+                .unwrap();
+            let params = FlashAttnPrefillParams {
+                n_heads: HEADS as u32,
+                n_kv_heads: 1,
+                head_dim: D as u32,
+                seq_len_q: QL as u32,
+                seq_len_k: kv_len as u32,
+                batch: 1,
+                scale: 1.0 / (D as f32).sqrt(),
+                do_causal: false,
+            };
+
+            for (kv, output) in [(&zero_guard, &zero_guard_out), (&nan_guard, &nan_guard_out)] {
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_flash_attn_prefill_bf16_d512_with_nsg(
+                    &mut encoder,
+                    &device,
+                    &mut registry,
+                    &q,
+                    kv,
+                    kv,
+                    None,
+                    output,
+                    &params,
+                    nsg,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+            }
+
+            let elements = HEADS * QL * D;
+            let zero_guard_values = unsafe {
+                std::slice::from_raw_parts(zero_guard_out.contents_ptr() as *const bf16, elements)
+            };
+            let nan_guard_values = unsafe {
+                std::slice::from_raw_parts(nan_guard_out.contents_ptr() as *const bf16, elements)
+            };
+            for (index, (zero_guard, nan_guard)) in
+                zero_guard_values.iter().zip(nan_guard_values).enumerate()
+            {
+                assert_eq!(
+                    zero_guard.to_bits(),
+                    nan_guard.to_bits(),
+                    "NSG={nsg} kL={kv_len} output depends on bytes past the logical KV view at element {index}: zero_guard={zero_guard:?} nan_guard={nan_guard:?}"
+                );
+            }
+        }
     }
 }
