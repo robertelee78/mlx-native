@@ -368,10 +368,13 @@ fn adr022_iq4_nl_mv_id_parity_2tok_2slot() {
 
 #[test]
 fn adr022_q5_1_mv_id_parity_realistic_shape() {
-    // Realistic gemma4 ffn_down expert shape (k=2816, n=704), but
-    // shrunk by 32× to keep the test fast: k=2816/4=704, n=704/4=176,
-    // n_experts=4 (vs 128 in real file). Verifies the kernel survives
-    // larger nb (blocks per row).
+    // Realistic gemma4 ffn_down expert shape (k=2816, n=704), with each
+    // matrix dimension reduced by 4x to keep the test fast:
+    // k=2816/4=704, n=704/4=176,
+    // n_experts=8 (vs 128 in real file). Keeping n_experts >= top_k
+    // preserves the production router invariant while still shrinking the
+    // weight stack by 16x. Verifies the kernel survives larger nb (blocks per
+    // row).
     run_mv_id_parity(
         GgmlType::Q5_1,
         BLOCK_Q5_1_BYTES,
@@ -379,7 +382,7 @@ fn adr022_q5_1_mv_id_parity_realistic_shape() {
         test_only_dequantize_q5_1,
         /*n_tokens=*/ 1,
         /*top_k=*/ 8,
-        /*n_experts=*/ 4,
+        /*n_experts=*/ 8,
         /*n=*/ 176,
         /*k=*/ 704,
         0xAD22_0511_0002,
@@ -395,7 +398,7 @@ fn adr022_iq4_nl_mv_id_parity_realistic_shape() {
         test_only_dequantize_iq4_nl,
         /*n_tokens=*/ 1,
         /*top_k=*/ 8,
-        /*n_experts=*/ 4,
+        /*n_experts=*/ 8,
         /*n=*/ 176,
         /*k=*/ 704,
         0xAD22_004F_0002,
