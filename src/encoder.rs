@@ -34,8 +34,10 @@ use metal::{
 use objc::runtime::Object;
 #[allow(unused_imports)]
 use objc::{msg_send, sel, sel_impl};
+use serde::{Deserialize, Serialize};
 
 use crate::buffer::MlxBuffer;
+use crate::device::metal_device_registry_id;
 use crate::error::{MlxError, Result};
 use crate::mem_ranges::MemRanges;
 use crate::residency::ResidencySet;
@@ -146,12 +148,32 @@ pub enum RecordedBinding {
 }
 
 /// How to dispatch the recorded kernel.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchKind {
     /// `dispatch_threads(grid_size, threadgroup_size)` — Metal picks threadgroup count.
     Threads,
     /// `dispatch_thread_groups(threadgroups, threadgroup_size)` — caller specifies threadgroup count.
     ThreadGroups,
+}
+
+/// One dispatch that was actually encoded into this command encoder while an
+/// explicit receipt scope was active. Unlike graph capture, this observation
+/// does not replace execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncodedKernelDispatch {
+    pub pipeline_label: String,
+    pub dispatch_kind: DispatchKind,
+    pub grid: [u64; 3],
+    pub threads_per_threadgroup: [u64; 3],
+    pub threadgroup_memory: Vec<(u64, u64)>,
+}
+
+struct EncodedDispatchReceiptState {
+    dispatches: Vec<EncodedKernelDispatch>,
+    max_dispatches: usize,
+    overflowed: bool,
 }
 
 /// Operation kind tag for captured nodes, used by the fusion pass (4e.2).
@@ -815,6 +837,10 @@ pub struct CommandEncoder {
     /// When `Some`, dispatches are recorded here instead of being encoded
     /// into Metal.  Set via `start_capture()`, extracted via `take_capture()`.
     capture: Option<Vec<CapturedNode>>,
+    /// Scoped receipt of dispatches that were actually encoded. This remains
+    /// `None` on the ordinary hot path and is mutually exclusive with graph
+    /// capture, which records instead of executing.
+    encoded_dispatch_receipt: Option<EncodedDispatchReceiptState>,
     /// Op kind tag for the NEXT captured dispatch.  Set via `set_op_kind()`,
     /// consumed (reset to `Other`) when a dispatch is captured.
     pending_op_kind: CapturedOpKind,
@@ -999,6 +1025,7 @@ impl CommandEncoder {
             queue: queue.to_owned(),
             active_encoder: std::ptr::null(),
             capture: None,
+            encoded_dispatch_receipt: None,
             pending_op_kind: CapturedOpKind::Other,
             pending_reads: Vec::new(),
             pending_writes: Vec::new(),
@@ -1030,6 +1057,75 @@ impl CommandEncoder {
     /// Returns `None` if capture mode was not active.
     pub fn take_capture(&mut self) -> Option<Vec<CapturedNode>> {
         self.capture.take()
+    }
+
+    pub(crate) fn start_encoded_dispatch_receipt(&mut self, max_dispatches: usize) -> Result<()> {
+        if self.capture.is_some() {
+            return Err(MlxError::InvalidArgument(
+                "cannot observe executed dispatches while graph capture is active".into(),
+            ));
+        }
+        if self.encoded_dispatch_receipt.is_some() {
+            return Err(MlxError::InvalidArgument(
+                "an encoded-dispatch receipt scope is already active".into(),
+            ));
+        }
+        if max_dispatches == 0 || max_dispatches > 4096 {
+            return Err(MlxError::InvalidArgument(format!(
+                "encoded-dispatch receipt bound must be in 1..=4096, got {max_dispatches}"
+            )));
+        }
+        self.encoded_dispatch_receipt = Some(EncodedDispatchReceiptState {
+            dispatches: Vec::with_capacity(max_dispatches),
+            max_dispatches,
+            overflowed: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn device_registry_id(&self) -> u64 {
+        metal_device_registry_id(self.queue.device())
+    }
+
+    pub(crate) fn take_encoded_dispatch_receipt(&mut self) -> Result<Vec<EncodedKernelDispatch>> {
+        let state = self.encoded_dispatch_receipt.take().ok_or_else(|| {
+            MlxError::InvalidArgument("no encoded-dispatch receipt scope is active".into())
+        })?;
+        if state.overflowed {
+            return Err(MlxError::InvalidArgument(format!(
+                "encoded-dispatch receipt exceeded its {}-dispatch bound",
+                state.max_dispatches
+            )));
+        }
+        Ok(state.dispatches)
+    }
+
+    #[inline]
+    fn record_encoded_dispatch(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        dispatch_kind: DispatchKind,
+        grid: MTLSize,
+        threads_per_threadgroup: MTLSize,
+        threadgroup_memory: &[(u64, u64)],
+    ) {
+        if let Some(state) = self.encoded_dispatch_receipt.as_mut() {
+            if state.dispatches.len() >= state.max_dispatches {
+                state.overflowed = true;
+                return;
+            }
+            state.dispatches.push(EncodedKernelDispatch {
+                pipeline_label: pipeline.label().to_string(),
+                dispatch_kind,
+                grid: [grid.width, grid.height, grid.depth],
+                threads_per_threadgroup: [
+                    threads_per_threadgroup.width,
+                    threads_per_threadgroup.height,
+                    threads_per_threadgroup.depth,
+                ],
+                threadgroup_memory: threadgroup_memory.to_vec(),
+            });
+        }
     }
 
     /// Tag the NEXT captured dispatch with the given operation kind.
@@ -1337,6 +1433,13 @@ impl CommandEncoder {
         assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::Threads,
+            grid_size,
+            threadgroup_size,
+            &[],
+        );
     }
 
     /// Encode a compute pass using threadgroups instead of raw thread counts.
@@ -1390,6 +1493,13 @@ impl CommandEncoder {
         assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::ThreadGroups,
+            threadgroups,
+            threadgroup_size,
+            &[],
+        );
     }
 
     /// Encode a compute pass using threadgroups with shared threadgroup memory.
@@ -1457,6 +1567,13 @@ impl CommandEncoder {
         assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::ThreadGroups,
+            threadgroups,
+            threadgroup_size,
+            threadgroup_mem,
+        );
     }
 
     /// Encode a dispatch with mixed buffer/bytes bindings (dispatch_threads).
@@ -1497,6 +1614,13 @@ impl CommandEncoder {
         assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::Threads,
+            grid_size,
+            threadgroup_size,
+            &[],
+        );
     }
 
     /// Encode a dispatch with mixed buffer/bytes bindings (dispatch_thread_groups).
@@ -1547,6 +1671,13 @@ impl CommandEncoder {
         assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::ThreadGroups,
+            threadgroups,
+            threadgroup_size,
+            &[],
+        );
     }
 
     /// Encode a dispatch with mixed buffer/bytes bindings and shared memory.
@@ -1601,6 +1732,13 @@ impl CommandEncoder {
         assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
         encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::ThreadGroups,
+            threadgroups,
+            threadgroup_size,
+            threadgroup_mem,
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1960,6 +2098,13 @@ impl CommandEncoder {
         // construction already validated the geometry.
         encoder.dispatch_thread_groups(rec.threadgroups, rec.threads_per_tg);
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            &rec.pipeline,
+            DispatchKind::ThreadGroups,
+            rec.threadgroups,
+            rec.threads_per_tg,
+            &rec.threadgroup_mem,
+        );
     }
 
     /// Run the dataflow check, emit a barrier on conflict, and record
@@ -2076,6 +2221,13 @@ impl CommandEncoder {
             }
         }
         self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            dispatch_kind,
+            threads_per_grid,
+            threads_per_threadgroup,
+            threadgroup_memory,
+        );
     }
 
     /// Flush any pending residency-set add/remove staging.

@@ -56,6 +56,7 @@ mod encoder_session;
 pub mod encoder_worker;
 mod env_flags;
 pub mod ggml_capability;
+pub mod ggml_dispatch_trace;
 mod kernel_registry;
 mod mem_ranges;
 mod residency;
@@ -85,6 +86,10 @@ pub use ggml_capability::{
     GgmlRoutingPolicy, GgmlScratchRequirement, GgmlTensorMmPreference,
     GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
+pub use ggml_dispatch_trace::{
+    GgmlDeviceIdentity, GgmlKernelDispatchReceipt, GgmlResolvedDispatchTrace,
+    GgmlResolvedKernelRoute, GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION,
+};
 pub use ggml_routing_policy::ggml_routing_policy_from_environment;
 pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
@@ -93,7 +98,8 @@ pub use encoder::{
     auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
     cmd_buf_count, dispatch_count, gpu_busy_ns, pipeline_dispatch_buckets, reset_counters,
     reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode, CapturedOpKind,
-    CommandEncoder, DispatchKind, DispatchRecord, KernelArg, RecordedBinding,
+    CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
+    RecordedBinding,
 };
 pub use encoder_session::EncoderSession;
 pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
@@ -101,7 +107,10 @@ pub use error::{MlxError, Result};
 pub use graph::{
     barrier_ns, barrier_ns_reset, ComputeGraph, GraphExecutor, GraphSession, OpKind,
 };
-pub use kernel_registry::KernelRegistry;
+pub use kernel_registry::{
+    KernelPipelineIdentity, KernelPipelineOrigin, KernelRegistry,
+    KERNEL_PIPELINE_IDENTITY_SCHEMA_VERSION,
+};
 // Test-only counters and gate-reset helpers.  Marked #[doc(hidden)] so
 // they don't appear in published rustdoc; consumers should not depend
 // on them outside test code.  Not feature-gated because integration
@@ -135,6 +144,7 @@ pub use ops::quantized_matmul_ggml::{
     quantized_matmul_ggml_batched_mm_strided_input_with_policy,
     quantized_matmul_ggml_batched_mm_with_policy, quantized_matmul_ggml_batched_mv,
     quantized_matmul_ggml_batched_mv_with_policy, quantized_matmul_ggml_with_policy,
+    quantized_matmul_ggml_with_policy_and_trace,
     quantized_matmul_mm_tensor_perm021,
     quantized_matmul_mm_tensor_perm021_f16,
     GgmlBatchedQuantizedMatmulInputStrides, GgmlBatchedQuantizedMatmulParams,

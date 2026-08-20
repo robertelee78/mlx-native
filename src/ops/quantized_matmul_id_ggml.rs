@@ -30,6 +30,7 @@ static CACHED_Q6K_ID_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_ID_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
@@ -178,28 +179,24 @@ fn required_expert_weight_bytes(
         .map_err(|_| MlxError::InvalidArgument("expert GGUF bytes exceed usize".into()))
 }
 
-/// One-shot probe for mm_id tensor-API availability.  Cached separately
-/// from the dense-mm probe in quantized_matmul_ggml.rs because these are
-/// distinct shader files; whichever runs first pays its own compile cost.
-static TENSOR_MM_ID_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
-    *TENSOR_MM_ID_AVAILABLE.get_or_init(|| {
-        let ok = registry
-            .get_pipeline("kernel_mul_mm_id_q4_0_tensor_f32", device.metal_device())
-            .is_ok();
-        if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
-            eprintln!(
-                "[mlx-native] tensor_mm_id probe: {}",
-                if ok {
-                    "OK (using tensor variant for MoE)"
-                } else {
-                    "FAILED (falling back to simdgroup MMA)"
-                }
-            );
-        }
-        ok
-    })
+fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> Result<bool> {
+    let probe = registry.probe_optional_pipeline(
+        "kernel_mul_mm_id_q4_0_tensor_f32",
+        device.metal_device(),
+        device.registry_id(),
+        is_unavailable_tensor_header,
+    )?;
+    if probe.newly_probed && std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+        eprintln!(
+            "[mlx-native] tensor_mm_id probe: {}",
+            if probe.available {
+                "OK (using tensor variant for MoE)"
+            } else {
+                "FAILED (falling back to simdgroup MMA)"
+            }
+        );
+    }
+    Ok(probe.available)
 }
 
 pub(crate) fn expert_routing_policy_from_environment() -> GgmlRoutingPolicy {
@@ -1202,15 +1199,7 @@ pub fn build_q6k_id_nr2_m1_record(
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
     let routing = ggml_routing_policy_from_environment();
-    build_q6k_id_nr2_m1_record_with_policy(
-        registry,
-        device,
-        n,
-        k,
-        top_k,
-        expert_stride,
-        &routing,
-    )
+    build_q6k_id_nr2_m1_record_with_policy(registry, device, n, k, top_k, expert_stride, &routing)
 }
 
 /// Explicit-policy form of [`build_q6k_id_nr2_m1_record`].
@@ -2136,10 +2125,10 @@ fn dispatch_id_mm_with_layout(
     // ---- Stage 2: mm_id — matmul with the per-expert lists ----
     //
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
-    // mm_id variant on M3+.  The probe caches the decision after the
-    // first dispatch; subsequent calls are branch-free.
+    // mm_id variant on M3+. The device-bound registry caches the exact
+    // pipeline result after the first dispatch.
     let use_tensor = routing.expert_tensor_mm == GgmlTensorMmPreference::AutoProbe
-        && probe_tensor_mm_id(registry, device);
+        && probe_tensor_mm_id(registry, device)?;
     // Fall through to the simdgroup variant when the per-type tensor
     // kernel isn't shipped — e.g. IQ4_XS (ADR-033 §Pi Task #20 shipped
     // the simdgroup variant only; tensor-API variant deferred as a

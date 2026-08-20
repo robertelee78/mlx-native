@@ -10,7 +10,10 @@ use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
 use crate::encoder::{CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
+use crate::ggml_capability::{GgmlRoutingPolicy, GgmlWorkloadClass};
+use crate::ggml_dispatch_trace::{trace_dense_gate_up_silu_operation, GgmlResolvedDispatchTrace};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::quantized_matmul_ggml::GgmlType;
 
 pub static FUSED_GATE_UP_SILU_Q6_K_SHADER_SOURCE: &str =
     include_str!("../shaders/fused_gate_up_silu_q6_K.metal");
@@ -152,4 +155,35 @@ pub fn dispatch_fused_gate_up_silu_q6_K(
         threads_per_tg,
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments, non_snake_case)]
+pub fn dispatch_fused_gate_up_silu_q6_K_with_trace(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    gate_w: &MlxBuffer,
+    up_w: &MlxBuffer,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    args: FusedGateUpSiluQ6_KArgs,
+    routing: &GgmlRoutingPolicy,
+    workload: GgmlWorkloadClass,
+) -> Result<GgmlResolvedDispatchTrace> {
+    trace_dense_gate_up_silu_operation(
+        encoder,
+        registry,
+        device,
+        GgmlType::Q6_K,
+        args.m,
+        args.intermediate_size,
+        args.hidden_size,
+        routing,
+        workload,
+        |encoder, registry| {
+            dispatch_fused_gate_up_silu_q6_K(
+                encoder, registry, device, gate_w, up_w, input, output, args,
+            )
+        },
+    )
 }

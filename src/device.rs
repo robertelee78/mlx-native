@@ -18,6 +18,13 @@ use crate::encoder_session::EncoderSession;
 use crate::error::{MlxError, Result};
 use crate::residency::{macos_15_or_newer, residency_disabled_by_env, ResidencySet};
 
+pub(crate) fn metal_device_registry_id(device: &metal::DeviceRef) -> u64 {
+    // SAFETY: `registryID` is a read-only MTLDevice property available on
+    // every macOS version supported by mlx-native. `device` is a live retained
+    // MTLDevice object for the duration of the message send.
+    unsafe { objc::msg_send![device, registryID] }
+}
+
 /// Wraps a Metal device and its command queue.
 ///
 /// # Thread Safety
@@ -379,6 +386,13 @@ impl MlxDevice {
     /// Human-readable name of the GPU (e.g. "Apple M2 Max").
     pub fn name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Stable Metal registry identifier for the physical GPU selected by this
+    /// device handle. Runtime dispatch receipts bind both this value and the
+    /// human-readable name so evidence cannot move silently between devices.
+    pub fn registry_id(&self) -> u64 {
+        metal_device_registry_id(&self.device)
     }
 }
 
