@@ -24,7 +24,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use metal::{ComputePipelineDescriptor, ComputePipelineState, FunctionConstantValues, MTLDataType};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use crate::device::metal_device_registry_id;
 use crate::error::{MlxError, Result};
 
 /// Bytes of the precompiled `default.metallib` produced by `build.rs` from
@@ -32,6 +35,48 @@ use crate::error::{MlxError, Result};
 /// `MLX_NATIVE_SKIP_METALLIB` was set at build time (non-macOS or explicit
 /// skip); toolchain-absent on macOS is now a hard build error.
 const EMBEDDED_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/default.metallib"));
+
+fn embedded_metallib_sha256() -> String {
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| hex::encode(Sha256::digest(EMBEDDED_METALLIB)))
+        .clone()
+}
+
+pub const KERNEL_PIPELINE_IDENTITY_SCHEMA_VERSION: u32 = 1;
+
+pub(crate) struct OptionalPipelineProbe {
+    pub available: bool,
+    pub newly_probed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelPipelineOrigin {
+    PrecompiledMetallib,
+    RuntimeSource,
+}
+
+/// Exact crate-controlled build inputs for one compiled pipeline used by a
+/// dispatch. A precompiled origin binds the exact metallib bytes. A runtime
+/// source origin binds source and compile/descriptor options; the driver-built
+/// binary additionally requires the caller's OS/Metal runtime, crate artifact,
+/// and hardware profile for cross-run admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelPipelineIdentity {
+    pub schema_version: u32,
+    pub pipeline_label: String,
+    pub kernel_name: String,
+    pub origin: KernelPipelineOrigin,
+    /// Exact registered MSL source used for a runtime compilation. `None`
+    /// for a precompiled pipeline because that source is not an input to the
+    /// embedded metallib selected by Metal.
+    pub runtime_source_sha256: Option<String>,
+    pub embedded_metallib_sha256: Option<String>,
+    pub precise_fp32_math: bool,
+    pub threadgroup_size_multiple_hint: bool,
+}
 
 /// Returns `true` when the precompiled `.metallib` fast path is enabled
 /// (default-ON).  Set `MLX_PRECOMPILED_METALLIB=0` (or `false`, `off`)
@@ -94,12 +139,18 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// `get_pipeline` to allow mutable cache insertion).  If you need concurrent
 /// access, wrap it in a `Mutex` or use one registry per thread.
 pub struct KernelRegistry {
+    /// A Metal pipeline state is device-owned. Reject attempts to reuse this
+    /// registry on another physical GPU instead of returning a cached PSO for
+    /// the wrong device.
+    bound_device_registry_id: Option<u64>,
     /// Cached pipelines keyed by kernel function name.
     cache: HashMap<String, ComputePipelineState>,
     /// Stable optional-pipeline capability results for this registry/device.
     /// A registry already caches device-specific pipeline objects, so its
     /// capability decisions have the same lifetime and identity scope.
     optional_pipeline_capabilities: HashMap<String, bool>,
+    /// Exact immutable build identity of every compiled cache entry.
+    pipeline_identities: HashMap<String, KernelPipelineIdentity>,
     /// MSL source text keyed by kernel function name.
     ///
     /// Populated at construction time with all embedded shader sources.
@@ -1411,8 +1462,10 @@ impl KernelRegistry {
         sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
         Self {
+            bound_device_registry_id: None,
             cache: HashMap::new(),
             optional_pipeline_capabilities: HashMap::new(),
+            pipeline_identities: HashMap::new(),
             sources,
             precompiled_lib: None,
             precompiled_load_attempted: false,
@@ -1455,10 +1508,40 @@ impl KernelRegistry {
     /// kernel generation).
     pub fn register_source(&mut self, name: impl Into<String>, source: &'static str) {
         let name = name.into();
-        // Invalidate any cached pipeline for this name since the source changed.
-        self.cache.remove(&name);
-        self.optional_pipeline_capabilities.remove(&name);
+        // Invalidate every specialization for this function since the source
+        // changed. Specialized cache keys are prefixed by `name|`.
+        let specialized_prefix = format!("{name}|");
+        self.cache
+            .retain(|key, _| key != &name && !key.starts_with(&specialized_prefix));
+        self.optional_pipeline_capabilities.retain(|key, _| {
+            let pipeline_key = key.split_once(':').map_or(key.as_str(), |(_, rest)| rest);
+            pipeline_key != name && !pipeline_key.starts_with(&specialized_prefix)
+        });
+        self.pipeline_identities
+            .retain(|key, _| key != &name && !key.starts_with(&specialized_prefix));
         self.sources.insert(name, source);
+    }
+
+    /// Return the exact source/metallib identity of a compiled pipeline label.
+    pub fn pipeline_identity(&self, pipeline_label: &str) -> Result<KernelPipelineIdentity> {
+        self.pipeline_identities
+            .get(pipeline_label)
+            .cloned()
+            .ok_or_else(|| MlxError::KernelNotFound(pipeline_label.to_string()))
+    }
+
+    fn bind_device(&mut self, device: &metal::DeviceRef) -> Result<u64> {
+        let registry_id = metal_device_registry_id(device);
+        match self.bound_device_registry_id {
+            Some(bound) if bound != registry_id => Err(MlxError::InvalidArgument(format!(
+                "kernel registry is bound to Metal device {bound}, not {registry_id}"
+            ))),
+            Some(_) => Ok(registry_id),
+            None => {
+                self.bound_device_registry_id = Some(registry_id);
+                Ok(registry_id)
+            }
+        }
     }
 
     /// Probe and cache an optional pipeline capability for this registry's
@@ -1469,13 +1552,24 @@ impl KernelRegistry {
         &mut self,
         name: &str,
         device: &metal::DeviceRef,
+        device_registry_id: u64,
         unavailable: F,
-    ) -> Result<bool>
+    ) -> Result<OptionalPipelineProbe>
     where
         F: FnOnce(&MlxError) -> bool,
     {
-        if let Some(&available) = self.optional_pipeline_capabilities.get(name) {
-            return Ok(available);
+        let actual_registry_id = self.bind_device(device)?;
+        if actual_registry_id != device_registry_id {
+            return Err(MlxError::InvalidArgument(format!(
+                "claimed Metal registry id {device_registry_id} does not match device {actual_registry_id}"
+            )));
+        }
+        let capability_key = format!("{device_registry_id}:{name}");
+        if let Some(&available) = self.optional_pipeline_capabilities.get(&capability_key) {
+            return Ok(OptionalPipelineProbe {
+                available,
+                newly_probed: false,
+            });
         }
 
         let probe = self.get_pipeline(name, device).map(|_| ());
@@ -1485,8 +1579,70 @@ impl KernelRegistry {
             Err(error) => return Err(error),
         };
         self.optional_pipeline_capabilities
-            .insert(name.to_string(), available);
-        Ok(available)
+            .insert(capability_key, available);
+        Ok(OptionalPipelineProbe {
+            available,
+            newly_probed: true,
+        })
+    }
+
+    /// Probe and cache a function-constant-specialized optional pipeline for
+    /// one physical device. The cache key is the exact pipeline label plus the
+    /// Metal registry id, so a registry reused across devices cannot inherit a
+    /// probe result from another GPU.
+    pub(crate) fn probe_optional_pipeline_with_constants<F>(
+        &mut self,
+        name: &str,
+        device: &metal::DeviceRef,
+        device_registry_id: u64,
+        bool_constants: &[(usize, bool)],
+        int_constants: &[(usize, i32)],
+        unavailable: F,
+    ) -> Result<OptionalPipelineProbe>
+    where
+        F: FnOnce(&MlxError) -> bool,
+    {
+        let actual_registry_id = self.bind_device(device)?;
+        if actual_registry_id != device_registry_id {
+            return Err(MlxError::InvalidArgument(format!(
+                "claimed Metal registry id {device_registry_id} does not match device {actual_registry_id}"
+            )));
+        }
+        let mut pipeline_label = name.to_string();
+        for &(index, value) in bool_constants {
+            pipeline_label.push('|');
+            pipeline_label.push_str(&index.to_string());
+            pipeline_label.push_str(if value { ":b1" } else { ":b0" });
+        }
+        for &(index, value) in int_constants {
+            pipeline_label.push('|');
+            pipeline_label.push_str(&index.to_string());
+            pipeline_label.push(':');
+            pipeline_label.push('i');
+            pipeline_label.push_str(&value.to_string());
+        }
+        let capability_key = format!("{device_registry_id}:{pipeline_label}");
+        if let Some(&available) = self.optional_pipeline_capabilities.get(&capability_key) {
+            return Ok(OptionalPipelineProbe {
+                available,
+                newly_probed: false,
+            });
+        }
+
+        let probe = self
+            .get_pipeline_with_constants(name, device, bool_constants, int_constants)
+            .map(|_| ());
+        let available = match probe {
+            Ok(()) => true,
+            Err(error) if unavailable(&error) => false,
+            Err(error) => return Err(error),
+        };
+        self.optional_pipeline_capabilities
+            .insert(capability_key, available);
+        Ok(OptionalPipelineProbe {
+            available,
+            newly_probed: true,
+        })
     }
 
     /// ADR-033 §Pi Task #20 iter 11 (2026-05-23) — eagerly compile a list
@@ -1504,8 +1660,14 @@ impl KernelRegistry {
     /// list contains a kernel name for an arch this build doesn't use).
     /// Logs at debug level on failure to keep load-path quiet.
     ///
-    /// Returns the count of pipelines successfully prewarmed.
+    /// Returns the count of pipelines successfully prewarmed. A registry
+    /// already bound to another physical device fails closed with zero.
     pub fn prewarm_pipelines(&mut self, device: &metal::DeviceRef, names: &[&str]) -> usize {
+        // Bind before inspecting the cache so a registry already populated on
+        // one physical device cannot report a false cache hit on another.
+        if self.bind_device(device).is_err() {
+            return 0;
+        }
         let mut warmed = 0_usize;
         for name in names {
             // Skip if already cached.
@@ -1540,12 +1702,16 @@ impl KernelRegistry {
     /// `validateWithDevice:` asserts and aborts the process. Provide
     /// the constants production uses and prewarming becomes safe.
     ///
-    /// Returns count warmed.
+    /// Returns count warmed. A registry already bound to another physical
+    /// device fails closed with zero.
     pub fn prewarm_pipelines_with_bool_constants(
         &mut self,
         device: &metal::DeviceRef,
         entries: &[(&str, &[(usize, bool)])],
     ) -> usize {
+        if self.bind_device(device).is_err() {
+            return 0;
+        }
         let mut warmed = 0_usize;
         for (name, bool_constants) in entries {
             if !self.sources.contains_key(*name) {
@@ -1567,9 +1733,13 @@ impl KernelRegistry {
     /// Total cost is bounded by the number of registered kernels times
     /// the per-pipeline PSO creation cost (~5-15ms typical on M-series).
     ///
-    /// Returns (warmed, skipped) counts.
+    /// Returns (warmed, skipped) counts. A registry already bound to another
+    /// physical device reports every requested source as skipped.
     pub fn prewarm_all(&mut self, device: &metal::DeviceRef) -> (usize, usize) {
         let names: Vec<String> = self.sources.keys().cloned().collect();
+        if self.bind_device(device).is_err() {
+            return (0, names.len());
+        }
         let mut warmed = 0_usize;
         let mut skipped = 0_usize;
         for name in &names {
@@ -1602,6 +1772,7 @@ impl KernelRegistry {
         name: &str,
         device: &metal::DeviceRef,
     ) -> Result<&ComputePipelineState> {
+        self.bind_device(device)?;
         if !self.cache.contains_key(name) {
             // ADR-029 iter-175 Step 1l: precompiled .metallib fast path.
             // When MLX_PRECOMPILED_METALLIB=1 AND the kernel exists in the
@@ -1612,6 +1783,12 @@ impl KernelRegistry {
                 .try_precompiled_lib(device)
                 .and_then(|lib| lib.get_function(name, None).ok());
 
+            let origin = if precompiled_function.is_some() {
+                KernelPipelineOrigin::PrecompiledMetallib
+            } else {
+                KernelPipelineOrigin::RuntimeSource
+            };
+            let precise_fp32_math = requires_precise_fp32_math(name);
             let function = match precompiled_function {
                 Some(f) => f,
                 None => {
@@ -1622,7 +1799,7 @@ impl KernelRegistry {
                         .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
 
                     let compile_opts = metal::CompileOptions::new();
-                    if requires_precise_fp32_math(name) {
+                    if precise_fp32_math {
                         compile_opts.set_fast_math_enabled(false);
                     }
                     let library = device
@@ -1659,7 +1836,9 @@ impl KernelRegistry {
             // SAFETY: every dispatched threadgroup MUST be a multiple of 32 at
             // runtime — Apple specifies undefined behavior otherwise.  Our hot
             // kernels use tg_size ∈ {32, 64, 256, 1024} (all multiples of 32).
-            if std::env::var("HF2Q_PIPELINE_TG_MULT_HINT").ok().as_deref() == Some("1") {
+            let threadgroup_size_multiple_hint =
+                std::env::var("HF2Q_PIPELINE_TG_MULT_HINT").ok().as_deref() == Some("1");
+            if threadgroup_size_multiple_hint {
                 descriptor.set_thread_group_size_is_multiple_of_thread_execution_width(true);
             }
 
@@ -1670,6 +1849,33 @@ impl KernelRegistry {
                     message: msg,
                 })?;
 
+            let runtime_source_sha256 = match origin {
+                KernelPipelineOrigin::PrecompiledMetallib => None,
+                KernelPipelineOrigin::RuntimeSource => {
+                    let source = self
+                        .sources
+                        .get(name)
+                        .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
+                    Some(hex::encode(Sha256::digest(source.as_bytes())))
+                }
+            };
+            self.pipeline_identities.insert(
+                name.to_string(),
+                KernelPipelineIdentity {
+                    schema_version: KERNEL_PIPELINE_IDENTITY_SCHEMA_VERSION,
+                    pipeline_label: name.to_string(),
+                    kernel_name: name.to_string(),
+                    origin,
+                    runtime_source_sha256,
+                    embedded_metallib_sha256: matches!(
+                        origin,
+                        KernelPipelineOrigin::PrecompiledMetallib
+                    )
+                    .then(embedded_metallib_sha256),
+                    precise_fp32_math,
+                    threadgroup_size_multiple_hint,
+                },
+            );
             self.cache.insert(name.to_string(), pipeline);
         }
 
@@ -1708,6 +1914,7 @@ impl KernelRegistry {
         bool_constants: &[(usize, bool)],
         int_constants: &[(usize, i32)],
     ) -> Result<&ComputePipelineState> {
+        self.bind_device(device)?;
         // Build a composite cache key so distinct constant combinations each
         // compile to their own pipeline.  Bool entries use the 'b' type marker
         // and i32 entries use 'i'; this prevents a collision between, e.g.,
@@ -1786,6 +1993,12 @@ impl KernelRegistry {
                 None
             };
 
+            let origin = if precompiled_function.is_some() {
+                KernelPipelineOrigin::PrecompiledMetallib
+            } else {
+                KernelPipelineOrigin::RuntimeSource
+            };
+            let precise_fp32_math = requires_precise_fp32_math(name);
             let function = match precompiled_function {
                 Some(f) => f,
                 None => {
@@ -1796,7 +2009,7 @@ impl KernelRegistry {
                         .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
 
                     let compile_opts = metal::CompileOptions::new();
-                    if requires_precise_fp32_math(name) {
+                    if precise_fp32_math {
                         compile_opts.set_fast_math_enabled(false);
                     }
                     let library = device
@@ -1825,7 +2038,9 @@ impl KernelRegistry {
             descriptor.set_compute_function(Some(&function));
             descriptor.set_label(&cache_key);
             // ADR-028 iter-376: same hint as primary pipeline path.
-            if std::env::var("HF2Q_PIPELINE_TG_MULT_HINT").ok().as_deref() == Some("1") {
+            let threadgroup_size_multiple_hint =
+                std::env::var("HF2Q_PIPELINE_TG_MULT_HINT").ok().as_deref() == Some("1");
+            if threadgroup_size_multiple_hint {
                 descriptor.set_thread_group_size_is_multiple_of_thread_execution_width(true);
             }
 
@@ -1836,6 +2051,33 @@ impl KernelRegistry {
                     message: msg,
                 })?;
 
+            let runtime_source_sha256 = match origin {
+                KernelPipelineOrigin::PrecompiledMetallib => None,
+                KernelPipelineOrigin::RuntimeSource => {
+                    let source = self
+                        .sources
+                        .get(name)
+                        .ok_or_else(|| MlxError::KernelNotFound(name.to_string()))?;
+                    Some(hex::encode(Sha256::digest(source.as_bytes())))
+                }
+            };
+            self.pipeline_identities.insert(
+                cache_key.clone(),
+                KernelPipelineIdentity {
+                    schema_version: KERNEL_PIPELINE_IDENTITY_SCHEMA_VERSION,
+                    pipeline_label: cache_key.clone(),
+                    kernel_name: name.to_string(),
+                    origin,
+                    runtime_source_sha256,
+                    embedded_metallib_sha256: matches!(
+                        origin,
+                        KernelPipelineOrigin::PrecompiledMetallib
+                    )
+                    .then(embedded_metallib_sha256),
+                    precise_fp32_math,
+                    threadgroup_size_multiple_hint,
+                },
+            );
             self.cache.insert(cache_key.clone(), pipeline);
         }
 

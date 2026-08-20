@@ -47,11 +47,16 @@ pub(super) fn tensor_pipeline_available(
             true
         }
         DenseMmBackend::Auto if force_fallback_from_env() => false,
-        DenseMmBackend::Auto => registry.probe_optional_pipeline(
-            pipeline_name,
-            device.metal_device(),
-            is_unavailable_tensor_header,
-        )?,
+        DenseMmBackend::Auto => {
+            registry
+                .probe_optional_pipeline(
+                    pipeline_name,
+                    device.metal_device(),
+                    device.registry_id(),
+                    is_unavailable_tensor_header,
+                )?
+                .available
+        }
     };
 
     if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {

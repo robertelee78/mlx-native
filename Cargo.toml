@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.10.15"
+version = "0.10.16"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
@@ -40,6 +40,8 @@ memmap2 = "0.9.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 half = { version = "2", features = ["bytemuck"] }
+hex = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 static_assertions = "1"

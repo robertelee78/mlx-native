@@ -18,9 +18,12 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
-    plan_dense_auto_route, DenseAutoPlan, GgmlRoutingPolicy, GgmlTensorMmPreference,
+    plan_dense_auto_route, DenseAutoPlan, GgmlCapabilityRequest, GgmlInvocation, GgmlRoutingPolicy,
+    GgmlTensorMmPreference, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
+use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
 use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
+use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_mv.
@@ -201,7 +204,7 @@ impl GgmlType {
 
     /// Metal kernel function name for the matrix-vector (mv) kernel
     /// — used for `m <= MM_ROUTING_THRESHOLD`.
-    fn kernel_name(self) -> &'static str {
+    pub(crate) fn kernel_name(self) -> &'static str {
         match self {
             // Scalar/non-quantized types are not applicable to this dispatch.
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
@@ -228,7 +231,7 @@ impl GgmlType {
     /// Metal kernel function name for the matrix-matrix (mm) kernel
     /// — used for `m > MM_ROUTING_THRESHOLD`.  Ported from
     /// llama.cpp's `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
-    fn mm_kernel_name(self) -> &'static str {
+    pub(crate) fn mm_kernel_name(self) -> &'static str {
         match self {
             // ADR-022 Phase 2 — Q5_K dense mm ported.
             // ADR-022 Phase 3 — Q4_K dense mm ported.
@@ -251,7 +254,7 @@ impl GgmlType {
     /// variant (ADR-011 Phase 3 Wave P3b-tensor).  On M3+ this path uses
     /// `mpp::tensor_ops::matmul2d<>` which hits the hardware tensor cores
     /// for 2-3× the FLOP throughput of the simdgroup MMA variant.
-    fn mm_tensor_kernel_name(self) -> &'static str {
+    pub(crate) fn mm_tensor_kernel_name(self) -> &'static str {
         match self {
             // ADR-022 Phase 2: Q5_K tensor mm landed.
             // ADR-022 Phase 3: Q4_K tensor mm landed.
@@ -275,7 +278,7 @@ impl GgmlType {
     /// shmem staging), 4 simdgroups.  Ports llama.cpp's modern tensor
     /// kernel layout at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:
     /// 9309-9431 (the GGML_METAL_HAS_TENSOR branch).
-    fn mm_tensor_v2_kernel_name(self) -> &'static str {
+    pub(crate) fn mm_tensor_v2_kernel_name(self) -> &'static str {
         match self {
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
@@ -293,40 +296,29 @@ impl GgmlType {
     }
 }
 
-/// Cached tensor-API availability — `None` until the first mm dispatch,
-/// then `Some(true)` if the tensor mm kernels compile on this device,
-/// `Some(false)` if they don't (we transparently fall back to the
-/// simdgroup MMA variants).  One-shot probe keeps the hot path
-/// branch-free after the first layer.
-static TENSOR_MM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
-    *TENSOR_MM_AVAILABLE.get_or_init(|| {
-        // Attempt to compile one tensor-mm pipeline; success means the
-        // Metal runtime has `<metal_tensor>` +
-        // `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>`
-        // available on this device (M3+).  Probing via Q4_0 is sufficient
-        // — all three qtype variants share the same tensor_ops surface.
-        let ok = registry
-            .get_pipeline_with_constants(
-                "kernel_mul_mm_q4_0_tensor_f32",
-                device.metal_device(),
-                &[],
-                &[(700, 1), (701, 1), (702, 1)],
-            )
-            .is_ok();
-        if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
-            eprintln!(
-                "[mlx-native] tensor_mm probe: {}",
-                if ok {
-                    "OK (using tensor variant)"
-                } else {
-                    "FAILED (falling back to simdgroup MMA)"
-                }
-            );
-        }
-        ok
-    })
+/// Device-bound tensor-API availability. The registry caches the exact
+/// specialized-pipeline result; later calls still perform the registry-id and
+/// cache-key lookup but do not recompile the probe pipeline.
+fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> Result<bool> {
+    let probe = registry.probe_optional_pipeline_with_constants(
+        "kernel_mul_mm_q4_0_tensor_f32",
+        device.metal_device(),
+        device.registry_id(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+        is_unavailable_tensor_header,
+    )?;
+    if probe.newly_probed && std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+        eprintln!(
+            "[mlx-native] tensor_mm probe: {}",
+            if probe.available {
+                "OK (using tensor variant)"
+            } else {
+                "FAILED (falling back to simdgroup MMA)"
+            }
+        );
+    }
+    Ok(probe.available)
 }
 
 pub(crate) fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
@@ -695,6 +687,41 @@ pub fn quantized_matmul_ggml_with_policy(
             encoder, registry, device, input, weight, output, params, routing,
         ),
     }
+}
+
+/// Execute the canonical dense GGUF operation under an explicit routing
+/// policy and return typed evidence for the exact Metal dispatches encoded by
+/// this call. The trace scope is fail-closed and cannot coexist with graph
+/// capture, which records instead of executing. The receipt proves encoding,
+/// not command-buffer completion or latency.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_with_policy_and_trace(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
+    workload: GgmlWorkloadClass,
+) -> Result<GgmlResolvedDispatchTrace> {
+    let request = GgmlCapabilityRequest {
+        schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+        invocation: GgmlInvocation::DenseAuto {
+            m: params.m,
+            n: params.n,
+            k: params.k,
+        },
+        ggml_type: params.ggml_type,
+        workload,
+        routing: *routing,
+    };
+    trace_ggml_operation(encoder, registry, device, request, |encoder, registry| {
+        quantized_matmul_ggml_with_policy(
+            encoder, registry, device, input, weight, output, params, routing,
+        )
+    })
 }
 
 /// Execute independent quantized matrix products through the MM kernel's
@@ -1691,7 +1718,7 @@ fn dispatch_mm(
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
     let use_tensor = routing.dense_tensor_mm == GgmlTensorMmPreference::AutoProbe
-        && probe_tensor_mm(registry, device);
+        && probe_tensor_mm(registry, device)?;
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
     // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).
