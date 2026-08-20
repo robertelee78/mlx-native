@@ -59,6 +59,7 @@ pub mod ggml_capability;
 mod kernel_registry;
 mod mem_ranges;
 mod residency;
+mod ggml_routing_policy;
 pub mod gguf;
 pub mod kernel_profile;
 pub mod graph;
@@ -84,6 +85,7 @@ pub use ggml_capability::{
     GgmlRoutingPolicy, GgmlScratchRequirement, GgmlTensorMmPreference,
     GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
+pub use ggml_routing_policy::ggml_routing_policy_from_environment;
 pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
 pub use dtypes::DType;

@@ -19,6 +19,7 @@ use crate::ggml_capability::{
     ggml_expert_bytes, plan_expert_auto_route, ExpertAutoPlan, GgmlRoutingPolicy,
     GgmlTensorMmPreference,
 };
+use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_id_mv.
@@ -201,7 +202,7 @@ fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> bool
     })
 }
 
-fn expert_routing_policy_from_environment() -> GgmlRoutingPolicy {
+pub(crate) fn expert_routing_policy_from_environment() -> GgmlRoutingPolicy {
     GgmlRoutingPolicy {
         expert_mm_threshold: mm_id_routing_threshold(),
         expert_q6k_mv_nr2: cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2"),
@@ -250,7 +251,7 @@ pub fn quantized_matmul_id_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = expert_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_id_ggml_with_policy(
         encoder, registry, device, input, weight, ids, output, params, &routing,
     )
@@ -294,7 +295,7 @@ pub fn quantized_matmul_id_ggml_mv(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = expert_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_id_ggml_mv_with_policy(
         encoder, registry, device, input, weight, ids, output, params, &routing,
     )
@@ -475,7 +476,7 @@ pub fn quantized_matmul_id_ggml_pooled(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = expert_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_id_ggml_pooled_with_policy(
         encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
     )
@@ -538,7 +539,7 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = expert_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_id_ggml_pooled_pair_with_policy(
         encoder,
         registry,
@@ -790,7 +791,7 @@ pub fn quantized_matmul_id_ggml_pooled_slotted(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = expert_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_id_ggml_pooled_slotted_with_policy(
         encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
     )
@@ -1200,6 +1201,28 @@ pub fn build_q6k_id_nr2_m1_record(
     top_k: u32,
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
+    let routing = ggml_routing_policy_from_environment();
+    build_q6k_id_nr2_m1_record_with_policy(
+        registry,
+        device,
+        n,
+        k,
+        top_k,
+        expert_stride,
+        &routing,
+    )
+}
+
+/// Explicit-policy form of [`build_q6k_id_nr2_m1_record`].
+pub fn build_q6k_id_nr2_m1_record_with_policy(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    expert_stride: u64,
+    routing: &GgmlRoutingPolicy,
+) -> Result<Option<DispatchRecord>> {
     if expert_stride > i64::MAX as u64 {
         return Err(MlxError::InvalidArgument(
             "expert stride exceeds the signed Metal kernel ABI".into(),
@@ -1207,7 +1230,7 @@ pub fn build_q6k_id_nr2_m1_record(
     }
     // Only bakeable when the NR2 variant is the selected one — same
     // gate as `dispatch_id_mv`'s `use_q6k_id_nr2` branch.
-    if !cached_env_default_true(&CACHED_Q6K_ID_MV_NR2, "HF2Q_Q6K_ID_MV_NR2") {
+    if !routing.expert_q6k_mv_nr2 {
         return Ok(None);
     }
 
@@ -1296,6 +1319,28 @@ pub fn build_q8_0_id_decode_record(
     real_top_k: u32,
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
+    let routing = ggml_routing_policy_from_environment();
+    build_q8_0_id_decode_record_with_policy(
+        registry,
+        device,
+        n,
+        k,
+        real_top_k,
+        expert_stride,
+        &routing,
+    )
+}
+
+/// Explicit-policy form of [`build_q8_0_id_decode_record`].
+pub fn build_q8_0_id_decode_record_with_policy(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    n: u32,
+    k: u32,
+    real_top_k: u32,
+    expert_stride: u64,
+    routing: &GgmlRoutingPolicy,
+) -> Result<Option<DispatchRecord>> {
     if expert_stride > i64::MAX as u64 {
         return Err(MlxError::InvalidArgument(
             "expert stride exceeds the signed Metal kernel ABI".into(),
@@ -1303,7 +1348,7 @@ pub fn build_q8_0_id_decode_record(
     }
     // Only bakeable when the regular (non-NR2) Q8_0_ID kernel is selected.
     // Mirrors the negation of `dispatch_id_mv`'s `use_q8_0_id_nr2` branch.
-    if cached_env_eq_one(&CACHED_Q8_0_ID_MV_NR2, "HF2Q_Q8_0_ID_MV_NR2") {
+    if routing.expert_q8_0_mv_nr2 {
         return Ok(None);
     }
 

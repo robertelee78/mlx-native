@@ -175,7 +175,11 @@ embedding route for an exact public entry point, shape, workload regime, and
 explicit routing policy. Correct but non-specialized fallbacks are explicit—
 for example, prompt-shaped dense IQ4_XS is executable through matvec but has no
 dense-MM route. The matching `*_with_policy` dispatch APIs consume that exact
-policy rather than rereading environment overrides. Device selection between
+policy rather than rereading environment overrides. Use
+`ggml_routing_policy_from_environment()` once at model load when compatibility
+with the legacy environment-backed entry points is required; serialize that
+returned value into the execution receipt and pass it to every capability
+query, explicit dispatch, and pre-baked dispatch-record builder. Device selection between
 tensor-API and simdgroup MM kernels remains labeled runtime-trace and measured
 kernel-profile evidence, not an inferred speed claim.
 See [the GGUF execution capability decision](docs/gguf-execution-capability-2026-08-19.md)
