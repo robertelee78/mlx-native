@@ -144,7 +144,8 @@ impl MetadataValue {
 pub struct TensorInfo {
     /// Tensor name (e.g. "blk.0.attn_q.weight").
     pub name: String,
-    /// Tensor shape, innermost dimension first (as stored in GGUF).
+    /// Tensor shape in logical outermost-first order. GGUF stores dimensions
+    /// innermost-first; the parser reverses them exactly once at the boundary.
     pub shape: Vec<usize>,
     /// GGML quantization type.
     pub ggml_type: GgmlType,
@@ -396,26 +397,39 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
 
 /// Compute the byte length of a tensor from its shape and GGML type.
 ///
-/// For quantized types, the innermost dimension (shape[0] in GGUF's row-major
-/// convention) must be divisible by the block's element count.
+/// For quantized types, the logical innermost dimension (`shape.last()` after
+/// the parser's boundary reversal) must be divisible by the block's element
+/// count. GGML blocks never span rows.
 fn compute_byte_len(shape: &[usize], ggml_type: GgmlType) -> Result<usize> {
-    let total_elements: usize = shape.iter().product();
-    if total_elements == 0 {
-        return Ok(0);
+    let (&innermost, outer_shape) = shape.split_last().ok_or_else(|| {
+        MlxError::GgufParseError("tensor shape must contain at least one dimension".into())
+    })?;
+    if innermost == 0 || outer_shape.contains(&0) {
+        return Err(MlxError::GgufParseError(
+            "tensor shape dimensions must be non-zero".into(),
+        ));
     }
 
     let elems_per_block = ggml_type.block_values() as usize;
     let bytes_per_block = ggml_type.block_bytes() as usize;
 
-    if total_elements % elems_per_block != 0 {
+    if innermost % elems_per_block != 0 {
         return Err(MlxError::GgufParseError(format!(
-            "total elements {total_elements} not divisible by block size {elems_per_block} \
-             for type {:?}",
+            "innermost dimension {innermost} not divisible by block size {elems_per_block} \
+             for type {:?}; GGML blocks cannot span rows",
             ggml_type
         )));
     }
 
-    Ok((total_elements / elems_per_block) * bytes_per_block)
+    let outer_rows = outer_shape.iter().try_fold(1usize, |rows, dimension| {
+        rows.checked_mul(*dimension)
+            .ok_or_else(|| MlxError::GgufParseError("tensor outer-row count overflow".into()))
+    })?;
+    let blocks_per_row = innermost / elems_per_block;
+    outer_rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(bytes_per_block))
+        .ok_or_else(|| MlxError::GgufParseError("tensor byte length overflow".into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,6 +1315,11 @@ impl GgufFile {
             let byte_len = compute_byte_len(&shape, ggml_type)
                 .map_err(|e| MlxError::GgufParseError(format!("tensor '{name}': {e}")))?;
 
+            if tensors.contains_key(&name) {
+                return Err(MlxError::GgufParseError(format!(
+                    "duplicate tensor name '{name}' in GGUF directory"
+                )));
+            }
             tensors.insert(
                 name.clone(),
                 TensorInfo {
@@ -1395,11 +1414,47 @@ impl GgufFile {
     /// This is a private helper that seeks to the tensor's location and reads
     /// `byte_len` bytes.
     fn read_tensor_bytes(&self, info: &TensorInfo) -> Result<Vec<u8>> {
-        let abs_offset = self.tensor_data_offset + info.offset;
+        let abs_offset = self
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .ok_or_else(|| {
+                MlxError::GgufParseError(format!(
+                    "tensor '{}' absolute file offset overflow",
+                    info.name
+                ))
+            })?;
+        let byte_len = u64::try_from(info.byte_len).map_err(|_| {
+            MlxError::GgufParseError(format!(
+                "tensor '{}' byte length is not representable",
+                info.name
+            ))
+        })?;
+        let abs_end = abs_offset.checked_add(byte_len).ok_or_else(|| {
+            MlxError::GgufParseError(format!(
+                "tensor '{}' absolute file range overflow",
+                info.name
+            ))
+        })?;
         let mut reader = self
             .reader
             .lock()
             .map_err(|_| MlxError::GgufParseError("reader mutex poisoned".into()))?;
+        let file_len = reader
+            .get_ref()
+            .metadata()
+            .map_err(|error| {
+                MlxError::IoError(format!(
+                    "stat GGUF before reading tensor '{}': {error}",
+                    info.name
+                ))
+            })?
+            .len();
+        if abs_end > file_len {
+            return Err(MlxError::GgufParseError(format!(
+                "tensor '{}' range [{abs_offset}, {abs_end}) exceeds file length {file_len}",
+                info.name
+            )));
+        }
 
         reader
             .seek(SeekFrom::Start(abs_offset))
@@ -1414,6 +1469,48 @@ impl GgufFile {
         })?;
 
         Ok(buf)
+    }
+
+    /// Read one tensor's exact packed payload bytes without allocating a Metal
+    /// buffer.
+    ///
+    /// The returned bytes exclude GGUF alignment padding and are read from the
+    /// checked tensor region described by [`TensorInfo`]. This is intended for
+    /// artifact verification, conversion receipts, and other host-side
+    /// provenance work that must bind the bytes actually stored on disk.
+    pub fn read_tensor_bytes_host(&self, name: &str) -> Result<Vec<u8>> {
+        let info = self.tensors.get(name).ok_or_else(|| {
+            MlxError::GgufParseError(format!("tensor '{name}' not found in GGUF file"))
+        })?;
+        self.read_tensor_bytes(info)
+    }
+
+    /// Decode one tensor to host-resident F32 values without requiring Metal.
+    ///
+    /// This uses the same GGML decoder as [`Self::load_tensor_f32`], but
+    /// returns an owned vector. It is the canonical device-free path for
+    /// computing logical tensor hashes from finalized GGUF payload bytes.
+    pub fn read_tensor_f32_host(&self, name: &str) -> Result<Vec<f32>> {
+        let info = self.tensors.get(name).ok_or_else(|| {
+            MlxError::GgufParseError(format!("tensor '{name}' not found in GGUF file"))
+        })?;
+        let data = self.read_tensor_bytes(info)?;
+        let total_elements = info
+            .shape
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+            .ok_or_else(|| {
+                MlxError::GgufParseError(format!("tensor '{}' element count overflow", info.name))
+            })?;
+        if total_elements == 0 {
+            return Err(MlxError::GgufParseError(format!(
+                "tensor '{}' has zero elements",
+                info.name
+            )));
+        }
+        let mut values = vec![0.0_f32; total_elements];
+        dequantize_to_f32(&data, info.ggml_type, &mut values)?;
+        Ok(values)
     }
 
     /// Map one tensor through its own virtual-address range.

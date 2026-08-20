@@ -135,7 +135,7 @@ fn q3_k_type_size_and_cpu_dequant_match_llama_formula() {
         GgmlType::Q3_K
     );
     assert_eq!(
-        mlx_native::gguf::test_only_compute_byte_len(&[512, 3], GgmlType::Q3_K).unwrap(),
+        mlx_native::gguf::test_only_compute_byte_len(&[3, 512], GgmlType::Q3_K).unwrap(),
         660
     );
 
