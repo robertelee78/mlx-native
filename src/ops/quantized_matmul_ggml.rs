@@ -17,6 +17,9 @@ use crate::device::MlxDevice;
 use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
+use crate::ggml_capability::{
+    plan_dense_auto_route, DenseAutoPlan, GgmlRoutingPolicy, GgmlTensorMmPreference,
+};
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_mv.
@@ -30,6 +33,14 @@ static CACHED_DECODE_MV_EXT: AtomicI8 = AtomicI8::new(-1);
 static CACHED_DECODE_MVN: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+
+fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
+    factors.iter().try_fold(1usize, |total, factor| {
+        total.checked_mul(*factor).ok_or_else(|| {
+            MlxError::InvalidArgument(format!("quantized_matmul_ggml: {label} size overflow"))
+        })
+    })
+}
 
 // ---- Block format constants ----
 
@@ -96,7 +107,8 @@ const BLOCK_IQ4_XS_BYTES: u32 = 136;
 // ---- Public types ----
 
 /// GGML quantization type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[allow(non_camel_case_types)]
 pub enum GgmlType {
     /// 32-bit float (unquantized). 1 element per block, 4 bytes per block.
@@ -289,15 +301,6 @@ static TENSOR_MM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new
 
 fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     *TENSOR_MM_AVAILABLE.get_or_init(|| {
-        // ADR-029 H28 probe: HF2Q_DISABLE_TENSOR_MM=1 forces the
-        // simdgroup-MMA fallback so we can A/B test whether the tensor
-        // variant is the source of the 2× prefill gap vs peer.
-        if std::env::var("HF2Q_DISABLE_TENSOR_MM").as_deref() == Ok("1") {
-            if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
-                eprintln!("[mlx-native] tensor_mm probe: DISABLED via HF2Q_DISABLE_TENSOR_MM=1");
-            }
-            return false;
-        }
         // Attempt to compile one tensor-mm pipeline; success means the
         // Metal runtime has `<metal_tensor>` +
         // `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>`
@@ -323,6 +326,25 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
         }
         ok
     })
+}
+
+fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
+    GgmlRoutingPolicy {
+        dense_decode_mvn: cached_env_default_true(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN"),
+        dense_decode_mv_ext: cached_env_eq_one(&CACHED_DECODE_MV_EXT, "HF2Q_DECODE_MV_EXT"),
+        dense_q6k_mv_nr2: cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2"),
+        dense_q8_0_mv_nr2: cached_env_default_true(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2"),
+        dense_tensor_mm: if std::env::var("HF2Q_DISABLE_TENSOR_MM").as_deref() == Ok("1") {
+            GgmlTensorMmPreference::ForceSimd
+        } else {
+            GgmlTensorMmPreference::AutoProbe
+        },
+        allow_dense_large_tile_mm: !matches!(
+            std::env::var("HF2Q_LARGE_TILE_MM").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        ),
+        ..GgmlRoutingPolicy::default()
+    }
 }
 
 /// llama.cpp's `ne11_mm_min` threshold for routing between mat-vec and
@@ -452,6 +474,27 @@ pub fn quantized_matmul_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    let routing = dense_routing_policy_from_environment();
+    quantized_matmul_ggml_with_policy(
+        encoder, registry, device, input, weight, output, params, &routing,
+    )
+}
+
+/// Execute the canonical dense GGUF operation under an explicit routing
+/// policy. This is the receipt-bindable entry point used by allocators and
+/// benchmark harnesses; unlike [`quantized_matmul_ggml`], it does not consult
+/// process-global routing overrides.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
     // ADR-028: output: &MlxBuffer (was &mut).  Encoders never mutate
     // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
     // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
@@ -501,38 +544,50 @@ pub fn quantized_matmul_ggml(
     }
 
     let blocks_per_row = params.k / qk;
-    let expected_weight_bytes =
-        (params.n as usize) * (blocks_per_row as usize) * (block_bytes as usize);
-    if weight.byte_len() < expected_weight_bytes {
+    let expected_weight_bytes = checked_byte_extent(
+        "weight",
+        &[
+            params.n as usize,
+            blocks_per_row as usize,
+            block_bytes as usize,
+        ],
+    )?;
+    if weight.data_byte_len() < expected_weight_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "Weight buffer too small: expected {} bytes for {:?} [{}x{}], got {}",
             expected_weight_bytes,
             params.ggml_type,
             params.n,
             params.k,
-            weight.byte_len()
+            weight.data_byte_len()
         )));
     }
 
-    let expected_input_bytes = (params.m as usize) * (params.k as usize) * DType::F32.size_of();
-    if input.byte_len() < expected_input_bytes {
+    let expected_input_bytes = checked_byte_extent(
+        "input",
+        &[params.m as usize, params.k as usize, DType::F32.size_of()],
+    )?;
+    if input.data_byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "Input buffer too small: expected {} bytes for [{}x{}] f32, got {}",
             expected_input_bytes,
             params.m,
             params.k,
-            input.byte_len()
+            input.data_byte_len()
         )));
     }
 
-    let expected_output_bytes = (params.m as usize) * (params.n as usize) * DType::F32.size_of();
-    if output.byte_len() < expected_output_bytes {
+    let expected_output_bytes = checked_byte_extent(
+        "output",
+        &[params.m as usize, params.n as usize, DType::F32.size_of()],
+    )?;
+    if output.data_byte_len() < expected_output_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "Output buffer too small: expected {} bytes for [{}x{}] f32, got {}",
             expected_output_bytes,
             params.m,
             params.n,
-            output.byte_len()
+            output.data_byte_len()
         )));
     }
 
@@ -597,59 +652,47 @@ pub fn quantized_matmul_ggml(
     // -O3 metallib + release-deterministic parity (after the encoder-retain root
     // fix that the mvN flake surfaced — encoder.rs §0.21c-track2) + measured
     // +12.5% net N=8 decode throughput (clean single-tenant).
-    if cached_env_default_true(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN")
-        && matches!(params.ggml_type, GgmlType::Q6_K)
-        && params.m >= 2
-        && params.m <= 8
-        && params.k % QK6_K == 0
-    {
-        if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
-            eprintln!(
-                "[mvN-route] Q6_K m={} n={} k={} → mN tiles={:?}",
-                params.m,
-                params.n,
-                params.k,
-                mn_column_tiling(params.m as usize)
-            );
+    match plan_dense_auto_route(params.ggml_type, params.m, params.k, routing) {
+        DenseAutoPlan::Q6kWidthMn => {
+            debug_assert!(params.k % QK6_K == 0);
+            if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
+                eprintln!(
+                    "[mvN-route] Q6_K m={} n={} k={} → mN tiles={:?}",
+                    params.m,
+                    params.n,
+                    params.k,
+                    mn_column_tiling(params.m as usize)
+                );
+            }
+            dispatch_mv_q6k_mn_adaptive(encoder, registry, device, input, weight, output, params)
         }
-        return dispatch_mv_q6k_mn_adaptive(
-            encoder, registry, device, input, weight, output, params,
-        );
-    }
-    let mv_ext_ok = matches!(
-        params.ggml_type,
-        GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0
-    );
-    if cached_env_eq_one(&CACHED_DECODE_MV_EXT, "HF2Q_DECODE_MV_EXT")
-        && params.m >= 2
-        && params.m <= 8
-        && params.k >= 32
-        && mv_ext_ok
-        && params.k % (params.ggml_type.block_values() as u32) == 0
-    {
-        let ext_params = crate::ops::mul_mv_ext::MulMvExtParams {
-            m: params.m,
-            n: params.n,
-            k: params.k,
-            batch: 1,
-            ggml_type: params.ggml_type,
-        };
-        return crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
-            encoder,
-            registry,
-            device,
-            weight,
-            input,
-            output,
-            &ext_params,
-        );
-    }
-    if params.m > MM_ROUTING_THRESHOLD && params.k >= 32 && mm_supported {
-        dispatch_mm(
-            encoder, registry, device, input, weight, output, params, 1, None, false,
-        )
-    } else {
-        dispatch_mv(encoder, registry, device, input, weight, output, params)
+        DenseAutoPlan::WidthMvExt => {
+            let ext_params = crate::ops::mul_mv_ext::MulMvExtParams {
+                m: params.m,
+                n: params.n,
+                k: params.k,
+                batch: 1,
+                ggml_type: params.ggml_type,
+            };
+            crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                output,
+                &ext_params,
+            )
+        }
+        DenseAutoPlan::Mm => {
+            debug_assert!(mm_supported);
+            dispatch_mm(
+                encoder, registry, device, input, weight, output, params, 1, None, routing,
+            )
+        }
+        DenseAutoPlan::Mv => dispatch_mv(
+            encoder, registry, device, input, weight, output, params, routing,
+        ),
     }
 }
 
@@ -670,6 +713,24 @@ pub fn quantized_matmul_ggml_batched_mm(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
+    let routing = dense_routing_policy_from_environment();
+    quantized_matmul_ggml_batched_mm_with_policy(
+        encoder, registry, device, input, weight, output, params, &routing,
+    )
+}
+
+/// Batched MM under an explicit receipt-bindable routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_batched_mm_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
     let element_bytes = DType::F32.size_of() as u64;
     let row_bytes = u64::from(params.k)
         .checked_mul(element_bytes)
@@ -679,7 +740,7 @@ pub fn quantized_matmul_ggml_batched_mm(
     let batch_bytes = row_bytes.checked_mul(u64::from(params.m)).ok_or_else(|| {
         MlxError::InvalidArgument("batched quantized MM input batch stride overflows".into())
     })?;
-    quantized_matmul_ggml_batched_mm_strided_input(
+    quantized_matmul_ggml_batched_mm_strided_input_with_policy(
         encoder,
         registry,
         device,
@@ -691,6 +752,7 @@ pub fn quantized_matmul_ggml_batched_mm(
             row_bytes,
             batch_bytes,
         },
+        routing,
     )
 }
 
@@ -705,6 +767,33 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
     input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
+) -> Result<()> {
+    let routing = dense_routing_policy_from_environment();
+    quantized_matmul_ggml_batched_mm_strided_input_with_policy(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        input_strides,
+        &routing,
+    )
+}
+
+/// Strided-input batched MM under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_batched_mm_strided_input_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+    input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
@@ -797,10 +886,10 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input(
         (weight, weight_bytes, "weight"),
         (output, output_bytes, "output"),
     ] {
-        if buffer.byte_len() < required {
+        if buffer.data_byte_len() < required {
             return Err(MlxError::InvalidArgument(format!(
                 "batched quantized MM {label} buffer needs {required} bytes, got {}",
-                buffer.byte_len()
+                buffer.data_byte_len()
             )));
         }
     }
@@ -821,7 +910,7 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input(
         &scalar,
         params.batch,
         Some(input_strides),
-        false,
+        routing,
     )
 }
 
@@ -840,6 +929,24 @@ pub fn quantized_matmul_ggml_batched_mv(
     weight: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
+) -> Result<()> {
+    let routing = dense_routing_policy_from_environment();
+    quantized_matmul_ggml_batched_mv_with_policy(
+        encoder, registry, device, input, weight, output, params, &routing,
+    )
+}
+
+/// Batched MV under an explicit receipt-bindable routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_batched_mv_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
@@ -907,10 +1014,10 @@ pub fn quantized_matmul_ggml_batched_mv(
         (weight, weight_bytes, "weight"),
         (output, output_bytes, "output"),
     ] {
-        if buffer.byte_len() < required {
+        if buffer.data_byte_len() < required {
             return Err(MlxError::InvalidArgument(format!(
                 "batched quantized MV {label} buffer needs {required} bytes, got {}",
-                buffer.byte_len()
+                buffer.data_byte_len()
             )));
         }
     }
@@ -930,6 +1037,7 @@ pub fn quantized_matmul_ggml_batched_mv(
         output,
         &scalar,
         params.batch,
+        routing,
     )
 }
 
@@ -1067,8 +1175,9 @@ pub fn dispatch_mm_for_test(
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     validate_mm_for_test(params)?;
+    let routing = GgmlRoutingPolicy::default();
     dispatch_mm(
-        encoder, registry, device, input, weight, output, params, 1, None, false,
+        encoder, registry, device, input, weight, output, params, 1, None, &routing,
     )
 }
 
@@ -1086,8 +1195,12 @@ pub fn dispatch_mm_simd_for_test(
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
     validate_mm_for_test(params)?;
+    let routing = GgmlRoutingPolicy {
+        dense_tensor_mm: GgmlTensorMmPreference::ForceSimd,
+        ..GgmlRoutingPolicy::default()
+    };
     dispatch_mm(
-        encoder, registry, device, input, weight, output, params, 1, None, true,
+        encoder, registry, device, input, weight, output, params, 1, None, &routing,
     )
 }
 
@@ -1135,9 +1248,10 @@ fn dispatch_mv(
     weight: &MlxBuffer,
     output: &MlxBuffer, // ADR-028: was &mut, see public fn comment
     params: &GgmlQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     dispatch_mv_batched(
-        encoder, registry, device, input, weight, output, params, 1,
+        encoder, registry, device, input, weight, output, params, 1, routing,
     )
 }
 
@@ -1151,6 +1265,7 @@ fn dispatch_mv_batched(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
     batch: u32,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     // ADR-028 —nr0=2 variant for q6_K mat-vec.  Peer pattern:
     // 4 rows/TG (vs baseline's 2) + cached `yl[16]` (vs no cache + device
@@ -1161,14 +1276,12 @@ fn dispatch_mv_batched(
     // "default should have the best things on that provide the best
     // mantra-aligned outcome for users").  Opt out with
     // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
-    let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K)
-        && cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2");
+    let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K) && routing.dense_q6k_mv_nr2;
     // Q8_0 NSG=4 NR=2 is the peer-style llama.cpp geometry. Exact-output
     // parity and DeepSeek-V4 end-to-end decode validation make it the
     // production default; operators can retain the legacy kernel with
     // `HF2Q_Q8_0_MV_NR2=0` / `=false` / `=off` for diagnostics.
-    let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0)
-        && cached_env_default_true(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2");
+    let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0) && routing.dense_q8_0_mv_nr2;
     let kernel_name = if use_q6k_nr2 {
         "kernel_mul_mv_q6_K_f32_nr2"
     } else if use_q8_0_nr2 {
@@ -1435,6 +1548,10 @@ fn mn_column_tiling(m: usize) -> Vec<(usize, usize)> {
     }
 }
 
+pub(crate) fn q6k_mn_dispatch_count(m: u32) -> u32 {
+    mn_column_tiling(m as usize).len() as u32
+}
+
 /// Adaptive entry point: tile the m∈[2,8] batch into register-safe column
 /// chunks (each width 2..=5) and dispatch one mN tile per chunk. Bit-identity
 /// is preserved because columns are independent — any column-tiling produces
@@ -1550,13 +1667,14 @@ fn dispatch_mm(
     params: &GgmlQuantizedMatmulParams,
     batch: u32,
     input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
-    force_simd: bool,
+    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // variant on M3+ (hardware tensor cores); fall back to the simdgroup
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
-    let use_tensor = !force_simd && probe_tensor_mm(registry, device);
+    let use_tensor = routing.dense_tensor_mm == GgmlTensorMmPreference::AutoProbe
+        && probe_tensor_mm(registry, device);
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
     // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).
@@ -1567,11 +1685,7 @@ fn dispatch_mm(
     //   decode m=1 unaffected (V2 only fires at m > MM_ROUTING_THRESHOLD=8)
     // 3457/0/11 unit tests pass.  Default ON; opt-out via
     // `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
-    let use_v2_large_tile = use_tensor
-        && match std::env::var("HF2Q_LARGE_TILE_MM").as_deref() {
-            Ok("0") | Ok("false") | Ok("off") => false,
-            _ => true,
-        };
+    let use_v2_large_tile = use_tensor && routing.allow_dense_large_tile_mm;
     let kernel_name = if use_v2_large_tile {
         params.ggml_type.mm_tensor_v2_kernel_name()
     } else if use_tensor {
@@ -1765,6 +1879,11 @@ pub fn quantized_matmul_mm_tensor_perm021(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulPerm021Params,
 ) -> Result<()> {
+    if params.m == 0 || params.n == 0 || params.k == 0 {
+        return Err(MlxError::InvalidArgument(
+            "quantized_matmul_mm_tensor_perm021: M, N, and K must be non-zero".into(),
+        ));
+    }
     let kernel_name = match params.ggml_type {
         GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_bf16_perm021",
         // ADR-022 Phase 3 — Q8_0 perm021 instantiation added so the
@@ -1796,17 +1915,62 @@ pub fn quantized_matmul_mm_tensor_perm021(
             params.k, params.head_dim
         )));
     }
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: K ({}) must be divisible by block QK ({})",
+            params.k, qk,
+        )));
+    }
+    if input_bf16.dtype() != DType::BF16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: input must be BF16, got {:?}",
+            input_bf16.dtype(),
+        )));
+    }
 
     // Input-buffer size check: n_heads * seq_len * head_dim * sizeof(bfloat).
     let n_heads = params.k / params.head_dim;
-    let expected_input_bytes =
-        (n_heads as usize) * (params.m as usize) * (params.head_dim as usize) * 2;
-    if input_bf16.byte_len() < expected_input_bytes {
+    let expected_input_bytes = checked_byte_extent(
+        "perm021 input",
+        &[
+            n_heads as usize,
+            params.m as usize,
+            params.head_dim as usize,
+            DType::BF16.size_of(),
+        ],
+    )?;
+    if input_bf16.data_byte_len() < expected_input_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_mm_tensor_perm021: input_bf16 buffer too small \
              (have {}, need {})",
-            input_bf16.byte_len(),
+            input_bf16.data_byte_len(),
             expected_input_bytes
+        )));
+    }
+
+    let blocks_per_row = params.k / qk;
+    let block_bytes = params.ggml_type.block_bytes();
+    let expected_weight_bytes = (params.n as usize)
+        .checked_mul(blocks_per_row as usize)
+        .and_then(|blocks| blocks.checked_mul(block_bytes as usize))
+        .ok_or_else(|| MlxError::InvalidArgument("perm021 weight bytes overflow".into()))?;
+    if weight.data_byte_len() < expected_weight_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: weight buffer too small (have {}, need {})",
+            weight.data_byte_len(),
+            expected_weight_bytes,
+        )));
+    }
+    let expected_output_bytes = (params.m as usize)
+        .checked_mul(params.n as usize)
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("perm021 output bytes overflow".into()))?;
+    if output.data_byte_len() < expected_output_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_mm_tensor_perm021: output buffer too small (have {}, need {})",
+            output.data_byte_len(),
+            expected_output_bytes,
         )));
     }
 
@@ -1817,9 +1981,6 @@ pub fn quantized_matmul_mm_tensor_perm021(
         &[(700, 1), (701, 1), (702, 1)],
     )?;
 
-    let qk = params.ggml_type.block_values();
-    let block_bytes = params.ggml_type.block_bytes();
-    let blocks_per_row = params.k / qk;
     let nb01 = (blocks_per_row as u64) * (block_bytes as u64);
 
     let gpu_params = GgmlMatmulMmTensorPerm021GpuParams {

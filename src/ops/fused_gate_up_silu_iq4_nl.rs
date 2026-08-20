@@ -30,10 +30,10 @@ struct FusedGateUpSiluIq4NlParams {
     ne02: i64,
     ne10: i64,
     ne12: i64,
-    ne0:  i64,
-    ne1:  i64,
-    r2:   u32,
-    r3:   u32,
+    ne0: i64,
+    ne1: i64,
+    r2: u32,
+    r3: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,10 +83,23 @@ pub fn dispatch_fused_gate_up_silu_iq4_nl(
 
     let blocks_per_row = args.hidden_size / QK4_0;
     let weight_bytes = (args.intermediate_size as usize)
-        * (blocks_per_row as usize)
-        * (BLOCK_IQ4_NL_BYTES as usize);
-    let input_bytes = (args.hidden_size as usize) * (args.m as usize) * 4;
-    let output_bytes = (args.intermediate_size as usize) * (args.m as usize) * 4;
+        .checked_mul(blocks_per_row as usize)
+        .and_then(|value| value.checked_mul(BLOCK_IQ4_NL_BYTES as usize))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_iq4_nl: weight size overflow".into())
+        })?;
+    let input_bytes = (args.hidden_size as usize)
+        .checked_mul(args.m as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_iq4_nl: input size overflow".into())
+        })?;
+    let output_bytes = (args.intermediate_size as usize)
+        .checked_mul(args.m as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_iq4_nl: output size overflow".into())
+        })?;
 
     for (name, buf, expected) in [
         ("gate_w", gate_w, weight_bytes),
@@ -94,10 +107,10 @@ pub fn dispatch_fused_gate_up_silu_iq4_nl(
         ("input", input, input_bytes),
         ("output", output, output_bytes),
     ] {
-        if buf.byte_len() < expected {
+        if buf.data_byte_len() < expected {
             return Err(MlxError::InvalidArgument(format!(
                 "fused_gate_up_silu_iq4_nl: {name} too small: need {expected} bytes, have {}",
-                buf.byte_len()
+                buf.data_byte_len()
             )));
         }
     }
@@ -115,19 +128,15 @@ pub fn dispatch_fused_gate_up_silu_iq4_nl(
         ne02: 1,
         ne10: args.hidden_size as i64,
         ne12: 1,
-        ne0:  args.intermediate_size as i64,
-        ne1:  args.m as i64,
-        r2:   1,
-        r3:   1,
+        ne0: args.intermediate_size as i64,
+        ne1: args.m as i64,
+        r2: 1,
+        r3: 1,
     };
 
     // Same geometry as kernel_mul_mv_iq4_nl_f32 / Q4_0 baseline:
     // align=8 (8 rows/TG), (8, 8, 1) threads = 64 = 2 SG × 32. No shmem.
-    let threadgroups = MTLSize::new(
-        ((args.intermediate_size as u64) + 7) / 8,
-        args.m as u64,
-        1,
-    );
+    let threadgroups = MTLSize::new(((args.intermediate_size as u64) + 7) / 8, args.m as u64, 1);
     let threads_per_tg = MTLSize::new(8, 8, 1);
 
     encoder.encode_threadgroups_with_args(

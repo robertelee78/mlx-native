@@ -55,6 +55,7 @@ mod encoder;
 mod encoder_session;
 pub mod encoder_worker;
 mod env_flags;
+pub mod ggml_capability;
 mod kernel_registry;
 mod mem_ranges;
 mod residency;
@@ -74,6 +75,14 @@ pub use affine_capability::{
     PackedAffineCapability, PackedAffineKernelRoute, PackedAffineRejectionCode,
     PackedAffineRequest,
     PACKED_AFFINE_CAPABILITY_SCHEMA_VERSION,
+};
+pub use ggml_capability::{
+    ggml_batched_matrix_bytes, ggml_capability, ggml_expert_bytes,
+    ggml_matrix_bytes, ggml_packed_row_bytes, GgmlBatchedInputLayout,
+    GgmlCapability, GgmlCapabilityRequest, GgmlExpertInputLayout,
+    GgmlExpertShape, GgmlInvocation, GgmlKernelRoute, GgmlRejectionCode,
+    GgmlRoutingPolicy, GgmlScratchRequirement, GgmlTensorMmPreference,
+    GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 pub use buffer_pool::MlxBufferPool;
 pub use device::MlxDevice;
@@ -120,7 +129,10 @@ pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, Quantiz
 pub use ops::quantized_matmul_ggml::{
     dispatch_mm_for_test, dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
-    quantized_matmul_ggml_batched_mm_strided_input, quantized_matmul_ggml_batched_mv,
+    quantized_matmul_ggml_batched_mm_strided_input,
+    quantized_matmul_ggml_batched_mm_strided_input_with_policy,
+    quantized_matmul_ggml_batched_mm_with_policy, quantized_matmul_ggml_batched_mv,
+    quantized_matmul_ggml_batched_mv_with_policy, quantized_matmul_ggml_with_policy,
     quantized_matmul_mm_tensor_perm021,
     quantized_matmul_mm_tensor_perm021_f16,
     GgmlBatchedQuantizedMatmulInputStrides, GgmlBatchedQuantizedMatmulParams,
@@ -133,7 +145,11 @@ pub use ops::quantized_matmul_id::{
 };
 pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_slotted,
+    quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,
+    quantized_matmul_id_ggml_pooled_slotted,
+    quantized_matmul_id_ggml_pooled_slotted_with_policy,
+    quantized_matmul_id_ggml_pooled_with_policy, quantized_matmul_id_ggml_with_policy,
+    quantized_matmul_id_ggml_mv_with_policy,
     quantized_matmul_id_swiglu_q4_0, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams,
     IdMmScratch, MM_ID_ROUTING_THRESHOLD,
 };

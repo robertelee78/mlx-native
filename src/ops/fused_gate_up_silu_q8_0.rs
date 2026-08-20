@@ -53,10 +53,10 @@ struct FusedGateUpSiluQ8_0Params {
     ne02: i64, // batch (weights) = 1
     ne10: i64, // K (input dim) = ne00
     ne12: i64, // batch (input) = 1
-    ne0:  i64, // output stride = ne01
-    ne1:  i64, // M (number of input rows; 1 for decode)
-    r2:   u32, // ne12 / ne02 = 1
-    r3:   u32, // 1 (always for non-batched)
+    ne0: i64,  // output stride = ne01
+    ne1: i64,  // M (number of input rows; 1 for decode)
+    r2: u32,   // ne12 / ne02 = 1
+    r3: u32,   // 1 (always for non-batched)
 }
 
 /// Public params for [`dispatch_fused_gate_up_silu_q8_0`].
@@ -111,10 +111,23 @@ pub fn dispatch_fused_gate_up_silu_q8_0(
 
     let blocks_per_row = args.hidden_size / QK8_0;
     let weight_bytes = (args.intermediate_size as usize)
-        * (blocks_per_row as usize)
-        * (BLOCK_Q8_0_BYTES as usize);
-    let input_bytes = (args.hidden_size as usize) * (args.m as usize) * 4;
-    let output_bytes = (args.intermediate_size as usize) * (args.m as usize) * 4;
+        .checked_mul(blocks_per_row as usize)
+        .and_then(|value| value.checked_mul(BLOCK_Q8_0_BYTES as usize))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_q8_0: weight size overflow".into())
+        })?;
+    let input_bytes = (args.hidden_size as usize)
+        .checked_mul(args.m as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_q8_0: input size overflow".into())
+        })?;
+    let output_bytes = (args.intermediate_size as usize)
+        .checked_mul(args.m as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("fused_gate_up_silu_q8_0: output size overflow".into())
+        })?;
 
     for (name, buf, expected) in [
         ("gate_w", gate_w, weight_bytes),
@@ -122,10 +135,10 @@ pub fn dispatch_fused_gate_up_silu_q8_0(
         ("input", input, input_bytes),
         ("output", output, output_bytes),
     ] {
-        if buf.byte_len() < expected {
+        if buf.data_byte_len() < expected {
             return Err(MlxError::InvalidArgument(format!(
                 "fused_gate_up_silu_q8_0: {name} buffer too small: need {expected} bytes, have {}",
-                buf.byte_len()
+                buf.data_byte_len()
             )));
         }
     }
@@ -146,19 +159,15 @@ pub fn dispatch_fused_gate_up_silu_q8_0(
         ne02: 1,
         ne10: args.hidden_size as i64,
         ne12: 1,
-        ne0:  args.intermediate_size as i64,
-        ne1:  args.m as i64,
-        r2:   1,
-        r3:   1,
+        ne0: args.intermediate_size as i64,
+        ne1: args.m as i64,
+        r2: 1,
+        r3: 1,
     };
 
     // Same geometry as kernel_mul_mv_q8_0_f32_nr2: NR0=2 rows/TG, NSG=4
     // simdgroups × NW=32 threads = 128 threads/TG.
-    let threadgroups = MTLSize::new(
-        ((args.intermediate_size as u64) + 1) / 2,
-        args.m as u64,
-        1,
-    );
+    let threadgroups = MTLSize::new(((args.intermediate_size as u64) + 1) / 2, args.m as u64, 1);
     let threads_per_tg = MTLSize::new(32, 4, 1);
 
     // Threadgroup memory: NR0 (2) × 2 (gate + up) × NW (32) × f32 (4) = 256 bytes

@@ -90,9 +90,9 @@ pub fn embedding_gather_q2_k(
         .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
         .ok_or_else(|| MlxError::InvalidArgument("embedding_q2_k: output size overflow".into()))?;
     for (name, actual, required) in [
-        ("weight", weight.byte_len(), weight_bytes),
-        ("token_ids", token_ids.byte_len(), token_bytes),
-        ("output", output.byte_len(), output_bytes),
+        ("weight", weight.data_byte_len(), weight_bytes),
+        ("token_ids", token_ids.data_byte_len(), token_bytes),
+        ("output", output.data_byte_len(), output_bytes),
     ] {
         if actual < required {
             return Err(MlxError::InvalidArgument(format!(
@@ -101,6 +101,13 @@ pub fn embedding_gather_q2_k(
         }
     }
     let ids = token_ids.as_slice::<u32>()?;
+    if ids.len() < params.n_tokens {
+        return Err(MlxError::InvalidArgument(format!(
+            "embedding_q2_k: token_ids logical view has {} ids, need {}",
+            ids.len(),
+            params.n_tokens
+        )));
+    }
     if let Some((position, id)) = ids
         .iter()
         .take(params.n_tokens)
