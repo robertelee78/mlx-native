@@ -94,6 +94,28 @@ fn host_read_returns_exact_packed_q8_bytes_and_logical_values() {
 }
 
 #[test]
+fn from_file_preserves_the_already_open_artifact_identity() {
+    let path = fixture_path("open_inode");
+    let replacement = fixture_path("replacement_inode");
+    let mut payload = Vec::with_capacity(34);
+    payload.extend_from_slice(&f16::from_f32(0.25).to_le_bytes());
+    payload.extend(0_u8..32);
+    write_minimal_gguf(&path, "weight", &[32], 8, &payload);
+    let exact_file = std::fs::File::open(&path).expect("open exact GGUF inode");
+
+    write_minimal_gguf(&replacement, "other", &[32], 8, &[0_u8; 34]);
+    std::fs::rename(&replacement, &path).expect("replace pathname after opening exact inode");
+
+    let exact = GgufFile::from_file(exact_file).expect("parse already-open exact inode");
+    assert_eq!(exact.read_tensor_bytes_host("weight").unwrap(), payload);
+    assert!(exact.tensor_info("other").is_none());
+    let reopened = GgufFile::open(&path).expect("parse replacement pathname");
+    assert!(reopened.tensor_info("weight").is_none());
+    assert!(reopened.tensor_info("other").is_some());
+    std::fs::remove_file(path).expect("remove replacement fixture");
+}
+
+#[test]
 fn host_read_rejects_missing_and_truncated_tensors() {
     let path = fixture_path("missing");
     let payload = vec![0_u8; 34];
