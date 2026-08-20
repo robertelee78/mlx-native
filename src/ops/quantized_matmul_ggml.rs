@@ -20,6 +20,7 @@ use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
     plan_dense_auto_route, DenseAutoPlan, GgmlRoutingPolicy, GgmlTensorMmPreference,
 };
+use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_mv.
@@ -328,7 +329,7 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> bool {
     })
 }
 
-fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
+pub(crate) fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
     GgmlRoutingPolicy {
         dense_decode_mvn: cached_env_default_true(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN"),
         dense_decode_mv_ext: cached_env_eq_one(&CACHED_DECODE_MV_EXT, "HF2Q_DECODE_MV_EXT"),
@@ -474,7 +475,7 @@ pub fn quantized_matmul_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = dense_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_ggml_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -713,7 +714,7 @@ pub fn quantized_matmul_ggml_batched_mm(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = dense_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_ggml_batched_mm_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -768,7 +769,7 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input(
     params: &GgmlBatchedQuantizedMatmulParams,
     input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
 ) -> Result<()> {
-    let routing = dense_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_ggml_batched_mm_strided_input_with_policy(
         encoder,
         registry,
@@ -930,7 +931,7 @@ pub fn quantized_matmul_ggml_batched_mv(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = dense_routing_policy_from_environment();
+    let routing = ggml_routing_policy_from_environment();
     quantized_matmul_ggml_batched_mv_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -1604,9 +1605,25 @@ pub fn build_q6k_nr2_m1_record(
     n: u32,
     k: u32,
 ) -> Result<Option<DispatchRecord>> {
+    let routing = ggml_routing_policy_from_environment();
+    build_q6k_nr2_m1_record_with_policy(registry, device, n, k, &routing)
+}
+
+/// Explicit-policy form of [`build_q6k_nr2_m1_record`].
+///
+/// Use this when the dispatch record is part of a capability or performance
+/// receipt. The record and its eventual execution then remain bound to the
+/// same serialized policy even if the process environment differs.
+pub fn build_q6k_nr2_m1_record_with_policy(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    n: u32,
+    k: u32,
+    routing: &GgmlRoutingPolicy,
+) -> Result<Option<DispatchRecord>> {
     // Only bakeable when the NR2 variant is the selected one.
     // (Matches the `use_q6k_nr2` decision in dispatch_mv.)
-    if !cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2") {
+    if !routing.dense_q6k_mv_nr2 {
         return Ok(None);
     }
 

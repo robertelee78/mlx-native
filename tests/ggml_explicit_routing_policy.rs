@@ -28,6 +28,13 @@ use mlx_native::ops::fused_gate_up_silu_q6_K::{
 use mlx_native::ops::fused_gate_up_silu_q8_0::{
     dispatch_fused_gate_up_silu_q8_0, FusedGateUpSiluQ8_0Args,
 };
+use mlx_native::ops::quantized_matmul_ggml::{
+    build_q6k_nr2_m1_record, build_q6k_nr2_m1_record_with_policy,
+};
+use mlx_native::ops::quantized_matmul_id_ggml::{
+    build_q6k_id_nr2_m1_record, build_q6k_id_nr2_m1_record_with_policy,
+    build_q8_0_id_decode_record, build_q8_0_id_decode_record_with_policy,
+};
 
 #[test]
 fn fused_and_embedding_entrypoints_reject_short_logical_views() {
@@ -550,4 +557,84 @@ fn explicit_expert_q8_policy_selects_baseline_or_nr2_geometry() {
         }
         CapturedNode::Barrier => panic!("expected NR2 dispatch"),
     }
+}
+
+#[test]
+fn explicit_dispatch_record_policy_helper() {
+    if std::env::var_os("MLX_NATIVE_RECORD_POLICY_TEST_CHILD").is_none() {
+        return;
+    }
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+
+    let mut policy = GgmlRoutingPolicy::default();
+    policy.dense_q6k_mv_nr2 = true;
+    policy.expert_q6k_mv_nr2 = true;
+    policy.expert_q8_0_mv_nr2 = false;
+
+    assert!(build_q6k_nr2_m1_record_with_policy(
+        &mut registry,
+        device.metal_device(),
+        4,
+        256,
+        &policy,
+    )
+    .expect("explicit dense Q6 record")
+    .is_some());
+    assert!(build_q6k_id_nr2_m1_record_with_policy(
+        &mut registry,
+        device.metal_device(),
+        4,
+        256,
+        1,
+        4 * 210,
+        &policy,
+    )
+    .expect("explicit expert Q6 record")
+    .is_some());
+    assert!(build_q8_0_id_decode_record_with_policy(
+        &mut registry,
+        device.metal_device(),
+        32,
+        32,
+        1,
+        32 * 34,
+        &policy,
+    )
+    .expect("explicit expert Q8 record")
+    .is_some());
+
+    // The child environment requests the opposite routes. Legacy builders
+    // must preserve those environment semantics while the explicit builders
+    // above remain controlled solely by the serialized policy.
+    assert!(
+        build_q6k_nr2_m1_record(&mut registry, device.metal_device(), 4, 256)
+            .expect("legacy dense Q6 record")
+            .is_none()
+    );
+    assert!(
+        build_q6k_id_nr2_m1_record(&mut registry, device.metal_device(), 4, 256, 1, 4 * 210,)
+            .expect("legacy expert Q6 record")
+            .is_none()
+    );
+    assert!(
+        build_q8_0_id_decode_record(&mut registry, device.metal_device(), 32, 32, 1, 32 * 34,)
+            .expect("legacy expert Q8 record")
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_dispatch_records_ignore_conflicting_environment() {
+    let status = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+        .arg("--exact")
+        .arg("explicit_dispatch_record_policy_helper")
+        .arg("--nocapture")
+        .env("MLX_NATIVE_RECORD_POLICY_TEST_CHILD", "1")
+        .env("HF2Q_Q6K_MV_NR2", "0")
+        .env("HF2Q_Q6K_ID_MV_NR2", "0")
+        .env("HF2Q_Q8_0_ID_MV_NR2", "1")
+        .status()
+        .expect("run isolated dispatch-record helper");
+    assert!(status.success());
 }

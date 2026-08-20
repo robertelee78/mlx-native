@@ -22,9 +22,14 @@ kernel probing remains necessary.
 The capability implementation and canonical dense and expert dispatchers share
 pure route planners. The public `*_with_policy` entry points also consume the
 same serialized policy for NR2, width-N, tensor/simdgroup, large-tile, and
-expert-threshold decisions. Legacy entry points resolve environment overrides
-once and delegate to those explicit-policy entry points. This is deliberate: a
-copied predicate or an independently-read environment could allow the receipt
+expert-threshold decisions. The Q6/Q8 pre-baked dispatch-record builders have
+matching `*_with_policy` forms because those records are part of the executed
+program too. Legacy entry points resolve environment overrides
+once through the public `ggml_routing_policy_from_environment()` resolver and
+delegate to those explicit-policy entry points. Evidence-producing callers
+resolve that whole dense+expert policy at model load, serialize it, and pass the
+same value to every capability query and explicit dispatch. This is deliberate:
+a copied predicate or an independently-read environment could allow the receipt
 and production execution to drift while both continued to compile.
 
 ## Why tensor type alone is insufficient
