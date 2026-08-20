@@ -1232,6 +1232,19 @@ impl GgufFile {
         let file = std::fs::File::open(path).map_err(|e| {
             MlxError::IoError(format!("cannot open GGUF file '{}': {e}", path.display()))
         })?;
+        Self::from_file(file)
+    }
+
+    /// Parse a GGUF v3 file from an already-open file handle.
+    ///
+    /// This is the identity-preserving counterpart to [`Self::open`] for
+    /// provenance code that has already created, synced, or authenticated an
+    /// exact inode and must not reopen a mutable pathname between directory
+    /// and payload verification. The file cursor may be at any position; the
+    /// parser seeks to the start before reading.
+    pub fn from_file(mut file: std::fs::File) -> Result<Self> {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| MlxError::IoError(format!("seek GGUF file start: {e}")))?;
         let mut reader = BufReader::new(file);
 
         // --- Header ---
