@@ -16,15 +16,14 @@ The W-5b.11 hand-off attributed the dominant `layer.ffn_dispatch` bucket to
    `ffn_up.weight` Q4_0 (5120, 17408), `ffn_down.weight` Q4_0 (17408, 5120)).
 2. The dispatch path is `quantized_matmul_ggml::dispatch_mm` →
    `kernel_mul_mm_q4_0_tensor_f32`, NOT `moe_q::*`.
-3. The kernel itself is **already byte-identical to llama.cpp's
-   `kernel_mul_mm_q4_0_f32` with `GGML_METAL_HAS_TENSOR`** (same NR0=64,
-   NR1=32, NK=32 tile, same `mpp::tensor_ops::matmul2d`, same
-   `dequantize_q4_0`). See `quantized_matmul_mm_tensor.metal:5-14` for the
-   provenance comment.
+3. The kernel itself is **already byte-identical to the reference
+   implementation's Q4_0 tensor mm kernel** (same NR0=64, NR1=32, NK=32
+   tile, same `mpp::tensor_ops::matmul2d`, same `dequantize_q4_0`). See
+   `docs/peer-benchmarks.md` for the side-by-side.
 
 Per `project_metal_compiler_auto_optimizes_static_levers` and
 `project_mm_id_byte_identical`: when the kernel is byte-identical to
-llama.cpp's, the gap is **structurally NOT in the kernel.** It's in the
+the reference's, the gap is **structurally NOT in the kernel.** It's in the
 caller's wrapper / dispatch / barrier pattern.
 
 ## Per-shape kernel bench (Qwen3.6 27B DWQ46 production prefill)
@@ -61,27 +60,17 @@ work (subgroup-block fusion or weight repacking) that the Metal compiler
 has consistently neutralised in 9 prior M5 Max static-evidence kernel
 hypotheses (per `project_metal_compiler_auto_optimizes_static_levers`).
 
-## Structural diff vs llama.cpp's MoE matmul kernel
+## Structural diff vs the reference MoE matmul kernel
 
-For completeness — though the Qwen3.6 27B model uses dense FFN and does
-NOT exercise the `_id` (MoE) path — here is the side-by-side state of the
-mlx-native MoE matmul vs llama.cpp:
-
-| component | mlx-native | llama.cpp | status |
-|-----------|------------|-----------|--------|
-| Dense mm kernel | `kernel_mul_mm_q4_0_tensor_f32` (`quantized_matmul_mm_tensor.metal`) | `kernel_mul_mm_q4_0_f32` (`ggml-metal.metal:10104`) | **byte-identical** (mpp::tensor_ops::matmul2d, same tile geom, same dequant) |
-| MoE `_id` mm kernel | `kernel_mul_mm_id_q4_0_f32` + `_tensor_f32` (`quantized_matmul_id_mm.metal`) | `kernel_mul_mm_id_q4_0_f32` (same file, lines 9708-9716) | **structurally aligned** (map0 + mm_id; mlx-native has ne20_1 + ne20_8 templates only, llama.cpp has 1/2/4/5/6/8/10/16/22) |
-| Routing threshold (mv vs mm) | `MM_ROUTING_THRESHOLD = 8` | `ne11_mm_min = 8` (`ggml-metal-ops.cpp:2046`) | identical |
-| Tensor-API probe | one-shot `OnceLock` (`probe_tensor_mm`) | `GGML_METAL_HAS_TENSOR` compile-time | both produce the same hot-path kernel name on M5 Max |
-| Activation fusion (silu_mul) | NOT fused into mm kernel — `dispatch_silu_mul` is a separate dispatch | NOT fused into mm kernel — same shape | **parity** (both pay 1 silu_mul dispatch per layer) |
-| Concurrent dispatch | mlx-native `enc.memory_barrier()` between mm calls | llama.cpp `ggml_metal_op_concurrency_reset` | **parity** |
-
-mlx-native's `_id` mm has a tighter top_k template instantiation set than
-llama.cpp's (only `ne20_1` and `ne20_8` vs llama.cpp's 9 variants 1/2/4/5/6/8/10/16/22).
-This is **NOT a bottleneck for current production models**: Qwen3.6 27B
-is dense (no `_id` calls), Qwen3.6 35B-A3B uses top_k=8 (covered), Gemma 4
-26B uses top_k=8 + top_k=1 (both covered). It would matter if/when a
-top_k=2 / 4 / 5 / 6 / 10 / 16 / 22 model arrives.
+The full side-by-side table (dense mm byte-identical; `_id` mm
+structurally aligned with a tighter top_k template instantiation set;
+routing thresholds identical; activation fusion and concurrent dispatch at
+parity) has moved to `docs/peer-benchmarks.md` §Structural diff. The
+tighter top_k set (`ne20_1`, `ne20_8` only) is NOT a bottleneck for
+current production models: Qwen3.6 27B is dense (no `_id` calls), Qwen3.6
+35B-A3B uses top_k=8 (covered), Gemma 4 26B uses top_k=8 + top_k=1 (both
+covered). It would matter if/when a top_k=2 / 4 / 5 / 6 / 10 / 16 / 22
+model arrives.
 
 A 2026-04-26 attempt to fuse silu_mul into a Q4_0 mv_id swiglu kernel
 (`quantized_matmul_id_swiglu_q4_0`, mlx-native commit `4efeec0`) **regressed
@@ -158,8 +147,8 @@ as MoE-Q's). The quantitative win is measured by re-running the W-5b.11
 profile bench (`/opt/hf2q/scripts/bench-w5b11-post-attn.sh`); the
 expected `layer.ffn_dispatch` drops from 9,750 ms to ~4,000–5,500 ms
 (retaining only the 3,567 ms kernel-only floor + a small commit-overhead
-residual). The wall-clock ratio vs llama.cpp would shift from 4.34× to
-approximately 3.4–3.7× at pp4096.
+residual). The wall-clock ratio vs the peer baseline would shift from
+4.34× to approximately 3.4–3.7× at pp4096 (see `docs/peer-benchmarks.md`).
 
 ## Why this audit STOPS at recommendation (per worker contract)
 
@@ -184,4 +173,4 @@ approximately 3.4–3.7× at pp4096.
 
 No `/opt/mlx-native/src/` modifications.
 No `/opt/hf2q/src/` modifications.
-No `/opt/llama.cpp` modifications (read-only reference).
+No modifications to the read-only peer reference checkout.
