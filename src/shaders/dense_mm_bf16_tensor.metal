@@ -1,8 +1,7 @@
 // dense_mm_bf16_tensor.metal — Dense bf16×f32 → f32 tensor-API matmul.
 //
-// Port of llama.cpp's `kernel_mul_mm_bf16_f32` template instantiation
-// (ggml/src/ggml-metal/ggml-metal.metal:10032) with the
-// `GGML_METAL_HAS_TENSOR` branch active.  Tile geometry, shared memory
+// Implements the `kernel_mul_mm_bf16_f32` template-instantiation shape
+// with the tensor-API branch active.  Tile geometry, shared memory
 // layout, and matmul2d descriptor are identical to our existing
 // `quantized_matmul_mm_tensor.metal`:
 //   * sa (A tile): bfloat, [NR0=64][NK=32] row-major, 4 KB
@@ -24,11 +23,7 @@
 // attending but nkv shared KV heads.  The attention mat-muls iterate
 // over nh in the z-axis (im = tgpig.z); the src0 head offset divides
 // by r2 = nh/nkv so the same KV head is broadcast across all heads in
-// its GQA group.  This matches llama.cpp's ggml_mul_mat r2/r3 contract.
-//
-// Portions of this file are derived from llama.cpp
-// (https://github.com/ggml-org/llama.cpp), MIT licensed.
-// Copyright the llama.cpp Authors.  See LICENSE-MIT-llamacpp.
+// its GQA group.  This is the standard mul_mat r2/r3 broadcast contract.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -77,7 +72,7 @@ struct DenseMmBf16F32TensorParams {
 //     from the quantized path.
 //   * A-stage tile stride: src0 is laid out row-major bfloat, so each
 //     thread loads 16 consecutive bfloats from src0 and stores them
-//     into sa at the llama.cpp tile-row/tile-col positions matching
+//     into sa at the tile-row/tile-col positions matching
 //     the tensor_ops matmul2d contract (same as the quantized path
 //     after dequantize).
 

@@ -1,7 +1,6 @@
 // dense_mm_f16_tensor.metal — Dense f16×f32 → f32 tensor-API matmul.
 //
-// Port of llama.cpp's `kernel_mul_mm_f16_f32` template instantiation
-// (ggml/src/ggml-metal/ggml-metal.metal:10099):
+// Implements the `kernel_mul_mm_f16_f32` template-instantiation shape:
 //
 //   template [[host_name("kernel_mul_mm_f16_f32")]]
 //     kernel mul_mm_t kernel_mul_mm<
@@ -46,9 +45,6 @@
 // GQA (nh = nkv per `clip.cpp:Gemma4VHead`), so r2 = 1 in production;
 // the broadcast plumbing is preserved for parity with the BF16/F32
 // siblings and so a future GQA vision tower can reuse this kernel.
-//
-// Portions derived from llama.cpp (https://github.com/ggml-org/llama.cpp),
-// MIT licensed.  Copyright the llama.cpp Authors.  See LICENSE-MIT-llamacpp.
 
 #include <metal_stdlib>
 #include <metal_tensor>

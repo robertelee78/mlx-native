@@ -16,9 +16,8 @@
 // for ALL (token, slot) pairs. The kernel uses the ids buffer to route each output
 // row to the correct expert's weight slice.
 //
-// Copyright the candle Authors and llama.cpp Authors.
-// See LICENSE-APACHE-candle and LICENSE-MIT-llamacpp in this directory.
-// The Q3_K additions are ported from llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
+// Copyright the candle Authors.
+// See LICENSE-APACHE-candle in this directory.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -98,7 +97,7 @@ typedef struct {
 //   Structurally Q5_K minus the 32-byte qh "high-bit" array.
 //   Same K_SCALE_SIZE=12 layout for packed (sub-scale, sub-min) 6-bit pairs.
 //
-// Source: ggml-common.h block_q4_K (llama.cpp).
+// GGUF block_q4_K layout.
 typedef struct {
     half    d;                    // super-block scale for quantized scales
     half    dmin;                 // super-block scale for quantized mins
@@ -138,7 +137,7 @@ typedef struct {
     uint8_t qs[QK4_0 / 2];  // 16 bytes
 } block_iq4_nl;
 
-// IQ4_NL non-linear codebook (frozen by llama.cpp ggml-common.h:1109-1112).
+// IQ4_NL non-linear codebook (frozen by the GGUF format).
 // Any drift breaks every IQ4_NL GGUF on disk; do not edit without
 // updating the host-side `KVALUES_IQ4_NL` in src/gguf/mod.rs in lock-step.
 constant int8_t kvalues_iq4nl[16] = {
@@ -159,8 +158,8 @@ typedef struct {
 
 // ---- Q5_1 dot product helper (ADR-022 Phase 1) ----
 //
-// Mirrors `block_q_n_dot_y<block_q5_1>` from llama.cpp
-// (ggml-metal.metal:3293-3310). Q5_1 differs from Q4_0 by carrying
+// Mirrors the reference `block_q_n_dot_y<block_q5_1>`
+// helper. Q5_1 differs from Q4_0 by carrying
 // (a) an additional `m` (min) term contributing `m * sumy` to the dot,
 // and (b) a 5th high-bit per element packed in `qh`.
 //
@@ -302,8 +301,8 @@ inline float block_q4_0_dot_y(
 //
 // Dispatch geometry: threadgroups=(ceil(N/8), n_tokens*top_k, 1), tg=(8,8,1)
 //
-// Routing index is in dim Y, NOT dim Z (despite llama.cpp's mul_mv_id grid
-// using ne123 in z at ggml-metal-ops.cpp:2452).  Tested 2026-04-26 on M5 Max
+// Routing index is in dim Y, NOT dim Z (despite the peer's mul_mv_id grid
+// putting ne123 in z).  Tested 2026-04-26 on M5 Max
 // dwq46 64-token decode: switching kernel to read tgpig.z + dispatcher
 // MTLSize::new(N/8, 1, m) regressed throughput from 114 t/s to 90.9 t/s
 // (-19%).  Apple GPU's threadgroup scheduler distributes this dispatch
@@ -638,8 +637,8 @@ kernel void kernel_mul_mv_id_q2_K_f32(
     }
 }
 
-// Expert-routed port of current llama.cpp `kernel_mul_mv_q3_K_f32_impl`
-// (MIT), preserving its two rows per simdgroup and accumulator order.
+// Expert-routed variant of the current `kernel_mul_mv_q3_K_f32_impl`
+// scheme, preserving its two rows per simdgroup and accumulator order.
 kernel void kernel_mul_mv_id_q3_K_f32(
     device const  char  * src0   [[buffer(0)]],
     device const float  * src1   [[buffer(1)]],
@@ -752,8 +751,7 @@ kernel void kernel_mul_mv_id_q3_K_f32(
 
 // ====================================================================
 // Q8_0 _id expert-indexed mat-vec kernel — NR0=2 NSG=4 variant
-// (ADR-029 iter-6 port; peer N_R0_Q8_0=2 + N_SG_Q8_0=4 in
-//  /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:27,40)
+// (ADR-029 iter-6 port; peer N_R0_Q8_0=2 + N_SG_Q8_0=4)
 // ====================================================================
 //
 // Same row coverage as `kernel_mul_mv_id_q8_0_f32` (8 rows/TG) but
@@ -878,8 +876,8 @@ kernel void kernel_mul_mv_id_q8_0_f32_nr2(
 // (b) the dot helper used (`block_q5_1_dot_y` carries the m*sumy term
 // and qh-bit injection; `block_q4_0_dot_y` does not).
 //
-// Reference: llama.cpp `mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>`
-// at ggml-metal.metal:3358-3443 + 3293-3310. Inlined here in mlx-native
+// Reference: `mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>`.
+// Inlined here in mlx-native
 // style (matching the Q4_0 / Q8_0 ports above) rather than templated.
 
 kernel void kernel_mul_mv_id_q5_1_f32(
@@ -964,8 +962,7 @@ kernel void kernel_mul_mv_id_q5_1_f32(
 // helper, which multiplies element-wise by the looked-up codebook
 // values.
 //
-// Reference: llama.cpp `kernel_mul_mv_iq4_nl_f32_impl` at
-// ggml-metal.metal (template instantiated at line 10359 via
+// Reference: `kernel_mul_mv_iq4_nl_f32_impl` (instantiated upstream via
 // kernel_mul_mv_id<mmv_fn<...>>); inlined here in mlx-native style.
 
 // ====================================================================
@@ -978,8 +975,8 @@ kernel void kernel_mul_mv_id_q5_1_f32(
 // (offset = expert_id * expert_stride). Geometry mirrors IQ4_NL's
 // mv_id (N_SIMDGROUP=2, N_DST=4, threadgroup=(8,8,1)).
 //
-// Reference: llama.cpp `kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>`
-// at ggml-metal.metal:10432. Inlined here in mlx-native style (no
+// Reference: `kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>`.
+// Inlined here in mlx-native style (no
 // template metaprogramming).
 
 kernel void kernel_mul_mv_id_iq4_xs_f32(
@@ -1114,7 +1111,7 @@ kernel void kernel_mul_mv_id_iq4_nl_f32(
 //
 // Ported from candle-metal-kernels kernel_mul_mv_q5_K_f32_impl with
 // the expert-routing indirection from the Q6_K _id kernel above.
-// Copyright the candle Authors (Apache-2.0) and llama.cpp Authors (MIT).
+// Copyright the candle Authors (Apache-2.0).
 
 kernel void kernel_mul_mv_id_q5_K_f32(
     device const  char  * src0   [[buffer(0)]],
@@ -1421,8 +1418,8 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
 // Q4_K expert-indexed mat-vec kernel
 // ====================================================================
 //
-// ADR-013 P7 — port of llama.cpp `kernel_mul_mv_id_q4_K_f32` (mv_id
-// thunk in ggml-metal.metal:10349 wrapping `kernel_mul_mv_q4_K_f32_impl`).
+// ADR-013 P7 — implements `kernel_mul_mv_id_q4_K_f32` (the mv_id
+// thunk wrapping `kernel_mul_mv_q4_K_f32_impl`).
 //
 // Mirrors the Q5_K mv_id kernel above, differing only in:
 //   1. Block struct has no qh field (saves 32 bytes per block).
@@ -1432,8 +1429,8 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
 //      paired with the pre-summed yl/yh/sumy.
 //
 // Scale-decode is byte-identical to Q5_K: same kmask1/kmask2/kmask3,
-// same sc16[] packing — verified against llama.cpp's
-// kernel_mul_mv_q4_K_f32_impl at ggml-metal.metal:7727-7729.
+// same sc16[] packing — verified against the reference
+// kernel_mul_mv_q4_K_f32_impl.
 //
 // Geometry (mirrors Q5_K mv_id):
 //   2 simdgroups per threadgroup, 1 row per simdgroup → 2 rows per tg.

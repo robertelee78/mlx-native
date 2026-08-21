@@ -88,7 +88,7 @@ kernel void kv_cache_copy_batch_f32(
 /// Cache layout: [n_heads, capacity, head_dim] head-major F16.
 ///
 /// Casts float → half on write, halving cache memory bandwidth for SDPA reads.
-/// Reference: llama.cpp stores KV cache in F16 for bandwidth-bound decode SDPA.
+/// An F16 KV cache is the standard layout for bandwidth-bound decode SDPA.
 ///
 /// Grid: 2D — x=element within head (head_dim), y=head index (n_heads).
 kernel void kv_cache_copy_batch_f32_to_f16(

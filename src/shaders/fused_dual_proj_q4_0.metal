@@ -68,8 +68,8 @@ constant int qmatmul_r3_effective =
 #define QMM_R3(p)   ((qmatmul_r3_effective   >= 0) ? (uint)qmatmul_r3_effective   : (uint)(p).r3)
 
 // Q4_0 dot helper — ported from `quantized_matmul_ggml.metal:224-240`.
-// 4-accumulator layout matches llama.cpp's block_q_n_dot_y for byte-identical
-// FP rounding.
+// The 4-accumulator layout is load-bearing: accumulation order affects
+// byte-identical FP rounding.
 inline float block_q4_0_dot_y(
     device const block_q4_0 * qb,
     float sumy,

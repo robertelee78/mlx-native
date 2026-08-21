@@ -11,11 +11,10 @@
 //     total weight.
 //   - For sf >= 1 (upsampling), support degenerates to 1 → 4-tap
 //     bilinear; for sf < 1 (downsampling), support > 1 → wider
-//     low-pass filter — load-bearing semantic match to llama.cpp's
-//     `BILINEAR | ANTIALIAS` mode.
+//     low-pass filter — load-bearing semantic match to the reference
+//     antialiased-bilinear resize mode.
 //
-// Reference: /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:7578-7637
-// (the C++ source the CPU oracle ports). For the Qwen3-VL fixture
+// The CPU oracle ports the same formula. For the Qwen3-VL fixture
 // trained_n == target_n on both axes so the fast path of the
 // general formula collapses to pass-through (sy=floor(y), weight=1)
 // — verified.

@@ -6,14 +6,12 @@ using namespace metal;
 //
 // ADR-033 §Pi iter B (SKELETON ONLY — body pending iter B-2). Consumes
 // the (tpe, hids) output of iter A's `moe_mm_id_map0` to drive a per-
-// expert NR0=64 / NR1=32 / NK=32 simdgroup-matmul tile. Ported from
-// llama.cpp's `kernel_mul_mm_id<...block_q4_0..>` at
-// /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9791-10225.
+// expert NR0=64 / NR1=32 / NK=32 simdgroup-matmul tile.
 //
 // This file is iter B SCAFFOLDING. The args struct, name, and registration
 // are committed so iter B-2 can fill the body without needing to also
 // design the dispatch contract. The current entry point is a structural
-// stub that early-returns when r1 >= neh1 (boundary check from llama.cpp)
+// stub that early-returns when r1 >= neh1 (upstream boundary check)
 // and writes the launched output to zero otherwise. Production wiring
 // (iter C) MUST NOT engage this kernel until iter B-2 lands the actual
 // simdgroup matmul body.
@@ -21,16 +19,16 @@ using namespace metal;
 // Pending body work (iter B-2):
 //   - 16-element block_q4_0 dequantization into shmem (sa) — 16 weights
 //     per block × NK=32 K-elements per loop iteration.
-//   - simdgroup_half8x8 ma[4] / mb[2] / mc[8] accumulator chain (vs
-//     llama.cpp's S0_8x8/S1_8x8 templated types — specialized here for
-//     half input + f32 accumulator).
+//   - simdgroup_half8x8 ma[4] / mb[2] / mc[8] accumulator chain
+//     (specialized here for half input + f32 accumulator instead of
+//     templated element types).
 //   - Inner loop k = 0 .. args.ne00 by NK, dequantize + simdgroup_load
 //     + simdgroup_multiply_accumulate chain.
 //   - Tail handling at boundary (output writeback to dst with neh1 mask).
 // --------------------------------------------------------------------------
 
 struct MoeMmIdQ4_0Params {
-    // Matches ggml_metal_kargs_mul_mm_id at ggml-metal-impl.h:507-524.
+    // Mirrors the reference mm_id kargs layout.
     // Field order must NOT drift — the iter C Rust dispatch wrapper will
     // memcpy values into this layout directly.
     int32_t  ne00;  // K dim (input feature width)
@@ -51,8 +49,8 @@ struct MoeMmIdQ4_0Params {
     int16_t  r3;    // reserved
 };
 
-// Output tile geometry — MUST match llama.cpp's NR0/NR1/NK at
-// ggml-metal.metal:9810-9815. Drift here changes the dispatch grid
+// Output tile geometry — NR0/NR1/NK are load-bearing constants shared
+// with the host dispatcher. Drift here changes the dispatch grid
 // shape and silently produces wrong outputs.
 constant constexpr int NR0 = 64;
 constant constexpr int NR1 = 32;
@@ -60,7 +58,7 @@ constant constexpr int NR1 = 32;
 // --------------------------------------------------------------------------
 // SKELETON ENTRY POINT (iter B-1)
 //
-// Boundary checks + tile-index resolution from llama.cpp:9817-9846.
+// Boundary checks + tile-index resolution per the reference scheme.
 // Body deferred to iter B-2.
 // --------------------------------------------------------------------------
 

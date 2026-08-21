@@ -1,7 +1,7 @@
 // ADR-033 §Pi Task #20 + ADR-034 task #93 prefill extension —
 // Fused MoE gate+up+silu_mul mm_id kernel for Q6_K.
 //
-// Closes the hf2q-vs-llama.cpp prefill gap at production Qwen MoE
+// Closes the hf2q-vs-peer prefill gap at production Qwen MoE
 // shapes (~7-15% slower at pp1024-pp4096 pre-fusion). Replaces a
 // 3-dispatch sequence (gate_mm_id + up_mm_id + silu_mul_id) with a
 // single fused dispatch per layer:
@@ -57,7 +57,7 @@ static_assert(sizeof(block_q6_K) == sizeof(half) + QK_K/16 + 3*QK_K/4,
 
 // Per-call dequantize: writes 16 elements of one Q6_K block to a 4x4 tile.
 // Verbatim port of `dequantize_q6_K` from quantized_matmul_id_mm.metal:213
-// (which is itself the upstream llama.cpp template). DO NOT modify — the
+// (itself the shared upstream template). DO NOT modify — the
 // `il`/scales index arithmetic + kmask bit-packing is mm-template-specific.
 template <typename type4x4>
 void dequantize_q6_K_fused(device const block_q6_K * xb, short il, thread type4x4 & reg) {

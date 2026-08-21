@@ -6,7 +6,7 @@ using namespace metal;
 // Computes: out[r, i] = sum(x[r, 0..=i]) for every row r independently.
 //
 // Spec source: ADR-013 Decision 4. Formula derived from the definition of
-// an inclusive prefix scan; no code copied from llama.cpp.
+// an inclusive prefix scan; no upstream code copied.
 //
 // Algorithm: per-row Hillis-Steele scan using threadgroup shared memory.
 // One threadgroup per row; each thread owns CHUNK contiguous elements, loaded

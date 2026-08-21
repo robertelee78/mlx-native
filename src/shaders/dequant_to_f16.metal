@@ -1,7 +1,7 @@
 // dequant_to_f16.metal — whole-tensor dequantization from block-quantized
 // formats (Q4_0, Q5_K, Q6_K, Q8_0, etc.) to F16 storage.
 //
-// ADR-029 iter-28 H29 — peer (llama.cpp on Apple Silicon) NEVER dispatches
+// ADR-029 iter-28 H29 — the peer runtime on Apple Silicon NEVER dispatches
 // quantized mat-mat kernels for gemma4 attn weights (Q6_K).  Instead it
 // pre-dequantizes Q6_K → F16 once at model load, then runs the F16-input
 // `kernel_mul_mm_f16_f32_*` for every dense attn dispatch.  This trades
@@ -170,8 +170,8 @@ void dq_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
 }
 
 // FIX 2026-05-17: original `dq_q5_K` (commit 90c5691) used a buggy
-// scale-index pattern that does not match llama.cpp's `dequantize_q5_K`
-// reference at `ggml-metal.metal:683-705`.  Symptoms: any GGUF with
+// scale-index pattern that does not match the reference `dequantize_q5_K`
+// scheme.  Symptoms: any GGUF with
 // Q5_K tensors (which is most standard Q5_K_M community quants —
 // bartowski, unsloth) decoded to garbage because the F16 shadow built
 // at ADR-029 H29 load-time contained wrong values.  ara-abliterated

@@ -1,12 +1,8 @@
 // dense_gemm.metal — Dense F16 matrix multiply: C = A * B^T
 //
-// Portions of this file are modeled after llama.cpp's kernel_mul_mv_f16_f32
-// (MIT licensed). Copyright the llama.cpp Authors. See LICENSE-MIT-llamacpp.
-//
 // Two kernels:
 //
 // 1. `dense_matvec_f16`  — Specialized M=1 mat-vec (decode path).
-//    Modeled after llama.cpp's kernel_mul_mv_f16_f32 pattern.
 //    Each SIMD group (32 threads) processes N_DST rows using vectorized
 //    half4 loads and simd_sum reduction.
 //
@@ -34,7 +30,7 @@ struct DenseGemmParams {
 // Kernel 1: Specialized M=1 mat-vec — the hot path for lm_head decode
 // ============================================================
 //
-// Architecture (matches llama.cpp pattern):
+// Architecture:
 //   - N_DST=4 rows per SIMD group, N_SIMDGROUP=2 per threadgroup -> 8 rows/tg
 //   - Each thread in a simdgroup handles K/(32*4) vectorized loads (half4)
 //   - simd_sum reduces across 32 lanes

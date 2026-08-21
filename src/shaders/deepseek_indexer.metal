@@ -1,9 +1,9 @@
 // DeepSeek-V4 0731 tiled lightning indexer and deterministic causal top-512.
 //
 // The score kernel tiles 64 candidates while preserving the prior BF16->F32
-// reduction order and fail-closed semantics.  The top-k path follows the
-// block-sort/hierarchical-merge structure of llama.cpp's MIT-licensed Metal
-// implementation (commit f9e832c1), adapted to mlx-native's strided output.
+// reduction order and fail-closed semantics.  The top-k path follows a
+// block-sort/hierarchical-merge structure, adapted to mlx-native's
+// strided output.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -131,7 +131,7 @@ kernel void deepseek_indexer_score_bf16(
     }
 }
 
-// Fast finite-input path matching llama.cpp's simdgroup-MMA score geometry.
+// Fast finite-input path matching the peer's simdgroup-MMA score geometry.
 // It is opt-in until model-level coherence accepts the BF16->F16 tile staging.
 kernel void deepseek_indexer_score_mma_bf16(
         constant DeepSeekIndexerParams &p [[buffer(0)]],

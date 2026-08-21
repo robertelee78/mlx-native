@@ -4,10 +4,9 @@ using namespace metal;
 // Multi-section Rotary Position Embedding (MROPE), interleaved mode
 // (IMROPE), and Vision mode (Qwen3-VL ViT 2-D positions).
 //
-// Spec source: ADR-013 Decision 10 (MROPE/IMROPE) and
-// /opt/llama.cpp/ggml/include/ggml.h:1840-1846 + ggml-cpu/ops.cpp:5643-5711
-// + ggml-cuda/rope.cu:268-328 (Vision). Formula derived from the published
-// definitions. No code copied — only the math is reproduced here.
+// Spec source: ADR-013 Decision 10 (MROPE/IMROPE) plus the published
+// MROPE/IMROPE/Vision RoPE definitions. No code copied — only the math
+// is reproduced here.
 //
 // # Modes
 //
@@ -62,9 +61,8 @@ using namespace metal;
 //   sector      = pair_idx % sect_dims_v       (= pair_idx for full coverage)
 //   sector < s0                  -> axis 0 (y), local_p = sector
 //   s0 <= sector < s0+s1         -> axis 1 (x), local_p = sector - s0
-// Per-section theta exponent restart, mirroring
-//   /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:303-314 and the
-//   `indep_sects` branch of /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5660-5710.
+// Per-section theta exponent restart (`indep_sects` behavior: each
+// section restarts its frequency schedule at exponent 0).
 //
 // # Positions layout
 //
@@ -97,8 +95,7 @@ constant uint RMODE_VISION  = 24u;
 // pick_axis returns position axis index (0=t/y, 1=h/x, 2=w, 3=e) for a
 // given sector, according to the mode and sections counts.
 //
-// For VISION, only axes 0 and 1 are ever returned (s2/s3 ignored), matching
-// /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:303-314.
+// For VISION, only axes 0 and 1 are ever returned (s2/s3 ignored).
 static inline uint pick_axis(uint sector, uint mode, uint s0, uint s1, uint s2) {
     if (mode == RMODE_IMROPE) {
         if (sector % 3u == 0u && sector < 3u * s0) return 0u;
@@ -122,8 +119,7 @@ static inline uint pick_axis(uint sector, uint mode, uint s0, uint s1, uint s2) 
 // exponent for VISION mode. For MROPE/IMROPE, the global `pair_idx` is the
 // exponent; this helper is only called when mode == VISION.
 //
-// Mirrors `p = sector` (axis 0) and `p = sector - s0` (axis 1) at
-// /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:309,312.
+// Uses `p = sector` (axis 0) and `p = sector - s0` (axis 1).
 static inline uint pick_local_p_vision(uint sector, uint s0) {
     if (sector < s0) return sector;
     return sector - s0;
@@ -145,17 +141,16 @@ static inline int fetch_pos(
 //
 // MROPE / IMROPE: caller passes `p = pair_idx`, `denom = rope_dim`.
 // VISION:         caller passes `p = local_p` (per-section index),
-//                 `denom = n_dims = head_dim / 2`. Mirrors
+//                 `denom = n_dims = head_dim / 2`. Equivalent to
 //                 `theta_scale = powf(freq_base, -2.0f/n_dims)` and
-//                 `theta_base = pos * powf(theta_scale, p)` at
-//                 /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:307-314.
+//                 `theta_base = pos * powf(theta_scale, p)`.
 static inline float2 compute_cos_sin(
     int pos,
     uint p,
     float freq_base,
     uint denom
 ) {
-    // dim_ratio = 2 * p / denom  (matches llama.cpp theta_scale).
+    // dim_ratio = 2 * p / denom  (equivalent to the theta_scale form above).
     const float dim_ratio = float(2u * p) / float(denom);
     // freq = freq_base^(-dim_ratio) = 1 / freq_base^dim_ratio.
     const float freq = 1.0f / pow(freq_base, dim_ratio);

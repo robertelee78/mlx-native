@@ -5,8 +5,7 @@ using namespace metal;
 // repeat_tiled_f32 — Tiled GQA broadcast of a [T, Hg, K] F32 tensor into a
 //                    [T, H, K] F32 output, where dst[t, h, k] = src[t, h % Hg, k].
 //
-// This is the GPU analog of llama.cpp's `ggml_repeat_4d` op as used in
-// `delta-net-base.cpp:357 k = ggml_repeat(ctx0, k, s)` for the GQA broadcast
+// This is the GPU analog of a 4D tensor-repeat op, used for the GQA broadcast
 // of K (and the matching Q expansion in hf2q's `apply_gated_delta_net_chunk`
 // wrapper, which uses TILED replication to match Qwen3.6's GGUF tensor
 // layout — see `gpu_delta_net.rs:834-866` for the convention rationale).
