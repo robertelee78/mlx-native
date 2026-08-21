@@ -130,7 +130,7 @@ fn main() -> Result<()> {
     }
 
     eprintln!();
-    eprintln!("Reference: llama.cpp implies ~0.14 µs/dispatch (~150 µs / ~1070 dispatches).");
+    eprintln!("Reference baseline (peer engine): ~0.14 µs/dispatch (~150 µs / ~1070 dispatches).");
     eprintln!("If hf2q ≈ 0.14 µs/dispatch, gap residual lives in Rust orchestration.");
     eprintln!("If hf2q ≫ 0.14 µs/dispatch, gap residual lives in shader-launch path.");
 

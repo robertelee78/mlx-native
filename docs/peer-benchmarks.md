@@ -61,9 +61,20 @@ covered); would matter if a top_k=2/4/5/6/10/16/22 model arrives.
   (~150 µs across ~1,070 dispatches); used as the calibration reference in
   `examples/dispatch_cost_calibration.rs`.
 
-## Notes salvaged from code comments (2026-08-20 sweep)
+## Measurements retained namelessly in code (2026-08-20 sweep)
 
-Comparative remarks removed from code comments during the llama.cpp
-reference sweep are consolidated below so the data survives.
+The reference sweep kept comparative measurements in code comments but
+stripped the peer's name (comments now say "the peer" / "the reference").
+The notable ones, with the peer identified, for the record:
 
-<!-- populated by the sweep; see PR chore/llamacpp-sweep -->
+- Flash-attn D=512 unroll sweep vs the peer's `MIN(DK8/2, 4*NSG)` formula:
+  unroll(4)=34.30, (8)=34.11, (16)=35.85, (32, peer full unroll)=36.64
+  ms/call at FA_GL@4K (`flash_attn_prefill_d512.metal`).
+- `flash_attn_vec_hybrid`: estimated ~1.05× of llama.cpp per-dispatch at
+  F16-K; 1.81× per-dispatch K-side gap measured.
+- `flash_attn_vec_tq` FOR_UNROLL backport targeted a ~14 pp decode gap vs
+  llama.cpp (gemma-26B-dwq cn=1: 0.86× → expected 0.91–0.94×).
+- NWG=1 vec peer port falsified at tg5000: −25% vs llama.cpp
+  (`flash_attn_vec_peer_port_f16_reduce.metal`).
+- Peer decode dispatch overhead ~11.4 µs/dispatch (`bench_dispatch_overhead`);
+  11.22 µs/dispatch FA=1 APEX-Q5_K_M (`test_quantized_matmul_id_mm`).

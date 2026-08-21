@@ -1114,7 +1114,7 @@ void flash_attn_prefill_d512(
   decltype(flash_attn_prefill_d512<T, MaskT>) \
   flash_attn_prefill_d512<T, MaskT>;
 
-instantiate_d512("flash_attn_prefill_llamacpp_bf16_d512",          bfloat, bfloat)
-instantiate_d512("flash_attn_prefill_llamacpp_bf16_d512_boolmask", bfloat, bool)
-instantiate_d512("flash_attn_prefill_llamacpp_f16_d512",           half,   half)
-instantiate_d512("flash_attn_prefill_llamacpp_f16_d512_boolmask",  half,   bool)
+instantiate_d512("flash_attn_prefill_d512_bf16",          bfloat, bfloat)
+instantiate_d512("flash_attn_prefill_d512_bf16_boolmask", bfloat, bool)
+instantiate_d512("flash_attn_prefill_d512_f16",           half,   half)
+instantiate_d512("flash_attn_prefill_d512_f16_boolmask",  half,   bool)

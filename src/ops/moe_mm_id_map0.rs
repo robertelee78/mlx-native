@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_ne20_set_matches_llamacpp() {
+    fn supported_ne20_set_matches_reference() {
         // Pinned reference specialization set. Drift here means the
         // iter B main-kernel port
         // also needs to track new specializations.

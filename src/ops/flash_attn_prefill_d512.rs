@@ -24,10 +24,10 @@
 //!
 //! | Kernel name                                       | I/O dtype | Mask kind |
 //! |---------------------------------------------------|-----------|-----------|
-//! | `flash_attn_prefill_llamacpp_bf16_d512`           | bf16      | bf16 additive |
-//! | `flash_attn_prefill_llamacpp_bf16_d512_boolmask`  | bf16      | bool (`is_attended`) |
-//! | `flash_attn_prefill_llamacpp_f16_d512`            | f16       | f16 additive |
-//! | `flash_attn_prefill_llamacpp_f16_d512_boolmask`   | f16       | bool |
+//! | `flash_attn_prefill_d512_bf16`           | bf16      | bf16 additive |
+//! | `flash_attn_prefill_d512_bf16_boolmask`  | bf16      | bool (`is_attended`) |
+//! | `flash_attn_prefill_d512_f16`            | f16       | f16 additive |
+//! | `flash_attn_prefill_d512_f16_boolmask`   | f16       | bool |
 //!
 //! NSG is NOT in the entry-point name; it is specialised at pipeline-creation
 //! time via the int function constant at index 322 (see below).
@@ -115,20 +115,20 @@ pub static FLASH_ATTN_PREFILL_D512_SHADER_SOURCE: &str =
 // ─── Kernel entry-point names ────────────────────────────────────────────────
 
 /// D=512 NSG-specialised, bf16 I/O, bf16 additive mask.
-pub const K_LLAMACPP_BF16_D512: &str = "flash_attn_prefill_llamacpp_bf16_d512";
+pub const K_D512_BF16: &str = "flash_attn_prefill_d512_bf16";
 /// D=512 NSG-specialised, bf16 I/O, bool (`is_attended`) mask.
-pub const K_LLAMACPP_BF16_D512_BOOLMASK: &str = "flash_attn_prefill_llamacpp_bf16_d512_boolmask";
+pub const K_D512_BF16_BOOLMASK: &str = "flash_attn_prefill_d512_bf16_boolmask";
 /// D=512 NSG-specialised, f16 I/O, f16 additive mask.
-pub const K_LLAMACPP_F16_D512: &str = "flash_attn_prefill_llamacpp_f16_d512";
+pub const K_D512_F16: &str = "flash_attn_prefill_d512_f16";
 /// D=512 NSG-specialised, f16 I/O, bool mask.
-pub const K_LLAMACPP_F16_D512_BOOLMASK: &str = "flash_attn_prefill_llamacpp_f16_d512_boolmask";
+pub const K_D512_F16_BOOLMASK: &str = "flash_attn_prefill_d512_f16_boolmask";
 
 /// All four kernel entry-point names registered by this module.
 pub const ALL_KERNEL_NAMES: &[&str] = &[
-    K_LLAMACPP_BF16_D512,
-    K_LLAMACPP_BF16_D512_BOOLMASK,
-    K_LLAMACPP_F16_D512,
-    K_LLAMACPP_F16_D512_BOOLMASK,
+    K_D512_BF16,
+    K_D512_BF16_BOOLMASK,
+    K_D512_F16,
+    K_D512_F16_BOOLMASK,
 ];
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -686,7 +686,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     // point, not just a function constant).  When has_mask=false, the
     // additive-mask pipeline is compiled with has_mask=false, dead-code-
     // eliminating all mask accesses, and never binds buffers 5/6.
-    let kernel_name = K_LLAMACPP_BF16_D512; // additive bf16 (or disabled) mask path
+    let kernel_name = K_D512_BF16; // additive bf16 (or disabled) mask path
 
     // ── Pipeline lookup (mixed bool+int function constants) ──────────────
     //
@@ -889,7 +889,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
 ///
 /// Sibling of [`dispatch_flash_attn_prefill_bf16_d512_with_blk`] with all
 /// buffers and the mask in F16 (half) instead of BF16.  Uses the
-/// `flash_attn_prefill_llamacpp_f16_d512` kernel entry point — same template
+/// `flash_attn_prefill_d512_f16` kernel entry point — same template
 /// as the BF16 variant, instantiated with `T=half, MaskT=half`.
 ///
 /// **Why F16 instead of BF16 at D=512**: the kernel stores Q in 16-bit
@@ -1126,7 +1126,7 @@ fn dispatch_flash_attn_prefill_f16_d512_with_nsg_blk_and_sinks(
     }
 
     // ── Kernel name ───────────────────────────────────────────────────────
-    let kernel_name = K_LLAMACPP_F16_D512; // additive f16 (or disabled) mask path
+    let kernel_name = K_D512_F16; // additive f16 (or disabled) mask path
 
     let pipeline = registry.get_pipeline_with_constants(
         kernel_name,
@@ -1270,15 +1270,15 @@ mod tests {
 
     #[test]
     fn test_tile_geometry_d512() {
-        assert_eq!(NQPSG_D512, 8, "NQPSG=8 for D=512 (llama.cpp-impl.h:93)");
-        assert_eq!(NCPSG_D512, 64, "NCPSG=64 for D=512 (llama.cpp-impl.h:94)");
-        assert_eq!(NSG_D512, 8, "NSG=8 for D=512 (llama.cpp-ops.cpp:2807)");
+        assert_eq!(NQPSG_D512, 8, "NQPSG=8 for D=512 (reference geometry)");
+        assert_eq!(NCPSG_D512, 64, "NCPSG=64 for D=512 (reference geometry)");
+        assert_eq!(NSG_D512, 8, "NSG=8 for D=512 (reference geometry)");
         // Threadgroup size: 32 × NSG = 256 threads at NSG=8.
         assert_eq!(32 * NSG_D512, 256);
     }
 
     #[test]
-    fn test_threadgroup_memory_matches_llamacpp() {
+    fn test_threadgroup_memory_matches_reference() {
         // FATTN_SMEM(nsg=8, DK=DV=512, bf16, is_q=0):
         //   inner = 8 * (512 + 2 * PAD(512, 64) + 2 * (2 * 64))
         //         = 8 * (512 + 1024 + 256)
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fc_idx_nsg_matches_llamacpp() {
+    fn test_fc_idx_nsg_matches_reference() {
         // FC_FLASH_ATTN_EXT = 300, offset 22 → 322.
         assert_eq!(FC_IDX_NSG, 322);
     }
@@ -1301,8 +1301,8 @@ mod tests {
             assert!(!name.is_empty());
             assert!(seen.insert(name), "duplicate name: {name}");
             assert!(
-                name.starts_with("flash_attn_prefill_llamacpp_"),
-                "name must be prefixed with llamacpp marker: {name}"
+                name.starts_with("flash_attn_prefill_d512_"),
+                "name must carry the flash_attn_prefill_d512_ prefix: {name}"
             );
             assert!(
                 name.contains("d512"),
@@ -1498,7 +1498,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_resume(
     let do_causal = params.do_causal;
 
     // ── Pipeline lookup (F16 kernel, NSG fc) ──────────────────────────────
-    let kernel_name = K_LLAMACPP_F16_D512;
+    let kernel_name = K_D512_F16;
     let pipeline = registry.get_pipeline_with_constants(
         kernel_name,
         device.metal_device(),
@@ -1672,7 +1672,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d512_resume(
     let has_blk = false;
     let do_causal = params.do_causal;
 
-    let kernel_name = K_LLAMACPP_BF16_D512;
+    let kernel_name = K_D512_BF16;
     let pipeline = registry.get_pipeline_with_constants(
         kernel_name,
         device.metal_device(),

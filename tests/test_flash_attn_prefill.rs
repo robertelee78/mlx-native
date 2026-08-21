@@ -2933,7 +2933,7 @@ fn test_d512_pipeline_tg_memory_and_threads() {
 
     let pipeline = registry
         .get_pipeline_with_constants(
-            "flash_attn_prefill_llamacpp_bf16_d512",
+            "flash_attn_prefill_d512_bf16",
             device.metal_device(),
             &[(200, true), (201, true), (300, false), (301, false)],
             &[(322, 8_i32)],
@@ -2986,7 +2986,7 @@ fn test_d512_pipeline_tg_memory_and_threads() {
 /// template has an MSL syntax bug, this test fails before any of the
 /// correctness tests have a chance to run.
 #[test]
-fn test_bf16_d512_llamacpp_library_compiles() {
+fn test_bf16_d512_library_compiles() {
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
     flash_attn_prefill_d512::register(&mut registry);
@@ -2994,13 +2994,13 @@ fn test_bf16_d512_llamacpp_library_compiles() {
     // Canonical FC combo: align_Q=true, align_K=true, has_mask=false,
     // do_causal=false, nsg=8.
     let result = registry.get_pipeline_with_constants(
-        "flash_attn_prefill_llamacpp_bf16_d512",
+        "flash_attn_prefill_d512_bf16",
         device.metal_device(),
         &[(200, true), (201, true), (300, false), (301, false)],
         &[(322, 8_i32)],
     );
     match result {
-        Ok(_) => eprintln!("test_bf16_d512_llamacpp_library_compiles: OK"),
+        Ok(_) => eprintln!("test_bf16_d512_library_compiles: OK"),
         Err(MlxError::ShaderCompilationError { name, message }) => {
             panic!(
                 "bf16 D=512 NSG=8 pipeline compilation failed: name={name}, \

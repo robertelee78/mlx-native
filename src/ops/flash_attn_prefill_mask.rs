@@ -190,7 +190,7 @@ pub fn build_sdpa_mask_bf16(
     if let Some(0) = params.window_size {
         return Err(MlxError::InvalidArgument(
             "build_sdpa_mask_bf16: window_size=Some(0) is not allowed \
-             (llama.cpp treats n_swa=0 as undefined; pass None for \
+             (n_swa=0 is undefined; pass None for \
              no-window / causal-only)".into(),
         ));
     }

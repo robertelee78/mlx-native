@@ -255,7 +255,7 @@ fn adr022_iq4_nl_dequant_zero_input_yields_zero_output() {
 }
 
 #[test]
-fn adr022_iq4_nl_codebook_constant_byte_equal_to_llama_cpp() {
+fn adr022_iq4_nl_codebook_constant_byte_equal_to_reference() {
     // Codebook frozen by ggml-common.h:1109-1112. Any drift breaks
     // every existing IQ4_NL GGUF on disk. Pin the bytes here so a
     // future change to KVALUES_IQ4_NL is caught at test time.
