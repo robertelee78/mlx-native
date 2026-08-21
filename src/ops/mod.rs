@@ -20,14 +20,15 @@ pub mod dense_gemm;
 pub mod dense_gemv_bf16;
 pub mod dense_mm_bf16;
 mod dense_mm_capability;
-#[cfg(test)]
-mod dense_mm_fallback_tests;
 pub mod dense_mm_f16;
 pub mod dense_mm_f32_f32;
+#[cfg(test)]
+mod dense_mm_fallback_tests;
 pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;
 pub mod embedding_q2_k;
+pub mod embedding_q4_k;
 pub mod embedding_q8_0;
 pub mod encode_helpers;
 pub mod flash_attn_prefill;
@@ -64,6 +65,7 @@ pub mod moe_mm_id_map0;
 pub mod moe_softmax_topk;
 pub mod moe_weighted_reduce;
 pub mod mul_mv_ext;
+pub mod q_gate_deinterleave;
 pub mod qkv_split;
 pub mod quantized_matmul;
 pub mod quantized_matmul_ggml;

@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MlxError, Result};
-use crate::ops::quantized_matmul_ggml::{q6k_mn_dispatch_count, GgmlType, MM_ROUTING_THRESHOLD};
+use crate::ops::quantized_matmul_ggml::{dense_mn_dispatch_count, GgmlType, MM_ROUTING_THRESHOLD};
 use crate::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD;
 
 /// Schema version for serialized [`GgmlCapability`] receipts.
@@ -204,6 +204,7 @@ pub struct GgmlCapabilityRequest {
 pub enum GgmlKernelRoute {
     DenseMv,
     DenseMvNr2,
+    DenseQ4kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
     DenseMmSimdgroup,
@@ -226,6 +227,7 @@ pub enum GgmlKernelRoute {
     ExpertPooledSlottedMmDeviceSelected,
     ExpertSwiGluDownQ4,
     EmbeddingQ2K,
+    EmbeddingQ4K,
     EmbeddingQ8_0,
 }
 
@@ -561,6 +563,7 @@ fn dense_mm_route(request: &GgmlCapabilityRequest, batched: bool) -> (GgmlKernel
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenseAutoPlan {
     Mv,
+    Q4kWidthMn,
     Q6kWidthMn,
     WidthMvExt,
     Mm,
@@ -573,19 +576,25 @@ pub(crate) fn plan_dense_auto_route(
     routing: &GgmlRoutingPolicy,
 ) -> DenseAutoPlan {
     if routing.dense_decode_mvn
+        && ggml_type == GgmlType::Q4_K
+        && (2..=MM_ROUTING_THRESHOLD).contains(&m)
+    {
+        return DenseAutoPlan::Q4kWidthMn;
+    }
+    if routing.dense_decode_mvn
         && ggml_type == GgmlType::Q6_K
         && (2..=MM_ROUTING_THRESHOLD).contains(&m)
     {
         return DenseAutoPlan::Q6kWidthMn;
     }
-    if routing.dense_decode_mv_ext
-        && matches!(
-            ggml_type,
-            GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0
-        )
-        && (2..=MM_ROUTING_THRESHOLD).contains(&m)
-        && k >= 32
-    {
+    let mv_ext_width_supported = match ggml_type {
+        // K-quants use mul_mv_ext only once four columns can amortize the
+        // wider dequantization path.
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (4..=MM_ROUTING_THRESHOLD).contains(&m),
+        GgmlType::Q4_0 | GgmlType::Q8_0 => (2..=MM_ROUTING_THRESHOLD).contains(&m),
+        _ => false,
+    };
+    if routing.dense_decode_mv_ext && mv_ext_width_supported && k >= 32 {
         return DenseAutoPlan::WidthMvExt;
     }
     if m > MM_ROUTING_THRESHOLD && k >= 32 && ggml_type != GgmlType::IQ4_XS {
@@ -605,6 +614,19 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
         );
     }
     match plan_dense_auto_route(request.ggml_type, m, k, &request.routing) {
+        DenseAutoPlan::Q4kWidthMn => GgmlCapability::supported(
+            request,
+            GgmlKernelRoute::DenseQ4kWidthMn,
+            request.workload == GgmlWorkloadClass::ContinuousWidth,
+            request.workload != GgmlWorkloadClass::ContinuousWidth,
+            false,
+            1,
+            bytes,
+            GgmlScratchRequirement::None,
+            dense_mn_dispatch_count(m),
+            0,
+            "Q4_K byte-identical multi-column matvec route",
+        ),
         DenseAutoPlan::Q6kWidthMn => GgmlCapability::supported(
             request,
             GgmlKernelRoute::DenseQ6kWidthMn,
@@ -614,7 +636,7 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
             1,
             bytes,
             GgmlScratchRequirement::None,
-            q6k_mn_dispatch_count(m),
+            dense_mn_dispatch_count(m),
             0,
             "Q6_K byte-identical multi-column matvec route",
         ),
@@ -1086,6 +1108,7 @@ fn embedding(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
     }
     let route = match request.ggml_type {
         GgmlType::Q2_K => GgmlKernelRoute::EmbeddingQ2K,
+        GgmlType::Q4_K => GgmlKernelRoute::EmbeddingQ4K,
         GgmlType::Q8_0 => GgmlKernelRoute::EmbeddingQ8_0,
         other => {
             return GgmlCapability::unsupported(

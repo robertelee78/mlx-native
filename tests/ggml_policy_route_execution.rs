@@ -76,6 +76,23 @@ fn width_and_dense_mm_policy_knobs_bind_production_dispatch() {
     let width_mn = capture_dense(&device, &mut registry, width, GgmlRoutingPolicy::default());
     assert!(width_mn.iter().all(|label| label.contains("q6_K_f32_mN")));
 
+    let q4_width = GgmlQuantizedMatmulParams {
+        ggml_type: GgmlType::Q4_K,
+        ..width
+    };
+    let q4_width_mn = capture_dense(
+        &device,
+        &mut registry,
+        q4_width,
+        GgmlRoutingPolicy::default(),
+    );
+    assert!(
+        q4_width_mn
+            .iter()
+            .all(|label| label.contains("q4_K_f32_mN")),
+        "{q4_width_mn:?}"
+    );
+
     let mv_ext = capture_dense(
         &device,
         &mut registry,
