@@ -12,7 +12,7 @@
 // but absolute ratio is 2.65× vs raw F32, NOT 3.19×.
 //
 // Why hybrid wins on speed (per peer source read iter-349):
-//   * Peer's F16-K SDPA at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6837
+//   * Peer's F16-K SDPA
 //     does ONE thing in the K-loop: `mqk[cc] += dot((float4)pk4[...], (float4)pq4[...])`
 //   * Our existing TQ-HB K-loop (flash_attn_vec_tq_hb.metal:555+) does FOUR things:
 //     byte unpack → codebook lookup × 4 → scalar mul × 4 → dot.
@@ -495,8 +495,8 @@ kernel void flash_attn_vec_hybrid_impl(
 
     // Main loop over KV cache in chunks of C=32.
     // ADR-028 iter-127b: NSG-axis K-stride. Each simdgroup `sgitg` within
-    // workgroup `iwg` strides through K with step `NWG*NSG`. Matches
-    // llama.cpp's flash_attn_vec_ext at ggml-metal.metal:6782.
+    // workgroup `iwg` strides through K with step `NWG*NSG`, matching the
+    // peer's vec-attention stride pattern.
     // At NSG=1 (sgitg always 0): `for (ic0 = iwg; ; ic0 += NWG)` — identical
     // to pre-iter-127 behavior.
     for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
@@ -571,7 +571,7 @@ kernel void flash_attn_vec_hybrid_impl(
                     float partial = 0.0f;
                     for (short ii = 0; ii < DK4 / NL; ++ii) {
                         // Direct half4 load + cast to float4 — peer-equivalent
-                        // (mirrors llama.cpp ggml-metal.metal:6837 F16 K branch).
+                        // (mirrors the peer's F16 K branch).
                         half4 k_val_h = *((device const half4 *)(k_base + (ii * NL) * 4));
                         float4 k_val = float4(k_val_h);
                         partial += dot(k_val, float4(pq4[ii * NL]));
@@ -695,7 +695,7 @@ kernel void flash_attn_vec_hybrid_impl(
     // Existing per-WG write below uses the merged values.
     //
     // NSG_MAX=4 to bound the per-thread `ms_arr` static array (matches
-    // llama.cpp's policy `nsg ∈ {1, 2, 4}` capped at 4).
+    // the reference policy `nsg ∈ {1, 2, 4}` capped at 4).
     if (NSG > 1u && sgitg == 0) {
         constexpr ushort NSG_MAX = 4;
         float ms_arr[NSG_MAX];
@@ -923,8 +923,8 @@ kernel void flash_attn_vec_hybrid_batched_impl(
 
     // Main loop over KV cache in chunks of C=32.
     // ADR-028 iter-127b: NSG-axis K-stride. Each simdgroup `sgitg` within
-    // workgroup `iwg` strides through K with step `NWG*NSG`. Matches
-    // llama.cpp's flash_attn_vec_ext at ggml-metal.metal:6782.
+    // workgroup `iwg` strides through K with step `NWG*NSG`, matching the
+    // peer's vec-attention stride pattern.
     // At NSG=1 (sgitg always 0): `for (ic0 = iwg; ; ic0 += NWG)` — identical
     // to pre-iter-127 behavior.
     for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
@@ -999,7 +999,7 @@ kernel void flash_attn_vec_hybrid_batched_impl(
                     float partial = 0.0f;
                     for (short ii = 0; ii < DK4 / NL; ++ii) {
                         // Direct half4 load + cast to float4 — peer-equivalent
-                        // (mirrors llama.cpp ggml-metal.metal:6837 F16 K branch).
+                        // (mirrors the peer's F16 K branch).
                         half4 k_val_h = *((device const half4 *)(k_base + (ii * NL) * 4));
                         float4 k_val = float4(k_val_h);
                         partial += dot(k_val, float4(pq4[ii * NL]));
@@ -1123,7 +1123,7 @@ kernel void flash_attn_vec_hybrid_batched_impl(
     // Existing per-WG write below uses the merged values.
     //
     // NSG_MAX=4 to bound the per-thread `ms_arr` static array (matches
-    // llama.cpp's policy `nsg ∈ {1, 2, 4}` capped at 4).
+    // the reference policy `nsg ∈ {1, 2, 4}` capped at 4).
     if (NSG > 1u && sgitg == 0) {
         constexpr ushort NSG_MAX = 4;
         float ms_arr[NSG_MAX];

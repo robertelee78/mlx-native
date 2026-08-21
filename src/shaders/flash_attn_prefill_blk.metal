@@ -1,9 +1,6 @@
 // flash_attn_prefill_blk — pre-pass tile-skip classifier for the
 // flash_attn_prefill family of kernels.
 //
-// Ported from llama.cpp's `kernel_flash_attn_ext_blk`
-// (/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5666-5719).
-//
 // ## What it does
 //
 // Walks the additive attention mask in tile-sized chunks matching the main
@@ -19,23 +16,23 @@
 //                         kernel computes Q·K^T and softmax normally but
 //                         skips the mask-add (save one mask load per tile).
 //
-// ## Why not re-use llama.cpp's (8, 64) tile shape
+// ## Why not re-use the reference (8, 64) tile shape
 //
 // The blk byte is indexed by the main kernel as `blk[qt][kt]` where
 // `(qt, kt)` is the main kernel's outer KV-tile loop position.  Our
-// flash_attn_prefill main kernels use a DIFFERENT geometry than llama.cpp:
+// flash_attn_prefill main kernels use a DIFFERENT geometry:
 //
 //   D=256  : BQ=32, BK=16   (candle-derived per-warp-Q-stacking template)
-//   D=512  : BQ= 8, BK= 8   (llama.cpp-derived per-simdgroup-Q-distributed)
+//   D=512  : BQ= 8, BK= 8   (per-simdgroup-Q-distributed)
 //
 // The pre-pass MUST use the same (BQ, BK) as the main kernel it feeds,
 // otherwise the blk index arithmetic is wrong.  See ADR-011 phase 2 §5.1
 // for the full analysis.
 //
-// ## Sentinel convention (differs from llama.cpp)
+// ## Sentinel convention (differs from the reference)
 //
-// llama.cpp uses f16 masks with `-MAXHALF` as the "fully masked" sentinel
-// (`ggml-metal.metal:5704`).  We use bf16 masks with a true `-INFINITY`
+// The reference uses f16 masks with `-MAXHALF` as the "fully masked"
+// sentinel.  We use bf16 masks with a true `-INFINITY`
 // encoding (`ADR-011-phase2-port-sentinel.md §2`, Wave 2A + Wave 2D).  The
 // classification threshold is `mmax > bfloat(-1.0e30)` — conservative wide
 // threshold that matches both true `-inf` and any "very negative" finite
@@ -46,7 +43,7 @@
 // ## Grid geometry
 //
 //   Threadgroups: (NK, NQ, 1)   — one threadgroup per (Q-tile, K-tile) pair.
-//   Threads/TG  : (32, 1, 1)    — one simdgroup (matches llama.cpp:5666).
+//   Threads/TG  : (32, 1, 1)    — one simdgroup.
 //
 // Each lane in the simdgroup reads elements from the tile, performs a
 // simdgroup-wide min/max reduction, and lane 0 writes the classification
@@ -117,8 +114,8 @@ struct FlashAttnPrefillBlkParams {
 // lane 0 of the simdgroup writes the output byte after a 32-wide reduction.
 //
 // The tile is read directly from device memory — we do NOT stage the mask
-// through threadgroup memory, matching llama.cpp's design choice
-// (`ggml-metal.metal:5685-5699`).  This is what makes the pre-pass
+// through threadgroup memory, matching the reference design
+// choice.  This is what makes the pre-pass
 // asymptotically cheaper than inline classification in the main kernel:
 // no K/V loads, no mask staging to shared memory, no cross-simdgroup
 // synchronisation.
@@ -141,7 +138,7 @@ void flash_attn_prefill_blk_impl(
     const int kL = params.seq_len_k;
     const int M_stride = params.mask_row_stride;  // elements between mask rows
 
-    // Mirror llama.cpp ggml-metal.metal:5683 — partial trailing K-tiles
+    // Partial trailing K-tiles
     // (tile straddles the kL right edge) default to `mixed` (1).  Classifying
     // a partial tile cleanly would require per-element bound checks inside
     // the main kernel's loop, which is exactly what the main kernel already
@@ -239,8 +236,8 @@ void flash_attn_prefill_blk_impl(
         mmin = simd_min(mmin);
         mmax = simd_max(mmax);
 
-        // Three-way classification.  See the llama.cpp reference at
-        // ggml-metal.metal:5704-5710 for the equivalent f16 logic.
+        // Three-way classification (the reference carries the equivalent
+        // f16 logic).
         //
         // Fully-masked: our mask builder writes bit-exact `-INFINITY` for
         // blocked cells.  `simd_max` of a tile of all -inf returns -inf.

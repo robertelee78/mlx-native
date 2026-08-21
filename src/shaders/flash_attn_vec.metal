@@ -1,11 +1,8 @@
-// Ported from llama.cpp ggml-metal.metal — flash_attn_ext_vec template
-// (MIT licensed). SIMD-vectorized decode-path scaled dot product attention.
-// Source: /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal
+// flash_attn_vec — SIMD-vectorized decode-path scaled dot product attention
+// (MIT licensed).
 //
-// Copyright the llama.cpp Authors. See LICENSE-MIT-llamacpp.
-//
-// ADR-009 Phase 3A: match llama.cpp's FOR_UNROLL to ensure identical
-// compiler optimization and FMA generation for the d=256 path.
+// ADR-009 Phase 3A: FOR_UNROLL matches the reference unroll idiom to ensure
+// identical compiler optimization and FMA generation for the d=256 path.
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 //
 // Simplified for F32 Q/K/V with NE=1 (Gemma 4 head dims 256 and 512).
@@ -46,7 +43,7 @@ struct FlashAttnVecParams {
     // calls with qL = seq_len <= 8 dispatching that many threadgroups
     // in grid.x. Each (iq1, iq2) threadgroup processes query iq1 for
     // head iq2, with causal mask `abs_pos = kv_seq_len - qL + iq1`.
-    // Peer-code reference: llama.cpp's kernel_flash_attn_ext_vec uses
+    // Peer-code reference: the peer's `kernel_flash_attn_ext_vec` uses
     // an identical pattern (NQPSG=1, ne01 threadgroups in qL dim).
     uint  qL;
 };

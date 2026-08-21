@@ -1,17 +1,15 @@
 // flash_attn_prefill_mask — GPU fill kernel for the bf16 additive attention
 // mask consumed by the flash_attn_prefill family of kernels.
 //
-// Ported from: llama.cpp's llm_graph_input_attn_no_cache::set_input mask-fill
-// algorithm at /opt/llama.cpp/src/llama-graph.cpp:380-444.
-//
-// llama.cpp fills the mask CPU-side then relies on implicit upload.  We fill
+// The reference implementation fills the mask CPU-side then relies on
+// implicit upload.  We fill
 // it GPU-side because (a) Apple Silicon has unified memory so there is no
 // meaningful "upload", (b) GPU fill parallelises trivially over (qL, kL) and
 // stays on-device to match the rest of the mlx-native dispatcher, and
 // (c) we avoid the cache-invalidation overhead of a large host→device transfer
 // per prefill when we build both the global and sliding masks.  The mask
-// values written by this kernel are byte-identical to llama.cpp's post-cast
-// bf16 mask (see ADR-011 phase 2 §6.1).
+// values written by this kernel are byte-identical to the reference's
+// post-cast bf16 mask (see ADR-011 phase 2 §6.1).
 //
 // Reference: the canonical in-kernel attended predicate (simplified for the
 // batch=1, single-sequence, no-ALiBi, causal_attn=true case, per ADR-011
@@ -22,7 +20,7 @@
 //                 q_abs - k_pos < n_swa)        // SWA window
 //
 // Otherwise the cell is written as bfloat16_t(-INFINITY), matching
-// llama-graph.cpp:421,436 and the flash_attn_prefill.metal mask-sentinel
+// the flash_attn_prefill.metal mask-sentinel
 // contract (masked = bf16 -inf = bit pattern 0xFF80; attended = +0.0 =
 // bit pattern 0x0000).
 //
@@ -97,11 +95,11 @@ kernel void flash_attn_prefill_mask_fill_bf16(
     for (uint k_pos = tid; k_pos < seq_len_k; k_pos += tg_size) {
         const int kp = int(k_pos);
 
-        // Mirror llama_hparams::is_masked_swa (llama-hparams.h:316-328) +
+        // SWA-mask predicate +
         // causal: attended iff (kp <= q_abs) for causal, AND (q_abs - kp <
         // n_swa) for SWA_STANDARD.
         //
-        // The llama.cpp loops ("if future ... continue" and "if masked_swa
+        // The reference loops ("if future ... continue" and "if masked_swa
         // ... continue") map to our boolean OR of "is_masked" gates below.
         bool is_masked = false;
         if (causal && kp > q_abs) {
@@ -149,7 +147,7 @@ kernel void flash_attn_prefill_mask_fill_f16(
 // ── Block-diagonal variant (ADR-040 iter-G(a) cross-slot prefill) ───────────
 //
 // Builds the additive mask for N concatenated sequences in one [T, T] buffer,
-// where T = Σ Lᵢ.  Isolation is enforced ENTIRELY by the mask (llama.cpp's
+// where T = Σ Lᵢ.  Isolation is enforced ENTIRELY by the mask (the
 // unified-batch technique): query qi attends key kj iff they are in the SAME
 // sequence AND per-seq-causal (AND, for sliding layers, within the window).
 // Per-token `seq_id` and per-seq-LOCAL `local_pos` are passed as host-written
