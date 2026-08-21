@@ -418,12 +418,22 @@ fn embedding_contract_is_exact() {
         ggml_capability(request).route,
         Some(GgmlKernelRoute::EmbeddingQ4K)
     );
+    request.ggml_type = GgmlType::Q5_K;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingQ5K)
+    );
+    request.ggml_type = GgmlType::Q6_K;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingQ6K)
+    );
     request.ggml_type = GgmlType::Q8_0;
     assert_eq!(
         ggml_capability(request).route,
         Some(GgmlKernelRoute::EmbeddingQ8_0)
     );
-    request.ggml_type = GgmlType::Q5_K;
+    request.ggml_type = GgmlType::F16;
     assert!(!ggml_capability(request).executable);
 }
 

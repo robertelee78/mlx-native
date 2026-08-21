@@ -136,6 +136,9 @@ pub use ops::deepseek_hyper_connection::{
 };
 pub use ops::embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams};
 pub use ops::embedding_q4_k::{embedding_gather_q4_k, EmbeddingQ4KParams};
+pub use ops::embedding_kquant::{
+    embedding_gather_q5_k, embedding_gather_q6_k, EmbeddingQ5KParams, EmbeddingQ6KParams,
+};
 pub use ops::embedding_q8_0::{embedding_gather_q8_0, EmbeddingQ8_0Params};
 pub use ops::q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinterleaveParams};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
