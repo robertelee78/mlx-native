@@ -61,6 +61,7 @@ mlx-native and hf2q are related but have a strict ownership boundary:
   external peer engines. Say "the reference implementation"; comparison data
   and derived-kernel provenance live only in `docs/peer-benchmarks.md`
   (legal notices: `LICENSE-MIT-llamacpp`, `LICENSE-APACHE-candle`).
+  Enforced in CI by `scripts/check_reference_policy.sh`.
 
 ## Working method
 
