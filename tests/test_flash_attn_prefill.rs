@@ -4,7 +4,7 @@
 //! Tests the `attention<BQ, BK, BD, WM, WN>` kernel in
 //! `src/shaders/flash_attn_prefill.metal` against a CPU reference that
 //! mirrors the exact mathematical idioms used in the GPU shader (base-2
-//! softmax, llama.cpp finite-M-sentinel convention with ONE output-side
+//! softmax, finite-M-sentinel convention with ONE output-side
 //! guard at the final normalisation — see kernel preamble and
 //! ADR-011-phase2-port-sentinel.md).
 //!
@@ -47,13 +47,13 @@
 //!   `TransformScale` applied to Q on load).
 //! - Softmax uses `f32::exp2(x - max)` (matches `ExpSubOp::apply`).
 //! - Row max `max_score` initialised to `f32::MIN / 2.0` = `-FLT_MAX/2`,
-//!   the llama.cpp finite sentinel (ggml-metal.metal:5891).  This lets
+//!   the reference finite sentinel.  This lets
 //!   `exp2(score - max_score)` evaluate cleanly for any masked score
 //!   (`exp2(-inf - finite) = 0.0`, IEEE-754 exact) without an intermediate
 //!   NaN guard.
 //! - ONE output-side guard at the final normalisation:
-//!   `safe_sum = sum_exp == 0 ? 1 : sum_exp` — mirrors llama.cpp's
-//!   `scale = S == 0 ? 0 : 1/S` at ggml-metal.metal:6358, which handles
+//!   `safe_sum = sum_exp == 0 ? 1 : sum_exp` — mirrors the reference
+//!   `scale = S == 0 ? 0 : 1/S` guard, which handles
 //!   fully-masked rows where every exp is bit-exact 0.
 //! - Additive (float) mask is multiplied by `log2(e)` before being added to
 //!   the score, matching the kernel's mask-addition step.
@@ -531,7 +531,7 @@ fn sdpa_naive_scalar_f32(
                 }
 
                 // Standard numerically-stable softmax using exp() — updated
-                // to the llama.cpp finite-sentinel convention for parity with
+                // to the finite-sentinel convention for parity with
                 // the kernel-equivalent reference.  For any non-fully-masked
                 // input, `max_s` is the real row-max (identical to the
                 // previous NEG_INFINITY init, which would have been overwritten
@@ -539,7 +539,7 @@ fn sdpa_naive_scalar_f32(
                 // at -FLT_MAX/2, `exp(-inf - -FLT_MAX/2) = exp(-inf) = 0.0`
                 // (IEEE-754 exact), sum = 0, safe_sum = 1, output = 0 — same
                 // final answer as the previous branch-guarded form.
-                let mut max_s = f32::MIN / 2.0; // = -FLT_MAX/2 sentinel (llama.cpp ggml-metal.metal:5891)
+                let mut max_s = f32::MIN / 2.0; // = -FLT_MAX/2 sentinel (reference-implementation convention)
                 for &s in &scores {
                     if s > max_s {
                         max_s = s;
@@ -550,7 +550,7 @@ fn sdpa_naive_scalar_f32(
                     .map(|&s| (s - max_s).exp())
                     .collect();
                 let sum_exp: f32 = exp_scores.iter().sum();
-                // Mirror of llama.cpp's `S == 0 ? 0 : 1/S` at ggml-metal.metal:6358.
+                // Mirror of the reference `S == 0 ? 0 : 1/S` guard.
                 let safe_sum = if sum_exp == 0.0 { 1.0 } else { sum_exp };
 
                 let o_base = b * n_heads * ql * head_dim + h * ql * head_dim + q_pos * head_dim;
@@ -642,16 +642,16 @@ fn sdpa_reference_f32(
                     }
                 }
 
-                // ── Online softmax (base-2, llama.cpp finite-M regime) ────
+                // ── Online softmax (base-2, finite-M regime) ──────────────
                 // Row max reduction:
                 // flash_attn_prefill.metal — row_reduce<MaxOp>(new_max) with
-                // max_score init = -FLT_MAX/2 (llama.cpp convention,
-                // ggml-metal.metal:5891).  A finite sentinel absorbs -inf
+                // max_score init = -FLT_MAX/2 (reference-implementation
+                // convention).  A finite sentinel absorbs -inf
                 // scores via max() without ever letting max_score become
                 // -inf, so the subsequent exp2(score - max) path never sees
                 // exp2(-inf - -inf) = exp2(NaN).  See
                 // ADR-011-phase2-port-sentinel.md §1.3.
-                let mut max_score = f32::MIN / 2.0; // = -FLT_MAX/2, matches llama.cpp + our kernel
+                let mut max_score = f32::MIN / 2.0; // = -FLT_MAX/2, matches our kernel's sentinel
                 for &s in &scores {
                     if s > max_score {
                         max_score = s;
@@ -662,8 +662,7 @@ fn sdpa_reference_f32(
                 // construction (simd_max of -FLT_MAX/2 floor and real
                 // scores), so exp2(-inf - finite) = exp2(-inf) = +0.0
                 // (IEEE-754 exact) for any masked position, never NaN.
-                // Matches llama.cpp's unguarded `exp(s2 - M[jj])` at
-                // ggml-metal.metal:6156.
+                // Matches the reference's unguarded `exp(s2 - M[jj])`.
                 let exp_scores: Vec<f32> = scores
                     .iter()
                     .map(|&s| f32::exp2(s - max_score))
@@ -671,15 +670,15 @@ fn sdpa_reference_f32(
 
                 // Sum: flash_attn_prefill.metal — row_reduce<SumOp>
                 let sum_exp: f32 = exp_scores.iter().sum();
-                // THE single surviving guard — mirrors llama.cpp's
-                // `scale = S == 0 ? 0 : 1/S` at ggml-metal.metal:6358.
+                // THE single surviving guard — mirrors the reference
+                // `scale = S == 0 ? 0 : 1/S` form.
                 // For a fully-masked row every exp is 0 so sum_exp = 0;
                 // downstream the weighted sum becomes (exp / safe_sum) = 0
                 // and `* 0` when sum_exp was 0, i.e. 0 output.  We keep
                 // the `safe_sum = 1` form here because the weighted loop
                 // below does `(exp / safe_sum) * v`: when sum_exp == 0
                 // every `exp` is also 0, so `0 / 1 * v = 0` — same final
-                // behaviour as llama.cpp's `reciprocal-then-multiply`.
+                // behaviour as the reference's `reciprocal-then-multiply`.
                 let safe_sum = if sum_exp == 0.0 { 1.0 } else { sum_exp };
 
                 // ── Weighted sum of V ─────────────────────────────────────
@@ -836,9 +835,9 @@ fn test_cpu_ref_self_consistency_additive_mask() {
     eprintln!("test_cpu_ref_self_consistency_additive_mask: PASS (both refs produce finite output)");
 }
 
-/// CPU fully-masked input must produce zero output (llama.cpp sentinel regime).
+/// CPU fully-masked input must produce zero output (finite-sentinel regime).
 ///
-/// Under the llama.cpp finite-M convention (ADR-011-phase2-port-sentinel.md),
+/// Under the finite-M convention (ADR-011-phase2-port-sentinel.md),
 /// when ALL K positions are masked to -infinity the fully-masked-row path is:
 ///
 /// 1. Row max `max_score` initialised to `-FLT_MAX/2` (finite).  Every score
@@ -850,8 +849,8 @@ fn test_cpu_ref_self_consistency_additive_mask() {
 ///    (`safe_sum = sum_exp == 0 ? 1 : sum_exp`) sets divisor to 1.
 /// 4. `(0 / 1) * v = 0` per output component → output = all 0.0.
 ///
-/// Mirrors llama.cpp's end-to-end trace at ggml-metal.metal:5888-6374 for a
-/// fully-masked row (final `scale = S == 0 ? 0 : 1/S` at :6358 yields 0).
+/// Mirrors the reference implementation's end-to-end trace for a
+/// fully-masked row (the final `scale = S == 0 ? 0 : 1/S` yields 0).
 #[test]
 fn test_cpu_ref_nan_guard_fully_masked() {
     let batch = 1; let h = 2; let kv_h = 2;
@@ -949,7 +948,7 @@ fn test_cpu_ref_custom_scale() {
 const BF16_GPU_ATOL: f32 = 5e-3;
 const BF16_GPU_RTOL: f32 = 2e-2;
 
-// Tightened D=512 tolerance — exercised only by the D=512 llama.cpp-derived
+// Tightened D=512 tolerance — exercised only by the D=512 reference-derived
 // kernel (`flash_attn_prefill_d512.metal`, NSG=8).
 //
 // Why tighter than D=256?  The original D=512 tests inherited the D=256
@@ -1677,17 +1676,17 @@ fn test_gpu_bf16_d256_additive_mask() {
     );
 }
 
-/// GPU correctness: fully-masked KV tile under the llama.cpp sentinel regime.
+/// GPU correctness: fully-masked KV tile under the finite-sentinel regime.
 ///
-/// The kernel uses llama.cpp's finite-M convention (ADR-011-phase2-port-sentinel.md):
+/// The kernel uses the finite-M convention (ADR-011-phase2-port-sentinel.md):
 /// the running row-max `M` is initialised to `-FLT_MAX/2` (finite), so
 /// `simd_max(-FLT_MAX/2, -inf) = -FLT_MAX/2` keeps `M` finite throughout
 /// the K-sweep, which in turn makes `exp2(-inf - M) = exp2(-inf) = +0.0`
 /// (IEEE-754 exact) — never `exp2(NaN)`.  The K-sweep accumulates
 /// `sum_score = bit-exact 0` with no intermediate NaN.  The ONE remaining
 /// guard is the final output normalisation (`DivOp`: `sum_score == 0 ?
-/// 0 : x/sum_score`), mirroring llama.cpp's
-/// `scale = S == 0 ? 0 : 1/S` at ggml-metal.metal:6358.
+/// 0 : x/sum_score`), mirroring the reference
+/// `scale = S == 0 ? 0 : 1/S` guard.
 ///
 /// This test sets the entire mask to -inf; the expected output is all zeros
 ///   (no valid keys attended).  Any NaN or Inf in the output = the sentinel
@@ -2842,13 +2841,13 @@ fn test_repro_production_bf16_bytes_direct() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// § 6  GPU CORRECTNESS — BF16 D=512 (NSG=8, llama.cpp-derived kernel)
+// § 6  GPU CORRECTNESS — BF16 D=512 (NSG=8, reference-derived kernel)
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // These tests exercise `dispatch_flash_attn_prefill_bf16_d512` — the
-// llama.cpp-derived NSG=8 kernel at `shaders/flash_attn_prefill_d512.metal`.
+// reference-derived NSG=8 kernel at `shaders/flash_attn_prefill_d512.metal`.
 // The tolerance budget is the same as D=256 (BF16_GPU_ATOL=5e-3, _RTOL=2e-2)
-// because the kernel body is a direct port of llama.cpp's proven math and
+// because the kernel body is a direct port of the reference's proven math and
 // uses the same bf16 I/O + f32 accumulation pipeline.
 //
 // Unlike the D=256 kernel, D=512 ships with only ONE entry point per dtype
@@ -2922,9 +2921,9 @@ fn run_bf16_gpu_d512(
 
 /// Measure the compiled pipeline's static threadgroup memory footprint and
 /// max threads/TG.  This is the regression gate for the TG-memory claim:
-/// llama.cpp reports 28,672 B for (DK=DV=512, Q=8, C=64, NSG=8, bf16,
-/// is_q=0); if this measurement is larger, the kernel is allocating
-/// statically-sized threadgroup arrays that don't exist in llama.cpp's
+/// the reference kernel reports 28,672 B for (DK=DV=512, Q=8, C=64, NSG=8,
+/// bf16, is_q=0); if this measurement is larger, the kernel is allocating
+/// statically-sized threadgroup arrays that don't exist in the reference
 /// kernel (or our shmem aliasing has drifted).
 #[test]
 fn test_d512_pipeline_tg_memory_and_threads() {
@@ -2934,7 +2933,7 @@ fn test_d512_pipeline_tg_memory_and_threads() {
 
     let pipeline = registry
         .get_pipeline_with_constants(
-            "flash_attn_prefill_llamacpp_bf16_d512",
+            "flash_attn_prefill_d512_bf16",
             device.metal_device(),
             &[(200, true), (201, true), (300, false), (301, false)],
             &[(322, 8_i32)],
@@ -2970,7 +2969,7 @@ fn test_d512_pipeline_tg_memory_and_threads() {
         "max_total_threads_per_threadgroup >= 256 required for NSG=8 × 32 lanes"
     );
 
-    // Dynamic allocation is used (matches llama.cpp), so static size should
+    // Dynamic allocation is used (matches the reference kernel), so static size should
     // be small or zero.
     assert!(
         static_tg < 1024,
@@ -2979,7 +2978,7 @@ fn test_d512_pipeline_tg_memory_and_threads() {
     );
 }
 
-/// Verify the llama.cpp-derived D=512 shader library compiles and the
+/// Verify the reference-derived D=512 shader library compiles and the
 /// bf16 NSG=8 pipeline is obtainable at the canonical function-constant
 /// combination.
 ///
@@ -2987,7 +2986,7 @@ fn test_d512_pipeline_tg_memory_and_threads() {
 /// template has an MSL syntax bug, this test fails before any of the
 /// correctness tests have a chance to run.
 #[test]
-fn test_bf16_d512_llamacpp_library_compiles() {
+fn test_bf16_d512_library_compiles() {
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
     flash_attn_prefill_d512::register(&mut registry);
@@ -2995,13 +2994,13 @@ fn test_bf16_d512_llamacpp_library_compiles() {
     // Canonical FC combo: align_Q=true, align_K=true, has_mask=false,
     // do_causal=false, nsg=8.
     let result = registry.get_pipeline_with_constants(
-        "flash_attn_prefill_llamacpp_bf16_d512",
+        "flash_attn_prefill_d512_bf16",
         device.metal_device(),
         &[(200, true), (201, true), (300, false), (301, false)],
         &[(322, 8_i32)],
     );
     match result {
-        Ok(_) => eprintln!("test_bf16_d512_llamacpp_library_compiles: OK"),
+        Ok(_) => eprintln!("test_bf16_d512_library_compiles: OK"),
         Err(MlxError::ShaderCompilationError { name, message }) => {
             panic!(
                 "bf16 D=512 NSG=8 pipeline compilation failed: name={name}, \
@@ -3235,9 +3234,9 @@ fn test_gpu_bf16_d512_high_variance_softmax() {
 // § 7  SWA / CAUSAL MASK BUILDER (Wave 2D, ADR-011 Phase 2)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Verifies the port of llama.cpp's `llm_graph_input_attn_no_cache::set_input`
-// mask-fill algorithm (llama-graph.cpp:380-444) and the `is_masked_swa`
-// predicate (llama-hparams.h:316-328) into a bf16 GPU-fill kernel.
+// Verifies the port of the reference `llm_graph_input_attn_no_cache::set_input`
+// mask-fill algorithm and the `is_masked_swa`
+// predicate into a bf16 GPU-fill kernel.
 //
 // The builder produces a `[seq_len_q, seq_len_k]` bf16 mask with discrete
 // cell values: 0.0 for attended, -inf for masked.  Correctness is EXACT

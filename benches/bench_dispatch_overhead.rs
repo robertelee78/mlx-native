@@ -3,7 +3,7 @@
 //! Hypothesis under test (H2):
 //!   "hf2q's per-dispatch CPU overhead (Rust→Metal binding) is a large
 //!    fraction of the 14.7 µs/dispatch decode-time average — and a
-//!    measurable fraction of the gap to llama.cpp peer (which does
+//!    measurable fraction of the gap to the peer engine (which does
 //!    11.4 µs/dispatch via thinner C-Metal binding)."
 //!
 //! Falsification plan:

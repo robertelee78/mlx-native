@@ -3,8 +3,7 @@
 //! When the env var is set at process start, `CommandEncoder::new_with_residency`
 //! constructs each `MTLCommandBuffer` via
 //! `CommandQueueRef::new_command_buffer_with_unretained_references` instead of
-//! the default `commandBuffer`.  llama.cpp uses this same call at
-//! `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:512` to skip
+//! the default `commandBuffer`.  The peer engine uses this same call to skip
 //! per-buffer-binding ARC retains on submit; the docstring on
 //! `mlx-native/src/encoder.rs:392-411` cites ~3-5% wall on M-series GPUs.
 //!

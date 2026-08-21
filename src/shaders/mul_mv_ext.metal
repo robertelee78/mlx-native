@@ -1,25 +1,24 @@
 // ADR-022 Phase 1 P1.7 — `mul_mv_ext` r1 family for Q5_1 + IQ4_NL.
 //
-// Direct port of llama.cpp's `kernel_mul_mv_ext_q4_f32_impl`
-// (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:3662-3761`) +
-// the eight `template [[host_name(...)]]` instantiations at :3936-3939
-// (Q5_1 × r1∈{2,3,4,5}) and :3951-3954 (IQ4_NL × r1∈{2,3,4,5}).
+// Implements the `kernel_mul_mv_ext_q4_f32_impl` shape plus its eight
+// `template [[host_name(...)]]` instantiations
+// (Q5_1 × r1∈{2,3,4,5}) and (IQ4_NL × r1∈{2,3,4,5}).
 //
 // Why a separate kernel from `kernel_mul_mv_<q>_f32`:
 //   The plain mv kernel computes one src1 row at a time (m=1 decode).
 //   At small batch m∈{2,3,4,5} (speculative decode, batched server, MTP),
 //   the per-row dispatch overhead dominates. mv_ext processes `r1ptg` src1
 //   rows in parallel per simdgroup, sharing the dequantized src0 weights
-//   across all r1ptg rows. llama.cpp's host dispatcher (ggml-metal-ops.cpp:2107)
+//   across all r1ptg rows. The peer host dispatcher
 //   routes the m=2..8 range to mv_ext when ne01 % nsg*nypsg == 0.
 //
 // Function constants:
-//   FC_mul_mv_nsg   (i32 @ 600) — num simdgroups per threadgroup; llama.cpp
-//                                 always passes 2 (`ggml-metal-ops.cpp:2090`).
+//   FC_mul_mv_nsg   (i32 @ 600) — num simdgroups per threadgroup; the peer
+//                                 dispatcher always passes 2.
 //   FC_mul_mv_nxpsg (i32 @ 601) — num threads along row per simdgroup;
-//                                 llama.cpp picks ∈ {4, 8, 16} by K-modulus.
+//                                 chosen ∈ {4, 8, 16} by K-modulus.
 //
-// Note on data type: llama.cpp declares these as `short` (i16). mlx-native's
+// Note on data type: upstream declares these as `short` (i16). mlx-native's
 // `KernelRegistry::get_pipeline_with_constants` infrastructure currently
 // supports bool + i32; we declare them as `int [[function_constant(...)]]`
 // here and the kernel uses them as scalar `short`-range values via implicit
@@ -27,7 +26,7 @@
 // type difference.
 //
 // Mantra: chesterton's fence — every shape-rule, every offset, every shift
-// here is a 1:1 byte-port from the llama.cpp peer source. No improvisation.
+// here is a 1:1 byte-port from the peer source. No improvisation.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -94,9 +93,9 @@ typedef struct {
 //   - quantized_matmul_ggml.metal    kvalues_iq4nl
 //   - host: src/gguf/mod.rs::KVALUES_IQ4_NL
 //
-// llama.cpp uses a `float` array here for fast multiply-accumulate in the
+// The peer uses a `float` array here for fast multiply-accumulate in the
 // dequant_t4 inner loop; the existing mlx-native callers use `int8_t` then
-// cast to float per-element. Float-form matches llama.cpp's mv_ext path
+// cast to float per-element. Float-form matches the peer mv_ext path
 // exactly, so we duplicate the pattern in this file rather than recompute.
 constexpr constant static float kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
@@ -495,7 +494,7 @@ kernel void hf2q_mul_mv_ext_q4_f32_impl<5, block_q8_0, 8, dequantize_q8_0_t4>(
 
 // ------- mv_ext q4x4 kernel template (16-element / float4x4 chunks) -------
 //
-// Port of llama.cpp `kernel_mul_mv_ext_q4x4_f32_impl` (ggml-metal.metal:3765).
+// The q4x4 variant of the mv_ext template (`kernel_mul_mv_ext_q4x4_f32_impl`).
 // Used for K-quant types (256-element blocks, 16-element chunks):
 // chpb = QK_K/16 = 16. Otherwise structurally identical to the q4 variant
 // above — same FC dispatch, same r1ptg parallelization, same simdgroup reduction.

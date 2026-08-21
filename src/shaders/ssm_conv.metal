@@ -5,7 +5,7 @@ using namespace metal;
 //
 // Spec source: ADR-013 Decision 7. Formula derived from Mamba-family causal
 // depthwise 1D convolution literature plus the spec block in ADR-013; no
-// llama.cpp source referenced.
+// upstream kernel source referenced.
 //
 // Operation:
 //   ssm_conv(x, kernel_w, state) -> (y, new_state)

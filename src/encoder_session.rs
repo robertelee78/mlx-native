@@ -189,8 +189,7 @@ pub struct EncoderSession {
 
     /// Per-session monotonic fence counter.
     ///
-    /// Mirrors `ggml_metal_event::value` at
-    /// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:941`.
+    /// Monotonic shared-event value (reference-implementation pattern).
     /// [`Self::fence_stage`] post-increments (signal = current+1, then
     /// store current+1); [`Self::reset_for_next_stage`] reads (wait =
     /// current). Starts at 0; bumps to 1 on first fence; CB N waits on
@@ -477,9 +476,8 @@ impl EncoderSession {
     /// [`metal::DeviceRef::new_shared_event`]
     /// (`/Users/robert/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/metal-0.33.0/src/device.rs:2063`).
     /// Subsequent calls reuse the same event — the monotonic
-    /// `event_value` carries the per-fence identity. This matches the
-    /// llama.cpp pattern at
-    /// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:944-958`.
+    /// `event_value` carries the per-fence identity (reference
+    /// shared-event pattern).
     ///
     /// # Label
     ///
@@ -524,8 +522,7 @@ impl EncoderSession {
         // residency-flush + cmd_buf.commit, all inside the inner
         // helper. This preserves F1 (encoder is ended exactly once per
         // CB), F2 (residency-flush still fires at the commit boundary),
-        // and matches llama.cpp's pattern at
-        // `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:944-950`.
+        // and matches the reference signal-fence pattern.
         let new_value = self.event_value + 1;
         let event_ref: &metal::SharedEventRef = self
             .event

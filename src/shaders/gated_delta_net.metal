@@ -15,13 +15,13 @@ using namespace metal;
 //   output[t]   = state' @ q[t]                                      // [D_v]
 //
 // IMPORTANT: alpha is applied to state BEFORE computing delta = v - state@k.
-// This matches llama.cpp build_delta_net_autoregressive (line 338-360):
-//   g = ggml_exp(g); s = s*g; sk = sum(s*k); d = v-sk; s = s + outer(beta*d, k)
+// The autoregressive recurrence order is:
+//   g = exp(g); s = s*g; sk = sum(s*k); d = v-sk; s = s + outer(beta*d, k)
 //
 // GQA broadcast: `num_v_heads` may exceed `num_k_heads`. This kernel uses
 // the **TILED** convention `k_head = v_head % n_k_heads` (NOT the block
-// convention `v_head / group_ratio`), matching llama.cpp's `ggml_repeat`
-// at `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:1695-1737` and Qwen3.6
+// convention `v_head / group_ratio`), matching a tiled tensor-repeat
+// expansion and Qwen3.6
 // GGUF's GQA layout. The chunk-pipeline kernels (`gated_delta_net_kkt`,
 // `gated_delta_net_recompute_wu`, `gated_delta_net_chunk`,
 // `gated_delta_net_chunk_o`) use the BLOCK convention to stay
@@ -103,8 +103,7 @@ kernel void gated_delta_net_f32(
     if (tid >= D_v) return;
 
     // GQA broadcast: map v_head to k_head using modulo (tiled), matching
-    // llama.cpp's fused Metal kernel (i01 = i21 % args.ne01) and the
-    // ggml_repeat_4d tiled expansion used in the non-fused path.
+    // the tiled tensor-repeat expansion used in the non-fused path.
     // NOT division (block-style), which would give a different ordering.
     const uint k_head = v_head % n_k_heads;
 
@@ -153,7 +152,7 @@ kernel void gated_delta_net_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Step 1: decay state — apply alpha to state_row BEFORE computing sk.
-        // This matches llama.cpp: s = s * exp(gate); sk = sum(s * k).
+        // Recurrence order: s = s * exp(gate); sk = sum(s * k).
         for (uint j = 0; j < D_k; ++j) {
             state_row[j] *= alpha;
         }

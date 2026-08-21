@@ -3,7 +3,7 @@
 //! at seq_len=2455 on M5 Max.
 //!
 //! Purpose: decompose the per-shape wall-clock of `kernel_mul_mm_*_tensor_f32`
-//! so we can tell whether the hf2q-vs-llama.cpp prefill gap lives in
+//! so we can tell whether hf2q's prefill gap to the peer engine lives in
 //! per-call kernel performance or in dispatch/scheduling overhead.
 //!
 //! Shapes derived from the Gemma 4 26B A4B DWQ GGUF metadata:

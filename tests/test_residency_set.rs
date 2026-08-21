@@ -12,10 +12,10 @@ use mlx_native::{
 // RESIDENCY=1 skips registration) PLUS the commit-count regression test
 // that fixes both prior variants' per-allocation commit storm.
 //
-// Design reference: llama.cpp ggml-metal-device.m:1378-1382 (batch
-// addAllocation in for-loop, commit ONCE) and lines 1397-1399 (free path
+// Design reference: peer Metal backend convention — batch
+// addAllocation in a for-loop, commit ONCE; the free path
 // uses removeAllAllocations + endResidency once for the entire buffer
-// set, NOT per-allocation).
+// set, NOT per-allocation.
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 

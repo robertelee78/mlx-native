@@ -1,13 +1,12 @@
 // dense_gemv_bf16.metal — Dense bf16 × f32 → f32 GEMV (matrix-vector multiply).
 //
-// Port of llama.cpp's `kernel_mul_mv_t_t_4` template instantiation for
+// Implements the `kernel_mul_mv_t_t_4` template-instantiation shape for
 // `bfloat, bfloat4, float, float4` (i.e. `kernel_mul_mv_bf16_f32_4`).
-// Reference: ggml/src/ggml-metal/ggml-metal.metal.
 //
 // Used when M == 1 (single-token decode) for linear projections.
 // For M > 1, use the GEMM tensor-core kernel (dense_mm_bf16_tensor.metal).
 //
-// Layout contract (identical to llama.cpp):
+// Layout contract:
 //   src0  [src0_batch, N, K]  bfloat, row-major  (weight matrix, transposed convention)
 //   src1  [src1_batch, M, K]  float,  row-major  (input vectors)
 //   dst   [src1_batch, M, N]  float,  row-major  (output vectors)
@@ -17,13 +16,10 @@
 //   - Each threadgroup handles NR0=2 output elements (weight rows) for one
 //     input row.
 //   - Each threadgroup has 32 × NSG threads (one simdgroup per "lane block").
-//     NSG = min(4, (K + 127) / 128) — empirically chosen by llama.cpp.
+//     NSG = min(4, (K + 127) / 128) — an empirically chosen split.
 //   - Each simdgroup computes a partial dot product of its K-slice and reduces
 //     via simd_sum, then stores to threadgroup memory for the final cross-group
 //     reduction.
-//
-// Derived from llama.cpp (https://github.com/ggml-org/llama.cpp), MIT licensed.
-// Copyright the llama.cpp Authors.  See LICENSE-MIT-llamacpp.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -58,13 +54,13 @@ struct DenseGemvBf16Params {
 // ---- Kernel ----------------------------------------------------------------
 //
 // Template parameters:
-//   NR0  = weight rows per threadgroup (2, matching llama.cpp default).
+//   NR0  = weight rows per threadgroup (2, the reference default).
 //   NSG  = simdgroups per threadgroup;  baked-in as a constant (4).
 //          Caller chooses 1..4 based on K; we compile NSG=4 and let the
 //          host limit the grid accordingly.  Unused simdgroups produce zero
 //          contributions that are harmlessly summed.
 //
-// llama.cpp uses a function_constant for NSG; we hard-code NSG=4 since we
+// Upstream uses a function_constant for NSG; we hard-code NSG=4 since we
 // only need to cover the M5 Max's large K dimensions (K ≥ 2048 always for
 // our model, so NSG = min(4, (K+127)/128) = 4 in all cases).
 
@@ -168,7 +164,7 @@ kernel void hf2q_dense_gemv_bf16_f32_4(
         }
     }
 
-    // ---- Threadgroup reduction (identical to llama.cpp helper_mv_reduce_and_write) ----
+    // ---- Threadgroup reduction (standard mv reduce-and-write pattern) ----
     //
     // Layout of threadgroup memory: [NR0][NW] floats = [2][32] floats = 256 bytes.
     threadgroup float * shmem_f32 = (threadgroup float *)shmem;

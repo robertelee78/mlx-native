@@ -1,7 +1,6 @@
 // dense_mm_f32_f32.metal — Dense f32×f32 → f32 tensor-API matmul.
 //
-// Port of llama.cpp's `kernel_mul_mm_f32_f32` template instantiation
-// (ggml/src/ggml-metal/ggml-metal.metal:10098):
+// Implements the `kernel_mul_mm_f32_f32` template-instantiation shape:
 //
 //   template [[host_name("kernel_mul_mm_f32_f32")]]
 //     kernel mul_mm_t kernel_mul_mm<
@@ -10,7 +9,7 @@
 //         float4x4, 1, dequantize_f32,
 //         float, float4x4, float, float2x4>;
 //
-// llama.cpp's f32_f32 specialization downcasts both A and B to half in
+// The reference f32_f32 specialization downcasts both A and B to half in
 // shared memory before the simdgroup MMA, then accumulates into float.
 // We instead keep the staged tiles as float for the tensor-API
 // matmul2d path — the M3+ Apple Silicon tensor-ops dispatch supports
@@ -34,10 +33,7 @@
 //
 // ne02 / r2 broadcast: matches BF16 sibling.  hf2q's ViT and GQA
 // code paths broadcast nkv KV heads across nh query heads via
-// r2 = nh / nkv (same contract as llama.cpp's ggml_mul_mat).
-//
-// Portions derived from llama.cpp (https://github.com/ggml-org/llama.cpp),
-// MIT licensed.  Copyright the llama.cpp Authors.  See LICENSE-MIT-llamacpp.
+// r2 = nh / nkv (the standard mul_mat broadcast contract).
 
 #include <metal_stdlib>
 #include <metal_tensor>

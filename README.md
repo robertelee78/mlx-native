@@ -15,7 +15,7 @@ mlx-native is the right tool when **all** of these hold:
 - You want **low Metal decode latency** and are willing to drive a kernel-dispatch API
 - You're fine assembling the forward pass yourself — there is no `Tensor` type, no `Module` system, no model zoo
 
-Reach for **[candle](https://github.com/huggingface/candle)** instead if you need autograd / training, multi-backend support (CUDA / CPU / WASM), Python bindings, ONNX import, a built-in model zoo, or a high-level tensor algebra surface. The two are complementary: candle is "PyTorch-shaped Rust ML framework," mlx-native is the Metal compute backend of a llama.cpp-shaped inference engine.
+Reach for **[candle](https://github.com/huggingface/candle)** instead if you need autograd / training, multi-backend support (CUDA / CPU / WASM), Python bindings, ONNX import, a built-in model zoo, or a high-level tensor algebra surface. The two are complementary: candle is "PyTorch-shaped Rust ML framework," mlx-native is the Metal compute backend of a GGUF-native inference engine.
 
 ### What we do that candle's Metal backend doesn't
 
@@ -140,7 +140,7 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 ## GPU operations
 
 ### Attention
-- `flash_attn_vec` — SIMD-vectorized decode-path SDPA (NWG-parallel, llama.cpp port)
+- `flash_attn_vec` — SIMD-vectorized decode-path SDPA (NWG-parallel)
 - `flash_attn_vec_tq` / `flash_attn_vec_tq_hb` — TurboQuant-quantized KV variants (Lloyd-Max + Hadamard)
 - `flash_attn_vec_hybrid` — F16-K + TQ-HB-V SDPA (memory savings without full KV quant cost)
 - `flash_attn_vec_peer_port_f16` (+ `_nwg32` NWG=32 variant with reduce dispatcher) — verbatim peer kernel port for F16 decode
@@ -150,7 +150,7 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
 
 ### Matrix multiplication
-- **GGUF formats**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS — mat-vec + mul_mm kernels where implemented (peer-parity with llama.cpp inference subset; tensor-core paths where implemented)
+- **GGUF formats**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS — mat-vec + mul_mm kernels where implemented (byte-parity with the reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented)
 - **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS (top_k>1 MoE mat-vec + tensor-mm where implemented)
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
 - **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`
@@ -298,7 +298,7 @@ This crate includes Metal kernels and dispatch code derived from:
 - [candle](https://github.com/huggingface/candle) (Apache-2.0) — see `LICENSE-APACHE-candle`
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) (MIT) — see `LICENSE-MIT-llamacpp`
 
-Per-file attribution headers identify which kernels are derived from which upstream.
+Derived-kernel provenance and peer comparisons are consolidated in `docs/peer-benchmarks.md`.
 
 ## License
 

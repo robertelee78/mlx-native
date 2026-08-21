@@ -4,7 +4,7 @@
 //! `mlx-native/src/shaders/quantized_matmul_id_mm.metal`. This is the
 //! batched matrix-matrix MoE kernel that unblocks hf2q-native prefill
 //! of IQ4_XS apex-i-quality GGUFs at m > 8 tokens (apex-i-quality
-//! files were previously serveable only via llama.cpp because hf2q's
+//! files were previously serveable only via the peer engine because hf2q's
 //! own prefill errored out when the dispatcher hit IQ4_XS).
 //!
 //! mv_id (the decode-path single-token-per-call variant) is already

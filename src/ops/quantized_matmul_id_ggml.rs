@@ -91,8 +91,8 @@ impl GgmlType {
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_id_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mv_id_q3_K_f32",
-            // ADR-013 P7 — Q4_K mv_id ported from llama.cpp
-            // (ggml-metal.metal:10349) for dwq46/dwq48 MoE expert weights.
+            // ADR-013 P7 — Q4_K mv_id peer-pattern kernel for
+            // dwq46/dwq48 MoE expert weights.
             GgmlType::Q4_K => "kernel_mul_mv_id_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mv_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mv_id_q6_K_f32",
@@ -107,7 +107,7 @@ impl GgmlType {
     }
 
     /// Metal kernel function name for the mat-mat `_id` variant (ADR-011
-    /// Phase 3 Wave P3a port of llama.cpp's `kernel_mul_mm_id_<q>_f32`).
+    /// Phase 3 Wave P3a peer port of `kernel_mul_mm_id_<q>_f32`).
     fn id_mm_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
@@ -117,8 +117,8 @@ impl GgmlType {
             // ADR-022 Phase 2 — Q5_K mm_id ported.
             GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_f32",
             GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32",
-            // ADR-013 P16 — Q4_K mm_id ported (port of llama.cpp
-            // `kernel_mul_mm_id_q4_K_f32` at ggml-metal.metal:10169).
+            // ADR-013 P16 — Q4_K mm_id peer port of
+            // `kernel_mul_mm_id_q4_K_f32`.
             GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32",
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
@@ -149,7 +149,8 @@ impl GgmlType {
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
             // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
-            // SHIPPED 2026-05-22 to close the prefill perf gap vs llama.cpp.
+            // SHIPPED 2026-05-22 to close the prefill perf gap vs the
+            // reference implementation.
             GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32",
         }
     }
@@ -976,10 +977,10 @@ fn quantized_matmul_id_ggml_pooled_impl(
 }
 
 /// The n_tokens threshold at which `quantized_matmul_id_ggml` switches
-/// from the mv_id kernel to the mm_id kernel.  Matches llama.cpp's
-/// `ne11_mm_min = 8` (ggml-metal-ops.cpp:2046).
-// ADR-013 P17 — bumped 8 → 32 to match llama.cpp's `ne21_mm_id_min = 32`
-// in `ggml-metal-ops.cpp:2312`. Below 32 tokens, mv_id is faster than mm_id
+/// from the mv_id kernel to the mm_id kernel.  Matches the reference
+/// `ne11_mm_min = 8`.
+// ADR-013 P17 — bumped 8 → 32 to match the reference `ne21_mm_id_min = 32`.
+// Below 32 tokens, mv_id is faster than mm_id
 // (the mm tile-reuse setup overhead doesn't amortize at small n_tokens).
 pub const MM_ID_ROUTING_THRESHOLD: u32 = 32;
 
@@ -1031,7 +1032,7 @@ fn dispatch_id_mv(
     // Opt out with `HF2Q_Q6K_ID_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_id_nr2 = matches!(params.ggml_type, GgmlType::Q6_K) && routing.expert_q6k_mv_nr2;
     // ADR-029 — nr0=2 nsg=4 variant for q8_0 _id mat-vec.
-    // Matches peer's N_R0_Q8_0=2 + N_SG_Q8_0=4 in ggml-metal-impl.h:27,40.
+    // Matches peer's N_R0_Q8_0=2 + N_SG_Q8_0=4.
     // gemma4 APEX-Q5_K_M MoE down_exps is Q8_0 → 30 dispatches/decode-tok
     // on this path.  Opt-in via `HF2Q_Q8_0_ID_MV_NR2=1`; default-off
     // until coherence + bench validation. Cached via AtomicI8.
@@ -1062,7 +1063,7 @@ fn dispatch_id_mv(
 
     let (nth0, nth1, align) = match params.ggml_type {
         // Q4_0/Q8_0: historical (8, 8) layout = 64 threads = 2 simdgroups
-        // of 32.  Tested 2026-04-26 against llama.cpp's (32, 2) layout —
+        // of 32.  Tested 2026-04-26 against the reference (32, 2) layout —
         // (32, 2) gave a 1.8% short-bench improvement on dwq46 but a
         // 2.0% REGRESSION on the 5-cold-run 256-token decode bench
         // (median 108.0 vs 110.2 t/s).  Likely cache/scheduling
@@ -1071,9 +1072,9 @@ fn dispatch_id_mv(
         // Max.  6th confirmed M5 Max static-evidence kernel hypothesis
         // falsified — Metal compiler/scheduler optimizes both layouts
         // similarly, with workload-specific edges that don't match
-        // llama.cpp's tuning.
+        // the reference tuning.
         // ADR-022: Q5_1 and IQ4_NL are 32-element legacy formats; share
-        // the (8, 8) layout with Q4_0 / Q8_0. Confirmed against llama.cpp's
+        // the (8, 8) layout with Q4_0 / Q8_0. Confirmed against the reference
         // dispatch_id_mv launch geometry for `kernel_mul_mv_id_q5_1_f32`
         // and `kernel_mul_mv_id_iq4_nl_f32` (both NWG=2, NSIMDGROUP=2,
         // ngroups along K = nb/4 → 8 thread blocks of 8 rows each).
@@ -1115,8 +1116,8 @@ fn dispatch_id_mv(
     let n = params.n as usize;
     let m = total_rows;
 
-    // Dispatch routing dim in Y, NOT Z (despite llama.cpp's mul_mv_id using
-    // ne123 in z at ggml-metal-ops.cpp:2452).  Tested 2026-04-26: switching
+    // Dispatch routing dim in Y, NOT Z (despite the reference mul_mv_id
+    // routing in z).  Tested 2026-04-26: switching
     // to z-routing on M5 Max regressed dwq46 256-token decode from 112 t/s
     // to 90.9 t/s (-19%).  Apple GPU's threadgroup scheduler distributes
     // this dispatch shape better via y than z — 7th confirmed static-
@@ -1733,7 +1734,7 @@ fn div_ceil(a: usize, b: usize) -> usize {
 // ============================================================================
 // ADR-011 Phase 3 Wave P3a: `_id` matrix-matrix (mm) path.
 //
-// Ports llama.cpp's `kernel_mul_mm_id_map0_ne20_<N>` + `kernel_mul_mm_id_<q>_f32`
+// Peer port of the `kernel_mul_mm_id_map0_ne20_<N>` + `kernel_mul_mm_id_<q>_f32`
 // two-stage dispatch.  Used for MoE projections at prefill — instead of
 // re-reading each expert's weight blocks once per routed (token, slot) pair,
 // the mm kernel stages a 64x32 expert weight tile into threadgroup shared
@@ -2117,8 +2118,6 @@ fn dispatch_id_mm_with_layout(
         // Memory barrier: the mm kernel reads htpe + hids, map0 wrote them.
         // Without this, Metal's concurrent-dispatch compute encoder lets the
         // two dispatches overlap — mm would read zeros (all-expert early-exit).
-        // llama.cpp does the same via `ggml_metal_op_concurrency_reset`
-        // (ggml-metal-ops.cpp:2353).
         encoder.memory_barrier();
     }
 
@@ -2156,8 +2155,8 @@ fn dispatch_id_mm_with_layout(
     // The normal input layout is `[n_tokens, K]`: nb11=0 shares one input
     // row across every expert slot and nb12=K*4 advances by token. Slotted
     // MoE down inputs are `[n_tokens, top_k, K]`: nb11=K*4 advances by slot
-    // and nb12=top_k*K*4 advances by token. The latter matches llama.cpp's
-    // upstream MUL_MAT_ID addressing without forcing callers to flatten
+    // and nb12=top_k*K*4 advances by token. The latter matches the
+    // reference MUL_MAT_ID addressing without forcing callers to flatten
     // top_k into the token count.
     let mm_params = GgmlIdMmMmGpuParams {
         ne00: params.k as i32,

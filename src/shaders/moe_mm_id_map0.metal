@@ -4,9 +4,7 @@ using namespace metal;
 // --------------------------------------------------------------------------
 // moe_mm_id_map0 — MoE token-to-expert sort pre-pass for two-pass mm_id
 //
-// Adapted from llama.cpp's `kernel_mul_mm_id_map0` at
-// /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9724-9788. This is
-// iter A of the ADR-033 §Pi multi-iter arc to port llama.cpp's two-pass
+// This is iter A of the ADR-033 §Pi multi-iter arc for the two-pass
 // MoE Q4_0 mm_id kernel. See
 // project_adr033_pi_next_iter_arc_moe_q4_0_kernel_port_2026_05_23.md.
 //
@@ -35,14 +33,13 @@ using namespace metal;
 //     loading top-k arrays into shmem for parallel scan.
 //   - Templated on ne20 (n_expert_used) so the inner unroll loops are
 //     constant-bounded — specialized variants registered for ne20 ∈
-//     {1, 2, 4, 5, 6, 8, 10, 16, 22} matching llama.cpp's set.
+//     {1, 2, 4, 5, 6, 8, 10, 16, 22}.
 // --------------------------------------------------------------------------
 
 struct MoeMmIdMap0Params {
-    // Layout mirrors ggml_metal_kargs_mul_mm_id_map0 at
-    // ggml-metal-impl.h:496-505 — keep field order identical so the Rust
-    // dispatch wrapper can transcribe arg values directly from a
-    // llama.cpp-style call site if needed for debugging parity.
+    // Keep field order identical to the reference map0 kargs layout so
+    // the Rust dispatch wrapper can transcribe arg values directly from
+    // a reference call site if needed for debugging parity.
     int32_t  ne02;    // n_experts_total
     int32_t  ne10;    // unused here; carried for layout parity
     int32_t  ne11;    // n_expert_used (broadcast — equals ne20 for top-k)
@@ -121,9 +118,7 @@ static void moe_mm_id_map0_impl(
 }
 
 // Specializations. ne20 = n_expert_used for the routing decision.
-// Qwen3.6 35B-A3B uses ne20=8. Set matches llama.cpp's
-// kernel_mul_mm_id_map0_ne20_{1,2,4,5,6,8,10,16,22} family at
-// ggml-metal.metal:9780-9788.
+// Qwen3.6 35B-A3B uses ne20=8.
 
 #define MOE_MM_ID_MAP0_VARIANT(NE) \
     [[host_name("moe_mm_id_map0_ne20_" #NE)]] \

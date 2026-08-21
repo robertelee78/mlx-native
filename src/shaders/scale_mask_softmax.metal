@@ -28,7 +28,7 @@
 //     params so we can derive q = row_idx % seq_q for the mask index.
 //
 // Used for the non-FA prefill attention path (HF2Q_NO_FA=1).  Modelled
-// on llama.cpp's kernel_soft_max_f32 (ggml-metal.metal:1855-1960),
+// on the reference simdgroup-reduction softmax kernel,
 // simplified for our specific case (no ALiBi, bf16 mask, fixed scale).
 
 #include <metal_stdlib>
@@ -44,7 +44,7 @@ struct ScaleMaskSoftmaxParams {
     uint  _pad;
 };
 
-// D.3 — llama.cpp-style simdgroup-reduction softmax.  Uses hardware
+// D.3 — simdgroup-reduction softmax.  Uses hardware
 // simd_max / simd_sum (1-cycle intra-simdgroup reductions) instead of
 // the tree-reduce + threadgroup barriers we had before.  When the
 // threadgroup has more than one simdgroup (tg_size > 32), a secondary
@@ -54,7 +54,7 @@ struct ScaleMaskSoftmaxParams {
 // tg_size=256 (8 simdgroups, cols=2455 attention row), this cuts the
 // softmax kernel time by ~3x per row.
 //
-// Structure matches llama.cpp's kernel_soft_max (ggml-metal.metal:1855).
+// Structure follows the reference softmax kernel.
 
 kernel void scale_mask_softmax_f32(
     device const float  *input   [[buffer(0)]],
@@ -129,8 +129,8 @@ kernel void scale_mask_softmax_f32(
         local_sum += e;
     }
 
-    // Barrier fixes a sporadic reduction ordering bug on Apple GPUs —
-    // matches llama.cpp's comment at ggml-metal.metal:1925.
+    // Barrier fixes a sporadic reduction ordering bug on Apple GPUs
+    // (a fix the reference implementation also carries).
     threadgroup_barrier(mem_flags::mem_none);
 
     float sum = simd_sum(local_sum);
@@ -161,7 +161,7 @@ kernel void scale_mask_softmax_f32(
 
 // ===========================================================================
 // ADR-029 iter-93 H71: float4-vectorized scale_mask_softmax_f32 — peer parity
-// with kernel_soft_max_f32_4 (ggml-metal.metal:1961).
+// with the peer's float4 softmax variant.
 //
 // Mirrors the scalar kernel above but reads/writes input/output as
 // float4 (4 elements per loop iteration). Mask remains bfloat: read

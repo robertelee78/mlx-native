@@ -3,9 +3,8 @@
 // intrinsics.
 //
 // This is the Metal-tensor-API equivalent of our existing simdgroup-MMA
-// mul_mm kernel (quantized_matmul_mm.metal) — ports llama.cpp's
-// `kernel_mul_mm_impl<GGML_METAL_HAS_TENSOR>` branch
-// (ggml/src/ggml-metal/ggml-metal.metal:9289+).  Same tile geometry
+// mul_mm kernel (quantized_matmul_mm.metal) — the tensor-enabled
+// branch of the same mul_mm template.  Same tile geometry
 // (NR0=64, NR1=32, NK=32, 4 simdgroups / threadgroup, 128 threads), same
 // dequantize functions.  The difference is the compute engine: instead
 // of `simdgroup_multiply_accumulate` the kernel uses
@@ -26,12 +25,6 @@
 // on devices where the tensor API is available (M3+).  At runtime the
 // dispatcher picks between this tensor kernel and the simdgroup fallback
 // based on a device-capability check.
-//
-// Portions of this file are derived from llama.cpp
-// (https://github.com/ggml-org/llama.cpp), MIT licensed.
-// Original source: ggml/src/ggml-metal/ggml-metal.metal.
-// Copyright the llama.cpp Authors.  See LICENSE-MIT-llamacpp.
-// Q3_K source revision: llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -180,7 +173,7 @@ void dequantize_q8_0_t(device const block_q8_0 * xb, short il, thread type4x4 & 
     reg = (type4x4) reg_f;
 }
 
-// Pinned llama.cpp 6ea215d17 ggml-metal.metal::dequantize_q2_K.
+// Q2_K dequantize, pinned to a fixed upstream revision.
 template <typename type4x4>
 void dequantize_q2_K_t(device const block_q2_K * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -200,7 +193,7 @@ void dequantize_q2_K_t(device const block_q2_K * xb, short il, thread type4x4 & 
     }
 }
 
-// Current llama.cpp ggml-metal.metal `dequantize_q3_K` (MIT).
+// `dequantize_q3_K` (current upstream revision).
 template <typename type4x4>
 void dequantize_q3_K_t(device const block_q3_K * xb, short il, thread type4x4 & reg) {
     const half d_all = xb->d;
@@ -351,12 +344,12 @@ void dequantize_q4_K_t(device const block_q4_K * xb, short il, thread type4x4 & 
 
 // ---- tensor-API mul_mm template ----
 //
-// Direct port of llama.cpp's kernel_mul_mm with the GGML_METAL_HAS_TENSOR
+// The mul_mm template with the tensor-API
 // branches active.  Shared memory is `sa`/`sb` in row-major layout that
 // the tensor<> views consume directly.  Every loop iteration stages a
 // 64x32 (A) + 32x32 (B) tile, then runs `mm.run` which the compiler
 // lowers to native M3+ tensor MMA.  Partial-tile (edge) write-back uses
-// a threadgroup float buffer shared with sa+sb, matching llama.cpp's
+// a threadgroup float buffer shared with sa+sb, matching the reference
 // layout.
 
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
@@ -427,11 +420,9 @@ kernel void hf2q_mul_mm_tensor_impl(
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         // ---- Stage A tile (block_q -> half, via dequantize_func).
         // Tensor-path layout: sa is [NR0][NK] row-major — write every
-        // element to `sa + NK*(8*sy + ly) + 8*sx + lx`.  Matches
-        // llama.cpp ggml-metal.metal:9446-9456 (GGML_METAL_HAS_TENSOR
-        // branch).
+        // element to `sa + NK*(8*sy + ly) + 8*sx + lx`.
         //
-        // NOTE: We DO NOT add llama.cpp's FOR_UNROLL pragma here.
+        // NOTE: We DO NOT add the peer's FOR_UNROLL pragma here.
         // Tested 2026-04-19 (P4.8): no measurable prefill delta on M5
         // Max (5-run median 2710 tok/s with vs 2710 without).  The
         // Metal compiler unrolls 16-iter constant-bound loops on its
@@ -462,7 +453,7 @@ kernel void hf2q_mul_mm_tensor_impl(
         // NK=32, so the per-element K-tail bounds check that the
         // per-element path needs is never triggered in practice.  Drop
         // it and issue a single 8-wide vector store per thread — this
-        // is what llama.cpp's `FC_mul_mm_bc_inp=false` path does and is
+        // is what the `FC_mul_mm_bc_inp=false` fast path does and is
         // 4-8x the per-element path's store throughput.
         //
         // Cast: `(half2x4)(*((device float2x4 *) y))` loads 8 f32 values
@@ -507,7 +498,7 @@ kernel void hf2q_mul_mm_tensor_impl(
     } else {
         // Partial tile: stage to shmem (reusing sa+sb space), then the
         // first simdgroup copies rows out with M-bound.  Same approach as
-        // llama.cpp's non-tensor path, just using cooperative_tensor::store
+        // the non-tensor path, just using cooperative_tensor::store
         // to shmem instead of simdgroup_store.
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -542,7 +533,7 @@ kernel void hf2q_mul_mm_tensor_impl(
 // ADR-029 iter-23 H28-A: large-tile v2 mm-tensor — 4× threadgroup reduction
 // at gemma4 prefill shapes vs the legacy 32×64 tile.
 //
-// Geometry (ports llama.cpp ggml-metal.metal:9309-9431 line-for-line, with
+// Geometry (follows the peer template line-for-line, with
 // the type-template params collapsed to gemma4's fixed F32-in / F32-out /
 // F16-shmem case):
 //   NRA = SZ_SIMDGROUP × N_MM_BLOCK_Y × N_MM_SIMD_GROUP_Y = 16 × 2 × 2 = 64

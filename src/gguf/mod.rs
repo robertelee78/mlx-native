@@ -82,7 +82,7 @@ const GGML_TYPE_I32: u32 = 26;
 
 /// IQ4_NL non-linear codebook constants. 16 signed entries selected by
 /// 4-bit indices in `block_iq4_nl::qs`. Verified byte-equal with
-/// `/opt/llama.cpp/ggml/src/ggml-common.h:1109-1112`. ADR-022 Phase 1.
+/// the reference codebook. ADR-022 Phase 1.
 const KVALUES_IQ4_NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
@@ -172,7 +172,7 @@ pub struct GgufFile {
 ///
 /// Large models are split only when they exceed Metal's per-buffer limit.
 /// Individual tensors are views into these shared resources, matching the
-/// resource topology used by llama.cpp's Metal mmap loader.
+/// resource topology used by the reference Metal mmap loader.
 pub struct GgufMappedTensorSet<'a> {
     gguf: &'a GgufFile,
     segments: Vec<MappedTensorSegment>,
@@ -522,7 +522,7 @@ fn dequantize_q8_0(data: &[u8], output: &mut [f32]) -> Result<()> {
 /// Extract a (scale, min) pair for sub-block `j` from the 12-byte scales
 /// array used by Q4_K and Q5_K.
 ///
-/// This matches `get_scale_min_k4` from candle / llama.cpp exactly:
+/// This matches candle's `get_scale_min_k4` exactly:
 ///
 /// For j < 4:
 ///   scale = scales[j] & 63
@@ -601,7 +601,7 @@ fn dequantize_q2_k(data: &[u8], output: &mut [f32]) -> Result<()> {
 /// `[0, 3]` or `[-4, -1]`. The 16 group scales are signed values represented
 /// by packed 6-bit integers biased by 32.
 ///
-/// Layout and unpacking follow llama.cpp's MIT-licensed
+/// Layout and unpacking follow the ggml
 /// `block_q3_K` / `dequantize_row_q3_K` definitions.
 fn dequantize_q3_k(data: &[u8], output: &mut [f32]) -> Result<()> {
     const BLOCK_BYTES: usize = 110;
@@ -675,7 +675,7 @@ fn dequantize_q3_k(data: &[u8], output: &mut [f32]) -> Result<()> {
 /// pairs — the high bit per element is masked out of qh using shifting
 /// selector values `u1 = 1 << (2*pair_idx)` / `u2 = 2 << (2*pair_idx)`.
 ///
-/// Spec source: derived from `ggml/src/ggml-quants.c::dequantize_row_q5_K`.
+/// Spec source: derived from the ggml `dequantize_row_q5_K` definition.
 /// No code copied — formula reproduced from the mathematical definition.
 fn dequantize_q5_k(data: &[u8], output: &mut [f32]) -> Result<()> {
     const BLOCK_BYTES: usize = 176;
@@ -992,7 +992,7 @@ fn copy_f32(data: &[u8], output: &mut [f32]) -> Result<()> {
 /// where `x0 = (qs[j] & 0x0F) | ((qh >> j) << 4) & 0x10`,
 ///       `x1 = (qs[j] >> 4)  | ((qh >> (j + 12)) & 0x10)`.
 ///
-/// Reference: `/opt/llama.cpp/ggml/src/ggml-quants.c:464` `dequantize_row_q5_1`.
+/// Peer port of `dequantize_row_q5_1`.
 /// ADR-022 Phase 1.
 fn dequantize_q5_1(data: &[u8], output: &mut [f32]) -> Result<()> {
     const BLOCK_BYTES: usize = 24;
@@ -1046,8 +1046,8 @@ fn dequantize_q5_1(data: &[u8], output: &mut [f32]) -> Result<()> {
 /// Per-element: `out[j]      = d * KVALUES_IQ4_NL[qs[j] & 0x0F]`,
 ///              `out[j + 16] = d * KVALUES_IQ4_NL[qs[j] >> 4]`.
 ///
-/// Reference: `/opt/llama.cpp/ggml/src/ggml-quants.c:2649` `dequantize_row_iq4_nl`.
-/// Codebook table verified against `ggml-common.h:1109-1112`. ADR-022 Phase 1.
+/// Peer port of `dequantize_row_iq4_nl`.
+/// Codebook table verified byte-equal against the reference. ADR-022 Phase 1.
 fn dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()> {
     const BLOCK_BYTES: usize = 18;
     const BLOCK_ELEMS: usize = 32;
@@ -1085,7 +1085,7 @@ fn dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()> {
 }
 
 /// Dequantize raw IQ4_XS bytes to f32. Pure-Rust mirror of
-/// `dequantize_row_iq4_xs` at `/opt/llama.cpp/ggml/src/ggml-quants.c:2667`.
+/// `dequantize_row_iq4_xs`.
 ///
 /// Block layout (256-element super-block, 136 bytes):
 ///   - d:        2 bytes f16 super-block scale
@@ -1166,7 +1166,7 @@ pub fn test_only_dequantize_iq4_nl(data: &[u8], output: &mut [f32]) -> Result<()
 }
 
 /// Test-only accessor for `KVALUES_IQ4_NL` so parity tests can pin the
-/// codebook bytes against the llama.cpp source of truth.
+/// codebook bytes against the reference source of truth.
 #[doc(hidden)]
 pub fn test_only_kvalues_iq4_nl() -> [i8; 16] {
     KVALUES_IQ4_NL

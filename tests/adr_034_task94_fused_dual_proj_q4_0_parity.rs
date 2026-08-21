@@ -40,7 +40,7 @@ fn pack_q4_0(values: &[f32]) -> Vec<u8> {
     assert!(values.len() % QK4_0 == 0);
     let mut bytes = Vec::with_capacity(values.len() / QK4_0 * 18);
     for block in values.chunks(QK4_0) {
-        // Find max abs * sign (llama.cpp uses sign of max-abs for d).
+        // Find max abs * sign (the canonical encoder uses sign of max-abs for d).
         let mut amax = 0.0f32;
         let mut max_val = 0.0f32;
         for &v in block {

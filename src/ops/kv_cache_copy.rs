@@ -284,7 +284,7 @@ pub fn dispatch_kv_cache_copy_f32(
 ///
 /// Copies ALL heads in one dispatch, casting float→half on write.
 /// This halves KV cache memory bandwidth for SDPA reads (bandwidth-bound
-/// at batch=1 decode). Reference: llama.cpp stores KV cache in F16.
+/// at batch=1 decode). The reference implementation stores KV cache in F16.
 ///
 /// Source layout: `[n_heads * head_dim]` flat F32 (one token, all heads).
 /// Cache layout: `[n_heads, capacity, head_dim]` head-major F16.

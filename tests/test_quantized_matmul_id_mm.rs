@@ -1,7 +1,7 @@
 //! Unit tests for the GGML block-format `_id` matrix-matrix (mm) quantized
 //! GPU kernels.
 //!
-//! ADR-011 Phase 3 Wave P3a port of llama.cpp's
+//! ADR-011 Phase 3 Wave P3a port of the reference
 //! `kernel_mul_mm_id_map0_ne20_<N>` + `kernel_mul_mm_id_<qtype>_f32`.
 //!
 //! Verification strategy: for a random MoE setup (weights, tokens, expert
@@ -389,8 +389,8 @@ fn run_mm_id_vs_mv_id_test(
 // This test caught a subtle bug during development: mlx-native's compute
 // encoder runs dispatches concurrently by default, so without a
 // `memory_barrier()` between map0 and mm_id the mm kernel read htpe as
-// all-zeros and early-exited every threadgroup.  llama.cpp emits the
-// same barrier via `ggml_metal_op_concurrency_reset`.
+// all-zeros and early-exited every threadgroup.  The peer engine emits
+// the same barrier at its concurrency-reset point.
 //
 // The test verifies (a) map0 produces the expected counts and routed-ids,
 // and (b) the full two-stage dispatch of `dispatch_id_mm_for_test` leaves
@@ -627,7 +627,7 @@ fn test_q4_0_mm_id_sparse_experts() {
 // shape (n_tokens=1, top_k=8). Establishes baseline for kernel-level
 // optimization A/B testing in iter-95+.
 //
-// Hypothesis: per iter-90, hf2q decode = 15.86 µs/dispatch, llama.cpp
+// Hypothesis: per iter-90, hf2q decode = 15.86 µs/dispatch, peer-engine
 // decode (FA=1, gemma APEX-Q5_K_M) = 11.22 µs/dispatch — 30% slower per
 // dispatch. Per-call instrumentation here measures Q6_K mv_id specifically
 // (the dominant gemma-MoE matmul kernel).

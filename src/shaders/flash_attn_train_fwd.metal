@@ -684,8 +684,8 @@ struct ExpSubOp {
   METAL_FUNC static constexpr T apply(T x, T y) { return fast::exp2(x - y); }
 };
 struct DivOp {
-  // Single surviving guard: fully-masked row → sum_score == 0 → output 0.
-  // Matches llama.cpp ggml-metal.metal:6358.
+  // Single surviving guard: fully-masked row → sum_score == 0 → output 0
+  // (reference-implementation convention).
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
     return (y == T(0)) ? T(0) : x / y;
@@ -847,8 +847,8 @@ template <
   AccumType max_score[kRowsPT];
   AccumType sum_score[kRowsPT] = {0};
 
-  // Finite-M sentinel: -FLT_MAX/2 so exp2(masked_score - M) = 0, not NaN.
-  // Matches llama.cpp ggml-metal.metal:5891; see flash_attn_prefill.metal preamble.
+  // Finite-M sentinel: -FLT_MAX/2 so exp2(masked_score - M) = 0, not NaN
+  // (reference-implementation convention); see flash_attn_prefill.metal preamble.
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
     max_score[i] = -FLT_MAX / AccumType(2);

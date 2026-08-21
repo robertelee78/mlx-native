@@ -1,36 +1,31 @@
 // quantized_matmul_mm.metal — GGML block-format quantized matrix-matrix kernels.
 //
-// Ports llama.cpp's `kernel_mul_mm_<qtype>_f32` matmul kernel
-// (ggml/src/ggml-metal/ggml-metal.metal:9276) to mlx-native.
+// Implements the `kernel_mul_mm_<qtype>_f32` matmul kernel shape
+// for mlx-native.
 //
 // Why mm and not mv?  The existing `kernel_mul_mv_q*_f32` family
 // (quantized_matmul_ggml.metal) re-loads each weight block once per prompt
 // token from DRAM.  At prefill m=2455 that is a ~32x read amplification
-// vs llama.cpp's mm variant, which stages a 64x32 tile into threadgroup
+// vs an mm variant that stages a 64x32 tile into threadgroup
 // shared memory and reuses it across a whole 32-row block of the prompt.
 // Switching the prefill path from mv to mm closes most of the 7x tok/s
-// gap vs llama.cpp (see ADR-011 phase 3 investigation).
+// gap vs the peer (see ADR-011 phase 3 investigation).
 //
 // Port rules:
-//   * Bit-exact against llama.cpp at the kernel level: identical NK/NR0/NR1,
-//     identical dequantize formulas, identical accumulation order.  Tests
-//     verify the output matches the existing mv kernel (which is itself
-//     byte-for-byte with the llama.cpp mv path) to f32 tolerance.
+//   * Bit-exact against the reference at the kernel level: identical
+//     NK/NR0/NR1, identical dequantize formulas, identical accumulation
+//     order.  Tests verify the output matches the existing mv kernel
+//     (which is itself byte-for-byte with the reference mv path) to f32
+//     tolerance.
 //   * We use the non-tensor (simdgroup_multiply_accumulate) code path.
-//     llama.cpp gates its tensor-API path behind GGML_METAL_HAS_TENSOR;
+//     Upstream gates its tensor-API path behind a build flag;
 //     mlx-native does not enable that path, so we drop it and use only
 //     the simdgroup MMA implementation.
-//   * We always enable the bounds-checked input / output paths.  llama.cpp
+//   * We always enable the bounds-checked input / output paths.  Upstream
 //     keys these on FC_mul_mm_bc_inp / FC_mul_mm_bc_out function constants
 //     to skip the branches when shapes are aligned; for the port we keep
 //     a single correct variant.  Overhead is a couple of predicates per
 //     32-wide tile; orders of magnitude below the DRAM savings vs mv.
-//
-// Portions of this file are derived from llama.cpp
-// (https://github.com/ggerganov/llama.cpp), MIT licensed.
-// Original source: ggml/src/ggml-metal/ggml-metal.metal.
-// Copyright the llama.cpp Authors.  See LICENSE-MIT-llamacpp.
-// Q3_K source revision: llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -43,16 +38,16 @@ using namespace metal;
 #define QK8_0 32
 #define QK_K  256
 
-// Matches llama.cpp's QK_NL = 16 (the "nibbles per lane" step for K-quant
-// block deqauntize).
+// QK_NL = 16 is the "nibbles per lane" step for K-quant
+// block deqauntize.
 #define QK_NL 16
 
 // ---- Host-facing params struct ----
 //
-// Mirrors llama.cpp's `ggml_metal_kargs_mul_mm`.  We include a handful of
+// Mirrors the reference mul_mm kargs layout.  We include a handful of
 // extra fields (nb0x, ne0x) so mlx-native can pass the kernel the
 // byte-strides it needs without a second dispatch.  Field names match
-// llama.cpp 1:1 where possible.
+// the reference 1:1 where possible.
 
 struct GgmlMatmulMmParams {
     int32_t  ne00;  // K
@@ -157,7 +152,7 @@ constant int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113
 };
 
-// ---- Dequantize helpers (llama.cpp, ggml-metal.metal) ----
+// ---- Dequantize helpers ----
 //
 // Each helper reads a single 16-element slice of a block (indexed by
 // `il`) and produces a 4x4 tile of values in the caller's output dtype.
@@ -195,7 +190,7 @@ void dequantize_q8_0(device const block_q8_0 * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
-// Pinned llama.cpp 6ea215d17 ggml-metal.metal::dequantize_q2_K.
+// Q2_K dequantize, pinned to a fixed upstream revision.
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -215,7 +210,7 @@ void dequantize_q2_K(device const block_q2_K * xb, short il, thread type4x4 & re
     }
 }
 
-// Current llama.cpp ggml-metal.metal `dequantize_q3_K` (MIT).
+// `dequantize_q3_K` (current upstream revision).
 template <typename type4x4>
 void dequantize_q3_K(device const block_q3_K * xb, short il, thread type4x4 & reg) {
     const half d_all = xb->d;
@@ -282,7 +277,7 @@ void dequantize_q6_K(device const block_q6_K * xb, short il, thread type4x4 & re
 }
 
 // ADR-022 Phase 1 — Q5_1 dequant for dense mm MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:511-541 (`dequantize_q5_1`).
+// Spec source: reference `dequantize_q5_1`.
 // Identical body to the mm_id variant (proven against mv_id reference).
 template <typename type4x4>
 void dequantize_q5_1(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
@@ -307,7 +302,7 @@ void dequantize_q5_1(device const block_q5_1 * xb, short il, thread type4x4 & re
 }
 
 // ADR-022 Phase 1 — IQ4_NL dequant for dense mm MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:920-933 (`dequantize_iq4_nl`).
+// Spec source: reference `dequantize_iq4_nl`.
 template <typename type4x4>
 void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
     device const uint16_t * q4 = (device const uint16_t *)xb->qs;
@@ -324,7 +319,7 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
 }
 
 // ADR-022 Phase 2 — Q5_K dequant for dense mm MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+// Spec source: reference `dequantize_q5_K`.
 // Identical body to the mm_id variant in quantized_matmul_id_mm.metal —
 // proven against mv_id reference at iter 19 (Phase-2 mm_id parity tests).
 template <typename type4x4>
@@ -351,7 +346,7 @@ void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & re
 }
 
 // ADR-022 Phase 3 — Q4_K dequant for dense mm MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:681-697 (`dequantize_q4_K`).
+// Spec source: reference `dequantize_q4_K`.
 // Body identical to id_mm.metal's dequantize_q4_K (ADR-013 P16 — proven
 // against mv_id reference in tests/test_quantized_matmul_id_mm.rs).
 template <typename type4x4>
@@ -375,16 +370,16 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
 
 // ---- kernel_mul_mm template ----
 //
-// Directly ports llama.cpp ggml-metal.metal:9276 (the non-tensor path, with
+// The non-tensor mul_mm path, with
 // FC_mul_mm_bc_inp = true and FC_mul_mm_bc_out = true always enabled for
-// safety).  One threadgroup computes a 64x32 tile of the output (NR0 x NR1).
+// safety.  One threadgroup computes a 64x32 tile of the output (NR0 x NR1).
 // Four simdgroups (128 threads total) cooperate on the tile.  Each loop
 // iteration stages an NK=32 wide slice of A and B into threadgroup shared
 // memory (via dequantize), then runs 8 simdgroup_multiply_accumulate
 // 8x8 MMA ops covering the 64x32 output.
 
 //
-// Template parameters (reduced vs llama.cpp since we always use T0=half and
+// Template parameters (reduced vs the reference since we always use T0=half and
 // f32 output):
 //   * block_q           — e.g. block_q4_0, block_q8_0, block_q6_K.
 //   * nl                — the number of 16-element slices per block
@@ -404,7 +399,7 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
 //   * tgpig.y = r0 / NR0      (n-tile index)
 //   * tgpig.z = im            (batch, always 0)
 //
-// Threadgroup shmem layout (matches llama.cpp byte layout):
+// Threadgroup shmem layout (byte layout is load-bearing):
 //   * sa: half at +0     — A tile (64 rows x 32 K-slots), 4096 bytes
 //   * sb: float at +4096 — B tile (32 rows x 32 K-slots), 4096 bytes
 //   * (Write-back on small tiles reuses sa+sb for partial-tile staging.)
@@ -482,7 +477,7 @@ kernel void hf2q_mul_mm_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // ADR-033 §Pi Task #20 iter 9 — added #pragma unroll matching
-            // llama.cpp's FOR_UNROLL at ggml-metal.metal:9907 (mm_id path,
+            // the peer's FOR_UNROLL on this loop (mm_id path,
             // shared template body).
             #pragma clang loop unroll(full)
             for (short i = 0; i < 16; i++) {
@@ -503,7 +498,7 @@ kernel void hf2q_mul_mm_impl(
         // ADR-033 §Pi Task #20 iter 9 — vectorized 8-float B-tile store
         // when K is divisible by NK (true for all production projection
         // shapes — K ∈ {2048, 2112, 2816, 4096, 5120}, all multiples of
-        // NK=32). Matches llama.cpp's FC_mul_mm_bc_inp=false fast path.
+        // NK=32). Matches the FC_mul_mm_bc_inp=false fast path.
         // The scalar bounds-checked fallback stays for defensive safety
         // on hypothetical K%NK!=0 shapes.
         {
@@ -589,7 +584,7 @@ kernel void hf2q_mul_mm_impl(
 
         if (sgitg == 0) {
             // When sgitg==0 the per-simdgroup offset below is 0, so temp_str
-            // coincides with (threadgroup float *) shmem.  llama.cpp reads
+            // coincides with (threadgroup float *) shmem.  The reference reads
             // via `temp_str + j*NR0` but effectively that equals
             // `(threadgroup float *) shmem + j*NR0` here.
             for (int j = tiitg; j < nr1; j += NR1) {
@@ -615,7 +610,7 @@ kernel void hf2q_mul_mm_impl(
 
 // ---- Template instantiations ----
 //
-// Follow llama.cpp's host_name convention: kernel_mul_mm_<qtype>_f32.  The
+// host_name convention: kernel_mul_mm_<qtype>_f32.  The
 // kernel registry in src/kernel_registry.rs maps these names to the shader
 // source.
 

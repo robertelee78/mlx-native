@@ -466,8 +466,8 @@ kernel void flash_attn_vec_tq_hb_impl(
 
     // Main loop over KV cache in chunks of C=32.
     // ADR-028 iter-127b: NSG-axis K-stride. Each simdgroup `sgitg` within
-    // workgroup `iwg` strides through K with step `NWG*NSG`. Matches
-    // llama.cpp's flash_attn_vec_ext at ggml-metal.metal:6782.
+    // workgroup `iwg` strides through K with step `NWG*NSG`, matching the
+    // peer's vec-attention stride pattern.
     // At NSG=1 (sgitg always 0): `for (ic0 = iwg; ; ic0 += NWG)` — identical
     // to pre-iter-127 behavior.
     for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
@@ -649,7 +649,7 @@ kernel void flash_attn_vec_tq_hb_impl(
     // Existing per-WG write below uses the merged values.
     //
     // NSG_MAX=4 to bound the per-thread `ms_arr` static array (matches
-    // llama.cpp's policy `nsg ∈ {1, 2, 4}` capped at 4).
+    // the reference policy `nsg ∈ {1, 2, 4}` capped at 4).
     if (NSG > 1u && sgitg == 0) {
         constexpr ushort NSG_MAX = 4;
         float ms_arr[NSG_MAX];

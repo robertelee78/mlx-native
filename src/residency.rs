@@ -45,8 +45,7 @@ enum ResidencySetInner {
         ///
         /// This converts the per-allocation commit storm
         /// (~880 commits/token in iter8d/8e) into one
-        /// commit per CB-submission boundary — mirrors llama.cpp's
-        /// `ggml-metal-device.m:1378-1382` (batch addAllocation in loop,
+        /// commit per CB-submission boundary (batch addAllocation in loop,
         /// commit ONCE at the end of the batch).
         pending: AtomicBool,
         heartbeat_ticks: AtomicUsize,
@@ -174,9 +173,8 @@ impl ResidencySet {
     /// Calls Metal's `addAllocation:` but does NOT commit. The caller is
     /// expected to invoke [`flush_pending`](Self::flush_pending) at the next
     /// CB-submission boundary (or [`commit`](Self::commit) explicitly for a
-    /// batched-add path like `MlxBufferPool::alloc_batch`). This matches
-    /// llama.cpp's `ggml-metal-device.m:1378-1382` pattern: addAllocation
-    /// in a loop, commit ONCE.
+    /// batched-add path like `MlxBufferPool::alloc_batch`). Pattern:
+    /// addAllocation in a loop, commit ONCE.
     pub(crate) fn add_allocation(&self, buffer: &MTLBufferRef) {
         self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, addAllocation: buffer];
@@ -229,9 +227,9 @@ impl ResidencySet {
     ///
     /// Hooked at every `CommandEncoder::commit*` boundary so the
     /// per-allocation commit storm collapses to at most one
-    /// `[set commit]` per CB submission. Mirrors the lifetime of
-    /// llama.cpp's `ggml_metal_buffer_rset_init` which batches addAllocation
-    /// in `ggml-metal-device.m:1378-1382` and commits exactly once.
+    /// `[set commit]` per CB submission. Mirrors the reference
+    /// residency-set init lifetime, which batches addAllocation
+    /// and commits exactly once.
     ///
     /// Returns whether a commit was actually issued (useful for tests).
     pub(crate) fn flush_pending(&self) -> bool {
@@ -278,7 +276,7 @@ impl ResidencySet {
 }
 
 const RESIDENCY_HEARTBEAT_INTERVAL_MS: u64 = 5;
-// Match the pinned llama.cpp Metal residency lifecycle: refresh active sets
+// Match the pinned reference Metal residency lifecycle: refresh active sets
 // every 5 ms for three minutes after GPU work. Zero disables the heartbeat.
 static RESIDENCY_HEARTBEAT_KEEP_ALIVE_SECONDS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS")

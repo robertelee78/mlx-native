@@ -135,7 +135,8 @@ pub struct GatedDeltaNetChunkParams {
     pub k: u32,
     /// Per-head V dimension.
     pub v: u32,
-    /// Chunk size (BT). Recommended 64; matches FLA / llama.cpp.
+    /// Chunk size (BT). Recommended 64; matches FLA and the reference
+    /// implementation.
     pub bt: u32,
 }
 

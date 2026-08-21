@@ -11,8 +11,7 @@
 //!      known `d`, `dmin`, scales (encoded via the K_SCALE_SIZE 6-bit
 //!      pairing pattern shared with Q5_K), and qs nibbles.
 //!   2. Compute the CPU reference: dequantize the block to 256 f32
-//!      values per the layout in
-//!      `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:680-697`,
+//!      values per the canonical Q4_K layout,
 //!      then matmul against the input.
 //!   3. Dispatch the GPU kernel on the same fixture.
 //!   4. Compare element-wise: max abs diff REAL — no hardcoded EPSILON.
@@ -47,8 +46,7 @@ fn pseudo_random_f32(seed: u64, n: usize) -> Vec<f32> {
 // --------------------------------------------------------------------------
 
 /// Encode 8 (sub-scale, sub-min) 6-bit pairs into the 12-byte `scales`
-/// array using the bit-packing decoded by `get_scale_min_k4_just2`
-/// (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:675-678`).
+/// array using the bit-packing decoded by `get_scale_min_k4_just2`.
 ///
 /// Decoder semantics:
 ///   j < 4: sc[j] = scales[j+0] & 63
@@ -196,9 +194,8 @@ fn pack_q4_k(values: &[f32]) -> Vec<u8> {
 // CPU dequantization reference
 // --------------------------------------------------------------------------
 
-/// CPU dequant for one Q4_K block — spec-derived, port of llama.cpp's
-/// `dequantize_q4_K` template at
-/// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:680-697`.
+/// CPU dequant for one Q4_K block — spec-derived port of the canonical
+/// `dequantize_q4_K` template.
 ///
 /// Conceptual layout: 8 sub-blocks of 32 values; pair (s0, s1) shares
 /// 32 bytes of qs.  qs[base + l] low nibble belongs to s0, high nibble

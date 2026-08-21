@@ -1,6 +1,6 @@
 //! Focused Q3_K runtime parity tests.
 //!
-//! The fixture packer is the inverse of llama.cpp's MIT-licensed
+//! The fixture packer is the inverse of the canonical
 //! `dequantize_row_q3_K` formula. It deliberately exercises every scale
 //! field, hmask plane, and packed-quant shift without depending on an
 //! external converter at test time.
@@ -127,7 +127,7 @@ fn upload_f32(device: &MlxDevice, data: &[f32], shape: Vec<usize>) -> mlx_native
 }
 
 #[test]
-fn q3_k_type_size_and_cpu_dequant_match_llama_formula() {
+fn q3_k_type_size_and_cpu_dequant_match_reference_formula() {
     assert_eq!(GgmlType::Q3_K.block_values(), 256);
     assert_eq!(GgmlType::Q3_K.block_bytes(), 110);
     assert_eq!(

@@ -68,7 +68,7 @@ import torch
 
 
 # ---------------------------------------------------------------------------
-# Constants (kept identical to FLA defaults; matches llama.cpp's CS=64).
+# Constants (kept identical to FLA defaults; matches the reference CS=64).
 # ---------------------------------------------------------------------------
 FIXTURE_VERSION = "wave5b.1-iter1-v1"
 SEED = 0xC0FFEE

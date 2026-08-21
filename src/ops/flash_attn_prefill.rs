@@ -88,16 +88,15 @@
 //! `log2(e) ≈ 1.44269504` and uses `fast::exp2` throughout — so the host
 //! MUST NOT pre-multiply by `log2(e)`.
 //!
-//! ## Mask-sentinel contract (llama.cpp convention)
+//! ## Mask-sentinel contract (reference-implementation convention)
 //!
 //! The additive mask buffer (bf16/f16 for the additive dispatchers) uses
-//! the llama.cpp CPU-side convention: **masked positions = `-INFINITY`**
+//! the reference CPU-side convention: **masked positions = `-INFINITY`**
 //! (IEEE-754 f32 `0xFF800000`, cast to the I/O dtype — both `half(-inf)`
 //! and `bfloat16(-inf)` have a real `-inf` encoding that the kernel
 //! consumes correctly).  Attended positions = `0.0`.
 //!
-//! This matches llama.cpp's mask-authoring sites at
-//! `llama-graph.cpp:421, 436, 557` and `llama-kv-cache.cpp:1572`, where
+//! This matches the reference mask-authoring sites, where
 //! the CPU writes raw `-INFINITY` and the flash-attn cast to f16 saturates
 //! to f16-`-INFINITY`.
 //!
@@ -459,7 +458,7 @@ pub(crate) fn validate_buffer_size(buf: &MlxBuffer, name: &str, expected_element
 /// - `k`    — `[batch, n_kv_heads, seq_len_k, 256]`, dtype BF16
 /// - `v`    — `[batch, n_kv_heads, seq_len_k, 256]`, dtype BF16
 /// - `mask` — `[batch, n_heads, seq_len_q, seq_len_k]`, dtype BF16
-///   (additive, log-scale: 0.0 = attend, -inf = mask out — llama.cpp
+///   (additive, log-scale: 0.0 = attend, -inf = mask out — reference
 ///   convention, see module doc "Mask-sentinel contract"), or `None`
 /// - `out`  — `[batch, n_heads,    seq_len_q, 256]`, dtype BF16 (output)
 ///
@@ -1669,7 +1668,7 @@ impl FlashAttnPrefillLayout {
 /// `mask` may be either rank-2 `[seq_len_q, seq_len_k]` (broadcast across
 /// batch+heads — the BERT padding-mask shape) or rank-4
 /// `[batch, n_heads, seq_len_q, seq_len_k]` (per-head).  Both use the
-/// llama.cpp additive convention: 0.0 = attend, -inf = mask out.
+/// reference additive convention: 0.0 = attend, -inf = mask out.
 ///
 /// # Function constants
 ///

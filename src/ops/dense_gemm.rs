@@ -6,8 +6,8 @@
 //! Two GPU kernels:
 //!
 //! - `dense_matvec_f16` — specialised M=1 mat-vec (decode hot path).
-//!   Uses vectorised half4 loads + simd_sum, modelled after the llama.cpp
-//!   `kernel_mul_mv_f16_f32` pattern.
+//!   Uses vectorised half4 loads + simd_sum, modelled after the
+//!   `kernel_mul_mv_f16_f32` peer pattern.
 //!
 //! - `dense_gemm_f16` — tiled GEMM for M>1 with simdgroup_matrix MMA.
 

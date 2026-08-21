@@ -3,7 +3,7 @@
 //!
 //! Goal: empirically demonstrate that the new K=256 chunk-parallel pipeline
 //! (iters 19-22) closes the autoregressive-fallback gap that caused
-//! hf2q to lag llama.cpp at Qwen3.6 prefill. Llama.cpp uses a chunk-scan
+//! hf2q to lag the peer engine at Qwen3.6 prefill. The peer uses a chunk-scan
 //! path natively; with iter 22's K=256 dispatch wired up via hf2q
 //! iter 23 chunk_path_eligible, hf2q can now match (or exceed) that path.
 //!

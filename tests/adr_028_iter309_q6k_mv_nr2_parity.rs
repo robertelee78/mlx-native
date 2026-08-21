@@ -1,6 +1,6 @@
 //! ADR-028 iter-309 — parity test for `kernel_mul_mv_q6_K_f32_nr2`.
 //!
-//! The new kernel ports llama.cpp's `kernel_mul_mv_q6_K_f32_impl` with
+//! The new kernel ports the reference `kernel_mul_mv_q6_K_f32_impl` with
 //! `N_R0_Q6_K=2` (peer pattern) — 4 rows/TG (2 SGs × 2 rows) with
 //! cached `yl[16]` shared across both rows.  The original
 //! `kernel_mul_mv_q6_K_f32` processes 2 rows/TG (1 row/SG) with no Y

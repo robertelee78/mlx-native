@@ -3,8 +3,7 @@ using namespace metal;
 
 // Fused Gated DeltaNet recurrent kernel — SIMD-group/`simd_sum` variant.
 //
-// ADR-015 iter56 — mirrors llama.cpp's `kernel_gated_delta_net_f32_<NSG>`
-// (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:2532-2647`) using
+// ADR-015 iter56 — peer-pattern NSG variant using
 // 32-lane warp-level reductions instead of `threadgroup_barrier` +
 // shared memory. Equivalent math to `gated_delta_net_f32` (the existing
 // 128-thread/threadgroup variant) but uses dramatically less synchronization
@@ -23,7 +22,7 @@ using namespace metal;
 //   output[t,i] = state[*, i] · q[t]                                 // [D_v]
 //
 // NB: caller pre-scales q with 1/sqrt(D_k) (matching the existing
-// `gated_delta_net_f32` kernel's contract). llama.cpp's variant folds the
+// `gated_delta_net_f32` kernel's contract). The peer variant folds the
 // scale in the kernel; we keep the existing two-step contract to make
 // iter56 a drop-in parity replacement.
 //
@@ -72,7 +71,7 @@ using namespace metal;
 //                                    q_scale_bits)  // ADR-033 §Pi iter 25:
 //                                    q_scale_bits = as_type<uint>(1.0f/sqrt(D_k))
 //                                    if non-zero, kernel applies q_scale at
-//                                    output writeback (matches llama.cpp pattern,
+//                                    output writeback (peer pattern,
 //                                    eliminates the per-layer scalar_mul_f32
 //                                    pre-pass dispatch). If zero, kernel runs
 //                                    in legacy mode (caller pre-scaled q).
@@ -109,7 +108,7 @@ inline void gated_delta_net_decode_impl(
     const uint n_v_heads = params[3];
     const uint n_tokens  = params[4];
     const uint n_seqs    = params[5];
-    // ADR-033 §Pi iter 25 (2026-05-23): q_scale fold-in (matches llama.cpp).
+    // ADR-033 §Pi iter 25 (2026-05-23): q_scale fold-in (peer pattern).
     // If params[8] != 0, interpret as a f32 bits encoding of q_scale, and
     // apply at output writeback. Default (params[8]==0) preserves legacy
     // contract (caller pre-scales q).
@@ -122,8 +121,8 @@ inline void gated_delta_net_decode_impl(
 
     if (v_head >= n_v_heads || seq >= n_seqs || i20 >= D_v) return;
 
-    // GQA: tiled mapping (matches llama.cpp `i01 = i21 % args.ne01` and
-    // the existing `gated_delta_net_f32` kernel).
+    // GQA: tiled mapping (matches the existing `gated_delta_net_f32`
+    // kernel).
     const uint k_head = v_head % n_k_heads;
 
     // Strides (matches `gated_delta_net_f32` — D_k innermost in state).
@@ -190,8 +189,8 @@ inline void gated_delta_net_decode_impl(
         const float y = metal::simd_sum(partial_y);
 
         // Output: lane 0 of each (i20) row writes the fully-reduced value.
-        // ADR-033 §Pi iter 25: apply q_scale at writeback (matches llama.cpp
-        // line 2636 `y*scale`). When q_scale_bits == 0, q_scale == 1.0 and
+        // ADR-033 §Pi iter 25: apply q_scale at writeback
+        // (`y * q_scale`). When q_scale_bits == 0, q_scale == 1.0 and
         // the legacy caller-pre-scales-q contract is preserved.
         if (tx == 0) {
             output[seq * v_seq_stride + t * v_token_stride + v_head * D_v + i20] = y * q_scale;

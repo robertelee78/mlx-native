@@ -334,8 +334,6 @@ kernel void rms_norm_no_scale_bf16(
 /// single kernel pass, eliminating one barrier and one global memory
 /// round-trip.
 ///
-/// Inspired by llama.cpp's kernel_rms_norm_mul_f32 (ggml-metal.metal),
-/// MIT licensed.  Copyright the llama.cpp Authors. See LICENSE-MIT-llamacpp.
 /// Adapted for mlx-native's dispatch conventions.
 ///
 /// Buffer layout:

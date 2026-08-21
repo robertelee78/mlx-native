@@ -13,7 +13,7 @@
 //! Where `Hg = n_k_heads`, `H = n_v_heads`, `K = head_dim`. The "tiled"
 //! variant matches Qwen3.6 GGUF tensor layout (per
 //! `project_qwen36_gqa_tiled_vs_block` and `gpu_delta_net.rs:834-866`),
-//! and is the same convention as llama.cpp's `ggml_repeat_4d` graph op.
+//! and is the same convention as the `ggml_repeat_4d` graph op.
 //!
 //! ADR-005 W-5b.19 (2026-04-27): single-dispatch GPU broadcast eliminates
 //! the chunk-wrapper's CPU memcpy bucket. Production caller:

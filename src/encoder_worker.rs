@@ -1,8 +1,7 @@
 //! Persistent encoder worker thread (ADR-028 iter-380).
 //!
 //! Provides a long-lived worker thread for parallel command-buffer encoding,
-//! mirroring llama.cpp's `n_cb=2` GCD `dispatch_apply` pattern (see
-//! `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:438+550`).
+//! mirroring the reference `n_cb=2` GCD `dispatch_apply` pattern.
 //!
 //! Per the existing `forward_decode` comment at line 4592-4595:
 //! > Threaded wait DURING encode: -43 tok/s (thread spawn + Metal

@@ -1,6 +1,6 @@
 //! Dense bf16 × f32 → f32 GEMV (matrix-vector multiply) for M == 1 decode.
 //!
-//! Port of llama.cpp's `kernel_mul_mv_bf16_f32_4` kernel (bfloat4 vectorized
+//! Peer port of the `kernel_mul_mv_bf16_f32_4` kernel (bfloat4 vectorized
 //! path).  Use this instead of [`dense_mm_bf16::dense_matmul_bf16_f32_tensor`]
 //! when the number of input rows M == 1, i.e. single-token decode.
 //!
@@ -14,7 +14,8 @@
 //!
 //! This is the same contract as [`dense_mm_bf16::DenseMmBf16F32Params`].
 //!
-//! Derived from llama.cpp (MIT).  See `src/shaders/dense_gemv_bf16.metal`.
+//! See `src/shaders/dense_gemv_bf16.metal` for the kernel source and its
+//! attribution.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;

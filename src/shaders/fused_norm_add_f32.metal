@@ -274,8 +274,8 @@ kernel void fused_norm_add_f32(
 }
 
 // ---------------------------------------------------------------------------
-// fused_norm_add_f32_v2 (ADR-028 iter-331) — peer-pattern port mirroring
-// llama.cpp `kernel_rms_norm_fuse_impl<float4, 3>` (ggml-metal.metal:2989+).
+// fused_norm_add_f32_v2 (ADR-028 iter-331) — vectorized peer-pattern
+// rewrite of the fused RMS-norm + residual-add kernel.
 //
 // Replaces our scalar + threadgroup tree-reduction `fused_norm_add_f32`
 // with:

@@ -9,12 +9,12 @@
 //! drift from the BF16 cast specifically, not from any other source.
 //!
 //! Computes `dst[b, m, n] = sum_k src0[b/r2, n, k] * src1[b, m, k]`
-//! across all `b` in `[0, src1_batch)`.  Implements llama.cpp's
-//! `kernel_mul_mm_f32_f32` template instantiation
-//! (ggml/src/ggml-metal/ggml-metal.metal:10098) on the
-//! `GGML_METAL_HAS_TENSOR` branch.
+//! across all `b` in `[0, src1_batch)`.  Implements the
+//! `kernel_mul_mm_f32_f32` template instantiation on the
+//! tensor-API branch.
 //!
-//! Derived from llama.cpp (MIT).  See `src/shaders/dense_mm_f32_f32.metal`.
+//! See `src/shaders/dense_mm_f32_f32.metal` for the kernel source and its
+//! attribution.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;

@@ -1,8 +1,7 @@
 // quantized_matmul_id_mm.metal — MoE-routed GGML-quantized matrix-matrix kernels.
 //
-// Ports llama.cpp's `kernel_mul_mm_id_<qtype>_f32`
-// (ggml/src/ggml-metal/ggml-metal.metal:9650) and its preprocessing helper
-// `kernel_mul_mm_id_map0_ne20_<N>` (same file:9584) to mlx-native.
+// Implements the `kernel_mul_mm_id_<qtype>_f32` kernel shape and its
+// preprocessing helper `kernel_mul_mm_id_map0_ne20_<N>` for mlx-native.
 //
 // Why mm_id?  The MoE variant of quantized_matmul needs to run the same
 // expert weight tile against many tokens that routed to that expert.  The
@@ -12,7 +11,7 @@
 // and reuses it across a 32-row block of the expert's routed tokens —
 // the same win as the dense mm kernel, but per-expert.
 //
-// Two-stage dispatch (matches llama.cpp):
+// Two-stage dispatch:
 //
 //   1. `kernel_mul_mm_id_map0_ne20_8` — scans the (token, slot) -> expert
 //       id table, for each expert builds a contiguous list of the packed
@@ -31,11 +30,8 @@
 // different experts, defeating weight reuse.
 //
 // Port rules identical to the dense mm port (see quantized_matmul_mm.metal
-// for detail).  Both kernels are bit-compatible with the llama.cpp source;
+// for detail).  Both kernels are bit-compatible with the reference source;
 // output tolerance-level matches with the existing mv_id kernel.
-//
-// Portions derived from llama.cpp (MIT).  Copyright the llama.cpp Authors.
-// Q3_K source revision: llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -50,8 +46,8 @@ using namespace metal;
 
 // ---- Params for map0 ----
 //
-// Maps llama.cpp's `ggml_metal_kargs_mul_mm_id_map0`
-// (ggml-metal-impl.h:483).  We omit `ne02` (== n_experts, used for a
+// Maps the reference map0 kargs layout.  We omit `ne02` (== n_experts,
+// used for a
 // threadgroup-size assert upstream — we pass it host-side and dispatch
 // exactly `n_experts` threads per threadgroup to mirror the upstream
 // `ntg = n_experts` launch).
@@ -69,8 +65,7 @@ struct GgmlMatmulIdMm_Map0Params {
 
 // ---- Params for mul_mm_id ----
 //
-// Maps llama.cpp's `ggml_metal_kargs_mul_mm_id`
-// (ggml-metal-impl.h:494).
+// Maps the reference mm_id kargs layout.
 
 struct GgmlMatmulIdMm_MmParams {
     int32_t  ne00;   // K
@@ -187,7 +182,7 @@ constant int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113
 };
 
-// Spec source: llama.cpp ggml-metal.metal:675 — `get_scale_min_k4_just2`.
+// Spec source: reference `get_scale_min_k4_just2`.
 // Decodes the (sub-block scale, sub-block min) 6-bit pair at index `j`
 // (within sub-block group `k`) from the packed K_SCALE_SIZE=12 array.
 static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
@@ -227,7 +222,7 @@ void dequantize_q8_0(device const block_q8_0 * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
-// Pinned llama.cpp 6ea215d17 ggml-metal.metal::dequantize_q2_K.
+// Q2_K dequantize, pinned to a fixed upstream revision.
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -311,7 +306,7 @@ void dequantize_q6_K(device const block_q6_K * xb, short il, thread type4x4 & re
 }
 
 // ADR-022 Phase 1 — Q5_1 dequant for the mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:511-541 (`dequantize_q5_1`).
+// Spec source: reference `dequantize_q5_1`.
 // Fills a 4x4 tile (16 values) with positions [16*il .. 16*il+16) of
 // the 32-element block. il=0 fills low half, il=1 fills high half.
 template <typename type4x4>
@@ -337,7 +332,7 @@ void dequantize_q5_1(device const block_q5_1 * xb, short il, thread type4x4 & re
 }
 
 // ADR-022 Phase 1 — IQ4_NL dequant for the mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:920-933 (`dequantize_iq4_nl`).
+// Spec source: reference `dequantize_iq4_nl`.
 // 16 elements per call addressed by il ∈ {0, 1}; loops over 4 uint16
 // chunks of qs, extracting 4 4-bit indices each via shift+mask, looking
 // up into kvalues_iq4nl per nibble.
@@ -358,7 +353,7 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
 
 // ADR-033 §Pi Task #20 — IQ4_XS float codebook table.
 // Identical values to `kvalues_iq4nl` above but pre-converted to float
-// to match llama.cpp's `kvalues_iq4nl_f` representation byte-for-byte.
+// to match the reference `kvalues_iq4nl_f` representation byte-for-byte.
 // Used by `dequantize_iq4_xs` below — using the int8 table + cast was
 // producing numerical divergence at top_k=8 mm_id batch shapes, so the
 // safer mirror of canonical is to emit a float table directly.
@@ -368,8 +363,8 @@ constant float kvalues_iq4nl_f[16] = {
 };
 
 // ADR-033 §Pi Task #20 — IQ4_XS dequant for the mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:948-966 (`dequantize_iq4_xs`)
-// — ported verbatim modulo formatting.
+// Spec source: reference `dequantize_iq4_xs`
+// — reproduced verbatim modulo formatting.
 //
 // 16 elements per call addressed by `il ∈ [0,16)`:
 //   - `ib32 = il/2` selects the 32-element sub-block (0..7) in qs;
@@ -403,7 +398,7 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
 }
 
 // ADR-013 P16 — Q4_K dequant for the mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:681. Fills a 4x4 tile with the
+// Spec source: reference `dequantize_q4_K`. Fills a 4x4 tile with the
 // 16 dequantized values addressed by `il` (which selects sub-block + half
 // nibble), using the same scale/min decode as the mat-vec-id Q4_K kernel
 // already shipped at quantized_matmul_id_ggml.metal.
@@ -427,7 +422,7 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
 }
 
 // ADR-022 Phase 2 — Q5_K dequant for mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+// Spec source: reference `dequantize_q5_K`.
 // Q5_K differs from Q4_K by adding a 32-byte qh "high-bit" array; each
 // of the 16 elements per call OR's an extra 16 (low half) or 256 (high
 // half) into the dequantized value when the corresponding qh bit is set.
@@ -463,7 +458,7 @@ void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & re
 // Output: hids — per-expert routed-token list `[n_experts, n_tokens]` int32.
 //         Each slot holds `(token_idx * ne20 + slot_idx)` packed.
 //
-// Dispatch geometry (matches llama.cpp:9584):
+// Dispatch geometry:
 //   threadgroups = (1, 1, 1)
 //   threads_per_threadgroup = (n_experts, 1, 1)     (ntg == ne02)
 //
@@ -543,7 +538,7 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
 // mul_mm_id — MoE matmul using the map0-produced expert token lists
 // ====================================================================
 //
-// Dispatch geometry (matches llama.cpp:2389):
+// Dispatch geometry:
 //   threadgroups = (ceil(neh1/32), ceil(N/64), n_experts)
 //   threads_per_threadgroup = (128, 1, 1)
 //
@@ -658,7 +653,7 @@ kernel void hf2q_mul_mm_id_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // ADR-033 §Pi Task #20 iter 8 — added #pragma unroll to match
-            // llama.cpp's FOR_UNROLL for 16-iter A-tile staging loop.
+            // the peer's FOR_UNROLL for the 16-iter A-tile staging loop.
             #pragma clang loop unroll(full)
             for (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
@@ -673,7 +668,7 @@ kernel void hf2q_mul_mm_id_impl(
         // ---- B tile stage ----
         //
         // ADR-033 §Pi Task #20 iter 8 — vectorized B-tile store fast path
-        // matching llama.cpp `*(threadgroup S1_2x4 *)(sb + ...) = (S1_2x4) *((device T1_2x4 *) y)`.
+        // matching the reference `*(threadgroup S1_2x4 *)(sb + ...) = (S1_2x4) *((device T1_2x4 *) y)`.
         // Each thread does ONE 8-float store instead of 8 scalar stores
         // when the K-loop iteration is fully in-bounds. For Q6_K with
         // K%QK_K==0 and NK=32, K is always divisible by NK, so the fast
@@ -838,8 +833,8 @@ kernel void hf2q_mul_mm_id_impl<block_q5_1, 2, dequantize_q5_1>(
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
 
 // ADR-033 §Pi Task #20 — IQ4_XS mm_id template instantiation.
-// Matches llama.cpp ggml-metal.metal:10252's
-// `kernel_mul_mm_id_iq4_xs_f32` (parameters: block_iq4_xs + QK_NL=16
+// Matches the reference `kernel_mul_mm_id_iq4_xs_f32`
+// (parameters: block_iq4_xs + QK_NL=16
 // + dequantize_iq4_xs).
 template [[host_name("kernel_mul_mm_id_iq4_xs_f32")]]
 kernel void hf2q_mul_mm_id_impl<block_iq4_xs, QK_NL, dequantize_iq4_xs>(

@@ -28,8 +28,8 @@
 // before that landed; backporting now to close the ~14pp peer-perf gap (gemma-26B-dwq
 // cn=1: 0.86× → expected 0.91-0.94× per Worker T's iter-223 porting plan). Loops
 // with constant compile-time bounds (C=32, DK4/NL, DV4/NL) get the full-unroll hint;
-// thread-stride loops (i += NW) keep plain `for`. Identical macro to upstream
-// llama.cpp ggml-metal.metal:6666-7095 + our own dense flash_attn_vec.metal:9.
+// thread-stride loops (i += NW) keep plain `for`. Identical macro to
+// our own dense flash_attn_vec.metal:9.
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 #include <metal_stdlib>

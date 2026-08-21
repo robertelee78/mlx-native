@@ -30,8 +30,8 @@
 //! Falsification:
 //!   - If MoE _id reaches >65% peak (similar to dense), MoE bandwidth
 //!     is saturated → optimization gap is in dispatch/scheduling.
-//!   - If <40% peak, MoE _id sparse access is the bottleneck → port
-//!     llama.cpp's expert tile reuse or build a fused router+gate+up.
+//!   - If <40% peak, MoE _id sparse access is the bottleneck → adopt
+//!     an expert tile reuse scheme or build a fused router+gate+up.
 //!
 //! Run:
 //!   cargo bench -p mlx-native --bench bench_decode_moe_id_shapes --release

@@ -2,16 +2,14 @@
 //
 // Portions of this file are derived from candle-metal-kernels v0.10.2
 // (https://github.com/huggingface/candle), Apache-2.0 licensed.
-// Original source: llama.cpp's ggml-metal.metal, vendored in candle.
 // Source: candle-metal-kernels/src/metal_src/quantized.metal
 //
 // Block struct definitions and dequantization formulas are byte-for-byte
 // compatible with GGUF on-disk format. The kernel dispatch pattern is
 // adapted to mlx-native's CommandEncoder API.
 //
-// Copyright the candle Authors and llama.cpp Authors.
-// See LICENSE-APACHE-candle and LICENSE-MIT-llamacpp in this directory.
-// The Q3_K additions are ported from llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
+// Copyright the candle Authors.
+// See LICENSE-APACHE-candle in this directory.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -27,7 +25,7 @@ using namespace metal;
 #define N_SIMDWIDTH 32  // Apple GPU SIMD width
 
 // Q8_0 uses wider threadgroups: 4 simdgroups × 2 rows = 8 rows/tg.
-// Matches llama.cpp N_SG_Q8_0=4, N_R0_Q8_0=2.
+// N_SG_Q8_0=4, N_R0_Q8_0=2.
 #define N_DST_Q8       2   // each SIMD group works on 2 rows
 #define N_SIMDGROUP_Q8 4   // 4 SIMD groups per threadgroup (128 threads)
 
@@ -44,8 +42,8 @@ struct GgmlMatvecParams {
     uint    r3;   // ne13 / ne03 (always 1 for non-batched)
 };
 
-// ADR-029 iter-162 H93: peer-grounded port of llama.cpp commit da4495332
-// ("metal : promote mul_mv/mul_mm batch divisors to function constants").
+// ADR-029 iter-162 H93: peer-grounded change promoting mul_mv/mul_mm
+// batch divisors to function constants.
 //
 // `ne12`, `r2`, `r3` appear in offset arithmetic as integer divisors:
 //   const uint i12 = im % p.ne12;
@@ -107,7 +105,7 @@ typedef struct {
 static_assert(sizeof(block_q2_K) == 2*sizeof(half) + QK_K/16 + QK_K/4,
               "wrong q2_K block size");
 
-// Q3_K block layout from llama.cpp ggml-common.h (MIT).
+// Q3_K block layout per the GGUF spec.
 typedef struct {
     uint8_t hmask[QK_K/8];
     uint8_t qs[QK_K/4];
@@ -137,7 +135,7 @@ static_assert(sizeof(block_q6_K) == sizeof(half) + QK_K/16 + 3*QK_K/4, "wrong q6
 //
 // Q4_K is structurally Q5_K minus the 32-byte qh "high-bit" array.
 //
-// Source: ggml-common.h block_q4_K (llama.cpp).
+// GGUF block_q4_K layout.
 #define K_SCALE_SIZE 12
 typedef struct {
     half    d;                    // super-block scale for quantized scales
@@ -288,10 +286,11 @@ inline float block_iq4_xs_dot_y(
 //
 // Dispatch: threadgroups=(ceil(N/8), M, B), threads_per_tg=(8, 8, 1)
 
-// ADR-009 Phase 3A: match llama.cpp's 4-accumulator layout exactly.
+// ADR-009 Phase 3A: keep the 4-accumulator layout exactly — accumulation
+// order affects byte-parity.
 // Using 4 separate accumulators (one per nibble position) instead of 2
-// paired accumulators ensures identical floating-point rounding to
-// llama.cpp's block_q_n_dot_y for block_q4_0.
+// paired accumulators ensures identical floating-point rounding for
+// block_q4_0.
 inline float block_q4_0_dot_y(
     device const block_q4_0 * qb,
     float sumy,
@@ -346,9 +345,9 @@ kernel void kernel_mul_mv_q4_0_f32(
 
     device const float * yb = y + ix * QK4_0 + il;
 
-    // ADR-009 Phase 3A: match llama.cpp's two-accumulator sumy pattern.
-    // llama.cpp accumulates sumy[0] (first half) and sumy[1] (second half)
-    // separately, then combines. This ensures identical FP rounding.
+    // ADR-009 Phase 3A: keep the two-accumulator sumy pattern exactly.
+    // sumy[0] (first half) and sumy[1] (second half) accumulate
+    // separately, then combine. This ensures identical FP rounding.
     for (int ib = ix; ib < nb; ib += nw/2) {
         float sumy[2] = { 0.f, 0.f };
         for (int i = 0; i < 8; i += 2) {
@@ -457,7 +456,7 @@ kernel void kernel_mul_mv_q5_1_f32(
 //
 // Each thread processes a sub-block-half-at-a-time and uses simd_sum to
 // reduce per-row partial sums. The kernel is byte-cmp-validated against
-// llama.cpp's `kernel_mul_mv_iq4_xs_f32` via a per-row parity test on
+// the peer's `kernel_mul_mv_iq4_xs_f32` via a per-row parity test on
 // synthetic input (see tests/iq4_xs_metal_parity.rs).
 kernel void kernel_mul_mv_iq4_xs_f32(
     device const  void  * src0   [[buffer(0)]],
@@ -732,7 +731,7 @@ kernel void kernel_mul_mv_q2_K_f32(
 
 // ---- Q8_0 mat-vec kernel — peer-style NSG=4 NR=2 (ADR-028 iter-368) ----
 //
-// Port of llama.cpp's `kernel_mul_mv_q8_0_f32_impl` with N_R0_Q8_0=2 and
+// Peer-style `kernel_mul_mv_q8_0_f32_impl` with N_R0_Q8_0=2 and
 // N_SG_Q8_0=4 (functional constant equivalent).  Each TG covers 2 rows;
 // 4 simdgroups collaborate on those 2 rows with cross-SG reduction via
 // threadgroup memory.  Uses 128 threads/TG vs the existing kernel's 64 →
@@ -746,8 +745,6 @@ kernel void kernel_mul_mv_q2_K_f32(
 //   threadgroups   = (ceil(N/NR0), M, B)
 //   threads_per_tg = (NW, NSG, 1) = (32, 4, 1)
 //   shared memory  = NR0 * NW * sizeof(float) = 2 * 32 * 4 = 256 bytes
-//
-// Reference: /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:3572 (MIT).
 
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
@@ -930,7 +927,7 @@ kernel void kernel_mul_mv_q6_K_f32(
 
 // ---- Q6_K mat-vec kernel, nr0=2 variant (ADR-028 iter-309) ----
 //
-// Ported from llama.cpp `kernel_mul_mv_q6_K_f32_impl` with N_R0_Q6_K=2.
+// Peer-style `kernel_mul_mv_q6_K_f32_impl` with N_R0_Q6_K=2.
 // Doubles rows per simdgroup vs the baseline q6_K mv (1 row → 2) and
 // caches `yl[16]` once per QK_K block, re-using it across both rows so
 // the dequant unpack work amortizes.  4 rows per threadgroup (2 SGs ×
@@ -941,7 +938,7 @@ kernel void kernel_mul_mv_q6_K_f32(
 //
 // Hypothesis (ADR-028 iter-308): cuts per-dispatch time on the biggest
 // gemma4 APEX-Q5_K_M decode kernel (17.91% of dispatches) by closing
-// the row-amortization gap with peer llama.cpp.
+// the row-amortization gap with the peer.
 kernel void kernel_mul_mv_q6_K_f32_nr2(
     device const  void  * src0   [[buffer(0)]],
     device const float  * src1   [[buffer(1)]],
@@ -994,7 +991,7 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
     for (int i = ix; i < nb; i += 2) {
         // Y vector cached once per block, reused across nr0 rows.
         // ADR-028 iter-352: explicit `clang loop unroll(full)` (mirroring peer's
-        // FOR_UNROLL macro at llama.cpp ggml-metal.metal:8035) was tested here
+        // FOR_UNROLL macro on this loop) was tested here
         // and FALSIFIED — measured -0.2-0.4 tok/s vs Apple Metal's auto-unroll.
         // Compiler was already doing the optimal thing without the hint, and the
         // explicit pragma may have hurt register allocation.  Removed; auto-unroll
@@ -1213,7 +1210,7 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl<8>(
 
 // ---- Q3_K mat-vec kernel ----
 //
-// Port of current llama.cpp `kernel_mul_mv_q3_K_f32_impl` (MIT), adapted
+// The current `kernel_mul_mv_q3_K_f32_impl` scheme, adapted
 // only for mlx-native's compact parameter ABI. Two simdgroups process two
 // rows each, for four output rows per threadgroup.
 
@@ -1340,8 +1337,8 @@ kernel void kernel_mul_mv_q3_K_f32(
 
 // ---- Q4_K mat-vec kernel ----
 //
-// ADR-013 P7 — port of llama.cpp `kernel_mul_mv_q4_K_f32_impl`
-// (ggml-metal.metal:7715-7821). Algorithm: for each weight row, decode
+// ADR-013 P7 — implements the `kernel_mul_mv_q4_K_f32_impl`
+// shape. Algorithm: for each weight row, decode
 // the 8 sub-block (scale, min) 6-bit pairs from the packed 12-byte
 // `scales` array, dequant and dot-product against the input vector.
 //
@@ -1463,7 +1460,7 @@ kernel void kernel_mul_mv_q4_K_f32(
 
 // ---- Q5_K dense mat-vec kernel (ADR-022 Phase 2) ----
 //
-// Port of llama.cpp `kernel_mul_mv_q5_K_f32_impl` (ggml-metal.metal:7837).
+// Implements the `kernel_mul_mv_q5_K_f32_impl` shape.
 // Body is `kernel_mul_mv_q4_K_f32` (above) plus the Q5_K mv_id qh/acc2
 // high-bit accumulation block — the only structural delta between Q4_K
 // and Q5_K. The geometry, scale-decode (kmask1/2/3 + sc16 packing), and

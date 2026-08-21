@@ -47,7 +47,7 @@ fn pseudo_random_f32(seed: u64, n: usize) -> Vec<f32> {
 
 /// Pack a flat F32 array (length must be a multiple of `QK8_0`) into
 /// GGUF Q8_0 blocks (34 bytes per block: 2-byte half scale + 32 int8).
-/// Mirrors llama.cpp's `quantize_row_q8_0_ref`.
+/// Mirrors the canonical `quantize_row_q8_0_ref`.
 fn pack_q8_0(values: &[f32]) -> Vec<u8> {
     assert!(values.len() % QK8_0 == 0);
     let mut bytes = Vec::with_capacity(values.len() / QK8_0 * 34);

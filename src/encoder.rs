@@ -201,8 +201,8 @@ impl CapturedOpKind {
     /// Whether this captured op kind is safe to reorder past in the graph
     /// optimizer (Phase 4e.3).
     ///
-    /// Mirrors the `h_safe` whitelist from llama.cpp's
-    /// `ggml_metal_graph_optimize_reorder`.  Non-safe ops break the 64-node
+    /// The `h_safe` whitelist for graph-optimize reorder (reference
+    /// convention).  Non-safe ops break the 64-node
     /// lookahead — the reorder pass cannot look past them.
     pub fn is_reorderable(&self) -> bool {
         match self {
@@ -404,9 +404,8 @@ pub fn dispatch_count() -> u64 {
 ///
 /// Env-gated via `MLX_DISP_BUCKET=1`.  When enabled, every
 /// `encode*` call records its pipeline's label in a global hash map.
-/// This gives a per-kernel breakdown comparable to llama.cpp's
-/// instrumented dispatch site for finding *which* kernels make up
-/// the per-token dispatch budget.
+/// This gives a per-kernel breakdown for finding *which* kernels make
+/// up the per-token dispatch budget.
 fn pipeline_buckets() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
     static BUCKETS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
         std::sync::OnceLock::new();
@@ -532,10 +531,9 @@ fn encode_trace_enabled() -> bool {
 /// ADR-015 — when true, `CommandEncoder::new_with_residency` opens
 /// each `MTLCommandBuffer` via
 /// [`CommandQueueRef::new_command_buffer_with_unretained_references`]
-/// instead of the default `commandBuffer`.  llama.cpp's per-token decode
-/// CBs use this same call (`/opt/llama.cpp/ggml/src/ggml-metal/`
-/// `ggml-metal-context.m:512` `[queue commandBufferWithUnretainedReferences]`)
-/// and gain ~3-5% wall on M-series GPUs by skipping per-buffer-binding ARC
+/// instead of the default `commandBuffer`.  Per-token decode CBs using
+/// `[queue commandBufferWithUnretainedReferences]`
+/// gain ~3-5% wall on M-series GPUs by skipping per-buffer-binding ARC
 /// retains on submit.
 ///
 /// **Caller-side prerequisite.**  Every Metal buffer bound to a dispatch
@@ -627,8 +625,8 @@ fn assert_tg_size_multiple_of_32_if_hinted(tg: MTLSize, pipeline: &ComputePipeli
 /// call consults a [`MemRanges`](crate::mem_ranges::MemRanges) tracker
 /// and auto-emits a `memoryBarrierWithScope:` exactly when the new
 /// dispatch's read/write ranges conflict with previously-recorded
-/// ranges (mirrors llama.cpp's `ggml_metal_op_concurrency_check` at
-/// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:147-225`).
+/// ranges (a concurrency check following the reference-implementation
+/// pattern).
 /// When false, `dispatch_tracked` collapses to the same code path as
 /// `encode*` — no tracking, no auto-barriers — preserving sourdough
 /// behavior for any caller that opts into the tracked API but runs
@@ -906,7 +904,7 @@ pub struct CommandEncoder {
 /// `cmd_buf` is alive — this invariant holds across thread boundaries
 /// because both fields move together.
 ///
-/// This matches llama.cpp's pattern of encoding command buffers on GCD
+/// This matches the reference pattern of encoding command buffers on GCD
 /// worker threads via `dispatch_apply`, and is used for the dual-buffer
 /// pipeline where buf1 is encoded on a worker thread while buf0 executes.
 unsafe impl Send for CommandEncoder {}
@@ -938,8 +936,8 @@ impl CommandEncoder {
     ///
     /// We use the regular `commandBuffer` (Metal retains every bound
     /// resource for the lifetime of the buffer) rather than
-    /// `commandBufferWithUnretainedReferences`.  llama.cpp uses unretained
-    /// refs for an additional perf bump (~3-5% on M-series GPUs), but the
+    /// `commandBufferWithUnretainedReferences`.  Unretained refs give an
+    /// additional perf bump (~3-5% on M-series GPUs), but the
     /// hf2q dispatch pattern allocates many transient scratch buffers
     /// inside helper functions (`apply_proj` → `weight_bf16_owned`,
     /// `apply_pre_norm` → `params`, etc.) that go out of scope at the
@@ -970,16 +968,13 @@ impl CommandEncoder {
     /// submitting the Metal command buffer. This converts the
     /// per-allocation `[set commit]` storm
     /// (~880 commits/decode-token) into
-    /// at most one commit per CB submission — mirrors llama.cpp's
-    /// `ggml-metal-device.m:1378-1382` pattern (batch addAllocation in
+    /// at most one commit per CB submission (batch addAllocation in
     /// loop, commit ONCE).
     ///
     /// ADR-015: when the `MLX_UNRETAINED_REFS=1` env var is set at
     /// process start, this constructor uses
     /// [`CommandQueueRef::new_command_buffer_with_unretained_references`]
-    /// instead of `new_command_buffer`.  llama.cpp's per-token decode CBs
-    /// use `commandBufferWithUnretainedReferences` (see
-    /// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:512`) which
+    /// instead of `new_command_buffer`.  `commandBufferWithUnretainedReferences`
     /// skips Metal's per-buffer-binding ARC-retain on submit and saves
     /// ~3-5% on M-series GPUs (per the docstring above).
     ///
@@ -1325,8 +1320,8 @@ impl CommandEncoder {
     /// dispatches where the later dispatch reads a buffer written by an
     /// earlier one.
     ///
-    /// This is the same pattern llama.cpp uses:
-    /// `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
+    /// Emits `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
+    /// (reference-implementation pattern).
     #[allow(unexpected_cfgs)]
     pub fn memory_barrier(&mut self) {
         if let Some(ref mut nodes) = self.capture {
@@ -2111,8 +2106,8 @@ impl CommandEncoder {
     /// the dispatch's ranges into the cumulative state.
     ///
     /// Always called *before* the underlying `encode_*` method
-    /// applies the dispatch.  Mirrors lines 220-225 of
-    /// `ggml-metal-ops.cpp` (`concurrency_check + concurrency_reset +
+    /// applies the dispatch.  Mirrors the peer
+    /// pattern (`concurrency_check + concurrency_reset +
     /// concurrency_add` around each node).
     fn maybe_auto_barrier(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
         if self.mem_ranges.check_dispatch(reads, writes) {
@@ -2237,8 +2232,7 @@ impl CommandEncoder {
     /// [`ResidencySet::remove_allocation`](ResidencySet::remove_allocation)
     /// calls (as fired by `MlxDevice::alloc_buffer` and
     /// `MlxBufferStorage::Drop`) collapse into at most ONE `[set commit]`
-    /// per CB submission. Mirrors llama.cpp's
-    /// `ggml-metal-device.m:1378-1382` (batch addAllocation in loop,
+    /// per CB submission (batch addAllocation in loop,
     /// commit ONCE).
     #[inline]
     fn flush_residency_pending(&self) {

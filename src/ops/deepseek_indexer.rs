@@ -249,7 +249,7 @@ pub fn dispatch_deepseek_indexer_into(
 }
 
 /// Encode the indexer with the same half-staged simdgroup-MMA arithmetic
-/// used by llama.cpp's Metal lightning-indexer kernel.
+/// used by the reference Metal lightning-indexer kernel.
 ///
 /// The ordinary [`dispatch_deepseek_indexer_into`] entry point remains the
 /// BF16-to-F32 reference path. Model runtimes that need production throughput

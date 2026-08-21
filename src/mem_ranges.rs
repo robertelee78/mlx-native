@@ -1,4 +1,4 @@
-//! Dataflow-driven barrier inference (port of llama.cpp `mem_ranges`).
+//! Dataflow-driven barrier inference (peer port of `mem_ranges`).
 //!
 //! ADR-015 iter37 — framework-side complement to iter21's hand-audited
 //! barrier fix at `gpu_full_attn.rs:1856`.
@@ -23,8 +23,7 @@
 //! sequence built without rigorous review is subject to the same
 //! class of bug.
 //!
-//! `MemRanges` ports llama.cpp's mem_ranges algorithm
-//! (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-common.cpp`) so
+//! `MemRanges` implements the peer mem_ranges algorithm so
 //! callers describe each dispatch's read and write buffer regions and
 //! the framework auto-emits a barrier exactly when the new dispatch's
 //! ranges overlap a previously-recorded range.  This makes
@@ -32,8 +31,7 @@
 //!
 //! # Algorithm
 //!
-//! Verbatim port of `ggml_mem_ranges_check` + `ggml_mem_ranges_add`
-//! (lines 124-185 of `ggml-metal-common.cpp`):
+//! Verbatim peer port of `ggml_mem_ranges_check` + `ggml_mem_ranges_add`:
 //!
 //! * A range is `(buffer_id, p0, p1, role∈{Src,Dst})`.
 //! * Two ranges in different buffers can never conflict.
@@ -42,13 +40,13 @@
 //! * A new `Dst` overlapping any existing range (Src or Dst) is a
 //!   WAR/WAW conflict.
 //! * Overlap test: `new.p0 < existing.p1 && new.p1 >= existing.p0`
-//!   (matches llama.cpp byte-for-byte at line 138).
+//!   (matches the reference implementation byte-for-byte).
 //! * On conflict, the caller emits a `memoryBarrier` and `reset()`s
 //!   the cumulative state, then records the new dispatch's ranges.
 //!
 //! # mlx-native specifics
 //!
-//! llama.cpp keys ranges by `tensor->buffer` (the backend buffer
+//! The reference implementation keys ranges by `tensor->buffer` (the backend buffer
 //! handle) plus `tensor->data` (the element pointer inside that
 //! buffer). mlx-native uses
 //! [`MlxBuffer::metal_buffer`](crate::buffer::MlxBuffer::metal_buffer)
@@ -83,8 +81,7 @@ use crate::buffer::MlxBuffer;
 use metal::foreign_types::ForeignType;
 
 /// Whether a recorded range was read by a dispatch (`Src`) or written
-/// by a dispatch (`Dst`).  Mirrors `ggml_mem_range_type` in
-/// `ggml-metal-common.h:14-17`.
+/// by a dispatch (`Dst`).  Mirrors the peer `ggml_mem_range_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemRangeRole {
     /// Dispatch reads this range.
@@ -95,7 +92,7 @@ pub enum MemRangeRole {
 
 /// A buffer region recorded for dataflow tracking.
 ///
-/// Mirrors `struct ggml_mem_range` in `ggml-metal-common.cpp:10-17`.
+/// Mirrors the peer `struct ggml_mem_range`.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferRange {
     /// Backing `metal::Buffer` pointer cast to `usize`.  Stable across
@@ -106,7 +103,7 @@ pub struct BufferRange {
     /// Start byte address (`contents_ptr() + byte_offset` for
     /// `MlxBuffer`).  Used for overlap arithmetic.
     pub p0: u64,
-    /// End byte address (start + element-extent).  llama.cpp uses
+    /// End byte address (start + element-extent).  The reference uses
     /// `tensor->data + ggml_backend_buft_get_alloc_size(tensor)` —
     /// for mlx-native we use the buffer's `byte_len()` minus
     /// `byte_offset()`, which equals the slice extent.
@@ -128,7 +125,7 @@ impl BufferRange {
     ///   contents_ptr + byte_offset + (byte_len - byte_offset))`.
     /// For non-slice buffers `byte_offset == 0` and the range covers
     /// the full allocation.  For slices the range covers only the
-    /// slice region — matching llama.cpp's `tensor->data ..
+    /// slice region — matching the reference `tensor->data ..
     /// tensor->data + alloc_size`.
     #[inline]
     pub fn from_buffer(buf: &MlxBuffer, role: MemRangeRole) -> Self {
@@ -152,7 +149,7 @@ impl BufferRange {
     }
 
     /// Whether `self` and `other` overlap by the same arithmetic
-    /// llama.cpp uses at `ggml-metal-common.cpp:138`.
+    /// as the reference implementation.
     ///
     /// Returns `false` for cross-buffer pairs (different `buf_id`) and
     /// for src-vs-src pairs (read-read is always concurrent-safe).
@@ -164,15 +161,15 @@ impl BufferRange {
         if self.role == MemRangeRole::Src && other.role == MemRangeRole::Src {
             return false;
         }
-        // Llama.cpp: `mr.p0 < cmp.p1 && mr.p1 >= cmp.p0`
+        // Reference: `mr.p0 < cmp.p1 && mr.p1 >= cmp.p0`
         self.p0 < other.p1 && self.p1 >= other.p0
     }
 }
 
 /// Cumulative dataflow state for a sequence of concurrent dispatches.
 ///
-/// Direct port of `struct ggml_mem_ranges` in
-/// `ggml-metal-common.cpp:19-23`.  The state is reset every time a
+/// Direct peer port of `struct ggml_mem_ranges`.
+/// The state is reset every time a
 /// barrier is emitted; between barriers, all recorded dispatches are
 /// considered to run concurrently and their R/W ranges accumulate.
 pub struct MemRanges {
@@ -192,8 +189,8 @@ impl Default for MemRanges {
 }
 
 impl MemRanges {
-    /// New empty state.  Pre-allocates capacity matching llama.cpp's
-    /// `reserve(256)` (line 28).
+    /// New empty state.  Pre-allocates capacity matching the reference
+    /// `reserve(256)`.
     pub fn new() -> Self {
         Self {
             ranges: Vec::with_capacity(256),
@@ -247,8 +244,7 @@ impl MemRanges {
 
     /// Record a dispatch's read-buffer ranges + write-buffer ranges.
     ///
-    /// Mirrors `ggml_mem_ranges_add(tensor)` at
-    /// `ggml-metal-common.cpp:114-122`: pushes one Src range per
+    /// Mirrors `ggml_mem_ranges_add(tensor)`: pushes one Src range per
     /// `tensor->src[i]` and one Dst range for `tensor` itself.
     ///
     /// Caller is expected to have already invoked
@@ -271,7 +267,7 @@ impl MemRanges {
     ///
     /// Returns `true` iff none of the candidate's reads or writes
     /// conflict with any recorded range.  Exactly mirrors
-    /// `ggml_mem_ranges_check(tensor)` at `ggml-metal-common.cpp:175-185`:
+    /// `ggml_mem_ranges_check(tensor)`:
     /// each src is checked against existing ranges, then the dst is
     /// checked against existing ranges.
     ///
@@ -313,7 +309,7 @@ impl MemRanges {
     /// 3. Call [`Self::add_dispatch`] with the same `reads`/`writes`
     ///    to seed the new concurrent group.
     ///
-    /// This mirrors the call pattern at `ggml-metal-ops.cpp:220-225`.
+    /// This mirrors the peer call pattern.
     pub fn check_and_record(
         &mut self,
         reads: &[&MlxBuffer],
@@ -441,7 +437,7 @@ mod tests {
 
     /// Disjoint slices of the same parent: today the algorithm is
     /// conservative (treats slice writes as touching the full
-    /// addressable extent of the parent), matching llama.cpp's
+    /// addressable extent of the parent), matching the reference
     /// `alloc_size` upper bound.  This documents the behavior so
     /// future iterations can tighten it intentionally.
     #[test]

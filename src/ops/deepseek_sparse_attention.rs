@@ -287,7 +287,7 @@ pub fn dispatch_deepseek_sparse_attention_with_scratch(
     Ok(())
 }
 
-/// Gather selected shared-KV rows and run the llama.cpp-derived D=512 Flash
+/// Gather selected shared-KV rows and run the peer-pattern D=512 Flash
 /// Attention kernel with each sparse query presented as an independent flash
 /// batch. The selection is shared by all 64 query heads, so gathering once
 /// lets the tiled kernel reuse each selected KV row across heads.

@@ -54,9 +54,13 @@ mlx-native and hf2q are related but have a strict ownership boundary:
   and CPU/GPU synchronization are API invariants, not debug assertions.
 - Raw byte copies must preserve every payload bit, including packed quantized
   data and NaN payloads.
-- Production library code does not launch Python, llama.cpp, MLX, or another
+- Production library code does not launch Python, MLX, or any other
   inference runtime. Reference programs are acceptable only in explicit
   benchmark/parity harnesses.
+- Reference-implementation policy: code, comments, and docs do not name
+  external peer engines. Say "the reference implementation"; comparison data
+  and derived-kernel provenance live only in `docs/peer-benchmarks.md`
+  (legal notices: `LICENSE-MIT-llamacpp`, `LICENSE-APACHE-candle`).
 
 ## Working method
 

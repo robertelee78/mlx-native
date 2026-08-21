@@ -1,6 +1,6 @@
 //! ADR-028 iter-368 — parity test for `kernel_mul_mv_q8_0_f32_nr2`.
 //!
-//! New kernel ports llama.cpp's `kernel_mul_mv_q8_0_f32_impl` with N_R0_Q8_0=2
+//! New kernel ports the reference `kernel_mul_mv_q8_0_f32_impl` with N_R0_Q8_0=2
 //! and N_SG_Q8_0=4 (peer pattern) — 128 threads/TG, 2 rows/TG with cross-SG
 //! reduction.  The original `kernel_mul_mv_q8_0_f32` uses 64 threads/TG, 8
 //! rows/TG (each SG handles 4 different rows independently).

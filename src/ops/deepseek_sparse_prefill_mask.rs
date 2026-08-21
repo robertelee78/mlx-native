@@ -70,7 +70,7 @@ pub fn dispatch_deepseek_sparse_prefill_mask(
     )
 }
 
-/// F16 sibling used by llama.cpp-compatible D=512 flash prefill.
+/// F16 sibling used by the peer-pattern D=512 flash prefill.
 pub fn dispatch_deepseek_sparse_prefill_mask_f16(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,

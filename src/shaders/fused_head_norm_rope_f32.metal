@@ -141,8 +141,8 @@ kernel void fused_head_norm_rope_f32(
     // threadgroups on Apple Silicon).
     //
     // Matches candle's pattern at reduce.metal:1099 (dedicated threadgroup
-    // scalar under a full barrier) and llama.cpp's architectural choice of
-    // writing Phase-2 results to device memory (never reusing shared scratch).
+    // scalar under a full barrier); Phase-2 results go to device memory
+    // (never reusing shared scratch).
     //
     // Ref: docs/spike-batched-prefill-race-rootcause.md (hf2q, 2026-04-16).
     threadgroup_barrier(mem_flags::mem_threadgroup);

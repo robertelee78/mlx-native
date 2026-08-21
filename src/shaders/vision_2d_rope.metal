@@ -14,8 +14,7 @@ using namespace metal;
 ///   theta_i = base ^ (-2 * i / d_half)
 ///   angle   = position * theta_i
 /// (denominator is d_half, NOT head_dim — each half is its own rotation
-/// domain, mirroring `ggml_rope_ext(..., n_dims = n_dim/2, ...)` in
-/// `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:59-86`.)
+/// domain, i.e. RoPE is applied with n_dims = head_dim/2 per half.)
 ///
 /// Buffer layout:
 ///   buffer(0): input    — float / bfloat array, shape [n_rows, head_dim]

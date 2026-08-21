@@ -54,9 +54,8 @@ pub enum RopeMultiMode {
     Imrope = 40,
     /// Vision multi-section RoPE for ViT 2-D positions (Qwen3-VL ViT block).
     ///
-    /// Mode value `24` matches `GGML_ROPE_TYPE_VISION` in
-    /// `/opt/llama.cpp/ggml/include/ggml.h:253` and the per-section
-    /// `[yyyyxxxx]` layout described at `ggml.h:1840-1846`.
+    /// Mode value `24` matches ggml's `GGML_ROPE_TYPE_VISION` and the
+    /// per-section `[yyyyxxxx]` layout.
     ///
     /// # Layout
     ///
@@ -82,13 +81,13 @@ pub enum RopeMultiMode {
     ///
     /// `local_p` is the index of the pair *within its section*, not the
     /// global `pair_idx`. This per-section restart is what produces the
-    /// `[0123][0123]` exponent pattern documented at `ggml.h:1845-1846`.
+    /// `[0123][0123]` exponent pattern (ggml section-layout contract).
     ///
     /// # No partial-rotary tail
     ///
-    /// The CPU reference at `ggml-cpu/ops.cpp:5860` calls
+    /// The CPU reference calls
     /// `rotate_pairs(ne0, n_dims, ...)` (rotating *all* `head_dim/2` pairs)
-    /// and at `:5866` skips the partial-rotary fill loop when `is_vision`,
+    /// and skips the partial-rotary fill loop when `is_vision`,
     /// so the caller MUST supply `rope_dim == head_dim`.
     ///
     /// # Caller-side requirements
@@ -143,10 +142,10 @@ fn validate(
             p.freq_base
         )));
     }
-    // Vision-mode requires every pair to rotate (no partial-rotary tail —
-    // see /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5803,5866) and the first
+    // Vision-mode requires every pair to rotate (no partial-rotary tail)
+    // and the first
     // two section counts must sum to n_dims = head_dim / 2 (last 2 ignored
-    // per ggml.h:1843-1846).
+    // per the ggml section-layout contract).
     if p.mode == RopeMultiMode::Vision {
         if p.rope_dim != p.head_dim {
             return Err(MlxError::InvalidArgument(format!(

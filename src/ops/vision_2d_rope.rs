@@ -3,7 +3,7 @@
 //! The head_dim splits in half: the first half rotates by `pos_x` and the
 //! second half by `pos_y`, each NeoX-style with its own d-axis schedule.
 //!
-//! Mirrors `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:46-91`:
+//! Mirrors the reference gemma4v vision-RoPE graph:
 //!
 //! ```text
 //! first  = ggml_rope_ext(view[0..n_dim/2],   pos_x, n_dim/2, NEOX, ...)

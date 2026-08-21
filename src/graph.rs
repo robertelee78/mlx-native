@@ -1,6 +1,7 @@
 //! [`GraphExecutor`] — batched Metal dispatch for single-encoder forward passes.
 //!
-//! llama.cpp's speed advantage over candle is NOT the kernels (Phase 0 proved
+//! The reference implementation's speed advantage over candle is NOT the
+//! kernels (Phase 0 proved
 //! candle's are as fast or faster per-call).  It is the dispatch pattern:
 //! 1 encoder per command buffer instead of ~120.  This module implements that
 //! pattern.
@@ -236,8 +237,8 @@ impl ComputeGraph {
     /// fly from each node's read/write buffer ranges.
     ///
     /// This is the correct encoding method for reordered graphs where barrier
-    /// sentinels have been stripped.  Mirrors llama.cpp's encode-time barrier
-    /// insertion via `ggml_metal_op_concurrency_check`.
+    /// sentinels have been stripped: barriers are re-derived from range
+    /// conflicts at encode time.
     ///
     /// Returns the number of barriers emitted.
     pub fn encode_with_barriers(&self, encoder: &mut CommandEncoder) -> u32 {
@@ -295,8 +296,7 @@ impl ComputeGraph {
     /// immediately (GPU starts executing).  The remaining dispatches are encoded
     /// into `encoder1`.  The caller is responsible for committing `encoder1`.
     ///
-    /// This matches llama.cpp's dual command buffer pattern from
-    /// `ggml_metal_graph_compute` (ggml-metal-context.m:441-644):
+    /// Dual command buffer split (reference-implementation pattern):
     /// `n_nodes_0 = MAX(64, 0.1 * n_nodes)` for the first buffer.
     ///
     /// Command buffers submitted to the same `MTLCommandQueue` execute in
@@ -522,16 +522,16 @@ impl ComputeGraph {
 
     /// Run the reorder pass over the graph to improve GPU concurrency.
     ///
-    /// Port of llama.cpp's `ggml_metal_graph_optimize_reorder` — a greedy
-    /// 64-node lookahead that pulls independent dispatches forward to fill
-    /// larger concurrent groups between barriers.
+    /// A greedy 64-node lookahead (peer port) that pulls independent
+    /// dispatches forward to fill larger concurrent groups between
+    /// barriers.
     ///
     /// **Prerequisites:** Call `fuse()` first if desired.  The reorder pass
     /// operates on the post-fusion graph.  Barrier sentinel nodes are stripped
     /// before reordering (they will be recomputed at encode time by the
     /// `ConflictTracker` in `encode_sequential`).
     ///
-    /// **Algorithm (matching llama.cpp exactly):**
+    /// **Algorithm (matching the reference implementation exactly):**
     /// 1. Strip all `CapturedNode::Barrier` nodes.
     /// 2. For each unprocessed node `i0`:
     ///    - If it conflicts with the current concurrent group (`mrs0`):
@@ -582,7 +582,7 @@ impl ComputeGraph {
             };
 
             // Check if node0 conflicts with the current concurrent group.
-            // Empty nodes (no ranges) never conflict — like llama.cpp's is_empty.
+            // Empty nodes (no ranges) never conflict — the is_empty rule.
             let has_ranges = !reads0.is_empty() || !writes0.is_empty();
             if has_ranges && mrs0.conflicts(reads0, writes0) {
                 // Before starting a new group, look forward for nodes that
@@ -801,7 +801,7 @@ fn encode_chunk_with_barriers(nodes: &[CapturedNode], encoder: &mut CommandEncod
 /// rather than requiring live `&MlxBuffer` references.  This is the reorder-time
 /// equivalent of the runtime `ConflictTracker`.
 ///
-/// Conflict rules match llama.cpp's `ggml_mem_ranges_check`:
+/// Conflict rules:
 /// - Two read ranges: OK (read-read is concurrent-safe)
 /// - A new read overlapping an existing write: CONFLICT (RAW)
 /// - A new write overlapping any existing range: CONFLICT (WAR/WAW)
@@ -950,7 +950,7 @@ impl GraphExecutor {
 /// The underlying command buffer is abandoned (never committed to the GPU).
 /// Tracks buffer address ranges for automatic barrier elision.
 ///
-/// Mirrors llama.cpp's `ggml_mem_ranges` — accumulates the read and write
+/// Accumulates the read and write
 /// ranges of all dispatches in the current concurrent group. When a new
 /// dispatch's reads overlap with an existing write (RAW), or its writes
 /// overlap with an existing read or write (WAR/WAW), a barrier is needed.
@@ -978,7 +978,7 @@ impl ConflictTracker {
     /// Check if a new dispatch with the given reads and writes conflicts
     /// with the current concurrent group.
     ///
-    /// Conflict rules (same as llama.cpp `ggml_mem_ranges_check`):
+    /// Conflict rules:
     /// - Two SRC (read) ranges in the same buffer: OK (read-read)
     /// - A new SRC overlapping an existing DST: CONFLICT (RAW)
     /// - A new DST overlapping an existing SRC or DST: CONFLICT (WAR/WAW)
@@ -1702,9 +1702,6 @@ impl<'a> GraphSession<'a> {
     /// actually conflicts with any dispatch in the current concurrent group.
     /// If yes, emits a Metal barrier and resets the tracker. If no, the
     /// barrier is elided and the dispatch can run concurrently.
-    ///
-    /// This mirrors llama.cpp's `ggml_metal_op_concurrency_check` +
-    /// `ggml_metal_op_concurrency_reset` pattern.
     #[inline]
     pub fn barrier_between(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
         // ADR-040 §25 — gated host-encode profiling (HF2Q_BARRIER_NS=1): time the
@@ -1917,9 +1914,8 @@ impl<'a> GraphSession<'a> {
         // `MTLCaptureManager.stopCapture` marks the recording
         // boundary at exactly this point.  CBs committed BEFORE this
         // line are in the trace; any work done by the caller through
-        // the returned encoder is NOT.  This matches llama.cpp's
-        // ggml-metal-context.m:608 pattern (`stopCapture` after the
-        // last `commit + waitUntilCompleted`).
+        // the returned encoder is NOT.  (`stopCapture` goes after the
+        // last `commit + waitUntilCompleted`.)
         //
         // Note: for the async commit() path, the GPU may still be
         // executing the CB when stopCapture fires.  Apple's
@@ -2018,9 +2014,8 @@ impl<'a> GraphSession<'a> {
     /// Mirrors `commit()` semantics, plus the fusion optimization pass.
     ///
     /// Used by the prefill per-layer pattern where the next layer's CPU
-    /// encoding should overlap with this layer's GPU execution — peer's
-    /// llama.cpp Metal backend uses the same async-commit-with-graph-opt
-    /// pattern at `ggml-metal-context.m:617-621`.
+    /// encoding should overlap with this layer's GPU execution — the peer
+    /// Metal backend uses the same async-commit-with-graph-opt pattern.
     ///
     /// In direct-dispatch mode (recording=false), behaves identically to
     /// `commit()`: no fusion happens, just an async commit.

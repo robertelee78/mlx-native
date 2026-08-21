@@ -1,7 +1,7 @@
 //! ADR-028 iter-168: numerical bisect of F16 KV vs F32 KV in flash_attn_vec.
 //!
 //! ADR-009 (2026-04-16) measured F16 KV path producing 19× worse cache_k
-//! drift and 45× worse sdpa_out drift vs llama.cpp baseline. Hypothesis:
+//! drift and 45× worse sdpa_out drift vs the peer baseline. Hypothesis:
 //! the kernel has a layout/alignment bug, NOT a precision tradeoff — peer's
 //! F16 KV is byte-identical to F32 KV (their `2327/2327`), ours drifts.
 //!

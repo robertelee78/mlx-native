@@ -1,5 +1,5 @@
 // Dense BF16/F16/F32 matrix-multiply fallback for environments without the
-// optional Metal tensor API.  This is the non-tensor shape used by llama.cpp:
+// optional Metal tensor API.  This is the reference non-tensor shape:
 // a 64x32 output tile, K=32 staging, and four simdgroups performing 8x8 MMA.
 // BF16 and F16 activations are rounded while staged, matching the tensor
 // kernels' element semantics; F32 stays F32 end-to-end.

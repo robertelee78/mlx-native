@@ -365,7 +365,7 @@ fn test_gdn_gqa_broadcast_correct_k_head_picked() {
         d_k: 4, d_v: 4, n_k_heads: 2, n_v_heads: 6, n_tokens: 2, n_seqs: 1,
     };
     // GQA mapping is modulo (k_head = v_head % n_k_heads, matching
-    // llama.cpp's tiled convention — see 4f00f6e).
+    // the peer's tiled convention; fixed locally in 4f00f6e).
     // n_k_heads=2, n_v_heads=6 -> v_heads {0,2,4} share k_head 0;
     // v_heads {1,3,5} share k_head 1.
 

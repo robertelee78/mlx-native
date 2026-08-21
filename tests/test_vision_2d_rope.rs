@@ -1,6 +1,6 @@
 //! Tests for the 2-D NeoX RoPE used by Gemma 4 Vision (gemma4v).
 //!
-//! Verifies (per `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:46-91`):
+//! Verifies (per the reference gemma4v vision graph):
 //!   1. Identity at origin: when `pos_x[p] = 0` AND `pos_y[p] = 0`, output equals input.
 //!   2. Inverse: applying the kernel and then its inverse (negative angles) recovers input.
 //!   3. NeoX-pair structure: at one (pos_x, pos_y) the per-pair rotation

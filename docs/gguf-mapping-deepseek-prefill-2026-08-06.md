@@ -59,14 +59,15 @@ milliseconds for 180 seconds after the most recent command-buffer submission.
 The same mutex serializes the heartbeat with allocation membership changes;
 the thread stops after the final set owner is dropped. The duration is
 configurable with `MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS`, and zero disables
-the heartbeat for controlled diagnosis. The default matches the lifecycle in
-pinned llama.cpp commit
-`15586e2d7165570fb3aa7c26e0d442e289ef69de`; no model family calls it directly.
+the heartbeat for controlled diagnosis. The default matches the lifecycle at
+the pinned peer reference commit (see `docs/peer-benchmarks.md`); no model
+family calls it directly.
 
 The second-request pre-GPU residual fell to 2.487 ms. A matched three-trial
 M5 Max gate on the same 4,987-token prompt and 100.05 GiB hf2q-produced GGUF
 measured hf2q medians of 674.737 prompt tok/s and 33.908 decode tok/s versus
-llama.cpp medians of 672.914 and 31.643 tok/s. Every greedy transcript was
+peer-baseline medians of 672.914 and 31.643 tok/s (full comparison in
+`docs/peer-benchmarks.md`). Every greedy transcript was
 exact, all prompt-cache counts were zero, and trials were separated by 60
 seconds. This accepts the heartbeat as both a repeat-run stability fix and a
 family-neutral runtime improvement.

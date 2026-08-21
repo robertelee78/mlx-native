@@ -433,7 +433,7 @@ fn run_fused_mm_id_q6_K_parity(
 // which is well below Q6_K's per-element quantization noise (~3-5% rel
 // per coefficient, accumulated to ~3% over K=256). For end-to-end model
 // quality the relevant gate is perplexity parity (validated separately
-// via llama.cpp peer harness — see ADR-033 §Pi memory entries).
+// via the peer harness — see ADR-033 §Pi memory entries).
 
 #[test]
 fn adr033_pi_task20_fused_mm_id_q6_K_parity_top_k1_small() {

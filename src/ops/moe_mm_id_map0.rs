@@ -1,6 +1,6 @@
 //! MoE two-pass mm_id pre-pass — sorts tokens by expert assignment.
 //!
-//! ADR-033 §Pi next-iter arc (iter A) — port of llama.cpp's
+//! ADR-033 §Pi next-iter arc (iter A) — peer port of
 //! `kernel_mul_mm_id_map0`. See
 //! `project_adr033_pi_next_iter_arc_moe_q4_0_kernel_port_2026_05_23.md`.
 //!
@@ -21,15 +21,13 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
-/// Supported `ne20` (n_expert_used) specializations. Mirrors llama.cpp's
-/// `kernel_mul_mm_id_map0_ne20_{N}` host_name set at
-/// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9780-9788`.
+/// Supported `ne20` (n_expert_used) specializations. Mirrors the
+/// reference `kernel_mul_mm_id_map0_ne20_{N}` host_name set.
 pub const SUPPORTED_NE20: &[u32] = &[1, 2, 4, 5, 6, 8, 10, 16, 22];
 
 /// Parameter layout — bytewise identical to the `MoeMmIdMap0Params` struct
-/// in `shaders/moe_mm_id_map0.metal`, which itself mirrors
-/// `ggml_metal_kargs_mul_mm_id_map0` at
-/// `ggml-metal-impl.h:496-505`. Keep field order unchanged.
+/// in `shaders/moe_mm_id_map0.metal`, which itself mirrors the peer
+/// `ggml_metal_kargs_mul_mm_id_map0`. Keep field order unchanged.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct MoeMmIdMap0Params {
@@ -209,9 +207,9 @@ mod tests {
     }
 
     #[test]
-    fn supported_ne20_set_matches_llamacpp() {
-        // Pinned set from /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal
-        // lines 9780-9788. Drift here means the iter B main-kernel port
+    fn supported_ne20_set_matches_reference() {
+        // Pinned reference specialization set. Drift here means the
+        // iter B main-kernel port
         // also needs to track new specializations.
         assert_eq!(SUPPORTED_NE20, &[1u32, 2, 4, 5, 6, 8, 10, 16, 22]);
     }

@@ -16,9 +16,9 @@
 //! because the command buffer also references the encoder (no UAF), so the
 //! symptom was silent data-race non-determinism, NOT a panic.
 //!
-//! llama.cpp uses the IDENTICAL primitive (concurrent encoder +
-//! `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`,
-//! ggml-metal-device.m:512) and works — because it RETAINS the encoder
+//! The peer engine uses the IDENTICAL primitive (concurrent encoder +
+//! `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`)
+//! and works — because it RETAINS the encoder
 //! (`[res->obj retain]`, released at end). The fix matches that: retain in
 //! `get_or_create_encoder`, balanced release in `end_active_encoder`, and a
 //! leak-safe `reset_command_buffer` that routes through `end_active_encoder`

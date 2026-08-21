@@ -38,7 +38,7 @@ fn pseudo_random_f32(seed: u64, n: usize) -> Vec<f32> {
 /// Pack a flat F32 array (length multiple of QK_K=256) into Q4_K super-blocks.
 /// 144 bytes each: 2*sizeof(half) + 12 scales + 128 packed nibbles.
 ///
-/// Mirrors llama.cpp `quantize_row_q4_K_ref`. Uses per-sub-block (32-element)
+/// Mirrors the canonical `quantize_row_q4_K_ref`. Uses per-sub-block (32-element)
 /// affine quantization with 6-bit signed scales and 6-bit unsigned mins,
 /// packed into the 12-byte `scales` field via the standard k-mask layout.
 fn pack_q4_K(values: &[f32]) -> Vec<u8> {
@@ -61,7 +61,7 @@ fn pack_q4_K(values: &[f32]) -> Vec<u8> {
             sub_d[s] = (max - min) / 15.0;
             if sub_d[s] == 0.0 { sub_d[s] = 1e-30; }
         }
-        // Outer scales: per llama.cpp, d (super-scale) = max(sub_d) / 63
+        // Outer scales: per the reference encoder, d (super-scale) = max(sub_d) / 63
         // and dmin = max(-sub_m) / 63.
         let outer_d_max  = sub_d.iter().cloned().fold(0.0f32, f32::max);
         let outer_dm_max = sub_m.iter().cloned().fold(0.0f32, |acc, m| acc.max(-m));

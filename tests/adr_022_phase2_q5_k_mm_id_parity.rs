@@ -34,7 +34,7 @@ fn random_pm1(state: &mut u64) -> f32 {
 /// Reference Q5_K quantizer for synthesizing test weights from F32 rows.
 ///
 /// Encodes a 256-element row using the same packed layout as
-/// llama.cpp's `quantize_row_q5_K_ref`: per-32-element sub-block scale
+/// the canonical `quantize_row_q5_K_ref`: per-32-element sub-block scale
 /// + min, packed as 6-bit pairs in `scales[12]`; quants stored as 4-bit
 /// `qs[128]` plus 1-bit `qh[32]`. The implementation here is a naive
 /// per-sub-block fit (no roundtrip optimization) — sufficient for parity

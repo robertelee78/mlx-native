@@ -210,8 +210,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_q8_0_f32_nr2".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
         // ADR-028 iter-309 — q6_K mat-vec with nr0=2 + cached yl[16]
-        // (peer-pattern port of llama.cpp's `kernel_mul_mv_q6_K_f32_impl`
-        // with N_R0_Q6_K=2; 4 rows/TG vs baseline's 2).  Env-gated via
+        // (peer-pattern kernel with N_R0_Q6_K=2;
+        // 4 rows/TG vs baseline's 2).  Env-gated via
         // `HF2Q_Q6K_MV_NR2=1` in the dispatcher.
         sources.insert("kernel_mul_mv_q6_K_f32_nr2".into(), ggml_src);
         // ADR-040 §0.21c — q6_K column-amortizing mat-vec (mN). Reads each
@@ -224,14 +224,13 @@ impl KernelRegistry {
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL dense mat-vec.
         sources.insert("kernel_mul_mv_q5_1_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_iq4_nl_f32".into(), ggml_src);
-        // ADR-013 P7 — Q4_K dense decode mat-vec (port of llama.cpp's
-        // kernel_mul_mv_q4_K_f32 at ggml-metal.metal:7715-7821).
+        // ADR-013 P7 — Q4_K dense decode mat-vec (peer-pattern kernel).
         sources.insert("kernel_mul_mv_q4_K_f32".into(), ggml_src);
         // ADR-022 Phase 2 — Q5_K dense mv kernel.
         sources.insert("kernel_mul_mv_q5_K_f32".into(), ggml_src);
 
         // GGML block-format quantized matrix-matrix kernels
-        // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's kernel_mul_mm_<q>_f32).
+        // (ADR-011 Phase 3 Wave P3a: peer port of kernel_mul_mm_<q>_f32).
         // Used at prefill m > 8 to reuse each weight tile across a 32-row
         // block via threadgroup-staged simdgroup MMA, instead of re-reading
         // every block per prompt-token as the mv kernel does.
@@ -250,8 +249,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_q4_K_f32".into(), ggml_mm_src);
 
         // GGML block-format quantized matrix-matrix kernels — tensor API
-        // variant (ADR-011 Phase 3 Wave P3b-tensor: port of llama.cpp's
-        // kernel_mul_mm_impl `#ifdef GGML_METAL_HAS_TENSOR` branch).
+        // variant (ADR-011 Phase 3 Wave P3b-tensor: peer port of the
+        // kernel_mul_mm_impl tensor-API branch).
         // Uses Apple's MetalPerformancePrimitives `tensor_ops::matmul2d`
         // primitive which on M3+ dispatches to hardware tensor cores for
         // 2-3x the effective FLOP throughput vs the simdgroup MMA path.
@@ -375,9 +374,9 @@ impl KernelRegistry {
         }
 
         // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
-        // prefill Q@K^T and scores@V, modeled on llama.cpp's
-        // kernel_mul_mm_bf16_f32 with the GGML_METAL_HAS_TENSOR branch
-        // active).  Tile geometry and write-back identical to the
+        // prefill Q@K^T and scores@V; peer-pattern
+        // kernel_mul_mm_bf16_f32 on the tensor-API
+        // branch).  Tile geometry and write-back identical to the
         // quantized tensor kernel; only the A-stage copy (bfloat →
         // bfloat, no dequantize) differs.
         let dense_mm_bf16_tensor_src: &'static str =
@@ -398,9 +397,8 @@ impl KernelRegistry {
         // Dense f32×f32 → f32 tensor-API matmul (F32-everywhere
         // sibling of dense_mm_bf16_tensor).  Used by hf2q's ADR-005
         // iter-118 BF16-vs-F32 ViT attention A/B diagnostic to remove
-        // the BF16 K-stage cast as a confounding variable.  Port of
-        // llama.cpp's kernel_mul_mm_f32_f32 specialization
-        // (ggml-metal.metal:10098) on the GGML_METAL_HAS_TENSOR
+        // the BF16 K-stage cast as a confounding variable.  Peer port
+        // of the kernel_mul_mm_f32_f32 specialization on the tensor-API
         // branch.  Same tile geometry (NR0=64 NR1=32 NK=32) but
         // float-everywhere shmem staging.
         let dense_mm_f32_f32_tensor_src: &'static str =
@@ -414,7 +412,7 @@ impl KernelRegistry {
         // of dense_mm_bf16_tensor).  Used by hf2q's ADR-005 Phase 2c
         // iter-128 gemma4v ViT precision-parity path: every mmproj
         // weight is stored as F16 in GGUF, peer's `kernel_mul_mm_f16_f32`
-        // (`ggml-metal.metal:10099`) stages BOTH A and B as `half` in
+        // stages BOTH A and B as `half` in
         // shmem and computes on `simdgroup_half8x8`.  Matches peer
         // per-element rounding budget exactly (10-bit mantissa vs
         // BF16's 7-bit), closing the 1.16x/block cascade compound that
@@ -448,7 +446,7 @@ impl KernelRegistry {
         );
 
         // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
-        // for M=1 single-token decode.  Port of llama.cpp's
+        // for M=1 single-token decode.  Peer port of
         // kernel_mul_mv_bf16_f32_4 (bfloat4-vectorized GEMV kernel).
         // Used in apply_linear_projection_f32 when seq_len=1 and the
         // weight matrix is BF16, replacing the MM kernel (~2× faster for
@@ -480,8 +478,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q2_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q3_K_f32".into(), ggml_id_src);
-        // ADR-013 P7 — Q4_K MoE expert-routed mat-vec (port of
-        // llama.cpp's kernel_mul_mv_id_q4_K_f32 at ggml-metal.metal:10349).
+        // ADR-013 P7 — Q4_K MoE expert-routed mat-vec (peer-pattern
+        // kernel).
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
@@ -490,8 +488,7 @@ impl KernelRegistry {
         // Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
         sources.insert("kernel_mul_mv_id_q6_K_f32_nr2".into(), ggml_id_src);
         // ADR-029 iter-6 — q8_0 _id with nr0=2 + nsg=4 cross-SG reduce
-        // (peer-pattern port; peer N_R0_Q8_0=2 + N_SG_Q8_0=4 in
-        //  /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:27,40).
+        // (peer-pattern port; peer N_R0_Q8_0=2 + N_SG_Q8_0=4).
         // Env-gated via HF2Q_Q8_0_ID_MV_NR2=1 in dispatch_id_mv.
         sources.insert("kernel_mul_mv_id_q8_0_f32_nr2".into(), ggml_id_src);
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL MoE expert-routed mat-vec.
@@ -503,7 +500,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_0_f32_swiglu".into(), ggml_id_src);
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
-        // (ADR-011 Phase 3 Wave P3a: port of llama.cpp's
+        // (ADR-011 Phase 3 Wave P3a: peer port of
         // `kernel_mul_mm_id_map0_ne20_N` + `kernel_mul_mm_id_<q>_f32`).
         // Two-stage dispatch: map0 regroups the token-to-expert table into
         // per-expert routed-token lists, then mm_id stages a 64x32 expert
@@ -518,7 +515,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q2_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q3_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
-        // ADR-013 P16 — Q4_K mm_id (port of llama.cpp ggml-metal.metal:10169).
+        // ADR-013 P16 — Q4_K mm_id (peer-pattern kernel).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
         // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id template instantiations.
         sources.insert("kernel_mul_mm_id_q5_1_f32".into(), ggml_id_mm_src);
@@ -529,7 +526,8 @@ impl KernelRegistry {
         // ADR-033 §Pi Task #20 / ADR-034 §93 — fused MoE gate+up+silu_mul
         // mm_id kernel for Q6_K. Replaces 3 dispatches (gate_mm_id, up_mm_id,
         // silu_mul_id) with 1 fused dispatch per MoE FFN per layer. Closes
-        // hf2q-vs-llama.cpp prefill gap at production Qwen MoE shapes.
+        // the prefill gap vs the reference implementation at production
+        // Qwen MoE shapes.
         let fused_q6_k_mm_id_src: &'static str =
             include_str!("shaders/fused_gate_up_silu_mm_id_q6_K.metal");
         sources.insert(
@@ -612,7 +610,7 @@ impl KernelRegistry {
 
         // ADR-033 §Pi next-iter arc — two-pass MoE mm_id (iter A: map0).
         // Pre-pass that sorts tokens by expert assignment before the main
-        // mm_id kernel. Ported from llama.cpp's kernel_mul_mm_id_map0; one
+        // mm_id kernel. Peer port of kernel_mul_mm_id_map0; one
         // template specialization per supported ne20 (n_expert_used).
         let moe_mm_id_map0_src: &'static str = include_str!("shaders/moe_mm_id_map0.metal");
         sources.insert("moe_mm_id_map0_ne20_1".into(), moe_mm_id_map0_src);
@@ -762,7 +760,7 @@ impl KernelRegistry {
         );
 
         // Flash attention vector kernels — SIMD-vectorized decode-path SDPA
-        // (ported from llama.cpp flash_attn_ext_vec)
+        // (peer port of flash_attn_ext_vec)
         let flash_attn_vec_src: &'static str = include_str!("shaders/flash_attn_vec.metal");
         sources.insert("flash_attn_vec_dk256".into(), flash_attn_vec_src);
         sources.insert("flash_attn_vec_dk512".into(), flash_attn_vec_src);
@@ -795,8 +793,8 @@ impl KernelRegistry {
         sources.insert("rope_neox_f32".into(), rope_src);
         let rms_norm_src: &'static str = include_str!("shaders/rms_norm.metal");
         sources.insert("rms_norm_f32".into(), rms_norm_src);
-        // ADR-028 iter-310 — float4 + simd_sum variants (peer-pattern,
-        // ported from llama.cpp kernel_rms_norm_fuse_impl<float4, 1>).
+        // ADR-028 iter-310 — float4 + simd_sum variants (peer-pattern
+        // kernel_rms_norm_fuse_impl<float4, 1>).
         // Env-gated via HF2Q_RMS_NORM_V2=1 in the dispatchers.
         sources.insert("rms_norm_f32_v2".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_f32_v2".into(), rms_norm_src);
@@ -1154,8 +1152,8 @@ impl KernelRegistry {
         // Fused norm-add f32 kernels — post-attention / post-FFN / end-of-layer
         let fused_norm_add_f32_src: &'static str = include_str!("shaders/fused_norm_add_f32.metal");
         sources.insert("fused_norm_add_f32".into(), fused_norm_add_f32_src);
-        // ADR-028 iter-331 — float4 + simd_sum variant (peer-pattern,
-        // ported from llama.cpp kernel_rms_norm_fuse_impl<float4, 3>).
+        // ADR-028 iter-331 — float4 + simd_sum variant (peer-pattern
+        // kernel_rms_norm_fuse_impl<float4, 3>).
         // Env-gated via HF2Q_FUSED_NORM_ADD_V2=1 in the dispatcher
         // (default ON since iter-331; opt-out via =0/false/off).
         sources.insert("fused_norm_add_f32_v2".into(), fused_norm_add_f32_src);
@@ -1312,7 +1310,7 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_hybrid_batched_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_batched_dk512".into(), hybrid_src);
 
-        // ADR-029: verbatim llama.cpp peer port.
+        // ADR-029: verbatim peer port.
         // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.
         let peer_port_src: &'static str =
             include_str!("shaders/flash_attn_vec_peer_port_f16.metal");
@@ -1321,7 +1319,7 @@ impl KernelRegistry {
             peer_port_src,
         );
 
-        // ADR-029 iter-134: peer reduce kernel (verbatim port of ggml-metal.metal 7235-7275).
+        // ADR-029 iter-134: peer reduce kernel (verbatim peer port).
         // Pairs with the NWG=32 vec kernel to match peer's actual runtime dispatch.
         let peer_port_reduce_src: &'static str =
             include_str!("shaders/flash_attn_vec_peer_port_f16_reduce.metal");

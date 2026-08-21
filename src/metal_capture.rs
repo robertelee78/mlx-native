@@ -1,8 +1,8 @@
 //! Programmatic Metal Frame Capture wrapping (ADR-015 iter63 Part B).
 //!
-//! Mirrors llama.cpp's `GGML_METAL_CAPTURE_COMPUTE` env-driven capture
-//! pattern (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m`
-//! lines 161-170 + 488-608).  Triggered by:
+//! Env-driven one-shot GPU frame capture: when the capture env vars are
+//! set, the first forward pass of the process is recorded to a
+//! `.gputrace` document.  Triggered by:
 //!
 //! ```bash
 //! METAL_CAPTURE_ENABLED=1 \
@@ -19,9 +19,8 @@
 //! Capture is one-shot per process: the FIRST [`MetalCapture::from_env`]
 //! call after the env var is set returns `Some(MetalCapture)`; every
 //! subsequent call returns `None` (a process-global `AtomicBool`
-//! latches after the first consume).  This mirrors llama.cpp's
-//! `capture_compute = 1; capture_compute--` countdown semantics —
-//! the very first decode/prefill forward pass is captured, and the
+//! latches after the first consume).  Countdown semantics: the very
+//! first decode/prefill forward pass is captured, and the
 //! kit goes quiet thereafter.  Re-running capture requires a fresh
 //! process.
 //!
@@ -55,7 +54,7 @@ use crate::MlxDevice;
 /// Process-global one-shot latch.  Set to `true` the first time a
 /// `MetalCapture` is constructed; subsequent `from_env` calls return
 /// `None` so a single bench run captures exactly the first forward
-/// pass (mirrors llama.cpp's countdown semantics).
+/// pass (one-shot countdown semantics).
 static CAPTURE_CONSUMED: AtomicBool = AtomicBool::new(false);
 
 /// A live programmatic capture session backed by an `MTLCaptureScope`.

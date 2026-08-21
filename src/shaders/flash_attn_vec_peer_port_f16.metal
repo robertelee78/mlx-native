@@ -1,8 +1,7 @@
-// flash_attn_vec_peer_port_f16.metal — Verbatim port of llama.cpp kernel_flash_attn_ext_vec
+// flash_attn_vec_peer_port_f16.metal — Verbatim port of the peer's kernel_flash_attn_ext_vec
 // for f16-K / f16-V, DK=DV=256, NWG=1, NSG=1, NE=1.
 //
 // ADR-029 CFA cfa-20260512-fa-peer-port (iter-125 redo).
-// Peer source: /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal lines 6666-7096.
 // Hypothesis: verbatim peer source body produces peer-equivalent PSO from Apple compiler.
 //
 // Surface adaptations only (RULE-1):
@@ -55,7 +54,7 @@ using namespace metal;
 template <typename T> inline void deq_k_t4(device const T*, short, thread half4& out) { out = half4(0); }
 template <typename T> inline void deq_v_t4(device const T*, short, thread half4& out) { out = half4(0); }
 
-// FA_TYPES expansion for f16/f16 (peer ggml-metal.metal line 7101-7107):
+// FA_TYPES expansion for f16/f16 (peer):
 //   q_t=half4, k_t=half4, v_t=half4, qk_t=float, s_t=float, s4_t=float4, o4_t=float4.
 // kd4_t=k4_t=half4, vd4_t=v4_t=half4 (peer: kd4_t is the dequant type, equal to k4_t
 // for F16 → is_same<kd4_t,k4_t>::value is true at compile time).
@@ -69,8 +68,8 @@ typedef float  s_t;
 typedef float4 s4_t;
 typedef float4 o4_t;
 
-// is_same<T,U>::value — peer uses this construct verbatim (peer ggml-metal.metal uses
-// its own definition; Metal stdlib provides metal::is_same via <metal_stdlib> +
+// is_same<T,U>::value — peer uses this construct verbatim (the peer source defines
+// its own; Metal stdlib provides metal::is_same via <metal_stdlib> +
 // `using namespace metal`. We use the stdlib version directly — equivalent semantics,
 // avoids ambiguity with the global-scope redeclaration that conflicts in Metal 32023+.)
 // No local redefinition needed: metal::is_same<T,U>::value is already in scope.

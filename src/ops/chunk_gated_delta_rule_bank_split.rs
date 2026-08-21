@@ -10,7 +10,7 @@
 //! `head_dim = 256`, so they hit the K validator and fall back to the
 //! token-by-token autoregressive path. That fallback is ~6.7× slower at
 //! pp4096 (per `gpu_delta_net.rs:1118`) and is the documented residual
-//! source of the prefill peer-parity gap vs llama.cpp at production shapes.
+//! source of the prefill peer-parity gap at production shapes.
 //!
 //! This module implements the multi-iter structural fix per
 //! [`chunk_gated_delta_rule.rs:191-195`]:
@@ -70,7 +70,7 @@
 //! - **Iter 20**: orchestrator wiring (gpu_delta_net.rs `chunk_path_eligible`
 //!   accepts K=256 when bank-split dispatch is available).
 //! - **Iter 21**: end-to-end bench Qwen3.6 35B-A3B Q4_0 MoE prefill —
-//!   target: hf2q ≥ llama.cpp at all tested seq lengths.
+//!   target: hf2q ≥ the reference implementation at all tested seq lengths.
 //!
 //! # Status
 //!

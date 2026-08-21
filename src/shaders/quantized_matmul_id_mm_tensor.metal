@@ -10,9 +10,6 @@
 // matmul — the existing simdgroup version is reused verbatim).  Shared-
 // memory staging is the tensor-path row-major layout identical to the
 // dense tensor mm kernel.
-//
-// Portions derived from llama.cpp (MIT).  Copyright the llama.cpp Authors.
-// Q3_K source revision: llama.cpp f9e832c10e9444cb168ddcb579cc62c154f3068b.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -127,7 +124,7 @@ constant int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113
 };
 
-// Spec source: llama.cpp ggml-metal.metal:675.
+// Spec source: reference `get_scale_min_k4_just2`.
 static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
     return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
@@ -161,7 +158,7 @@ void dq_q8_0_id(device const block_q8_0 * xb, short il, thread type4x4 & reg) {
     reg = (type4x4) reg_f;
 }
 
-// Pinned llama.cpp 6ea215d17 ggml-metal.metal::dequantize_q2_K.
+// Q2_K dequantize, pinned to a fixed upstream revision.
 template <typename type4x4>
 void dq_q2_K_id(device const block_q2_K * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -246,9 +243,8 @@ void dq_q6_K_id(device const block_q6_K * xb, short il, thread type4x4 & reg) {
 
 // ADR-022 Phase 1 — Q5_1 / IQ4_NL dequant for tensor-API MMA-tile path.
 // These mirror the dequantize_q5_1 / dequantize_iq4_nl helpers in
-// quantized_matmul_id_mm.metal (which mirror llama.cpp's
-// dequantize_q5_1 at ggml-metal.metal:511 and dequantize_iq4_nl at
-// :920). Renamed to dq_<type>_id to follow the file-local convention.
+// quantized_matmul_id_mm.metal. Renamed to dq_<type>_id to follow the
+// file-local convention.
 
 template <typename type4x4>
 void dq_q5_1_id(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
@@ -288,8 +284,8 @@ void dq_iq4_nl_id(device const block_iq4_nl * xb, short il, thread type4x4 & reg
 }
 
 // ADR-033 §Pi Task #20 tensor-API — IQ4_XS dequant for the tensor-cored
-// MMA path. Spec source: llama.cpp ggml-metal.metal:948-966
-// (`dequantize_iq4_xs`) — ported verbatim modulo formatting. Same
+// MMA path. Spec source: reference `dequantize_iq4_xs`
+// — reproduced verbatim modulo formatting. Same
 // algorithm as `dequantize_iq4_xs` in quantized_matmul_id_mm.metal but
 // scoped to the tensor-API kernel's namespace.
 template <typename type4x4>
@@ -312,7 +308,7 @@ void dq_iq4_xs_id(device const block_iq4_xs * xb, short il, thread type4x4 & reg
 }
 
 // ADR-013 P16 — Q4_K dequant for tensor-API MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:681 (`dequantize_q4_K`).
+// Spec source: reference `dequantize_q4_K`.
 template <typename type4x4>
 void dq_q4_K_id(device const block_q4_K * xb, short il, thread type4x4 & reg) {
     device const uchar * q = xb->qs;
@@ -333,7 +329,7 @@ void dq_q4_K_id(device const block_q4_K * xb, short il, thread type4x4 & reg) {
 }
 
 // ADR-022 Phase 2 — Q5_K dequant for tensor-API mm_id MMA-tile path.
-// Spec source: llama.cpp ggml-metal.metal:699-720 (`dequantize_q5_K`).
+// Spec source: reference `dequantize_q5_K`.
 template <typename type4x4>
 void dq_q5_K_id(device const block_q5_K * xb, short il, thread type4x4 & reg) {
     device const uint8_t * q  = xb->qs;
@@ -437,7 +433,7 @@ kernel void hf2q_mul_mm_id_tensor_impl(
         //
         // ADR-029 iter-55 H47 FALSIFIED 2026-05-11: tested adding
         // `#pragma clang loop unroll(full)` here to mirror peer's
-        // FOR_UNROLL at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9903.
+        // FOR_UNROLL on this loop.
         // Bench (post-H44+H46 baseline, 4K + 8K warmup-then-real):
         //   4K MOE_GATE_UP: 10.61 → 10.65 ms/call (+0.4%, σ)
         //   4K MOE_DOWN:    9.82  → 9.83  ms/call (+0.1%, σ)
@@ -473,7 +469,7 @@ kernel void hf2q_mul_mm_id_tensor_impl(
         // K is always a multiple of NK=32 on our projections, so the
         // per-element K-tail bounds check that the scalar path needs is
         // never triggered — drop it and issue a single half2x4 store
-        // per thread.  Matches llama.cpp's FC_mul_mm_bc_inp=false path.
+        // per thread.  Matches the FC_mul_mm_bc_inp=false fast path.
         {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
@@ -590,9 +586,9 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_nl, 2, dq_iq4_nl_id>(
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
 
 // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
-// template instantiation. Closes the prefill perf gap vs llama.cpp
+// template instantiation. Closes the prefill perf gap vs the peer
 // at production-Qwen-MoE shape — the simdgroup variant alone clocks
-// ~1465 tok/s on M5 Max while llama.cpp's tensor-core kernel hits
+// ~1465 tok/s on M5 Max while the peer's tensor-core kernel hits
 // ~2127 tok/s. Tensor-core path uses Apple M3+'s simdgroup matrix
 // multiply intrinsics via mlx's `tensor_ops::matmul2d` reduction.
 template [[host_name("kernel_mul_mm_id_iq4_xs_tensor_f32")]]

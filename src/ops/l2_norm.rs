@@ -4,7 +4,7 @@
 //!
 //! Used by Gated DeltaNet to normalize Q and K after the conv1d state update
 //! (ADR-013 Decision 3; spec derived from the mathematical definition of
-//! L2 norm, not from llama.cpp source).
+//! L2 norm, not from reference-implementation source).
 //!
 //! Reduction is always performed in f32 for numerical stability regardless
 //! of input dtype.

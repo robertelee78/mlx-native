@@ -1,12 +1,12 @@
 // flash_attn_vec_peer_port_f16_reduce.metal — verbatim port of
-// llama.cpp's kernel_flash_attn_ext_vec_reduce (ggml-metal.metal lines 7232-7275)
+// the peer's kernel_flash_attn_ext_vec_reduce
 // for DV=256, NWG=32. Used after the NWG=32 vec kernel to combine partial
 // results from each workgroup into the final dst.
 //
 // ADR-029 iter-134 (cfa/fa-peer-port-nwg32 follow-up).
 //
 // Hypothesis (refined from iter-127/132): peer's flash-attn-vec uses NWG=32 +
-// reduce kernel by default (ggml-metal-ops.cpp:2944 — `if (false)` disables
+// reduce kernel by default (an `if (false)` in its host dispatch disables the
 // NWG=1 path). The original CFA port (iter-126) targeted the unused NWG=1 dead
 // code path, which falsified at tg5000 (-25%). This file is part of the proper
 // NWG=32 + reduce-kernel port.
@@ -15,7 +15,7 @@
 //   (a) args struct → FlashAttnVecPeerPortReduceParams (just nrows)
 //   (b) DV/NWG baked as file-header #define matching peer's FC-bake
 //   (c) Buffer slots: 0=params, 1=htmp (workgroup partials, float*), 2=dst (float*)
-// Kernel body VERBATIM from peer 7235-7275.
+// Kernel body VERBATIM from the peer.
 
 #include <metal_stdlib>
 using namespace metal;
