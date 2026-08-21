@@ -226,6 +226,11 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_iq4_nl_f32".into(), ggml_src);
         // ADR-013 P7 — Q4_K dense decode mat-vec (peer-pattern kernel).
         sources.insert("kernel_mul_mv_q4_K_f32".into(), ggml_src);
+        // Q4_K column-amortizing mat-vec. The floating-point tree per column
+        // is byte-identical to the serial Q4_K kernel above.
+        for r1 in 2..=5 {
+            sources.insert(format!("kernel_mul_mv_q4_K_f32_mN_r1_{r1}"), ggml_src);
+        }
         // ADR-022 Phase 2 — Q5_K dense mv kernel.
         sources.insert("kernel_mul_mv_q5_K_f32".into(), ggml_src);
 
@@ -1191,6 +1196,13 @@ impl KernelRegistry {
         let gather_src: &'static str = include_str!("shaders/gather.metal");
         sources.insert("gather_f32".into(), gather_src);
 
+        // Direct GGML Q4_K embedding gather. Keep the source registered even
+        // when the precompiled metallib is disabled or unavailable.
+        sources.insert(
+            "embedding_gather_q4_k_f32".into(),
+            include_str!("shaders/embedding_q4_k.metal"),
+        );
+
         // F32 KV cache copy kernel (Session merge S1+S2)
         let kv_cache_copy_src: &'static str = include_str!("shaders/kv_cache_copy.metal");
         sources.insert("kv_cache_copy".into(), kv_cache_copy_src);
@@ -1206,6 +1218,12 @@ impl KernelRegistry {
         // gpu_delta_net::layer_qkv_deinterleave).
         let qkv_split_src: &'static str = include_str!("shaders/qkv_split.metal");
         sources.insert("qkv_split_f32".into(), qkv_split_src);
+
+        // Exact deinterleave of Qwen fused Q/gate projection activations.
+        // Input is [m, heads, 2*head_dim], outputs are separate Q/gate rows.
+        let q_gate_deinterleave_src: &'static str =
+            include_str!("shaders/q_gate_deinterleave.metal");
+        sources.insert("q_gate_deinterleave_f32".into(), q_gate_deinterleave_src);
 
         // Tiled-GQA broadcast kernel (ADR-005 W-5b.19 — replaces hf2q CPU
         // tiled-replicate at gpu_delta_net::apply_gated_delta_net_chunk

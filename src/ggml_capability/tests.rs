@@ -49,6 +49,11 @@ fn dense_decode_reports_specialized_mv_and_exact_bytes() {
 #[test]
 fn dense_auto_routing_policy_is_explicit() {
     let mut request = dense_request(4, GgmlWorkloadClass::ContinuousWidth);
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ4kWidthMn)
+    );
+
     request.ggml_type = GgmlType::Q6_K;
     assert_eq!(
         ggml_capability(request).route,
@@ -69,6 +74,53 @@ fn dense_auto_routing_policy_is_explicit() {
 }
 
 #[test]
+fn mv_ext_widths_are_type_sensitive() {
+    let mut request = dense_request(2, GgmlWorkloadClass::ContinuousWidth);
+    request.routing.dense_decode_mvn = false;
+    request.routing.dense_decode_mv_ext = true;
+
+    for ggml_type in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+        request.ggml_type = ggml_type;
+        for width in 2..=3 {
+            request.invocation = GgmlInvocation::DenseAuto {
+                m: width,
+                n: 5_120,
+                k: 5_120,
+            };
+            assert_ne!(
+                ggml_capability(request).route,
+                Some(GgmlKernelRoute::DenseWidthMvExt),
+                "{ggml_type:?} width {width} must stay off mul_mv_ext"
+            );
+        }
+        request.invocation = GgmlInvocation::DenseAuto {
+            m: 4,
+            n: 5_120,
+            k: 5_120,
+        };
+        assert_eq!(
+            ggml_capability(request).route,
+            Some(GgmlKernelRoute::DenseWidthMvExt),
+            "{ggml_type:?} width 4 must use mul_mv_ext"
+        );
+    }
+
+    for ggml_type in [GgmlType::Q4_0, GgmlType::Q8_0] {
+        request.ggml_type = ggml_type;
+        request.invocation = GgmlInvocation::DenseAuto {
+            m: 2,
+            n: 5_120,
+            k: 5_120,
+        };
+        assert_eq!(
+            ggml_capability(request).route,
+            Some(GgmlKernelRoute::DenseWidthMvExt),
+            "legacy {ggml_type:?} width 2 remains eligible for mul_mv_ext"
+        );
+    }
+}
+
+#[test]
 fn prompt_device_selection_is_not_misreported_as_resolved() {
     let mut request = dense_request(2_048, GgmlWorkloadClass::Prompt);
     let capability = ggml_capability(request);
@@ -85,11 +137,11 @@ fn prompt_device_selection_is_not_misreported_as_resolved() {
 }
 
 #[test]
-fn short_prompt_is_valid_but_reports_mv_fallback() {
+fn short_prompt_is_valid_but_reports_width_route_as_fallback() {
     let request = dense_request(4, GgmlWorkloadClass::Prompt);
     let capability = ggml_capability(request);
     assert!(capability.executable);
-    assert_eq!(capability.route, Some(GgmlKernelRoute::DenseMv));
+    assert_eq!(capability.route, Some(GgmlKernelRoute::DenseQ4kWidthMn));
     assert!(!capability.specialized_for_workload);
     assert!(capability.correctness_fallback);
 }
@@ -223,12 +275,14 @@ fn batched_mv_accepts_width_eight_and_rejects_width_nine_or_prompt_contract() {
 }
 
 #[test]
-fn q6_width_dispatch_count_matches_runtime_tiling() {
+fn q4_and_q6_width_dispatch_count_matches_runtime_tiling() {
     for (m, expected) in [(2, 1), (3, 1), (4, 1), (5, 1), (6, 2), (7, 2), (8, 2)] {
-        let mut request = dense_request(m, GgmlWorkloadClass::ContinuousWidth);
-        request.ggml_type = GgmlType::Q6_K;
-        let capability = ggml_capability(request);
-        assert_eq!(capability.dispatches, expected, "M={m}");
+        for ggml_type in [GgmlType::Q4_K, GgmlType::Q6_K] {
+            let mut request = dense_request(m, GgmlWorkloadClass::ContinuousWidth);
+            request.ggml_type = ggml_type;
+            let capability = ggml_capability(request);
+            assert_eq!(capability.dispatches, expected, "{ggml_type:?} M={m}");
+        }
     }
 }
 
@@ -360,6 +414,16 @@ fn embedding_contract_is_exact() {
         Some(GgmlKernelRoute::EmbeddingQ2K)
     );
     request.ggml_type = GgmlType::Q4_K;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingQ4K)
+    );
+    request.ggml_type = GgmlType::Q8_0;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingQ8_0)
+    );
+    request.ggml_type = GgmlType::Q5_K;
     assert!(!ggml_capability(request).executable);
 }
 

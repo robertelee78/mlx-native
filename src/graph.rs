@@ -175,8 +175,10 @@ impl ComputeGraph {
     pub fn unannotated_dispatch_count(&self) -> usize {
         self.nodes
             .iter()
-            .filter(|n| matches!(n, CapturedNode::Dispatch { reads, writes, .. }
-                if reads.is_empty() || writes.is_empty()))
+            .filter(|n| {
+                matches!(n, CapturedNode::Dispatch { reads, writes, .. }
+                if reads.is_empty() || writes.is_empty())
+            })
             .count()
     }
 
@@ -359,7 +361,10 @@ impl ComputeGraph {
             // Check if current node is an RMS norm dispatch.
             let is_rms_norm = matches!(
                 &self.nodes[i],
-                CapturedNode::Dispatch { op_kind: CapturedOpKind::RmsNorm, .. }
+                CapturedNode::Dispatch {
+                    op_kind: CapturedOpKind::RmsNorm,
+                    ..
+                }
             );
 
             if !is_rms_norm {
@@ -385,7 +390,10 @@ impl ComputeGraph {
 
             let is_elem_mul = matches!(
                 &self.nodes[j],
-                CapturedNode::Dispatch { op_kind: CapturedOpKind::ElemMul, .. }
+                CapturedNode::Dispatch {
+                    op_kind: CapturedOpKind::ElemMul,
+                    ..
+                }
             );
 
             if !is_elem_mul {
@@ -405,7 +413,14 @@ impl ComputeGraph {
                         threadgroup_memory,
                         dispatch_kind,
                         ..
-                    } => (pipeline, bindings, threads_per_grid, threads_per_threadgroup, threadgroup_memory, dispatch_kind),
+                    } => (
+                        pipeline,
+                        bindings,
+                        threads_per_grid,
+                        threads_per_threadgroup,
+                        threadgroup_memory,
+                        dispatch_kind,
+                    ),
                     _ => unreachable!(),
                 };
 
@@ -428,7 +443,9 @@ impl ComputeGraph {
             let mul_a_ptr = Self::buffer_ptr_for_slot(mul_bindings, 0);
             let mul_b_ptr = Self::buffer_ptr_for_slot(mul_bindings, 1);
 
-            if norm_output_ptr.is_none() || (norm_output_ptr != mul_a_ptr && norm_output_ptr != mul_b_ptr) {
+            if norm_output_ptr.is_none()
+                || (norm_output_ptr != mul_a_ptr && norm_output_ptr != mul_b_ptr)
+            {
                 // Data dependency not confirmed — don't fuse.
                 result.push(self.nodes[i].clone());
                 i += 1;
@@ -489,8 +506,16 @@ impl ComputeGraph {
             // plus the mul's scale input, and writes to the mul's output.
             let (fused_reads, fused_writes) = match (&self.nodes[i], &self.nodes[j]) {
                 (
-                    CapturedNode::Dispatch { reads: nr, writes: _nw, .. },
-                    CapturedNode::Dispatch { reads: mr, writes: mw, .. },
+                    CapturedNode::Dispatch {
+                        reads: nr,
+                        writes: _nw,
+                        ..
+                    },
+                    CapturedNode::Dispatch {
+                        reads: mr,
+                        writes: mw,
+                        ..
+                    },
                 ) => {
                     let mut reads = nr.clone();
                     reads.extend_from_slice(mr);
@@ -575,9 +600,12 @@ impl ComputeGraph {
 
             // Extract reads/writes for conflict check.
             let (reads0, writes0, op_kind0) = match node0 {
-                CapturedNode::Dispatch { reads, writes, op_kind, .. } => {
-                    (reads.as_slice(), writes.as_slice(), *op_kind)
-                }
+                CapturedNode::Dispatch {
+                    reads,
+                    writes,
+                    op_kind,
+                    ..
+                } => (reads.as_slice(), writes.as_slice(), *op_kind),
                 CapturedNode::Barrier => continue, // stripped, but be safe
             };
 
@@ -598,9 +626,12 @@ impl ComputeGraph {
 
                     let node1 = &self.nodes[i1];
                     let (reads1, writes1, op_kind1) = match node1 {
-                        CapturedNode::Dispatch { reads, writes, op_kind, .. } => {
-                            (reads.as_slice(), writes.as_slice(), *op_kind)
-                        }
+                        CapturedNode::Dispatch {
+                            reads,
+                            writes,
+                            op_kind,
+                            ..
+                        } => (reads.as_slice(), writes.as_slice(), *op_kind),
                         CapturedNode::Barrier => continue,
                     };
 
@@ -667,10 +698,17 @@ impl ComputeGraph {
     ///
     /// Returns `Some(ptr)` if the slot has a `RecordedBinding::Buffer`,
     /// `None` otherwise.
-    fn buffer_ptr_for_slot(bindings: &[(u64, RecordedBinding)], slot: u64) -> Option<*const std::ffi::c_void> {
+    fn buffer_ptr_for_slot(
+        bindings: &[(u64, RecordedBinding)],
+        slot: u64,
+    ) -> Option<*const std::ffi::c_void> {
         for (idx, binding) in bindings {
             if *idx == slot {
-                if let RecordedBinding::Buffer { metal_buffer, offset: _ } = binding {
+                if let RecordedBinding::Buffer {
+                    metal_buffer,
+                    offset: _,
+                } = binding
+                {
                     // Use the Metal buffer's GPU address as the identity key.
                     // On Apple Silicon unified memory, this uniquely identifies
                     // the allocation.
@@ -984,9 +1022,11 @@ impl ConflictTracker {
     /// - A new DST overlapping an existing SRC or DST: CONFLICT (WAR/WAW)
     /// Check for conflicts and return the reason if one is found.
     /// Returns (conflict_type, new_buf_ptr, existing_buf_ptr) or None.
-    fn conflicts_reason(&self, reads: &[&MlxBuffer], writes: &[&MlxBuffer])
-        -> Option<(&'static str, usize, usize)>
-    {
+    fn conflicts_reason(
+        &self,
+        reads: &[&MlxBuffer],
+        writes: &[&MlxBuffer],
+    ) -> Option<(&'static str, usize, usize)> {
         // Check new reads against existing writes (RAW)
         for r in reads {
             let r_start = r.contents_ptr() as usize;
@@ -1246,6 +1286,27 @@ impl<'a> GraphSession<'a> {
         params: &ops::embedding_q2_k::EmbeddingQ2KParams,
     ) -> Result<()> {
         ops::embedding_q2_k::embedding_gather_q2_k(
+            &mut self.encoder,
+            registry,
+            device,
+            weight,
+            token_ids,
+            output,
+            params,
+        )
+    }
+
+    /// Gather GGML Q4_K embedding rows directly into F32 activations.
+    pub fn embedding_gather_q4_k(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weight: &MlxBuffer,
+        token_ids: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::embedding_q4_k::EmbeddingQ4KParams,
+    ) -> Result<()> {
+        ops::embedding_q4_k::embedding_gather_q4_k(
             &mut self.encoder,
             registry,
             device,
@@ -1563,13 +1624,7 @@ impl<'a> GraphSession<'a> {
         input: &MlxBuffer,
         output: &MlxBuffer,
     ) -> Result<()> {
-        ops::gelu::dispatch_gelu(
-            &mut self.encoder,
-            registry,
-            device,
-            input,
-            output,
-        )
+        ops::gelu::dispatch_gelu(&mut self.encoder, registry, device, input, output)
     }
 
     /// Encode a softmax into this session's encoder.
@@ -1707,7 +1762,11 @@ impl<'a> GraphSession<'a> {
         // ADR-040 §25 — gated host-encode profiling (HF2Q_BARRIER_NS=1): time the
         // conflict-tracking work (conflicts_reason + tracker.add) to split the
         // ~2.44ms/step serial encode into barrier-overhead vs Metal arg-encoding.
-        let _bt = if *BARRIER_NS_ON { Some(std::time::Instant::now()) } else { None };
+        let _bt = if *BARRIER_NS_ON {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // In capture mode, stash the read/write ranges so the next captured
         // dispatch node carries them for the reorder pass (Phase 4e.3).
         if self.recording {
@@ -1725,7 +1784,8 @@ impl<'a> GraphSession<'a> {
                     (start, start + b.byte_len())
                 })
                 .collect();
-            self.encoder.set_pending_buffer_ranges(read_ranges, write_ranges);
+            self.encoder
+                .set_pending_buffer_ranges(read_ranges, write_ranges);
         }
 
         let reason = self.tracker.conflicts_reason(reads, writes);
@@ -1744,7 +1804,10 @@ impl<'a> GraphSession<'a> {
         self.total_dispatches += 1;
         self.tracker.add(reads, writes);
         if let Some(t) = _bt {
-            BARRIER_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            BARRIER_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -1757,9 +1820,17 @@ impl<'a> GraphSession<'a> {
             gs[idx] += 1;
         }
         let total_groups: u32 = gs.iter().sum();
-        eprintln!("  [GROUP_STATS] dispatches={} barriers={} groups={} ratio={:.2}",
-            self.total_dispatches, self.barrier_count, total_groups,
-            if total_groups > 0 { self.total_dispatches as f64 / total_groups as f64 } else { 0.0 });
+        eprintln!(
+            "  [GROUP_STATS] dispatches={} barriers={} groups={} ratio={:.2}",
+            self.total_dispatches,
+            self.barrier_count,
+            total_groups,
+            if total_groups > 0 {
+                self.total_dispatches as f64 / total_groups as f64
+            } else {
+                0.0
+            }
+        );
         for (i, &count) in gs.iter().enumerate() {
             if count > 0 {
                 eprintln!("    size {}: {} groups", i + 1, count);
@@ -2253,7 +2324,14 @@ impl<'a> GraphSession<'a> {
                         gpu_wait_ns as f64 / 1e6, b0, b1);
                 }
 
-                return Ok((encoding_ns, gpu_wait_ns, fusions, reordered, barriers0, barriers1));
+                return Ok((
+                    encoding_ns,
+                    gpu_wait_ns,
+                    fusions,
+                    reordered,
+                    barriers0,
+                    barriers1,
+                ));
             }
         }
 
@@ -2263,6 +2341,13 @@ impl<'a> GraphSession<'a> {
         self.encoder.commit();
         self.encoder.wait_until_completed()?;
         let gpu_wait_ns = commit_start.elapsed().as_nanos() as u64;
-        Ok((encoding_ns, gpu_wait_ns, fusions, reordered, barriers0, barriers1))
+        Ok((
+            encoding_ns,
+            gpu_wait_ns,
+            fusions,
+            reordered,
+            barriers0,
+            barriers1,
+        ))
     }
 }

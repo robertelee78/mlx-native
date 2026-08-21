@@ -157,6 +157,29 @@ fn trace_binds_actual_dense_routes_and_drains_failures() {
     );
     assert_eq!(width_trace.dispatches.len(), 2);
 
+    let q4_width = GgmlQuantizedMatmulParams {
+        ggml_type: GgmlType::Q4_K,
+        ..width
+    };
+    let (q4_input, q4_weight, q4_output) = buffers(&device, q4_width);
+    let q4_trace = quantized_matmul_ggml_with_policy_and_trace(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q4_input,
+        &q4_weight,
+        &q4_output,
+        &q4_width,
+        &GgmlRoutingPolicy::default(),
+        GgmlWorkloadClass::ContinuousWidth,
+    )
+    .expect("Q4_K width trace");
+    assert_eq!(
+        q4_trace.resolved_route,
+        GgmlResolvedKernelRoute::DenseQ4kWidthMn
+    );
+    assert_eq!(q4_trace.dispatches.len(), 2);
+
     let short_weight = device
         .alloc_buffer(1, DType::U8, vec![1])
         .expect("short weight");
@@ -237,7 +260,7 @@ fn trace_binds_baseline_nr2_mv_ext_and_small_tile_device_routes() {
     assert_eq!(nr2.resolved_route, GgmlResolvedKernelRoute::DenseMvNr2);
 
     let width = GgmlQuantizedMatmulParams {
-        m: 2,
+        m: 4,
         n: 16,
         k: 256,
         ggml_type: GgmlType::Q4_K,

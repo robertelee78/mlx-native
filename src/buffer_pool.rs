@@ -222,10 +222,16 @@ impl MlxBufferPool {
         // Track the handout so reset() can recycle it.  ARC clone is cheap.
         self.in_use.push((bucket, metal_buf.clone()));
 
-        Ok((
-            MlxBuffer::from_raw(metal_buf, dtype, shape),
-            added_residency,
-        ))
+        // `metal_buf` owns the power-of-two bucket capacity, but callers asked
+        // for exactly `byte_len` logical bytes.  Preserve that distinction in
+        // the returned handle.  Treating the whole bucket as logical data
+        // breaks strict kernel boundaries (for example a 20 KiB Q4_K
+        // embedding row lives in a 32 KiB bucket) and lets overlap/size
+        // validation reason about bytes outside the tensor.
+        let bucket_view = MlxBuffer::from_raw(metal_buf, dtype, shape.clone());
+        let logical_view = bucket_view.data_view(0, byte_len, dtype, shape)?;
+
+        Ok((logical_view, added_residency))
     }
 
     /// Return a single buffer to the pool's free list for future reuse.
@@ -654,6 +660,11 @@ mod tests {
             .expect("allocate non-power-of-two logical tensor");
 
         assert_eq!(buffer.byte_len(), 256, "pool retains bucket capacity");
+        assert_eq!(
+            buffer.data_byte_len(),
+            140,
+            "pool exposes only the requested logical bytes"
+        );
         assert_eq!(
             buffer
                 .as_logical_slice::<i32>()

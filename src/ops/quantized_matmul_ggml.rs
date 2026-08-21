@@ -32,7 +32,7 @@ static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 // ADR-040 §0.21 decode mul_mv_ext lever (opt-in, default off — see routing site).
 static CACHED_DECODE_MV_EXT: AtomicI8 = AtomicI8::new(-1);
-// ADR-040 §0.21c decode mvN lever (bit-identical column-amortizing Q6_K mv).
+// Decode mvN lever (bit-identical column-amortizing Q4_K/Q6_K mv).
 static CACHED_DECODE_MVN: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
@@ -610,11 +610,11 @@ pub fn quantized_matmul_ggml_with_policy(
     // `r1ptg` src1 columns processed per threadgroup, so each quantized weight
     // block is read ONCE across the m columns — vs the regular `mv` which
     // re-reads the weight per column, measured ~5× at m=8). mul_mv_ext is
-    // BYTE-IDENTICAL to mv (per-column dot-product, same MAC order; proven by
-    // adr_022_phase{1,4}_mv_ext_parity), so batched decode stays bit-exact to
-    // the serial m=1 path. Gated to the instantiated qtypes (gemma4 = Q6_K +
-    // Q8_0) and k divisible by the type's block; everything else falls through
-    // to the existing mv/mm routing unchanged.
+    // Numerically close but not generally byte-identical to mv: the wider
+    // kernel uses a different reduction tree. A family must therefore qualify
+    // model decisions and cache handoff before enabling it in production.
+    // K-quants use m=4..8; legacy Q4_0/Q8_0 retain m=2..8. Unsupported shapes
+    // fall through unchanged.
     // ADR-040 §0.21 decode F3 lever (mul_mv_ext weight-amortization) — opt-in,
     // DEFAULT OFF (HF2Q_DECODE_MV_EXT=1). MEASURED: routing decode m∈[2,8] to
     // mul_mv_ext gives N=8 decode 197→245.8 t/s (+25%, toward llama 291) — the
@@ -641,6 +641,19 @@ pub fn quantized_matmul_ggml_with_policy(
     // fix that the mvN flake surfaced — encoder.rs §0.21c-track2) + measured
     // +12.5% net N=8 decode throughput (clean single-tenant).
     match plan_dense_auto_route(params.ggml_type, params.m, params.k, routing) {
+        DenseAutoPlan::Q4kWidthMn => {
+            debug_assert!(params.k % QK4_K == 0);
+            if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
+                eprintln!(
+                    "[mvN-route] Q4_K m={} n={} k={} → mN tiles={:?}",
+                    params.m,
+                    params.n,
+                    params.k,
+                    mn_column_tiling(params.m as usize)
+                );
+            }
+            dispatch_mv_q4k_mn_adaptive(encoder, registry, device, input, weight, output, params)
+        }
         DenseAutoPlan::Q6kWidthMn => {
             debug_assert!(params.k % QK6_K == 0);
             if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
@@ -1417,6 +1430,120 @@ fn dispatch_mv_batched(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mv_q4k_mn_chunk(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    r1ptg: usize,
+    col0: usize,
+    width: usize,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q4k_mn: expected Q4_K weights, got {:?}",
+            params.ggml_type
+        )));
+    }
+    if !(2..=5).contains(&r1ptg) || r1ptg != width {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q4k_mn: tile width must equal r1ptg in 2..=5, got width={width}, r1ptg={r1ptg}"
+        )));
+    }
+
+    let kernel_name = match r1ptg {
+        2 => "kernel_mul_mv_q4_K_f32_mN_r1_2",
+        3 => "kernel_mul_mv_q4_K_f32_mN_r1_3",
+        4 => "kernel_mul_mv_q4_K_f32_mN_r1_4",
+        5 => "kernel_mul_mv_q4_K_f32_mN_r1_5",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_mv_q4k_mn: r1ptg must be 2..=5, got {r1ptg}"
+            )))
+        }
+    };
+
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
+
+    let gpu_params = GgmlMatvecGpuParams {
+        ne00: params.k as i64,
+        ne01: params.n as i64,
+        ne02: 1,
+        ne10: params.k as i64,
+        ne12: 1,
+        ne0: params.n as i64,
+        ne1: width as i64,
+        r2: 1,
+        r3: 1,
+    };
+
+    let f32_sz = DType::F32.size_of() as u64;
+    let input_off = (col0 as u64) * (params.k as u64) * f32_sz;
+    let output_off = (col0 as u64) * (params.n as u64) * f32_sz;
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(params.n as usize, 2) as u64,
+        div_ceil(width, r1ptg) as u64,
+        1,
+    );
+    let threads_per_tg = metal::MTLSize::new(2, 32, 1);
+
+    encoder.dispatch_tracked_threadgroups_with_args(
+        &pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::BufferWithOffset(input, input_off)),
+            (2, KernelArg::BufferWithOffset(output, output_off)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[weight, input],
+        &[output],
+        threadgroups,
+        threads_per_tg,
+    );
+
+    Ok(())
+}
+
+/// Tile a Q4_K m∈[2,8] batch into the same register-safe widths used by
+/// Q6_K. Columns are independent, so tiling preserves serial byte identity.
+pub fn dispatch_mv_q4k_mn_adaptive(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    let m = params.m as usize;
+    if params.ggml_type != GgmlType::Q4_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q4k_mn_adaptive: expected Q4_K weights, got {:?}",
+            params.ggml_type
+        )));
+    }
+    if !(2..=MM_ROUTING_THRESHOLD as usize).contains(&m) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q4k_mn_adaptive: m must be 2..={MM_ROUTING_THRESHOLD}, got {m}"
+        )));
+    }
+    for (col0, width) in mn_column_tiling(m) {
+        dispatch_mv_q4k_mn_chunk(
+            encoder, registry, device, input, weight, output, params, width, col0, width,
+        )?;
+    }
+    Ok(())
+}
+
 /// ADR-040 §0.21c — dispatch the bit-identical column-amortizing Q6_K mat-vec
 /// (`kernel_mul_mv_q6_K_f32_mN_r1_{R1}`) as a SINGLE tile of width `r1ptg` over
 /// a width-`params.m` batch (so `r1ptg` must equal `params.m`). For arbitrary
@@ -1571,7 +1698,7 @@ fn mn_column_tiling(m: usize) -> Vec<(usize, usize)> {
     }
 }
 
-pub(crate) fn q6k_mn_dispatch_count(m: u32) -> u32 {
+pub(crate) fn dense_mn_dispatch_count(m: u32) -> u32 {
     mn_column_tiling(m as usize).len() as u32
 }
 

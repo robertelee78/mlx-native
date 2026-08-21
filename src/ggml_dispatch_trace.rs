@@ -38,6 +38,7 @@ pub struct GgmlKernelDispatchReceipt {
 pub enum GgmlResolvedKernelRoute {
     DenseMv,
     DenseMvNr2,
+    DenseQ4kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
     DenseMmSimdgroup,
@@ -246,7 +247,10 @@ fn validate_dense_dispatches(
                 GgmlResolvedKernelRoute::DenseMv
             })
         }
-        GgmlKernelRoute::DenseQ6kWidthMn => {
+        GgmlKernelRoute::DenseQ4kWidthMn | GgmlKernelRoute::DenseQ6kWidthMn => {
+            let is_q4 = structural_route == GgmlKernelRoute::DenseQ4kWidthMn;
+            let type_name = if is_q4 { "Q4_K" } else { "Q6_K" };
+            let kernel_type = if is_q4 { "q4_K" } else { "q6_K" };
             let widths: &[u32] = match m {
                 2 => &[2],
                 3 => &[3],
@@ -256,30 +260,34 @@ fn validate_dense_dispatches(
                 7 => &[4, 3],
                 8 => &[4, 4],
                 _ => {
-                    return Err(MlxError::InvalidArgument(
-                        "Q6_K width trace requires M in 2..=8".into(),
-                    ))
+                    return Err(MlxError::InvalidArgument(format!(
+                        "{type_name} width trace requires M in 2..=8"
+                    )))
                 }
             };
             if dispatches.len() != widths.len() {
                 return Err(MlxError::InvalidArgument(format!(
-                    "Q6_K width trace requires {} tiles, got {}",
+                    "{type_name} width trace requires {} tiles, got {}",
                     widths.len(),
                     dispatches.len()
                 )));
             }
             for (dispatch, width) in dispatches.iter().zip(widths.iter()) {
-                let kernel = format!("kernel_mul_mv_q6_K_f32_mN_r1_{width}");
+                let kernel = format!("kernel_mul_mv_{kernel_type}_f32_mN_r1_{width}");
                 require_dispatch(
                     dispatch,
                     &kernel,
                     &single_batch_pipeline_label(&kernel),
-                    [div_ceil_u64(n, 4), 1, 1],
+                    [div_ceil_u64(n, if is_q4 { 2 } else { 4 }), 1, 1],
                     [2, 32, 1],
                     &[],
                 )?;
             }
-            Ok(GgmlResolvedKernelRoute::DenseQ6kWidthMn)
+            Ok(if is_q4 {
+                GgmlResolvedKernelRoute::DenseQ4kWidthMn
+            } else {
+                GgmlResolvedKernelRoute::DenseQ6kWidthMn
+            })
         }
         GgmlKernelRoute::DenseWidthMvExt => {
             let dispatch = require_one(dispatches)?;
@@ -594,6 +602,56 @@ mod tests {
             &width_request,
             &capability,
             &[dispatch(3), dispatch(4)]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn q4_width_trace_requires_exact_ordered_tiles_and_geometry() {
+        let width_request = request(
+            GgmlInvocation::DenseAuto {
+                m: 7,
+                n: 65,
+                k: 256,
+            },
+            GgmlType::Q4_K,
+            GgmlWorkloadClass::ContinuousWidth,
+            GgmlRoutingPolicy::default(),
+        );
+        let capability = ggml_capability(width_request);
+        let dispatch = |width| {
+            let kernel = format!("kernel_mul_mv_q4_K_f32_mN_r1_{width}");
+            fake_dispatch(
+                &kernel,
+                &single_batch_pipeline_label(&kernel),
+                [33, 1, 1],
+                [2, 32, 1],
+                Vec::new(),
+            )
+        };
+        let valid = vec![dispatch(4), dispatch(3)];
+        assert_eq!(
+            validate_dense_dispatches(&width_request, &capability, &valid).unwrap(),
+            GgmlResolvedKernelRoute::DenseQ4kWidthMn
+        );
+        assert!(validate_dense_dispatches(
+            &width_request,
+            &capability,
+            &[dispatch(3), dispatch(4)]
+        )
+        .is_err());
+        let kernel = "kernel_mul_mv_q4_K_f32_mN_r1_4";
+        let wrong_geometry = fake_dispatch(
+            kernel,
+            &single_batch_pipeline_label(kernel),
+            [17, 1, 1],
+            [2, 32, 1],
+            Vec::new(),
+        );
+        assert!(validate_dense_dispatches(
+            &width_request,
+            &capability,
+            &[wrong_geometry, dispatch(3)]
         )
         .is_err());
     }
