@@ -1,7 +1,7 @@
 //! ADR-015 P3a — Per-dispatch encode cost calibration on M5 Max.
 //!
 //! P2 (`cb_cost_calibration.rs`) measured async µs/CB ≈ 1.6 µs and
-//! showed that the hf2q→llama.cpp 0.5 ms/token decode gap can only
+//! showed that hf2q's 0.5 ms/token decode gap to the peer engine can only
 //! be ~32% explained by CB-count alone.  The remaining ~340 µs/token
 //! must live in **per-dispatch** encode cost or **Rust-side
 //! orchestration overhead**.
@@ -18,14 +18,14 @@
 //!
 //! ## Reading the numbers
 //!
-//! - `µs/dispatch` ≈ 0.14 (matching llama.cpp's implied per-dispatch
+//! - `µs/dispatch` ≈ 0.14 (matching the peer engine's implied per-dispatch
 //!   cost: ~150 µs CPU encode for ~1070 dispatches per token):
 //!   the residual gap is **NOT** per-dispatch.  Lever lives elsewhere
 //!   (Rust orchestration, buffer pool, barrier bookkeeping).
 //! - `µs/dispatch` ≫ 0.14: hf2q's per-dispatch encoding has overhead
-//!   llama.cpp doesn't.  Lever is shader-launch path optimization.
+//!   the peer engine doesn't.  Lever is shader-launch path optimization.
 //! - hf2q decode at ~1070 dispatches/token × measured µs/dispatch
-//!   gives the actual per-dispatch budget; compare to llama.cpp's
+//!   gives the actual per-dispatch budget; compare to the peer engine's
 //!   ~150 µs total CPU encode (per ADR-012's analysis).
 //!
 //! ## Usage

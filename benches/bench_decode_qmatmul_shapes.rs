@@ -52,7 +52,7 @@ const SHAPES: &[DecodeShape] = &[
     DecodeShape { label: "V_sliding",  n: 2048, k: 2816, qtype: GgmlType::Q6_K, per_token: 24 },
     DecodeShape { label: "O_sliding",  n: 2816, k: 4096, qtype: GgmlType::Q6_K, per_token: 24 },
     // Global layers (6 of 30): same head shapes as sliding for gemma4
-    // (per llama.cpp gemma4.cpp:208 — both use n_head_kv but proj
+    // (per the reference model graph — both use n_head_kv but proj
     // weights live at the same n=2816→4096/2048 dims).  Re-bench at
     // the same shape to confirm Q5_K behaviour.
     DecodeShape { label: "Q_global",   n: 4096, k: 2816, qtype: GgmlType::Q6_K, per_token: 6 },

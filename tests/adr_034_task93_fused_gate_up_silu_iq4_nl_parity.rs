@@ -40,7 +40,7 @@ fn pseudo_random_f32(seed: u64, n: usize) -> Vec<f32> {
 }
 
 /// Pack F32 values into IQ4_NL blocks (18 bytes each: half scale + 16 packed
-/// codebook indices). Mirrors llama.cpp's quantize_row_iq4_nl_ref logic:
+/// codebook indices). Mirrors the canonical quantize_row_iq4_nl_ref logic:
 /// per block, find d such that max|v|/d ∈ codebook range, then nearest-index
 /// lookup for each value.
 fn pack_iq4_nl(values: &[f32]) -> Vec<u8> {
@@ -48,7 +48,7 @@ fn pack_iq4_nl(values: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() / QK4_0 * 18);
     for block in values.chunks(QK4_0) {
         // d = max|v| / 113 (max-abs of codebook = max(113, -(-127)) = 127,
-        //    but llama.cpp's pivot uses max signed extent properly).
+        //    but the reference pivot uses max signed extent properly).
         // Simpler: choose d so that v/d lies in codebook range,
         // then nearest-neighbor lookup.
         let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);

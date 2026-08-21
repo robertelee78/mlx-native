@@ -1,7 +1,7 @@
 //! ADR-015 P2 — Empty-CB encode/submit cost calibration on M5 Max.
 //!
 //! Refutes or confirms the working assumption from ADR-012 §Optimize that
-//! the hf2q→llama.cpp 0.5 ms/token decode gap is dominated by
+//! hf2q's 0.5 ms/token decode gap to the peer engine is dominated by
 //! CPU-side per-CB scheduling overhead at ~5 µs/CB × ~100 CB/token.
 //!
 //! ## Method

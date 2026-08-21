@@ -73,7 +73,7 @@ fn pick_axis_cpu(sector: u32, mode: RopeMultiMode, s: [u32; 4]) -> u32 {
         }
         RopeMultiMode::Vision => {
             // Vision ignores sections 2 and 3; only y/x axes used.
-            // Mirrors /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:308-313.
+            // Mirrors the reference CUDA kernel's sector mapping.
             if sector < s[0] {
                 0
             } else {
@@ -88,9 +88,8 @@ fn pick_axis_cpu(sector: u32, mode: RopeMultiMode, s: [u32; 4]) -> u32 {
 /// Handles all three modes. For VISION (mode 24), `sect_dims = s0 + s1`
 /// (last two sections ignored), the theta exponent is the *per-section*
 /// `local_p` rather than the global `pair_idx`, and the denominator is
-/// `n_dims = head_dim/2` rather than `rope_dim`. Mirrors the CUDA
-/// reference at /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:268-328 and the
-/// `indep_sects` branch of /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5660-5710.
+/// `n_dims = head_dim/2` rather than `rope_dim`. Mirrors the reference
+/// CUDA kernel and the `indep_sects` branch of the reference CPU op.
 fn cpu_rope_multi(
     input: &[f32],
     positions: &[i32],
@@ -827,12 +826,9 @@ fn test_rope_multi_cached_seq_len_variation() {
 // VISION mode (mode == 24, RopeMultiMode::Vision) — Qwen3-VL ViT
 // =================================================================
 //
-// Spec sources:
-//   /opt/llama.cpp/ggml/include/ggml.h:253                (mode = 24)
-//   /opt/llama.cpp/ggml/include/ggml.h:1840-1846          ([yyyyxxxx] layout)
-//   /opt/llama.cpp/ggml/src/ggml-cuda/rope.cu:268-328     (kernel ref)
-//   /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5643-5711    (cache_init w/ indep_sects)
-//   /opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:14,111   (call site)
+// Spec source: the reference implementation — mode = 24, [yyyyxxxx]
+// section layout, the CUDA rope kernel, cache_init with indep_sects,
+// and the Qwen3-VL ViT call site.
 //
 // Acceptance for the mlx-native PR: synthetic input where [yyyyxxxx] dim
 // layout produces specific output values from a hand-computed reference;

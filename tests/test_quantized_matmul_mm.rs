@@ -1,6 +1,6 @@
 //! Unit tests for the GGML block-format matrix-matrix (mm) quantized GPU kernels.
 //!
-//! ADR-011 Phase 3 Wave P3a port of llama.cpp's `kernel_mul_mm_<qtype>_f32`.
+//! ADR-011 Phase 3 Wave P3a port of the reference `kernel_mul_mm_<qtype>_f32`.
 //! The dispatcher in `quantized_matmul_ggml.rs` routes inputs with `m > 8`
 //! through these kernels, which stage a 64x32 weight tile into threadgroup
 //! shared memory and reuse it across a 32-row block of M.  The same math,
@@ -620,7 +620,7 @@ fn test_q8_0_mm_matches_mv_small() {
     let input = pseudo_random_f32(0x5678, m * k);
 
     // MM kernel uses FP16 A-tile (`simdgroup_half8x8 ma[4]` at
-    // quantized_matmul_mm.metal:401) per llama.cpp's MMA design for
+    // quantized_matmul_mm.metal:401) per the reference MMA design for
     // tensor-core speedup. MV kernel keeps FP32 throughout. The precision
     // bound is ~2 × sqrt(K) × eps_fp16 ≈ 1e-2 at K=128.
     check_mm_matches_mv_by_row(m, n, k, GgmlType::Q8_0, &weight_bytes, &input, 1.5e-2,
@@ -853,7 +853,7 @@ fn test_q6_k_mm_matches_mv_small() {
     }
     let input = pseudo_random_f32(0x9ABC, m * k);
 
-    // Q6_K MM uses FP16 A-tile (`simdgroup_half8x8 ma[4]` per llama.cpp MMA
+    // Q6_K MM uses FP16 A-tile (`simdgroup_half8x8 ma[4]` per the reference MMA
     // design) while MV stays FP32. Precision bound at K=256:
     // ~2 × sqrt(256) × eps_fp16 ≈ 1.5e-2 — calibrated with quant-noise margin.
     check_mm_matches_mv_by_row(m, n, k, GgmlType::Q6_K, &weight_bytes, &input, 2e-2,

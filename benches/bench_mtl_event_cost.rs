@@ -28,11 +28,11 @@
 //!
 //! ## Peer reference (semantic only, no code copied)
 //!
-//! `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:935-985`:
-//!   `newSharedEvent` (961), `encodeSignalEvent:value:` with
-//!   `atomic_fetch_add_explicit + 1` monotonic counter (945-949),
-//!   `encodeWaitForEvent:value:` (952-957). One event per stage boundary,
-//!   monotonic per-event counter, signal `N+1` then wait `N`.
+//! The peer engine's Metal backend uses `newSharedEvent`,
+//!   `encodeSignalEvent:value:` with an `atomic_fetch_add_explicit + 1`
+//!   monotonic counter, and `encodeWaitForEvent:value:`. One event per
+//!   stage boundary, monotonic per-event counter, signal `N+1` then
+//!   wait `N`.
 //!
 //! ## Methodology — "measure 3x, cut once"
 //!
@@ -105,8 +105,8 @@ fn encode_wait(cb: &CommandBufferRef, event: &SharedEvent, value: u64) {
 // ---------------------------------------------------------------------------
 // H1 — MTLSharedEvent signal+wait roundtrip per CB-pair.
 //
-// Pattern (mirrors llama.cpp ggml-metal-device.m:945-957 monotonic-counter
-// semantic): for each pair i in 0..N_PAIRS,
+// Pattern (mirrors the peer engine's monotonic-counter semantic):
+// for each pair i in 0..N_PAIRS,
 //   * cb_a := queue.new_command_buffer
 //   * cb_a.encode_signal_event(ev, i+1)
 //   * cb_a.commit()                       (non-blocking)

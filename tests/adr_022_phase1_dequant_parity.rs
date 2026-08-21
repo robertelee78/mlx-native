@@ -11,8 +11,8 @@
 //! > → mlx-native dequant → assert max_abs_delta ≤ documented quant
 //! > error bound (Q5_1 ≤ 0.025; IQ4_NL ≤ 0.025).
 //!
-//! Reference quantization mirrors the canonical llama.cpp encoders:
-//!   * Q5_1: `quantize_row_q5_1_ref` (`ggml-quants.c:189`).
+//! Reference quantization mirrors the canonical GGUF encoders:
+//!   * Q5_1: `quantize_row_q5_1_ref`.
 //!   * IQ4_NL: simplified d-fit + nearest-codebook (full
 //!     `quantize_row_iq4_nl_impl` is more sophisticated, but for parity
 //!     purposes a naive quantizer is sufficient — we're validating the
@@ -29,10 +29,10 @@ const BLOCK_Q5_1_BYTES: usize = 24;
 const QK4_NL: usize = 32;
 const BLOCK_IQ4_NL_BYTES: usize = 18;
 
-// ----- Reference quantizers (pure-Rust, byte-for-byte llama.cpp parity) -----
+// ----- Reference quantizers (pure-Rust, byte-for-byte canonical parity) -----
 
-/// Reference Q5_1 quantization mirroring `quantize_row_q5_1_ref`
-/// (`ggml-quants.c:189`). Used only to produce reference block bytes
+/// Reference Q5_1 quantization mirroring `quantize_row_q5_1_ref`.
+/// Used only to produce reference block bytes
 /// for the dequant parity test.
 fn ref_quantize_q5_1(row: &[f32]) -> Vec<u8> {
     assert!(row.len() % QK5_1 == 0);

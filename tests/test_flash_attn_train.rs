@@ -10,7 +10,7 @@
 //! `sdpa_reference_with_logsumexp` mirrors the GPU kernel step-for-step:
 //!
 //! - Q pre-scaled by `scale * log2(e)` before QK^T.
-//! - Online softmax via `f32::exp2(x - max)` (base-2, llama.cpp sentinel).
+//! - Online softmax via `f32::exp2(x - max)` (base-2, finite-M sentinel).
 //! - L[b, h, i] computed from the final row max + log(sum_exp):
 //!   `L = max_base2 * ln(2) + ln(sum_exp)` — FA-2 Algorithm 1 convention.
 //! - O normalised by `sum_exp`; guard: fully-masked row → O = 0.
@@ -119,7 +119,7 @@ fn sdpa_reference_with_logsumexp(
                 }
 
                 // Online softmax (base-2, finite-M sentinel = -FLT_MAX/2)
-                let mut max_b2 = f32::MIN / 2.0; // = -FLT_MAX/2 (llama.cpp convention)
+                let mut max_b2 = f32::MIN / 2.0; // = -FLT_MAX/2 (reference convention)
                 for &s in &scores {
                     if s > max_b2 { max_b2 = s; }
                 }
