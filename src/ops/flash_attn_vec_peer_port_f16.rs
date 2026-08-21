@@ -1,6 +1,6 @@
 //! Flash attention vector kernel — verbatim peer port (f16-K + f16-V, DK=DV=256).
 //!
-//! Ports llama.cpp's `kernel_flash_attn_ext_vec` body verbatim for the
+//! Verbatim peer port of the `kernel_flash_attn_ext_vec` body for the
 //! NWG=1, NSG=1, NE=1, DK=DV=256, f16-K/f16-V instantiation targeting
 //! gemma4 sliding decode.
 //!
@@ -140,7 +140,7 @@ pub fn flash_attn_vec_peer_port_f16(
         ring_start: params.ring_start,
     };
 
-    // FATTN_SMEM(nsg=1) from ggml-metal-ops.cpp:2938 specialized for DK=DV=256, C=32, nsg=1.
+    // Peer FATTN_SMEM(nsg=1) specialized for DK=DV=256, C=32, nsg=1.
     // Formula: GGML_PAD((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128)) * nsg
     //           * sizeof(float)/2, 16)
     // = GGML_PAD((256 + 128 + 512) * 1 * 2, 16) = GGML_PAD(1792, 16) = 1792 bytes.
@@ -166,7 +166,7 @@ pub fn flash_attn_vec_peer_port_f16(
     // Threadgroup grid for decode-single-query:
     // threadgroups = (ne01, ne02, ne03*NWG) = (1, num_heads, 1) [NWG=1, NE=1 baked].
     // threadgroup_size = (32, NSG, 1) = (32, 1, 1) [NSG=1 baked].
-    // Matches peer ggml-metal-ops.cpp:3019 at nqptg=nhptg=nwg=nsg=1, ne01=ne02=ne03=1.
+    // Matches the peer dispatch at nqptg=nhptg=nwg=nsg=1, ne01=ne02=ne03=1.
     let threadgroups = MTLSize::new(1, params.num_heads as u64, 1);
     let threadgroup_size = MTLSize::new(32, 1, 1);
 
@@ -207,7 +207,7 @@ struct FlashAttnVecPeerPortReduceParamsGpu {
 }
 
 /// Size in bytes of the tmp buffer required by the NWG=32 vec dispatcher.
-/// Layout (peer ggml-metal-ops.cpp `ggml_metal_op_flash_attn_ext_extra_tmp`):
+/// Layout (peer `ggml_metal_op_flash_attn_ext_extra_tmp`):
 ///   partials: nrows × DV × NWG × sizeof(f32)
 ///   S/M    : nrows × 2 × NWG × sizeof(f32)
 /// Total = nrows × NWG × (DV + 2) × 4 bytes.
@@ -220,7 +220,7 @@ pub fn flash_attn_vec_peer_port_f16_nwg32_tmp_bytes(num_heads: u32, head_dim: u3
 
 /// Dispatch the NWG=32 peer-port vec kernel + reduce kernel.
 ///
-/// Mirrors peer's runtime dispatch (ggml-metal-ops.cpp:3010-3055 at nwg=32):
+/// Mirrors peer's runtime dispatch (at nwg=32):
 ///   1. Vec kernel writes partials to `tmp`, threadgroups (1, num_heads, NWG=32).
 ///   2. Encoder barrier (peer's `ggml_metal_op_concurrency_reset`).
 ///   3. Reduce kernel reads `tmp`, writes final `output`, threadgroups (num_heads, 1, 1).
@@ -325,7 +325,7 @@ pub fn flash_attn_vec_peer_port_f16_nwg32(
 
     encoder.set_op_kind(CapturedOpKind::Sdpa);
 
-    // Peer ggml-metal-ops.cpp:3019/3032 at nwg=32: dispatch (ne01, ne02, ne03*nwg) = (1, num_heads, 32).
+    // Peer vec dispatch at nwg=32: (ne01, ne02, ne03*nwg) = (1, num_heads, 32).
     let vec_threadgroups = MTLSize::new(1, params.num_heads as u64, 32);
     let vec_threadgroup_size = MTLSize::new(32, 1, 1);
 
@@ -356,7 +356,7 @@ pub fn flash_attn_vec_peer_port_f16_nwg32(
         nrows: params.num_heads as i32,
     };
 
-    // Peer ggml-metal-ops.cpp:3052: dispatch (nrows, 1, 1) × (32*nwg, 1, 1) = (num_heads, 1, 1) × (1024, 1, 1).
+    // Peer reduce dispatch: (nrows, 1, 1) × (32*nwg, 1, 1) = (num_heads, 1, 1) × (1024, 1, 1).
     let reduce_threadgroups = MTLSize::new(params.num_heads as u64, 1, 1);
     let reduce_threadgroup_size = MTLSize::new(32 * 32, 1, 1);
 

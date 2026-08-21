@@ -10,8 +10,7 @@
 //!   (PyTorch align_corners=False / pixel_offset=0.5).
 //! - antialias: when sf < 1 (downsampling), support widens beyond 1
 //!   to apply a low-pass triangle prefilter — exactly matching
-//!   ggml's `BILINEAR | ANTIALIAS` mode at
-//!   `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:7578-7637`.
+//!   ggml's `BILINEAR | ANTIALIAS` mode.
 //! - When sf == 1 (matching edge), the formula collapses to
 //!   pass-through; this is the fast path Qwen3-VL hits at the
 //!   trained 768×768 resolution.

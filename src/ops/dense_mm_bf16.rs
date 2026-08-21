@@ -5,9 +5,10 @@
 //! (M-N-K with batch broadcasting via r2/r3) but operates on dense bf16
 //! weights instead of GGML block-quantized weights.  Used by hf2q's
 //! non-flash-attention prefill path for Q@K^T and scores@V, matching
-//! llama.cpp's `ggml_mul_mat` dispatch when `-fa 0`.
+//! the reference mat-mul dispatch when flash attention is disabled.
 //!
-//! Derived from llama.cpp (MIT).  See `src/shaders/dense_mm_bf16_tensor.metal`.
+//! See `src/shaders/dense_mm_bf16_tensor.metal` for the kernel source and
+//! its attribution.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -63,7 +64,7 @@ struct DenseMmBf16F32TensorGpuParams {
 /// Dense bf16 × f32 → f32 matmul with automatic tensor/simdgroup dispatch.
 ///
 /// Computes `output[b, m, n] = sum_k src0[b/r2, n, k] * src1[b, m, k]`
-/// for every `b` in `0..src1_batch`.  Implements llama.cpp's
+/// for every `b` in `0..src1_batch`.  Implements the
 /// `kernel_mul_mm_bf16_f32` contract on the tensor-core path.
 ///
 /// Dtype contract:

@@ -1,6 +1,6 @@
 //! Flash attention vector kernel dispatch — SIMD-vectorized decode-path SDPA.
 //!
-//! Ported from llama.cpp's `flash_attn_ext_vec` kernel. This replaces the naive
+//! Peer port of the `flash_attn_ext_vec` kernel. This replaces the naive
 //! SDPA kernel with a workgroup-parallel implementation that splits the KV cache
 //! across `nwg` workgroups, each computing partial softmax results, then a
 //! reduce kernel combines them.
@@ -59,7 +59,7 @@ pub struct FlashAttnVecParams {
     /// seq_len`. The shader dispatches `q_seq_len` threadgroups in
     /// `grid.x`; each handles one (query, head) pair with causal mask
     /// `abs_pos = kv_seq_len - q_seq_len + iq1`. Peer-code reference:
-    /// llama.cpp's `kernel_flash_attn_ext_vec` (NQPSG=1, ne01
+    /// `kernel_flash_attn_ext_vec` (NQPSG=1, ne01
     /// threadgroups in qL dim).
     pub q_seq_len: u32,
 }
@@ -96,7 +96,7 @@ struct FlashAttnVecReduceParamsGpu {
 }
 
 /// Number of workgroups to split the KV cache across.
-/// llama.cpp uses 32 as default. Must be <= 32 (one per SIMD lane in reduce).
+/// The reference default is 32. Must be <= 32 (one per SIMD lane in reduce).
 const NWG: u32 = 32;
 
 /// Validate flash attention parameters.

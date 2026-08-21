@@ -5,8 +5,7 @@
 //!   `kernel_mul_mv_ext_<q>_f32_r1_<r1>` for q ∈ {q5_1, iq4_nl},
 //!   r1 ∈ {2, 3, 4, 5}.
 //!
-//! The host dispatcher mirrors llama.cpp's
-//! `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:2080-2152`:
+//! The host dispatcher mirrors the reference small-batch dispatch:
 //!   - `nsg = 2` (constant)
 //!   - `nxpsg = 16` if `K % 256 == 0 && M < 3`,
 //!     else `8` if `K % 128 == 0`,
@@ -34,7 +33,7 @@ use crate::ops::quantized_matmul_ggml::GgmlType;
 ///   - `input`  (= src1): row-major `[batch, M, K]` f32. K = ne00.
 ///   - `output` (= dst):  row-major `[batch, M, N]` f32. N = ne01 / ne0.
 ///
-/// `r2`, `r3` model llama.cpp's batch-broadcast (default 1, 1).
+/// `r2`, `r3` model the reference batch-broadcast (default 1, 1).
 #[derive(Debug, Clone, Copy)]
 pub struct MulMvExtParams {
     /// M — number of src1 rows (small batch, must be ∈ [2, 8]).
@@ -53,7 +52,7 @@ pub struct MulMvExtParams {
 /// GPU args struct — must match `hf2q_mul_mv_ext_args` in
 /// `shaders/mul_mv_ext.metal` byte-for-byte.
 ///
-/// llama.cpp's C layout puts an int32 triple before u64 fields, then more
+/// The reference C layout puts an int32 triple before u64 fields, then more
 /// int32 + u64, ending with two i16. The Metal-side struct's natural
 /// alignment matches this with padding inserted after `ne02` (4-byte pad
 /// before nb00 to reach 8-byte alignment). We model that explicitly so
@@ -88,7 +87,7 @@ struct MulMvExtGpuArgs {
     _pad2: u32,
 }
 
-/// Pick `nxpsg` per llama.cpp's `ggml-metal-ops.cpp:2094-2100`.
+/// Pick `nxpsg` per the reference selection rule.
 fn pick_nxpsg(k: u32, m: u32) -> i32 {
     if k % 256 == 0 && m < 3 {
         16
@@ -99,7 +98,7 @@ fn pick_nxpsg(k: u32, m: u32) -> i32 {
     }
 }
 
-/// Pick `r1ptg` per llama.cpp's `ggml-metal-ops.cpp:2107-2120` switch.
+/// Pick `r1ptg` per the reference selection switch.
 /// Returns `Err(InvalidArgument)` for unsupported m values.
 fn pick_r1ptg(m: u32) -> Result<i32> {
     match m {
@@ -247,7 +246,7 @@ pub fn mul_mv_ext_dispatch(
     }
 
     // GPU args. nb01 = bytes per weight row; nb00 = block_bytes (1 block per
-    // QK4_0=32 elements). The args mirror llama.cpp's:
+    // QK4_0=32 elements). The args mirror the reference convention:
     //   nb00 = ggml_type_size(weight)            (single block)
     //   nb01 = ggml_row_size(weight, K)           (full row)
     //   nb02 = nb01 * N                           (single batch)

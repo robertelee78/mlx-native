@@ -2,9 +2,8 @@
 //!
 //! Wave 2E of the ADR-011 Phase 2 port.  Pairs with Wave 2D
 //! (`flash_attn_prefill_mask`) and Waves 2A/2C (main kernels at D=256 and
-//! D=512 respectively).  Ported from llama.cpp's `kernel_flash_attn_ext_blk`
-//! at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5666-5719` with
-//! host dispatch at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:2750-2820`.
+//! D=512 respectively).  Peer port of `kernel_flash_attn_ext_blk`
+//! (tile-classifier pre-pass) together with its host dispatch.
 //!
 //! ## What this module does
 //!
@@ -47,10 +46,10 @@
 //! See `ADR-011-phase2-port-tile-skip.md §5.1` for the full analysis of
 //! the tile-shape choice.
 //!
-//! ## Sentinel convention (differs from llama.cpp)
+//! ## Sentinel convention (differs from the reference implementation)
 //!
-//! llama.cpp uses `-MAXHALF` (f16 ≈ -65504) as the "fully masked" threshold
-//! at `ggml-metal.metal:5704`.  Our Wave 2D mask builder writes bit-exact
+//! The reference uses `-MAXHALF` (f16 ≈ -65504) as the "fully masked"
+//! threshold.  Our Wave 2D mask builder writes bit-exact
 //! `-INFINITY` for blocked cells (`bf16 0xFF80`) and bit-exact `0.0` for
 //! attended cells (`bf16 0x0000`).  The pre-pass classifier uses a
 //! conservative `mmax <= -1e30f` threshold that catches both true `-inf`
@@ -70,7 +69,6 @@
 //!
 //! - Kernel: `/opt/mlx-native/src/shaders/flash_attn_prefill_blk.metal`
 //! - Port spec: `/opt/hf2q/docs/ADR-011-phase2-port-tile-skip.md`
-//! - llama.cpp ref: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5666-5719`
 
 use metal::MTLSize;
 
@@ -180,8 +178,8 @@ pub struct BlkParams {
 /// Number of bytes required for the `blk` output buffer.
 ///
 /// `ceil(qL / BQ) * ceil(kL / BK)` — one byte per tile.  Pad to 32 bytes
-/// (Metal's minimum buffer alignment), matching llama.cpp's
-/// `GGML_PAD(…, 32)` at `ggml-metal-ops.cpp:2591`.
+/// (Metal's minimum buffer alignment), matching the reference
+/// `GGML_PAD(…, 32)`.
 ///
 /// # Errors
 ///
@@ -206,7 +204,7 @@ pub fn blk_buffer_byte_len(params: &BlkParams) -> Result<usize> {
             nq, nk,
         ))
     })?;
-    // 32-byte alignment mirrors llama.cpp's GGML_PAD(…, 32) and keeps the
+    // 32-byte alignment mirrors the reference GGML_PAD(…, 32) and keeps the
     // Metal buffer on a friendly boundary for byte-granular writes.  At
     // minimum 32 bytes so even tiny (NQ=1, NK=1) masks get a full-aligned
     // buffer.
@@ -274,10 +272,9 @@ fn validate_params(params: &BlkParams) -> Result<()> {
 /// # Grid geometry
 ///
 /// - Threadgroups: `(NK, NQ, 1)` where `NQ = ceil(qL/BQ)`, `NK = ceil(kL/BK)`.
-///   One threadgroup per (Q-tile, K-tile) pair.  Matches llama.cpp at
-///   `ggml-metal-ops.cpp:2770`.
-/// - Threads per threadgroup: `(32, 1, 1)` — one simdgroup.  Matches
-///   llama.cpp's tile-classifier dispatch.
+///   One threadgroup per (Q-tile, K-tile) pair.
+/// - Threads per threadgroup: `(32, 1, 1)` — one simdgroup
+///   (tile-classifier dispatch geometry).
 ///
 /// # Function constants
 ///
@@ -415,7 +412,7 @@ fn dispatch_flash_attn_prefill_blk_typed(
     //   threadgroups: (NK, NQ, 1)   — one TG per (qtile, ktile) pair
     //   threads / TG: (32, 1, 1)    — one simdgroup
     //
-    // Matches llama.cpp's grid at ggml-metal-ops.cpp:2770-2773 (adapted to
+    // Matches the reference grid (adapted to
     // our single-plane mask — no batch / kv-group broadcast dim).
     let grid = MTLSize::new(nk as u64, nq as u64, 1);
     let tg_size = MTLSize::new(32, 1, 1);

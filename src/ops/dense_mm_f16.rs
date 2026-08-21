@@ -4,8 +4,7 @@
 //! F16-staging sibling of [`crate::ops::dense_mm_bf16`].  Used by hf2q's
 //! gemma4v ViT precision-parity path (ADR-005 Phase 2c iter-128): every
 //! mmproj weight is stored F16 in GGUF, peer's
-//! `kernel_mul_mm_f16_f32` (`/opt/llama.cpp/ggml/src/ggml-metal/
-//! ggml-metal.metal:10099`) stages BOTH A and B as `half` in shmem and
+//! `kernel_mul_mm_f16_f32` stages BOTH A and B as `half` in shmem and
 //! computes on `simdgroup_half8x8`.  Pre-iter-128, hf2q dequantized
 //! F16→F32 at load and re-cast F32→BF16 at the matmul, costing 8× the
 //! peer's per-element rounding budget per element — visible in the
@@ -13,11 +12,11 @@
 //! vs peer ~25).  This kernel matches peer precision exactly.
 //!
 //! Computes `dst[b, m, n] = sum_k src0[b/r2, n, k] * src1[b, m, k]`
-//! across all `b` in `[0, src1_batch)`.  Implements llama.cpp's
-//! `kernel_mul_mm_f16_f32` template instantiation
-//! (`ggml-metal.metal:10099`) on the `GGML_METAL_HAS_TENSOR` branch.
+//! across all `b` in `[0, src1_batch)`.  Implements the
+//! `kernel_mul_mm_f16_f32` template instantiation on the tensor-API branch.
 //!
-//! Derived from llama.cpp (MIT).  See `src/shaders/dense_mm_f16_tensor.metal`.
+//! See `src/shaders/dense_mm_f16_tensor.metal` for the kernel source and its
+//! attribution.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -74,7 +73,7 @@ struct DenseMmF16F32TensorGpuParams {
 /// Dense f16 × f32 → f32 matmul with automatic tensor/simdgroup dispatch.
 ///
 /// Computes `output[b, m, n] = sum_k src0[b/r2, n, k] * src1[b, m, k]`
-/// for every `b` in `0..src1_batch`.  Implements llama.cpp's
+/// for every `b` in `0..src1_batch`.  Implements the
 /// `kernel_mul_mm_f16_f32` contract on the tensor-core path.
 ///
 /// Dtype contract:

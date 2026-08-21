@@ -1,6 +1,6 @@
 //! Decode-only fused Gated DeltaNet kernel — `simd_sum`-based variant.
 //!
-//! ADR-015 iter56. Mirrors llama.cpp's `kernel_gated_delta_net_f32_<NSG>`
+//! ADR-015 iter56. Mirrors the `kernel_gated_delta_net_f32_<NSG>` peer
 //! threading model (32-lane simdgroup reductions, NSG state cells per
 //! thread, no shared memory, no threadgroup barriers) — drop-in replacement
 //! for [`super::gated_delta_net::dispatch_gated_delta_net`] when n_tokens is

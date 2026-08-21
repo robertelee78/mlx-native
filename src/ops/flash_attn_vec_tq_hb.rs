@@ -124,7 +124,7 @@ pub struct FlashAttnVecTqHbParams {
     pub fuse_fwht_pre: u32,
     /// ADR-028 Path D:number of simdgroups per workgroup (NSG axis).
     ///
-    /// llama.cpp's K-loop uses `for (ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`
+    /// The reference K-loop uses `for (ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`
     /// to split K-blocks across NSG simdgroups within each workgroup, on top
     /// of NWG workgroups. At qwen-realistic kL=4096, NSG=4 cuts per-WG K-iters
     /// from 4 to 1 (predicted ~4× FA speedup, ~28% decode at qwen production).
@@ -135,7 +135,7 @@ pub struct FlashAttnVecTqHbParams {
     ///   simdgroup reduce + threadgroup memory layout.
     /// - threadgroup_size = (32, nsg, 1) → 32*nsg threads/workgroup.
     ///   Apple Metal max threads/threadgroup is 1024 → nsg ≤ 32. Practically
-    ///   capped at 4 (matches llama.cpp).
+    ///   capped at 4 (matches the reference implementation).
     pub nsg: u32,
 }
 
@@ -205,7 +205,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
     }
     // ADR-028 Path D:NSG must be a power of 2 in [1, 32].
     // 32 is Apple Metal's max threads/threadgroup divided by simdgroup-width
-    // (1024 / 32). Practically capped at 4 (matches llama.cpp policy).
+    // (1024 / 32). Practically capped at 4 (matches the reference policy).
     if params.nsg == 0 || (params.nsg & (params.nsg - 1)) != 0 {
         return Err(MlxError::InvalidArgument(format!(
             "flash_attn_vec_tq_hb: nsg must be a power of 2 (1, 2, 4, ...), got {}",
@@ -214,7 +214,7 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
     }
     // ADR-028: kernel reduce uses a fixed-size NSG_MAX=4 stack array
     // for per-simdgroup rescale factors. Tighten validation to match the
-    // kernel-side cap. llama.cpp also caps at nsg=4 (`ggml-metal-ops.cpp:2954`).
+    // kernel-side cap. The reference implementation also caps at nsg=4.
     if params.nsg > 4 {
         return Err(MlxError::InvalidArgument(format!(
             "flash_attn_vec_tq_hb: nsg must be ≤ 4 (kernel reduce cap), got {}",
@@ -226,14 +226,14 @@ fn validate_params(params: &FlashAttnVecTqHbParams) -> Result<()> {
 
 /// ADR-028 Path D:select NSG (simdgroups per workgroup) from kv_seq_len.
 ///
-/// Mirrors llama.cpp's policy at `ggml-metal-ops.cpp:2953`:
+/// Mirrors the reference policy:
 /// `while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) { nsg *= 2; }`
 ///
 /// With our nwg=32 (computed by `compute_nwg`) and ncpsg=32 (C in the metal
 /// shader), the NSG schedule becomes:
 /// - kL ≤ 2048 — nsg=1 (32 simdgroups suffice for 64 K-blocks at most)
 /// - 2049 ≤ kL ≤ 4096 — nsg=2
-/// - kL > 4096 — nsg=4 (cap, matches llama.cpp)
+/// - kL > 4096 — nsg=4 (cap, matches the reference implementation)
 ///
 /// Override via `HF2Q_TQ_NSG` env var (1, 2, or 4 only). Default policy
 /// keeps short-context behavior byte-identical (nsg=1) per

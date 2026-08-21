@@ -8,9 +8,8 @@
 //!
 //! Supported formats include Q2_K, Q4_0, Q8_0, and K-quants through Q6_K.
 //!
-//! Portions derived from candle-metal-kernels v0.10.2 (Apache-2.0) and
-//! llama.cpp (MIT). See src/shaders/quantized_matmul_ggml.metal for full
-//! attribution.
+//! Portions derived from candle-metal-kernels v0.10.2 (Apache-2.0).
+//! See src/shaders/quantized_matmul_ggml.metal for full attribution.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -79,22 +78,22 @@ const BLOCK_Q5_K_BYTES: u32 = 176;
 const QK6_K: u32 = 256;
 const BLOCK_Q6_K_BYTES: u32 = 210;
 
-/// Q5_1 (legacy llama.cpp 5-bit asymmetric, 32-element block).
+/// Q5_1 (legacy ggml 5-bit asymmetric, 32-element block).
 /// Block layout: d(fp16) + m(fp16) + qh(u32) + qs[16] = 24 bytes.
 /// 6 effective bpw (5 payload bits + scale + min term).
-/// ADR-022 Phase 1 — added 2026-05-08 to support llama.cpp APEX-Q5_K_M
+/// ADR-022 Phase 1 — added 2026-05-08 to support APEX-Q5_K_M
 /// MoE expert tensors that fall through the layer-mix policy into
 /// Q5_1 (e.g. `gemma4-ara-2pass-APEX-Q5_K_M.gguf` blk.{5..9, 20..24}.ffn_down_exps.weight).
-/// Reference: ggml-common.h `block_q5_1`.
+/// Reference: the ggml `block_q5_1` block format.
 const QK5_1: u32 = 32;
 const BLOCK_Q5_1_BYTES: u32 = 24;
 
 /// IQ4_NL (4-bit non-linear codebook, 32-element block).
 /// Block layout: d(fp16) + qs[16] = 18 bytes.
 /// 4.5 effective bpw — 16 4-bit indices into a fixed 16-entry signed
-/// codebook (`kvalues_iq4nl` at ggml-common.h:1109-1112).
+/// codebook (the ggml `kvalues_iq4nl` codebook).
 /// ADR-022 Phase 1 — added 2026-05-08 alongside Q5_1.
-/// Reference: ggml-common.h `block_iq4_nl`.
+/// Reference: the ggml `block_iq4_nl` block format.
 const QK4_NL: u32 = 32;
 const BLOCK_IQ4_NL_BYTES: u32 = 18;
 
@@ -105,7 +104,7 @@ const BLOCK_IQ4_NL_BYTES: u32 = 18;
 /// the SAME `kvalues_iq4nl` codebook used by IQ4_NL.
 /// ADR-033 §Pi 2026-05-22 — added to unblock apex-i-quality on Qwen MoE
 /// (every quality-tier mudler config uses IQ4_XS for mid-layer experts).
-/// Reference: ggml-common.h `block_iq4_xs` at :449.
+/// Reference: the ggml `block_iq4_xs` block format.
 const BLOCK_IQ4_XS_BYTES: u32 = 136;
 
 // ---- Public types ----
@@ -212,7 +211,7 @@ impl GgmlType {
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mv_q3_K_f32",
-            // ADR-013 P7 — Q4_K mv kernel ported from llama.cpp.
+            // ADR-013 P7 — Q4_K mv peer-pattern kernel.
             GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
             // ADR-022 Phase 2 — Q5_K dense mv ported.
             GgmlType::Q5_K => "kernel_mul_mv_q5_K_f32",
@@ -222,15 +221,15 @@ impl GgmlType {
             GgmlType::IQ4_NL => "kernel_mul_mv_iq4_nl_f32",
             // ADR-033 §Pi Task #16 SHIPPED 2026-05-22 — mirrors IQ4_NL
             // geometry (N_SIMDGROUP=2, N_DST=4, threadgroup=(8,8,1)).
-            // Byte-cmp parity tested against llama.cpp's Metal IQ4_XS
+            // Byte-cmp parity tested against the reference Metal IQ4_XS
             // kernel via tests/iq4_xs_metal_parity.rs.
             GgmlType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
         }
     }
 
     /// Metal kernel function name for the matrix-matrix (mm) kernel
-    /// — used for `m > MM_ROUTING_THRESHOLD`.  Ported from
-    /// llama.cpp's `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
+    /// — used for `m > MM_ROUTING_THRESHOLD`.  Peer port of the
+    /// `kernel_mul_mm_<qtype>_f32` template (ADR-011 Phase 3).
     pub(crate) fn mm_kernel_name(self) -> &'static str {
         match self {
             // ADR-022 Phase 2 — Q5_K dense mm ported.
@@ -275,9 +274,8 @@ impl GgmlType {
 
     /// ADR-029 H28-A — V2 large-tile tensor mm-kernel names.
     /// 64 (M tile) × 128 (N tile) output tile, direct-device B-read (no
-    /// shmem staging), 4 simdgroups.  Ports llama.cpp's modern tensor
-    /// kernel layout at /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:
-    /// 9309-9431 (the GGML_METAL_HAS_TENSOR branch).
+    /// shmem staging), 4 simdgroups.  Peer port of the modern tensor
+    /// kernel layout.
     pub(crate) fn mm_tensor_v2_kernel_name(self) -> &'static str {
         match self {
             GgmlType::F32 | GgmlType::F16 | GgmlType::I16 | GgmlType::I32 => "unsupported",
@@ -340,8 +338,8 @@ pub(crate) fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
     }
 }
 
-/// llama.cpp's `ne11_mm_min` threshold for routing between mat-vec and
-/// mat-mat (see `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:2046`).
+/// The `ne11_mm_min` threshold (reference-implementation convention) for
+/// routing between mat-vec and mat-mat.
 /// At prefill m > 8, the mm kernel's threadgroup-staged weight tile reuse
 /// beats the mv kernel's per-row DRAM re-read by 5-30x on Apple Silicon.
 /// At m <= 8 the mv kernel wins on launch overhead for narrow inputs.
@@ -405,8 +403,6 @@ struct GgmlMatvecGpuParams {
 /// GPU-side params struct for the mat-mat (mm) kernel.
 /// Must match `GgmlMatmulMmParams` in
 /// `/opt/mlx-native/src/shaders/quantized_matmul_mm.metal`.
-/// Mirrors llama.cpp's `ggml_metal_kargs_mul_mm`
-/// (`ggml/src/ggml-metal/ggml-metal-impl.h:423`).
 ///
 /// Explicit 4-byte padding is inserted between `ne12` and `nb10` so the
 /// Rust struct has deterministic layout and matches the natural Metal
@@ -444,13 +440,12 @@ struct GgmlMatmulMmGpuParams {
 ///   (`kernel_mul_mv_q*_f32`).  Lower launch overhead; one output row
 ///   per threadgroup-block in the M axis.
 /// - `m > MM_ROUTING_THRESHOLD` -> uses the matrix-matrix kernel
-///   (`kernel_mul_mm_q*_f32`, ADR-011 Phase 3 port from llama.cpp).
+///   (`kernel_mul_mm_q*_f32`, ADR-011 Phase 3 peer port).
 ///   Tiles the input at 64x32 and stages a dequantized weight tile into
 ///   threadgroup shared memory, reusing each weight block across a 32-row
 ///   block of inputs.  At prefill m=2455 this is ~32x less DRAM traffic.
 ///
-/// The threshold matches llama.cpp's `ne11_mm_min = 8`
-/// (ggml-metal-ops.cpp:2046).
+/// The threshold matches the reference `ne11_mm_min = 8`.
 ///
 /// # Errors
 ///
@@ -594,8 +589,8 @@ pub fn quantized_matmul_ggml_with_policy(
     // low M (decode m=1, short-prompt prefill m<=8) where launch overhead
     // dominates tile reuse savings.
     //
-    // Threshold matches llama.cpp's `ne11_mm_min = 8`
-    // (ggml-metal-ops.cpp:2046).  The mm kernel also requires K >= NK=32,
+    // Threshold matches the reference `ne11_mm_min = 8`.
+    // The mm kernel also requires K >= NK=32,
     // which every projection in our Gemma 4 DWQ model satisfies — guard
     // kept so any future shape smaller than 32 falls back to mv.
     // ADR-013 P7 — Q4_K mm/mm_tensor not yet ported; Q4_K always
@@ -611,7 +606,7 @@ pub fn quantized_matmul_ggml_with_policy(
     let mm_supported = !matches!(params.ggml_type, GgmlType::IQ4_XS);
     // ADR-040 §0.21 decode F3 lever: at small continuous-batching decode width
     // m∈[2,8], route quantized matmuls to the weight-amortizing `mul_mv_ext`
-    // kernel (llama.cpp's small-batch path, ggml-metal-ops.cpp:2079-2133:
+    // kernel (the reference small-batch path:
     // `r1ptg` src1 columns processed per threadgroup, so each quantized weight
     // block is read ONCE across the m columns — vs the regular `mv` which
     // re-reads the weight per column, measured ~5× at m=8). mul_mv_ext is
@@ -1305,7 +1300,7 @@ fn dispatch_mv_batched(
     // mantra-aligned outcome for users").  Opt out with
     // `HF2Q_Q6K_MV_NR2=0` / `=false` / `=off`.
     let use_q6k_nr2 = matches!(params.ggml_type, GgmlType::Q6_K) && routing.dense_q6k_mv_nr2;
-    // Q8_0 NSG=4 NR=2 is the peer-style llama.cpp geometry. Exact-output
+    // Q8_0 NSG=4 NR=2 is the peer-pattern geometry. Exact-output
     // parity and DeepSeek-V4 end-to-end decode validation make it the
     // production default; operators can retain the legacy kernel with
     // `HF2Q_Q8_0_MV_NR2=0` / `=false` / `=off` for diagnostics.
@@ -1318,8 +1313,8 @@ fn dispatch_mv_batched(
         params.ggml_type.kernel_name()
     };
     // ADR-029 H93: PSO-specialize batch divisors (ne12/r2/r3) at
-    // function-constant slots 700/701/702. Peer-grounded port of llama.cpp
-    // commit da4495332. `ne12=batch` specializes the z-grid divisor for both
+    // function-constant slots 700/701/702. Peer-grounded port.
+    // `ne12=batch` specializes the z-grid divisor for both
     // the ordinary batch=1 path and independent grouped products.
     // The redundant .clone() is omitted — registry is not
     // accessed again after pipeline lookup, so we can hold the &ComputePipelineState
@@ -1697,8 +1692,8 @@ pub fn build_q6k_nr2_m1_record_with_policy(
     }))
 }
 
-/// Matrix-matrix (mm) dispatch.  ADR-011 Phase 3 Wave P3a: port of
-/// llama.cpp's `kernel_mul_mm_<qtype>_f32`.  64x32 output tile, 4
+/// Matrix-matrix (mm) dispatch.  ADR-011 Phase 3 Wave P3a: peer port
+/// of `kernel_mul_mm_<qtype>_f32`.  64x32 output tile, 4
 /// simdgroups (128 threads), threadgroup-staged A+B with simdgroup MMA.
 /// See `/opt/mlx-native/src/shaders/quantized_matmul_mm.metal`.
 fn dispatch_mm(

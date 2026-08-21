@@ -30,7 +30,7 @@ use crate::residency::ResidencySet;
 /// [`Arc<MlxBufferStorage>`](MlxBufferStorage) that owns the residency-set
 /// reference and runs `removeAllocation:` (deferred — flushed at the next
 /// `CommandEncoder::commit*` boundary) when the last clone is dropped.
-/// Mirrors llama.cpp's `ggml-metal-device.m:1378-1382` pattern: batch
+/// Pattern: batch
 /// `addAllocation:` calls in a loop, commit ONCE.
 pub struct MlxBuffer {
     /// The underlying Metal buffer (StorageModeShared) plus optional
@@ -54,9 +54,8 @@ pub struct MlxBuffer {
 /// Wrapped in [`Arc`] inside [`MlxBuffer`] so that [`Clone`] / [`slice_view`]
 /// share both the underlying Metal allocation and the residency-set
 /// registration. The Drop fires `removeAllocation:` only when the LAST clone
-/// goes out of scope — matching llama.cpp's `addAllocation:` /
-/// `removeAllocation:` lifecycle in `ggml-metal-device.m:1378-1382` and
-/// `ggml-metal-device.m:1397-1399`.
+/// goes out of scope — matching the reference `addAllocation:` /
+/// `removeAllocation:` lifecycle.
 ///
 /// Drop is **deferred**: it calls `set.remove_allocation(buffer)` which marks
 /// the residency set's pending flag but does NOT call `[set commit]`. The
@@ -77,7 +76,7 @@ pub(crate) struct MlxBufferStorage {
 impl Drop for MlxBufferStorage {
     fn drop(&mut self) {
         if let Some(set) = self.residency_set.as_ref() {
-            // Mirror ggml-metal-device.m:1397-1399 free-path semantics, but
+            // Mirror the reference free-path semantics, but
             // deferred — the actual `[set commit]` is issued at the next
             // CommandEncoder::commit* boundary by flush_pending().
             set.remove_allocation(&self.inner);
@@ -165,8 +164,8 @@ impl MlxBuffer {
     ) -> Self {
         // Stage the addAllocation; the actual `[set commit]` is deferred to
         // the next encoder.commit* boundary via flush_pending. This is the
-        // structural fix for the per-allocation commit storm; mirrors
-        // llama.cpp's ggml-metal-device.m:1378-1382 pattern.
+        // structural fix for the per-allocation commit storm; the
+        // batch-add / single-commit pattern.
         residency_set.add_allocation(&inner);
 
         let data_byte_len = inner.length() as usize;

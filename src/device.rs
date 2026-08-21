@@ -310,8 +310,8 @@ impl MlxDevice {
         // device's residency set so it gets the MTLResidencySet hint on the
         // next dispatch. The `with_residency` path stages the addAllocation
         // but DEFERS the `[set commit]` to the next CommandEncoder::commit*
-        // boundary via flush_pending — mirrors llama.cpp's batch-add /
-        // single-commit pattern in ggml-metal-device.m:1378-1382.
+        // boundary via flush_pending — the batch-add /
+        // single-commit pattern.
         //
         // No-op when residency_set is None (HF2Q_NO_RESIDENCY=1, macOS<15,
         // or no Metal device).

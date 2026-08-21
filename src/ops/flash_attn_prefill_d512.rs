@@ -1,11 +1,10 @@
 //! Flash-attention-style tiled prefill kernel — NSG=8 D=512 host dispatch.
 //!
 //! Companion to [`crate::ops::flash_attn_prefill`] (candle-derived D=256
-//! kernel).  This module dispatches the **llama.cpp-derived D=512 kernel**
-//! in `shaders/flash_attn_prefill_d512.metal` — a faithful port of
-//! `kernel_flash_attn_ext_impl` from `llama.cpp/ggml/src/ggml-metal/
-//! ggml-metal.metal:5736-6375` specialised for DK=DV=512 with NSG (simdgroups
-//! per threadgroup) selectable as an int function constant.
+//! kernel).  This module dispatches the **peer-pattern D=512 kernel**
+//! in `shaders/flash_attn_prefill_d512.metal` — a flash-attention-ext
+//! kernel specialised for DK=DV=512 with NSG (simdgroups per threadgroup)
+//! selectable as an int function constant.
 //!
 //! # Why this exists (not just an extension of `flash_attn_prefill.rs`)
 //!
@@ -18,9 +17,8 @@
 //! The new kernel is architecturally different: Q rows are DISTRIBUTED
 //! across simdgroups (NQ = Q/NSG rows per simdgroup), the output accumulator
 //! `O` lives in threadgroup memory (not registers), and NSG=8 fits in
-//! 28,672 bytes of threadgroup memory.  This is the same geometry llama.cpp
-//! uses for DK=512 (`ggml-metal-ops.cpp:2807` — `int32_t nsg = ne00 >= 512
-//! ? 8 : 4;`).
+//! 28,672 bytes of threadgroup memory.  This geometry matches the reference
+//! implementation for DK=512 (NSG selected as 8 when head_dim >= 512, else 4).
 //!
 //! # Kernel variants registered (four entry points)
 //!
@@ -46,8 +44,6 @@
 //!
 //! Index 322 is new to this module and is plumbed via
 //! [`KernelRegistry::get_pipeline_with_constants`] (the bool+int variant).
-//! Matches llama.cpp's `FC_flash_attn_ext_nsg` at
-//! `ggml-metal.metal:5735` = `FC_FLASH_ATTN_EXT + 22` = `300 + 22 = 322`.
 //!
 //! # Buffer layout (indices match the MSL kernel)
 //!
@@ -67,18 +63,15 @@
 //! - NSG=8: 256 threads (8 simdgroups × 32 lanes).
 //! - NSG=4: 128 threads (4 simdgroups × 32 lanes).
 //!
-//! Matches llama.cpp's grid at `ggml-metal-ops.cpp:2861` —
-//! `((ne01+nqptg-1)/nqptg, ne02, ne03, 32, nsg, 1)`.
-//!
 //! # Threadgroup memory
 //!
-//! 28,672 bytes requested via `setThreadgroupMemoryLength` at encode time.
-//! Matches llama.cpp's `FATTN_SMEM(nsg=8)` exactly for (DK=DV=512, NQPSG=8,
+//! 28,672 bytes requested via `setThreadgroupMemoryLength` at encode time —
+//! the reference-implementation footprint for (DK=DV=512, NQPSG=8,
 //! NCPSG=64, is_q=0, bf16).  Derivation: §2.3 of ADR-011-phase2-port-d512.md.
 //! Our actual layout (sq + so + ss) uses 20,480 bytes; the extra 8,192 bytes
-//! reserve the per-simdgroup K/V dequant scratch that llama.cpp uses for the
-//! `is_q=1` path (we drop that branch for Gemma 4's bf16 K/V, but keep the
-//! identical shmem footprint for like-for-like behaviour).
+//! reserve the per-simdgroup K/V dequant scratch that the `is_q=1` path would
+//! use (we drop that branch for Gemma 4's bf16 K/V, but keep the identical
+//! shmem footprint for like-for-like behaviour).
 //!
 //! # Scale convention
 //!
@@ -89,7 +82,7 @@
 //! # Mask-sentinel contract
 //!
 //! Identical to D=256: additive masks use **masked positions = `-INFINITY`**
-//! (llama.cpp CPU-side convention).  See the D=256 dispatcher module doc
+//! (reference-implementation convention).  See the D=256 dispatcher module doc
 //! for the full rationale; the kernel's finite-M-sentinel regime handles
 //! `-inf` mask values without NaN propagation.
 //!
@@ -97,7 +90,6 @@
 //!
 //! - Kernel: `/opt/mlx-native/src/shaders/flash_attn_prefill_d512.metal`
 //! - Port spec: `/opt/hf2q/docs/ADR-011-phase2-port-d512.md`
-//! - llama.cpp reference: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5736-6430`
 
 use metal::MTLSize;
 
@@ -116,7 +108,7 @@ pub use super::flash_attn_prefill::{
 
 // ─── Shader source ───────────────────────────────────────────────────────────
 
-/// MSL source for the NSG=8 D=512 llama.cpp-derived kernel.
+/// MSL source for the NSG=8 D=512 peer-pattern kernel.
 pub static FLASH_ATTN_PREFILL_D512_SHADER_SOURCE: &str =
     include_str!("../shaders/flash_attn_prefill_d512.metal");
 
@@ -152,18 +144,16 @@ pub fn register(registry: &mut KernelRegistry) {
     }
 }
 
-// ─── Tile geometry constants (D=512 llama.cpp geometry) ─────────────────────
+// ─── Tile geometry constants (D=512 tile geometry) ──────────────────────────
 
-/// Queries per threadgroup.  Matches `OP_FLASH_ATTN_EXT_NQPSG`
-/// (llama.cpp-impl.h:93).
+/// Queries per threadgroup.
 pub const NQPSG_D512: u32 = 8;
 
-/// Cache items per threadgroup.  Matches `OP_FLASH_ATTN_EXT_NCPSG`
-/// (llama.cpp-impl.h:94).
+/// Cache items per threadgroup.
 pub const NCPSG_D512: u32 = 64;
 
-/// Simdgroups per threadgroup for head_dim=512.  Matches
-/// `ggml-metal-ops.cpp:2807` — `ne00 >= 512 ? 8 : 4`.
+/// Simdgroups per threadgroup for head_dim=512 (8 when head_dim >= 512,
+/// else 4).
 ///
 /// Exposed as a constant (not a parameter) because:
 /// - NSG=8 is the only configuration that justifies this kernel's existence
@@ -173,9 +163,7 @@ pub const NCPSG_D512: u32 = 64;
 ///   below, for A/B benchmarking against NSG=8.
 pub const NSG_D512: u32 = 8;
 
-/// Int function-constant index for NSG.  Mirrors llama.cpp's
-/// `FC_flash_attn_ext_nsg` at `ggml-metal.metal:5735` =
-/// `FC_FLASH_ATTN_EXT + 22` = `300 + 22 = 322`.
+/// Int function-constant index for NSG (index 322 in the shader).
 pub const FC_IDX_NSG: usize = 322;
 /// Bool function constant enabling denominator-only learned attention sinks.
 pub const FC_IDX_SINKS: usize = 304;
@@ -237,7 +225,7 @@ fn validate_buffer_size(buf: &MlxBuffer, name: &str, expected_elements: usize) -
 
 // ─── bf16 D=512 dispatcher (NSG=8 default) ───────────────────────────────────
 
-/// Dispatch llama.cpp-derived NSG=8 flash-attention prefill for bf16 Q/K/V/O,
+/// Dispatch peer-pattern NSG=8 flash-attention prefill for bf16 Q/K/V/O,
 /// head_dim=512.
 ///
 /// Encodes a compute command into `encoder` without committing.  The caller
@@ -662,7 +650,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
 
     // Validate blk buffer size when present.  Tile shape is fixed for D=512:
     // BQ=NQPSG=8, BK=NCPSG=64 — NO: for the Wave 2E pre-pass paired with
-    // D=512, we use (BQ=8, BK=8) NOT (8, 64).  Rationale: llama.cpp's
+    // D=512, we use (BQ=8, BK=8) NOT (8, 64).  Rationale: the reference
     // pre-pass ties its tile to the main kernel's block shape; our D=512
     // main kernel's mask-load slab is C=64 wide but it's consumed AT
     // (Q-row, KV-chunk) granularity — and the blk byte indexes
@@ -764,11 +752,8 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
 
     // ── Grid geometry ──────────────────────────────────────────────────────
     //
-    // Matches llama.cpp ggml-metal-ops.cpp:2861:
-    //   grid = ((ne01 + nqptg - 1)/nqptg, ne02, ne03)
+    //   grid = (ceil(qL / NQPSG), H, B)
     //   threads / TG = (32, nsg, 1)
-    //
-    // ne01 = qL, ne02 = H (query heads), ne03 = B.
     let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
     let tg_size = MTLSize::new(32, nsg as u64, 1);
 
@@ -778,7 +763,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
     // Threadgroup memory — SAME footprint for NSG=4 and NSG=8 at is_q=0
     // (per ADR §2.3; the NSG term only shows up when is_q=1 allocates
     // per-simdgroup dequant scratch, which we've dropped).  Using the
-    // llama.cpp FATTN_SMEM(nsg=8) value for like-for-like memory behaviour.
+    // reference nsg=8 footprint for like-for-like memory behaviour.
     let tgmem = TGMEM_BYTES_D512 as u64;
     // Metal requires a concrete binding value at encode time.  When the
     // function constant disables sinks, buffer(8) is dead-code-eliminated;
@@ -899,7 +884,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
 
 // ─── f16 D=512 dispatcher (NSG=8 default) ────────────────────────────────────
 
-/// Dispatch llama.cpp-derived NSG=8 flash-attention prefill for f16 Q/K/V/O,
+/// Dispatch peer-pattern NSG=8 flash-attention prefill for f16 Q/K/V/O,
 /// head_dim=512.
 ///
 /// Sibling of [`dispatch_flash_attn_prefill_bf16_d512_with_blk`] with all
@@ -914,7 +899,7 @@ fn dispatch_flash_attn_prefill_bf16_d512_with_nsg_blk_and_sinks(
 /// On Gemma 4 26B-A4B ara-abliterated, the BF16 D=512 path drifted argmax
 /// late in greedy decode (`Format: Hemoglobin` loop at decode-pos ~70 on a
 /// 300-item enumeration); the F16 variant lands below the empirical argmax-
-/// flip threshold and matches llama.cpp's coherent output.
+/// flip threshold and matches the reference implementation's coherent output.
 ///
 /// Dynamic range: F16's 5-bit exponent (±65504) safely contains all Gemma 4
 /// activation magnitudes (max |V| ≈ 15, RMS-normalised Q/K ≈ 1).
@@ -1563,8 +1548,7 @@ pub fn dispatch_flash_attn_prefill_f16_d512_resume(
     };
 
     // ── Grid geometry ─────────────────────────────────────────────────────
-    // Matches llama.cpp ggml-metal-ops.cpp:2861:
-    //   grid = ((ne01 + nqptg - 1)/nqptg, ne02, ne03)
+    //   grid = (ceil(qL / NQPSG), H, B)
     //   threads / TG = (32, nsg, 1)
     let grid = MTLSize::new(nq as u64, params.n_heads as u64, params.batch as u64);
     let tg_size = MTLSize::new(32, nsg as u64, 1);

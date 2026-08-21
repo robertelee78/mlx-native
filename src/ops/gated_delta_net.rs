@@ -11,11 +11,11 @@
 //! output[t]   = state' @ q[t]
 //! ```
 //!
-//! IMPORTANT: alpha is applied before computing delta. This matches
-//! llama.cpp build_delta_net_autoregressive which does: s=s*exp(gate); sk=sum(s*k).
+//! IMPORTANT: alpha is applied before computing delta. This matches the
+//! reference build_delta_net_autoregressive which does: s=s*exp(gate); sk=sum(s*k).
 //!
 //! Spec source: ADR-013 Decision 6. Derived from the mathematical spec;
-//! no llama.cpp code copied.
+//! no reference code copied.
 //!
 //! # GQA broadcast
 //!
@@ -212,7 +212,7 @@ pub fn dispatch_gated_delta_net(
 /// ADR-033 §Pi iter 25 (2026-05-23): extended from 8 → 9 u32 to include
 /// q_scale_bits at index 8. When non-zero, the gated_delta_net_decode
 /// kernel applies `output *= as_type<float>(q_scale_bits)` at writeback
-/// (matching llama.cpp's per-kernel q_scale fold-in). When zero, kernel
+/// (matching the reference per-kernel q_scale fold-in). When zero, kernel
 /// preserves the legacy contract (caller pre-scales q).
 pub fn build_gated_delta_net_params(
     device: &crate::MlxDevice,
@@ -241,7 +241,7 @@ pub fn build_gated_delta_net_params(
 /// peer-parity gap).
 ///
 /// Caller passes the unscaled q buffer; the kernel scales the output at
-/// writeback (matching llama.cpp `kernel_gated_delta_net_impl` pattern).
+/// writeback (matching the `kernel_gated_delta_net_impl` pattern).
 pub fn build_gated_delta_net_params_with_q_scale(
     device: &crate::MlxDevice,
     p: GatedDeltaNetParams,
@@ -288,7 +288,7 @@ pub fn cpu_reference_f32(
     let nh_v = p.n_v_heads as usize;
     let n_t = p.n_tokens as usize;
     let n_s = p.n_seqs as usize;
-    // GQA: tiled mapping k_head = v_head % n_k_heads (matches llama.cpp fused kernel).
+    // GQA: tiled mapping k_head = v_head % n_k_heads (matches the fused kernel).
     // Not block-style (v_head / group_ratio) which gives wrong ordering.
     let kq_token_stride = nh_k * d_k;
     let kq_seq_stride = n_t * kq_token_stride;
@@ -304,7 +304,7 @@ pub fn cpu_reference_f32(
 
     for s in 0..n_s {
         for vh in 0..nh_v {
-            let kh = vh % nh_k;  // tiled GQA: matches llama.cpp k_head = v_head % n_k_heads
+            let kh = vh % nh_k;  // tiled GQA: k_head = v_head % n_k_heads
 
             for t in 0..n_t {
                 let kq_base = s * kq_seq_stride + t * kq_token_stride + kh * d_k;
@@ -318,7 +318,7 @@ pub fn cpu_reference_f32(
                 let state_base = s * state_seq_stride + vh * state_head_stride;
 
                 // Step 1: decay state — apply alpha BEFORE computing delta.
-                // Matches llama.cpp: s = s * exp(gate); sk = sum(s * k).
+                // Matches the reference: s = s * exp(gate); sk = sum(s * k).
                 for i in 0..d_v {
                     for j in 0..d_k {
                         state[state_base + i * d_k + j] *= alpha;

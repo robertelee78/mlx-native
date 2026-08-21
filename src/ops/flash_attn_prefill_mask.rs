@@ -1,8 +1,7 @@
 //! SWA / causal attention-mask builder for the flash_attn_prefill kernels.
 //!
-//! Ported from llama.cpp's `llm_graph_input_attn_no_cache::set_input`
-//! (`/opt/llama.cpp/src/llama-graph.cpp:380-444`) and the `is_masked_swa`
-//! predicate at `/opt/llama.cpp/src/llama-hparams.h:316-328`.  See
+//! Peer port of `llm_graph_input_attn_no_cache::set_input`
+//! and the `is_masked_swa` predicate.  See
 //! `docs/ADR-011-phase2-port-swa-mask.md` for the full port spec and
 //! `docs/ADR-011-phase2-wave2d-swa-mask-verification.md` for verification
 //! notes.
@@ -20,14 +19,14 @@
 //! ## Sentinel choice
 //!
 //! Masked = `-INFINITY` (post-Wave-2A convention).  Attended = `0.0`.  These
-//! match llama.cpp's CPU-side convention at `llama-graph.cpp:421, 436`.
+//! match the reference CPU-side convention.
 //! bf16 has the same 8-bit exponent as f32 so `-inf` is an exact
 //! representable value — no cast precision loss.
 //!
 //! ## Why GPU fill (not CPU fill)
 //!
-//! llama.cpp builds the mask on the CPU then relies on ggml's implicit
-//! host→device upload.  We build on-GPU instead because:
+//! The reference implementation builds the mask on the CPU then relies on
+//! an implicit host→device upload.  We build on-GPU instead because:
 //!
 //! 1. **Unified memory** on Apple Silicon means there is no meaningful
 //!    "upload" — CPU and GPU see the same `StorageModeShared` buffer.  The
@@ -41,8 +40,8 @@
 //!    280 GB/s — negligible compared with the ~200 µs of a single prefill
 //!    attention dispatch.
 //!
-//! This is a documented deviation from llama.cpp (see ADR-011 phase 2
-//! §6.1).  The mask values are byte-identical.
+//! This is a documented deviation from the reference implementation (see
+//! ADR-011 phase 2 §6.1).  The mask values are byte-identical.
 //!
 //! ## Broadcast semantics
 //!
@@ -50,7 +49,7 @@
 //! batch or head dimension.  It is broadcast across batch and heads at the
 //! flash_attn_prefill call-site by passing `m_strides = [0, 0, kL]` —
 //! see `AttnMaskParamsGpu` in [`crate::ops::flash_attn_prefill`].  This
-//! mirrors llama.cpp's `ggml_new_tensor_4d(ctx, F32, n_tokens, n_tokens, 1, 1)`
+//! mirrors the reference single-plane mask
 //! layout where `ne[2] = ne[3] = 1` broadcast the single (qL, kL) plane
 //! across heads and batch.
 //!
@@ -108,7 +107,7 @@ pub fn register(registry: &mut KernelRegistry) {
 
 /// Host-side parameters for the SWA-mask builder.
 ///
-/// Mirrors llama.cpp's `(n_tokens, n_kv, n_swa, swa_type, causal_attn)`
+/// Mirrors the reference `(n_tokens, n_kv, n_swa, swa_type, causal_attn)`
 /// inputs to `llm_graph_input_attn_no_cache::set_input` simplified for
 /// the batch=1, single-sequence case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,8 +165,8 @@ struct MaskFillParamsGpu {
 /// # Errors
 ///
 /// - `MlxError::InvalidArgument` if `seq_len_q == 0` or `seq_len_k == 0`.
-/// - `MlxError::InvalidArgument` if `window_size == Some(0)` (llama.cpp
-///   treats n_swa=0 as UB upstream; we reject it cleanly here).
+/// - `MlxError::InvalidArgument` if `window_size == Some(0)` (the
+///   reference treats n_swa=0 as UB; we reject it cleanly here).
 /// - `MlxError::BufferAllocationError` if Metal buffer allocation fails.
 /// - `MlxError::ShaderCompilationError` if the mask-fill kernel fails to
 ///   compile (shouldn't happen on supported Apple Silicon).
