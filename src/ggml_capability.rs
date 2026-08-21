@@ -228,6 +228,8 @@ pub enum GgmlKernelRoute {
     ExpertSwiGluDownQ4,
     EmbeddingQ2K,
     EmbeddingQ4K,
+    EmbeddingQ5K,
+    EmbeddingQ6K,
     EmbeddingQ8_0,
 }
 
@@ -1109,6 +1111,8 @@ fn embedding(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
     let route = match request.ggml_type {
         GgmlType::Q2_K => GgmlKernelRoute::EmbeddingQ2K,
         GgmlType::Q4_K => GgmlKernelRoute::EmbeddingQ4K,
+        GgmlType::Q5_K => GgmlKernelRoute::EmbeddingQ5K,
+        GgmlType::Q6_K => GgmlKernelRoute::EmbeddingQ6K,
         GgmlType::Q8_0 => GgmlKernelRoute::EmbeddingQ8_0,
         other => {
             return GgmlCapability::unsupported(

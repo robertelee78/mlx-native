@@ -27,6 +27,7 @@ mod dense_mm_fallback_tests;
 pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;
+pub mod embedding_kquant;
 pub mod embedding_q2_k;
 pub mod embedding_q4_k;
 pub mod embedding_q8_0;

@@ -1317,6 +1317,48 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Gather GGML Q5_K embedding rows directly into F32 activations.
+    pub fn embedding_gather_q5_k(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weight: &MlxBuffer,
+        token_ids: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::embedding_kquant::EmbeddingQ5KParams,
+    ) -> Result<()> {
+        ops::embedding_kquant::embedding_gather_q5_k(
+            &mut self.encoder,
+            registry,
+            device,
+            weight,
+            token_ids,
+            output,
+            params,
+        )
+    }
+
+    /// Gather GGML Q6_K embedding rows directly into F32 activations.
+    pub fn embedding_gather_q6_k(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weight: &MlxBuffer,
+        token_ids: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &ops::embedding_kquant::EmbeddingQ6KParams,
+    ) -> Result<()> {
+        ops::embedding_kquant::embedding_gather_q6_k(
+            &mut self.encoder,
+            registry,
+            device,
+            weight,
+            token_ids,
+            output,
+            params,
+        )
+    }
+
     /// Gather GGML Q8_0 embedding rows directly into F32 activations.
     pub fn embedding_gather_q8_0(
         &mut self,
