@@ -602,6 +602,9 @@ struct HadamardQuantizeHbParams {
     uint is_sliding;
     float scale_factor_d512; // Same semantics as 4-bit path
     uint codebook_bits;      // 5, 6, or 8
+    // Zero selects legacy uniform slots. Nonzero is the number of flattened
+    // [kv_head, token] rows in a bounded banked arena.
+    uint arena_token_capacity;
 };
 
 // Higher-bit quantization kernel: same FWHT + norm as 4-bit, but quantizes to
@@ -764,8 +767,9 @@ kernel void hadamard_quantize_kv_hb_batched(
     device       uint8_t                  *packed     [[buffer(1)]],  // [n_seqs, nkv, cap, HEAD_DIM] u8
     device       float                    *norms      [[buffer(2)]],  // [n_seqs, nkv, cap, npp] f32
     constant HadamardQuantizeHbParams     &params     [[buffer(3)]],
-    device const uint                     *slot_id_arr[[buffer(4)]],  // [N]
+    device const uint                *slot_or_base_arr[[buffer(4)]],  // [N] slot id or base token row
     device const uint                     *seq_pos_arr[[buffer(5)]],  // [N] raw seq position
+    device const uint                    *capacity_arr[[buffer(6)]],  // [N], banked layout only
     uint2 tgid [[threadgroup_position_in_grid]],   // x=head, y=query
     uint  tiisg [[thread_index_in_simdgroup]])
 {
@@ -777,12 +781,24 @@ kernel void hadamard_quantize_kv_hb_batched(
 
     if (head_idx >= params.num_kv_heads) return;
 
-    const uint slot = slot_id_arr[iq];
+    const bool banked = params.arena_token_capacity != 0u;
+    const uint slot_or_base = slot_or_base_arr[iq];
     const uint wpos = seq_pos_arr[iq];
+    const uint capacity = banked ? capacity_arr[iq] : params.cache_capacity;
+    if (capacity == 0u) return;
+
+    const ulong base_row = banked
+        ? (ulong)slot_or_base
+        : (ulong)slot_or_base * (ulong)params.num_kv_heads * (ulong)capacity;
+    const ulong end_row = base_row + (ulong)params.num_kv_heads * (ulong)capacity;
+    if ((banked && (end_row < base_row || end_row > (ulong)params.arena_token_capacity)) ||
+        (params.is_sliding == 0u && (ulong)wpos >= (ulong)capacity)) {
+        return;
+    }
 
     // 1. Load elements (per-query src row offset).
-    const uint src_base = iq * (params.num_kv_heads * HEAD_DIM)
-                        + head_idx * HEAD_DIM + lane * EPT;
+    const ulong src_base = (ulong)iq * ((ulong)params.num_kv_heads * (ulong)HEAD_DIM)
+                         + (ulong)head_idx * (ulong)HEAD_DIM + (ulong)lane * (ulong)EPT;
     float elems[EPT];
     for (ushort i = 0; i < EPT; i++) elems[i] = src[src_base + i];
 
@@ -863,30 +879,25 @@ kernel void hadamard_quantize_kv_hb_batched(
     }
 
     // 7. Write byte-packed output (per-query slot region).
-    uint actual_pos = (params.is_sliding != 0u)
-        ? (wpos % params.cache_capacity)
+    const uint actual_pos = (params.is_sliding != 0u)
+        ? (wpos % capacity)
         : wpos;
-    const uint slot_packed_base = slot * (params.num_kv_heads * params.cache_capacity * HEAD_DIM);
-    const uint packed_base = slot_packed_base
-                           + head_idx * params.cache_capacity * HEAD_DIM
-                           + actual_pos * HEAD_DIM;
-    const uint elem_base = packed_base + lane * EPT;
+    const ulong row = base_row + (ulong)head_idx * (ulong)capacity + (ulong)actual_pos;
+    const ulong elem_base = row * (ulong)HEAD_DIM + (ulong)lane * (ulong)EPT;
     for (ushort i = 0; i < EPT; i++) {
         packed[elem_base + i] = indices[i];
     }
 
     // 8. Store norm(s) — per-query slot region.
-    const uint slot_norm_base = slot * (params.num_kv_heads * params.cache_capacity * NPP);
+    const ulong norm_base = row * (ulong)NPP;
     if (HEAD_DIM == 256) {
         if (lane == 0) {
-            norms[slot_norm_base + head_idx * params.cache_capacity + actual_pos] = norm0;
+            norms[norm_base] = norm0;
         }
     } else {
         if (lane == 0u) {
-            uint norm_base = slot_norm_base + head_idx * params.cache_capacity * 2u + actual_pos * 2u;
             norms[norm_base + 0u] = norm0;
         } else if (lane == 16u) {
-            uint norm_base = slot_norm_base + head_idx * params.cache_capacity * 2u + actual_pos * 2u;
             norms[norm_base + 1u] = norm1;
         }
     }
@@ -895,13 +906,13 @@ kernel void hadamard_quantize_kv_hb_batched(
 template [[host_name("hadamard_quantize_kv_hb_batched_d256")]]
 kernel void hadamard_quantize_kv_hb_batched<256>(
     device const float *, device uint8_t *, device float *,
-    constant HadamardQuantizeHbParams &, device const uint *, device const uint *,
+    constant HadamardQuantizeHbParams &, device const uint *, device const uint *, device const uint *,
     uint2, uint);
 
 template [[host_name("hadamard_quantize_kv_hb_batched_d512")]]
 kernel void hadamard_quantize_kv_hb_batched<512>(
     device const float *, device uint8_t *, device float *,
-    constant HadamardQuantizeHbParams &, device const uint *, device const uint *,
+    constant HadamardQuantizeHbParams &, device const uint *, device const uint *, device const uint *,
     uint2, uint);
 
 // ============================================================================

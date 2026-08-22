@@ -12,6 +12,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
+use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
@@ -759,6 +760,9 @@ struct FlashAttnVecTqHbBatchedParamsGpu {
     fuse_fwht_pre: u32,
     nsg: u32,
     n_queries: u32,
+    /// Zero selects legacy uniform slots. Nonzero is the number of flattened
+    /// `[kv_head, token]` rows in the banked arena.
+    arena_token_capacity: u32,
 }
 
 /// ADR-040 M-SPEED-LC — BATCHED multi-sequence decode flash for byte-packed
@@ -824,6 +828,187 @@ pub fn flash_attn_vec_tq_hb_batched(
     seq_pos_arr: &MlxBuffer,
     params: &FlashAttnVecTqHbParams,
 ) -> Result<()> {
+    flash_attn_vec_tq_hb_batched_layout(
+        encoder,
+        registry,
+        device,
+        n_q,
+        q,
+        k_packed,
+        k_norms,
+        v_packed,
+        v_norms,
+        output,
+        tmp,
+        slot_id_arr,
+        seq_pos_arr,
+        slot_id_arr,
+        0,
+        params,
+    )
+}
+
+/// Run batched TQ-HB attention over unequal physical slot banks in one arena.
+///
+/// `base_token_rows[i]` and `capacities[i]` describe query `i`'s contiguous
+/// bank. A KV row is addressed as `base + kv_head * capacity + position`.
+/// Invalid per-query layouts are rejected by the shader before any arena read;
+/// their output row is numerically zero. Legacy uniform-slot callers use
+/// [`flash_attn_vec_tq_hb_batched`] unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_tq_hb_batched_banked(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    base_token_rows: &MlxBuffer,
+    capacities: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    arena_token_capacity: u32,
+    params: &FlashAttnVecTqHbParams,
+) -> Result<()> {
+    const OP: &str = "flash_attn_vec_tq_hb_batched_banked";
+    validate_params(params)?;
+    if n_q == 0 {
+        return Ok(());
+    }
+    if arena_token_capacity == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: arena_token_capacity must be greater than zero"
+        )));
+    }
+    if q.dtype() != DType::F32
+        || k_packed.dtype() != DType::U8
+        || k_norms.dtype() != DType::F32
+        || v_packed.dtype() != DType::U8
+        || v_norms.dtype() != DType::F32
+        || output.dtype() != DType::F32
+        || tmp.dtype() != DType::F32
+        || base_token_rows.dtype() != DType::U32
+        || capacities.dtype() != DType::U32
+        || seq_pos_arr.dtype() != DType::U32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: expected Q/norms/output/tmp F32, packed K/V U8, and layout arrays U32"
+        )));
+    }
+    if !output.is_cpu_writable() || !tmp.is_cpu_writable() {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: output and tmp destinations must have writable backing"
+        )));
+    }
+    for (name, buffer) in [
+        ("q", q),
+        ("k_norms", k_norms),
+        ("v_norms", v_norms),
+        ("output", output),
+        ("tmp", tmp),
+        ("base_token_rows", base_token_rows),
+        ("capacities", capacities),
+        ("seq_pos_arr", seq_pos_arr),
+    ] {
+        if buffer.byte_offset() % 4 != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: {name} byte offset must be 4-byte aligned"
+            )));
+        }
+    }
+
+    let array_bytes = u64::from(n_q) * 4;
+    for (name, buffer) in [
+        ("base_token_rows", base_token_rows),
+        ("capacities", capacities),
+        ("seq_pos_arr", seq_pos_arr),
+    ] {
+        if (buffer.data_byte_len() as u64) < array_bytes {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: {name} has {} bytes but needs {array_bytes}",
+                buffer.data_byte_len()
+            )));
+        }
+    }
+
+    let rows = u64::from(arena_token_capacity);
+    let head_dim = u64::from(params.head_dim);
+    let norms_per_row = head_dim / 256;
+    let n_rows = n_q.checked_mul(params.num_heads).ok_or_else(|| {
+        MlxError::InvalidArgument(format!("{OP}: query-head row count overflows u32"))
+    })?;
+    let q_output_bytes = u64::from(n_q)
+        .checked_mul(u64::from(params.num_heads))
+        .and_then(|count| count.checked_mul(head_dim))
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: Q/output size overflow")))?;
+    let packed_bytes = rows
+        .checked_mul(head_dim)
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: packed size overflow")))?;
+    let norm_bytes = rows
+        .checked_mul(norms_per_row)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: norm size overflow")))?;
+    let tmp_bytes = tmp_buffer_bytes(n_rows, params.head_dim) as u64;
+    for (name, actual, required) in [
+        ("q", q.data_byte_len() as u64, q_output_bytes),
+        ("output", output.data_byte_len() as u64, q_output_bytes),
+        ("k_packed", k_packed.data_byte_len() as u64, packed_bytes),
+        ("v_packed", v_packed.data_byte_len() as u64, packed_bytes),
+        ("k_norms", k_norms.data_byte_len() as u64, norm_bytes),
+        ("v_norms", v_norms.data_byte_len() as u64, norm_bytes),
+        ("tmp", tmp.data_byte_len() as u64, tmp_bytes),
+    ] {
+        if actual < required {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: {name} has {actual} bytes but needs {required}"
+            )));
+        }
+    }
+
+    flash_attn_vec_tq_hb_batched_layout(
+        encoder,
+        registry,
+        device,
+        n_q,
+        q,
+        k_packed,
+        k_norms,
+        v_packed,
+        v_norms,
+        output,
+        tmp,
+        base_token_rows,
+        seq_pos_arr,
+        capacities,
+        arena_token_capacity,
+        params,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_vec_tq_hb_batched_layout(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_or_base_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    capacity_arr: &MlxBuffer,
+    arena_token_capacity: u32,
+    params: &FlashAttnVecTqHbParams,
+) -> Result<()> {
     validate_params(params)?;
 
     let head_dim = params.head_dim;
@@ -846,6 +1031,7 @@ pub fn flash_attn_vec_tq_hb_batched(
         fuse_fwht_pre: params.fuse_fwht_pre,
         nsg: params.nsg,
         n_queries: n_q,
+        arena_token_capacity,
     };
 
     let kernel_name = match head_dim {
@@ -890,8 +1076,9 @@ pub fn flash_attn_vec_tq_hb_batched(
             (4, KernelArg::Buffer(v_packed)),
             (5, KernelArg::Buffer(v_norms)),
             (6, KernelArg::Buffer(dst_buf)),
-            (7, KernelArg::Buffer(slot_id_arr)),
+            (7, KernelArg::Buffer(slot_or_base_arr)),
             (8, KernelArg::Buffer(seq_pos_arr)),
+            (9, KernelArg::Buffer(capacity_arr)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,
@@ -943,6 +1130,7 @@ mod tests {
         // ADR-028: 15 fields × 4 bytes = 60 bytes (added nsg).
         // Was 14 before fuse_fwht_pre; nsg was added most recently.
         assert_eq!(std::mem::size_of::<FlashAttnVecTqHbParamsGpu>(), 60);
+        assert_eq!(std::mem::size_of::<FlashAttnVecTqHbBatchedParamsGpu>(), 68);
     }
 
     #[test]

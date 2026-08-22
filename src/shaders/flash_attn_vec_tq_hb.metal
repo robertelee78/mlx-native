@@ -1017,6 +1017,9 @@ struct FlashAttnVecTqHbBatchedParams {
     uint  fuse_fwht_pre;
     uint  nsg;
     uint  n_queries;      // ADR-040 M-SPEED-LC: batched flash query count
+    // Zero selects legacy uniform slots. Nonzero is the number of flattened
+    // [kv_head, token] rows in a bounded banked arena.
+    uint  arena_token_capacity;
 };
 
 // ---------------------------------------------------------------------------
@@ -1044,8 +1047,9 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
     device const uint8_t             *V_packed    [[buffer(4)]],
     device const float               *V_norms     [[buffer(5)]],
     device       float               *dst         [[buffer(6)]],
-    device const uint                *slot_id_arr [[buffer(7)]],
+    device const uint           *slot_or_base_arr [[buffer(7)]],
     device const uint                *seq_pos_arr [[buffer(8)]],
+    device const uint               *capacity_arr [[buffer(9)]],
     threadgroup  half                *shmem       [[threadgroup(0)]],
     uint3  tgpig [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
@@ -1071,16 +1075,47 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
     const ushort iq2 = tgpig[1];  // head index
     const ushort iq1 = tgpig[0];  // query index (0..n_q-1)
     const uint   sp_b      = seq_pos_arr[iq1];
-    const uint   slot_b    = slot_id_arr[iq1];
+    const bool   banked_b  = params.arena_token_capacity != 0u;
+    const uint   slot_or_base_b = slot_or_base_arr[iq1];
+    const uint   cap_b     = banked_b ? capacity_arr[iq1] : params.kv_capacity;
     const bool   is_ring_b = (params.mask_type == 2u);
-    const uint   ksl_b     = is_ring_b ? min(sp_b + 1u, params.kv_capacity) : (sp_b + 1u);
-    const uint   rs_b      = (is_ring_b && ksl_b >= params.kv_capacity) ? ((sp_b + 1u) % params.kv_capacity) : 0u;
+    const ulong  produced_b = (ulong)sp_b + 1ul;
+    const ulong  base_row_b = banked_b
+        ? (ulong)slot_or_base_b
+        : (ulong)slot_or_base_b * (ulong)params.n_kv_heads * (ulong)cap_b;
+    const ulong  end_row_b = base_row_b + (ulong)params.n_kv_heads * (ulong)cap_b;
+    const bool   valid_b = cap_b != 0u &&
+        (!banked_b || (end_row_b >= base_row_b && end_row_b <= (ulong)params.arena_token_capacity)) &&
+        (is_ring_b || produced_b <= (ulong)cap_b);
+    const uint   ksl_b     = is_ring_b ? (uint)min(produced_b, (ulong)cap_b) : (uint)produced_b;
+    const uint   rs_b      = (is_ring_b && cap_b != 0u && produced_b >= (ulong)cap_b)
+        ? (uint)(produced_b % (ulong)cap_b) : 0u;
     constexpr ushort npp_b = (DK == 512) ? 2 : 1;
-    const uint   q_off_b   = (uint)iq1 * params.n_heads * DK;
-    const uint   k_off_b   = slot_b * params.n_kv_heads * params.kv_capacity * DK;
-    const uint   kn_off_b  = slot_b * params.n_kv_heads * params.kv_capacity * npp_b;
-    const uint   v_off_b   = slot_b * params.n_kv_heads * params.kv_capacity * DV;
-    const uint   vn_off_b  = slot_b * params.n_kv_heads * params.kv_capacity * npp_b;
+    const ulong  q_off_b   = (ulong)iq1 * (ulong)params.n_heads * (ulong)DK;
+    const ulong  k_off_b   = base_row_b * (ulong)DK;
+    const ulong  kn_off_b  = base_row_b * (ulong)npp_b;
+    const ulong  v_off_b   = base_row_b * (ulong)DV;
+    const ulong  vn_off_b  = base_row_b * (ulong)npp_b;
+
+    // A malformed row descriptor must not read outside the arena. Produce a
+    // deterministic all-zero partial for every workgroup so the unchanged
+    // reduce kernel also yields an all-zero final row.
+    if (!valid_b) {
+        if (sgitg == 0) {
+            const ulong nrows = (ulong)params.n_queries * (ulong)params.n_heads;
+            const ulong rid = (ulong)iq2 + (ulong)iq1 * (ulong)params.n_heads;
+            device float4 *dst4 = (device float4 *)dst;
+            for (ushort i = tiisg; i < DV4; i += NW) {
+                dst4[rid * (ulong)DV4 * (ulong)NWG + (ulong)NWG * (ulong)i + (ulong)iwg] = float4(0.0f);
+            }
+            if (NWG > 1u && tiisg == 0) {
+                device float *dst1 = (device float *)dst + nrows * (ulong)DV * (ulong)NWG;
+                dst1[rid * (ulong)(2u * NWG) + (ulong)(2u * iwg)] = 0.0f;
+                dst1[rid * (ulong)(2u * NWG) + (ulong)(2u * iwg + 1u)] = -FLT_MAX / 2;
+            }
+        }
+        return;
+    }
 
     // GQA: map query head to KV head.
     const uint heads_per_kv = params.n_heads / params.n_kv_heads;
@@ -1149,7 +1184,7 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
 
     const ushort tx = tiisg;
     const uint kv_seq_len = ksl_b;
-    const uint kv_capacity = params.kv_capacity;
+    const uint kv_capacity = cap_b;
     const uint ring_start = rs_b;
     const uint cbits = params.codebook_bits;
     const float sf_d512 = params.scale_factor_d512;
@@ -1200,12 +1235,13 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
                 // Dequant scale for K.
                 float k_sn;
                 if (is_d512) {
-                    device const float *knorm = K_norms + kn_off_b + (kv_head * kv_capacity + kv_pos) * 2u;
+                    const ulong kv_row = (ulong)kv_head * (ulong)kv_capacity + (ulong)kv_pos;
+                    device const float *knorm = K_norms + kn_off_b + kv_row * 2ul;
                     (void)k_sn;
                     (void)inv_sqrt_dk;
 
                     device const uint8_t *k_base =
-                        K_packed + k_off_b + (kv_head * kv_capacity + kv_pos) * DK;
+                        K_packed + k_off_b + kv_row * (ulong)DK;
 
                     float partial = 0.0f;
                     // Block 0: coords 0..255
@@ -1229,11 +1265,12 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
                     }
                     mqk[cc] = simd_sum(partial);
                 } else {
-                    float k_norm_val = K_norms[kn_off_b + kv_head * kv_capacity + kv_pos];
+                    const ulong kv_row = (ulong)kv_head * (ulong)kv_capacity + (ulong)kv_pos;
+                    float k_norm_val = K_norms[kn_off_b + kv_row];
                     k_sn = k_norm_val * inv_sqrt_dk;
 
                     device const uint8_t *k_base =
-                        K_packed + k_off_b + (kv_head * kv_capacity + kv_pos) * DK + tx * 4u;
+                        K_packed + k_off_b + kv_row * (ulong)DK + (ulong)tx * 4ul;
 
                     float partial = 0.0f;
                     for (short ii = 0; ii < DK4 / NL; ++ii) {
@@ -1279,9 +1316,10 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
                 if (kv_pos >= kv_seq_len) continue;
 
                 if (is_d512) {
-                    device const float *vnorm = V_norms + vn_off_b + (kv_head * kv_capacity + kv_pos) * 2u;
+                    const ulong kv_row = (ulong)kv_head * (ulong)kv_capacity + (ulong)kv_pos;
+                    device const float *vnorm = V_norms + vn_off_b + kv_row * 2ul;
                     device const uint8_t *v_base =
-                        V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV;
+                        V_packed + v_off_b + kv_row * (ulong)DV;
                     float w = ss[cc];
 
                     // Block 0: coords 0..255
@@ -1297,10 +1335,11 @@ kernel void flash_attn_vec_tq_hb_batched_impl(
                         lo[DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, cbits);
                     }
                 } else {
-                    float v_norm_val = V_norms[vn_off_b + kv_head * kv_capacity + kv_pos];
+                    const ulong kv_row = (ulong)kv_head * (ulong)kv_capacity + (ulong)kv_pos;
+                    float v_norm_val = V_norms[vn_off_b + kv_row];
                     float v_sw = v_norm_val * inv_sqrt_dv * ss[cc];
                     device const uint8_t *v_base =
-                        V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV + tx * 4u;
+                        V_packed + v_off_b + kv_row * (ulong)DV + (ulong)tx * 4ul;
 
                     for (short ii = 0; ii < DV4 / NL; ++ii) {
                         lo[ii] += dequant_hb_float4(v_base, (uint)(ii * NL) * 4u, v_sw, cbits);
