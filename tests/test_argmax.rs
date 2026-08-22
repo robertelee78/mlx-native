@@ -217,6 +217,58 @@ fn test_argmax_small() {
 }
 
 #[test]
+fn test_argmax_equal_maxima_choose_lowest_vocab_index_across_strides() {
+    let (device, mut registry) = setup();
+    let n: u32 = 2048;
+    let mut data = vec![0.0f32; n as usize];
+    data[1] = 100.0;
+    data[1024] = 100.0;
+
+    let (expected_idx, expected_val) = cpu_argmax(&data);
+    assert_eq!(expected_idx, 1, "CPU contract must keep the first maximum");
+
+    let mut input_buf = device
+        .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
+        .expect("alloc input");
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("write input")
+        .copy_from_slice(&data);
+    let out_index = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .expect("alloc out_index");
+    let out_value = device
+        .alloc_buffer(4, DType::F32, vec![1])
+        .expect("alloc out_value");
+    let mut params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .expect("alloc params");
+    params_buf.as_mut_slice::<u32>().expect("write params")[0] = n;
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    argmax::dispatch_argmax_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &input_buf,
+        &out_index,
+        &out_value,
+        &params_buf,
+        n,
+    )
+    .expect("dispatch_argmax_f32");
+    encoder.commit_and_wait().expect("commit_and_wait");
+
+    let actual_idx = out_index.as_slice::<u32>().expect("read index")[0];
+    let actual_val = out_value.as_slice::<f32>().expect("read value")[0];
+    assert_eq!(
+        actual_idx, expected_idx,
+        "GPU must keep the lowest vocab index"
+    );
+    assert_eq!(actual_val, expected_val);
+}
+
+#[test]
 fn test_argmax_zero_elements_error() {
     let (device, mut registry) = setup();
 
