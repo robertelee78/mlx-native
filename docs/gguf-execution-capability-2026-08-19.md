@@ -79,9 +79,10 @@ device-resolved route has a matched benchmark receipt.
   four-byte scalar storage in the raw loader. `load_tensor_f32` remains an
   explicit diagnostic/materialization request; model loaders must not use it
   to disguise a missing native execution route.
-- Direct dense embedding gather supports F32, F16, and BF16 tables and converts
-  only selected rows to the graph's F32 activation dtype. This is row execution,
-  not a second resident weight representation.
+- Direct embedding gather supports native F32, F16, BF16, Q4_0, Q8_0, Q2_K,
+  Q4_K, Q5_K, and Q6_K tables and converts only selected rows to the graph's
+  F32 activation dtype. This is row execution, not a second resident weight
+  representation. Other codecs fail closed at capability admission.
 - Dense F32, F16, and BF16 projections expose explicit native scalar routes at
   decode, continuous widths through eight, and prompt/physical-batch widths
   above eight. The capability receipt accounts for the exact two- or four-byte

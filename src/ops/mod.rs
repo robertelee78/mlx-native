@@ -30,6 +30,7 @@ pub mod embedding;
 pub mod embedding_dense;
 pub mod embedding_kquant;
 pub mod embedding_q2_k;
+pub mod embedding_q4_0;
 pub mod embedding_q4_k;
 pub mod embedding_q8_0;
 pub mod encode_helpers;

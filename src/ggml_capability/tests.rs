@@ -471,6 +471,11 @@ fn embedding_contract_is_exact() {
         ggml_capability(request).route,
         Some(GgmlKernelRoute::EmbeddingQ4K)
     );
+    request.ggml_type = GgmlType::Q4_0;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingQ4_0)
+    );
     request.ggml_type = GgmlType::Q5_K;
     assert_eq!(
         ggml_capability(request).route,
@@ -502,6 +507,13 @@ fn embedding_contract_is_exact() {
     assert_eq!(
         bf16.minimum_weight_buffer_bytes,
         151_936_u64 * 5_120 * 2
+    );
+    request.ggml_type = GgmlType::Q5_1;
+    let unsupported = ggml_capability(request);
+    assert!(!unsupported.executable);
+    assert_eq!(
+        unsupported.rejection_code,
+        Some(GgmlRejectionCode::UnsupportedType)
     );
 }
 
