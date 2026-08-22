@@ -1,6 +1,6 @@
 # Native dense GGUF scalar storage — 2026-08-22
 
-Status: accepted for mlx-native 0.11.3; downstream exact-artifact
+Status: accepted for mlx-native 0.12.0; downstream exact-artifact
 qualification remains a separate gate.
 
 ## Decision
