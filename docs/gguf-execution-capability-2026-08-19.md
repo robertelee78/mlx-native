@@ -75,6 +75,13 @@ device-resolved route has a matched benchmark receipt.
   allocator must describe those as an explicit stored-GGUF to executed-F16
   transformation and query/measure the F16 operation rather than pretending
   the stored GGUF codec executes directly.
+- Unquantized GGUF F32, F16, and BF16 tensors retain their declared two- or
+  four-byte scalar storage in the raw loader. `load_tensor_f32` remains an
+  explicit diagnostic/materialization request; model loaders must not use it
+  to disguise a missing native execution route.
+- Direct dense embedding gather supports F32, F16, and BF16 tables and converts
+  only selected rows to the graph's F32 activation dtype. This is row execution,
+  not a second resident weight representation.
 
 ## Evidence and remaining scope
 

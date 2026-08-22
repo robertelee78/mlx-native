@@ -433,8 +433,23 @@ fn embedding_contract_is_exact() {
         ggml_capability(request).route,
         Some(GgmlKernelRoute::EmbeddingQ8_0)
     );
+    request.ggml_type = GgmlType::F32;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingF32)
+    );
     request.ggml_type = GgmlType::F16;
-    assert!(!ggml_capability(request).executable);
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingF16)
+    );
+    request.ggml_type = GgmlType::BF16;
+    let bf16 = ggml_capability(request);
+    assert_eq!(bf16.route, Some(GgmlKernelRoute::EmbeddingBF16));
+    assert_eq!(
+        bf16.minimum_weight_buffer_bytes,
+        151_936_u64 * 5_120 * 2
+    );
 }
 
 #[test]

@@ -226,6 +226,9 @@ pub enum GgmlKernelRoute {
     ExpertPooledSlottedMmSimdgroup,
     ExpertPooledSlottedMmDeviceSelected,
     ExpertSwiGluDownQ4,
+    EmbeddingF32,
+    EmbeddingF16,
+    EmbeddingBF16,
     EmbeddingQ2K,
     EmbeddingQ4K,
     EmbeddingQ5K,
@@ -463,6 +466,15 @@ fn workload_shape_valid(request: &GgmlCapabilityRequest) -> bool {
 
 fn packed_matrix_bytes(request: &GgmlCapabilityRequest) -> Option<u64> {
     let (_, n, k) = request.invocation.dimensions();
+    if matches!(request.invocation, GgmlInvocation::EmbeddingGather { .. })
+        && matches!(request.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+    {
+        return u64::from(n)
+            .checked_mul(u64::from(k))
+            .and_then(|elements| {
+                elements.checked_mul(u64::from(request.ggml_type.block_bytes()))
+            });
+    }
     ggml_matrix_bytes(request.ggml_type, n, k).ok()
 }
 
@@ -482,7 +494,9 @@ fn validate_common(request: &GgmlCapabilityRequest) -> Option<GgmlCapability> {
             "M, N, and K must all be non-zero",
         ));
     }
-    if !quantized_matmul_type(request.ggml_type) {
+    let dense_scalar_embedding = matches!(request.invocation, GgmlInvocation::EmbeddingGather { .. })
+        && matches!(request.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
+    if !quantized_matmul_type(request.ggml_type) && !dense_scalar_embedding {
         return Some(GgmlCapability::unsupported(
             request,
             GgmlRejectionCode::UnsupportedType,
@@ -1109,6 +1123,9 @@ fn embedding(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
         );
     }
     let route = match request.ggml_type {
+        GgmlType::F32 => GgmlKernelRoute::EmbeddingF32,
+        GgmlType::F16 => GgmlKernelRoute::EmbeddingF16,
+        GgmlType::BF16 => GgmlKernelRoute::EmbeddingBF16,
         GgmlType::Q2_K => GgmlKernelRoute::EmbeddingQ2K,
         GgmlType::Q4_K => GgmlKernelRoute::EmbeddingQ4K,
         GgmlType::Q5_K => GgmlKernelRoute::EmbeddingQ5K,
@@ -1133,7 +1150,7 @@ fn embedding(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
         GgmlScratchRequirement::None,
         1,
         0,
-        "dedicated block-quantized embedding-gather route",
+        "dedicated native-storage embedding-gather route",
     )
 }
 
