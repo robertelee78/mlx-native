@@ -21,6 +21,8 @@ jobs:
           persist-credentials: false
       - name: Reference naming policy
         run: bash scripts/check_reference_policy.sh
+      - name: Package hygiene
+        run: bash scripts/check_package_hygiene.sh
 
   rust-metal-train:
     runs-on: macos-15

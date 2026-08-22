@@ -11,6 +11,8 @@
 .claude-flow/
 .swarm/
 ruvector.db
+*.rvf
+*.rvf.lock
 CLAUDE.md
 
 # BMAD session research artifacts (transient — distilled into ADRs/docs)

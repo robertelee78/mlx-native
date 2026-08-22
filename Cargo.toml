@@ -12,7 +12,7 @@ documentation = "https://docs.rs/mlx-native"
 readme = "README.md"
 keywords = ["metal", "gpu", "mlx", "inference", "apple-silicon"]
 categories = ["os::macos-apis", "science"]
-exclude = [".claude/", ".agents/", "AGENTS.md", "CLAUDE.md.pre-ruflo", "_bmad/", "_bmad-output/", "docs/", "!docs/command-buffer-autorelease-lifetime-2026-08-08.md", ".github/", "**/*.bak"]
+exclude = [".claude/", ".agents/", "AGENTS.md", "CLAUDE.md.pre-ruflo", "_bmad/", "_bmad-output/", "docs/", "!docs/command-buffer-autorelease-lifetime-2026-08-08.md", ".github/", "**/*.bak", "**/*.rvf", "**/*.rvf.lock"]
 
 [package.metadata.docs.rs]
 default-target = "aarch64-apple-darwin"
