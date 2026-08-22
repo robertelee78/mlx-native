@@ -15,12 +15,14 @@
 //! `norms_per_pos(head_dim)` = `head_dim / 256`. Callers must allocate norms buffers
 //! with `num_kv_heads * cache_capacity * norms_per_pos(head_dim)` f32 elements.
 
+use metal::foreign_types::ForeignType;
 use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::DType;
 
 use super::encode_helpers::{encode_threadgroups_with_args_and_shared, KernelArg};
 
@@ -486,13 +488,15 @@ pub fn dispatch_hadamard_quantize_kv_fast_dual(
     if (src_k.element_count() as u64) < required_src {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv_fast_dual: src_k has {} elements but need {}",
-            src_k.element_count(), required_src
+            src_k.element_count(),
+            required_src
         )));
     }
     if (src_v.element_count() as u64) < required_src {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv_fast_dual: src_v has {} elements but need {}",
-            src_v.element_count(), required_src
+            src_v.element_count(),
+            required_src
         )));
     }
 
@@ -501,13 +505,15 @@ pub fn dispatch_hadamard_quantize_kv_fast_dual(
     if (packed_k.byte_len() as u64) < required_packed_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv_fast_dual: packed_k has {} bytes but need {}",
-            packed_k.byte_len(), required_packed_bytes
+            packed_k.byte_len(),
+            required_packed_bytes
         )));
     }
     if (packed_v.byte_len() as u64) < required_packed_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv_fast_dual: packed_v has {} bytes but need {}",
-            packed_v.byte_len(), required_packed_bytes
+            packed_v.byte_len(),
+            required_packed_bytes
         )));
     }
 
@@ -516,13 +522,15 @@ pub fn dispatch_hadamard_quantize_kv_fast_dual(
     if (norms_k.element_count() as u64) < required_norms {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv_fast_dual: norms_k has {} elements but need {}",
-            norms_k.element_count(), required_norms
+            norms_k.element_count(),
+            required_norms
         )));
     }
     if (norms_v.element_count() as u64) < required_norms {
         return Err(MlxError::InvalidArgument(format!(
             "hadamard_quantize_kv_fast_dual: norms_v has {} elements but need {}",
-            norms_v.element_count(), required_norms
+            norms_v.element_count(),
+            required_norms
         )));
     }
 
@@ -573,7 +581,41 @@ struct HadamardQuantizeHbParams {
     cache_capacity: u32,
     is_sliding: u32,
     scale_factor_d512: f32,
-    codebook_bits: u32,  // 5 or 6
+    codebook_bits: u32, // 5, 6, or 8
+}
+
+#[derive(Clone, Copy)]
+struct HbLogicalRange {
+    buffer_id: usize,
+    start: u64,
+    end: u64,
+}
+
+impl HbLogicalRange {
+    fn new(buffer: &MlxBuffer, relative_start: u64, byte_len: u64) -> Result<Self> {
+        let start = buffer
+            .byte_offset()
+            .checked_add(relative_start)
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "hadamard_quantize_kv_hb_seq: logical range start overflows u64".into(),
+                )
+            })?;
+        let end = start.checked_add(byte_len).ok_or_else(|| {
+            MlxError::InvalidArgument(
+                "hadamard_quantize_kv_hb_seq: logical range end overflows u64".into(),
+            )
+        })?;
+        Ok(Self {
+            buffer_id: buffer.metal_buffer().as_ptr() as usize,
+            start,
+            end,
+        })
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.buffer_id == other.buffer_id && self.start < other.end && other.start < self.end
+    }
 }
 
 /// Dispatch the higher-bit Hadamard-quantize KV kernel.
@@ -590,7 +632,7 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     registry: &mut KernelRegistry,
     device: &metal::DeviceRef,
     src: &MlxBuffer,
-    packed: &MlxBuffer,      // byte-packed: [nkv, capacity, head_dim] u8
+    packed: &MlxBuffer, // byte-packed: [nkv, capacity, head_dim] u8
     norms: &MlxBuffer,
     num_kv_heads: u32,
     head_dim: u32,
@@ -598,19 +640,27 @@ pub fn dispatch_hadamard_quantize_kv_hb(
     write_pos: u32,
     is_sliding: bool,
     scale_factor_d512: f32,
-    codebook_bits: u32,      // 5 or 6
+    codebook_bits: u32, // 5 or 6
 ) -> Result<()> {
-    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
     if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_hadamard_quantize_kv_hb: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
+            "dispatch_hadamard_quantize_kv_hb: codebook_bits must be 5, 6, or 8, got {}",
+            codebook_bits
+        )));
     }
 
     let kernel_name = match head_dim {
         256 => "hadamard_quantize_kv_hb_d256",
         512 => "hadamard_quantize_kv_hb_d512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "hadamard_quantize_kv_hb: head_dim {} not supported (need 256 or 512)", head_dim))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_hb: head_dim {} not supported (need 256 or 512)",
+                head_dim
+            )))
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
@@ -667,16 +717,24 @@ pub fn dispatch_hadamard_quantize_kv_hb_batched(
     scale_factor_d512: f32,
     codebook_bits: u32,
 ) -> Result<()> {
-    if num_kv_heads == 0 || head_dim == 0 || n_queries == 0 { return Ok(()); }
+    if num_kv_heads == 0 || head_dim == 0 || n_queries == 0 {
+        return Ok(());
+    }
     if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_hadamard_quantize_kv_hb_batched: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
+            "dispatch_hadamard_quantize_kv_hb_batched: codebook_bits must be 5, 6, or 8, got {}",
+            codebook_bits
+        )));
     }
     let kernel_name = match head_dim {
         256 => "hadamard_quantize_kv_hb_batched_d256",
         512 => "hadamard_quantize_kv_hb_batched_d512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "hadamard_quantize_kv_hb_batched: head_dim {} not supported (need 256 or 512)", head_dim))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_hb_batched: head_dim {} not supported (need 256 or 512)",
+                head_dim
+            )))
+        }
     };
     let pipeline = registry.get_pipeline(kernel_name, device)?;
     let params = HadamardQuantizeHbParams {
@@ -728,7 +786,7 @@ pub fn dispatch_kv_quantize_v_no_fwht(
     registry: &mut KernelRegistry,
     device: &metal::DeviceRef,
     src: &MlxBuffer,
-    packed: &MlxBuffer,      // byte-packed: [nkv, capacity, head_dim] u8
+    packed: &MlxBuffer, // byte-packed: [nkv, capacity, head_dim] u8
     norms: &MlxBuffer,
     num_kv_heads: u32,
     head_dim: u32,
@@ -736,20 +794,27 @@ pub fn dispatch_kv_quantize_v_no_fwht(
     write_pos: u32,
     is_sliding: bool,
     scale_factor_d512: f32,
-    codebook_bits: u32,      // 5, 6, or 8
+    codebook_bits: u32, // 5, 6, or 8
 ) -> Result<()> {
-    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
     if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
             "dispatch_kv_quantize_v_no_fwht: codebook_bits must be 5, 6, or 8, got {}",
-            codebook_bits)));
+            codebook_bits
+        )));
     }
 
     let kernel_name = match head_dim {
         256 => "kv_quantize_v_no_fwht_d256",
         512 => "kv_quantize_v_no_fwht_d512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "kv_quantize_v_no_fwht: head_dim {} not supported (need 256 or 512)", head_dim))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "kv_quantize_v_no_fwht: head_dim {} not supported (need 256 or 512)",
+                head_dim
+            )))
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
@@ -804,9 +869,9 @@ pub fn dispatch_kv_copy_kf16_quantize_v_no_fwht(
     device: &metal::DeviceRef,
     src_k: &MlxBuffer,
     src_v: &MlxBuffer,
-    cache_k: &MlxBuffer,    // F16 cache
-    packed_v: &MlxBuffer,   // U8 byte-packed
-    norms_v: &MlxBuffer,    // F32 norms
+    cache_k: &MlxBuffer,  // F16 cache
+    packed_v: &MlxBuffer, // U8 byte-packed
+    norms_v: &MlxBuffer,  // F32 norms
     num_kv_heads: u32,
     head_dim: u32,
     cache_capacity: u32,
@@ -815,24 +880,31 @@ pub fn dispatch_kv_copy_kf16_quantize_v_no_fwht(
     scale_factor_d512: f32,
     codebook_bits: u32,
 ) -> Result<()> {
-    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
     if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
             "dispatch_kv_copy_kf16_quantize_v_no_fwht: codebook_bits must be 5, 6, or 8, got {}",
-            codebook_bits)));
+            codebook_bits
+        )));
     }
     if cache_k.dtype() != crate::DType::F16 {
         return Err(MlxError::InvalidArgument(format!(
             "dispatch_kv_copy_kf16_quantize_v_no_fwht: cache_k must be DType::F16, got {:?}",
-            cache_k.dtype())));
+            cache_k.dtype()
+        )));
     }
 
     let kernel_name = match head_dim {
         256 => "kv_copy_kf16_quantize_v_no_fwht_d256",
         512 => "kv_copy_kf16_quantize_v_no_fwht_d512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "kv_copy_kf16_quantize_v_no_fwht: head_dim {} not supported (need 256 or 512)",
-            head_dim))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "kv_copy_kf16_quantize_v_no_fwht: head_dim {} not supported (need 256 or 512)",
+                head_dim
+            )))
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
@@ -897,17 +969,25 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
     scale_factor_d512: f32,
     codebook_bits: u32,
 ) -> Result<()> {
-    if num_kv_heads == 0 || head_dim == 0 { return Ok(()); }
+    if num_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
     if !matches!(codebook_bits, 5 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_hadamard_quantize_kv_hb_dual: codebook_bits must be 5, 6, or 8, got {}", codebook_bits)));
+            "dispatch_hadamard_quantize_kv_hb_dual: codebook_bits must be 5, 6, or 8, got {}",
+            codebook_bits
+        )));
     }
 
     let kernel_name = match head_dim {
         256 => "hadamard_quantize_kv_hb_dual_d256",
         512 => "hadamard_quantize_kv_hb_dual_d512",
-        _ => return Err(MlxError::InvalidArgument(format!(
-            "hadamard_quantize_kv_hb_dual: head_dim {} not supported (need 256 or 512)", head_dim))),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "hadamard_quantize_kv_hb_dual: head_dim {} not supported (need 256 or 512)",
+                head_dim
+            )))
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, device)?;
@@ -943,47 +1023,6 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
     Ok(())
 }
 
-/// ADR-027 Phase B — multi-token Hadamard-quantize KV (HB) dispatch.
-///
-/// Mirrors `dispatch_hadamard_quantize_kv_seq` (4-bit) but writes 1 byte
-/// per element via the 5/6/8-bit codebook used by `flash_attn_vec_tq_hb`.
-/// Walks `n_tokens` positions starting at `write_pos_start`, dispatching
-/// the per-position HB encode kernel with successive `src_offset`
-/// values (via `KernelArg::BufferWithOffset`).
-///
-/// Used by qwen35's prefill TQ encode loop in `gpu_full_attn::full_attn_
-/// layer_gpu` (ADR-027 Phase B) to populate `FullAttnKvSlot.tq`
-/// at all prefill positions before the first decode SDPA reads them.
-///
-/// # Arguments
-///
-/// - `src`: F32 buffer holding ≥ `(src_tok_offset + n_tokens) ×
-///   num_kv_heads × head_dim` elements (multi-token K or V, seq-major
-///   layout `[seq_len, num_kv_heads, head_dim]`).
-/// - `packed`: U8 destination, `[num_kv_heads, cache_capacity, head_dim]`.
-/// - `norms`: F32 destination, `[num_kv_heads, cache_capacity,
-///   norms_per_pos]`.
-/// - `n_tokens`: number of source tokens to encode.
-/// - `src_tok_offset`: index in `src` at which to begin reading
-///   (allows callers to encode a sub-range).
-/// - `write_pos_start`: cache slot index of the first encoded token.
-///
-/// # Errors
-///
-/// - `n_tokens == 0` → no-op (returns `Ok(())`; mirrors the 4-bit `_seq`).
-/// - `src` too small to cover `[src_tok_offset, src_tok_offset + n_tokens)`.
-/// - `head_dim` not in {256, 512}.
-/// - `codebook_bits` not in {5, 6, 8}.
-/// - For non-sliding caches: `write_pos_start + n_tokens > cache_capacity`
-///   detected per-position (matches the 4-bit `_seq` semantics).
-///
-/// # Performance notes
-///
-/// Correctness-first: dispatches one kernel launch per token. At pp2455
-/// with 30 layers this is on the order of 147k launches per prefill
-/// (mirrors the 4-bit `_seq` rationale). Promote to a 2-D dispatch
-/// shader if measured to be the bottleneck.
-#[allow(clippy::too_many_arguments)]
 /// ADR-028 Phase 10e.5: no-FWHT V seq variant for batched prefill.
 ///
 /// Dispatches `kv_quantize_v_no_fwht_d{256,512}` once per token in `[write_pos_start
@@ -1036,15 +1075,18 @@ pub fn dispatch_kv_quantize_v_no_fwht_seq(
         }
     };
 
-    let required_src = (src_tok_offset as u64 + n_tokens as u64)
-        * (num_kv_heads as u64)
-        * (head_dim as u64);
+    let required_src =
+        (src_tok_offset as u64 + n_tokens as u64) * (num_kv_heads as u64) * (head_dim as u64);
     if (src.element_count() as u64) < required_src {
         return Err(MlxError::InvalidArgument(format!(
             "kv_quantize_v_no_fwht_seq: src has {} elements but need {} \
              (src_tok_offset={} + n_tokens={} * num_kv_heads={} * head_dim={})",
-            src.element_count(), required_src,
-            src_tok_offset, n_tokens, num_kv_heads, head_dim,
+            src.element_count(),
+            required_src,
+            src_tok_offset,
+            n_tokens,
+            num_kv_heads,
+            head_dim,
         )));
     }
 
@@ -1057,99 +1099,6 @@ pub fn dispatch_kv_quantize_v_no_fwht_seq(
         if !is_sliding && write_pos >= cache_capacity {
             return Err(MlxError::InvalidArgument(format!(
                 "kv_quantize_v_no_fwht_seq: global cache write_pos({}) >= \
-                 cache_capacity({}) at seq idx {}",
-                write_pos, cache_capacity, i
-            )));
-        }
-        let params = HadamardQuantizeHbParams {
-            head_dim, num_kv_heads, write_pos, cache_capacity,
-            is_sliding: if is_sliding { 1 } else { 0 },
-            scale_factor_d512, codebook_bits,
-        };
-        let params_bytes = bytemuck::bytes_of(&params);
-        let src_offset = ((src_tok_offset + i) as u64) * bytes_per_token;
-
-        encode_threadgroups_with_args(
-            encoder, pipeline,
-            &[
-                (0, KA::BufferWithOffset(src, src_offset)),
-                (1, KA::Buffer(packed)),
-                (2, KA::Buffer(norms)),
-                (3, KA::Bytes(params_bytes)),
-            ],
-            MTLSize::new(num_kv_heads as u64, 1, 1),
-            MTLSize::new(32, 1, 1),
-        );
-    }
-
-    Ok(())
-}
-
-pub fn dispatch_hadamard_quantize_kv_hb_seq(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &metal::DeviceRef,
-    src: &MlxBuffer,
-    packed: &MlxBuffer,
-    norms: &MlxBuffer,
-    num_kv_heads: u32,
-    head_dim: u32,
-    cache_capacity: u32,
-    write_pos_start: u32,
-    n_tokens: u32,
-    src_tok_offset: u32,
-    is_sliding: bool,
-    scale_factor_d512: f32,
-    codebook_bits: u32,
-) -> Result<()> {
-    if n_tokens == 0 || num_kv_heads == 0 || head_dim == 0 {
-        return Ok(());
-    }
-    if !matches!(codebook_bits, 5 | 6 | 8) {
-        return Err(MlxError::InvalidArgument(format!(
-            "dispatch_hadamard_quantize_kv_hb_seq: codebook_bits must be \
-             5, 6, or 8, got {}",
-            codebook_bits
-        )));
-    }
-    let kernel_name = match head_dim {
-        256 => "hadamard_quantize_kv_hb_d256",
-        512 => "hadamard_quantize_kv_hb_d512",
-        _ => {
-            return Err(MlxError::InvalidArgument(format!(
-                "hadamard_quantize_kv_hb_seq: head_dim {} not supported \
-                 (need 256 or 512)",
-                head_dim
-            )))
-        }
-    };
-
-    // Validate src has enough bytes to cover the requested slice.
-    let required_src = (src_tok_offset as u64 + n_tokens as u64)
-        * (num_kv_heads as u64)
-        * (head_dim as u64);
-    if (src.element_count() as u64) < required_src {
-        return Err(MlxError::InvalidArgument(format!(
-            "hadamard_quantize_kv_hb_seq: src has {} elements but need {} \
-             (src_tok_offset={} + n_tokens={} * num_kv_heads={} * head_dim={})",
-            src.element_count(),
-            required_src,
-            src_tok_offset,
-            n_tokens,
-            num_kv_heads,
-            head_dim,
-        )));
-    }
-
-    let pipeline = registry.get_pipeline(kernel_name, device)?;
-    let bytes_per_token = (num_kv_heads as u64) * (head_dim as u64) * 4; // f32
-
-    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
-    for i in 0..n_tokens {
-        let write_pos = write_pos_start + i;
-        if !is_sliding && write_pos >= cache_capacity {
-            return Err(MlxError::InvalidArgument(format!(
-                "hadamard_quantize_kv_hb_seq: global cache write_pos({}) >= \
                  cache_capacity({}) at seq idx {}",
                 write_pos, cache_capacity, i
             )));
@@ -1179,6 +1128,257 @@ pub fn dispatch_hadamard_quantize_kv_hb_seq(
             MTLSize::new(32, 1, 1),
         );
     }
+
+    Ok(())
+}
+
+/// Encode a contiguous sequence into the byte-packed Hadamard-quantized cache.
+///
+/// Every non-empty valid request records one two-dimensional Metal dispatch.
+/// For a sliding request longer than the cache, only the final cache-capacity
+/// source rows are encoded because every earlier row would be overwritten.
+/// Validation completes before pipeline lookup or command encoding.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_hb_seq(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,
+    norms: &MlxBuffer,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_capacity: u32,
+    write_pos_start: u32,
+    n_tokens: u32,
+    src_tok_offset: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    const OP: &str = "hadamard_quantize_kv_hb_seq";
+
+    if n_tokens == 0 {
+        return Ok(());
+    }
+    if num_kv_heads == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: num_kv_heads must be greater than zero"
+        )));
+    }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: codebook_bits must be 5, 6, or 8, got {codebook_bits}"
+        )));
+    }
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_hb_d256",
+        512 => "hadamard_quantize_kv_hb_d512",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: head_dim {head_dim} not supported (need 256 or 512)"
+            )))
+        }
+    };
+    if cache_capacity == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: cache_capacity must be greater than zero"
+        )));
+    }
+    if src.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: src dtype must be F32, got {}",
+            src.dtype()
+        )));
+    }
+    if packed.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: packed dtype must be U8, got {}",
+            packed.dtype()
+        )));
+    }
+    if norms.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: norms dtype must be F32, got {}",
+            norms.dtype()
+        )));
+    }
+    if src.byte_offset() % DType::F32.size_of() as u64 != 0
+        || norms.byte_offset() % DType::F32.size_of() as u64 != 0
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: F32 source and norms offsets must be 4-byte aligned"
+        )));
+    }
+    if !packed.is_cpu_writable() || !norms.is_cpu_writable() {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: packed and norms destinations must have writable backing"
+        )));
+    }
+
+    let row_elements = u64::from(num_kv_heads)
+        .checked_mul(u64::from(head_dim))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: source row size overflows u64")))?;
+    let row_bytes = row_elements
+        .checked_mul(DType::F32.size_of() as u64)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source row byte size overflows u64"))
+        })?;
+    let requested_src_end_token = u64::from(src_tok_offset)
+        .checked_add(u64::from(n_tokens))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source token range overflows u64"))
+        })?;
+    let requested_src_start_bytes = u64::from(src_tok_offset)
+        .checked_mul(row_bytes)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source start byte offset overflows u64"))
+        })?;
+    let requested_src_bytes = u64::from(n_tokens).checked_mul(row_bytes).ok_or_else(|| {
+        MlxError::InvalidArgument(format!("{OP}: requested source byte size overflows u64"))
+    })?;
+    let required_src_elements = requested_src_end_token
+        .checked_mul(row_elements)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source element range overflows u64"))
+        })?;
+    let required_src_bytes = requested_src_end_token
+        .checked_mul(row_bytes)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source byte range overflows u64"))
+        })?;
+    if (src.element_count() as u64) < required_src_elements {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: src logical tensor has {} elements but needs {required_src_elements}",
+            src.element_count()
+        )));
+    }
+    if (src.data_byte_len() as u64) < required_src_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: src logical buffer has {} bytes but needs {required_src_bytes} bytes \
+             to cover src_tok_offset={src_tok_offset}, n_tokens={n_tokens}, \
+             num_kv_heads={num_kv_heads}, head_dim={head_dim}",
+            src.data_byte_len(),
+        )));
+    }
+
+    let norms_per_pos = u64::from((head_dim / 256).max(1));
+    let required_packed_bytes = u64::from(num_kv_heads)
+        .checked_mul(u64::from(cache_capacity))
+        .and_then(|count| count.checked_mul(u64::from(head_dim)))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: packed size overflows u64")))?;
+    let required_norm_elements = u64::from(num_kv_heads)
+        .checked_mul(u64::from(cache_capacity))
+        .and_then(|count| count.checked_mul(norms_per_pos))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: norms size overflows u64")))?;
+    let required_norm_bytes = required_norm_elements
+        .checked_mul(DType::F32.size_of() as u64)
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: norms byte size overflows u64")))?;
+
+    if required_packed_bytes > u64::from(u32::MAX) || required_norm_elements > u64::from(u32::MAX) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: destination index range exceeds the shader's u32 indexing"
+        )));
+    }
+    if (packed.element_count() as u64) < required_packed_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: packed logical tensor has {} elements but needs {required_packed_bytes}",
+            packed.element_count()
+        )));
+    }
+    if (packed.data_byte_len() as u64) < required_packed_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: packed logical buffer has {} bytes but needs {required_packed_bytes}",
+            packed.data_byte_len()
+        )));
+    }
+    if (norms.element_count() as u64) < required_norm_elements {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: norms logical tensor has {} elements but needs {required_norm_elements}",
+            norms.element_count()
+        )));
+    }
+    if (norms.data_byte_len() as u64) < required_norm_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: norms logical buffer has {} bytes but needs {required_norm_bytes}",
+            norms.data_byte_len()
+        )));
+    }
+
+    let (skipped_tokens, effective_n_tokens, effective_write_pos) = if is_sliding {
+        let skipped = n_tokens.saturating_sub(cache_capacity);
+        let effective = n_tokens.min(cache_capacity);
+        let write_pos =
+            ((u64::from(write_pos_start) + u64::from(skipped)) % u64::from(cache_capacity)) as u32;
+        (skipped, effective, write_pos)
+    } else {
+        let write_end = u64::from(write_pos_start) + u64::from(n_tokens);
+        if write_end > u64::from(cache_capacity) {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: global cache range [{write_pos_start}, {write_end}) exceeds \
+                 cache_capacity={cache_capacity}"
+            )));
+        }
+        (0, n_tokens, write_pos_start)
+    };
+
+    let effective_src_token = u64::from(src_tok_offset) + u64::from(skipped_tokens);
+    let relative_src_offset = effective_src_token
+        .checked_mul(row_bytes)
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: source offset overflows u64")))?;
+    let bound_src_offset = src
+        .byte_offset()
+        .checked_add(relative_src_offset)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: bound source offset overflows u64"))
+        })?;
+    let effective_src_elements = u64::from(effective_n_tokens)
+        .checked_mul(row_elements)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source index range overflows u64"))
+        })?;
+    if effective_src_elements > u64::from(u32::MAX) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: source index range exceeds the shader's u32 indexing"
+        )));
+    }
+
+    let src_range = HbLogicalRange::new(src, requested_src_start_bytes, requested_src_bytes)?;
+    let packed_range = HbLogicalRange::new(packed, 0, required_packed_bytes)?;
+    let norms_range = HbLogicalRange::new(norms, 0, required_norm_bytes)?;
+    if src_range.overlaps(packed_range)
+        || src_range.overlaps(norms_range)
+        || packed_range.overlaps(norms_range)
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: source, packed, and norms logical ranges must not overlap"
+        )));
+    }
+
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos: effective_write_pos,
+        cache_capacity,
+        is_sliding: if is_sliding { 1 } else { 0 },
+        scale_factor_d512,
+        codebook_bits,
+    };
+
+    encoder.dispatch_tracked_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::BufferWithOffset(src, bound_src_offset)),
+            (1, KernelArg::Buffer(packed)),
+            (2, KernelArg::Buffer(norms)),
+            (3, KernelArg::Bytes(bytemuck::bytes_of(&params))),
+        ],
+        &[src],
+        &[packed, norms],
+        MTLSize::new(u64::from(num_kv_heads), u64::from(effective_n_tokens), 1),
+        MTLSize::new(32, 1, 1),
+    );
 
     Ok(())
 }
