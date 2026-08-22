@@ -332,6 +332,14 @@ static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 /// overhead per decode token (ADR-012 §Optimize / Task #15 follow-up).
 static CMD_BUF_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Number of `MTLCommandBuffer` instances actually submitted to Metal.
+///
+/// Unlike [`CMD_BUF_COUNT`], this counter advances at the three primitive
+/// `cmd_buf.commit()` sites, so callers can distinguish command-buffer
+/// creation from GPU submission. Both synchronous and asynchronous commits
+/// are included; waits remain separately observable through [`SYNC_COUNT`].
+static COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Number of `memory_barrier()` calls that reached the
 /// `objc::msg_send![encoder, memoryBarrierWithScope:]` site.  Capture-mode
 /// no-ops and pre-encoder no-ops are excluded so the count reflects
@@ -378,6 +386,7 @@ pub fn reset_counters() {
     SYNC_COUNT.store(0, Ordering::Relaxed);
     DISPATCH_COUNT.store(0, Ordering::Relaxed);
     CMD_BUF_COUNT.store(0, Ordering::Relaxed);
+    COMMIT_COUNT.store(0, Ordering::Relaxed);
     BARRIER_COUNT.store(0, Ordering::Relaxed);
     BARRIER_NS.store(0, Ordering::Relaxed);
     GPU_BUSY_NS.store(0, Ordering::Relaxed);
@@ -468,6 +477,15 @@ pub fn reset_pipeline_dispatch_buckets() {
 /// command-buffer overhead in inner loops.
 pub fn cmd_buf_count() -> u64 {
     CMD_BUF_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read the number of command buffers submitted to Metal.
+///
+/// Every primitive synchronous or asynchronous `MTLCommandBuffer::commit`
+/// increments this counter exactly once. A command buffer that was allocated
+/// but never committed is therefore excluded.
+pub fn commit_count() -> u64 {
+    COMMIT_COUNT.load(Ordering::Relaxed)
 }
 
 /// Read the current value of `BARRIER_COUNT`.
@@ -2556,6 +2574,7 @@ impl CommandEncoder {
         // when no residency set or no staged changes.
         self.flush_residency_pending();
 
+        COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.cmd_buf.commit();
         self.cmd_buf.wait_until_completed();
 
@@ -2739,6 +2758,7 @@ impl CommandEncoder {
         // ADR-015:same flush hook as commit_and_wait —
         // this is the async-pipeline path that production decode uses.
         self.flush_residency_pending();
+        COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.cmd_buf.commit();
     }
 
@@ -3016,6 +3036,7 @@ impl CommandEncoder {
         // Step 4 + 5: same as commit() — flush residency staging, then
         // hand the CB to Metal.
         self.flush_residency_pending();
+        COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.cmd_buf.commit();
     }
 }

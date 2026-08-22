@@ -1202,6 +1202,10 @@ impl KernelRegistry {
             "embedding_gather_q4_k_f32".into(),
             include_str!("shaders/embedding_q4_k.metal"),
         );
+        let embedding_dense_src: &'static str = include_str!("shaders/embedding_dense.metal");
+        sources.insert("embedding_gather_bf16_f32".into(), embedding_dense_src);
+        sources.insert("embedding_gather_f16_f32".into(), embedding_dense_src);
+        sources.insert("embedding_gather_f32_f32".into(), embedding_dense_src);
 
         // F32 KV cache copy kernel (Session merge S1+S2)
         let kv_cache_copy_src: &'static str = include_str!("shaders/kv_cache_copy.metal");

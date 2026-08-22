@@ -34,7 +34,7 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 - **Apple Silicon only.** No CPU, no CUDA, no WASM. If you need to ship cross-platform, this is the wrong layer.
 - **No autograd.** A growing set of backward + optimizer kernels exists — SiLU / RMSNorm / softmax / log / row-sum / embedding-scatter / exp / divide / sqrt / outer-product / conv1d-depthwise-causal / MoE-weighted-sum / MoE-SwiGLU backward, differentiable affine qdq, Adam step, and `flash_attn_train` (forward + backward through attention with dQ/dK/dV) — but you wire the training loop yourself; there is no `Var` / `VarMap` / autodiff / `Module` system.
-- **GGML matmul coverage is the inference subset, not the full set.** Q2_K, Q3_K, Q4_0, Q8_0, and Q6_K have dense mat-vec / mat-mat plus expert-routed variants; the production shapes also use tensor-core paths where implemented. Q4_K and Q5_K have dense mat-vec / mat-mat plus expert-routed (`mm_id`) variants. Q5_1 and IQ4_NL have dense and expert-routed variants. Q4_1, Q5_0, Q8_1, and Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
+- **GGML matmul coverage is the inference subset, not the full set.** Q2_K, Q3_K, Q4_0, Q8_0, and Q6_K have dense mat-vec / mat-mat plus expert-routed variants; the production shapes also use tensor-core paths where implemented. Q4_K and Q5_K have dense mat-vec / mat-mat plus expert-routed (`mm_id`) variants. Q5_1 and IQ4_NL have dense and expert-routed variants. Unquantized GGUF F32, F16, and BF16 retain native typed storage and use the corresponding dense kernels; direct dense embedding gather supports all three. Q4_1, Q5_0, Q8_1, and Q8_K are not supported in the Metal matmul path. MLX-format affine quantization supports 4 / 6 / 8-bit (no 3-bit).
 - **No high-level model code.** This is a kernel library; the consumer (e.g. hf2q) builds the actual transformer forward pass.
 
 ## Status
@@ -150,7 +150,7 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
 
 ### Matrix multiplication
-- **GGUF formats**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS — mat-vec + mul_mm kernels where implemented (byte-parity with the reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented)
+- **GGUF formats**: F32, F16, BF16 typed storage plus Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS blocks — mat-vec + mul_mm kernels where implemented (byte-parity with the reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented)
 - **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS (top_k>1 MoE mat-vec + tensor-mm where implemented)
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
 - **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`

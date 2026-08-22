@@ -74,6 +74,59 @@ fn dense_auto_routing_policy_is_explicit() {
 }
 
 #[test]
+fn dense_scalar_storage_has_exact_decode_width_and_prompt_routes() {
+    for (kind, mv_route, mm_route, bytes_per_value) in [
+        (
+            GgmlType::F32,
+            GgmlKernelRoute::DenseF32Mv,
+            GgmlKernelRoute::DenseF32Mm,
+            4_u64,
+        ),
+        (
+            GgmlType::F16,
+            GgmlKernelRoute::DenseF16Mv,
+            GgmlKernelRoute::DenseF16Mm,
+            2_u64,
+        ),
+        (
+            GgmlType::BF16,
+            GgmlKernelRoute::DenseBF16Mv,
+            GgmlKernelRoute::DenseBF16Mm,
+            2_u64,
+        ),
+    ] {
+        let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
+        request.ggml_type = kind;
+        let decode = ggml_capability(request);
+        assert!(decode.executable, "{kind:?} decode: {}", decode.diagnostic);
+        assert_eq!(decode.route, Some(mv_route));
+        assert_eq!(
+            decode.minimum_weight_buffer_bytes,
+            5_120_u64 * 5_120 * bytes_per_value
+        );
+
+        for (m, workload) in [
+            (8, GgmlWorkloadClass::ContinuousWidth),
+            (16, GgmlWorkloadClass::Prompt),
+        ] {
+            request.invocation = GgmlInvocation::DenseAuto {
+                m,
+                n: 5_120,
+                k: 5_120,
+            };
+            request.workload = workload;
+            let width = ggml_capability(request);
+            assert!(width.executable, "{kind:?} M={m}: {}", width.diagnostic);
+            assert_eq!(width.route, Some(mm_route));
+            assert_eq!(
+                width.minimum_weight_buffer_bytes,
+                5_120_u64 * 5_120 * bytes_per_value
+            );
+        }
+    }
+}
+
+#[test]
 fn mv_ext_widths_are_type_sensitive() {
     let mut request = dense_request(2, GgmlWorkloadClass::ContinuousWidth);
     request.routing.dense_decode_mvn = false;
@@ -433,8 +486,23 @@ fn embedding_contract_is_exact() {
         ggml_capability(request).route,
         Some(GgmlKernelRoute::EmbeddingQ8_0)
     );
+    request.ggml_type = GgmlType::F32;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingF32)
+    );
     request.ggml_type = GgmlType::F16;
-    assert!(!ggml_capability(request).executable);
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingF16)
+    );
+    request.ggml_type = GgmlType::BF16;
+    let bf16 = ggml_capability(request);
+    assert_eq!(bf16.route, Some(GgmlKernelRoute::EmbeddingBF16));
+    assert_eq!(
+        bf16.minimum_weight_buffer_bytes,
+        151_936_u64 * 5_120 * 2
+    );
 }
 
 #[test]

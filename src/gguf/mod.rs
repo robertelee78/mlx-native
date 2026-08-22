@@ -21,7 +21,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use half::f16;
+use half::{bf16, f16};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::ops::quantized_matmul_ggml::GgmlType;
@@ -79,6 +79,7 @@ const GGML_TYPE_I16: u32 = 17;
 const GGML_TYPE_IQ4_NL: u32 = 20;
 const GGML_TYPE_IQ4_XS: u32 = 23;
 const GGML_TYPE_I32: u32 = 26;
+const GGML_TYPE_BF16: u32 = 30;
 
 /// IQ4_NL non-linear codebook constants. 16 signed entries selected by
 /// 4-bit indices in `block_iq4_nl::qs`. Verified byte-equal with
@@ -389,6 +390,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_IQ4_NL => Ok(GgmlType::IQ4_NL),
         GGML_TYPE_IQ4_XS => Ok(GgmlType::IQ4_XS),
         GGML_TYPE_I32 => Ok(GgmlType::I32),
+        GGML_TYPE_BF16 => Ok(GgmlType::BF16),
         other => Err(MlxError::GgufParseError(format!(
             "unsupported GGML type ID {other}"
         ))),
@@ -440,6 +442,12 @@ fn compute_byte_len(shape: &[usize], ggml_type: GgmlType) -> Result<usize> {
 #[inline]
 fn f16_from_le_bytes(bytes: [u8; 2]) -> f32 {
     f16::from_le_bytes(bytes).to_f32()
+}
+
+/// Convert a raw little-endian BF16 scalar to f32 for diagnostic callers.
+#[inline]
+fn bf16_from_le_bytes(bytes: [u8; 2]) -> f32 {
+    bf16::from_le_bytes(bytes).to_f32()
 }
 
 /// Dequantize Q4_0 blocks to f32.
@@ -956,6 +964,24 @@ fn dequantize_f16(data: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Convert BF16 data to F32 for diagnostic and explicitly-F32 callers.
+/// The default raw loader preserves the BF16 payload and dtype unchanged.
+fn dequantize_bf16(data: &[u8], output: &mut [f32]) -> Result<()> {
+    if data.len() % 2 != 0 {
+        return Err(MlxError::GgufParseError("BF16 data length not even".into()));
+    }
+    let count = data.len() / 2;
+    if output.len() < count {
+        return Err(MlxError::GgufParseError(
+            "BF16 output buffer too small".into(),
+        ));
+    }
+    for i in 0..count {
+        output[i] = bf16_from_le_bytes([data[2 * i], data[2 * i + 1]]);
+    }
+    Ok(())
+}
+
 /// Reinterpret F32 little-endian bytes into the output slice.
 fn copy_f32(data: &[u8], output: &mut [f32]) -> Result<()> {
     if data.len() % 4 != 0 {
@@ -1197,6 +1223,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
     match ggml_type {
         GgmlType::F32 => copy_f32(data, output),
         GgmlType::F16 => dequantize_f16(data, output),
+        GgmlType::BF16 => dequantize_bf16(data, output),
         GgmlType::Q4_0 => dequantize_q4_0(data, output),
         GgmlType::Q8_0 => dequantize_q8_0(data, output),
         GgmlType::Q2_K => dequantize_q2_k(data, output),
@@ -1673,7 +1700,7 @@ impl GgufFile {
     /// GGML blocks with dtype `U8` — these are consumed directly by
     /// `quantized_matmul_ggml` kernels.
     ///
-    /// F32, F16, and I32 tensors retain their corresponding typed dtype.
+    /// F32, F16, BF16, and I32 tensors retain their corresponding typed dtype.
     ///
     /// # Errors
     ///
@@ -1698,6 +1725,15 @@ impl GgufFile {
             GgmlType::F16 => {
                 let mut buf =
                     device.alloc_buffer(info.byte_len, DType::F16, info.shape.clone())?;
+                {
+                    let slice: &mut [u8] = buf.as_mut_slice()?;
+                    slice.copy_from_slice(&data);
+                }
+                Ok(buf)
+            }
+            GgmlType::BF16 => {
+                let mut buf =
+                    device.alloc_buffer(info.byte_len, DType::BF16, info.shape.clone())?;
                 {
                     let slice: &mut [u8] = buf.as_mut_slice()?;
                     slice.copy_from_slice(&data);
@@ -1755,8 +1791,8 @@ impl GgufFile {
     /// Load a raw tensor as a read-only, file-backed Metal buffer.
     ///
     /// This avoids copying GGUF weights into anonymous memory. Quantized
-    /// tensors retain their packed GGML bytes as `U8`; F32, F16, and I32 keep
-    /// their native dtype. The returned buffer owns a shared mapping reference
+    /// tensors retain their packed GGML bytes as `U8`; F32, F16, BF16, and I32
+    /// keep their native dtype. The returned buffer owns a shared mapping reference
     /// and remains valid after `GgufFile` and the on-disk directory entry are
     /// dropped. It must only be bound as a kernel input; GPU writes to the
     /// read-only mapped pages are unsupported.
@@ -1876,6 +1912,7 @@ fn raw_tensor_dtype(ggml_type: GgmlType) -> DType {
     match ggml_type {
         GgmlType::F32 => DType::F32,
         GgmlType::F16 => DType::F16,
+        GgmlType::BF16 => DType::BF16,
         GgmlType::I32 => DType::I32,
         GgmlType::Q4_0
         | GgmlType::Q8_0
@@ -1889,6 +1926,12 @@ fn raw_tensor_dtype(ggml_type: GgmlType) -> DType {
         | GgmlType::IQ4_NL
         | GgmlType::IQ4_XS => DType::U8,
     }
+}
+
+/// Test-only export for pinning native GGUF scalar storage.
+#[doc(hidden)]
+pub fn test_only_raw_tensor_dtype(ggml_type: GgmlType) -> DType {
+    raw_tensor_dtype(ggml_type)
 }
 
 fn host_page_size() -> Result<usize> {

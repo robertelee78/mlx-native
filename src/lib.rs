@@ -96,9 +96,9 @@ pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{
     auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
-    cmd_buf_count, dispatch_count, gpu_busy_ns, pipeline_dispatch_buckets, reset_counters,
-    reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode, CapturedOpKind,
-    CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
+    cmd_buf_count, commit_count, dispatch_count, gpu_busy_ns, pipeline_dispatch_buckets,
+    reset_counters, reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode,
+    CapturedOpKind, CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
     RecordedBinding,
 };
 pub use encoder_session::EncoderSession;
@@ -135,6 +135,7 @@ pub use ops::deepseek_hyper_connection::{
     DEEPSEEK_HC_EPS, DEEPSEEK_HC_MULT, DEEPSEEK_HC_SINKHORN_ITERS,
 };
 pub use ops::embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams};
+pub use ops::embedding_dense::{embedding_gather_dense, EmbeddingDenseParams};
 pub use ops::embedding_q4_k::{embedding_gather_q4_k, EmbeddingQ4KParams};
 pub use ops::embedding_kquant::{
     embedding_gather_q5_k, embedding_gather_q6_k, EmbeddingQ5KParams, EmbeddingQ6KParams,
