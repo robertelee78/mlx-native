@@ -12,6 +12,10 @@ kernel that consumes the declared dtype or reject the artifact before model
 allocation. It must not expand, dequantize, or re-encode a weight merely to fit
 another runtime path.
 
+`GgmlType` is non-exhaustive beginning with 0.12.0. Consumers must fail closed
+on an unrecognized storage type instead of assuming that the current public
+variant set is the complete GGUF vocabulary.
+
 `GgufFile::load_tensor_f32` is intentionally still available for diagnostics
 and small graph constants whose consumer explicitly requires F32. Calling it
 is a materialization decision; it is not the default weight-loading behavior.

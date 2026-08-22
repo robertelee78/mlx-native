@@ -113,6 +113,7 @@ const BLOCK_IQ4_XS_BYTES: u32 = 136;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(non_camel_case_types)]
+#[non_exhaustive]
 pub enum GgmlType {
     /// 32-bit float (unquantized). 1 element per block, 4 bytes per block.
     F32,
@@ -132,8 +133,7 @@ pub enum GgmlType {
     /// 4-bit super-block quantization. 256 values per block, 144 bytes per block.
     Q4_K,
     /// 5-bit super-block quantization. 256 values per block, 176 bytes per block.
-    /// Recognized for GGUF header parsing; dequant / matmul kernels not yet
-    /// implemented (ADR-013 P7+ depending on need).
+    /// Supported by dense, expert-routed, and embedding kernels.
     Q5_K,
     /// 6-bit super-block quantization. 256 values per block, 210 bytes per block.
     Q6_K,
