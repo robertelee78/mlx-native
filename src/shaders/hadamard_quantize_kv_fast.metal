@@ -606,6 +606,7 @@ struct HadamardQuantizeHbParams {
     // [kv_head, token] rows in a bounded banked arena.
     uint arena_token_capacity;
 };
+static_assert(sizeof(ulong) == 8, "banked TQ-HB offsets require 64-bit ulong");
 
 // Higher-bit quantization kernel: same FWHT + norm as 4-bit, but quantizes to
 // 5-bit (32 centroids) or 6-bit (64 centroids) and writes 1 byte per element.

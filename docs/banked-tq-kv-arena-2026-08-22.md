@@ -7,13 +7,15 @@ Status: validated on Apple M5 Max at mlx-native base
 
 A batched TQ-HB decode can preserve scalar results while its queries own
 different physical capacities inside one bounded allocation. The deciding
-test used capacities 16 and 64 with non-contiguous bases and compared the
-batched writer and attention output with two independent scalar executions.
+test used capacities 16 and 64 with non-contiguous bases at both supported
+head dimensions (256 and 512), then compared the batched writer and attention
+output with two independent scalar executions.
 
 The hypothesis passed:
 
 - packed writer bytes and norm bits matched the scalar calls;
 - every batched attention output bit matched the corresponding scalar call;
+- the D=512 run independently covered both norm values owned by every row;
 - guard rows before, between, and after the two banks were unchanged;
 - changing only the second bank changed the second result while every bit of
   the first result remained unchanged;
@@ -37,6 +39,17 @@ integers. They reject `capacity == 0`, a bank end beyond the declared arena,
 and a non-ring sequence position outside its bank. The existing uniform APIs
 remain source-compatible: an internal `arena_token_capacity == 0` selects the
 original `slot * n_kv_heads * kv_capacity` calculation.
+
+The host-visible `banked_tq_hb_byte_offsets` contract test places a valid D=512
+bank across the first packed byte offset above `u32::MAX` (the physically
+relevant 4 GiB boundary) and checks the exact `u64` packed and norm results.
+Truncating byte-offset multiplication to 32 bits fails the gate without wiring
+a 4 GiB test allocation. Both Metal sources also assert that `ulong` is 64
+bits.
+
+The scalar TQ-HB parameter block remains 60 bytes. The dedicated batched block
+is 68 bytes after `n_queries` and `arena_token_capacity`; Rust and Metal both
+carry compile-time size assertions for that ABI.
 
 ## Offset-surface audit
 

@@ -589,6 +589,50 @@ struct HadamardQuantizeHbParams {
 
 const _: [(); 32] = [(); std::mem::size_of::<HadamardQuantizeHbParams>()];
 
+/// Calculate the byte offsets selected by the banked TQ-HB shader contract.
+///
+/// `base_token_row` is already flattened across all earlier banks. The
+/// returned tuple is `(packed_byte_offset, norm_byte_offset)`. Keeping this
+/// arithmetic in `u64` is required even though descriptors are `u32`: a valid
+/// D=512 arena crosses the 4 GiB byte boundary after only 8,388,608 rows.
+/// Callers still validate the resulting row against their declared arena.
+pub fn banked_tq_hb_byte_offsets(
+    base_token_row: u32,
+    kv_head: u32,
+    capacity_tokens: u32,
+    position: u32,
+    head_dim: u32,
+) -> Result<(u64, u64)> {
+    const OP: &str = "banked_tq_hb_byte_offsets";
+    if capacity_tokens == 0 || position >= capacity_tokens {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: position {position} is outside capacity {capacity_tokens}"
+        )));
+    }
+    if !matches!(head_dim, 256 | 512) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: head_dim must be 256 or 512, got {head_dim}"
+        )));
+    }
+
+    let row = u64::from(base_token_row)
+        .checked_add(
+            u64::from(kv_head)
+                .checked_mul(u64::from(capacity_tokens))
+                .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: row offset overflow")))?,
+        )
+        .and_then(|row| row.checked_add(u64::from(position)))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: row offset overflow")))?;
+    let packed_byte_offset = row
+        .checked_mul(u64::from(head_dim))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: packed byte offset overflow")))?;
+    let norm_byte_offset = row
+        .checked_mul(u64::from(head_dim / 256))
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of() as u64))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: norm byte offset overflow")))?;
+    Ok((packed_byte_offset, norm_byte_offset))
+}
+
 #[derive(Clone, Copy)]
 struct HbLogicalRange {
     buffer_id: usize,

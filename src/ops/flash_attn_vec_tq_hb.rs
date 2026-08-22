@@ -733,14 +733,15 @@ pub fn flash_attn_vec_tq_hb_with_fused_undo(
 }
 
 /// GPU-side params for the BATCHED TQ-HB kernel. Byte-identical field layout
-/// to `FlashAttnVecTqHbParamsGpu` above, plus `n_queries` appended.
+/// to `FlashAttnVecTqHbParamsGpu` above, plus `n_queries` and the banked-arena
+/// row bound appended.
 ///
 /// ADR-040 M-SPEED-LC (codex constraint #3): this is a DEDICATED struct, not
 /// a widened version of `FlashAttnVecTqHbParamsGpu` — the non-batched
 /// dispatchers (`flash_attn_vec_tq_hb`, `flash_attn_vec_tq_hb_with_fused_undo`)
 /// keep uploading the unchanged 60-byte struct to the unchanged scalar
 /// kernel; only the new `flash_attn_vec_tq_hb_batched_*` pipeline reads the
-/// 64-byte `FlashAttnVecTqHbBatchedParams` declared in the Metal source.
+/// 68-byte `FlashAttnVecTqHbBatchedParams` declared in the Metal source.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct FlashAttnVecTqHbBatchedParamsGpu {
@@ -764,6 +765,8 @@ struct FlashAttnVecTqHbBatchedParamsGpu {
     /// `[kv_head, token]` rows in the banked arena.
     arena_token_capacity: u32,
 }
+
+const _: [(); 68] = [(); std::mem::size_of::<FlashAttnVecTqHbBatchedParamsGpu>()];
 
 /// ADR-040 M-SPEED-LC — BATCHED multi-sequence decode flash for byte-packed
 /// 5/6/8-bit TQ-HB K/V.

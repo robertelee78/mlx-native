@@ -989,7 +989,8 @@ template [[host_name("flash_attn_vec_tq_hb_gqa_q2_dk256")]]
 kernel flash_attn_vec_tq_hb_gqa_q2_t flash_attn_vec_tq_hb_gqa_impl<2>;
 
 // ---------------------------------------------------------------------------
-// ADR-040 M-SPEED-LC — batched-decode params: adds n_queries.
+// ADR-040 M-SPEED-LC — batched-decode params: adds n_queries and the
+// flattened banked-arena row bound.
 //
 // Kept as a SEPARATE struct from FlashAttnVecTqHbParams above (the one used by
 // flash_attn_vec_tq_hb_impl) rather than extending that struct in place: the
@@ -998,7 +999,8 @@ kernel flash_attn_vec_tq_hb_gqa_q2_t flash_attn_vec_tq_hb_gqa_impl<2>;
 // Appending n_queries there would grow the Metal-side struct to 64 bytes while
 // the existing dispatcher still uploads only 60 bytes, so `params.n_queries`
 // in the untouched kernel would read past the end of the constant buffer.
-// A dedicated struct keeps the scalar kernel's ABI byte-for-byte unchanged.
+// The banked row bound grows this dedicated batched struct to 68 bytes. Keeping
+// it separate preserves the scalar kernel's ABI byte-for-byte.
 // ---------------------------------------------------------------------------
 struct FlashAttnVecTqHbBatchedParams {
     uint  n_heads;
@@ -1021,6 +1023,9 @@ struct FlashAttnVecTqHbBatchedParams {
     // [kv_head, token] rows in a bounded banked arena.
     uint  arena_token_capacity;
 };
+static_assert(sizeof(FlashAttnVecTqHbBatchedParams) == 68,
+              "wrong batched TQ-HB params size");
+static_assert(sizeof(ulong) == 8, "banked TQ-HB offsets require 64-bit ulong");
 
 // ---------------------------------------------------------------------------
 // ADR-040 M-SPEED-LC — BATCHED multi-sequence decode flash, byte-packed
