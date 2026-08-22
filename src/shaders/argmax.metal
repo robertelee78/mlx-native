@@ -64,7 +64,9 @@ kernel void argmax_f32(
     for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             float other_val = shared_vals[tid + stride];
-            if (other_val > shared_vals[tid]) {
+            if (other_val > shared_vals[tid] ||
+                (other_val == shared_vals[tid] &&
+                 shared_idxs[tid + stride] < shared_idxs[tid])) {
                 shared_vals[tid] = other_val;
                 shared_idxs[tid] = shared_idxs[tid + stride];
             }
