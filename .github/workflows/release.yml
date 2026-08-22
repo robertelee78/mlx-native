@@ -66,6 +66,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bash scripts/check_package_hygiene.sh
           cargo +1.96.0 package --locked
           crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
           test -s "$crate"
