@@ -607,23 +607,26 @@ struct HadamardQuantizeHbParams {
 // Higher-bit quantization kernel: same FWHT + norm as 4-bit, but quantizes to
 // 5-bit (32 centroids) or 6-bit (64 centroids) and writes 1 byte per element.
 // Packed buffer: [num_kv_heads, capacity, head_dim] u8 (byte-packed).
+// Grid: x = KV head, y = contiguous token (scalar callers dispatch y = 1).
 template<ushort HEAD_DIM>
 kernel void hadamard_quantize_kv_hb(
     device const float                    *src    [[buffer(0)]],
     device       uint8_t                  *packed [[buffer(1)]],  // byte-packed (1 byte/elem)
     device       float                    *norms  [[buffer(2)]],
     constant HadamardQuantizeHbParams     &params [[buffer(3)]],
-    uint  tgid [[threadgroup_position_in_grid]],
+    uint2 tgid [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]])
 {
     constexpr ushort EPT = HEAD_DIM / 32;
-    const uint head_idx = tgid;
+    const uint head_idx = tgid.x;
+    const uint token_idx = tgid.y;
     const uint lane = tiisg;
 
     if (head_idx >= params.num_kv_heads) return;
 
     // 1. Load elements.
-    const uint src_base = head_idx * HEAD_DIM + lane * EPT;
+    const uint src_base = (token_idx * params.num_kv_heads + head_idx) * HEAD_DIM
+                        + lane * EPT;
     float elems[EPT];
     for (ushort i = 0; i < EPT; i++) elems[i] = src[src_base + i];
 
@@ -707,9 +710,10 @@ kernel void hadamard_quantize_kv_hb(
     }
 
     // 7. Write byte-packed output (1 byte per element).
+    const uint write_pos = params.write_pos + token_idx;
     uint actual_pos = (params.is_sliding != 0u)
-        ? (params.write_pos % params.cache_capacity)
-        : params.write_pos;
+        ? (write_pos % params.cache_capacity)
+        : write_pos;
     // Packed layout: [head_idx, actual_pos, 0..HEAD_DIM] u8 — byte-packed.
     const uint packed_base = head_idx * params.cache_capacity * HEAD_DIM
                            + actual_pos * HEAD_DIM;
@@ -737,12 +741,12 @@ kernel void hadamard_quantize_kv_hb(
 template [[host_name("hadamard_quantize_kv_hb_d256")]]
 kernel void hadamard_quantize_kv_hb<256>(
     device const float *, device uint8_t *, device float *,
-    constant HadamardQuantizeHbParams &, uint, uint);
+    constant HadamardQuantizeHbParams &, uint2, uint);
 
 template [[host_name("hadamard_quantize_kv_hb_d512")]]
 kernel void hadamard_quantize_kv_hb<512>(
     device const float *, device uint8_t *, device float *,
-    constant HadamardQuantizeHbParams &, uint, uint);
+    constant HadamardQuantizeHbParams &, uint2, uint);
 
 // ============================================================================
 // ADR-040 M4 — BATCHED multi-sequence FWHT-V quantize.
