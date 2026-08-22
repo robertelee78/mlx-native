@@ -96,9 +96,9 @@ pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{
     auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
-    cmd_buf_count, dispatch_count, gpu_busy_ns, pipeline_dispatch_buckets, reset_counters,
-    reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode, CapturedOpKind,
-    CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
+    cmd_buf_count, commit_count, dispatch_count, gpu_busy_ns, pipeline_dispatch_buckets,
+    reset_counters, reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode,
+    CapturedOpKind, CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
     RecordedBinding,
 };
 pub use encoder_session::EncoderSession;
