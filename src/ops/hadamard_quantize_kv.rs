@@ -582,6 +582,55 @@ struct HadamardQuantizeHbParams {
     is_sliding: u32,
     scale_factor_d512: f32,
     codebook_bits: u32, // 5, 6, or 8
+    /// Zero selects the legacy uniform-slot layout. Nonzero is the total
+    /// number of flattened head-token rows in a banked arena.
+    arena_token_capacity: u32,
+}
+
+const _: [(); 32] = [(); std::mem::size_of::<HadamardQuantizeHbParams>()];
+
+/// Calculate the byte offsets selected by the banked TQ-HB shader contract.
+///
+/// `base_token_row` is already flattened across all earlier banks. The
+/// returned tuple is `(packed_byte_offset, norm_byte_offset)`. Keeping this
+/// arithmetic in `u64` is required even though descriptors are `u32`: a valid
+/// D=512 arena crosses the 4 GiB byte boundary after only 8,388,608 rows.
+/// Callers still validate the resulting row against their declared arena.
+pub fn banked_tq_hb_byte_offsets(
+    base_token_row: u32,
+    kv_head: u32,
+    capacity_tokens: u32,
+    position: u32,
+    head_dim: u32,
+) -> Result<(u64, u64)> {
+    const OP: &str = "banked_tq_hb_byte_offsets";
+    if capacity_tokens == 0 || position >= capacity_tokens {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: position {position} is outside capacity {capacity_tokens}"
+        )));
+    }
+    if !matches!(head_dim, 256 | 512) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: head_dim must be 256 or 512, got {head_dim}"
+        )));
+    }
+
+    let row = u64::from(base_token_row)
+        .checked_add(
+            u64::from(kv_head)
+                .checked_mul(u64::from(capacity_tokens))
+                .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: row offset overflow")))?,
+        )
+        .and_then(|row| row.checked_add(u64::from(position)))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: row offset overflow")))?;
+    let packed_byte_offset = row
+        .checked_mul(u64::from(head_dim))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: packed byte offset overflow")))?;
+    let norm_byte_offset = row
+        .checked_mul(u64::from(head_dim / 256))
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of() as u64))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: norm byte offset overflow")))?;
+    Ok((packed_byte_offset, norm_byte_offset))
 }
 
 #[derive(Clone, Copy)]
@@ -673,6 +722,7 @@ pub fn dispatch_hadamard_quantize_kv_hb(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        arena_token_capacity: 0,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
@@ -745,6 +795,7 @@ pub fn dispatch_hadamard_quantize_kv_hb_batched(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        arena_token_capacity: 0,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
@@ -759,11 +810,177 @@ pub fn dispatch_hadamard_quantize_kv_hb_batched(
             (3, KA::Bytes(params_bytes)),
             (4, KA::Buffer(slot_id)),
             (5, KA::Buffer(seq_pos)),
+            // The legacy layout does not read per-query capacities, but the
+            // widened internal kernel ABI keeps this binding valid so old
+            // callers retain the same public API and allocation behavior.
+            (6, KA::Buffer(slot_id)),
         ],
         MTLSize::new(num_kv_heads as u64, n_queries as u64, 1),
         MTLSize::new(32, 1, 1),
     );
 
+    Ok(())
+}
+
+/// Encode higher-bit TQ rows into an arena whose physical slot capacities are
+/// allowed to differ per query.
+///
+/// `base_token_rows[i]` is the first flattened `[kv_head, token]` row owned by
+/// query `i`; `capacities[i]` is that slot's physical token capacity. The row
+/// used for one `(query, kv_head, position)` is:
+///
+/// `base_token_rows[i] + kv_head * capacities[i] + physical_position`.
+///
+/// The packed byte offset is that row multiplied by `head_dim`; the norm
+/// offset is multiplied by `head_dim / 256`. The shader performs the same
+/// bounds calculation in 64-bit arithmetic and drops an invalid query before
+/// touching the arena. This lets a growable cache reserve only the banks that
+/// exist while retaining one batched encode dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_hadamard_quantize_kv_hb_banked(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    packed: &MlxBuffer,
+    norms: &MlxBuffer,
+    base_token_rows: &MlxBuffer,
+    capacities: &MlxBuffer,
+    seq_pos: &MlxBuffer,
+    n_queries: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    arena_token_capacity: u32,
+    is_sliding: bool,
+    scale_factor_d512: f32,
+    codebook_bits: u32,
+) -> Result<()> {
+    const OP: &str = "dispatch_hadamard_quantize_kv_hb_banked";
+    if n_queries == 0 {
+        return Ok(());
+    }
+    if num_kv_heads == 0 || arena_token_capacity == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: num_kv_heads and arena_token_capacity must be greater than zero"
+        )));
+    }
+    if !matches!(head_dim, 256 | 512) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: head_dim {head_dim} not supported (need 256 or 512)"
+        )));
+    }
+    if !matches!(codebook_bits, 5 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: codebook_bits must be 5, 6, or 8, got {codebook_bits}"
+        )));
+    }
+    if src.dtype() != DType::F32
+        || packed.dtype() != DType::U8
+        || norms.dtype() != DType::F32
+        || base_token_rows.dtype() != DType::U32
+        || capacities.dtype() != DType::U32
+        || seq_pos.dtype() != DType::U32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: expected src/norms F32, packed U8, and layout arrays U32"
+        )));
+    }
+    if !packed.is_cpu_writable() || !norms.is_cpu_writable() {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: packed and norms destinations must have writable backing"
+        )));
+    }
+    for (name, buffer) in [
+        ("src", src),
+        ("norms", norms),
+        ("base_token_rows", base_token_rows),
+        ("capacities", capacities),
+        ("seq_pos", seq_pos),
+    ] {
+        if buffer.byte_offset() % 4 != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: {name} byte offset must be 4-byte aligned"
+            )));
+        }
+    }
+
+    let array_bytes = u64::from(n_queries)
+        .checked_mul(4)
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: array size overflow")))?;
+    for (name, buffer) in [
+        ("base_token_rows", base_token_rows),
+        ("capacities", capacities),
+        ("seq_pos", seq_pos),
+    ] {
+        if (buffer.data_byte_len() as u64) < array_bytes {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: {name} has {} bytes but needs {array_bytes}",
+                buffer.data_byte_len()
+            )));
+        }
+    }
+    let required_src_bytes = u64::from(n_queries)
+        .checked_mul(u64::from(num_kv_heads))
+        .and_then(|rows| rows.checked_mul(u64::from(head_dim)))
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: source size overflow")))?;
+    let required_packed_bytes = u64::from(arena_token_capacity)
+        .checked_mul(u64::from(head_dim))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: packed size overflow")))?;
+    let norms_per_pos = u64::from(head_dim / 256);
+    let required_norm_bytes = u64::from(arena_token_capacity)
+        .checked_mul(norms_per_pos)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: norm size overflow")))?;
+    for (name, actual, required) in [
+        ("src", src.data_byte_len() as u64, required_src_bytes),
+        (
+            "packed",
+            packed.data_byte_len() as u64,
+            required_packed_bytes,
+        ),
+        ("norms", norms.data_byte_len() as u64, required_norm_bytes),
+    ] {
+        if actual < required {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: {name} has {actual} bytes but needs {required}"
+            )));
+        }
+    }
+
+    let kernel_name = match head_dim {
+        256 => "hadamard_quantize_kv_hb_batched_d256",
+        512 => "hadamard_quantize_kv_hb_batched_d512",
+        _ => unreachable!(),
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let params = HadamardQuantizeHbParams {
+        head_dim,
+        num_kv_heads,
+        write_pos: 0,
+        cache_capacity: 0,
+        is_sliding: u32::from(is_sliding),
+        scale_factor_d512,
+        codebook_bits,
+        arena_token_capacity,
+    };
+    let params_bytes = bytemuck::bytes_of(&params);
+    use super::encode_helpers::{encode_threadgroups_with_args, KernelArg as KA};
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KA::Buffer(src)),
+            (1, KA::Buffer(packed)),
+            (2, KA::Buffer(norms)),
+            (3, KA::Bytes(params_bytes)),
+            (4, KA::Buffer(base_token_rows)),
+            (5, KA::Buffer(seq_pos)),
+            (6, KA::Buffer(capacities)),
+        ],
+        MTLSize::new(num_kv_heads as u64, n_queries as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
     Ok(())
 }
 
@@ -827,6 +1044,7 @@ pub fn dispatch_kv_quantize_v_no_fwht(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        arena_token_capacity: 0,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
@@ -917,6 +1135,7 @@ pub fn dispatch_kv_copy_kf16_quantize_v_no_fwht(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        arena_token_capacity: 0,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
@@ -1000,6 +1219,7 @@ pub fn dispatch_hadamard_quantize_kv_hb_dual(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        arena_token_capacity: 0,
     };
     let params_bytes = bytemuck::bytes_of(&params);
 
@@ -1111,6 +1331,7 @@ pub fn dispatch_kv_quantize_v_no_fwht_seq(
             is_sliding: if is_sliding { 1 } else { 0 },
             scale_factor_d512,
             codebook_bits,
+            arena_token_capacity: 0,
         };
         let params_bytes = bytemuck::bytes_of(&params);
         let src_offset = ((src_tok_offset + i) as u64) * bytes_per_token;
@@ -1364,6 +1585,7 @@ pub fn dispatch_hadamard_quantize_kv_hb_seq(
         is_sliding: if is_sliding { 1 } else { 0 },
         scale_factor_d512,
         codebook_bits,
+        arena_token_capacity: 0,
     };
 
     encoder.dispatch_tracked_threadgroups_with_args(

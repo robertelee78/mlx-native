@@ -25,6 +25,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
+use metal::foreign_types::ForeignType;
 use metal::{
     CommandBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
     ComputePipelineStateRef, CounterSampleBuffer, CounterSampleBufferDescriptor,
@@ -1374,6 +1375,116 @@ impl CommandEncoder {
         } else {
             issue_metal_buffer_barrier(encoder);
         }
+    }
+
+    /// Copy an exact raw byte range between Metal buffers in this command
+    /// buffer without mapping either range through the CPU.
+    ///
+    /// Offsets are relative to each [`MlxBuffer`] logical view, so nested
+    /// [`MlxBuffer::slice_view`] offsets compose correctly. The copy is
+    /// ordered after any preceding compute work and before subsequent compute
+    /// work by ending the active compute encoder and encoding one Metal blit.
+    ///
+    /// Metal does not define this primitive as `memmove`: non-identical
+    /// overlapping physical ranges of the same allocation are rejected.
+    /// Copying a range onto itself is an explicit no-op. Graph capture is
+    /// rejected because [`CapturedNode`] currently represents compute
+    /// dispatches and barriers only; silently omitting a blit would corrupt a
+    /// captured cache-growth sequence.
+    pub fn blit_copy_bytes(
+        &mut self,
+        source: &MlxBuffer,
+        source_offset: u64,
+        destination: &MlxBuffer,
+        destination_offset: u64,
+        byte_len: u64,
+    ) -> Result<()> {
+        const OP: &str = "CommandEncoder::blit_copy_bytes";
+
+        let source_end = source_offset.checked_add(byte_len).ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: source range overflows u64"))
+        })?;
+        let destination_end = destination_offset.checked_add(byte_len).ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: destination range overflows u64"))
+        })?;
+        if source_end > source.data_byte_len() as u64 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: source range [{source_offset}, {source_end}) exceeds logical length {}",
+                source.data_byte_len()
+            )));
+        }
+        if destination_end > destination.data_byte_len() as u64 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: destination range [{destination_offset}, {destination_end}) exceeds logical length {}",
+                destination.data_byte_len()
+            )));
+        }
+        if !destination.is_cpu_writable() {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: destination must have writable backing"
+            )));
+        }
+
+        let physical_source = source
+            .byte_offset()
+            .checked_add(source_offset)
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(format!("{OP}: physical source offset overflows u64"))
+            })?;
+        let physical_destination = destination
+            .byte_offset()
+            .checked_add(destination_offset)
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(format!(
+                    "{OP}: physical destination offset overflows u64"
+                ))
+            })?;
+
+        let same_allocation = source.metal_buffer().as_ptr() == destination.metal_buffer().as_ptr();
+        if same_allocation && physical_source == physical_destination {
+            return Ok(());
+        }
+        if byte_len == 0 {
+            return Ok(());
+        }
+        let physical_source_end = physical_source.checked_add(byte_len).ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{OP}: physical source range overflows u64"))
+        })?;
+        let physical_destination_end =
+            physical_destination.checked_add(byte_len).ok_or_else(|| {
+                MlxError::InvalidArgument(format!("{OP}: physical destination range overflows u64"))
+            })?;
+        if same_allocation
+            && physical_source < physical_destination_end
+            && physical_destination < physical_source_end
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: overlapping same-buffer ranges are unsupported; use a disjoint destination bank"
+            )));
+        }
+        if self.capture.is_some() {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: raw byte blits are not supported during graph capture"
+            )));
+        }
+
+        self.end_active_encoder();
+        objc::rc::autoreleasepool(|| {
+            let blit = self.cmd_buf.new_blit_command_encoder();
+            blit.copy_from_buffer(
+                source.metal_buffer(),
+                physical_source,
+                destination.metal_buffer(),
+                physical_destination,
+                byte_len,
+            );
+            blit.end_encoding();
+        });
+
+        // Ending the compute pass plus the ordered blit is a full scheduling
+        // boundary. A later tracked dispatch starts a fresh dependency group.
+        self.mem_ranges.reset();
+        Ok(())
     }
 
     /// Set the compute pipeline state for subsequent dispatches.
