@@ -21,6 +21,11 @@ requested rows from F32, F16, or BF16 storage and emits F32 activations. Host
 validation pins logical byte extents, dtypes, dimensions, and token bounds
 before command encoding.
 
+The machine-readable capability contract also admits direct dense scalar
+projections at M=1, continuous widths through eight, and larger prompt or
+physical-batch widths. Each receipt names the scalar dtype and decode-versus-
+matrix route and accounts for the exact native byte extent.
+
 ## Evidence
 
 - GGML type ID 30 maps to BF16 with exact block and byte sizing.

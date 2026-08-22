@@ -202,6 +202,12 @@ pub struct GgmlCapabilityRequest {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum GgmlKernelRoute {
+    DenseF32Mv,
+    DenseF32Mm,
+    DenseF16Mv,
+    DenseF16Mm,
+    DenseBF16Mv,
+    DenseBF16Mm,
     DenseMv,
     DenseMvNr2,
     DenseQ4kWidthMn,
@@ -466,9 +472,7 @@ fn workload_shape_valid(request: &GgmlCapabilityRequest) -> bool {
 
 fn packed_matrix_bytes(request: &GgmlCapabilityRequest) -> Option<u64> {
     let (_, n, k) = request.invocation.dimensions();
-    if matches!(request.invocation, GgmlInvocation::EmbeddingGather { .. })
-        && matches!(request.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
-    {
+    if matches!(request.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
         return u64::from(n)
             .checked_mul(u64::from(k))
             .and_then(|elements| {
@@ -494,14 +498,20 @@ fn validate_common(request: &GgmlCapabilityRequest) -> Option<GgmlCapability> {
             "M, N, and K must all be non-zero",
         ));
     }
-    let dense_scalar_embedding = matches!(request.invocation, GgmlInvocation::EmbeddingGather { .. })
-        && matches!(request.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
-    if !quantized_matmul_type(request.ggml_type) && !dense_scalar_embedding {
+    let native_scalar = matches!(
+        request.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    );
+    let native_scalar_operation = matches!(
+        request.invocation,
+        GgmlInvocation::DenseAuto { .. } | GgmlInvocation::EmbeddingGather { .. }
+    );
+    if !quantized_matmul_type(request.ggml_type) && !(native_scalar && native_scalar_operation) {
         return Some(GgmlCapability::unsupported(
             request,
             GgmlRejectionCode::UnsupportedType,
             format!(
-                "{:?} is not a GGUF block-quantized operation type",
+                "{:?} has no native route for this GGUF operation",
                 request.ggml_type
             ),
         ));
@@ -627,6 +637,30 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
             request,
             GgmlRejectionCode::UnsupportedRegime,
             "dense auto matmul does not use embedding-gather",
+        );
+    }
+    let scalar_route = match (request.ggml_type, m == 1) {
+        (GgmlType::F32, true) => Some(GgmlKernelRoute::DenseF32Mv),
+        (GgmlType::F32, false) => Some(GgmlKernelRoute::DenseF32Mm),
+        (GgmlType::F16, true) => Some(GgmlKernelRoute::DenseF16Mv),
+        (GgmlType::F16, false) => Some(GgmlKernelRoute::DenseF16Mm),
+        (GgmlType::BF16, true) => Some(GgmlKernelRoute::DenseBF16Mv),
+        (GgmlType::BF16, false) => Some(GgmlKernelRoute::DenseBF16Mm),
+        _ => None,
+    };
+    if let Some(route) = scalar_route {
+        return GgmlCapability::supported(
+            request,
+            route,
+            true,
+            false,
+            false,
+            1,
+            bytes,
+            GgmlScratchRequirement::None,
+            1,
+            0,
+            "native scalar GGUF dense projection route",
         );
     }
     match plan_dense_auto_route(request.ggml_type, m, k, &request.routing) {

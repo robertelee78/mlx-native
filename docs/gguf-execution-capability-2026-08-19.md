@@ -82,6 +82,10 @@ device-resolved route has a matched benchmark receipt.
 - Direct dense embedding gather supports F32, F16, and BF16 tables and converts
   only selected rows to the graph's F32 activation dtype. This is row execution,
   not a second resident weight representation.
+- Dense F32, F16, and BF16 projections expose explicit native scalar routes at
+  decode, continuous widths through eight, and prompt/physical-batch widths
+  above eight. The capability receipt accounts for the exact two- or four-byte
+  tensor extent and never describes the scalar tensor as a quantized block.
 
 ## Evidence and remaining scope
 
