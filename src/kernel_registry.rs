@@ -1196,8 +1196,12 @@ impl KernelRegistry {
         let gather_src: &'static str = include_str!("shaders/gather.metal");
         sources.insert("gather_f32".into(), gather_src);
 
-        // Direct GGML Q4_K embedding gather. Keep the source registered even
-        // when the precompiled metallib is disabled or unavailable.
+        // Direct GGML Q4_0 and Q4_K embedding gathers. Keep the sources
+        // registered even when the precompiled metallib is disabled or unavailable.
+        sources.insert(
+            "embedding_gather_q4_0_f32".into(),
+            include_str!("shaders/embedding_q4_0.metal"),
+        );
         sources.insert(
             "embedding_gather_q4_k_f32".into(),
             include_str!("shaders/embedding_q4_k.metal"),
