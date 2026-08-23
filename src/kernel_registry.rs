@@ -142,6 +142,9 @@ pub struct KernelRegistry {
     /// Immutable BF16 route metadata frozen before request-visible work.
     /// Plans contain no model buffers and cannot change after activation.
     pub(crate) dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState,
+    /// Immutable native scalar expert-ID route metadata. The plan is
+    /// pointer-free and scoped to one activation epoch.
+    pub(crate) dense_matmul_id_auto: crate::ops::dense_matmul_id_auto::DenseMatmulIdAutoState,
     /// A Metal pipeline state is device-owned. Reject attempts to reuse this
     /// registry on another physical GPU instead of returning a cached PSO for
     /// the wrong device.
@@ -172,6 +175,8 @@ pub struct KernelRegistry {
     /// Whether we've already attempted to load the precompiled library.
     /// Prevents repeated load attempts on failure.
     precompiled_load_attempted: bool,
+    #[cfg(test)]
+    test_next_pipeline_failure: Option<String>,
 }
 
 impl KernelRegistry {
@@ -202,6 +207,11 @@ impl KernelRegistry {
             "quantized_matmul_simd_bf16_expert".into(),
             include_str!("shaders/quantized_matmul.metal"),
         );
+
+        let dense_matmul_id_src: &'static str = include_str!("shaders/dense_matmul_id.metal");
+        for name in crate::ops::dense_matmul_id::DENSE_MATMUL_ID_PIPELINE_NAMES {
+            sources.insert(name.into(), dense_matmul_id_src);
+        }
 
         // GGML block-format quantized mat-vec kernels (ADR-006 Phase 3)
         let ggml_src: &'static str = include_str!("shaders/quantized_matmul_ggml.metal");
@@ -1491,6 +1501,8 @@ impl KernelRegistry {
 
         Self {
             dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState::default(),
+            dense_matmul_id_auto: crate::ops::dense_matmul_id_auto::DenseMatmulIdAutoState::default(
+            ),
             bound_device_registry_id: None,
             cache: HashMap::new(),
             optional_pipeline_capabilities: HashMap::new(),
@@ -1498,7 +1510,14 @@ impl KernelRegistry {
             sources,
             precompiled_lib: None,
             precompiled_load_attempted: false,
+            #[cfg(test)]
+            test_next_pipeline_failure: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_pipeline_lookup_failure(&mut self, name: &str) {
+        self.test_next_pipeline_failure = Some(name.to_string());
     }
 
     /// Try to obtain the precompiled `default.metallib` Library, loading it
@@ -1537,7 +1556,7 @@ impl KernelRegistry {
     /// kernel generation).
     ///
     /// This compatibility entry point panics if a caller attempts to mutate a
-    /// BF16 dense pipeline protected by a frozen route plan. Call
+    /// calibrated pipeline protected by a frozen route plan. Call
     /// [`Self::try_register_source`] when the rejection must be handled.
     pub fn register_source(&mut self, name: impl Into<String>, source: &'static str) {
         let name = name.into();
@@ -1547,7 +1566,7 @@ impl KernelRegistry {
     }
 
     /// Try to register a runtime shader source without invalidating a frozen
-    /// BF16 dense route plan's exact pipeline identities.
+    /// route plan's exact pipeline identities.
     pub fn try_register_source(
         &mut self,
         name: impl Into<String>,
@@ -1561,12 +1580,22 @@ impl KernelRegistry {
                 | "hf2q_dense_mm_bf16_f32_tensor"
                 | "hf2q_dense_mm_bf16_f32_fallback"
         );
+        let protected_dense_matmul_id =
+            crate::ops::dense_matmul_id::DENSE_MATMUL_ID_PIPELINE_NAMES.contains(&name.as_str());
         if protected_dense_bf16
             && self.dense_bf16_plan().is_some()
             && self.sources.get(&name).copied() != Some(source)
         {
             return Err(MlxError::InvalidArgument(format!(
                 "cannot mutate dense BF16 shader {name} after its route plan is frozen"
+            )));
+        }
+        if protected_dense_matmul_id
+            && self.dense_matmul_id_plan().is_some()
+            && self.sources.get(&name).copied() != Some(source)
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "cannot mutate dense expert-ID shader {name} after its route plan is frozen"
             )));
         }
         if self.sources.get(&name).copied() == Some(source) {
@@ -1838,6 +1867,11 @@ impl KernelRegistry {
         device: &metal::DeviceRef,
     ) -> Result<&ComputePipelineState> {
         self.bind_device(device)?;
+        #[cfg(test)]
+        if self.test_next_pipeline_failure.as_deref() == Some(name) {
+            self.test_next_pipeline_failure = None;
+            return Err(MlxError::KernelNotFound(name.to_string()));
+        }
         if !self.cache.contains_key(name) {
             // ADR-029 iter-175 Step 1l: precompiled .metallib fast path.
             // When MLX_PRECOMPILED_METALLIB=1 AND the kernel exists in the

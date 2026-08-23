@@ -1184,6 +1184,89 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Encode native F32/F16/BF16 expert-ID matmul with complete buffer
+    /// hazards for direct execution and recorded-graph replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dense_matmul_id(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weights: &MlxBuffer,
+        input: &MlxBuffer,
+        expert_ids: &MlxBuffer,
+        output: &MlxBuffer,
+        scratch: Option<&ops::dense_matmul_id::DenseMatmulIdScratch>,
+        params: &ops::dense_matmul_id::DenseMatmulIdParams,
+    ) -> Result<ops::dense_matmul_id::DenseMatmulIdDispatchReceipt> {
+        let capability = ops::dense_matmul_id::validate_dense_matmul_id_call(
+            weights, input, expert_ids, output, scratch, params,
+        )?;
+        match capability.route {
+            ops::dense_matmul_id::DenseMatmulIdRoute::Direct => {
+                self.barrier_between(&[weights, input, expert_ids], &[output]);
+            }
+            ops::dense_matmul_id::DenseMatmulIdRoute::GroupedPrefill => {
+                let scratch = scratch.ok_or_else(|| {
+                    MlxError::InvalidArgument(
+                        "dense_matmul_id grouped prefill requires caller-owned scratch".into(),
+                    )
+                })?;
+                self.barrier_between(
+                    &[weights, input, expert_ids],
+                    &[output, scratch.expert_counts(), scratch.routed_rows()],
+                );
+            }
+        }
+        ops::dense_matmul_id::dense_matmul_id(
+            &mut self.encoder,
+            registry,
+            device,
+            weights,
+            input,
+            expert_ids,
+            output,
+            scratch,
+            params,
+        )
+    }
+
+    /// Encode one activation-declared native scalar expert matmul through the
+    /// frozen route plan while preserving the primitive's complete hazards.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dense_matmul_id_auto(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        activation_epoch: u64,
+        weights: &MlxBuffer,
+        input: &MlxBuffer,
+        expert_ids: &MlxBuffer,
+        output: &MlxBuffer,
+        scratch: Option<&ops::dense_matmul_id::DenseMatmulIdScratch>,
+        params: &ops::dense_matmul_id::DenseMatmulIdParams,
+    ) -> Result<ops::dense_matmul_id_auto::DenseMatmulIdAutoDispatchReceipt> {
+        let (route, decision_source) =
+            ops::dense_matmul_id_auto::resolve_dense_matmul_id_auto_route(
+                registry,
+                device,
+                activation_epoch,
+                weights,
+                params,
+            )?;
+        let effective = ops::dense_matmul_id::DenseMatmulIdParams { route, ..*params };
+        let primitive = self.dense_matmul_id(
+            registry, device, weights, input, expert_ids, output, scratch, &effective,
+        )?;
+        Ok(
+            ops::dense_matmul_id_auto::DenseMatmulIdAutoDispatchReceipt {
+                route,
+                decision_source,
+                activation_epoch,
+                primitive,
+            },
+        )
+    }
+
     /// Encode a GGML block-format quantized mat-vec into this session's encoder.
     ///
     /// Delegates to [`ops::quantized_matmul_ggml::quantized_matmul_ggml`].

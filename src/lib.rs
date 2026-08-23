@@ -134,6 +134,23 @@ pub use ops::dense_bf16_auto::{
     DenseBf16DispatchDecision, DenseBf16DispatchTrace, DenseBf16Route, DenseBf16RoutePlan,
     DenseBf16Shape,
 };
+pub use ops::dense_matmul_id::{
+    dense_matmul_id, dense_matmul_id_capability, DenseMatmulIdCapability,
+    DenseMatmulIdDispatchReceipt, DenseMatmulIdInputLayout, DenseMatmulIdMultiplicity,
+    DenseMatmulIdParams, DenseMatmulIdRoute, DenseMatmulIdScratch, DenseMatmulIdScratchRequirement,
+    DENSE_MATMUL_ID_SCHEMA_VERSION,
+};
+pub use ops::dense_matmul_id_auto::{
+    calibrate_dense_matmul_id_routes, dense_matmul_id_auto,
+    dense_matmul_id_value_independence_theorem_sha256, resolve_dense_matmul_id_auto_route,
+    trace_dense_matmul_id, trace_dense_matmul_id_auto, DenseMatmulIdAutoDispatchReceipt,
+    DenseMatmulIdCalibrationBatchReceipt, DenseMatmulIdCalibrationCase,
+    DenseMatmulIdCalibrationDecision, DenseMatmulIdCalibrationLimits, DenseMatmulIdDecisionSource,
+    DenseMatmulIdDispatchTrace, DenseMatmulIdRoutePlan, DenseMatmulIdRouteTiming,
+    DenseMatmulIdRoutingProfile, DenseMatmulIdSelectionStatus, DenseMatmulIdShape,
+    DenseMatmulIdTimingDistribution, DENSE_MATMUL_ID_ROUTE_SCHEMA_VERSION,
+    DENSE_MATMUL_ID_VALUE_INDEPENDENCE_THEOREM,
+};
 pub use ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 pub use ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 pub use ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
