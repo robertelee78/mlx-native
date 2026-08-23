@@ -74,15 +74,20 @@ microseconds:
 
 | Role | tensor-32 | ordinary row | tiled-4 | Best |
 |---|---:|---:|---:|---|
-| FFN gate/up | 645.291 | 632.916 | 523.417 | tiled-4 |
-| FFN down | 871.333 | 645.500 | 532.250 | tiled-4 |
-| attention Q | 378.458 | 314.208 | 283.459 | tiled-4 |
-| attention K/V | 270.500 | 170.458 | 182.500 | ordinary row |
+| FFN gate/up | 651.417 | 666.458 | 532.917 | tiled-4 |
+| FFN down | 891.041 | 664.417 | 538.958 | tiled-4 |
+| attention Q | 356.417 | 319.917 | 294.125 | tiled-4 |
+| attention K/V | 269.916 | 182.042 | 178.750 | overlap |
+
+The K/V wall distributions overlap; GPU medians were 25.625 microseconds for
+ordinary row and 32.250 for tiled-4. A selector must retain the compatibility
+route when calibration cannot establish a material, stable winner.
 
 The complete M=1 through 16 matrix is reproducible with:
 
 ```bash
-MLX_BENCH_SUMMARY_ONLY=1 MLX_BENCH_WINNER_ONLY=1 \
+MLX_NATIVE_BENCH_COMMIT=a112660 \
+  MLX_BENCH_SUMMARY_ONLY=1 MLX_BENCH_WINNER_ONLY=1 \
   cargo bench --locked --bench bench_dense_bf16_short_rows
 ```
 
@@ -90,12 +95,15 @@ The downstream source spike used the exact 54,657,734,208-byte Qwen3.8 27B
 BF16 artifact with SHA-256
 `f30d9a6ea40ca3c5265d0996a460ad1474173c40c8e7f04c0b03caf6084c2cee`,
 the six checked-in code/repetition requests, greedy sampling, and one server
-slot. Against source `681842461816616eb9f273b7c0d1f0d9c62fda1`, routing the
-hot dense FFN verifier projections through this primitive preserved all six
-response bodies byte-for-byte and moved aggregate code throughput from 19.82
-to 23.12 tokens/s (+16.6%) and repetition from 19.59 to 23.11 tokens/s
-(+17.9%). This is downstream spike evidence, not registry-release authority
-or a claim against the external reference implementation.
+slot. The request contract and exact runnable comparison harness are
+`scripts/qwen38_matched_reference_contract.sh` and
+`scripts/qwen38_matched_reference_abba.sh` in hf2q. Against source
+`681842461816616eb9f273b7c0d1f0d9c62fda1`, routing the hot dense FFN verifier
+projections through this primitive preserved all six response bodies
+byte-for-byte and moved aggregate code throughput from 19.82 to 23.12
+tokens/s (+16.6%) and repetition from 19.59 to 23.11 tokens/s (+17.9%). This
+is downstream spike evidence, not registry-release authority or a claim
+against the external reference implementation.
 
 ## Release conditions
 
