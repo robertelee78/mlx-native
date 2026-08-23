@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
@@ -85,6 +85,10 @@ harness = false
 
 [[bench]]
 name = "bench_dense_mm_bf16_nofa_shapes"
+harness = false
+
+[[bench]]
+name = "bench_dense_bf16_short_rows"
 harness = false
 
 [[bench]]

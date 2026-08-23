@@ -14,15 +14,93 @@
 #![cfg(target_vendor = "apple")]
 
 use half::bf16;
-use mlx_native::ops::dense_mm_bf16::{
-    dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params,
-};
+use mlx_native::ops::dense_bf16_auto::{dense_matmul_bf16_f32_forced, DenseBf16Route};
+use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::{DType, KernelRegistry, MlxDevice};
 
 fn setup() -> (MlxDevice, KernelRegistry) {
     let device = MlxDevice::new().expect("MlxDevice::new");
     let registry = KernelRegistry::new();
     (device, registry)
+}
+
+#[test]
+fn tensor_and_simdgroup_reject_invalid_logical_contracts_before_encoding() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let params = DenseMmBf16F32Params {
+        m: 2,
+        n: 8,
+        k: 32,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    let weight = device
+        .alloc_buffer((params.n * params.k * 2) as usize, DType::BF16, vec![256])
+        .expect("weight");
+    let input = device
+        .alloc_buffer((params.m * params.k * 4) as usize, DType::F32, vec![64])
+        .expect("input");
+    let output = device
+        .alloc_buffer((params.m * params.n * 4) as usize, DType::F32, vec![16])
+        .expect("output");
+    let short_weight = weight.slice_view(0, 255);
+    let wrong_input = device
+        .alloc_buffer(input.data_byte_len(), DType::BF16, vec![128])
+        .expect("wrong input dtype");
+    let oversized = DenseMmBf16F32Params {
+        n: i32::MAX as u32 + 1,
+        ..params
+    };
+    let misaligned_tensor_rows = DenseMmBf16F32Params { k: 33, ..params };
+
+    for route in [DenseBf16Route::TensorV1, DenseBf16Route::Simdgroup] {
+        for (candidate_weight, candidate_input, candidate_params) in [
+            (&short_weight, &input, &params),
+            (&weight, &wrong_input, &params),
+            (&weight, &input, &oversized),
+        ] {
+            let mut encoder = device.command_encoder().expect("encoder");
+            assert!(dense_matmul_bf16_f32_forced(
+                route,
+                &mut encoder,
+                &mut registry,
+                &device,
+                candidate_weight,
+                candidate_input,
+                &output,
+                candidate_params,
+            )
+            .is_err());
+        }
+    }
+
+    let k33_weight = device
+        .alloc_buffer(
+            (params.n * 33 * 2) as usize,
+            DType::BF16,
+            vec![(params.n * 33) as usize],
+        )
+        .expect("K=33 weight");
+    let k33_input = device
+        .alloc_buffer(
+            (params.m * 33 * 4) as usize,
+            DType::F32,
+            vec![(params.m * 33) as usize],
+        )
+        .expect("K=33 input");
+    let mut encoder = device.command_encoder().expect("K=33 tensor encoder");
+    assert!(dense_matmul_bf16_f32_forced(
+        DenseBf16Route::TensorV1,
+        &mut encoder,
+        &mut registry,
+        &device,
+        &k33_weight,
+        &k33_input,
+        &output,
+        &misaligned_tensor_rows,
+    )
+    .is_err());
 }
 
 fn pseudo_random_f32(seed: u64, n: usize) -> Vec<f32> {
@@ -101,9 +179,11 @@ fn run_case(
 
     let src0_bytes = (src0_batch * n * k) as usize * 2;
     let mut src0_buf = device
-        .alloc_buffer(src0_bytes, DType::BF16, vec![
-            src0_batch as usize, n as usize, k as usize,
-        ])
+        .alloc_buffer(
+            src0_bytes,
+            DType::BF16,
+            vec![src0_batch as usize, n as usize, k as usize],
+        )
         .expect("alloc src0");
     src0_buf
         .as_mut_slice::<u16>()
@@ -112,9 +192,11 @@ fn run_case(
 
     let src1_bytes = (src1_batch * m * k) as usize * 4;
     let mut src1_buf = device
-        .alloc_buffer(src1_bytes, DType::F32, vec![
-            src1_batch as usize, m as usize, k as usize,
-        ])
+        .alloc_buffer(
+            src1_bytes,
+            DType::F32,
+            vec![src1_batch as usize, m as usize, k as usize],
+        )
         .expect("alloc src1");
     src1_buf
         .as_mut_slice::<f32>()
@@ -123,9 +205,11 @@ fn run_case(
 
     let dst_bytes = (src1_batch * m * n) as usize * 4;
     let mut dst_buf = device
-        .alloc_buffer(dst_bytes, DType::F32, vec![
-            src1_batch as usize, m as usize, n as usize,
-        ])
+        .alloc_buffer(
+            dst_bytes,
+            DType::F32,
+            vec![src1_batch as usize, m as usize, n as usize],
+        )
         .expect("alloc dst");
 
     let params = DenseMmBf16F32Params {
@@ -161,7 +245,13 @@ fn run_case(
     assert!(
         max_err < tol,
         "max error {} > tolerance {} (m={} n={} k={} src0_b={} src1_b={})",
-        max_err, tol, m, n, k, src0_batch, src1_batch
+        max_err,
+        tol,
+        m,
+        n,
+        k,
+        src0_batch,
+        src1_batch
     );
 }
 
@@ -196,11 +286,12 @@ fn prefill_attn_shape() {
 }
 
 // ------------------------------------------------------------------------
-// Partial K-tile coverage — K = ne00 not a multiple of NK=32. Without the
-// kernel's `loop_k + NK <= args.ne00` guard, the in-tile unconditional
-// 16-element / 8-element loads read past the end of the src0/src1
-// buffers on the trailing partial tile, accumulating garbage into the
-// output. Discovered externally by hf2q ADR-005 iter 67 on
+// Partial K-tile coverage — K = ne00 not a multiple of NK=32. Auto routing
+// uses the scalar-staging simdgroup kernel when K is not divisible by four,
+// because Tensor V1's full-tile `float4` input loads require aligned row
+// strides. Divisible-by-four partial tiles such as K=72 and K=100 continue to
+// cover Tensor V1's gated tail. Without either kernel's bounds guard, the
+// trailing tile reads past src0/src1 and accumulates garbage. Discovered on
 // bge-small-en-v1.5 BERT embeddings (cosine 0.99999 at K=32 → 0.75-0.92
 // at K=33-200). These tests lock the fix at the kernel level.
 //
@@ -274,9 +365,7 @@ fn partial_k_tile_k_eq_100_long_bert_seq() {
 /// 0's bytes regardless of slice offset). Post-fix max_err ≤ 0.2.
 #[test]
 fn slice_view_kernel_arg_buffer_propagates_byte_offset() {
-    use mlx_native::ops::dense_mm_bf16::{
-        dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params,
-    };
+    use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 
     let (device, mut registry) = setup();
     let m = 32u32;
@@ -321,11 +410,7 @@ fn slice_view_kernel_arg_buffer_propagates_byte_offset() {
     let src1_f32 = pseudo_random_f32(0xDEAD_C0DE, (m * k) as usize);
     let src1_bytes = (m * k) as usize * 4;
     let mut src1_buf = device
-        .alloc_buffer(
-            src1_bytes,
-            DType::F32,
-            vec![m as usize, k as usize],
-        )
+        .alloc_buffer(src1_bytes, DType::F32, vec![m as usize, k as usize])
         .expect("alloc src1");
     src1_buf
         .as_mut_slice::<f32>()
@@ -361,13 +446,7 @@ fn slice_view_kernel_arg_buffer_propagates_byte_offset() {
     // CPU reference: matmul against the MIDDLE block only.
     let middle_f32: &[f32] = &fused_f32[block_elems..2 * block_elems];
     let expected = cpu_ref(
-        middle_f32,
-        &src1_f32,
-        m as usize,
-        n as usize,
-        k as usize,
-        1,
-        1,
+        middle_f32, &src1_f32, m as usize, n as usize, k as usize, 1, 1,
     );
     let actual = dst_buf.as_slice::<f32>().expect("read dst").to_vec();
     let max_err = actual
@@ -391,13 +470,7 @@ fn slice_view_kernel_arg_buffer_propagates_byte_offset() {
     // test isn't trivially passing.
     let block0_f32: &[f32] = &fused_f32[..block_elems];
     let wrong_expected = cpu_ref(
-        block0_f32,
-        &src1_f32,
-        m as usize,
-        n as usize,
-        k as usize,
-        1,
-        1,
+        block0_f32, &src1_f32, m as usize, n as usize, k as usize, 1, 1,
     );
     let wrong_max_err = actual
         .iter()

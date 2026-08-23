@@ -127,6 +127,13 @@ pub use residency::{
 pub use gguf::{GgufFile, MetadataValue, TensorInfo};
 
 // Re-export ops.
+pub use ops::dense_bf16_auto::{
+    calibrate_dense_bf16_routes, dense_matmul_bf16_f32_auto,
+    trace_dense_matmul_bf16_f32_auto, DenseBf16BaseShape, DenseBf16CalibrationBatchReceipt,
+    DenseBf16CalibrationCase, DenseBf16CalibrationLimits, DenseBf16DecisionSource,
+    DenseBf16DispatchDecision, DenseBf16DispatchTrace, DenseBf16Route, DenseBf16RoutePlan,
+    DenseBf16Shape,
+};
 pub use ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 pub use ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 pub use ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};

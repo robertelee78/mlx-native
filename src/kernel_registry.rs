@@ -139,6 +139,9 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// `get_pipeline` to allow mutable cache insertion).  If you need concurrent
 /// access, wrap it in a `Mutex` or use one registry per thread.
 pub struct KernelRegistry {
+    /// Immutable BF16 route metadata frozen before request-visible work.
+    /// Plans contain no model buffers and cannot change after activation.
+    pub(crate) dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState,
     /// A Metal pipeline state is device-owned. Reject attempts to reuse this
     /// registry on another physical GPU instead of returning a cached PSO for
     /// the wrong device.
@@ -458,6 +461,7 @@ impl KernelRegistry {
         // M=1 due to better memory bandwidth utilization per thread).
         let dense_gemv_bf16_src: &'static str = include_str!("shaders/dense_gemv_bf16.metal");
         sources.insert("hf2q_dense_gemv_bf16_f32_4".into(), dense_gemv_bf16_src);
+        sources.insert("hf2q_dense_gemv_bf16_f32_r1_4".into(), dense_gemv_bf16_src);
 
         // Fused scale-mask-softmax for the non-flash-attention prefill
         // path.  One row-local threadgroup per (head, query) pair
@@ -1486,6 +1490,7 @@ impl KernelRegistry {
         sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
         Self {
+            dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState::default(),
             bound_device_registry_id: None,
             cache: HashMap::new(),
             optional_pipeline_capabilities: HashMap::new(),
@@ -1530,8 +1535,43 @@ impl KernelRegistry {
 
     /// Register a shader source at runtime (useful for testing and dynamic
     /// kernel generation).
+    ///
+    /// This compatibility entry point panics if a caller attempts to mutate a
+    /// BF16 dense pipeline protected by a frozen route plan. Call
+    /// [`Self::try_register_source`] when the rejection must be handled.
     pub fn register_source(&mut self, name: impl Into<String>, source: &'static str) {
         let name = name.into();
+        if let Err(error) = self.try_register_source(name, source) {
+            panic!("register shader source: {error}");
+        }
+    }
+
+    /// Try to register a runtime shader source without invalidating a frozen
+    /// BF16 dense route plan's exact pipeline identities.
+    pub fn try_register_source(
+        &mut self,
+        name: impl Into<String>,
+        source: &'static str,
+    ) -> Result<()> {
+        let name = name.into();
+        let protected_dense_bf16 = matches!(
+            name.as_str(),
+            "hf2q_dense_gemv_bf16_f32_4"
+                | "hf2q_dense_gemv_bf16_f32_r1_4"
+                | "hf2q_dense_mm_bf16_f32_tensor"
+                | "hf2q_dense_mm_bf16_f32_fallback"
+        );
+        if protected_dense_bf16
+            && self.dense_bf16_plan().is_some()
+            && self.sources.get(&name).copied() != Some(source)
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "cannot mutate dense BF16 shader {name} after its route plan is frozen"
+            )));
+        }
+        if self.sources.get(&name).copied() == Some(source) {
+            return Ok(());
+        }
         // Invalidate every specialization for this function since the source
         // changed. Specialized cache keys are prefixed by `name|`.
         let specialized_prefix = format!("{name}|");
@@ -1544,6 +1584,7 @@ impl KernelRegistry {
         self.pipeline_identities
             .retain(|key, _| key != &name && !key.starts_with(&specialized_prefix));
         self.sources.insert(name, source);
+        Ok(())
     }
 
     /// Return the exact source/metallib identity of a compiled pipeline label.

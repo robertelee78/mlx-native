@@ -155,7 +155,8 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
 - **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`
 - **MoE expert-routed**: `quantized_matmul_id` / `_id_ggml` / `_id_into` (top_k=1 tensor-mm fast path; `_into` accepts caller-provided output buffer); `quantized_matmul_id_ggml_pooled_pair` reuses one large-prefill routing schedule across two compatible expert projections
-- **Dense BF16**: `dense_mm_bf16_tensor`, `dense_gemv_bf16_f32` (M=1 decode)
+- **Dense BF16**: exact tensor/simdgroup, row, and four-row-tiled kernels behind
+  a frozen pre-serve calibrated route plan (`dense_matmul_bf16_f32_auto`)
 - **Dense F16**: `dense_gemm_f16`, `dense_matvec_f16`
 
 Before an artifact producer or model graph claims a packed-affine route, query
