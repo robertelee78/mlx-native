@@ -25,6 +25,12 @@ requested rows from F32, F16, or BF16 storage and emits F32 activations. Host
 validation pins logical byte extents, dtypes, dimensions, and token bounds
 before command encoding.
 
+Dense BF16 projections also retain the mapped bytes. Single-row and
+four-row-tiled GEMV operations consume the BF16 view directly; the tiled
+operation preserves the single-row F32 reduction order. Route selection is a
+separate measured decision documented in
+`dense-bf16-short-row-gemv-2026-08-22.md`.
+
 The machine-readable capability contract also admits direct dense scalar
 projections at M=1, continuous widths through eight, and larger prompt or
 physical-batch widths. Each receipt names the scalar dtype and decode-versus-
