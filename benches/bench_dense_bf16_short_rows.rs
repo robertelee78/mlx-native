@@ -117,12 +117,10 @@ fn encode(
 ) {
     match route {
         Route::Tensor32 => {
-            std::env::remove_var("HF2Q_LARGE_TILE_MM");
             dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, output, params)
                 .expect("tensor32 dispatch");
         }
         Route::Tensor128 => {
-            std::env::set_var("HF2Q_LARGE_TILE_MM", "1");
             dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, output, params)
                 .expect("tensor128 dispatch");
         }
@@ -137,6 +135,14 @@ fn encode(
     }
 }
 
+fn prepare_route(route: Route) {
+    match route {
+        Route::Tensor32 => std::env::remove_var("HF2Q_LARGE_TILE_MM"),
+        Route::Tensor128 => std::env::set_var("HF2Q_LARGE_TILE_MM", "1"),
+        Route::RowGemv | Route::TiledGemv4 => {}
+    }
+}
+
 fn run_once(
     route: Route,
     repeats: usize,
@@ -147,6 +153,10 @@ fn run_once(
     output: &MlxBuffer,
     params: &DenseMmBf16F32Params,
 ) -> (f64, f64) {
+    // Route selection is control-plane setup, not part of the kernel call.
+    // Keeping it outside the timed region gives every route the same timing
+    // boundary while preserving the actual production dispatcher.
+    prepare_route(route);
     let mut encoder = device.command_encoder().expect("command encoder");
     let started = std::time::Instant::now();
     for _ in 0..repeats {
