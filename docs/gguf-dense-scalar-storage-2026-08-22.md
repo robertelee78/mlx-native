@@ -27,8 +27,9 @@ before command encoding.
 
 Dense BF16 projections also retain the mapped bytes. Single-row and
 four-row-tiled GEMV operations consume the BF16 view directly; the tiled
-operation preserves the single-row F32 reduction order. Route selection is a
-separate measured decision documented in
+operation preserves the single-row F32 reduction order. Short-row route
+selection is frozen from a family-neutral, device/build/shape calibration
+before serving and retains no weight buffers. The policy is documented in
 `dense-bf16-short-row-gemv-2026-08-22.md`.
 
 The machine-readable capability contract also admits direct dense scalar

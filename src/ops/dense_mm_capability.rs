@@ -5,15 +5,13 @@ use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DenseMmBackend {
+pub(crate) enum DenseMmBackend {
     Auto,
-    #[cfg(test)]
     TensorRequired,
-    #[cfg(test)]
     FallbackRequired,
 }
 
-fn force_fallback_from_env() -> bool {
+pub(super) fn tensor_disabled_from_env() -> bool {
     static FORCE_FALLBACK: OnceLock<bool> = OnceLock::new();
     *FORCE_FALLBACK
         .get_or_init(|| std::env::var("MLX_NATIVE_DISABLE_METAL_TENSOR").as_deref() == Ok("1"))
@@ -39,14 +37,11 @@ pub(super) fn tensor_pipeline_available(
     device: &MlxDevice,
 ) -> Result<bool> {
     let supported = match backend {
-        #[cfg(test)]
         DenseMmBackend::FallbackRequired => false,
-        #[cfg(test)]
-        DenseMmBackend::TensorRequired => {
-            registry.get_pipeline(pipeline_name, device.metal_device())?;
-            true
-        }
-        DenseMmBackend::Auto if force_fallback_from_env() => false,
+        // Exact callers perform the single authoritative pipeline lookup in
+        // the dispatcher below; do not duplicate that hot-path lookup here.
+        DenseMmBackend::TensorRequired => true,
+        DenseMmBackend::Auto if tensor_disabled_from_env() => false,
         DenseMmBackend::Auto => {
             registry
                 .probe_optional_pipeline(
@@ -59,7 +54,7 @@ pub(super) fn tensor_pipeline_available(
         }
     };
 
-    if std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
+    if backend == DenseMmBackend::Auto && std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
         eprintln!(
             "[mlx-native] {pipeline_name}: {}",
             if supported {

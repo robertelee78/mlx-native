@@ -16,6 +16,7 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::dense_bf16_contract::{validate_dense_bf16_contract, DenseBf16Contract};
 use crate::ops::dense_mm_capability::{tensor_pipeline_available, DenseMmBackend};
 
 /// Host-side parameters for `dense_matmul_bf16_f32_tensor`.
@@ -36,6 +37,12 @@ pub struct DenseMmBf16F32Params {
     /// `src1_batch / src0_batch` consecutive src1 slices (GQA head
     /// broadcast).
     pub src1_batch: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseMmBf16TensorTile {
+    Environment,
+    V1,
 }
 
 /// GPU-side params struct; matches `DenseMmBf16F32TensorParams` in
@@ -85,7 +92,7 @@ pub fn dense_matmul_bf16_f32_tensor(
     dst: &MlxBuffer,
     params: &DenseMmBf16F32Params,
 ) -> Result<()> {
-    dense_matmul_bf16_f32_with_backend(
+    dense_matmul_bf16_f32_with_tile(
         encoder,
         registry,
         device,
@@ -94,9 +101,11 @@ pub fn dense_matmul_bf16_f32_tensor(
         dst,
         params,
         DenseMmBackend::Auto,
+        DenseMmBf16TensorTile::Environment,
     )
 }
 
+#[cfg(test)]
 pub(super) fn dense_matmul_bf16_f32_with_backend(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -107,96 +116,94 @@ pub(super) fn dense_matmul_bf16_f32_with_backend(
     params: &DenseMmBf16F32Params,
     backend: DenseMmBackend,
 ) -> Result<()> {
-    if params.m == 0 || params.n == 0 || params.k == 0 {
-        return Err(MlxError::InvalidArgument(
-            "dense_matmul_bf16_f32_tensor: M, N, K must all be > 0".into(),
-        ));
-    }
-    if params.k < 32 {
-        return Err(MlxError::InvalidArgument(format!(
-            "dense_matmul_bf16_f32_tensor: K ({}) must be >= 32",
-            params.k
-        )));
-    }
-    if params.src0_batch == 0 || params.src1_batch == 0 {
-        return Err(MlxError::InvalidArgument(
-            "dense_matmul_bf16_f32_tensor: batch counts must be > 0".into(),
-        ));
-    }
-    if params.src1_batch % params.src0_batch != 0 {
-        return Err(MlxError::InvalidArgument(format!(
-            "dense_matmul_bf16_f32_tensor: src1_batch ({}) must be a \
-             multiple of src0_batch ({}) for GQA broadcast",
-            params.src1_batch, params.src0_batch
-        )));
-    }
-    let broadcast = params.src1_batch / params.src0_batch;
-    if broadcast > i16::MAX as u32 {
-        return Err(MlxError::InvalidArgument(format!(
-            "dense_matmul_bf16_f32_tensor: GQA broadcast ratio ({broadcast}) exceeds i16::MAX"
-        )));
-    }
+    dense_matmul_bf16_f32_with_tile(
+        encoder,
+        registry,
+        device,
+        src0,
+        src1,
+        dst,
+        params,
+        backend,
+        DenseMmBf16TensorTile::Environment,
+    )
+}
 
-    let bf16_sz = DType::BF16.size_of();
-    let f32_sz = DType::F32.size_of();
-
-    let expected_src0_bytes =
-        (params.src0_batch as usize) * (params.n as usize) * (params.k as usize) * bf16_sz;
-    if src0.byte_len() < expected_src0_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "dense_matmul_bf16_f32_tensor: src0 too small: expected {} bytes for \
-             [{}×{}×{}] bf16, got {}",
-            expected_src0_bytes,
-            params.src0_batch,
-            params.n,
-            params.k,
-            src0.byte_len()
-        )));
-    }
-    let expected_src1_bytes =
-        (params.src1_batch as usize) * (params.m as usize) * (params.k as usize) * f32_sz;
-    if src1.byte_len() < expected_src1_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "dense_matmul_bf16_f32_tensor: src1 too small: expected {} bytes for \
-             [{}×{}×{}] f32, got {}",
-            expected_src1_bytes,
-            params.src1_batch,
-            params.m,
-            params.k,
-            src1.byte_len()
-        )));
-    }
-    let expected_dst_bytes =
-        (params.src1_batch as usize) * (params.m as usize) * (params.n as usize) * f32_sz;
-    if dst.byte_len() < expected_dst_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "dense_matmul_bf16_f32_tensor: dst too small: expected {} bytes for \
-             [{}×{}×{}] f32, got {}",
-            expected_dst_bytes,
-            params.src1_batch,
-            params.m,
-            params.n,
-            dst.byte_len()
-        )));
-    }
-
+pub(crate) fn dense_matmul_bf16_f32_with_tile(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    src0: &MlxBuffer,
+    src1: &MlxBuffer,
+    dst: &MlxBuffer,
+    params: &DenseMmBf16F32Params,
+    backend: DenseMmBackend,
+    tile: DenseMmBf16TensorTile,
+) -> Result<()> {
     // ADR-029 iter-80 H60: V2 large-tile (NRA=64, NRB=128) variant
     // env-gated by HF2Q_LARGE_TILE_MM.  Default OFF until coherence +
     // thermal-fair bench parity proven.  Treated as a fan-out shim: V1
     // pipeline + grid (NR0=64, NR1=32) when off, V2 pipeline + grid
     // (NRA=64, NRB=128) when on.  Truthy: "1", "true", "yes" (case-
     // insensitive); anything else → V1.
-    let use_v2_large_tile = match std::env::var("HF2Q_LARGE_TILE_MM").as_deref() {
-        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("yes") | Ok("YES") => true,
-        _ => false,
+    let use_v2_large_tile = match tile {
+        DenseMmBf16TensorTile::Environment => {
+            matches!(
+                std::env::var("HF2Q_LARGE_TILE_MM").as_deref(),
+                Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("yes") | Ok("YES")
+            )
+        }
+        DenseMmBf16TensorTile::V1 => false,
     };
     let tensor_kernel_name = if use_v2_large_tile {
         "hf2q_dense_mm_bf16_f32_tensor_v2"
     } else {
         "hf2q_dense_mm_bf16_f32_tensor"
     };
-    let use_tensor =
-        tensor_pipeline_available(backend, "hf2q_dense_mm_bf16_f32_tensor", registry, device)?;
+    // Tensor V1 performs aligned `float4` loads from every input row. A K
+    // stride that is not a multiple of four F32 values is legal for the
+    // scalar-staging simdgroup route, but cannot be sent to Tensor V1.
+    let use_tensor = if params.k % 4 != 0 {
+        match backend {
+            DenseMmBackend::TensorRequired => {
+                validate_dense_bf16_contract(
+                    "dense_matmul_bf16_f32_tensor_v1",
+                    DenseBf16Contract::MatrixTensor,
+                    src0,
+                    src1,
+                    dst,
+                    params,
+                )?;
+                return Err(MlxError::InvalidArgument(
+                    "dense_matmul_bf16_f32_tensor_v1: non-vector-aligned K was not rejected".into(),
+                ));
+            }
+            DenseMmBackend::Auto | DenseMmBackend::FallbackRequired => false,
+        }
+    } else {
+        tensor_pipeline_available(backend, "hf2q_dense_mm_bf16_f32_tensor", registry, device)?
+    };
+    validate_dense_bf16_contract(
+        if use_tensor {
+            "dense_matmul_bf16_f32_tensor_v1"
+        } else {
+            "dense_matmul_bf16_f32_simdgroup"
+        },
+        if use_tensor {
+            DenseBf16Contract::MatrixTensor
+        } else {
+            DenseBf16Contract::MatrixSimdgroup
+        },
+        src0,
+        src1,
+        dst,
+        params,
+    )?;
+    let broadcast = params.src1_batch / params.src0_batch;
+
+    let bf16_sz = DType::BF16.size_of();
+    let f32_sz = DType::F32.size_of();
+
     let kernel_name = if use_tensor {
         tensor_kernel_name
     } else {

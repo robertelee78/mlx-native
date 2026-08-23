@@ -1,7 +1,8 @@
 # Native BF16 short-row GEMV — 2026-08-22
 
-Status: accepted primitive at source `bebbddf`; registry publication and the
-downstream clean-source gate remain release conditions.
+Status: accepted primitive and frozen calibration policy for mlx-native
+0.12.2; registry publication and downstream clean-source gates remain release
+conditions.
 
 ## Decision
 
@@ -11,11 +12,27 @@ does not expand, dequantize, or re-encode the matrix. Its F32 reduction order
 matches `dense_gemv_bf16_f32`, so every completed row is bit-identical to the
 ordinary row path.
 
-The operation is a family-neutral primitive, not a hidden route policy.
-Latency depends on M and the N/K aspect ratio. Callers must select among the
-ordinary row, four-row-tiled, and tensor paths from measured evidence. The
-library therefore does not encode a model name or a blanket `M <= 16`
-threshold.
+Latency depends on M, the N/K aspect ratio, the physical device, and the exact
+compiled pipelines. `dense_matmul_bf16_f32_auto` therefore reads a
+registry-local immutable route plan created by
+`calibrate_dense_bf16_routes`; the library does not encode a model name or a
+blanket performance winner. M=1 through 16 is the explicit short-row coherence
+boundary: these widths use the row-reduction equivalence class, then calibration
+chooses between ordinary row and tiled-four execution. Calibration accepts
+borrowed weights and declared reachable M values, records wall and GPU
+distributions, and freezes the plan before request-visible work. It never
+authorizes a route from a different reduction class. A poisoned logical-output
+and guard-region execution still proves full writes, finite values, bit
+identity, and exact dispatch identity before either route may enter the timing
+comparison.
+
+The normal route decision is keyed only by the copyable physical shape. It does
+not allocate, read environment variables, synchronize, or touch the process
+cache; encoding then uses the registry's ordinary pipeline lookup. Missing
+shapes take a deterministic exact fallback from the frozen plan. Loading a
+second model with a previously calibrated device/build/shape key reuses
+metadata through keyed single-flight cells with zero timing submissions;
+neither the cache nor a plan retains model buffers.
 
 Both row kernels fail closed on zero dimensions, incompatible dtypes,
 unaligned logical views, K values that cannot support aligned vector loads,
@@ -33,11 +50,14 @@ by dispatching `ceil(M / 4)` row tiles, so the deciding benchmark was expanded
 to M=1 through 16 rather than restricting the public API to the first observed
 case.
 
-The expanded matrix also falsified a universal short-row cutoff. For example,
+The expanded matrix also falsified a universal short-row winner. For example,
 the four-row tile wins selected M=5 through 8 aspect ratios, while tensor MM
-wins other matrices at the same M. The accepted result is therefore the exact
-primitive plus its benchmark; downstream selection remains explicit and must
-be proven on the model shapes it serves.
+wins other matrices at the same M. Tensor MM is not an admissible short-row
+winner because it changes reduction semantics across physical batch widths. A
+Qwen-only threshold spike then proved whole-model value but not a family-neutral
+policy. The accepted reformulation is an exact route set plus centralized
+pre-serve calibration and an immutable engine-epoch plan. Model graphs supply
+weights and reachable physical widths; they do not choose kernels.
 
 ## Correctness evidence
 
@@ -54,6 +74,17 @@ The release-mode focused test proves:
 The same test passed with the embedded metallib, with
 `MLX_PRECOMPILED_METALLIB=0`, and with `MLX_UNRETAINED_REFS=1`. The locked
 all-target/all-feature check also passed.
+
+`test_dense_bf16_auto` additionally proves a real Metal activation over every
+M from 1 through 16, full encoded pipeline/grid/threadgroup/shared-memory
+identity, a one-shot plan, non-vacuous output, conflicting-plan rejection, and
+a second activation with sixteen process-cache hits and zero calibration
+submissions. It passes in the same three runtime modes. Calibration is bounded
+to declared M=1..16 shapes and a caller budget. The current engine plan freezes
+a typed compatibility fallback when its budget expires. The process cache
+retains only completed intrinsic decisions: budget fallbacks and transient
+failures are evicted so a later model activation can retry with its own
+available budget without changing the already-live plan.
 
 ## Performance evidence
 
@@ -110,7 +141,7 @@ against the external reference implementation.
 1. Publish an immutable crate containing `bebbddf` and verify the registry
    archive checksum.
 2. Pin that registry version in hf2q without a local Cargo patch.
-3. Centralize the measured BF16 selector across applicable model families;
-   do not duplicate a Qwen-only threshold at leaf call sites.
+3. Construct and freeze one route plan during mandatory activation for every
+   applicable model family; install the same plan into its worker registries.
 4. Repeat exact trajectory, physical-width, model-swap, and matched
    performance gates from the clean published dependency.
