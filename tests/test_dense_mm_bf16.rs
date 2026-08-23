@@ -2,12 +2,13 @@
 //! (hf2q non-flash-attention prefill matmul).
 //!
 //! Cases:
-//! 1. Single-tile shape (M=32, N=64, K=32) — smallest legal geometry.
-//! 2. Multi-tile shape, single batch (M=64, N=128, K=128) — verifies the
+//! 1. Short reductions K∈{1,2,3,4,8,16} — one zero-padded K tile.
+//! 2. Single-tile shape (M=32, N=64, K=32).
+//! 3. Multi-tile shape, single batch (M=64, N=128, K=128) — verifies the
 //!    NK-loop and write-back paths.
-//! 3. Partial-tile write-back (M=35, N=67, K=64) — exercises the
+//! 4. Partial-tile write-back (M=35, N=67, K=64) — exercises the
 //!    shmem-copy fallback write-back path.
-//! 4. GQA broadcast (src0_batch=2, src1_batch=8, r2=4) — verifies the
+//! 5. GQA broadcast (src0_batch=2, src1_batch=8, r2=4) — verifies the
 //!    head-broadcast offset math matches the CPU reference.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -258,6 +259,22 @@ fn run_case(
 #[test]
 fn single_tile_32x64x32() {
     run_case(32, 64, 32, 1, 1, 1, 2, 1e-1);
+}
+
+#[test]
+fn one_zero_padded_tile_supports_short_reductions() {
+    for (case, k) in [1, 2, 3, 4, 8, 16].into_iter().enumerate() {
+        run_case(
+            5,
+            17,
+            k,
+            1,
+            1,
+            0x51A0 + case as u64,
+            0xB170 + case as u64,
+            5e-2,
+        );
+    }
 }
 
 #[test]

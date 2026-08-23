@@ -49,12 +49,6 @@ pub(crate) fn validate_dense_bf16_contract(
                 params.k
             )));
         }
-        DenseBf16Contract::MatrixTensor | DenseBf16Contract::MatrixSimdgroup if params.k < 32 => {
-            return Err(MlxError::InvalidArgument(format!(
-                "{operation}: K ({}) must be at least 32",
-                params.k
-            )));
-        }
         DenseBf16Contract::MatrixTensor if params.k % 4 != 0 => {
             return Err(MlxError::InvalidArgument(format!(
                 "{operation}: tensor K ({}) must be divisible by 4 so every F32 input row is 16-byte aligned",
