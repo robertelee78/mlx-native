@@ -458,6 +458,7 @@ impl KernelRegistry {
         // M=1 due to better memory bandwidth utilization per thread).
         let dense_gemv_bf16_src: &'static str = include_str!("shaders/dense_gemv_bf16.metal");
         sources.insert("hf2q_dense_gemv_bf16_f32_4".into(), dense_gemv_bf16_src);
+        sources.insert("hf2q_dense_gemv_bf16_f32_r1_4".into(), dense_gemv_bf16_src);
 
         // Fused scale-mask-softmax for the non-flash-attention prefill
         // path.  One row-local threadgroup per (head, query) pair

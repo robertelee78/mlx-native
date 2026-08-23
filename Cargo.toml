@@ -88,6 +88,10 @@ name = "bench_dense_mm_bf16_nofa_shapes"
 harness = false
 
 [[bench]]
+name = "bench_dense_bf16_short_rows"
+harness = false
+
+[[bench]]
 name = "bench_dense_mm_f16_nofa_shapes"
 harness = false
 

@@ -3,8 +3,9 @@
 // Implements the `kernel_mul_mv_t_t_4` template-instantiation shape for
 // `bfloat, bfloat4, float, float4` (i.e. `kernel_mul_mv_bf16_f32_4`).
 //
-// Used when M == 1 (single-token decode) for linear projections.
-// For M > 1, use the GEMM tensor-core kernel (dense_mm_bf16_tensor.metal).
+// The scalar-row entry point serves single-token decode and small projections;
+// the tiled entry point reuses each weight load across four adjacent rows.
+// Larger row widths use the GEMM tensor-core kernel.
 //
 // Layout contract:
 //   src0  [src0_batch, N, K]  bfloat, row-major  (weight matrix, transposed convention)
@@ -55,14 +56,9 @@ struct DenseGemvBf16Params {
 //
 // Template parameters:
 //   NR0  = weight rows per threadgroup (2, the reference default).
-//   NSG  = simdgroups per threadgroup;  baked-in as a constant (4).
-//          Caller chooses 1..4 based on K; we compile NSG=4 and let the
-//          host limit the grid accordingly.  Unused simdgroups produce zero
-//          contributions that are harmlessly summed.
-//
-// Upstream uses a function_constant for NSG; we hard-code NSG=4 since we
-// only need to cover the M5 Max's large K dimensions (K ≥ 2048 always for
-// our model, so NSG = min(4, (K+127)/128) = 4 in all cases).
+//   NSG  = at most four simdgroups per threadgroup. The scalar-row host path
+//          may launch fewer groups for a small K; unpopulated partial slots
+//          remain zero and are harmless in the final reduction.
 
 kernel void hf2q_dense_gemv_bf16_f32_4(
         constant DenseGemvBf16Params & args,
@@ -107,7 +103,8 @@ kernel void hf2q_dense_gemv_bf16_f32_4(
     // Weight row pointers for the 2 output rows this threadgroup handles.
     device const bfloat4 * ax4[2];
     for (short row = 0; row < 2; ++row) {
-        const uint64_t offset0 = (uint64_t)(r0 + row) * args.nb01
+        const int output_row = min(r0 + (int)row, args.ne01 - 1);
+        const uint64_t offset0 = (uint64_t)output_row * args.nb01
                                + (uint64_t)(i12 / (uint)args.r2) * args.nb02
                                + (uint64_t)(i13 / (uint)args.r3) * args.nb03;
         ax4[row] = (device const bfloat4 *)((device const char *)src0 + offset0);
@@ -156,10 +153,7 @@ kernel void hf2q_dense_gemv_bf16_f32_4(
     device const float  * y_scalar  = (device const float  *)(src1 + offset1);
     for (int i = nb * NB + (int)sgitg * NW + (int)tiisg; i < args.ne00; i += NW * NSG) {
         for (short row = 0; row < 2; ++row) {
-            device const bfloat * ax_scalar = (device const bfloat *)((device const char *)src0
-                + (uint64_t)(r0 + row) * args.nb01
-                + (uint64_t)(i12 / (uint)args.r2) * args.nb02
-                + (uint64_t)(i13 / (uint)args.r3) * args.nb03);
+            device const bfloat * ax_scalar = (device const bfloat *)ax4[row];
             sumf[row] += (float)ax_scalar[i] * y_scalar[i];
         }
     }
@@ -197,6 +191,136 @@ kernel void hf2q_dense_gemv_bf16_f32_4(
         float tot = simd_sum(shmem_f32[row * NW + tiisg]);
         if (tiisg == 0 && sgitg == 0) {
             dst_f32[r0 + row] = tot;
+        }
+    }
+}
+
+// Width-four BF16 GEMV. Each threadgroup loads two weight rows once and
+// accumulates four independent input rows with the scalar GEMV reduction
+// order. This removes the row-wise kernel's fourfold weight reread without
+// expanding four live rows into the tensor kernel's 32-row tile.
+[[host_name("hf2q_dense_gemv_bf16_f32_r1_4")]]
+kernel void hf2q_dense_gemv_bf16_f32_r1_4(
+        constant DenseGemvBf16Params & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+
+    constexpr short M_TILE = 4;
+    constexpr short NR0 = 2;
+    constexpr short NSG = 4;
+    constexpr short NW = 32;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF / 4;
+
+    const int r0 = (int)tgpig.x * NR0;
+    const int r1 = (int)tgpig.y * M_TILE;
+    const int im = (int)tgpig.z;
+    const uint i12 = (uint)im % (uint)args.ne12;
+    const uint i13 = (uint)im / (uint)args.ne12;
+    const int nb = args.ne00 / NB;
+
+    device const bfloat4 * ax4[NR0];
+    for (short out = 0; out < NR0; ++out) {
+        const int output_row = min(r0 + (int)out, args.ne01 - 1);
+        const uint64_t offset0 = (uint64_t)output_row * args.nb01
+            + (uint64_t)(i12 / (uint)args.r2) * args.nb02
+            + (uint64_t)(i13 / (uint)args.r3) * args.nb03;
+        ax4[out] = (device const bfloat4 *)(src0 + offset0);
+    }
+
+    device const float4 * yb4[M_TILE];
+    device const float * y_scalar[M_TILE];
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = (int)sgitg * NF + ix;
+    for (short row = 0; row < M_TILE; ++row) {
+        const int input_row = min(r1 + (int)row, args.ne11 - 1);
+        const uint64_t offset1 = (uint64_t)input_row * args.nb11
+            + (uint64_t)i12 * args.nb12
+            + (uint64_t)i13 * args.nb13;
+        y_scalar[row] = (device const float *)(src1 + offset1);
+        yb4[row] = (device const float4 *)(src1 + offset1)
+            + (ib0 * NB + il * NF) / 4;
+    }
+
+    float sums[NR0][M_TILE] = {
+        { 0.f, 0.f, 0.f, 0.f },
+        { 0.f, 0.f, 0.f, 0.f },
+    };
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        device const bfloat4 * xb4[NR0];
+        for (short out = 0; out < NR0; ++out) {
+            xb4[out] = ax4[out] + (ib * NB + il * NF) / 4;
+        }
+        float4 weight_vectors[NR0][NF4];
+        for (short i = 0; i < NF4; ++i) {
+            for (short out = 0; out < NR0; ++out) {
+                weight_vectors[out][i] = float4(xb4[out][i]);
+            }
+        }
+        for (short out = 0; out < NR0; ++out) {
+            for (short row = 0; row < M_TILE; ++row) {
+                float block_sum = 0.f;
+                for (short i = 0; i < NF4; ++i) {
+                    block_sum += dot(weight_vectors[out][i], yb4[row][i]);
+                }
+                sums[out][row] += block_sum;
+            }
+        }
+        for (short row = 0; row < M_TILE; ++row) {
+            yb4[row] += NSG * NF * NW / 4;
+        }
+    }
+
+    for (int i = nb * NB + (int)sgitg * NW + (int)tiisg;
+         i < args.ne00;
+         i += NW * NSG) {
+        float weights[NR0];
+        for (short out = 0; out < NR0; ++out) {
+            weights[out] = ((device const bfloat *)ax4[out])[i];
+        }
+        for (short row = 0; row < M_TILE; ++row) {
+            const float input = y_scalar[row][i];
+            for (short out = 0; out < NR0; ++out) {
+                sums[out][row] += weights[out] * input;
+            }
+        }
+    }
+
+    threadgroup float * partials = (threadgroup float *)shmem;
+    for (short out = 0; out < NR0; ++out) {
+        for (short row = 0; row < M_TILE; ++row) {
+            if (sgitg == 0) {
+                partials[(out * M_TILE + row) * NW + tiisg] = 0.f;
+            }
+            sums[out][row] = simd_sum(sums[out][row]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        for (short out = 0; out < NR0; ++out) {
+            for (short row = 0; row < M_TILE; ++row) {
+                partials[(out * M_TILE + row) * NW + sgitg] = sums[out][row];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float * dst_f32 = (device float *)dst
+        + (uint64_t)im * (uint64_t)args.ne0 * (uint64_t)args.ne1;
+    for (short out = 0; out < NR0 && r0 + out < args.ne01; ++out) {
+        for (short row = 0; row < M_TILE && r1 + row < args.ne11; ++row) {
+            const float total = simd_sum(partials[(out * M_TILE + row) * NW + tiisg]);
+            if (tiisg == 0 && sgitg == 0) {
+                dst_f32[(uint64_t)(r1 + row) * args.ne0 + (r0 + out)] = total;
+            }
         }
     }
 }
