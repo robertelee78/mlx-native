@@ -40,6 +40,101 @@ fn assert_close(label: &str, tensor: &[f32], fallback: &[f32], tolerance: f32) {
     );
 }
 
+fn assert_short_bf16_backend_matches_cpu(k: u32, backend: DenseMmBackend) {
+    let device = MlxDevice::new().expect("device");
+    let m = 5u32;
+    let n = 17u32;
+    let weights_f32 = values(0x5100 + u64::from(k), (n * k) as usize);
+    let weights: Vec<u16> = weights_f32
+        .iter()
+        .map(|&value| bf16::from_f32(value).to_bits())
+        .collect();
+    let input = values(0xB170 + u64::from(k), (m * k) as usize);
+    let mut expected = vec![0.0f32; (m * n) as usize];
+    for row in 0..m as usize {
+        for output in 0..n as usize {
+            let mut sum = 0.0f32;
+            for depth in 0..k as usize {
+                sum += bf16::from_bits(weights[output * k as usize + depth]).to_f32()
+                    * input[row * k as usize + depth];
+            }
+            expected[row * n as usize + output] = sum;
+        }
+    }
+
+    let mut weight_buffer = device
+        .alloc_buffer(
+            weights.len() * 2,
+            DType::BF16,
+            vec![1, n as usize, k as usize],
+        )
+        .expect("weight buffer");
+    weight_buffer
+        .as_mut_slice::<u16>()
+        .expect("weight slice")
+        .copy_from_slice(&weights);
+    let mut input_buffer = device
+        .alloc_buffer(input.len() * 4, DType::F32, vec![1, m as usize, k as usize])
+        .expect("input buffer");
+    input_buffer
+        .as_mut_slice::<f32>()
+        .expect("input slice")
+        .copy_from_slice(&input);
+    let output_buffer = device
+        .alloc_buffer(
+            expected.len() * 4,
+            DType::F32,
+            vec![1, m as usize, n as usize],
+        )
+        .expect("output buffer");
+    let params = DenseMmBf16F32Params {
+        m,
+        n,
+        k,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().expect("encoder");
+    if let Err(error) = dense_matmul_bf16_f32_with_backend(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &weight_buffer,
+        &input_buffer,
+        &output_buffer,
+        &params,
+        backend,
+    ) {
+        assert!(
+            backend == DenseMmBackend::TensorRequired && is_unavailable_tensor_header(&error),
+            "short-K {backend:?} dispatch failed: {error}"
+        );
+        return;
+    }
+    encoder.commit_and_wait().expect("completion");
+    let actual = output_buffer.as_slice::<f32>().expect("output slice");
+    let max_abs = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&left, &right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs <= 5e-2,
+        "short-K {backend:?} K={k} max_abs {max_abs} exceeds 0.05"
+    );
+}
+
+#[test]
+fn bf16_short_reductions_are_correct_on_forced_backends() {
+    for k in [1, 2, 3, 4, 8, 16] {
+        assert_short_bf16_backend_matches_cpu(k, DenseMmBackend::FallbackRequired);
+    }
+    for k in [4, 8, 16] {
+        assert_short_bf16_backend_matches_cpu(k, DenseMmBackend::TensorRequired);
+    }
+}
+
 #[test]
 fn bf16_tensor_and_tiled_fallback_preserve_numerical_contract() {
     let device = MlxDevice::new().expect("device");
