@@ -21,7 +21,7 @@ use crate::ggml_capability::{
     GgmlTensorMmPreference, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
-use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
+use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
 use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
 use crate::ops::dense_q4_auto::{self, DenseQ4Route};
 use std::sync::atomic::AtomicI8;
@@ -212,11 +212,9 @@ impl GgmlType {
     pub(crate) fn kernel_name(self) -> &'static str {
         match self {
             // Scalar/non-quantized types are not applicable to this dispatch.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
@@ -244,11 +242,9 @@ impl GgmlType {
         match self {
             // ADR-022 Phase 2 — Q5_K dense mm ported.
             // ADR-022 Phase 3 — Q4_K dense mm ported.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
@@ -271,11 +267,9 @@ impl GgmlType {
         match self {
             // ADR-022 Phase 2: Q5_K tensor mm landed.
             // ADR-022 Phase 3: Q4_K tensor mm landed.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
@@ -296,11 +290,9 @@ impl GgmlType {
     /// kernel layout.
     pub(crate) fn mm_tensor_v2_kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
@@ -484,7 +476,7 @@ pub fn quantized_matmul_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -771,7 +763,7 @@ pub fn quantized_matmul_ggml_batched_mm(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_batched_mm_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -826,7 +818,7 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input(
     params: &GgmlBatchedQuantizedMatmulParams,
     input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_batched_mm_strided_input_with_policy(
         encoder,
         registry,
@@ -988,7 +980,7 @@ pub fn quantized_matmul_ggml_batched_mv(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_batched_mv_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -1805,7 +1797,7 @@ pub fn build_q6k_nr2_m1_record(
     n: u32,
     k: u32,
 ) -> Result<Option<DispatchRecord>> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     build_q6k_nr2_m1_record_with_policy(registry, device, n, k, &routing)
 }
 

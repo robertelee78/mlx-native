@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::device::metal_device_registry_id;
 use crate::error::{MlxError, Result};
+use crate::ggml_capability::GgmlRoutingPolicy;
 
 /// Bytes of the precompiled `default.metallib` produced by `build.rs` from
 /// every `src/shaders/*.metal` file.  Empty only when
@@ -139,6 +140,9 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// `get_pipeline` to allow mutable cache insertion).  If you need concurrent
 /// access, wrap it in a `Mutex` or use one registry per thread.
 pub struct KernelRegistry {
+    /// Model-lifetime GGML routing authority. Once bound, environment changes
+    /// cannot alter dispatch decisions made through this registry.
+    ggml_routing_policy: Option<GgmlRoutingPolicy>,
     /// Immutable BF16 route metadata frozen before request-visible work.
     /// Plans contain no model buffers and cannot change after activation.
     pub(crate) dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState,
@@ -1525,6 +1529,7 @@ impl KernelRegistry {
         sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
         Self {
+            ggml_routing_policy: None,
             dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState::default(),
             dense_matmul_id_auto: crate::ops::dense_matmul_id_auto::DenseMatmulIdAutoState::default(
             ),
@@ -1540,6 +1545,27 @@ impl KernelRegistry {
             #[cfg(test)]
             test_next_pipeline_failure: None,
         }
+    }
+
+    /// Bind one immutable routing policy to this model registry.
+    /// Repeating the same bind is idempotent; changing it fails closed.
+    pub fn freeze_ggml_routing_policy(&mut self, policy: GgmlRoutingPolicy) -> Result<()> {
+        match self.ggml_routing_policy {
+            Some(existing) if existing == policy => Ok(()),
+            Some(existing) => Err(MlxError::InvalidArgument(format!(
+                "GGML routing policy is already frozen as {existing:?}; cannot replace it with {policy:?}"
+            ))),
+            None => {
+                self.ggml_routing_policy = Some(policy);
+                Ok(())
+            }
+        }
+    }
+
+    /// Return the model-lifetime routing policy, if this registry has been
+    /// bound by its owner.
+    pub fn ggml_routing_policy(&self) -> Option<&GgmlRoutingPolicy> {
+        self.ggml_routing_policy.as_ref()
     }
 
     #[cfg(test)]

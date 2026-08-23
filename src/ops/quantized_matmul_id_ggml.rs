@@ -19,7 +19,7 @@ use crate::ggml_capability::{
     ggml_expert_bytes, plan_expert_auto_route, ExpertAutoPlan, GgmlRoutingPolicy,
     GgmlTensorMmPreference,
 };
-use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
+use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_id_mv.
@@ -99,11 +99,9 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mv_id ports.
             GgmlType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mv_id_iq4_nl_f32",
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             // ADR-033 §Pi Task #16 SHIPPED 2026-05-22 — mirrors IQ4_NL
             // _id geometry (N_SIMDGROUP=2, N_DST=4, (8, 8, 8) launch).
             GgmlType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
@@ -127,11 +125,9 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32",
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             // ADR-033 §Pi Task #20 — IQ4_XS mm_id ported (simdgroup MMA
             // path). Tensor-API variant is not yet ported; tests fall
             // back to the simdgroup path via TENSOR_MM_ID_AVAILABLE probe.
@@ -155,11 +151,9 @@ impl GgmlType {
             // ADR-022 Phase 1 —Q5_1 / IQ4_NL tensor-API mm_id ported.
             GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32",
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             // ADR-033 §Pi Task #20 tensor-API — IQ4_XS tensor-API mm_id
             // SHIPPED 2026-05-22 to close the prefill perf gap vs the
             // reference implementation.
@@ -261,7 +255,7 @@ pub fn quantized_matmul_id_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_id_ggml_with_policy(
         encoder, registry, device, input, weight, ids, output, params, &routing,
     )
@@ -305,7 +299,7 @@ pub fn quantized_matmul_id_ggml_mv(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_id_ggml_mv_with_policy(
         encoder, registry, device, input, weight, ids, output, params, &routing,
     )
@@ -486,7 +480,7 @@ pub fn quantized_matmul_id_ggml_pooled(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_id_ggml_pooled_with_policy(
         encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
     )
@@ -549,7 +543,7 @@ pub fn quantized_matmul_id_ggml_pooled_pair(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_id_ggml_pooled_pair_with_policy(
         encoder,
         registry,
@@ -801,7 +795,7 @@ pub fn quantized_matmul_id_ggml_pooled_slotted(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_id_ggml_pooled_slotted_with_policy(
         encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
     )
@@ -1212,7 +1206,7 @@ pub fn build_q6k_id_nr2_m1_record(
     top_k: u32,
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     build_q6k_id_nr2_m1_record_with_policy(registry, device, n, k, top_k, expert_stride, &routing)
 }
 
@@ -1322,7 +1316,7 @@ pub fn build_q8_0_id_decode_record(
     real_top_k: u32,
     expert_stride: u64,
 ) -> Result<Option<DispatchRecord>> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     build_q8_0_id_decode_record_with_policy(
         registry,
         device,

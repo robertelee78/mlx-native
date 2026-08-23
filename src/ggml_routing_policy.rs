@@ -7,6 +7,7 @@
 //! execute.
 
 use crate::ggml_capability::GgmlRoutingPolicy;
+use crate::kernel_registry::KernelRegistry;
 use crate::ops::quantized_matmul_ggml::dense_routing_policy_from_environment;
 use crate::ops::quantized_matmul_id_ggml::expert_routing_policy_from_environment;
 
@@ -20,6 +21,16 @@ pub fn ggml_routing_policy_from_environment() -> GgmlRoutingPolicy {
     let dense = dense_routing_policy_from_environment();
     let expert = expert_routing_policy_from_environment();
     combine_routing_policies(dense, expert)
+}
+
+/// Resolve the policy for an execution registry. Model owners freeze a policy
+/// before readiness; standalone and legacy registries retain environment
+/// compatibility until explicitly bound.
+pub(crate) fn ggml_routing_policy_for_registry(registry: &KernelRegistry) -> GgmlRoutingPolicy {
+    registry
+        .ggml_routing_policy()
+        .copied()
+        .unwrap_or_else(ggml_routing_policy_from_environment)
 }
 
 fn combine_routing_policies(
