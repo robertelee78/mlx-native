@@ -1,3 +1,5 @@
+#![cfg(mlx_native_has_metal_tensor_sdk)]
+
 use half::f16;
 use mlx_native::{
     calibrate_dense_q4_routes, trace_dense_q4_auto, DType, DenseQ4BaseShape,

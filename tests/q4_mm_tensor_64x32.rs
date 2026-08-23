@@ -1,3 +1,5 @@
+#![cfg(mlx_native_has_metal_tensor_sdk)]
+
 use half::f16;
 use mlx_native::{
     dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test, DType, GgmlQuantizedMatmulParams,

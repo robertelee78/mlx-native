@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(mlx_native_has_metal_tensor_sdk)");
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let out_dir = PathBuf::from(out_dir);
     let metallib_path = out_dir.join("default.metallib");
@@ -214,6 +215,16 @@ fn main() {
             failures = failures.len(),
             ok = air_files.len(),
         );
+    }
+
+    // Tests that exercise tensor-only kernels must follow the capability of
+    // the shader artifact this build actually produced.  Hosted macOS images
+    // may have a valid Metal toolchain whose SDK predates <metal_tensor>;
+    // those builds retain the portable kernels in the partial metallib.
+    if air_files.iter().any(|path| {
+        path.file_stem().and_then(|stem| stem.to_str()) == Some("quantized_matmul_mm_tensor")
+    }) {
+        println!("cargo:rustc-cfg=mlx_native_has_metal_tensor_sdk");
     }
 
     // Link all .air into a single .metallib.

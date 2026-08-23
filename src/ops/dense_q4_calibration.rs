@@ -416,6 +416,23 @@ fn compatibility_decision(
     }
 }
 
+fn apply_base_weight_failure(
+    decisions: &mut [DenseQ4CalibrationDecision],
+    status: DenseQ4SelectionStatus,
+    diagnostic: &str,
+) {
+    for decision in decisions {
+        decision.selected_route = DenseQ4Route::CompatibilityV2;
+        decision.status = status;
+        decision.diagnostic = Some(match decision.diagnostic.take() {
+            Some(existing) => {
+                format!("{existing}; base-shape Cartesian proof failure: {diagnostic}")
+            }
+            None => format!("base-shape Cartesian proof failure: {diagnostic}"),
+        });
+    }
+}
+
 fn deadline_reached(started: Instant, max_elapsed_ms: u64) -> bool {
     started.elapsed().as_secs_f64() * 1000.0 >= max_elapsed_ms as f64
 }
@@ -1451,16 +1468,7 @@ fn calibrate_dense_q4_routes_impl(
             base_decisions.push(decision);
         }
         if let Some((status, diagnostic)) = base_weight_failure {
-            for decision in &mut base_decisions {
-                decision.selected_route = DenseQ4Route::CompatibilityV2;
-                decision.status = status;
-                decision.diagnostic = Some(match decision.diagnostic.take() {
-                    Some(existing) => {
-                        format!("{existing}; base-shape Cartesian proof failure: {diagnostic}")
-                    }
-                    None => format!("base-shape Cartesian proof failure: {diagnostic}"),
-                });
-            }
+            apply_base_weight_failure(&mut base_decisions, status, &diagnostic);
         }
         for decision in base_decisions {
             plan_decisions.insert(decision.shape, decision.selected_route);
@@ -1716,6 +1724,7 @@ mod tests {
         }
     }
 
+    #[cfg(mlx_native_has_metal_tensor_sdk)]
     #[test]
     fn candidate_only_additional_weight_failure_downgrades_base_and_cleans_up() {
         let device = MlxDevice::new().expect("Metal device");
@@ -1773,6 +1782,53 @@ mod tests {
                     .as_deref()
                     .is_some_and(|diagnostic| diagnostic.contains("weight 1"))
         }));
+    }
+
+    #[test]
+    fn candidate_only_weight_failure_downgrades_every_base_shape_without_hardware() {
+        let shape = |m| DenseQ4Shape {
+            m,
+            n: 75,
+            k: 192,
+            batch: 1,
+            input_layout: super::super::dense_q4_auto::DenseQ4InputLayout::Contiguous,
+        };
+        let decision = |m, diagnostic| DenseQ4CalibrationDecision {
+            shape: shape(m),
+            selected_route: DenseQ4Route::Tensor64x32,
+            status: DenseQ4SelectionStatus::CalibratedWinner,
+            diagnostic,
+            timings: Vec::new(),
+            process_cache_hit: false,
+            authorized_weight_buffers: 2,
+            proof_submissions: 1,
+            proof_route_dispatches: 4,
+            proof_auxiliary_dispatches: 4,
+            proof_scratch_bytes: 1024,
+            proof_gpu_us: 1.0,
+            timing_submissions: 10,
+            calibration_submissions: 11,
+        };
+        let mut decisions = vec![decision(9, None), decision(37, Some("existing".into()))];
+
+        apply_base_weight_failure(
+            &mut decisions,
+            DenseQ4SelectionStatus::IncoherentCandidate,
+            "optional candidate failed for weight 1",
+        );
+
+        assert!(decisions.iter().all(|decision| {
+            decision.selected_route == DenseQ4Route::CompatibilityV2
+                && decision.status == DenseQ4SelectionStatus::IncoherentCandidate
+                && decision
+                    .diagnostic
+                    .as_deref()
+                    .is_some_and(|diagnostic| diagnostic.contains("weight 1"))
+        }));
+        assert!(decisions[1]
+            .diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.starts_with("existing;")));
     }
 
     #[test]

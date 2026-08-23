@@ -134,6 +134,14 @@ cargo test --locked --release --test q4_mm_tensor_64x32
 cargo test --locked --test q4_benchmark_contract
 ```
 
+The first two targets are tensor-hardware gates. The build enables them only
+when it successfully compiles the Q4 tensor shader into the current artifact;
+an older SDK that lacks the exact `<metal_tensor>` header still runs the
+model-free selection, downgrade, receipt, and capability-classifier tests.
+That hosted-safe path is not publication authority. Publication still requires
+the complete named hardware gate above on a build that produced the tensor
+shader.
+
 The activation-tax harness fixes reachable rows to
 `9,16,24,32,48,64,96,128,129,2048,4096`, uses exact production projection
 widths and representative layer multiplicity, runs a cold activation and a
