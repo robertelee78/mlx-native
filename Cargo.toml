@@ -100,6 +100,14 @@ name = "bench_decode_qmatmul_shapes"
 harness = false
 
 [[bench]]
+name = "bench_q4_mm_tensor_64x32"
+harness = false
+
+[[bench]]
+name = "bench_q4_activation_calibration"
+harness = false
+
+[[bench]]
 name = "bench_deepseek_q2_k"
 harness = false
 

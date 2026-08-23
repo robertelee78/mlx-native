@@ -23,6 +23,7 @@ use crate::ggml_capability::{
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
 use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
 use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
+use crate::ops::dense_q4_auto::{self, DenseQ4Route};
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_mv.
@@ -1238,6 +1239,35 @@ pub fn dispatch_mm_for_test(
     )
 }
 
+/// Test-only Q4_0 tensor-MM candidate with a 64-output by 32-token tile.
+///
+/// This retains the V2 kernel's native Q4_0 reads, direct F32 activation
+/// tensor, 32-wide K loop, reduction order, and output layout. Only the token
+/// tile and corresponding grid width differ.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mm_q4_0_tensor_64x32_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    validate_mm_for_test(params)?;
+    dispatch_mm_q4_route_internal(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        DenseQ4Route::Tensor64x32,
+    )
+}
+
 /// Test-only helper that forces the non-tensor simdgroup-MMA fallback.
 /// This proves the path used on devices without Metal tensor support while
 /// leaving the production capability probe and routing unchanged.
@@ -1856,6 +1886,77 @@ fn dispatch_mm(
     input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
+    dispatch_mm_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        batch,
+        input_strides,
+        routing,
+        None,
+    )
+}
+
+/// Exact Q4 tensor route used by calibration and evidence tooling.
+/// Ordinary inference calls [`dispatch_mm`] and may select the candidate only
+/// through a frozen exact-shape plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_mm_q4_route_internal(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    route: DenseQ4Route,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_0 || params.m <= MM_ROUTING_THRESHOLD {
+        return Err(MlxError::InvalidArgument(
+            "forced dense Q4 MM route requires Q4_0 and M > 8".into(),
+        ));
+    }
+    if !matches!(
+        route,
+        DenseQ4Route::CompatibilityV2 | DenseQ4Route::Tensor64x32
+    ) {
+        return Err(MlxError::InvalidArgument(
+            "forced dense Q4 calibration route must be V2 or Tensor64x32".into(),
+        ));
+    }
+    dispatch_mm_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        1,
+        None,
+        &GgmlRoutingPolicy::default(),
+        Some(route),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mm_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    batch: u32,
+    input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
+    routing: &GgmlRoutingPolicy,
+    forced_q4_route: Option<DenseQ4Route>,
+) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // variant on M3+ (hardware tensor cores); fall back to the simdgroup
     // MMA kernel if the probe fails or the tensor kernel can't compile
@@ -1873,19 +1974,56 @@ fn dispatch_mm(
     // 3457/0/11 unit tests pass.  Default ON; opt-out via
     // `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
     let use_v2_large_tile = use_tensor && routing.allow_dense_large_tile_mm;
-    let kernel_name = if use_v2_large_tile {
+    let q4_decision = dense_q4_auto::select_route(
+        registry,
+        device,
+        params,
+        batch,
+        input_strides.is_none(),
+        routing,
+    );
+    let q4_route = forced_q4_route.unwrap_or(q4_decision.route);
+    let mut use_q4_short_tile = use_v2_large_tile
+        && params.ggml_type == GgmlType::Q4_0
+        && batch == 1
+        && input_strides.is_none()
+        && q4_route == DenseQ4Route::Tensor64x32;
+    if forced_q4_route == Some(DenseQ4Route::Tensor64x32) && !use_q4_short_tile {
+        return Err(MlxError::InvalidArgument(
+            "forced Q4 tensor 64x32 route is unavailable for this device or layout".into(),
+        ));
+    }
+    let mut kernel_name = if use_q4_short_tile {
+        DenseQ4Route::Tensor64x32.kernel_name()
+    } else if use_v2_large_tile {
         params.ggml_type.mm_tensor_v2_kernel_name()
     } else if use_tensor {
         params.ggml_type.mm_tensor_kernel_name()
     } else {
         params.ggml_type.mm_kernel_name()
     };
-    let pipeline = registry.get_pipeline_with_constants(
+    let pipeline = match registry.get_pipeline_with_constants(
         kernel_name,
         device.metal_device(),
         &[],
-        &[(700, 1), (701, 1), (702, 1)],
-    )?;
+        dense_q4_auto::Q4_MM_PIPELINE_INT_CONSTANTS,
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(_error) if use_q4_short_tile && forced_q4_route.is_none() => {
+            // The candidate is optional performance metadata. Even after a
+            // successful activation, an unexpected lookup failure must not
+            // make a request less executable than the compatibility path.
+            use_q4_short_tile = false;
+            kernel_name = params.ggml_type.mm_tensor_v2_kernel_name();
+            registry.get_pipeline_with_constants(
+                kernel_name,
+                device.metal_device(),
+                &[],
+                dense_q4_auto::Q4_MM_PIPELINE_INT_CONSTANTS,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -1920,7 +2058,13 @@ fn dispatch_mm(
     // Both use 4 simdgroups / 128 threads per threadgroup.
     const THREADS_PER_TG: u64 = 128;
 
-    let (tg_x, tg_y, shmem_bytes) = if use_v2_large_tile {
+    let (tg_x, tg_y, shmem_bytes) = if use_q4_short_tile {
+        (
+            u64::from(params.m).div_ceil(32),
+            u64::from(params.n).div_ceil(64),
+            4096u64,
+        )
+    } else if use_v2_large_tile {
         // V2 in peer-convention coordinates:
         //   gx covers N_peer with stride NRB=128 → N_peer is the SLOWER axis
         //     (hf2q-M = tokens = params.m).

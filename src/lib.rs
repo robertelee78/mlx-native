@@ -151,6 +151,13 @@ pub use ops::dense_matmul_id_auto::{
     DenseMatmulIdTimingDistribution, DENSE_MATMUL_ID_ROUTE_SCHEMA_VERSION,
     DENSE_MATMUL_ID_VALUE_INDEPENDENCE_THEOREM,
 };
+pub use ops::dense_q4_auto::{
+    calibrate_dense_q4_routes, trace_dense_q4_auto, validate_dense_q4_cartesian_acceptance,
+    DenseQ4BaseShape, DenseQ4CalibrationBatchReceipt, DenseQ4CalibrationCase,
+    DenseQ4CalibrationLimits, DenseQ4CartesianAcceptanceRequirements, DenseQ4DecisionSource,
+    DenseQ4DispatchDecision, DenseQ4DispatchTrace, DenseQ4InputLayout, DenseQ4Route,
+    DenseQ4RoutePlan, DenseQ4Shape, DENSE_Q4_ROUTE_SCHEMA_VERSION,
+};
 pub use ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 pub use ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 pub use ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
@@ -169,8 +176,8 @@ pub use ops::embedding_q8_0::{embedding_gather_q8_0, EmbeddingQ8_0Params};
 pub use ops::q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinterleaveParams};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
-    dispatch_mm_for_test, dispatch_mv_q4k_mn_adaptive, dispatch_mv_q6k_mn,
-    dispatch_mv_q6k_mn_adaptive,
+    dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test,
+    dispatch_mv_q4k_mn_adaptive, dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
     quantized_matmul_ggml_batched_mm_strided_input,
     quantized_matmul_ggml_batched_mm_strided_input_with_policy,
