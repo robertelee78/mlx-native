@@ -718,7 +718,7 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
                 1,
                 0,
                 if request.routing.allow_dense_large_tile_mm {
-                    "dense MM route; tensor-capable devices may select the large-tile tensor kernel"
+                    "dense MM route; tensor-capable devices use a frozen exact-shape Q4 plan or the compatibility large-tile tensor kernel"
                 } else {
                     "dense MM route; large-tile tensor kernel disabled by routing policy"
                 },

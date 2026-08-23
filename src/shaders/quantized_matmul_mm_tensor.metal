@@ -568,7 +568,7 @@ kernel void hf2q_mul_mm_tensor_impl(
 // OFF until coherence + multi-regime bench parity proven.
 // ===========================================================================
 
-template<typename block_q, short nl,
+template<typename block_q, short nl, short n_mm_block_x,
          void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 kernel void hf2q_mul_mm_tensor_v2_impl(
         constant GgmlMatmulMmTensorParams & args,
@@ -601,7 +601,7 @@ kernel void hf2q_mul_mm_tensor_v2_impl(
 
     // Tile constants — peer's ggml-metal-impl.h.
     constexpr int SZ_SIMDGROUP        = 16;
-    constexpr int N_MM_BLOCK_X        = 4;
+    constexpr int N_MM_BLOCK_X        = n_mm_block_x;
     constexpr int N_MM_BLOCK_Y        = 2;
     constexpr int N_MM_SIMD_GROUP_X   = 2;
     constexpr int N_MM_SIMD_GROUP_Y   = 2;
@@ -634,7 +634,7 @@ kernel void hf2q_mul_mm_tensor_v2_impl(
             matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
         // PHASE 1: dequantize A tile into sa.
@@ -802,47 +802,54 @@ kernel void hf2q_mul_mm_tensor_v2_f16_impl(
 
 // ---- V2 kernel instantiations (env-gated via HF2Q_LARGE_TILE_MM=1) ----
 template [[host_name("kernel_mul_mm_q4_0_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, dequantize_q4_0_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, 4, dequantize_q4_0_t>(
+    constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
+    threadgroup char *, uint3, ushort, ushort);
+
+// Short-row candidate: identical Q4_0 dequantization, F32 activation view,
+// K-loop, reduction, and store as V2; only the token tile changes 128 -> 32.
+template [[host_name("kernel_mul_mm_q4_0_tensor_64x32_f32")]]
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, 1, dequantize_q4_0_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q8_0_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q8_0, 2, dequantize_q8_0_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q8_0, 2, 4, dequantize_q8_0_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q2_K_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q2_K, QK_NL, dequantize_q2_K_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q2_K, QK_NL, 4, dequantize_q2_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q3_K_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q3_K, QK_NL, dequantize_q3_K_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q3_K, QK_NL, 4, dequantize_q3_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q6_K_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q6_K, QK_NL, dequantize_q6_K_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q6_K, QK_NL, 4, dequantize_q6_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q5_1_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q5_1, 2, dequantize_q5_1_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q5_1, 2, 4, dequantize_q5_1_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q5_K_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q5_K, QK_NL, dequantize_q5_K_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q5_K, QK_NL, 4, dequantize_q5_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_q4_K_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_K, QK_NL, dequantize_q4_K_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_q4_K, QK_NL, 4, dequantize_q4_K_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_iq4_nl_tensor_v2_f32")]]
-kernel void hf2q_mul_mm_tensor_v2_impl<block_iq4_nl, 2, dequantize_iq4_nl_t>(
+kernel void hf2q_mul_mm_tensor_v2_impl<block_iq4_nl, 2, 4, dequantize_iq4_nl_t>(
     constant GgmlMatmulMmTensorParams &, device const char *, device const char *, device char *,
     threadgroup char *, uint3, ushort, ushort);
 

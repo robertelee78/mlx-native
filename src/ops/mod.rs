@@ -27,6 +27,9 @@ pub mod dense_mm_f16;
 pub mod dense_mm_f32_f32;
 #[cfg(test)]
 mod dense_mm_fallback_tests;
+mod dense_q4_acceptance;
+pub mod dense_q4_auto;
+mod dense_q4_calibration;
 pub mod dequant_to_f16;
 pub mod elementwise;
 pub mod embedding;

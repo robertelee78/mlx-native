@@ -20,7 +20,7 @@
 //!
 //! Default-ON; precompiled gives ~+6% on gemma4 Q-sliding decode (M5 Max).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use metal::{ComputePipelineDescriptor, ComputePipelineState, FunctionConstantValues, MTLDataType};
@@ -142,6 +142,9 @@ pub struct KernelRegistry {
     /// Immutable BF16 route metadata frozen before request-visible work.
     /// Plans contain no model buffers and cannot change after activation.
     pub(crate) dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState,
+    /// Immutable native-Q4 route metadata frozen before request-visible work.
+    /// Plans contain no model buffers and exact-shape misses stay on V2.
+    pub(crate) dense_q4_auto: crate::ops::dense_q4_auto::DenseQ4AutoState,
     /// A Metal pipeline state is device-owned. Reject attempts to reuse this
     /// registry on another physical GPU instead of returning a cached PSO for
     /// the wrong device.
@@ -158,6 +161,13 @@ pub struct KernelRegistry {
     ///
     /// Populated at construction time with all embedded shader sources.
     sources: HashMap<String, &'static str>,
+    /// Functions whose registered source changed after construction.
+    ///
+    /// A runtime source override must not resolve from the embedded metallib:
+    /// doing so would execute stale build-time bytes while reporting the
+    /// caller's replacement as active. Overrides therefore remain on the
+    /// runtime-source path for this registry's lifetime.
+    runtime_source_overrides: HashSet<String>,
     /// Precompiled `default.metallib` (lazy).
     ///
     /// `None` initially.  On first `get_pipeline*` call under
@@ -314,6 +324,10 @@ impl KernelRegistry {
             ggml_mm_tensor_src,
         );
         sources.insert(
+            "kernel_mul_mm_q4_0_tensor_64x32_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
             "kernel_mul_mm_q8_0_tensor_v2_f32".into(),
             ggml_mm_tensor_src,
         );
@@ -451,6 +465,17 @@ impl KernelRegistry {
         sources.insert(
             "hf2q_dense_mm_f32_f32_fallback".into(),
             dense_mm_fallback_src,
+        );
+
+        let dense_q4_calibration_src: &'static str =
+            include_str!("shaders/dense_q4_calibration.metal");
+        sources.insert(
+            "hf2q_dense_q4_proof_poison".into(),
+            dense_q4_calibration_src,
+        );
+        sources.insert(
+            "hf2q_dense_q4_proof_compare".into(),
+            dense_q4_calibration_src,
         );
 
         // Dense bf16×f32 → f32 GEMV (matrix-vector multiply) — optimized
@@ -1491,11 +1516,13 @@ impl KernelRegistry {
 
         Self {
             dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState::default(),
+            dense_q4_auto: crate::ops::dense_q4_auto::DenseQ4AutoState::default(),
             bound_device_registry_id: None,
             cache: HashMap::new(),
             optional_pipeline_capabilities: HashMap::new(),
             pipeline_identities: HashMap::new(),
             sources,
+            runtime_source_overrides: HashSet::new(),
             precompiled_lib: None,
             precompiled_load_attempted: false,
         }
@@ -1561,12 +1588,24 @@ impl KernelRegistry {
                 | "hf2q_dense_mm_bf16_f32_tensor"
                 | "hf2q_dense_mm_bf16_f32_fallback"
         );
+        let protected_dense_q4 = matches!(
+            name.as_str(),
+            "kernel_mul_mm_q4_0_tensor_v2_f32" | "kernel_mul_mm_q4_0_tensor_64x32_f32"
+        );
         if protected_dense_bf16
             && self.dense_bf16_plan().is_some()
             && self.sources.get(&name).copied() != Some(source)
         {
             return Err(MlxError::InvalidArgument(format!(
                 "cannot mutate dense BF16 shader {name} after its route plan is frozen"
+            )));
+        }
+        if protected_dense_q4
+            && self.dense_q4_plan().is_some()
+            && self.sources.get(&name).copied() != Some(source)
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "cannot mutate dense Q4 shader {name} after its route plan is frozen"
             )));
         }
         if self.sources.get(&name).copied() == Some(source) {
@@ -1583,6 +1622,7 @@ impl KernelRegistry {
         });
         self.pipeline_identities
             .retain(|key, _| key != &name && !key.starts_with(&specialized_prefix));
+        self.runtime_source_overrides.insert(name.clone());
         self.sources.insert(name, source);
         Ok(())
     }
@@ -1844,9 +1884,12 @@ impl KernelRegistry {
             // embedded library, use it.  Otherwise fall through to runtime
             // source compile.  Empirically ~+5.89% faster on q6_K matvec
             // (iter 1k bench).
-            let precompiled_function = self
-                .try_precompiled_lib(device)
-                .and_then(|lib| lib.get_function(name, None).ok());
+            let precompiled_function = if self.runtime_source_overrides.contains(name) {
+                None
+            } else {
+                self.try_precompiled_lib(device)
+                    .and_then(|lib| lib.get_function(name, None).ok())
+            };
 
             let origin = if precompiled_function.is_some() {
                 KernelPipelineOrigin::PrecompiledMetallib
@@ -2035,7 +2078,9 @@ impl KernelRegistry {
             //
             // get_function with FCV takes ownership of the FCV, so we
             // build a separate one for the precompiled probe.
-            let precompiled_function = if precompiled_fcv_enabled() {
+            let allow_precompiled =
+                precompiled_fcv_enabled() && !self.runtime_source_overrides.contains(name);
+            let precompiled_function = if allow_precompiled {
                 let probe_fcv = FunctionConstantValues::new();
                 for &(index, value) in bool_constants {
                     let v: u8 = if value { 1 } else { 0 };
