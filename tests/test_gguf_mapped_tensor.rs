@@ -176,6 +176,48 @@ fn mapped_tensor_is_read_only_outlives_file_and_binds_with_offset() {
 }
 
 #[test]
+fn shared_mapping_storage_plan_matches_realized_metal_resources() {
+    let values = [1.0f32, 4.0, 9.0, 16.0, 25.0];
+    let path = std::env::temp_dir().join(format!(
+        "mlx_mapped_gguf_storage_plan_{}.gguf",
+        std::process::id()
+    ));
+    std::fs::write(&path, fixture(&values)).expect("write mapped GGUF fixture");
+
+    let device = MlxDevice::new().expect("Metal device");
+    let gguf = GgufFile::open(&path).expect("open mapped GGUF fixture");
+    let plan = gguf
+        .mapped_tensor_storage_plan(device.metal_device())
+        .expect("plan shared GGUF storage");
+    let mapped = gguf
+        .map_tensor_data(&device)
+        .expect("map shared GGUF storage");
+
+    assert_eq!(mapped.storage_plan(), &plan);
+    assert_eq!(mapped.segment_count(), plan.segment_count());
+    assert_eq!(mapped.physical_byte_len(), plan.physical_byte_len());
+    assert_eq!(
+        plan.segment_physical_byte_lens()
+            .iter()
+            .try_fold(0usize, |total, bytes| total.checked_add(*bytes)),
+        Some(plan.physical_byte_len())
+    );
+    assert!(
+        plan.physical_byte_len() > values.len() * std::mem::size_of::<f32>(),
+        "physical plan must include page ownership rather than only logical tensor bytes"
+    );
+    let tensor = mapped
+        .load_tensor("weight.mapped")
+        .expect("load mapped tensor view");
+    assert_eq!(tensor.data_byte_len(), values.len() * 4);
+
+    drop(tensor);
+    drop(mapped);
+    drop(gguf);
+    std::fs::remove_file(path).expect("remove mapped GGUF fixture");
+}
+
+#[test]
 fn truncated_tensor_payload_is_rejected_before_mmap_access() {
     let values = [1.0f32, 4.0, 9.0, 16.0, 25.0];
     let mut bytes = fixture(&values);

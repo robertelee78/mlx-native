@@ -124,7 +124,7 @@ pub use residency::{
 };
 
 // Re-export GGUF parser.
-pub use gguf::{GgufFile, MetadataValue, TensorInfo};
+pub use gguf::{GgufFile, GgufMappedTensorStoragePlan, MetadataValue, TensorInfo};
 
 // Re-export ops.
 pub use ops::dense_bf16_auto::{

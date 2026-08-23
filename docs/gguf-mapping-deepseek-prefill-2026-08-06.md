@@ -43,6 +43,31 @@ CPU view beyond their physical tensor bytes, and the scratch buffer pool drops
 file-backed handles instead of retaining a Metal object after its mmap owner.
 Default-on tests cover all three cases.
 
+## Exact pre-map storage planning — 2026-08-23
+
+**Status:** Source candidate; downstream admission and runtime proof pending.
+
+Model-pool admission needs the physical bytes of a mapped GGUF before it owns
+those resources. Charging source tensor bytes is not exact: shared mappings
+include file gaps and page padding, while multiple logical tensor views share
+one Metal resource. Mapping first and charging afterward is exact at steady
+state but transiently takes ownership of an artifact that the pool may reject.
+
+The selected source design factors the existing mapping partition into one
+pure planner used by both preflight and `map_tensor_data`. The pointer-free
+receipt contains the page-rounded length of every shared Metal segment and its
+checked total. Mapping verifies every realized Metal buffer length against that
+same plan before returning the set. This makes metadata-only preflight equal to
+realized resource ownership by construction, without creating an mmap or Metal
+buffer and without copying the partition algorithm into a downstream crate.
+
+Mutation-sensitive unit cases pin absolute tensor-data offset, shared-page and
+gap accounting, the exact per-buffer split boundary, page padding, overflow,
+and an individually oversized segment. The remaining acceptance work is a
+focused library gate plus a Metal fixture asserting planned bytes equal mapped
+bytes, followed by downstream model-pool tests proving rejection occurs before
+projector mapping/publication and accepted loads charge the realized total.
+
 ## Residency heartbeat and command-buffer result
 
 Repeated inference exposed a Metal resource-preparation stall below the model
