@@ -126,21 +126,25 @@ a universal row-count cutoff or an hf2q integration result.
 
 ## Reproducible gates
 
-The focused correctness gate is:
+The publication correctness gate is:
 
 ```text
-cargo test --locked --release --test dense_q4_auto_calibration
-cargo test --locked --release --test q4_mm_tensor_64x32
-cargo test --locked --test q4_benchmark_contract
+scripts/check_q4_tensor_release_gate.sh
 ```
 
-The first two targets are tensor-hardware gates. The build enables them only
-when it successfully compiles the Q4 tensor shader into the current artifact;
-an older SDK that lacks the exact `<metal_tensor>` header still runs the
-model-free selection, downgrade, receipt, and capability-classifier tests.
-That hosted-safe path is not publication authority. Publication still requires
-the complete named hardware gate above on a build that produced the tensor
-shader.
+The script rejects `MLX_NATIVE_SKIP_METALLIB`, requires the build to include
+the Q4 tensor AIR in a successfully linked, nonempty `default.metallib`, runs
+all three named release-mode targets, and rejects a target that reports zero
+passing tests. The artifact-bound cfg is emitted only after that link receipt;
+it is not an SDK-source-compilation guess. The one hosted downgrade is the
+exact Q4 tensor compiler diagnostic for a missing `<metal_tensor>` header.
+Any other Q4 tensor shader failure is a regression and fails the build.
+
+An older SDK with that exact missing-header diagnostic can still run the
+ungated source canary, capability-classifier mutations, benchmark contract,
+and the model-free production-finalizer tests. That hosted-safe path proves
+classification, failure selection, plan downgrade, and receipt-metric
+conservation, but it is not publication authority.
 
 The activation-tax harness fixes reachable rows to
 `9,16,24,32,48,64,96,128,129,2048,4096`, uses exact production projection

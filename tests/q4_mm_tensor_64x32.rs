@@ -1,4 +1,4 @@
-#![cfg(mlx_native_has_metal_tensor_sdk)]
+#![cfg(mlx_native_has_metal_tensor_artifact)]
 
 use half::f16;
 use mlx_native::{
@@ -201,20 +201,6 @@ fn check_shape(
         weight.as_slice::<u8>().expect("read Q4_0 weights"),
         original_weight_bytes,
         "both routes must leave native Q4_0 bytes unchanged"
-    );
-}
-
-#[test]
-fn shader_candidate_changes_only_compile_time_token_tile() {
-    let shader = include_str!("../src/shaders/quantized_matmul_mm_tensor.metal");
-    assert!(shader.contains("short n_mm_block_x"));
-    assert!(shader.contains("hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, 4, dequantize_q4_0_t>"));
-    assert!(shader.contains("hf2q_mul_mm_tensor_v2_impl<block_q4_0, 2, 1, dequantize_q4_0_t>"));
-    assert_eq!(
-        shader
-            .matches("kernel_mul_mm_q4_0_tensor_64x32_f32")
-            .count(),
-        1
     );
 }
 

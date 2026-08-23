@@ -433,6 +433,39 @@ fn apply_base_weight_failure(
     }
 }
 
+fn finalize_base_shape_decisions(
+    base_outcomes: Vec<(DenseQ4CalibrationDecision, bool)>,
+) -> (
+    Vec<DenseQ4CalibrationDecision>,
+    HashMap<DenseQ4Shape, DenseQ4Route>,
+) {
+    let base_weight_failure = base_outcomes.iter().find_map(|(decision, candidate_proven)| {
+        (!*candidate_proven).then(|| {
+            (
+                decision.status,
+                decision.diagnostic.clone().unwrap_or_else(|| {
+                    format!(
+                        "exact M={} Cartesian current-weight batch did not authorize the optional candidate",
+                        decision.shape.m
+                    )
+                }),
+            )
+        })
+    });
+    let mut base_decisions = base_outcomes
+        .into_iter()
+        .map(|(decision, _)| decision)
+        .collect::<Vec<_>>();
+    if let Some((status, diagnostic)) = base_weight_failure {
+        apply_base_weight_failure(&mut base_decisions, status, &diagnostic);
+    }
+    let plan_decisions = base_decisions
+        .iter()
+        .map(|decision| (decision.shape, decision.selected_route))
+        .collect();
+    (base_decisions, plan_decisions)
+}
+
 fn deadline_reached(started: Instant, max_elapsed_ms: u64) -> bool {
     started.elapsed().as_secs_f64() * 1000.0 >= max_elapsed_ms as f64
 }
@@ -1260,8 +1293,7 @@ fn calibrate_dense_q4_routes_impl(
         let authorized_weight_buffers = u32::try_from(case.weights.len()).map_err(|_| {
             MlxError::InvalidArgument("dense Q4 authorized weight count overflow".into())
         })?;
-        let mut base_decisions = Vec::with_capacity(case.reachable_m.len());
-        let mut base_weight_failure: Option<(DenseQ4SelectionStatus, String)> = None;
+        let mut base_outcomes = Vec::with_capacity(case.reachable_m.len());
         for m in case.reachable_m {
             let shape = case.shape.with_m(m);
             let representative_weight = case.weights[0];
@@ -1447,17 +1479,6 @@ fn calibrate_dense_q4_routes_impl(
             } else {
                 authorized_weight_buffers
             };
-            if !candidate_proven {
-                base_weight_failure.get_or_insert((
-                    decision.status,
-                    decision.diagnostic.clone().unwrap_or_else(|| {
-                        format!(
-                            "exact M={} Cartesian current-weight batch did not authorize the optional candidate",
-                            shape.m
-                        )
-                    }),
-                ));
-            }
             calibration_submissions = calibration_submissions
                 .checked_add(decision.calibration_submissions)
                 .ok_or_else(|| {
@@ -1465,15 +1486,11 @@ fn calibrate_dense_q4_routes_impl(
                         "dense Q4 calibration submission count overflow".into(),
                     )
                 })?;
-            base_decisions.push(decision);
+            base_outcomes.push((decision, candidate_proven));
         }
-        if let Some((status, diagnostic)) = base_weight_failure {
-            apply_base_weight_failure(&mut base_decisions, status, &diagnostic);
-        }
-        for decision in base_decisions {
-            plan_decisions.insert(decision.shape, decision.selected_route);
-            decisions.push(decision);
-        }
+        let (base_decisions, base_plan_decisions) = finalize_base_shape_decisions(base_outcomes);
+        plan_decisions.extend(base_plan_decisions);
+        decisions.extend(base_decisions);
     }
     decisions.sort_by_key(|decision| decision.shape);
     let authorized_shape_weight_pairs = decisions.iter().try_fold(0u32, |total, decision| {
@@ -1724,7 +1741,7 @@ mod tests {
         }
     }
 
-    #[cfg(mlx_native_has_metal_tensor_sdk)]
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
     #[test]
     fn candidate_only_additional_weight_failure_downgrades_base_and_cleans_up() {
         let device = MlxDevice::new().expect("Metal device");
@@ -1785,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_only_weight_failure_downgrades_every_base_shape_without_hardware() {
+    fn base_shape_finalizer_downgrades_plan_and_conserves_receipt_metrics_without_hardware() {
         let shape = |m| DenseQ4Shape {
             m,
             n: 75,
@@ -1793,42 +1810,96 @@ mod tests {
             batch: 1,
             input_layout: super::super::dense_q4_auto::DenseQ4InputLayout::Contiguous,
         };
-        let decision = |m, diagnostic| DenseQ4CalibrationDecision {
+        let decision = |m, status, diagnostic, salt: u32| DenseQ4CalibrationDecision {
             shape: shape(m),
             selected_route: DenseQ4Route::Tensor64x32,
-            status: DenseQ4SelectionStatus::CalibratedWinner,
+            status,
             diagnostic,
-            timings: Vec::new(),
-            process_cache_hit: false,
-            authorized_weight_buffers: 2,
-            proof_submissions: 1,
-            proof_route_dispatches: 4,
-            proof_auxiliary_dispatches: 4,
-            proof_scratch_bytes: 1024,
-            proof_gpu_us: 1.0,
-            timing_submissions: 10,
-            calibration_submissions: 11,
+            timings: vec![timing(
+                DenseQ4Route::Tensor64x32,
+                (1.0 + f64::from(salt), 2.0, 3.0),
+                (4.0, 5.0 + f64::from(salt), 6.0),
+            )],
+            process_cache_hit: salt % 2 == 0,
+            authorized_weight_buffers: 2 + salt,
+            proof_submissions: 1 + salt,
+            proof_route_dispatches: 4 + salt,
+            proof_auxiliary_dispatches: 5 + salt,
+            proof_scratch_bytes: 1024 + u64::from(salt),
+            proof_gpu_us: 1.0 + f64::from(salt),
+            timing_submissions: 10 + salt,
+            calibration_submissions: 11 + salt * 2,
         };
-        let mut decisions = vec![decision(9, None), decision(37, Some("existing".into()))];
+        let base_outcomes = vec![
+            (
+                decision(
+                    9,
+                    DenseQ4SelectionStatus::CalibratedWinner,
+                    Some("existing".into()),
+                    1,
+                ),
+                true,
+            ),
+            (
+                decision(37, DenseQ4SelectionStatus::IncoherentCandidate, None, 2),
+                false,
+            ),
+            (
+                decision(
+                    65,
+                    DenseQ4SelectionStatus::CandidateUnavailable,
+                    Some("later failure must not win".into()),
+                    3,
+                ),
+                false,
+            ),
+        ];
+        let originals = base_outcomes
+            .iter()
+            .map(|(decision, _)| decision.clone())
+            .collect::<Vec<_>>();
+        let (decisions, plan_decisions) = finalize_base_shape_decisions(base_outcomes);
 
-        apply_base_weight_failure(
-            &mut decisions,
-            DenseQ4SelectionStatus::IncoherentCandidate,
-            "optional candidate failed for weight 1",
-        );
-
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(plan_decisions.len(), 3);
         assert!(decisions.iter().all(|decision| {
             decision.selected_route == DenseQ4Route::CompatibilityV2
                 && decision.status == DenseQ4SelectionStatus::IncoherentCandidate
                 && decision
                     .diagnostic
                     .as_deref()
-                    .is_some_and(|diagnostic| diagnostic.contains("weight 1"))
+                    .is_some_and(|diagnostic| diagnostic.contains("exact M=37"))
         }));
-        assert!(decisions[1]
+        assert!(decisions[0]
             .diagnostic
             .as_deref()
             .is_some_and(|diagnostic| diagnostic.starts_with("existing;")));
+        assert!(plan_decisions
+            .values()
+            .all(|route| *route == DenseQ4Route::CompatibilityV2));
+
+        for (before, after) in originals.iter().zip(&decisions) {
+            assert_eq!(after.shape, before.shape);
+            assert_eq!(after.timings, before.timings);
+            assert_eq!(after.process_cache_hit, before.process_cache_hit);
+            assert_eq!(
+                after.authorized_weight_buffers,
+                before.authorized_weight_buffers
+            );
+            assert_eq!(after.proof_submissions, before.proof_submissions);
+            assert_eq!(after.proof_route_dispatches, before.proof_route_dispatches);
+            assert_eq!(
+                after.proof_auxiliary_dispatches,
+                before.proof_auxiliary_dispatches
+            );
+            assert_eq!(after.proof_scratch_bytes, before.proof_scratch_bytes);
+            assert_eq!(after.proof_gpu_us, before.proof_gpu_us);
+            assert_eq!(after.timing_submissions, before.timing_submissions);
+            assert_eq!(
+                after.calibration_submissions,
+                before.calibration_submissions
+            );
+        }
     }
 
     #[test]

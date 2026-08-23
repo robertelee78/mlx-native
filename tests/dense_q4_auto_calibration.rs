@@ -1,4 +1,4 @@
-#![cfg(mlx_native_has_metal_tensor_sdk)]
+#![cfg(mlx_native_has_metal_tensor_artifact)]
 
 use half::f16;
 use mlx_native::{
