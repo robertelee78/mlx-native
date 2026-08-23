@@ -1,8 +1,8 @@
-//! ADR-022 Phase 1 P1.7 — `mul_mv_ext` r1 family for Q5_1 + IQ4_NL.
+//! Small-width weight-amortizing `mul_mv_ext` kernels for GGUF block weights.
 //!
-//! Wraps the eight Metal kernels in `shaders/mul_mv_ext.metal`:
+//! Wraps the Metal kernels in `shaders/mul_mv_ext.metal`:
 //!
-//!   `kernel_mul_mv_ext_<q>_f32_r1_<r1>` for q ∈ {q5_1, iq4_nl},
+//!   `kernel_mul_mv_ext_<q>_f32_r1_<r1>` for each admitted block codec,
 //!   r1 ∈ {2, 3, 4, 5}.
 //!
 //! The host dispatcher mirrors the reference small-batch dispatch:
@@ -14,9 +14,7 @@
 //!   - threadgroups = (N/r0ptg, M/r1ptg, batch)
 //!   - threads-per-tg = (32, nsg, 1)
 //!
-//! Falls within the public dispatcher's m=2..8 batch range. ADR-022 P1.7
-//! ports it for Q5_1 + IQ4_NL only; Phase 4 will extend the family across
-//! Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K.
+//! Falls within the public dispatcher's m=2..8 batch range.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -44,8 +42,8 @@ pub struct MulMvExtParams {
     pub k: u32,
     /// Batch-broadcast factor for src0 vs src1 (typical 1).
     pub batch: u32,
-    /// GGUF weight type. Phase 1 supports Q5_1 + IQ4_NL only; other types
-    /// return `MlxError::InvalidArgument`.
+    /// GGUF weight type. Unsupported codecs return
+    /// `MlxError::InvalidArgument`.
     pub ggml_type: GgmlType,
 }
 
@@ -116,8 +114,8 @@ fn pick_r1ptg(m: u32) -> Result<i32> {
 /// Compose the kernel name from ggml_type + r1ptg, matching the metal
 /// shader's `[[host_name(...)]]` attributes.
 ///
-/// Phase 1 (P1.7): Q5_1 + IQ4_NL × r1∈{2,3,4,5}.
-/// Phase 4: Q4_0, Q8_0, Q4_K, Q5_K, Q6_K × r1∈{2,3,4,5}.
+/// Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q5_1, and IQ4_NL each provide
+/// r1∈{2,3,4,5}.
 fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
     Ok(match (ggml_type, r1ptg) {
         (GgmlType::Q5_1, 2) => "kernel_mul_mv_ext_q5_1_f32_r1_2",
@@ -132,6 +130,10 @@ fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
         (GgmlType::Q4_0, 3) => "kernel_mul_mv_ext_q4_0_f32_r1_3",
         (GgmlType::Q4_0, 4) => "kernel_mul_mv_ext_q4_0_f32_r1_4",
         (GgmlType::Q4_0, 5) => "kernel_mul_mv_ext_q4_0_f32_r1_5",
+        (GgmlType::Q5_0, 2) => "kernel_mul_mv_ext_q5_0_f32_r1_2",
+        (GgmlType::Q5_0, 3) => "kernel_mul_mv_ext_q5_0_f32_r1_3",
+        (GgmlType::Q5_0, 4) => "kernel_mul_mv_ext_q5_0_f32_r1_4",
+        (GgmlType::Q5_0, 5) => "kernel_mul_mv_ext_q5_0_f32_r1_5",
         (GgmlType::Q8_0, 2) => "kernel_mul_mv_ext_q8_0_f32_r1_2",
         (GgmlType::Q8_0, 3) => "kernel_mul_mv_ext_q8_0_f32_r1_3",
         (GgmlType::Q8_0, 4) => "kernel_mul_mv_ext_q8_0_f32_r1_4",
@@ -150,7 +152,7 @@ fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
         (GgmlType::Q6_K, 5) => "kernel_mul_mv_ext_q6_K_f32_r1_5",
         (other_type, other_r1) => {
             return Err(MlxError::InvalidArgument(format!(
-                "mul_mv_ext: no kernel for type {:?} × r1ptg {} (Phase 1+4 ports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K/Q5_1/IQ4_NL × r1∈{{2,3,4,5}})",
+                "mul_mv_ext: no kernel for type {:?} × r1ptg {} (supported: Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K/Q5_1/IQ4_NL × r1∈{{2,3,4,5}})",
                 other_type, other_r1
             )));
         }
@@ -162,7 +164,7 @@ fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
 /// # Errors
 ///
 /// Returns `MlxError::InvalidArgument` if:
-///   - `ggml_type` is not Q5_1 or IQ4_NL,
+///   - `ggml_type` has no width-amortized kernel,
 ///   - `m` is outside [2, 8],
 ///   - `k` is not divisible by 32,
 ///   - any of `m`, `n`, `k`, `batch` is zero,
@@ -182,7 +184,7 @@ pub fn mul_mv_ext_dispatch(
         ));
     }
     // K must be divisible by the block size of the weight type.
-    // Legacy 32-element types (Q4_0/Q8_0/Q5_1/IQ4_NL): k % 32 == 0.
+    // Legacy 32-element types (Q4_0/Q5_0/Q8_0/Q5_1/IQ4_NL): k % 32 == 0.
     // K-quants (Q4_K/Q5_K/Q6_K): k % 256 == 0.
     let block_qk = params.ggml_type.block_values();
     if params.k % block_qk != 0 {
@@ -354,21 +356,23 @@ mod tests {
     }
 
     #[test]
-    fn kernel_name_covers_all_phase4_combinations() {
-        // Phase 4 (commit `9ee8a28`): Q4_0, Q8_0, Q4_K, Q5_K, Q6_K
-        // × r1 ∈ {2, 3, 4, 5}. Pin coverage so future GgmlType
-        // additions don't silently drop Phase 4 wires.
+    fn kernel_name_covers_all_extended_combinations() {
+        // Pin every legacy and K-quant extension so future GgmlType additions
+        // do not silently drop a registered width route.
         for r1 in 2..=5 {
-            assert!(kernel_name(GgmlType::Q4_0, r1).is_ok(),
-                "Phase 4 Q4_0 r1={r1} must have a kernel");
-            assert!(kernel_name(GgmlType::Q8_0, r1).is_ok(),
-                "Phase 4 Q8_0 r1={r1} must have a kernel");
-            assert!(kernel_name(GgmlType::Q4_K, r1).is_ok(),
-                "Phase 4 Q4_K r1={r1} must have a kernel");
-            assert!(kernel_name(GgmlType::Q5_K, r1).is_ok(),
-                "Phase 4 Q5_K r1={r1} must have a kernel");
-            assert!(kernel_name(GgmlType::Q6_K, r1).is_ok(),
-                "Phase 4 Q6_K r1={r1} must have a kernel");
+            for ggml_type in [
+                GgmlType::Q4_0,
+                GgmlType::Q5_0,
+                GgmlType::Q8_0,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+            ] {
+                assert!(
+                    kernel_name(ggml_type, r1).is_ok(),
+                    "{ggml_type:?} r1={r1} must have a kernel"
+                );
+            }
         }
     }
 

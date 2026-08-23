@@ -213,6 +213,7 @@ fn validate_dense_dispatches(
                 (kind, false) => {
                     let (align, threads) = match kind {
                         GgmlType::Q4_0
+                        | GgmlType::Q5_0
                         | GgmlType::Q8_0
                         | GgmlType::Q5_1
                         | GgmlType::IQ4_NL
@@ -304,6 +305,7 @@ fn validate_dense_dispatches(
             };
             let type_name = match request.ggml_type {
                 GgmlType::Q4_0 => "q4_0",
+                GgmlType::Q5_0 => "q5_0",
                 GgmlType::Q8_0 => "q8_0",
                 GgmlType::Q4_K => "q4_K",
                 GgmlType::Q5_K => "q5_K",

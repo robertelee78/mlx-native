@@ -50,6 +50,12 @@ typedef struct {
 } block_q4_0;
 
 typedef struct {
+    half    d;
+    uint8_t qh[4];
+    uint8_t qs[QK4_0 / 2];
+} block_q5_0;
+
+typedef struct {
     half   d;
     int8_t qs[QK8_0];
 } block_q8_0;
@@ -145,6 +151,28 @@ void dq_q4_0_id(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
         reg_f[i/2][2*(i%2) + 1] = d2 * (qs[i] & mask1) + md;
     }
     reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dq_q5_0_id(device const block_q5_0 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 3);
+    const float d = xb->d;
+    const float md = -16.h * xb->d;
+    const ushort mask = il ? 0x00F0 : 0x000F;
+    const uint qh = *((device const uint *)xb->qh);
+    const int x_mv = il ? 4 : 0;
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ? 0 : 4;
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i    )) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i + 1)) << gh_bk) & 0x10;
+        const int x0 = ((((qs[i]     ) & mask) >> x_mv) | xh_0);
+        const int x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+        reg_f[i/2][2*(i%2) + 0] = d * x0 + md;
+        reg_f[i/2][2*(i%2) + 1] = d * x1 + md;
+    }
+    reg = (type4x4)reg_f;
 }
 
 template <typename type4x4>
@@ -543,6 +571,12 @@ kernel void hf2q_mul_mm_id_tensor_impl(
 
 template [[host_name("kernel_mul_mm_id_q4_0_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_q4_0, 2, dq_q4_0_id>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_0_tensor_f32")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q5_0, 2, dq_q5_0_id>(
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

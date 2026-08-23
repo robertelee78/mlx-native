@@ -83,7 +83,7 @@ device-resolved route has a matched benchmark receipt.
   four-byte scalar storage in the raw loader. `load_tensor_f32` remains an
   explicit diagnostic/materialization request; model loaders must not use it
   to disguise a missing native execution route.
-- Direct embedding gather supports native F32, F16, BF16, Q4_0, Q8_0, Q2_K,
+- Direct embedding gather supports native F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q2_K,
   Q4_K, Q5_K, and Q6_K tables and converts only selected rows to the graph's
   F32 activation dtype. This is row execution, not a second resident weight
   representation. Other codecs fail closed at capability admission.

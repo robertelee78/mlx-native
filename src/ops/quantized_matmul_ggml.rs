@@ -6,7 +6,7 @@
 //! Weight buffers contain raw GGML blocks — the same bytes that come from
 //! GGUF mmap. No intermediate conversion.
 //!
-//! Supported formats include Q2_K, Q4_0, Q8_0, and K-quants through Q6_K.
+//! Supported formats include Q2_K, Q4_0, Q5_0, Q8_0, and K-quants through Q6_K.
 //!
 //! Portions derived from candle-metal-kernels v0.10.2 (Apache-2.0).
 //! See src/shaders/quantized_matmul_ggml.metal for full attribution.
@@ -51,6 +51,11 @@ fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
 /// Q4_0: 32 values per block, 18 bytes per block (2 byte f16 scale + 16 bytes quants).
 const QK4_0: u32 = 32;
 const BLOCK_Q4_0_BYTES: u32 = 18;
+
+/// Q5_0: 32 values per block, 22 bytes per block
+/// (2-byte f16 scale + 4-byte high-bit mask + 16 bytes of low nibbles).
+const QK5_0: u32 = 32;
+const BLOCK_Q5_0_BYTES: u32 = 22;
 
 /// Q8_0: 32 values per block, 34 bytes per block (2 byte f16 scale + 32 bytes quants).
 const QK8_0: u32 = 32;
@@ -125,6 +130,9 @@ pub enum GgmlType {
     BF16,
     /// 4-bit quantization. 32 values per block, 18 bytes per block.
     Q4_0,
+    /// Legacy symmetric 5-bit quantization (GGML type ID 6).
+    /// 32 values per block, 22 bytes per block.
+    Q5_0,
     /// 8-bit quantization. 32 values per block, 34 bytes per block.
     Q8_0,
     /// 2-bit super-block quantization. 256 values per block, 84 bytes per block.
@@ -172,6 +180,7 @@ impl GgmlType {
             GgmlType::F16 => 1,
             GgmlType::BF16 => 1,
             GgmlType::Q4_0 => QK4_0,
+            GgmlType::Q5_0 => QK5_0,
             GgmlType::Q8_0 => QK8_0,
             GgmlType::Q2_K => QK2_K,
             GgmlType::Q3_K => QK3_K,
@@ -193,6 +202,7 @@ impl GgmlType {
             GgmlType::F16 => 2,
             GgmlType::BF16 => 2,
             GgmlType::Q4_0 => BLOCK_Q4_0_BYTES,
+            GgmlType::Q5_0 => BLOCK_Q5_0_BYTES,
             GgmlType::Q8_0 => BLOCK_Q8_0_BYTES,
             GgmlType::Q2_K => BLOCK_Q2_K_BYTES,
             GgmlType::Q3_K => BLOCK_Q3_K_BYTES,
@@ -216,6 +226,7 @@ impl GgmlType {
                 "unsupported"
             }
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
+            GgmlType::Q5_0 => "kernel_mul_mv_q5_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mv_q3_K_f32",
@@ -248,6 +259,7 @@ impl GgmlType {
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_q5_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_f32",
@@ -273,6 +285,7 @@ impl GgmlType {
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_f32",
@@ -296,6 +309,7 @@ impl GgmlType {
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_v2_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_v2_f32",
@@ -513,6 +527,7 @@ pub fn quantized_matmul_ggml_with_policy(
         // come in P1.6, dispatcher already routes to mv at m ≤ 8).
         // ADR-022 Phase 2 — Q5_K added (mv + mm + mm_tensor).
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
         | GgmlType::Q3_K
@@ -627,7 +642,7 @@ pub fn quantized_matmul_ggml_with_policy(
     // Numerically close but not generally byte-identical to mv: the wider
     // kernel uses a different reduction tree. A family must therefore qualify
     // model decisions and cache handoff before enabling it in production.
-    // K-quants use m=4..8; legacy Q4_0/Q8_0 retain m=2..8. Unsupported shapes
+    // K-quants use m=4..8; legacy Q4_0/Q5_0/Q8_0 retain m=2..8. Unsupported shapes
     // fall through unchanged.
     // ADR-040 §0.21 decode F3 lever (mul_mv_ext weight-amortization) — opt-in,
     // DEFAULT OFF (HF2Q_DECODE_MV_EXT=1). MEASURED: routing decode m∈[2,8] to
@@ -1288,6 +1303,7 @@ fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
     let qk = params.ggml_type.block_values();
     match params.ggml_type {
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
         | GgmlType::Q3_K
@@ -1400,10 +1416,11 @@ fn dispatch_mv_batched(
     let m = params.m as usize;
 
     let (nth0, nth1, align) = match params.ggml_type {
-        // Q4_0 / Q8_0 / Q5_1 / IQ4_NL all use legacy 32-element blocks
+        // Q4_0 / Q5_0 / Q8_0 / Q5_1 / IQ4_NL all use legacy 32-element blocks
         // and the Q4_0-style (8, 8) threadgroup geometry: 2 simdgroups ×
         // 4 rows per simdgroup = 8 rows per threadgroup.
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL
@@ -2176,7 +2193,7 @@ pub struct GgmlQuantizedMatmulPerm021Params {
     pub k: u32,
     /// Head dimension.  Must be a multiple of NK=32.
     pub head_dim: u32,
-    /// GGML quantization type of the weight (Q4_0 or Q6_K).
+    /// GGML quantization type of the weight.
     pub ggml_type: GgmlType,
 }
 
@@ -2189,7 +2206,7 @@ pub struct GgmlQuantizedMatmulPerm021Params {
 ///
 /// # Errors
 /// Returns `InvalidArgument` if:
-/// - `ggml_type` is not Q4_0 or Q6_K
+/// - `ggml_type` is not Q4_0, Q5_0, Q8_0, or Q6_K
 /// - `head_dim` is not a positive multiple of 32
 /// - `k != n_heads * head_dim`  (we infer n_heads = k / head_dim)
 /// - buffer sizes don't match the declared shapes
@@ -2209,6 +2226,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
     }
     let kernel_name = match params.ggml_type {
         GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_bf16_perm021",
+        GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_bf16_perm021",
         // ADR-022 Phase 3 — Q8_0 perm021 instantiation added so the
         // Q8_0-quantized attention path (e.g. iter-21 Track B HB-encoded
         // K cache for Qwen 3.5 / 3.6) can use the same tensor-tile
@@ -2218,7 +2236,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_mm_tensor_perm021: unsupported ggml_type {:?} \
-                 (only Q4_0 / Q8_0 / Q6_K are instantiated)",
+                 (only Q4_0 / Q5_0 / Q8_0 / Q6_K are instantiated)",
                 other
             )));
         }

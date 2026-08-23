@@ -44,6 +44,12 @@ typedef struct {
 } block_q4_0;
 
 typedef struct {
+    half    d;
+    uint8_t qh[4];
+    uint8_t qs[QK4_0 / 2];
+} block_q5_0;
+
+typedef struct {
     half   d;
     int8_t qs[QK8_0];
 } block_q8_0;
@@ -133,6 +139,27 @@ void dequantize_q5_1_t4(device const block_q5_1 * xb, short il, thread type4 & r
 
         reg[2*ii + 0] = d * x0 + m;
         reg[2*ii + 1] = d * x1 + m;
+    }
+}
+
+template <typename type4>
+void dequantize_q5_0_t4(device const block_q5_0 * xb, short il, thread type4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 3);
+    const float d = xb->d;
+    const float md = -16.h * xb->d;
+    const ushort mask = (il/4) ? 0x00F0 : 0x000F;
+    const uint qh = *((device const uint *)xb->qh);
+    const int x_mv = (il/4) ? 4 : 0;
+    const int gh_mv = (il/4) ? 12 : 0;
+    const int gh_bk = (il/4) ? 0 : 4;
+    for (int ii = 0; ii < 2; ii++) {
+        const int i = 2*(il%4) + ii;
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i    )) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i + 1)) << gh_bk) & 0x10;
+        const int x0 = ((((qs[i]     ) & mask) >> x_mv) | xh_0);
+        const int x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+        reg[2*ii + 0] = d * x0 + md;
+        reg[2*ii + 1] = d * x1 + md;
     }
 }
 
@@ -423,6 +450,28 @@ kernel void hf2q_mul_mv_ext_q4_f32_impl<4, block_q5_1, 8, dequantize_q5_1_t4>(
 
 template [[host_name("kernel_mul_mv_ext_q5_1_f32_r1_5")]]
 kernel void hf2q_mul_mv_ext_q4_f32_impl<5, block_q5_1, 8, dequantize_q5_1_t4>(
+    constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
+    device char *, uint3, ushort, ushort);
+
+// --- Q5_0 ---
+
+template [[host_name("kernel_mul_mv_ext_q5_0_f32_r1_2")]]
+kernel void hf2q_mul_mv_ext_q4_f32_impl<2, block_q5_0, 8, dequantize_q5_0_t4>(
+    constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
+    device char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mv_ext_q5_0_f32_r1_3")]]
+kernel void hf2q_mul_mv_ext_q4_f32_impl<3, block_q5_0, 8, dequantize_q5_0_t4>(
+    constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
+    device char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mv_ext_q5_0_f32_r1_4")]]
+kernel void hf2q_mul_mv_ext_q4_f32_impl<4, block_q5_0, 8, dequantize_q5_0_t4>(
+    constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
+    device char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mv_ext_q5_0_f32_r1_5")]]
+kernel void hf2q_mul_mv_ext_q4_f32_impl<5, block_q5_0, 8, dequantize_q5_0_t4>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
     device char *, uint3, ushort, ushort);
 

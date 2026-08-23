@@ -60,6 +60,12 @@ typedef struct {
 } block_q4_0;
 
 typedef struct {
+    half    d;
+    uint8_t qh[4];
+    uint8_t qs[QK4_0 / 2];
+} block_q5_0;
+
+typedef struct {
     half   d;
     int8_t qs[QK8_0];
 } block_q8_0;
@@ -207,6 +213,25 @@ inline float block_q5_1_dot_y(
     }
 
     return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
+}
+
+inline float block_q5_0_dot_y(
+    device const block_q5_0 * qb,
+    float sumy,
+    thread float * yl,
+    int il
+) {
+    const float d = qb->d;
+    float4 acc = 0.f;
+    device const uint16_t * qs = ((device const uint16_t *)qb + 3 + il/2);
+    const uint qh = *((device const uint *)qb->qh);
+    for (int i = 0; i < 8; i += 2) {
+        acc[0] += yl[i + 0] * (float)((qs[i / 2] & 0x000F) | (((qh >> (i + 0 + il     )) << 4 ) & 0x0010));
+        acc[1] += yl[i + 1] * (float)((qs[i / 2] & 0x0F00) | (((qh >> (i + 1 + il     )) << 12) & 0x1000));
+        acc[2] += yl[i + 8] * (float)((qs[i / 2] & 0x00F0) | (((qh >> (i + 0 + il + 16)) << 8 ) & 0x0100));
+        acc[3] += yl[i + 9] * (float)((qs[i / 2] & 0xF000) | (((qh >> (i + 1 + il + 16)) << 16) & 0x10000));
+    }
+    return d * (sumy * -16.f + acc[0] + acc[1] + acc[2] + acc[3]);
 }
 
 // ---- IQ4_NL dot product helper (ADR-022 Phase 1) ----
@@ -944,6 +969,57 @@ kernel void kernel_mul_mv_id_q5_1_f32(
         yb += QK4_0 * 16;
     }
 
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[output_row * p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+kernel void kernel_mul_mv_id_q5_0_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw = N_SIMDWIDTH;
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int output_row = tgpig.y;
+    if (output_row >= (int)p.ne1) return;
+    const uint token_idx = output_row / p.top_k;
+    const uint expert_id = ids[output_row];
+    const int first_row = (r0 * nsg + sgitg) * nr;
+    device const block_q5_0 * x = (device const block_q5_0 *)((device const char *)src0
+                                + expert_id * p.expert_stride) + first_row * nb;
+    device const float * y = src1 + token_idx * p.ne10;
+    float yl[16];
+    float sumf[nr] = {0.f};
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+    device const float * yb = y + ix * QK4_0 + il;
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        float sumy = 0.f;
+        for (int i = 0; i < 8; i += 2) {
+            sumy += yb[i] + yb[i+1];
+            yl[i+0] = yb[i+0];
+            yl[i+1] = yb[i+1] / 256.f;
+            sumy += yb[i+16] + yb[i+17];
+            yl[i+8] = yb[i+16] / 16.f;
+            yl[i+9] = yb[i+17] / 4096.f;
+        }
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_q5_0_dot_y(x + ib + row*nb, sumy, yl, il);
+        }
+        yb += QK4_0 * 16;
+    }
     for (int row = 0; row < nr; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < p.ne01) {

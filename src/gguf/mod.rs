@@ -68,6 +68,7 @@ const GGUF_TYPE_FLOAT64: u32 = 12;
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q5_0: u32 = 6;
 const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q2_K: u32 = 10;
@@ -445,6 +446,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_F32 => Ok(GgmlType::F32),
         GGML_TYPE_F16 => Ok(GgmlType::F16),
         GGML_TYPE_Q4_0 => Ok(GgmlType::Q4_0),
+        GGML_TYPE_Q5_0 => Ok(GgmlType::Q5_0),
         GGML_TYPE_Q5_1 => Ok(GgmlType::Q5_1),
         GGML_TYPE_Q8_0 => Ok(GgmlType::Q8_0),
         GGML_TYPE_Q2_K => Ok(GgmlType::Q2_K),
@@ -551,6 +553,47 @@ fn dequantize_q4_0(data: &[u8], output: &mut [f32]) -> Result<()> {
             let x1 = (qs[j] >> 4) as i16 - 8;
             out[j] = x0 as f32 * d;
             out[j + 16] = x1 as f32 * d;
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize Q5_0 blocks to f32.
+///
+/// Block layout (22 bytes, 32 elements):
+///   f16 d          — scale
+///   u32 qh         — one high bit for each quantized value
+///   u8  qs[16]     — packed low nibbles (first 16, then second 16)
+fn dequantize_q5_0(data: &[u8], output: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 22;
+    const BLOCK_ELEMS: usize = 32;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "Q5_0 data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "Q5_0 output buffer too small".into(),
+        ));
+    }
+
+    for i in 0..num_blocks {
+        let block = &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+        let d = f16_from_le_bytes([block[0], block[1]]);
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let qs = &block[6..22];
+        let out = &mut output[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
+
+        for j in 0..16 {
+            let low = (qs[j] & 0x0f) as u32 | (((qh >> j) & 1) << 4);
+            let high = (qs[j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+            out[j] = (low as i32 - 16) as f32 * d;
+            out[j + 16] = (high as i32 - 16) as f32 * d;
         }
     }
     Ok(())
@@ -1291,6 +1334,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::F16 => dequantize_f16(data, output),
         GgmlType::BF16 => dequantize_bf16(data, output),
         GgmlType::Q4_0 => dequantize_q4_0(data, output),
+        GgmlType::Q5_0 => dequantize_q5_0(data, output),
         GgmlType::Q8_0 => dequantize_q8_0(data, output),
         GgmlType::Q2_K => dequantize_q2_k(data, output),
         GgmlType::Q3_K => dequantize_q3_k(data, output),
@@ -1734,7 +1778,7 @@ impl GgufFile {
 
     /// Load a tensor as a raw buffer on the Metal device.
     ///
-    /// For quantized types (Q4_0, Q8_0, Q4_K, Q6_K) the buffer contains raw
+    /// For quantized types (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K) the buffer contains raw
     /// GGML blocks with dtype `U8` — these are consumed directly by
     /// `quantized_matmul_ggml` kernels.
     ///
@@ -1788,6 +1832,7 @@ impl GgufFile {
                 Ok(buf)
             }
             GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q8_0
             | GgmlType::Q2_K
             | GgmlType::Q3_K
@@ -2046,6 +2091,7 @@ fn raw_tensor_dtype(ggml_type: GgmlType) -> DType {
         GgmlType::BF16 => DType::BF16,
         GgmlType::I32 => DType::I32,
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
         | GgmlType::Q3_K

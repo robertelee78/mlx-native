@@ -88,6 +88,7 @@ impl GgmlType {
     fn id_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
+            GgmlType::Q5_0 => "kernel_mul_mv_id_q5_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_id_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mv_id_q3_K_f32",
@@ -113,6 +114,7 @@ impl GgmlType {
     fn id_mm_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_id_q5_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mm_id_q3_K_f32",
@@ -140,6 +142,7 @@ impl GgmlType {
     fn id_mm_tensor_kernel_name(self) -> &'static str {
         match self {
             GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_id_q5_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32",
             GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_tensor_f32",
             GgmlType::Q3_K => "kernel_mul_mm_id_q3_K_tensor_f32",
@@ -1085,6 +1088,7 @@ fn dispatch_id_mv(
         // and `kernel_mul_mv_id_iq4_nl_f32` (both NWG=2, NSIMDGROUP=2,
         // ngroups along K = nb/4 → 8 thread blocks of 8 rows each).
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL
@@ -1963,6 +1967,7 @@ fn dispatch_id_mm_with_layout(
     // ADR-022 Phase 2 — Q5_K added. ADR-033 §Pi Task #20 — IQ4_XS added.
     match params.ggml_type {
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
         | GgmlType::Q3_K

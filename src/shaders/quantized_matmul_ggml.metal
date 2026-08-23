@@ -89,6 +89,14 @@ typedef struct {
 static_assert(sizeof(block_q4_0) == sizeof(half) + QK4_0 / 2, "wrong q4_0 block size");
 
 typedef struct {
+    half    d;
+    uint8_t qh[4];
+    uint8_t qs[QK4_0 / 2];
+} block_q5_0;
+static_assert(sizeof(block_q5_0) == sizeof(half) + 4 + QK4_0 / 2,
+              "wrong q5_0 block size");
+
+typedef struct {
     half   d;          // delta (scale)
     int8_t qs[QK8_0];  // 32 signed 8-bit quants
 } block_q8_0;
@@ -309,6 +317,26 @@ inline float block_q4_0_dot_y(
     return d * (sumy * -8.f + acc[0] + acc[1] + acc[2] + acc[3]);
 }
 
+inline float block_q5_0_dot_y(
+    device const block_q5_0 * qb,
+    float sumy,
+    thread float * yl,
+    int il
+) {
+    const float d = qb->d;
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    device const uint16_t * qs = ((device const uint16_t *)qb + 3 + il/2);
+    const uint qh = *((device const uint *)qb->qh);
+
+    for (int i = 0; i < 8; i += 2) {
+        acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i + 0 + il     ) << 4 ) & 0x00010));
+        acc[1] += yl[i + 1] * ((qs[i / 2] & 0x0F00) | ((qh >> (i + 1 + il     ) << 12) & 0x01000));
+        acc[2] += yl[i + 8] * ((qs[i / 2] & 0x00F0) | ((qh >> (i + 0 + il + 16) << 8 ) & 0x00100));
+        acc[3] += yl[i + 9] * ((qs[i / 2] & 0xF000) | ((qh >> (i + 1 + il + 16) << 16) & 0x10000));
+    }
+    return d * (sumy * -16.f + acc[0] + acc[1] + acc[2] + acc[3]);
+}
+
 kernel void kernel_mul_mv_q4_0_f32(
     device const  void  * src0   [[buffer(0)]],
     device const float  * src1   [[buffer(1)]],
@@ -363,6 +391,62 @@ kernel void kernel_mul_mv_q4_0_f32(
             sumf[row] += block_q4_0_dot_y(x + ib + row*nb, sumy[0] + sumy[1], yl, il);
         }
 
+        yb += QK4_0 * 16;
+    }
+
+    for (int row = 0; row < nr; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < p.ne01) {
+            dst[im*p.ne0*p.ne1 + r1*p.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+// Q5_0 uses the Q4_0 launch geometry and activation packing. Its fifth
+// quantization bit is stored in qh and its signed zero point is 16.
+kernel void kernel_mul_mv_q5_0_f32(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = p.ne00 / QK4_0;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * nsg + sgitg) * nr;
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
+    const uint offset0 = first_row * nb + (i12/QMM_R2(p))*(nb*p.ne01) + (i13/QMM_R3(p))*(nb*p.ne01*p.ne02);
+
+    device const block_q5_0 * x = (device const block_q5_0 *)src0 + offset0;
+    device const float * y = src1 + r1*p.ne10 + im*p.ne00*p.ne1;
+    float yl[16];
+    float sumf[nr] = {0.f};
+    const int ix = tiisg / 2;
+    const int il = (tiisg % 2) * 8;
+    device const float * yb = y + ix * QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += nw/2) {
+        float sumy[2] = {0.f, 0.f};
+        for (int i = 0; i < 8; i += 2) {
+            sumy[0] += yb[i] + yb[i+1];
+            yl[i+0] = yb[i+0];
+            yl[i+1] = yb[i+1] / 256.f;
+            sumy[1] += yb[i+16] + yb[i+17];
+            yl[i+8] = yb[i+16] / 16.f;
+            yl[i+9] = yb[i+17] / 4096.f;
+        }
+        for (int row = 0; row < nr; row++) {
+            sumf[row] += block_q5_0_dot_y(x + ib + row*nb, sumy[0] + sumy[1], yl, il);
+        }
         yb += QK4_0 * 16;
     }
 

@@ -237,6 +237,7 @@ pub enum GgmlKernelRoute {
     EmbeddingBF16,
     EmbeddingQ2K,
     EmbeddingQ4_0,
+    EmbeddingQ5_0,
     EmbeddingQ4K,
     EmbeddingQ5K,
     EmbeddingQ6K,
@@ -381,6 +382,7 @@ fn quantized_matmul_type(ggml_type: GgmlType) -> bool {
     matches!(
         ggml_type,
         GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q8_0
             | GgmlType::Q2_K
             | GgmlType::Q3_K
@@ -618,7 +620,7 @@ pub(crate) fn plan_dense_auto_route(
         // K-quants use mul_mv_ext only once four columns can amortize the
         // wider dequantization path.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (4..=MM_ROUTING_THRESHOLD).contains(&m),
-        GgmlType::Q4_0 | GgmlType::Q8_0 => (2..=MM_ROUTING_THRESHOLD).contains(&m),
+        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 => (2..=MM_ROUTING_THRESHOLD).contains(&m),
         _ => false,
     };
     if routing.dense_decode_mv_ext && mv_ext_width_supported && k >= 32 {
@@ -838,7 +840,7 @@ fn perm021(request: &GgmlCapabilityRequest, head_dim: u32, bytes: u64) -> GgmlCa
     let (_, _, k) = request.invocation.dimensions();
     if !matches!(
         request.ggml_type,
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K
+        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q6_K
     ) || head_dim == 0
         || head_dim % 32 != 0
         || k % head_dim != 0
@@ -846,7 +848,7 @@ fn perm021(request: &GgmlCapabilityRequest, head_dim: u32, bytes: u64) -> GgmlCa
         return GgmlCapability::unsupported(
             request,
             GgmlRejectionCode::InvalidOperationContract,
-            "perm021 requires Q4_0/Q8_0/Q6_K and a 32-aligned head dimension dividing K",
+            "perm021 requires Q4_0/Q5_0/Q8_0/Q6_K and a 32-aligned head dimension dividing K",
         );
     }
     let specialized = request.workload == GgmlWorkloadClass::Prompt;
@@ -1163,6 +1165,7 @@ fn embedding(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
         GgmlType::BF16 => GgmlKernelRoute::EmbeddingBF16,
         GgmlType::Q2_K => GgmlKernelRoute::EmbeddingQ2K,
         GgmlType::Q4_0 => GgmlKernelRoute::EmbeddingQ4_0,
+        GgmlType::Q5_0 => GgmlKernelRoute::EmbeddingQ5_0,
         GgmlType::Q4_K => GgmlKernelRoute::EmbeddingQ4K,
         GgmlType::Q5_K => GgmlKernelRoute::EmbeddingQ5K,
         GgmlType::Q6_K => GgmlKernelRoute::EmbeddingQ6K,

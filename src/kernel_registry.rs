@@ -230,6 +230,7 @@ impl KernelRegistry {
         // GGML block-format quantized mat-vec kernels (ADR-006 Phase 3)
         let ggml_src: &'static str = include_str!("shaders/quantized_matmul_ggml.metal");
         sources.insert("kernel_mul_mv_q4_0_f32".into(), ggml_src);
+        sources.insert("kernel_mul_mv_q5_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q8_0_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q2_K_f32".into(), ggml_src);
         sources.insert("kernel_mul_mv_q3_K_f32".into(), ggml_src);
@@ -268,6 +269,7 @@ impl KernelRegistry {
         // every block per prompt-token as the mv kernel does.
         let ggml_mm_src: &'static str = include_str!("shaders/quantized_matmul_mm.metal");
         sources.insert("kernel_mul_mm_q4_0_f32".into(), ggml_mm_src);
+        sources.insert("kernel_mul_mm_q5_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q8_0_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q2_K_f32".into(), ggml_mm_src);
         sources.insert("kernel_mul_mm_q3_K_f32".into(), ggml_mm_src);
@@ -293,8 +295,13 @@ impl KernelRegistry {
         let ggml_mm_tensor_src: &'static str =
             include_str!("shaders/quantized_matmul_mm_tensor.metal");
         sources.insert("kernel_mul_mm_q4_0_tensor_f32".into(), ggml_mm_tensor_src);
+        sources.insert("kernel_mul_mm_q5_0_tensor_f32".into(), ggml_mm_tensor_src);
         sources.insert(
             "kernel_mul_mm_q4_0_tensor_bf16_perm021".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q5_0_tensor_bf16_perm021".into(),
             ggml_mm_tensor_src,
         );
         sources.insert(
@@ -335,6 +342,10 @@ impl KernelRegistry {
         // dispatcher can pick V1 vs V2 at runtime via HF2Q_LARGE_TILE_MM.
         sources.insert(
             "kernel_mul_mm_q4_0_tensor_v2_f32".into(),
+            ggml_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_q5_0_tensor_v2_f32".into(),
             ggml_mm_tensor_src,
         );
         sources.insert(
@@ -400,10 +411,10 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_3".into(), mul_mv_ext_src);
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_4".into(), mul_mv_ext_src);
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_5".into(), mul_mv_ext_src);
-        // ADR-022 Phase 4 — Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K mv_ext.
-        // 5 types × 4 r1ptg widths = 20 instantiations.
+        // Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K mv_ext.
+        // 6 types × 4 r1ptg widths = 24 instantiations.
         for r1 in [2, 3, 4, 5].iter() {
-            for ty in ["q4_0", "q8_0", "q4_K", "q5_K", "q6_K"].iter() {
+            for ty in ["q4_0", "q5_0", "q8_0", "q4_K", "q5_K", "q6_K"].iter() {
                 let name = format!("kernel_mul_mv_ext_{ty}_f32_r1_{r1}");
                 sources.insert(name, mul_mv_ext_src);
             }
@@ -523,6 +534,7 @@ impl KernelRegistry {
         // Expert-routed (MoE) GGML block-format quantized matmul kernels
         let ggml_id_src: &'static str = include_str!("shaders/quantized_matmul_id_ggml.metal");
         sources.insert("kernel_mul_mv_id_q4_0_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q5_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q2_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q3_K_f32".into(), ggml_id_src);
@@ -559,6 +571,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_map0_ne20_6".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_q5_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q2_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q3_K_f32".into(), ggml_id_mm_src);
@@ -592,6 +605,10 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_mm_tensor.metal");
         sources.insert(
             "kernel_mul_mm_id_q4_0_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_q5_0_tensor_f32".into(),
             ggml_id_mm_tensor_src,
         );
         sources.insert(
@@ -1244,6 +1261,10 @@ impl KernelRegistry {
         sources.insert(
             "embedding_gather_q4_0_f32".into(),
             include_str!("shaders/embedding_q4_0.metal"),
+        );
+        sources.insert(
+            "embedding_gather_q5_0_f32".into(),
+            include_str!("shaders/embedding_q5_0.metal"),
         );
         sources.insert(
             "embedding_gather_q4_k_f32".into(),
