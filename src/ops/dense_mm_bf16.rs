@@ -82,7 +82,9 @@ struct DenseMmBf16F32TensorGpuParams {
 /// # Errors
 ///
 /// `MlxError::InvalidArgument` for any shape, buffer-size, or dtype
-/// mismatch, or if `k < 32` (kernel requires at least one NK=32 tile).
+/// mismatch. Reductions shorter than the NK=32 tile are zero-padded by the
+/// simdgroup and TensorV1 kernels and remain legal; TensorV2 stays gated to
+/// K>=32 until its direct cooperative B view has an explicit short-K proof.
 pub fn dense_matmul_bf16_f32_tensor(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -146,15 +148,16 @@ pub(crate) fn dense_matmul_bf16_f32_with_tile(
     // pipeline + grid (NR0=64, NR1=32) when off, V2 pipeline + grid
     // (NRA=64, NRB=128) when on.  Truthy: "1", "true", "yes" (case-
     // insensitive); anything else → V1.
-    let use_v2_large_tile = match tile {
-        DenseMmBf16TensorTile::Environment => {
-            matches!(
-                std::env::var("HF2Q_LARGE_TILE_MM").as_deref(),
-                Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("yes") | Ok("YES")
-            )
-        }
-        DenseMmBf16TensorTile::V1 => false,
-    };
+    let use_v2_large_tile = params.k >= 32
+        && match tile {
+            DenseMmBf16TensorTile::Environment => {
+                matches!(
+                    std::env::var("HF2Q_LARGE_TILE_MM").as_deref(),
+                    Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("yes") | Ok("YES")
+                )
+            }
+            DenseMmBf16TensorTile::V1 => false,
+        };
     let tensor_kernel_name = if use_v2_large_tile {
         "hf2q_dense_mm_bf16_f32_tensor_v2"
     } else {
