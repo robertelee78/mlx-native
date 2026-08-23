@@ -190,7 +190,7 @@ fn main() {
         &warm,
         &DenseQ4CartesianAcceptanceRequirements {
             // Acceptance stays pinned to the complete named profile. The
-            // environment overrides remain useful for diagnostics, but a
+            // environment overrides remain useful for diagnostics, but
             // reduced layer/projection/row runs cannot publish, and a budget
             // override cannot expand the profile's qualification ceiling.
             expected_base_shapes: profile.projections.len() as u32,
