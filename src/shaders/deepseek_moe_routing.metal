@@ -199,12 +199,15 @@ kernel void deepseek_moe_sanitize_indices(
         constant DeepSeekMoeRoutingParams &p [[buffer(0)]],
         device const int *indices           [[buffer(1)]],
         device uint *safe_indices           [[buffer(2)]],
+        device atomic_uint *invalid_status  [[buffer(3)]],
         uint token                          [[threadgroup_position_in_grid]],
         uint slot                           [[thread_index_in_threadgroup]]) {
     if (token >= p.n_tokens || slot >= DSV4_TOP_K) return;
     const ulong offset = ulong(token) * DSV4_TOP_K + slot;
     const int expert = indices[offset];
-    safe_indices[offset] = expert >= 0 && expert < int(DSV4_EXPERTS)
-        ? uint(expert)
-        : 0u;
+    const bool valid = expert >= 0 && expert < int(DSV4_EXPERTS);
+    safe_indices[offset] = valid ? uint(expert) : 0u;
+    if (!valid) {
+        atomic_fetch_or_explicit(invalid_status, 1u, memory_order_relaxed);
+    }
 }

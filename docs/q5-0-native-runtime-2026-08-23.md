@@ -39,12 +39,19 @@ its fixed-capacity schedule, and marks the schedule invalid on-device; every
 SIMD, tensor, fused, or schedule-reuse consumer then poisons the entire output
 and returns before reading weights or activations. This is a memory-safety and
 device-sentinel contract, not by itself a host `Err`: the graph consumer must
-reject the non-finite value at an existing result readback. The current hf2q
-linear and batched prefill paths do so for their argmax value; every decode and
-sampling consumer must provide the same check before this can be called
-end-to-end fail-closed. The device argmax preserves this signal as
+reject the non-finite value at an existing result readback. The downstream
+integration candidate validates the index/value pair in every generative GPU
+argmax consumer and validates raw full-logit/top-K readbacks before sampling.
+The device argmax preserves this signal as
 `(u32::MAX, NaN)` whenever any input logit is non-finite, using its existing
-index/value result buffers and no additional synchronization or copy.
+index/value result buffers and no additional synchronization or copy. DeepSeek
+uses an explicit sticky U32 status because its safe-index bridge deliberately
+substitutes expert zero and later graph stages sanitize non-finite activations;
+the safe-index, SwiGLU, and weighted-reduction kernels atomically mark invalid
+routes or dynamic values while keeping addresses and intermediate rows
+contained, and the downstream verifier checks that word after its existing
+wait and before publishing cache state. These source contracts
+remain unaccepted until the locked backend and downstream hardware gates run.
 
 Codec-specific fused gate/up and fused expert-down kernels remain limited to
 the codecs they actually implement. A Q5_0 caller uses the ordinary native
