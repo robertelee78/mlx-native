@@ -13,9 +13,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use mlx_native::ops::ssm_conv::{
-    dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams,
+    dispatch_ssm_conv, dispatch_ssm_conv_with_capture, dispatch_ssm_conv_with_selected_capture,
+    SsmConvParams,
 };
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CapturedNode, DType, DispatchKind, KernelRegistry, MlxBuffer, MlxDevice};
 
 fn setup() -> (MlxDevice, KernelRegistry) {
     let device = MlxDevice::new().expect("MlxDevice::new");
@@ -27,7 +28,9 @@ fn upload_f32(device: &MlxDevice, data: &[f32]) -> MlxBuffer {
     let mut buf = device
         .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
         .expect("alloc");
-    buf.as_mut_slice::<f32>().expect("mut").copy_from_slice(data);
+    buf.as_mut_slice::<f32>()
+        .expect("mut")
+        .copy_from_slice(data);
     buf
 }
 
@@ -74,16 +77,26 @@ fn run_legacy(
 
     let mut enc = device.command_encoder().expect("enc");
     dispatch_ssm_conv(
-        &mut enc, registry, device.metal_device(),
-        &x_buf, &kw_buf, &old_state, &new_state_buf, &y_buf,
-        &params_buf, p,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &x_buf,
+        &kw_buf,
+        &old_state,
+        &new_state_buf,
+        &y_buf,
+        &params_buf,
+        p,
     )
     .expect("dispatch ssm_conv");
     enc.commit_and_wait().expect("commit");
 
     (
         y_buf.as_slice::<f32>().expect("y read").to_vec(),
-        new_state_buf.as_slice::<f32>().expect("new_state read").to_vec(),
+        new_state_buf
+            .as_slice::<f32>()
+            .expect("new_state read")
+            .to_vec(),
     )
 }
 
@@ -113,15 +126,72 @@ fn run_capture(
 
     let mut enc = device.command_encoder().expect("enc");
     dispatch_ssm_conv_with_capture(
-        &mut enc, registry, device.metal_device(),
-        &x_buf, &kw_buf, &old_state, &y_buf, &cap_buf,
-        &params_buf, p,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &x_buf,
+        &kw_buf,
+        &old_state,
+        &y_buf,
+        &cap_buf,
+        &params_buf,
+        p,
     )
     .expect("dispatch ssm_conv_with_capture");
     enc.commit_and_wait().expect("commit");
 
     (
         y_buf.as_slice::<f32>().expect("y read").to_vec(),
+        cap_buf.as_slice::<f32>().expect("cap read").to_vec(),
+    )
+}
+
+fn run_selected_capture(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &[f32],
+    kernel_w: &[f32],
+    state: &[f32],
+    capture_token: u32,
+    p: SsmConvParams,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let x_buf = upload_f32(device, x);
+    let kw_buf = upload_f32(device, kernel_w);
+    let old_state = upload_f32(device, state);
+    let x_elems = (p.channels * p.n_tokens * p.n_seqs) as usize;
+    let capture_elems = (p.n_seqs as usize) * ((p.k_width - 1) as usize) * (p.channels as usize);
+    let y_buf = device
+        .alloc_buffer(x_elems * 4, DType::F32, vec![x_elems])
+        .expect("y alloc");
+    let cap_buf = device
+        .alloc_buffer(capture_elems * 4, DType::F32, vec![capture_elems])
+        .expect("selected cap alloc");
+    let state_buf = device
+        .alloc_buffer(capture_elems * 4, DType::F32, vec![capture_elems])
+        .expect("selected state alloc");
+    let params_buf = build_params_buf(device, p);
+
+    let mut enc = device.command_encoder().expect("enc");
+    dispatch_ssm_conv_with_selected_capture(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &x_buf,
+        &kw_buf,
+        &old_state,
+        &state_buf,
+        &y_buf,
+        &cap_buf,
+        &params_buf,
+        capture_token,
+        p,
+    )
+    .expect("dispatch selected ssm capture");
+    enc.commit_and_wait().expect("commit");
+
+    (
+        y_buf.as_slice::<f32>().expect("y read").to_vec(),
+        state_buf.as_slice::<f32>().expect("state read").to_vec(),
         cap_buf.as_slice::<f32>().expect("cap read").to_vec(),
     )
 }
@@ -133,9 +203,176 @@ fn assert_byte_identical(label: &str, a: &[f32], b: &[f32]) {
             x.to_bits(),
             y.to_bits(),
             "{label}: byte mismatch at idx {} ({} vs {})",
-            i, x, y
+            i,
+            x,
+            y
         );
     }
+}
+
+#[test]
+fn selected_capture_matches_all_position_capture_for_each_sequence() {
+    let (device, mut registry) = setup();
+    let p = SsmConvParams {
+        channels: 64,
+        n_tokens: 7,
+        n_seqs: 2,
+        k_width: 4,
+    };
+    let x_n = (p.channels * p.n_tokens * p.n_seqs) as usize;
+    let w_n = (p.k_width * p.channels) as usize;
+    let s_n = ((p.k_width - 1) * p.channels * p.n_seqs) as usize;
+    let mut seed = 0xB0A7_DA7A;
+    let x = rand_vec(&mut seed, x_n, 0.1);
+    let w = rand_vec(&mut seed, w_n, 0.05);
+    let s = rand_vec(&mut seed, s_n, 0.05);
+    let (ordinary_y, ordinary_state) = run_legacy(&device, &mut registry, &x, &w, &s, p);
+    let (all_y, all_capture) = run_capture(&device, &mut registry, &x, &w, &s, p);
+    assert_byte_identical("all-capture output", &all_y, &ordinary_y);
+
+    let per_token = ((p.k_width - 1) * p.channels) as usize;
+    let all_seq_stride = p.n_tokens as usize * per_token;
+    for capture_token in [0u32, 3, 6] {
+        let (selected_y, selected_state, selected_capture) =
+            run_selected_capture(&device, &mut registry, &x, &w, &s, capture_token, p);
+        assert_byte_identical("selected output", &selected_y, &ordinary_y);
+        assert_byte_identical("selected final state", &selected_state, &ordinary_state);
+        for seq in 0..p.n_seqs as usize {
+            let all_start = seq * all_seq_stride + capture_token as usize * per_token;
+            let selected_start = seq * per_token;
+            assert_byte_identical(
+                &format!("selected token {capture_token} seq {seq}"),
+                &selected_capture[selected_start..selected_start + per_token],
+                &all_capture[all_start..all_start + per_token],
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_capture_rejects_invalid_index_and_destination_before_encoding() {
+    let (device, mut registry) = setup();
+    let p = SsmConvParams {
+        channels: 32,
+        n_tokens: 3,
+        n_seqs: 1,
+        k_width: 4,
+    };
+    let x_elems = (p.channels * p.n_tokens) as usize;
+    let state_elems = ((p.k_width - 1) * p.channels) as usize;
+    let x = upload_f32(&device, &vec![0.1; x_elems]);
+    let kernel = upload_f32(&device, &vec![0.2; (p.k_width * p.channels) as usize]);
+    let old_state = upload_f32(&device, &vec![0.0; state_elems]);
+    let y = device
+        .alloc_buffer(x_elems * 4, DType::F32, vec![x_elems])
+        .expect("y");
+    let new_state = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("new state");
+    let capture = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("capture");
+    let short_capture = device
+        .alloc_buffer((state_elems - 1) * 4, DType::F32, vec![state_elems - 1])
+        .expect("short capture");
+    let params = build_params_buf(&device, p);
+    let mut encoder = device.command_encoder().expect("encoder");
+    let invalid_index = dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x,
+        &kernel,
+        &old_state,
+        &new_state,
+        &y,
+        &capture,
+        &params,
+        p.n_tokens,
+        p,
+    )
+    .expect_err("capture token at n_tokens must fail");
+    assert!(invalid_index.to_string().contains("capture_token"));
+    let invalid_shape = dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x,
+        &kernel,
+        &old_state,
+        &new_state,
+        &y,
+        &short_capture,
+        &params,
+        1,
+        p,
+    )
+    .expect_err("short selected capture must fail");
+    assert!(invalid_shape.to_string().contains("must be F32"));
+}
+
+#[test]
+fn selected_capture_records_a_raw_thread_dispatch() {
+    let (device, mut registry) = setup();
+    let p = SsmConvParams {
+        channels: 32,
+        n_tokens: 3,
+        n_seqs: 2,
+        k_width: 4,
+    };
+    let x_elems = (p.channels * p.n_tokens * p.n_seqs) as usize;
+    let state_elems = ((p.k_width - 1) * p.channels * p.n_seqs) as usize;
+    let x = upload_f32(&device, &vec![0.1; x_elems]);
+    let kernel = upload_f32(&device, &vec![0.2; (p.k_width * p.channels) as usize]);
+    let old_state = upload_f32(&device, &vec![0.0; state_elems]);
+    let y = device
+        .alloc_buffer(x_elems * 4, DType::F32, vec![x_elems])
+        .expect("y");
+    let new_state = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("new state");
+    let capture = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("capture");
+    let params = build_params_buf(&device, p);
+    let mut encoder = device.command_encoder().expect("encoder");
+    encoder.start_capture();
+    dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x,
+        &kernel,
+        &old_state,
+        &new_state,
+        &y,
+        &capture,
+        &params,
+        1,
+        p,
+    )
+    .expect("encode selected capture");
+    let nodes = encoder.take_capture().expect("captured dispatch");
+    let [CapturedNode::Dispatch {
+        threads_per_grid,
+        threads_per_threadgroup,
+        dispatch_kind,
+        ..
+    }] = nodes.as_slice()
+    else {
+        panic!("expected exactly one selected-capture dispatch")
+    };
+    assert!(matches!(dispatch_kind, DispatchKind::Threads));
+    assert_eq!(
+        (threads_per_grid.width, threads_per_grid.height, threads_per_grid.depth),
+        (p.channels as u64, p.n_tokens as u64, p.n_seqs as u64)
+    );
+    assert!(
+        threads_per_threadgroup.width
+            * threads_per_threadgroup.height
+            * threads_per_threadgroup.depth
+            <= 256
+    );
 }
 
 /// AC#1: y output byte-identical between capture and non-capture at
@@ -177,7 +414,7 @@ fn capture_y_byte_identical_qwen35_shape() {
     for i in 0..k_minus1 {
         for c in 0..channels {
             let legacy_idx = c * k_minus1 + i; // [channels, K-1] with K-1 stride 1
-            let cap_idx = i * channels + c;    // [K-1, channels] with channels stride 1
+            let cap_idx = i * channels + c; // [K-1, channels] with channels stride 1
             assert_eq!(
                 legacy_state[legacy_idx].to_bits(),
                 cap_last_t[cap_idx].to_bits(),
@@ -254,8 +491,7 @@ fn capture_intermediate_t_matches_truncated_dispatch() {
     let w = rand_vec(&mut seed, w_n, 0.05);
     let s = rand_vec(&mut seed, s_n, 0.05);
 
-    let (_cap_y, cap_capture) =
-        run_capture(&device, &mut registry, &x, &w, &s, p_full);
+    let (_cap_y, cap_capture) = run_capture(&device, &mut registry, &x, &w, &s, p_full);
 
     let per_t = ((p_full.k_width - 1) * p_full.channels) as usize;
     let k_minus1 = (p_full.k_width - 1) as usize;

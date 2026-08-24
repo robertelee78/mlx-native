@@ -48,7 +48,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -96,6 +96,18 @@ pub fn register(registry: &mut KernelRegistry) {
     );
     registry.register_source(
         "gated_delta_net_decode_capture_f32_4",
+        GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "gated_delta_net_decode_selected_capture_f32_1",
+        GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "gated_delta_net_decode_selected_capture_f32_2",
+        GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "gated_delta_net_decode_selected_capture_f32_4",
         GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE,
     );
 }
@@ -152,14 +164,10 @@ fn validate(
         )));
     }
 
-    let qk_elems = (p.d_k as usize)
-        * (p.n_k_heads as usize)
-        * (p.n_tokens as usize)
-        * (p.n_seqs as usize);
-    let v_elems = (p.d_v as usize)
-        * (p.n_v_heads as usize)
-        * (p.n_tokens as usize)
-        * (p.n_seqs as usize);
+    let qk_elems =
+        (p.d_k as usize) * (p.n_k_heads as usize) * (p.n_tokens as usize) * (p.n_seqs as usize);
+    let v_elems =
+        (p.d_v as usize) * (p.n_v_heads as usize) * (p.n_tokens as usize) * (p.n_seqs as usize);
     let scalar_elems = (p.n_v_heads as usize) * (p.n_tokens as usize) * (p.n_seqs as usize);
     let state_elems =
         (p.d_k as usize) * (p.d_v as usize) * (p.n_v_heads as usize) * (p.n_seqs as usize);
@@ -346,15 +354,21 @@ pub fn dispatch_gated_delta_net_decode_with_capture(
                  required {} (n_tokens={} × state_elems={}); strict EQUALITY required \
                  when n_seqs > 1 (got n_seqs={}) because the per-sequence token stride \
                  depends on params.n_tokens",
-                state_capture.element_count(), capture_required, p.n_tokens,
-                state_elems, p.n_seqs,
+                state_capture.element_count(),
+                capture_required,
+                p.n_tokens,
+                state_elems,
+                p.n_seqs,
             )));
         }
     } else if state_capture.element_count() < capture_required {
         return Err(MlxError::InvalidArgument(format!(
             "gated_delta_net_decode_with_capture: state_capture element count {} < \
              required {} (n_tokens={} × state_elems={})",
-            state_capture.element_count(), capture_required, p.n_tokens, state_elems,
+            state_capture.element_count(),
+            capture_required,
+            p.n_tokens,
+            state_elems,
         )));
     }
     if state_capture.dtype() != DType::F32 {
@@ -400,5 +414,98 @@ pub fn dispatch_gated_delta_net_decode_with_capture(
         tg,
     );
 
+    Ok(())
+}
+
+/// Dispatch the same recurrent forward while retaining exactly one selected
+/// intermediate state per sequence.
+///
+/// This is the bounded-memory counterpart to
+/// [`dispatch_gated_delta_net_decode_with_capture`]. It preserves every
+/// output and the final `state_out`, but `state_capture` is only
+/// `[D_k, D_v, n_v_heads, n_seqs]`; its sequence `s` slice is the state after
+/// `capture_token` for sequence `s`. The allocation is therefore independent
+/// of the enclosing prefill length.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gated_delta_net_decode_with_selected_capture(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    g: &MlxBuffer,
+    beta: &MlxBuffer,
+    state_in: &MlxBuffer,
+    output: &MlxBuffer,
+    state_out: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    state_capture: &MlxBuffer,
+    capture_token: u32,
+    p: GatedDeltaNetParams,
+) -> Result<()> {
+    validate(&p, q, k, v, g, beta, state_in, output, state_out)?;
+    validate_params_buf(params_buf)?;
+    if capture_token >= p.n_tokens {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode_with_selected_capture: capture_token {} >= n_tokens {}",
+            capture_token, p.n_tokens
+        )));
+    }
+    let state_elems = (p.d_k as usize)
+        .checked_mul(p.d_v as usize)
+        .and_then(|value| value.checked_mul(p.n_v_heads as usize))
+        .and_then(|value| value.checked_mul(p.n_seqs as usize))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(
+                "gated_delta_net_decode_with_selected_capture: state shape overflow".into(),
+            )
+        })?;
+    if state_capture.element_count() != state_elems {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode_with_selected_capture: state_capture element count {} != selected-state elements {}",
+            state_capture.element_count(), state_elems
+        )));
+    }
+    if state_capture.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "gated_delta_net_decode_with_selected_capture: state_capture must be f32 (got {})",
+            state_capture.dtype()
+        )));
+    }
+
+    let nsg = p.d_k / 32;
+    let kernel_name = match nsg {
+        1 => "gated_delta_net_decode_selected_capture_f32_1",
+        2 => "gated_delta_net_decode_selected_capture_f32_2",
+        4 => "gated_delta_net_decode_selected_capture_f32_4",
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "gated_delta_net_decode_with_selected_capture: unsupported NSG={} (D_k={})",
+                other, p.d_k
+            )))
+        }
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let tg = MTLSize::new(32, nsg as u64, 1);
+    let grid_tgs = MTLSize::new((p.d_v / nsg) as u64, p.n_v_heads as u64, p.n_seqs as u64);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(q)),
+            (1, KernelArg::Buffer(k)),
+            (2, KernelArg::Buffer(v)),
+            (3, KernelArg::Buffer(g)),
+            (4, KernelArg::Buffer(beta)),
+            (5, KernelArg::Buffer(state_in)),
+            (6, KernelArg::Buffer(output)),
+            (7, KernelArg::Buffer(state_out)),
+            (8, KernelArg::Buffer(params_buf)),
+            (9, KernelArg::Buffer(state_capture)),
+            (10, KernelArg::Bytes(as_bytes(&capture_token))),
+        ],
+        grid_tgs,
+        tg,
+    );
     Ok(())
 }

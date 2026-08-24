@@ -44,7 +44,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -54,8 +54,7 @@ pub static SSM_CONV_SHADER_SOURCE: &str = include_str!("../shaders/ssm_conv.meta
 /// kernel for K=N speculative decoding rollback on hybrid Qwen 3.5/3.6.
 /// Source: `../shaders/ssm_conv_capture.metal` — port of MTPLX
 /// `gdn_capture.py:61-125`.
-pub static SSM_CONV_CAPTURE_SHADER_SOURCE: &str =
-    include_str!("../shaders/ssm_conv_capture.metal");
+pub static SSM_CONV_CAPTURE_SHADER_SOURCE: &str = include_str!("../shaders/ssm_conv_capture.metal");
 
 /// Register SSM conv shader sources with the given kernel registry.
 pub fn register(registry: &mut KernelRegistry) {
@@ -70,6 +69,10 @@ pub fn register(registry: &mut KernelRegistry) {
         "ssm_conv_capture_forward_f32",
         SSM_CONV_CAPTURE_SHADER_SOURCE,
     );
+    registry.register_source(
+        "ssm_conv_selected_capture_forward_f32",
+        SSM_CONV_CAPTURE_SHADER_SOURCE,
+    );
 }
 
 /// Shape parameters for an ssm_conv dispatch.
@@ -79,6 +82,22 @@ pub struct SsmConvParams {
     pub n_tokens: u32,
     pub n_seqs: u32,
     pub k_width: u32, // typically 4; ADR-013 forbids K <= 1
+}
+
+#[inline]
+fn selected_capture_dispatch_sizes(params: SsmConvParams) -> (MTLSize, MTLSize) {
+    let grid = MTLSize::new(
+        params.channels as u64,
+        params.n_tokens as u64,
+        params.n_seqs as u64,
+    );
+    let tg_c = std::cmp::min(params.channels, 256).max(1);
+    let remain = 256u32 / tg_c;
+    let tg_t = std::cmp::min(params.n_tokens, remain).max(1);
+    let remain2 = (256u32 / (tg_c * tg_t)).max(1);
+    let tg_s = std::cmp::min(params.n_seqs, remain2).max(1);
+    let tg = MTLSize::new(tg_c as u64, tg_t as u64, tg_s as u64);
+    (grid, tg)
 }
 
 fn validate(
@@ -104,9 +123,8 @@ fn validate(
         .and_then(|v| v.checked_mul(params.n_seqs as usize))
         .ok_or_else(|| MlxError::InvalidArgument("ssm_conv: shape overflow".into()))?;
     let w_elems = (params.k_width as usize) * (params.channels as usize);
-    let s_elems = ((params.k_width - 1) as usize)
-        * (params.channels as usize)
-        * (params.n_seqs as usize);
+    let s_elems =
+        ((params.k_width - 1) as usize) * (params.channels as usize) * (params.n_seqs as usize);
 
     if x.element_count() != x_elems {
         return Err(MlxError::InvalidArgument(format!(
@@ -254,14 +272,18 @@ pub fn dispatch_ssm_conv(
     // When su_tg_i is itself a multiple of 32 (rare for SSM conv), step = 1
     // and any su_tg_c works — leaves the original value.
     fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
-        while b != 0 { let t = b; b = a % b; a = t; }
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
         a
     }
     let step = 32u32 / gcd_u32(su_tg_i, 32);
     let su_tg_c = if step <= 1 {
         su_tg_c_raw
     } else if su_tg_c_raw >= step {
-        (su_tg_c_raw / step) * step  // round DOWN to multiple of step
+        (su_tg_c_raw / step) * step // round DOWN to multiple of step
     } else {
         // su_tg_c_raw < step: can't satisfy multiple-of-32 with this su_tg_i.
         // Leave su_tg_c_raw alone; safety check will fire under
@@ -275,12 +297,7 @@ pub fn dispatch_ssm_conv(
 
     encoder.encode(
         state_pipeline,
-        &[
-            (0, x),
-            (1, old_state),
-            (2, new_state),
-            (3, params_buf),
-        ],
+        &[(0, x), (1, old_state), (2, new_state), (3, params_buf)],
         state_grid,
         state_tg,
     );
@@ -343,9 +360,8 @@ pub fn dispatch_ssm_conv_with_capture(
         .checked_mul(params.n_tokens as usize)
         .and_then(|v| v.checked_mul(params.n_seqs as usize))
         .ok_or_else(|| MlxError::InvalidArgument("ssm_conv_with_capture: shape overflow".into()))?;
-    let s_elems = ((params.k_width - 1) as usize)
-        * (params.channels as usize)
-        * (params.n_seqs as usize);
+    let s_elems =
+        ((params.k_width - 1) as usize) * (params.channels as usize) * (params.n_seqs as usize);
     let capture_elems = (params.n_seqs as usize)
         * (params.n_tokens as usize)
         * ((params.k_width - 1) as usize)
@@ -362,13 +378,16 @@ pub fn dispatch_ssm_conv_with_capture(
         if buf.element_count() != exp {
             return Err(MlxError::InvalidArgument(format!(
                 "ssm_conv_with_capture: {} element count {} != expected {}",
-                name, buf.element_count(), exp
+                name,
+                buf.element_count(),
+                exp
             )));
         }
         if buf.dtype() != DType::F32 {
             return Err(MlxError::InvalidArgument(format!(
                 "ssm_conv_with_capture: {} must be F32 (got {})",
-                name, buf.dtype()
+                name,
+                buf.dtype()
             )));
         }
     }
@@ -404,4 +423,92 @@ pub fn dispatch_ssm_conv_with_capture(
     );
 
     Ok(())
+}
+
+/// Fused SSM convolution with one selected intermediate state and the normal
+/// final state.
+///
+/// `conv_capture` owns exactly one state per sequence in
+/// `[n_seqs, K-1, channels]` order, independent of `n_tokens`. `new_state`
+/// retains the ordinary `[n_seqs, channels, K-1]` final-state contract.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_ssm_conv_with_selected_capture(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    x: &MlxBuffer,
+    kernel_w: &MlxBuffer,
+    old_state: &MlxBuffer,
+    new_state: &MlxBuffer,
+    y: &MlxBuffer,
+    conv_capture: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    capture_token: u32,
+    params: SsmConvParams,
+) -> Result<()> {
+    validate(&params, x, kernel_w, old_state, new_state, y)?;
+    if capture_token >= params.n_tokens {
+        return Err(MlxError::InvalidArgument(format!(
+            "ssm_conv_with_selected_capture: capture_token {} >= n_tokens {}",
+            capture_token, params.n_tokens
+        )));
+    }
+    let capture_elems = (params.n_seqs as usize)
+        .checked_mul((params.k_width - 1) as usize)
+        .and_then(|value| value.checked_mul(params.channels as usize))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("ssm_conv_with_selected_capture: shape overflow".into())
+        })?;
+    if conv_capture.element_count() != capture_elems || conv_capture.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "ssm_conv_with_selected_capture: conv_capture must be F32 with {} elements (got dtype {} elements {})",
+            capture_elems,
+            conv_capture.dtype(),
+            conv_capture.element_count()
+        )));
+    }
+    if params_buf.dtype() != DType::U32 || params_buf.element_count() < 4 {
+        return Err(MlxError::InvalidArgument(format!(
+            "ssm_conv_with_selected_capture: params_buf must contain at least four u32 values (got dtype {} elements {})",
+            params_buf.dtype(),
+            params_buf.element_count()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("ssm_conv_selected_capture_forward_f32", device)?;
+    let (grid, tg) = selected_capture_dispatch_sizes(params);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(x)),
+            (1, KernelArg::Buffer(kernel_w)),
+            (2, KernelArg::Buffer(old_state)),
+            (3, KernelArg::Buffer(y)),
+            (4, KernelArg::Buffer(new_state)),
+            (5, KernelArg::Buffer(conv_capture)),
+            (6, KernelArg::Buffer(params_buf)),
+            (7, KernelArg::Bytes(as_bytes(&capture_token))),
+        ],
+        grid,
+        tg,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod selected_capture_tests {
+    use super::{selected_capture_dispatch_sizes, SsmConvParams};
+
+    #[test]
+    fn production_prefill_geometry_is_a_raw_thread_grid() {
+        let params = SsmConvParams {
+            channels: 8192,
+            n_tokens: 4096,
+            n_seqs: 1,
+            k_width: 4,
+        };
+        let (grid, threadgroup) = selected_capture_dispatch_sizes(params);
+        assert_eq!((grid.width, grid.height, grid.depth), (8192, 4096, 1));
+        assert!(threadgroup.width * threadgroup.height * threadgroup.depth <= 256);
+    }
 }

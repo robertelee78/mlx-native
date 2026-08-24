@@ -17,6 +17,7 @@
 use mlx_native::ops::gated_delta_net::{build_gated_delta_net_params, GatedDeltaNetParams};
 use mlx_native::ops::gated_delta_net_decode::{
     dispatch_gated_delta_net_decode, dispatch_gated_delta_net_decode_with_capture,
+    dispatch_gated_delta_net_decode_with_selected_capture,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -30,7 +31,9 @@ fn upload_f32(device: &MlxDevice, data: &[f32]) -> MlxBuffer {
     let mut buf = device
         .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
         .expect("alloc");
-    buf.as_mut_slice::<f32>().expect("mut").copy_from_slice(data);
+    buf.as_mut_slice::<f32>()
+        .expect("mut")
+        .copy_from_slice(data);
     buf
 }
 
@@ -96,9 +99,19 @@ fn run_decode(
     let params = build_gated_delta_net_params(device, p).expect("params");
     let mut enc = device.command_encoder().expect("enc");
     dispatch_gated_delta_net_decode(
-        &mut enc, registry, device.metal_device(),
-        &q_buf, &k_buf, &v_buf, &g_buf, &beta_buf, &si_buf, &out_buf, &so_buf,
-        &params, p,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &g_buf,
+        &beta_buf,
+        &si_buf,
+        &out_buf,
+        &so_buf,
+        &params,
+        p,
     )
     .expect("dispatch decode");
     enc.commit_and_wait().expect("commit");
@@ -140,11 +153,79 @@ fn run_decode_with_capture(
     let params = build_gated_delta_net_params(device, p).expect("params");
     let mut enc = device.command_encoder().expect("enc");
     dispatch_gated_delta_net_decode_with_capture(
-        &mut enc, registry, device.metal_device(),
-        &q_buf, &k_buf, &v_buf, &g_buf, &beta_buf, &si_buf, &out_buf, &so_buf,
-        &params, &sc_buf, p,
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &g_buf,
+        &beta_buf,
+        &si_buf,
+        &out_buf,
+        &so_buf,
+        &params,
+        &sc_buf,
+        p,
     )
     .expect("dispatch decode_with_capture");
+    enc.commit_and_wait().expect("commit");
+    (
+        out_buf.as_slice::<f32>().expect("read out").to_vec(),
+        so_buf.as_slice::<f32>().expect("read state").to_vec(),
+        sc_buf.as_slice::<f32>().expect("read capture").to_vec(),
+    )
+}
+
+fn run_decode_with_selected_capture(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state_in: &[f32],
+    capture_token: u32,
+    p: GatedDeltaNetParams,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q_buf = upload_f32(device, q);
+    let k_buf = upload_f32(device, k);
+    let v_buf = upload_f32(device, v);
+    let g_buf = upload_f32(device, g);
+    let beta_buf = upload_f32(device, beta);
+    let si_buf = upload_f32(device, state_in);
+    let v_elems = (p.d_v * p.n_v_heads * p.n_tokens * p.n_seqs) as usize;
+    let state_elems = (p.d_k * p.d_v * p.n_v_heads * p.n_seqs) as usize;
+    let out_buf = device
+        .alloc_buffer(v_elems * 4, DType::F32, vec![v_elems])
+        .expect("out");
+    let so_buf = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("so");
+    let sc_buf = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("selected capture");
+    let params = build_gated_delta_net_params(device, p).expect("params");
+    let mut enc = device.command_encoder().expect("enc");
+    dispatch_gated_delta_net_decode_with_selected_capture(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &g_buf,
+        &beta_buf,
+        &si_buf,
+        &out_buf,
+        &so_buf,
+        &params,
+        &sc_buf,
+        capture_token,
+        p,
+    )
+    .expect("dispatch selected capture");
     enc.commit_and_wait().expect("commit");
     (
         out_buf.as_slice::<f32>().expect("read out").to_vec(),
@@ -160,9 +241,137 @@ fn assert_byte_identical(label: &str, a: &[f32], b: &[f32]) {
             x.to_bits(),
             y.to_bits(),
             "{label}: byte mismatch at idx {} ({} vs {})",
-            i, x, y
+            i,
+            x,
+            y
         );
     }
+}
+
+/// A stable-boundary checkpoint needs one intermediate recurrent state, not
+/// an allocation proportional to every token in the enclosing prefill. The
+/// selected-capture primitive must preserve the ordinary forward exactly and
+/// return the same bytes as the corresponding slice of all-position capture.
+#[test]
+fn selected_capture_matches_all_position_capture_without_changing_forward() {
+    let (device, mut registry) = setup();
+    let p = GatedDeltaNetParams {
+        d_k: 64,
+        d_v: 64,
+        n_k_heads: 2,
+        n_v_heads: 4,
+        n_tokens: 7,
+        n_seqs: 2,
+    };
+    let (q, k, v, g, beta, state_in) = random_inputs(p, 0xB0A7_DA7A);
+    let (ordinary_out, ordinary_state) =
+        run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+    let (all_out, all_state, all_capture) =
+        run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+    assert_byte_identical("all-capture output", &all_out, &ordinary_out);
+    assert_byte_identical("all-capture final state", &all_state, &ordinary_state);
+
+    let per_seq_state = (p.d_k * p.d_v * p.n_v_heads) as usize;
+    let all_seq_stride = p.n_tokens as usize * per_seq_state;
+    for capture_token in [0u32, 3, 6] {
+        let (selected_out, selected_state, selected_capture) = run_decode_with_selected_capture(
+            &device,
+            &mut registry,
+            &q,
+            &k,
+            &v,
+            &g,
+            &beta,
+            &state_in,
+            capture_token,
+            p,
+        );
+        assert_byte_identical("selected output", &selected_out, &ordinary_out);
+        assert_byte_identical("selected final state", &selected_state, &ordinary_state);
+        for seq in 0..p.n_seqs as usize {
+            let all_start = seq * all_seq_stride + capture_token as usize * per_seq_state;
+            let selected_start = seq * per_seq_state;
+            assert_byte_identical(
+                &format!("selected token {capture_token} seq {seq}"),
+                &selected_capture[selected_start..selected_start + per_seq_state],
+                &all_capture[all_start..all_start + per_seq_state],
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_capture_rejects_invalid_index_and_destination_before_encoding() {
+    let (device, mut registry) = setup();
+    let p = GatedDeltaNetParams {
+        d_k: 32,
+        d_v: 32,
+        n_k_heads: 1,
+        n_v_heads: 2,
+        n_tokens: 3,
+        n_seqs: 1,
+    };
+    let (q, k, v, g, beta, state) = random_inputs(p, 0xBAD5_E1EC);
+    let q = upload_f32(&device, &q);
+    let k = upload_f32(&device, &k);
+    let v = upload_f32(&device, &v);
+    let g = upload_f32(&device, &g);
+    let beta = upload_f32(&device, &beta);
+    let state = upload_f32(&device, &state);
+    let output_elems = (p.d_v * p.n_v_heads * p.n_tokens) as usize;
+    let state_elems = (p.d_k * p.d_v * p.n_v_heads) as usize;
+    let output = device
+        .alloc_buffer(output_elems * 4, DType::F32, vec![output_elems])
+        .expect("output");
+    let state_out = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("state out");
+    let capture = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("capture");
+    let short_capture = device
+        .alloc_buffer((state_elems - 1) * 4, DType::F32, vec![state_elems - 1])
+        .expect("short capture");
+    let params = build_gated_delta_net_params(&device, p).expect("params");
+    let mut encoder = device.command_encoder().expect("encoder");
+    let invalid_index = dispatch_gated_delta_net_decode_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &state,
+        &output,
+        &state_out,
+        &params,
+        &capture,
+        p.n_tokens,
+        p,
+    )
+    .expect_err("capture token at n_tokens must fail");
+    assert!(invalid_index.to_string().contains("capture_token"));
+    let invalid_shape = dispatch_gated_delta_net_decode_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &state,
+        &output,
+        &state_out,
+        &params,
+        &short_capture,
+        1,
+        p,
+    )
+    .expect_err("short selected capture must fail");
+    assert!(invalid_shape.to_string().contains("element count"));
 }
 
 /// AC#1+2: capture variant's output + state_out byte-identical to
@@ -171,10 +380,16 @@ fn assert_byte_identical(label: &str, a: &[f32], b: &[f32]) {
 fn capture_output_state_byte_identical_nsg1_d32() {
     let (device, mut registry) = setup();
     let p = GatedDeltaNetParams {
-        d_k: 32, d_v: 32, n_k_heads: 1, n_v_heads: 2, n_tokens: 1, n_seqs: 1,
+        d_k: 32,
+        d_v: 32,
+        n_k_heads: 1,
+        n_v_heads: 2,
+        n_tokens: 1,
+        n_seqs: 1,
     };
     let (q, k, v, g, beta, state_in) = random_inputs(p, 0xCAFE);
-    let (dec_out, dec_state) = run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+    let (dec_out, dec_state) =
+        run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
     let (cap_out, cap_state, cap_capture) =
         run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
     assert_byte_identical("nsg1 output", &cap_out, &dec_out);
@@ -190,10 +405,16 @@ fn capture_output_state_byte_identical_nsg1_d32() {
 fn capture_output_state_byte_identical_nsg2_d64() {
     let (device, mut registry) = setup();
     let p = GatedDeltaNetParams {
-        d_k: 64, d_v: 64, n_k_heads: 2, n_v_heads: 4, n_tokens: 1, n_seqs: 1,
+        d_k: 64,
+        d_v: 64,
+        n_k_heads: 2,
+        n_v_heads: 4,
+        n_tokens: 1,
+        n_seqs: 1,
     };
     let (q, k, v, g, beta, state_in) = random_inputs(p, 0x1234);
-    let (dec_out, dec_state) = run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+    let (dec_out, dec_state) =
+        run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
     let (cap_out, cap_state, cap_capture) =
         run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
     assert_byte_identical("nsg2 output", &cap_out, &dec_out);
@@ -206,15 +427,25 @@ fn capture_output_state_byte_identical_nsg2_d64() {
 fn capture_output_state_byte_identical_qwen35_shape() {
     let (device, mut registry) = setup();
     let p = GatedDeltaNetParams {
-        d_k: 128, d_v: 128, n_k_heads: 16, n_v_heads: 32, n_tokens: 1, n_seqs: 1,
+        d_k: 128,
+        d_v: 128,
+        n_k_heads: 16,
+        n_v_heads: 32,
+        n_tokens: 1,
+        n_seqs: 1,
     };
     let (q, k, v, g, beta, state_in) = random_inputs(p, 0xBEEF);
-    let (dec_out, dec_state) = run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+    let (dec_out, dec_state) =
+        run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
     let (cap_out, cap_state, cap_capture) =
         run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
     assert_byte_identical("qwen35 output", &cap_out, &dec_out);
     assert_byte_identical("qwen35 state_out", &cap_state, &dec_state);
-    assert_byte_identical("qwen35 capture[last] == state_out", &cap_capture, &dec_state);
+    assert_byte_identical(
+        "qwen35 capture[last] == state_out",
+        &cap_capture,
+        &dec_state,
+    );
 }
 
 /// ADR-034 task #90 Step 5 (2026-05-21) — STRONG parity test for the
@@ -226,11 +457,25 @@ fn capture_output_state_byte_identical_qwen35_shape() {
 fn capture_intermediate_t_matches_truncated_dispatch() {
     let (device, mut registry) = setup();
     let p_full = GatedDeltaNetParams {
-        d_k: 128, d_v: 128, n_k_heads: 16, n_v_heads: 32, n_tokens: 4, n_seqs: 1,
+        d_k: 128,
+        d_v: 128,
+        n_k_heads: 16,
+        n_v_heads: 32,
+        n_tokens: 4,
+        n_seqs: 1,
     };
     let (q, k, v, g, beta, state_in) = random_inputs(p_full, 0x517E);
-    let (_, _, cap_capture) =
-        run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p_full);
+    let (_, _, cap_capture) = run_decode_with_capture(
+        &device,
+        &mut registry,
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &state_in,
+        p_full,
+    );
     let state_elems = (p_full.d_k * p_full.d_v * p_full.n_v_heads * p_full.n_seqs) as usize;
 
     for t in 0..(p_full.n_tokens as usize - 1) {
@@ -247,14 +492,23 @@ fn capture_intermediate_t_matches_truncated_dispatch() {
         let g_trunc = g[..sc_per_tok * (t + 1)].to_vec();
         let beta_trunc = beta[..sc_per_tok * (t + 1)].to_vec();
         let p_trunc = GatedDeltaNetParams {
-            d_k: p_full.d_k, d_v: p_full.d_v,
-            n_k_heads: p_full.n_k_heads, n_v_heads: p_full.n_v_heads,
-            n_tokens: (t + 1) as u32, n_seqs: p_full.n_seqs,
+            d_k: p_full.d_k,
+            d_v: p_full.d_v,
+            n_k_heads: p_full.n_k_heads,
+            n_v_heads: p_full.n_v_heads,
+            n_tokens: (t + 1) as u32,
+            n_seqs: p_full.n_seqs,
         };
         let (_y_trunc, state_trunc) = run_decode(
-            &device, &mut registry,
-            &q_trunc, &k_trunc, &v_trunc, &g_trunc, &beta_trunc,
-            &state_in, p_trunc,
+            &device,
+            &mut registry,
+            &q_trunc,
+            &k_trunc,
+            &v_trunc,
+            &g_trunc,
+            &beta_trunc,
+            &state_in,
+            p_trunc,
         );
 
         // capture[t] must byte-match state_trunc.
@@ -275,7 +529,12 @@ fn capture_intermediate_t_matches_truncated_dispatch() {
 fn capture_last_slice_equals_state_out_n_tokens_4() {
     let (device, mut registry) = setup();
     let p = GatedDeltaNetParams {
-        d_k: 128, d_v: 128, n_k_heads: 16, n_v_heads: 32, n_tokens: 4, n_seqs: 1,
+        d_k: 128,
+        d_v: 128,
+        n_k_heads: 16,
+        n_v_heads: 32,
+        n_tokens: 4,
+        n_seqs: 1,
     };
     let (q, k, v, g, beta, state_in) = random_inputs(p, 0xDEAD);
     let (_, dec_state) = run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);

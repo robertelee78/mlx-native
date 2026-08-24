@@ -57,7 +57,7 @@ using namespace metal;
 // Caller allocates this buffer once per spec-decode iter and reads
 // states[accepted_idx] on partial-reject.
 
-template <short NSG>
+template <short NSG, bool SELECTED>
 inline void gated_delta_net_decode_capture_impl(
     device const float *q,
     device const float *k,
@@ -69,6 +69,7 @@ inline void gated_delta_net_decode_capture_impl(
     device       float *state_out,
     device const uint  *params,
     device       float *state_capture,
+    const uint capture_token,
     uint3 tpitg,
     uint3 tgpig
 ) {
@@ -161,15 +162,18 @@ inline void gated_delta_net_decode_capture_impl(
 
         // ADR-034 task #90 — capture per-position state AFTER this
         // token's update. Each thread writes its NSG cells.
-        const uint capture_row_base =
-            seq * state_capture_seq_stride
-            + t * state_capture_token_stride
-            + v_head * state_head_stride
-            + i20 * D_k;
-        #pragma clang loop unroll(full)
-        for (short j = 0; j < NSG; ++j) {
-            const uint is = tx * (uint)NSG + (uint)j;
-            state_capture[capture_row_base + is] = ls[j];
+        if (!SELECTED || t == capture_token) {
+            const uint capture_row_base =
+                (SELECTED
+                    ? seq * state_capture_token_stride
+                    : seq * state_capture_seq_stride + t * state_capture_token_stride)
+                + v_head * state_head_stride
+                + i20 * D_k;
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < NSG; ++j) {
+                const uint is = tx * (uint)NSG + (uint)j;
+                state_capture[capture_row_base + is] = ls[j];
+            }
         }
     }
 
@@ -198,9 +202,9 @@ kernel void gated_delta_net_decode_capture_f32_1(
     uint3 tpitg                       [[thread_position_in_threadgroup]],
     uint3 tgpig                       [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_capture_impl<1>(
+    gated_delta_net_decode_capture_impl<1, false>(
         q, k, v, g, beta, state_in, output, state_out, params, state_capture,
-        tpitg, tgpig);
+        0u, tpitg, tgpig);
 }
 
 kernel void gated_delta_net_decode_capture_f32_2(
@@ -217,9 +221,9 @@ kernel void gated_delta_net_decode_capture_f32_2(
     uint3 tpitg                       [[thread_position_in_threadgroup]],
     uint3 tgpig                       [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_capture_impl<2>(
+    gated_delta_net_decode_capture_impl<2, false>(
         q, k, v, g, beta, state_in, output, state_out, params, state_capture,
-        tpitg, tgpig);
+        0u, tpitg, tgpig);
 }
 
 kernel void gated_delta_net_decode_capture_f32_4(
@@ -236,7 +240,31 @@ kernel void gated_delta_net_decode_capture_f32_4(
     uint3 tpitg                       [[thread_position_in_threadgroup]],
     uint3 tgpig                       [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_capture_impl<4>(
+    gated_delta_net_decode_capture_impl<4, false>(
         q, k, v, g, beta, state_in, output, state_out, params, state_capture,
-        tpitg, tgpig);
+        0u, tpitg, tgpig);
 }
+
+#define DEFINE_SELECTED_CAPTURE(NSG) \
+kernel void gated_delta_net_decode_selected_capture_f32_##NSG( \
+    device const float *q [[buffer(0)]], \
+    device const float *k [[buffer(1)]], \
+    device const float *v [[buffer(2)]], \
+    device const float *g [[buffer(3)]], \
+    device const float *beta [[buffer(4)]], \
+    device const float *state_in [[buffer(5)]], \
+    device float *output [[buffer(6)]], \
+    device float *state_out [[buffer(7)]], \
+    device const uint *params [[buffer(8)]], \
+    device float *state_capture [[buffer(9)]], \
+    constant uint &capture_token [[buffer(10)]], \
+    uint3 tpitg [[thread_position_in_threadgroup]], \
+    uint3 tgpig [[threadgroup_position_in_grid]]) { \
+    gated_delta_net_decode_capture_impl<NSG, true>( \
+        q, k, v, g, beta, state_in, output, state_out, params, state_capture, \
+        capture_token, tpitg, tgpig); \
+}
+
+DEFINE_SELECTED_CAPTURE(1)
+DEFINE_SELECTED_CAPTURE(2)
+DEFINE_SELECTED_CAPTURE(4)

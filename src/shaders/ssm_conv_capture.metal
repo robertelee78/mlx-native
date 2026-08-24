@@ -129,3 +129,59 @@ kernel void ssm_conv_capture_forward_f32(
         conv_capture[s * capture_seq_stride + t * capture_per_t + i * channels + c] = state_val;
     }
 }
+
+// Bounded-memory checkpoint form: preserve ordinary y + final new_state while
+// writing only the requested intermediate state. The selected allocation is
+// O(state), not O(n_tokens * state).
+kernel void ssm_conv_selected_capture_forward_f32(
+    device const float *x              [[buffer(0)]],
+    device const float *kernel_w       [[buffer(1)]],
+    device const float *old_state      [[buffer(2)]],
+    device       float *y              [[buffer(3)]],
+    device       float *new_state      [[buffer(4)]],
+    device       float *conv_capture   [[buffer(5)]],
+    device const uint  *params         [[buffer(6)]],
+    constant uint &capture_token       [[buffer(7)]],
+    uint3 tid                          [[thread_position_in_grid]]
+) {
+    const uint channels = params[0];
+    const uint n_tokens = params[1];
+    const uint n_seqs = params[2];
+    const uint k_width = params[3];
+    const uint k_minus1 = k_width - 1u;
+    const uint c = tid.x;
+    const uint t = tid.y;
+    const uint s = tid.z;
+    if (c >= channels || t >= n_tokens || s >= n_seqs) return;
+
+    const uint x_seq_stride = n_tokens * channels;
+    const uint state_seq_stride = k_minus1 * channels;
+    float sum = 0.0f;
+    for (uint k = 0; k < k_width; ++k) {
+        const uint t_ext = t + k;
+        const float value = t_ext < k_minus1
+            ? old_state[s * state_seq_stride + c * k_minus1 + t_ext]
+            : x[s * x_seq_stride + (t_ext - k_minus1) * channels + c];
+        sum += kernel_w[c * k_width + k] * value;
+    }
+    y[s * x_seq_stride + t * channels + c] = sum / (1.0f + metal::exp(-sum));
+
+    if (t == capture_token) {
+        for (uint i = 0; i < k_minus1; ++i) {
+            const uint t_ext = t + 1u + i;
+            const float value = t_ext < k_minus1
+                ? old_state[s * state_seq_stride + c * k_minus1 + t_ext]
+                : x[s * x_seq_stride + (t_ext - k_minus1) * channels + c];
+            conv_capture[s * state_seq_stride + i * channels + c] = value;
+        }
+    }
+    if (t + 1u == n_tokens) {
+        for (uint i = 0; i < k_minus1; ++i) {
+            const uint t_ext = n_tokens + i;
+            const float value = t_ext < k_minus1
+                ? old_state[s * state_seq_stride + c * k_minus1 + t_ext]
+                : x[s * x_seq_stride + (t_ext - k_minus1) * channels + c];
+            new_state[s * state_seq_stride + c * k_minus1 + i] = value;
+        }
+    }
+}
