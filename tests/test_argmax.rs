@@ -208,7 +208,11 @@ fn test_argmax_small() {
     let actual_idx = out_index.as_slice::<u32>().expect("read index")[0];
     let actual_val = out_value.as_slice::<f32>().expect("read value")[0];
 
-    assert_eq!(actual_idx, 1, "argmax small: expected index 1, got {}", actual_idx);
+    assert_eq!(
+        actual_idx, 1,
+        "argmax small: expected index 1, got {}",
+        actual_idx
+    );
     assert!(
         (actual_val - 5.0).abs() < 1e-6,
         "argmax small: expected value 5.0, got {}",
@@ -269,12 +273,68 @@ fn test_argmax_equal_maxima_choose_lowest_vocab_index_across_strides() {
 }
 
 #[test]
+fn test_argmax_nonfinite_input_returns_poison_instead_of_valid_token() {
+    let (device, mut registry) = setup();
+
+    for (label, poisoned) in [
+        ("nan", f32::NAN),
+        ("positive infinity", f32::INFINITY),
+        ("negative infinity", f32::NEG_INFINITY),
+    ] {
+        // Keep a unique, otherwise-valid winner. Mutating any ordinary logit
+        // to non-finite must invalidate the whole selection instead of
+        // returning index 1 (or silently skipping the poisoned element).
+        let data = [1.0f32, 9.0, poisoned, 3.0, 2.0];
+        let mut input = device
+            .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
+            .expect("alloc input");
+        input
+            .as_mut_slice::<f32>()
+            .expect("write input")
+            .copy_from_slice(&data);
+        let out_index = device
+            .alloc_buffer(4, DType::U32, vec![1])
+            .expect("alloc out_index");
+        let out_value = device
+            .alloc_buffer(4, DType::F32, vec![1])
+            .expect("alloc out_value");
+        let mut params = device
+            .alloc_buffer(4, DType::U32, vec![1])
+            .expect("alloc params");
+        params.as_mut_slice::<u32>().expect("write params")[0] = data.len() as u32;
+
+        let mut encoder = device.command_encoder().expect("encoder");
+        argmax::dispatch_argmax_f32(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &input,
+            &out_index,
+            &out_value,
+            &params,
+            data.len() as u32,
+        )
+        .expect("dispatch_argmax_f32");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        let actual_index = out_index.as_slice::<u32>().expect("read index")[0];
+        let actual_value = out_value.as_slice::<f32>().expect("read value")[0];
+        assert_eq!(actual_index, u32::MAX, "{label} must poison the index");
+        assert!(actual_value.is_nan(), "{label} must poison the value");
+    }
+}
+
+#[test]
 fn test_argmax_zero_elements_error() {
     let (device, mut registry) = setup();
 
     let buf = device.alloc_buffer(4, DType::F32, vec![1]).expect("buf");
-    let out_idx = device.alloc_buffer(4, DType::U32, vec![1]).expect("out_idx");
-    let out_val = device.alloc_buffer(4, DType::F32, vec![1]).expect("out_val");
+    let out_idx = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .expect("out_idx");
+    let out_val = device
+        .alloc_buffer(4, DType::F32, vec![1])
+        .expect("out_val");
     let params = device.alloc_buffer(4, DType::U32, vec![1]).expect("params");
 
     let mut encoder = device.command_encoder().expect("encoder");

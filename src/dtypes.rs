@@ -2,8 +2,11 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Element data type carried by an [`MlxBuffer`](crate::MlxBuffer).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DType {
     /// 32-bit IEEE 754 float.
     F32,

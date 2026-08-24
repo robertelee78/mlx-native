@@ -162,12 +162,12 @@ fn run_parity_at_m(m: u32) {
     input_buf.as_mut_slice::<f32>().expect("input").copy_from_slice(&input);
 
     let mut gate_w_buf = device
-        .alloc_buffer(gate_q6_K.len(), DType::F32, vec![intermediate_size as usize, hidden_size as usize])
+        .alloc_buffer(gate_q6_K.len(), DType::U8, vec![intermediate_size as usize, hidden_size as usize])
         .expect("alloc gate_w");
     gate_w_buf.as_mut_slice::<u8>().expect("gw").copy_from_slice(&gate_q6_K);
 
     let mut up_w_buf = device
-        .alloc_buffer(up_q6_K.len(), DType::F32, vec![intermediate_size as usize, hidden_size as usize])
+        .alloc_buffer(up_q6_K.len(), DType::U8, vec![intermediate_size as usize, hidden_size as usize])
         .expect("alloc up_w");
     up_w_buf.as_mut_slice::<u8>().expect("uw").copy_from_slice(&up_q6_K);
 

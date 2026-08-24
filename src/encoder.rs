@@ -830,8 +830,8 @@ pub struct CommandEncoder {
     /// downstream lifecycle code (e.g. `EncoderSession::reset_for_next_stage`
     /// in Phase 0b-B) can open a fresh `CommandBuffer` from the same queue
     /// after a non-blocking `commit_stage()`. metal-rs 0.33's
-    /// `CommandQueue` type is `Send + Sync` via `foreign_obj_type!`
-    /// (`/Users/robert/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/metal-0.33.0/src/lib.rs:179`),
+    /// `CommandQueue` type is `Send + Sync` via `foreign_obj_type!` in
+    /// metal-rs 0.33,
     /// so adding this field preserves the existing unsafe `Send` impl
     /// on `CommandEncoder` (declared below).
     ///

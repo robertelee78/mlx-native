@@ -21,6 +21,7 @@ kernel void deepseek_moe_swiglu_f32(
         device const float *up                  [[buffer(2)]],
         device const float *selected_weights    [[buffer(3)]],
         device float *output                    [[buffer(4)]],
+        device atomic_uint *invalid_status      [[buffer(5)]],
         uint row                                [[threadgroup_position_in_grid]],
         uint tid                                [[thread_index_in_threadgroup]]) {
     if (row >= p.count) return;
@@ -48,6 +49,9 @@ kernel void deepseek_moe_swiglu_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const bool invalid = bad[0] != 0;
+    if (invalid && tid == 0) {
+        atomic_fetch_or_explicit(invalid_status, 1u, memory_order_relaxed);
+    }
     for (uint part = 0; part < 8; ++part) {
         const uint feature = tid + part * DSV4_THREADS;
         output[base + feature] = invalid ? 0.0f : activated[part];
@@ -61,6 +65,7 @@ kernel void deepseek_moe_weighted_reduce_f32(
         device const float *routed              [[buffer(3)]],
         device const float *shared              [[buffer(4)]],
         device float *output                    [[buffer(5)]],
+        device atomic_uint *invalid_status      [[buffer(6)]],
         uint token                              [[threadgroup_position_in_grid]],
         uint tid                                [[thread_index_in_threadgroup]]) {
     if (token >= p.count) return;
@@ -117,6 +122,9 @@ kernel void deepseek_moe_weighted_reduce_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const bool invalid = bad[0] != 0;
+    if (invalid && tid == 0) {
+        atomic_fetch_or_explicit(invalid_status, 1u, memory_order_relaxed);
+    }
     for (uint part = 0; part < 16; ++part) {
         const uint feature = tid + part * DSV4_THREADS;
         output[shared_base + feature] = invalid ? 0.0f : reduced[part];

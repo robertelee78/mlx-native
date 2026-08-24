@@ -6,11 +6,12 @@
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::{
-    embedding_gather_q2_k, embedding_gather_q8_0, quantized_matmul_ggml_with_policy,
-    quantized_matmul_id_ggml_mv_with_policy, quantized_matmul_id_ggml_pooled_pair_with_policy,
-    quantized_matmul_id_ggml_pooled_with_policy, quantized_matmul_id_swiglu_q4_0, CapturedNode,
-    DType, EmbeddingQ2KParams, EmbeddingQ8_0Params, GgmlQuantizedMatmulIdParams,
-    GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType, IdMmScratch, KernelRegistry, MlxDevice,
+    embedding_gather_q2_k, embedding_gather_q8_0, quantized_matmul_ggml,
+    quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml_mv_with_policy,
+    quantized_matmul_id_ggml_pooled_pair_with_policy, quantized_matmul_id_ggml_pooled_with_policy,
+    quantized_matmul_id_swiglu_q4_0, CapturedNode, DType, EmbeddingQ2KParams, EmbeddingQ8_0Params,
+    GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
+    IdMmScratch, KernelRegistry, MlxDevice,
 };
 
 use mlx_native::ops::fused_gate_up_silu_iq4_nl::{
@@ -35,6 +36,96 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
     build_q6k_id_nr2_m1_record, build_q6k_id_nr2_m1_record_with_policy,
     build_q8_0_id_decode_record, build_q8_0_id_decode_record_with_policy,
 };
+
+#[test]
+fn registry_policy_binding_is_immutable_and_idempotent() {
+    let mut registry = KernelRegistry::new();
+    let mut first = GgmlRoutingPolicy::default();
+    first.dense_q8_0_mv_nr2 = false;
+    registry
+        .freeze_ggml_routing_policy(first)
+        .expect("freeze first policy");
+    registry
+        .freeze_ggml_routing_policy(first)
+        .expect("repeat identical policy");
+    assert_eq!(registry.ggml_routing_policy(), Some(&first));
+
+    let mut changed = first;
+    changed.dense_q8_0_mv_nr2 = true;
+    assert!(registry.freeze_ggml_routing_policy(changed).is_err());
+    assert_eq!(registry.ggml_routing_policy(), Some(&first));
+}
+
+#[test]
+fn bound_policy_helper() {
+    if std::env::var_os("MLX_NATIVE_BOUND_POLICY_TEST_CHILD").is_none() {
+        return;
+    }
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let mut bound = GgmlRoutingPolicy::default();
+    bound.dense_q8_0_mv_nr2 = false;
+    registry
+        .freeze_ggml_routing_policy(bound)
+        .expect("bind model policy");
+    let weight = device
+        .alloc_buffer(34 * 32, DType::U8, vec![34 * 32])
+        .expect("weight");
+    let input = device
+        .alloc_buffer(32 * 4, DType::F32, vec![32])
+        .expect("input");
+    let output = device
+        .alloc_buffer(32 * 4, DType::F32, vec![32])
+        .expect("output");
+    let mut encoder = device.command_encoder().expect("encoder");
+    encoder.start_capture();
+    quantized_matmul_ggml(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &weight,
+        &output,
+        &GgmlQuantizedMatmulParams {
+            m: 1,
+            n: 32,
+            k: 32,
+            ggml_type: GgmlType::Q8_0,
+        },
+    )
+    .expect("bound standard dispatch");
+    let captured = encoder.take_capture().expect("captured graph");
+    match &captured[0] {
+        CapturedNode::Dispatch {
+            threads_per_threadgroup,
+            threadgroup_memory,
+            ..
+        } => {
+            assert_eq!(
+                (
+                    threads_per_threadgroup.width,
+                    threads_per_threadgroup.height
+                ),
+                (8, 8)
+            );
+            assert!(threadgroup_memory.is_empty());
+        }
+        CapturedNode::Barrier => panic!("expected baseline dispatch"),
+    }
+}
+
+#[test]
+fn bound_policy_overrides_process_environment_for_standard_dispatch() {
+    let status = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+        .arg("--exact")
+        .arg("bound_policy_helper")
+        .arg("--nocapture")
+        .env("MLX_NATIVE_BOUND_POLICY_TEST_CHILD", "1")
+        .env("HF2Q_Q8_0_MV_NR2", "1")
+        .status()
+        .expect("run isolated bound-policy helper");
+    assert!(status.success());
+}
 
 #[test]
 fn fused_and_embedding_entrypoints_reject_short_logical_views() {
@@ -587,6 +678,7 @@ fn explicit_dispatch_record_policy_helper() {
         4,
         256,
         1,
+        1,
         4 * 210,
         &policy,
     )
@@ -597,6 +689,7 @@ fn explicit_dispatch_record_policy_helper() {
         device.metal_device(),
         32,
         32,
+        1,
         1,
         32 * 34,
         &policy,
@@ -612,16 +705,28 @@ fn explicit_dispatch_record_policy_helper() {
             .expect("legacy dense Q6 record")
             .is_none()
     );
-    assert!(
-        build_q6k_id_nr2_m1_record(&mut registry, device.metal_device(), 4, 256, 1, 4 * 210,)
-            .expect("legacy expert Q6 record")
-            .is_none()
-    );
-    assert!(
-        build_q8_0_id_decode_record(&mut registry, device.metal_device(), 32, 32, 1, 32 * 34,)
-            .expect("legacy expert Q8 record")
-            .is_none()
-    );
+    assert!(build_q6k_id_nr2_m1_record(
+        &mut registry,
+        device.metal_device(),
+        4,
+        256,
+        1,
+        1,
+        4 * 210,
+    )
+    .expect("legacy expert Q6 record")
+    .is_none());
+    assert!(build_q8_0_id_decode_record(
+        &mut registry,
+        device.metal_device(),
+        32,
+        32,
+        1,
+        1,
+        32 * 34,
+    )
+    .expect("legacy expert Q8 record")
+    .is_none());
 }
 
 #[test]

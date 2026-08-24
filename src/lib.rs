@@ -124,7 +124,7 @@ pub use residency::{
 };
 
 // Re-export GGUF parser.
-pub use gguf::{GgufFile, MetadataValue, TensorInfo};
+pub use gguf::{GgufFile, GgufMappedTensorStoragePlan, MetadataValue, TensorInfo};
 
 // Re-export ops.
 pub use ops::dense_bf16_auto::{
@@ -133,6 +133,30 @@ pub use ops::dense_bf16_auto::{
     DenseBf16CalibrationCase, DenseBf16CalibrationLimits, DenseBf16DecisionSource,
     DenseBf16DispatchDecision, DenseBf16DispatchTrace, DenseBf16Route, DenseBf16RoutePlan,
     DenseBf16Shape,
+};
+pub use ops::dense_matmul_id::{
+    dense_matmul_id, dense_matmul_id_capability, DenseMatmulIdCapability,
+    DenseMatmulIdDispatchReceipt, DenseMatmulIdInputLayout, DenseMatmulIdMultiplicity,
+    DenseMatmulIdParams, DenseMatmulIdRoute, DenseMatmulIdScratch, DenseMatmulIdScratchRequirement,
+    DENSE_MATMUL_ID_SCHEMA_VERSION,
+};
+pub use ops::dense_matmul_id_auto::{
+    calibrate_dense_matmul_id_routes, dense_matmul_id_auto,
+    dense_matmul_id_value_independence_theorem_sha256, resolve_dense_matmul_id_auto_route,
+    trace_dense_matmul_id, trace_dense_matmul_id_auto, DenseMatmulIdAutoDispatchReceipt,
+    DenseMatmulIdCalibrationBatchReceipt, DenseMatmulIdCalibrationCase,
+    DenseMatmulIdCalibrationDecision, DenseMatmulIdCalibrationLimits, DenseMatmulIdDecisionSource,
+    DenseMatmulIdDispatchTrace, DenseMatmulIdRoutePlan, DenseMatmulIdRouteTiming,
+    DenseMatmulIdRoutingProfile, DenseMatmulIdSelectionStatus, DenseMatmulIdShape,
+    DenseMatmulIdTimingDistribution, DENSE_MATMUL_ID_ROUTE_SCHEMA_VERSION,
+    DENSE_MATMUL_ID_VALUE_INDEPENDENCE_THEOREM,
+};
+pub use ops::dense_q4_auto::{
+    calibrate_dense_q4_routes, trace_dense_q4_auto, validate_dense_q4_cartesian_acceptance,
+    DenseQ4BaseShape, DenseQ4CalibrationBatchReceipt, DenseQ4CalibrationCase,
+    DenseQ4CalibrationLimits, DenseQ4CartesianAcceptanceRequirements, DenseQ4DecisionSource,
+    DenseQ4DispatchDecision, DenseQ4DispatchTrace, DenseQ4InputLayout, DenseQ4Route,
+    DenseQ4RoutePlan, DenseQ4Shape, DENSE_Q4_ROUTE_SCHEMA_VERSION,
 };
 pub use ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 pub use ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
@@ -144,6 +168,7 @@ pub use ops::deepseek_hyper_connection::{
 pub use ops::embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams};
 pub use ops::embedding_dense::{embedding_gather_dense, EmbeddingDenseParams};
 pub use ops::embedding_q4_0::{embedding_gather_q4_0, EmbeddingQ4_0Params};
+pub use ops::embedding_q5_0::{embedding_gather_q5_0, EmbeddingQ5_0Params};
 pub use ops::embedding_q4_k::{embedding_gather_q4_k, EmbeddingQ4KParams};
 pub use ops::embedding_kquant::{
     embedding_gather_q5_k, embedding_gather_q6_k, EmbeddingQ5KParams, EmbeddingQ6KParams,
@@ -152,8 +177,8 @@ pub use ops::embedding_q8_0::{embedding_gather_q8_0, EmbeddingQ8_0Params};
 pub use ops::q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinterleaveParams};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
-    dispatch_mm_for_test, dispatch_mv_q4k_mn_adaptive, dispatch_mv_q6k_mn,
-    dispatch_mv_q6k_mn_adaptive,
+    dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test,
+    dispatch_mv_q4k_mn_adaptive, dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
     quantized_matmul_ggml_batched_mm_strided_input,
     quantized_matmul_ggml_batched_mm_strided_input_with_policy,

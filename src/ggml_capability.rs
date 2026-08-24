@@ -237,6 +237,7 @@ pub enum GgmlKernelRoute {
     EmbeddingBF16,
     EmbeddingQ2K,
     EmbeddingQ4_0,
+    EmbeddingQ5_0,
     EmbeddingQ4K,
     EmbeddingQ5K,
     EmbeddingQ6K,
@@ -381,6 +382,7 @@ fn quantized_matmul_type(ggml_type: GgmlType) -> bool {
     matches!(
         ggml_type,
         GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q8_0
             | GgmlType::Q2_K
             | GgmlType::Q3_K
@@ -562,8 +564,21 @@ fn dense_mv_route(request: &GgmlCapabilityRequest, batched: bool) -> GgmlKernelR
     }
 }
 
+/// Whether the default device-selected MM route may use the tensor pipeline.
+///
+/// Q5_0 stays on the native simdgroup kernels: the M5 tensor path exceeded
+/// the independent F32 parity bound at dense and expert prompt widths, while
+/// the simdgroup path passed the same bytes and shapes. An explicit future
+/// qualification can reopen this predicate without changing the artifact.
+pub(crate) fn tensor_mm_auto_selected(
+    ggml_type: GgmlType,
+    preference: GgmlTensorMmPreference,
+) -> bool {
+    preference == GgmlTensorMmPreference::AutoProbe && ggml_type != GgmlType::Q5_0
+}
+
 fn dense_mm_route(request: &GgmlCapabilityRequest, batched: bool) -> (GgmlKernelRoute, bool) {
-    if request.routing.dense_tensor_mm == GgmlTensorMmPreference::AutoProbe {
+    if tensor_mm_auto_selected(request.ggml_type, request.routing.dense_tensor_mm) {
         (
             if batched {
                 GgmlKernelRoute::DenseBatchedMmDeviceSelected
@@ -618,7 +633,7 @@ pub(crate) fn plan_dense_auto_route(
         // K-quants use mul_mv_ext only once four columns can amortize the
         // wider dequantization path.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (4..=MM_ROUTING_THRESHOLD).contains(&m),
-        GgmlType::Q4_0 | GgmlType::Q8_0 => (2..=MM_ROUTING_THRESHOLD).contains(&m),
+        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 => (2..=MM_ROUTING_THRESHOLD).contains(&m),
         _ => false,
     };
     if routing.dense_decode_mv_ext && mv_ext_width_supported && k >= 32 {
@@ -718,7 +733,7 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
                 1,
                 0,
                 if request.routing.allow_dense_large_tile_mm {
-                    "dense MM route; tensor-capable devices may select the large-tile tensor kernel"
+                    "dense MM route; tensor-capable devices use a frozen exact-shape Q4 plan or the compatibility large-tile tensor kernel"
                 } else {
                     "dense MM route; large-tile tensor kernel disabled by routing policy"
                 },
@@ -838,7 +853,7 @@ fn perm021(request: &GgmlCapabilityRequest, head_dim: u32, bytes: u64) -> GgmlCa
     let (_, _, k) = request.invocation.dimensions();
     if !matches!(
         request.ggml_type,
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K
+        GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q6_K
     ) || head_dim == 0
         || head_dim % 32 != 0
         || k % head_dim != 0
@@ -846,7 +861,7 @@ fn perm021(request: &GgmlCapabilityRequest, head_dim: u32, bytes: u64) -> GgmlCa
         return GgmlCapability::unsupported(
             request,
             GgmlRejectionCode::InvalidOperationContract,
-            "perm021 requires Q4_0/Q8_0/Q6_K and a 32-aligned head dimension dividing K",
+            "perm021 requires Q4_0/Q5_0/Q8_0/Q6_K and a 32-aligned head dimension dividing K",
         );
     }
     let specialized = request.workload == GgmlWorkloadClass::Prompt;
@@ -937,7 +952,7 @@ fn expert_mm_route(
     request: &GgmlCapabilityRequest,
     entrypoint: ExpertEntrypoint,
 ) -> (GgmlKernelRoute, bool) {
-    let tensor = request.routing.expert_tensor_mm == GgmlTensorMmPreference::AutoProbe;
+    let tensor = tensor_mm_auto_selected(request.ggml_type, request.routing.expert_tensor_mm);
     let route = match (entrypoint, tensor) {
         (ExpertEntrypoint::AutoAllocated, true) => GgmlKernelRoute::ExpertMmDeviceSelected,
         (ExpertEntrypoint::AutoAllocated, false) => GgmlKernelRoute::ExpertMmSimdgroup,
@@ -1020,7 +1035,7 @@ fn expert(
         );
     }
     if entrypoint != ExpertEntrypoint::ForcedMv && mm_eligible {
-        let (route, _tensor_probe) = expert_mm_route(request, entrypoint);
+        let (route, tensor_probe) = expert_mm_route(request, entrypoint);
         let Some(htpe_bytes) = u64::from(shape.n_experts).checked_mul(4) else {
             return GgmlCapability::unsupported(
                 request,
@@ -1049,7 +1064,7 @@ fn expert(
             route,
             request.workload == GgmlWorkloadClass::Prompt,
             request.workload != GgmlWorkloadClass::Prompt,
-            true,
+            tensor_probe,
             if entrypoint == ExpertEntrypoint::PooledPair {
                 2
             } else {
@@ -1163,6 +1178,7 @@ fn embedding(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
         GgmlType::BF16 => GgmlKernelRoute::EmbeddingBF16,
         GgmlType::Q2_K => GgmlKernelRoute::EmbeddingQ2K,
         GgmlType::Q4_0 => GgmlKernelRoute::EmbeddingQ4_0,
+        GgmlType::Q5_0 => GgmlKernelRoute::EmbeddingQ5_0,
         GgmlType::Q4_K => GgmlKernelRoute::EmbeddingQ4K,
         GgmlType::Q5_K => GgmlKernelRoute::EmbeddingQ5K,
         GgmlType::Q6_K => GgmlKernelRoute::EmbeddingQ6K,

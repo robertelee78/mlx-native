@@ -158,7 +158,7 @@ fn mv_ext_widths_are_type_sensitive() {
         );
     }
 
-    for ggml_type in [GgmlType::Q4_0, GgmlType::Q8_0] {
+    for ggml_type in [GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q8_0] {
         request.ggml_type = ggml_type;
         request.invocation = GgmlInvocation::DenseAuto {
             m: 2,
@@ -475,6 +475,11 @@ fn embedding_contract_is_exact() {
     assert_eq!(
         ggml_capability(request).route,
         Some(GgmlKernelRoute::EmbeddingQ4_0)
+    );
+    request.ggml_type = GgmlType::Q5_0;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::EmbeddingQ5_0)
     );
     request.ggml_type = GgmlType::Q5_K;
     assert_eq!(

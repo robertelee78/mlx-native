@@ -71,6 +71,32 @@ fn validate_buffer(buf: &MlxBuffer, name: &str, dtype: DType, shape: &[usize]) -
     Ok(())
 }
 
+fn ranges_overlap(left: &MlxBuffer, right: &MlxBuffer) -> bool {
+    let left_start = left.contents_ptr() as usize;
+    let right_start = right.contents_ptr() as usize;
+    let left_end = left_start.saturating_add(left.byte_len());
+    let right_end = right_start.saturating_add(right.byte_len());
+    left_start < right_end && right_start < left_end
+}
+
+fn validate_invalid_status(status: &MlxBuffer, inputs: &[(&str, &MlxBuffer)]) -> Result<()> {
+    validate_buffer(status, "invalid_status", DType::U32, &[1])?;
+    if !status.is_cpu_writable() {
+        return Err(MlxError::InvalidArgument(
+            "deepseek_moe_activation: invalid_status must be writable".into(),
+        ));
+    }
+    if let Some((name, _)) = inputs
+        .iter()
+        .find(|(_, input)| ranges_overlap(status, input))
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "deepseek_moe_activation: invalid_status must not overlap {name}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_count(count: usize, name: &str) -> Result<()> {
     if count == 0 || count > u32::MAX as usize {
         return Err(MlxError::InvalidArgument(format!(
@@ -84,7 +110,8 @@ fn validate_count(count: usize, name: &str) -> Result<()> {
 ///
 /// `gate`, `up`, and `output` are F32 `[rows, 2048]`. If present,
 /// `selected_weights` is F32 `[rows]` and is multiplied before expert-down.
-/// A nonfinite input fails its entire row closed to zero.
+/// A nonfinite input fails its entire row closed to zero and atomically marks
+/// the caller-owned sticky `invalid_status` word.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_deepseek_moe_swiglu(
     encoder: &mut CommandEncoder,
@@ -94,6 +121,7 @@ pub fn dispatch_deepseek_moe_swiglu(
     up: &MlxBuffer,
     selected_weights: Option<&MlxBuffer>,
     output: &MlxBuffer,
+    invalid_status: &MlxBuffer,
     rows: usize,
 ) -> Result<()> {
     validate_count(rows, "rows")?;
@@ -104,6 +132,11 @@ pub fn dispatch_deepseek_moe_swiglu(
     if let Some(weights) = selected_weights {
         validate_buffer(weights, "selected_weights", DType::F32, &[rows])?;
     }
+    let mut status_inputs = vec![("gate", gate), ("up", up), ("output", output)];
+    if let Some(weights) = selected_weights {
+        status_inputs.push(("selected_weights", weights));
+    }
+    validate_invalid_status(invalid_status, &status_inputs)?;
     let params = DeepSeekMoeActivationParams {
         count: rows as u32,
         use_weights: selected_weights.is_some() as u32,
@@ -119,7 +152,8 @@ pub fn dispatch_deepseek_moe_swiglu(
         if let Some(weights) = selected_weights {
             reads.push(range(weights));
         }
-        encoder.set_pending_buffer_ranges(reads, vec![range(output)]);
+        reads.push(range(invalid_status));
+        encoder.set_pending_buffer_ranges(reads, vec![range(output), range(invalid_status)]);
     }
     encoder.encode_threadgroups_with_args(
         pipeline,
@@ -129,6 +163,7 @@ pub fn dispatch_deepseek_moe_swiglu(
             (2, KernelArg::Buffer(up)),
             (3, KernelArg::Buffer(weights_or_dummy)),
             (4, KernelArg::Buffer(output)),
+            (5, KernelArg::Buffer(invalid_status)),
         ],
         MTLSize::new(rows as u64, 1, 1),
         MTLSize::new(THREADS, 1, 1),
@@ -142,7 +177,8 @@ pub fn dispatch_deepseek_moe_swiglu(
 /// `[tokens, 6, 4096]`, and shared/output `[tokens, 4096]`, all F32 except
 /// I32 indices. Contributions are accumulated by ascending expert ID (stable
 /// by slot for duplicate IDs), matching the official expert loop. Invalid IDs
-/// or any nonfinite dynamic value fail the entire token closed to zero.
+/// or any nonfinite dynamic value fail the entire token closed to zero and
+/// atomically mark the caller-owned sticky `invalid_status` word.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_deepseek_moe_weighted_reduce(
     encoder: &mut CommandEncoder,
@@ -153,6 +189,7 @@ pub fn dispatch_deepseek_moe_weighted_reduce(
     routed: &MlxBuffer,
     shared: &MlxBuffer,
     output: &MlxBuffer,
+    invalid_status: &MlxBuffer,
     n_tokens: usize,
 ) -> Result<()> {
     validate_count(n_tokens, "n_tokens")?;
@@ -177,12 +214,38 @@ pub fn dispatch_deepseek_moe_weighted_reduce(
     let hidden_shape = [n_tokens, DEEPSEEK_MOE_HIDDEN_DIM];
     validate_buffer(shared, "shared", DType::F32, &hidden_shape)?;
     validate_buffer(output, "output", DType::F32, &hidden_shape)?;
+    validate_invalid_status(
+        invalid_status,
+        &[
+            ("indices", indices),
+            ("weights", weights),
+            ("routed", routed),
+            ("shared", shared),
+            ("output", output),
+        ],
+    )?;
     let params = DeepSeekMoeActivationParams {
         count: n_tokens as u32,
         use_weights: 1,
     };
     let pipeline =
         registry.get_pipeline(DEEPSEEK_MOE_WEIGHTED_REDUCE_KERNEL, device.metal_device())?;
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start = buffer.contents_ptr() as usize;
+            (start, start + buffer.byte_len())
+        };
+        encoder.set_pending_buffer_ranges(
+            vec![
+                range(indices),
+                range(weights),
+                range(routed),
+                range(shared),
+                range(invalid_status),
+            ],
+            vec![range(output), range(invalid_status)],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         pipeline,
         &[
@@ -192,6 +255,7 @@ pub fn dispatch_deepseek_moe_weighted_reduce(
             (3, KernelArg::Buffer(routed)),
             (4, KernelArg::Buffer(shared)),
             (5, KernelArg::Buffer(output)),
+            (6, KernelArg::Buffer(invalid_status)),
         ],
         MTLSize::new(n_tokens as u64, 1, 1),
         MTLSize::new(THREADS, 1, 1),

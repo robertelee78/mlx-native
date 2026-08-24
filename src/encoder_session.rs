@@ -473,8 +473,7 @@ impl EncoderSession {
     ///
     /// On the first call, allocates the per-session
     /// [`MTLSharedEvent`](metal::SharedEvent) via
-    /// [`metal::DeviceRef::new_shared_event`]
-    /// (`/Users/robert/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/metal-0.33.0/src/device.rs:2063`).
+    /// [`metal::DeviceRef::new_shared_event`] from metal-rs 0.33.
     /// Subsequent calls reuse the same event — the monotonic
     /// `event_value` carries the per-fence identity (reference
     /// shared-event pattern).
@@ -512,8 +511,7 @@ impl EncoderSession {
         }
 
         // Lazy-alloc the SharedEvent on first fence in this session.
-        // metal::DeviceRef::new_shared_event lives at
-        // /Users/robert/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/metal-0.33.0/src/device.rs:2063.
+        // `metal::DeviceRef::new_shared_event` is provided by metal-rs 0.33.
         if self.event.is_none() {
             self.event = Some(self.device.new_shared_event());
         }

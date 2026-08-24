@@ -7,7 +7,7 @@ use mlx_native::ops::deepseek_moe_routing::{
     dispatch_deepseek_moe_score_route, DEEPSEEK_MOE_EXPERTS, DEEPSEEK_MOE_ROUTE_SCALE,
     DEEPSEEK_MOE_TOP_K,
 };
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CapturedNode, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 const E: usize = DEEPSEEK_MOE_EXPERTS;
 const K: usize = DEEPSEEK_MOE_TOP_K;
@@ -214,6 +214,8 @@ fn signed_route_indices_are_sanitized_before_expert_matmul() {
     let device = MlxDevice::new().unwrap();
     let indices = i32_buffer(&device, &[-1, 0, 255, 256, 17, -9], vec![1, K]);
     let safe = device.alloc_buffer(K * 4, DType::U32, vec![1, K]).unwrap();
+    let mut status = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+    status.as_mut_slice::<u32>().unwrap()[0] = 0;
     let mut registry = KernelRegistry::new();
     let mut encoder = device.command_encoder().unwrap();
     dispatch_deepseek_moe_sanitize_indices(
@@ -222,11 +224,83 @@ fn signed_route_indices_are_sanitized_before_expert_matmul() {
         &device,
         &indices,
         &safe,
+        &status,
         1,
     )
     .unwrap();
     encoder.commit_and_wait().unwrap();
     assert_eq!(safe.as_slice::<u32>().unwrap(), &[0, 0, 255, 0, 17, 0]);
+    assert_eq!(status.as_slice::<u32>().unwrap(), &[1]);
+
+    let valid = i32_buffer(&device, &[0, 1, 2, 3, 4, 5], vec![1, K]);
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_deepseek_moe_sanitize_indices(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &valid,
+        &safe,
+        &status,
+        1,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    assert_eq!(status.as_slice::<u32>().unwrap(), &[1]);
+}
+
+#[test]
+fn capture_annotates_sanitizer_status_dependencies() {
+    let device = MlxDevice::new().unwrap();
+    let indices = i32_buffer(&device, &[0, 1, 2, 3, 4, 5], vec![1, K]);
+    let safe = device.alloc_buffer(K * 4, DType::U32, vec![1, K]).unwrap();
+    let mut status = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+    status.as_mut_slice::<u32>().unwrap()[0] = 0;
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    dispatch_deepseek_moe_sanitize_indices(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &indices,
+        &safe,
+        &status,
+        1,
+    )
+    .unwrap();
+    let captured = encoder.take_capture().unwrap();
+    assert_eq!(captured.len(), 1);
+    match &captured[0] {
+        CapturedNode::Dispatch { reads, writes, .. } => {
+            assert_eq!(reads.len(), 2);
+            assert_eq!(writes.len(), 2);
+        }
+        CapturedNode::Barrier => panic!("expected sanitizer dispatch"),
+    }
+}
+
+#[test]
+fn valid_route_indices_leave_sticky_status_clear() {
+    let device = MlxDevice::new().unwrap();
+    let indices = i32_buffer(&device, &[0, 1, 2, 253, 254, 255], vec![1, K]);
+    let safe = device.alloc_buffer(K * 4, DType::U32, vec![1, K]).unwrap();
+    let mut status = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+    status.as_mut_slice::<u32>().unwrap()[0] = 0;
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    dispatch_deepseek_moe_sanitize_indices(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &indices,
+        &safe,
+        &status,
+        1,
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    assert_eq!(safe.as_slice::<u32>().unwrap(), &[0, 1, 2, 253, 254, 255]);
+    assert_eq!(status.as_slice::<u32>().unwrap(), &[0]);
 }
 
 #[test]
@@ -260,6 +334,30 @@ fn malformed_shapes_and_dtypes_are_rejected_before_encoding() {
         &ids,
         &weights,
         1,
+        1,
+    )
+    .is_err());
+    let signed = i32_buffer(&device, &[0; K], vec![1, K]);
+    let safe = device.alloc_buffer(K * 4, DType::U32, vec![1, K]).unwrap();
+    let bad_status = f32_buffer(&device, &[0.0], vec![1]);
+    assert!(dispatch_deepseek_moe_sanitize_indices(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &signed,
+        &safe,
+        &bad_status,
+        1,
+    )
+    .is_err());
+    let overlapping_status = safe.slice_view(0, 1);
+    assert!(dispatch_deepseek_moe_sanitize_indices(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &signed,
+        &safe,
+        &overlapping_status,
         1,
     )
     .is_err());

@@ -51,9 +51,8 @@
 //!
 //! - No stub. metal-rs 0.33 fully exposes `Device::new_shared_event`,
 //!   `CommandBufferRef::encode_signal_event`, `encode_wait_for_event` —
-//!   verified at `/Users/robert/.cargo/registry/src/index.crates.io-…/
-//!   metal-0.33.0/src/{device.rs:2059-2065, sync.rs:33-83,
-//!   commandbuffer.rs:194-210}`.
+//!   verified against the published metal-rs 0.33 source in `device.rs`,
+//!   `sync.rs`, and `commandbuffer.rs`.
 //! - `SharedEventRef: Deref<Target = EventRef>` per the macro at
 //!   `metal-0.33.0/src/lib.rs:148-167`, so passing `&shared_event`
 //!   to the `&EventRef` parameter is a borrow-deref, not a cast.

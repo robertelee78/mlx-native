@@ -104,7 +104,7 @@ fn run_parity_at_m(m: u32) {
     let mut gate_w_buf = device
         .alloc_buffer(
             gate_q8_0.len(),
-            DType::F32,
+            DType::U8,
             vec![intermediate_size as usize, hidden_size as usize],
         )
         .expect("alloc gate_w");
@@ -116,7 +116,7 @@ fn run_parity_at_m(m: u32) {
     let mut up_w_buf = device
         .alloc_buffer(
             up_q8_0.len(),
-            DType::F32,
+            DType::U8,
             vec![intermediate_size as usize, hidden_size as usize],
         )
         .expect("alloc up_w");

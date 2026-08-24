@@ -56,4 +56,11 @@ if [[ -n "$tracked_forbidden" ]]; then
     exit 1
 fi
 
+personal_paths=$(git grep -nE '/User[s]/[^/]+/' -- . || true)
+if [[ -n "$personal_paths" ]]; then
+    echo "repository contains user-specific absolute paths:" >&2
+    printf '%s\n' "$personal_paths" >&2
+    exit 1
+fi
+
 echo "package hygiene OK"

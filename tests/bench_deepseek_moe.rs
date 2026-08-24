@@ -66,6 +66,8 @@ fn benchmark_decode_and_prefill_production_shapes() {
         );
         let route_ids = i32_buffer(&device, &vec![0; tokens * K], vec![tokens, K]);
         let route_weights = f32_buffer(&device, tokens * K, vec![tokens, K]);
+        let mut invalid_status = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+        invalid_status.as_mut_slice::<u32>().unwrap()[0] = 0;
 
         let score_ms = measure(|| {
             let mut encoder = device.command_encoder().unwrap();
@@ -115,6 +117,7 @@ fn benchmark_decode_and_prefill_production_shapes() {
                 &up,
                 Some(&selected_weights),
                 &activated,
+                &invalid_status,
                 rows,
             )
             .unwrap();
@@ -139,6 +142,7 @@ fn benchmark_decode_and_prefill_production_shapes() {
                 &routed,
                 &shared,
                 &reduced,
+                &invalid_status,
                 tokens,
             )
             .unwrap();

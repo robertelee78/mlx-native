@@ -75,6 +75,14 @@ fn validate_buffer(buf: &MlxBuffer, name: &str, dtype: DType, shape: &[usize]) -
     Ok(())
 }
 
+fn ranges_overlap(left: &MlxBuffer, right: &MlxBuffer) -> bool {
+    let left_start = left.contents_ptr() as usize;
+    let right_start = right.contents_ptr() as usize;
+    let left_end = left_start.saturating_add(left.byte_len());
+    let right_end = right_start.saturating_add(right.byte_len());
+    left_start < right_end && right_start < left_end
+}
+
 fn validate_common(
     logits: &MlxBuffer,
     out_indices: &MlxBuffer,
@@ -198,15 +206,17 @@ pub fn dispatch_deepseek_moe_hash_route(
 
 /// Convert signed route indices to the unsigned expert-matmul contract.
 ///
-/// Invalid fail-closed sentinels become expert zero. Their corresponding
-/// route weights are already zero, so this prevents an out-of-range weight
-/// read while preserving the eventual all-zero token result.
+/// Invalid sentinels become expert zero solely to keep downstream pointer
+/// arithmetic in range, while `invalid_status` is atomically made nonzero.
+/// The caller owns that sticky one-word status for the complete inference
+/// transaction and must reject it after the transaction's existing wait.
 pub fn dispatch_deepseek_moe_sanitize_indices(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     indices: &MlxBuffer,
     safe_indices: &MlxBuffer,
+    invalid_status: &MlxBuffer,
     n_tokens: usize,
 ) -> Result<()> {
     if n_tokens == 0 || n_tokens > u32::MAX as usize {
@@ -217,18 +227,40 @@ pub fn dispatch_deepseek_moe_sanitize_indices(
     let shape = [n_tokens, DEEPSEEK_MOE_TOP_K];
     validate_buffer(indices, "indices", DType::I32, &shape)?;
     validate_buffer(safe_indices, "safe_indices", DType::U32, &shape)?;
+    validate_buffer(invalid_status, "invalid_status", DType::U32, &[1])?;
+    if !invalid_status.is_cpu_writable() {
+        return Err(MlxError::InvalidArgument(
+            "deepseek_moe_routing: invalid_status must be writable".into(),
+        ));
+    }
+    if ranges_overlap(invalid_status, indices) || ranges_overlap(invalid_status, safe_indices) {
+        return Err(MlxError::InvalidArgument(
+            "deepseek_moe_routing: invalid_status must not overlap route buffers".into(),
+        ));
+    }
     let params = DeepSeekMoeRoutingParams {
         n_tokens: n_tokens as u32,
         vocab_size: 0,
     };
     let pipeline =
         registry.get_pipeline(DEEPSEEK_MOE_SANITIZE_INDICES_KERNEL, device.metal_device())?;
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start = buffer.contents_ptr() as usize;
+            (start, start + buffer.byte_len())
+        };
+        encoder.set_pending_buffer_ranges(
+            vec![range(indices), range(invalid_status)],
+            vec![range(safe_indices), range(invalid_status)],
+        );
+    }
     encoder.encode_threadgroups_with_args(
         pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&params))),
             (1, KernelArg::Buffer(indices)),
             (2, KernelArg::Buffer(safe_indices)),
+            (3, KernelArg::Buffer(invalid_status)),
         ],
         MTLSize::new(n_tokens as u64, 1, 1),
         MTLSize::new(DEEPSEEK_MOE_TOP_K as u64, 1, 1),

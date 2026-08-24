@@ -369,7 +369,7 @@ fn run_id_vs_norid_test(
         .copy_from_slice(&input_data);
 
     let mut weight_buf = device
-        .alloc_buffer(stacked_bytes.len(), DType::U32, vec![stacked_bytes.len() / 4])
+        .alloc_buffer(stacked_bytes.len(), DType::U8, vec![stacked_bytes.len()])
         .unwrap();
     weight_buf
         .as_mut_slice::<u8>()
@@ -426,7 +426,7 @@ fn run_id_vs_norid_test(
             let expert_bytes = &stacked_bytes
                 [expert_id * per_expert_bytes..(expert_id + 1) * per_expert_bytes];
             let mut expert_w_buf = device
-                .alloc_buffer(per_expert_bytes, DType::U32, vec![per_expert_bytes / 4])
+                .alloc_buffer(per_expert_bytes, DType::U8, vec![per_expert_bytes])
                 .unwrap();
             expert_w_buf
                 .as_mut_slice::<u8>()
@@ -628,7 +628,7 @@ fn run_q5k_id_vs_cpu(
     input_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&input_data);
 
     let mut weight_buf = device
-        .alloc_buffer(stacked.len(), DType::U32, vec![stacked.len() / 4])
+        .alloc_buffer(stacked.len(), DType::U8, vec![stacked.len()])
         .unwrap();
     weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&stacked);
 

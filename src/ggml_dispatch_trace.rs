@@ -16,7 +16,7 @@ use crate::ggml_capability::{
 use crate::kernel_registry::{KernelPipelineIdentity, KernelRegistry};
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
-pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 1;
+pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +44,7 @@ pub enum GgmlResolvedKernelRoute {
     DenseMmSimdgroup,
     DenseMmTensorV1,
     DenseMmTensorV2,
+    DenseMmTensorQ4_64x32,
     DenseGateUpSilu,
 }
 
@@ -212,6 +213,7 @@ fn validate_dense_dispatches(
                 (kind, false) => {
                     let (align, threads) = match kind {
                         GgmlType::Q4_0
+                        | GgmlType::Q5_0
                         | GgmlType::Q8_0
                         | GgmlType::Q5_1
                         | GgmlType::IQ4_NL
@@ -303,6 +305,7 @@ fn validate_dense_dispatches(
             };
             let type_name = match request.ggml_type {
                 GgmlType::Q4_0 => "q4_0",
+                GgmlType::Q5_0 => "q5_0",
                 GgmlType::Q8_0 => "q8_0",
                 GgmlType::Q4_K => "q4_K",
                 GgmlType::Q5_K => "q5_K",
@@ -360,6 +363,20 @@ fn validate_dense_dispatches(
                     request.ggml_type.mm_tensor_kernel_name(),
                     [div_ceil_u64(m, 32), div_ceil_u64(n, 64), 1],
                     vec![(0, 8192)],
+                )
+            } else if request.ggml_type == GgmlType::Q4_0
+                && dispatch.pipeline.kernel_name == "kernel_mul_mm_q4_0_tensor_64x32_f32"
+            {
+                if !request.routing.allow_dense_large_tile_mm {
+                    return Err(MlxError::InvalidArgument(
+                        "Q4 exact-plan tensor dispatch violates large-tile routing policy".into(),
+                    ));
+                }
+                (
+                    GgmlResolvedKernelRoute::DenseMmTensorQ4_64x32,
+                    "kernel_mul_mm_q4_0_tensor_64x32_f32",
+                    [div_ceil_u64(m, 32), div_ceil_u64(n, 64), 1],
+                    vec![(0, 4096)],
                 )
             } else if dispatch.pipeline.kernel_name == request.ggml_type.mm_tensor_v2_kernel_name()
             {

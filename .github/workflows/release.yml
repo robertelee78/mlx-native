@@ -54,6 +54,11 @@ jobs:
       - name: Minimum supported Rust
         run: cargo +1.82.0 check --locked --lib
 
+      - name: Semver compatibility
+        run: |
+          cargo +1.96.0 install cargo-semver-checks --locked --version 0.50.0
+          cargo +1.96.0 semver-checks --baseline-version 0.12.2
+
       - name: Security audit
         run: |
           cargo +1.96.0 install cargo-audit --locked --version 0.22.2

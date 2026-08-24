@@ -6,7 +6,7 @@
 //! Weight buffers contain raw GGML blocks — the same bytes that come from
 //! GGUF mmap. No intermediate conversion.
 //!
-//! Supported formats include Q2_K, Q4_0, Q8_0, and K-quants through Q6_K.
+//! Supported formats include Q2_K, Q4_0, Q5_0, Q8_0, and K-quants through Q6_K.
 //!
 //! Portions derived from candle-metal-kernels v0.10.2 (Apache-2.0).
 //! See src/shaders/quantized_matmul_ggml.metal for full attribution.
@@ -17,12 +17,14 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
-    plan_dense_auto_route, DenseAutoPlan, GgmlCapabilityRequest, GgmlInvocation, GgmlRoutingPolicy,
-    GgmlTensorMmPreference, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+    plan_dense_auto_route, tensor_mm_auto_selected, DenseAutoPlan, GgmlCapabilityRequest,
+    GgmlInvocation, GgmlRoutingPolicy, GgmlTensorMmPreference, GgmlWorkloadClass,
+    GGML_CAPABILITY_SCHEMA_VERSION,
 };
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
-use crate::ggml_routing_policy::ggml_routing_policy_from_environment;
+use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
 use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
+use crate::ops::dense_q4_auto::{self, DenseQ4Route};
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_mv.
@@ -45,11 +47,44 @@ fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     })
 }
 
+fn validate_native_quantized_dtypes(
+    operation: &str,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+) -> Result<()> {
+    if input.dtype() != DType::F32 || weight.dtype() != DType::U8 || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{operation} requires F32 input, native U8 GGUF blocks, and F32 output; got {:?}/{:?}/{:?}",
+            input.dtype(),
+            weight.dtype(),
+            output.dtype(),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_signed_metal_dimensions(operation: &str, dimensions: &[(&str, u32)]) -> Result<()> {
+    for (label, value) in dimensions {
+        if *value > i32::MAX as u32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{operation}: {label} exceeds the signed Metal ABI"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---- Block format constants ----
 
 /// Q4_0: 32 values per block, 18 bytes per block (2 byte f16 scale + 16 bytes quants).
 const QK4_0: u32 = 32;
 const BLOCK_Q4_0_BYTES: u32 = 18;
+
+/// Q5_0: 32 values per block, 22 bytes per block
+/// (2-byte f16 scale + 4-byte high-bit mask + 16 bytes of low nibbles).
+const QK5_0: u32 = 32;
+const BLOCK_Q5_0_BYTES: u32 = 22;
 
 /// Q8_0: 32 values per block, 34 bytes per block (2 byte f16 scale + 32 bytes quants).
 const QK8_0: u32 = 32;
@@ -124,6 +159,9 @@ pub enum GgmlType {
     BF16,
     /// 4-bit quantization. 32 values per block, 18 bytes per block.
     Q4_0,
+    /// Legacy symmetric 5-bit quantization (GGML type ID 6).
+    /// 32 values per block, 22 bytes per block.
+    Q5_0,
     /// 8-bit quantization. 32 values per block, 34 bytes per block.
     Q8_0,
     /// 2-bit super-block quantization. 256 values per block, 84 bytes per block.
@@ -171,6 +209,7 @@ impl GgmlType {
             GgmlType::F16 => 1,
             GgmlType::BF16 => 1,
             GgmlType::Q4_0 => QK4_0,
+            GgmlType::Q5_0 => QK5_0,
             GgmlType::Q8_0 => QK8_0,
             GgmlType::Q2_K => QK2_K,
             GgmlType::Q3_K => QK3_K,
@@ -192,6 +231,7 @@ impl GgmlType {
             GgmlType::F16 => 2,
             GgmlType::BF16 => 2,
             GgmlType::Q4_0 => BLOCK_Q4_0_BYTES,
+            GgmlType::Q5_0 => BLOCK_Q5_0_BYTES,
             GgmlType::Q8_0 => BLOCK_Q8_0_BYTES,
             GgmlType::Q2_K => BLOCK_Q2_K_BYTES,
             GgmlType::Q3_K => BLOCK_Q3_K_BYTES,
@@ -211,12 +251,11 @@ impl GgmlType {
     pub(crate) fn kernel_name(self) -> &'static str {
         match self {
             // Scalar/non-quantized types are not applicable to this dispatch.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q4_0 => "kernel_mul_mv_q4_0_f32",
+            GgmlType::Q5_0 => "kernel_mul_mv_q5_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32",
             GgmlType::Q2_K => "kernel_mul_mv_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mv_q3_K_f32",
@@ -243,14 +282,13 @@ impl GgmlType {
         match self {
             // ADR-022 Phase 2 — Q5_K dense mm ported.
             // ADR-022 Phase 3 — Q4_K dense mm ported.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_q5_0_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_f32",
@@ -270,14 +308,13 @@ impl GgmlType {
         match self {
             // ADR-022 Phase 2: Q5_K tensor mm landed.
             // ADR-022 Phase 3: Q4_K tensor mm landed.
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_f32",
@@ -295,14 +332,13 @@ impl GgmlType {
     /// kernel layout.
     pub(crate) fn mm_tensor_v2_kernel_name(self) -> &'static str {
         match self {
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I16
-            | GgmlType::I32 => "unsupported",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
             GgmlType::Q2_K => "kernel_mul_mm_q2_K_tensor_v2_f32",
             GgmlType::Q3_K => "kernel_mul_mm_q3_K_tensor_v2_f32",
             GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_v2_f32",
+            GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_v2_f32",
             GgmlType::Q8_0 => "kernel_mul_mm_q8_0_tensor_v2_f32",
             GgmlType::Q4_K => "kernel_mul_mm_q4_K_tensor_v2_f32",
             GgmlType::Q5_K => "kernel_mul_mm_q5_K_tensor_v2_f32",
@@ -483,7 +519,7 @@ pub fn quantized_matmul_ggml(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -508,6 +544,12 @@ pub fn quantized_matmul_ggml_with_policy(
     // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
     // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
     // for the multi-thread encoding port (peer's n_cb=2 pattern).
+    validate_native_quantized_dtypes("quantized_matmul_ggml", input, weight, output)?;
+    validate_signed_metal_dimensions(
+        "quantized_matmul_ggml",
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
+
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
 
@@ -520,6 +562,7 @@ pub fn quantized_matmul_ggml_with_policy(
         // come in P1.6, dispatcher already routes to mv at m ≤ 8).
         // ADR-022 Phase 2 — Q5_K added (mv + mm + mm_tensor).
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
         | GgmlType::Q3_K
@@ -634,7 +677,7 @@ pub fn quantized_matmul_ggml_with_policy(
     // Numerically close but not generally byte-identical to mv: the wider
     // kernel uses a different reduction tree. A family must therefore qualify
     // model decisions and cache handoff before enabling it in production.
-    // K-quants use m=4..8; legacy Q4_0/Q8_0 retain m=2..8. Unsupported shapes
+    // K-quants use m=4..8; legacy Q4_0/Q5_0/Q8_0 retain m=2..8. Unsupported shapes
     // fall through unchanged.
     // ADR-040 §0.21 decode F3 lever (mul_mv_ext weight-amortization) — opt-in,
     // DEFAULT OFF (HF2Q_DECODE_MV_EXT=1). MEASURED: routing decode m∈[2,8] to
@@ -770,7 +813,7 @@ pub fn quantized_matmul_ggml_batched_mm(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_batched_mm_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -825,7 +868,7 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input(
     params: &GgmlBatchedQuantizedMatmulParams,
     input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_batched_mm_strided_input_with_policy(
         encoder,
         registry,
@@ -852,6 +895,15 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input_with_policy(
     input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
+    validate_signed_metal_dimensions(
+        "batched quantized MM",
+        &[
+            ("batch", params.batch),
+            ("M", params.m),
+            ("N", params.n),
+            ("K", params.k),
+        ],
+    )?;
     if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "batched quantized MM dimensions must all be nonzero".into(),
@@ -987,7 +1039,7 @@ pub fn quantized_matmul_ggml_batched_mv(
     output: &MlxBuffer,
     params: &GgmlBatchedQuantizedMatmulParams,
 ) -> Result<()> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     quantized_matmul_ggml_batched_mv_with_policy(
         encoder, registry, device, input, weight, output, params, &routing,
     )
@@ -1005,6 +1057,15 @@ pub fn quantized_matmul_ggml_batched_mv_with_policy(
     params: &GgmlBatchedQuantizedMatmulParams,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
+    validate_signed_metal_dimensions(
+        "batched quantized MV",
+        &[
+            ("batch", params.batch),
+            ("M", params.m),
+            ("N", params.n),
+            ("K", params.k),
+        ],
+    )?;
     if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "batched quantized MV dimensions must all be nonzero".into(),
@@ -1231,10 +1292,46 @@ pub fn dispatch_mm_for_test(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    validate_native_quantized_dtypes("dispatch_mm_for_test", input, weight, output)?;
     validate_mm_for_test(params)?;
     let routing = GgmlRoutingPolicy::default();
     dispatch_mm(
         encoder, registry, device, input, weight, output, params, 1, None, &routing,
+    )
+}
+
+/// Test-only Q4_0 tensor-MM candidate with a 64-output by 32-token tile.
+///
+/// This retains the V2 kernel's native Q4_0 reads, direct F32 activation
+/// tensor, 32-wide K loop, reduction order, and output layout. Only the token
+/// tile and corresponding grid width differ.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mm_q4_0_tensor_64x32_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    validate_native_quantized_dtypes(
+        "dispatch_mm_q4_0_tensor_64x32_for_test",
+        input,
+        weight,
+        output,
+    )?;
+    validate_mm_for_test(params)?;
+    dispatch_mm_q4_route_internal(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        DenseQ4Route::Tensor64x32,
     )
 }
 
@@ -1251,6 +1348,7 @@ pub fn dispatch_mm_simd_for_test(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    validate_native_quantized_dtypes("dispatch_mm_simd_for_test", input, weight, output)?;
     validate_mm_for_test(params)?;
     let routing = GgmlRoutingPolicy {
         dense_tensor_mm: GgmlTensorMmPreference::ForceSimd,
@@ -1266,6 +1364,7 @@ fn validate_mm_for_test(params: &GgmlQuantizedMatmulParams) -> Result<()> {
     let qk = params.ggml_type.block_values();
     match params.ggml_type {
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q2_K
         | GgmlType::Q3_K
@@ -1378,10 +1477,11 @@ fn dispatch_mv_batched(
     let m = params.m as usize;
 
     let (nth0, nth1, align) = match params.ggml_type {
-        // Q4_0 / Q8_0 / Q5_1 / IQ4_NL all use legacy 32-element blocks
+        // Q4_0 / Q5_0 / Q8_0 / Q5_1 / IQ4_NL all use legacy 32-element blocks
         // and the Q4_0-style (8, 8) threadgroup geometry: 2 simdgroups ×
         // 4 rows per simdgroup = 8 rows per threadgroup.
         GgmlType::Q4_0
+        | GgmlType::Q5_0
         | GgmlType::Q8_0
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL
@@ -1775,7 +1875,7 @@ pub fn build_q6k_nr2_m1_record(
     n: u32,
     k: u32,
 ) -> Result<Option<DispatchRecord>> {
-    let routing = ggml_routing_policy_from_environment();
+    let routing = ggml_routing_policy_for_registry(registry);
     build_q6k_nr2_m1_record_with_policy(registry, device, n, k, &routing)
 }
 
@@ -1856,11 +1956,82 @@ fn dispatch_mm(
     input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
+    dispatch_mm_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        batch,
+        input_strides,
+        routing,
+        None,
+    )
+}
+
+/// Exact Q4 tensor route used by calibration and evidence tooling.
+/// Ordinary inference calls [`dispatch_mm`] and may select the candidate only
+/// through a frozen exact-shape plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_mm_q4_route_internal(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    route: DenseQ4Route,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_0 || params.m <= MM_ROUTING_THRESHOLD {
+        return Err(MlxError::InvalidArgument(
+            "forced dense Q4 MM route requires Q4_0 and M > 8".into(),
+        ));
+    }
+    if !matches!(
+        route,
+        DenseQ4Route::CompatibilityV2 | DenseQ4Route::Tensor64x32
+    ) {
+        return Err(MlxError::InvalidArgument(
+            "forced dense Q4 calibration route must be V2 or Tensor64x32".into(),
+        ));
+    }
+    dispatch_mm_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        1,
+        None,
+        &GgmlRoutingPolicy::default(),
+        Some(route),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mm_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    batch: u32,
+    input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
+    routing: &GgmlRoutingPolicy,
+    forced_q4_route: Option<DenseQ4Route>,
+) -> Result<()> {
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // variant on M3+ (hardware tensor cores); fall back to the simdgroup
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
-    let use_tensor = routing.dense_tensor_mm == GgmlTensorMmPreference::AutoProbe
+    let use_tensor = tensor_mm_auto_selected(params.ggml_type, routing.dense_tensor_mm)
         && probe_tensor_mm(registry, device)?;
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
@@ -1873,19 +2044,56 @@ fn dispatch_mm(
     // 3457/0/11 unit tests pass.  Default ON; opt-out via
     // `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
     let use_v2_large_tile = use_tensor && routing.allow_dense_large_tile_mm;
-    let kernel_name = if use_v2_large_tile {
+    let q4_decision = dense_q4_auto::select_route(
+        registry,
+        device,
+        params,
+        batch,
+        input_strides.is_none(),
+        routing,
+    );
+    let q4_route = forced_q4_route.unwrap_or(q4_decision.route);
+    let mut use_q4_short_tile = use_v2_large_tile
+        && params.ggml_type == GgmlType::Q4_0
+        && batch == 1
+        && input_strides.is_none()
+        && q4_route == DenseQ4Route::Tensor64x32;
+    if forced_q4_route == Some(DenseQ4Route::Tensor64x32) && !use_q4_short_tile {
+        return Err(MlxError::InvalidArgument(
+            "forced Q4 tensor 64x32 route is unavailable for this device or layout".into(),
+        ));
+    }
+    let mut kernel_name = if use_q4_short_tile {
+        DenseQ4Route::Tensor64x32.kernel_name()
+    } else if use_v2_large_tile {
         params.ggml_type.mm_tensor_v2_kernel_name()
     } else if use_tensor {
         params.ggml_type.mm_tensor_kernel_name()
     } else {
         params.ggml_type.mm_kernel_name()
     };
-    let pipeline = registry.get_pipeline_with_constants(
+    let pipeline = match registry.get_pipeline_with_constants(
         kernel_name,
         device.metal_device(),
         &[],
-        &[(700, 1), (701, 1), (702, 1)],
-    )?;
+        dense_q4_auto::Q4_MM_PIPELINE_INT_CONSTANTS,
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(_error) if use_q4_short_tile && forced_q4_route.is_none() => {
+            // The candidate is optional performance metadata. Even after a
+            // successful activation, an unexpected lookup failure must not
+            // make a request less executable than the compatibility path.
+            use_q4_short_tile = false;
+            kernel_name = params.ggml_type.mm_tensor_v2_kernel_name();
+            registry.get_pipeline_with_constants(
+                kernel_name,
+                device.metal_device(),
+                &[],
+                dense_q4_auto::Q4_MM_PIPELINE_INT_CONSTANTS,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
 
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
@@ -1920,7 +2128,13 @@ fn dispatch_mm(
     // Both use 4 simdgroups / 128 threads per threadgroup.
     const THREADS_PER_TG: u64 = 128;
 
-    let (tg_x, tg_y, shmem_bytes) = if use_v2_large_tile {
+    let (tg_x, tg_y, shmem_bytes) = if use_q4_short_tile {
+        (
+            u64::from(params.m).div_ceil(32),
+            u64::from(params.n).div_ceil(64),
+            4096u64,
+        )
+    } else if use_v2_large_tile {
         // V2 in peer-convention coordinates:
         //   gx covers N_peer with stride NRB=128 → N_peer is the SLOWER axis
         //     (hf2q-M = tokens = params.m).
@@ -2040,7 +2254,7 @@ pub struct GgmlQuantizedMatmulPerm021Params {
     pub k: u32,
     /// Head dimension.  Must be a multiple of NK=32.
     pub head_dim: u32,
-    /// GGML quantization type of the weight (Q4_0 or Q6_K).
+    /// GGML quantization type of the weight.
     pub ggml_type: GgmlType,
 }
 
@@ -2053,7 +2267,7 @@ pub struct GgmlQuantizedMatmulPerm021Params {
 ///
 /// # Errors
 /// Returns `InvalidArgument` if:
-/// - `ggml_type` is not Q4_0 or Q6_K
+/// - `ggml_type` is not Q4_0, Q5_0, Q8_0, or Q6_K
 /// - `head_dim` is not a positive multiple of 32
 /// - `k != n_heads * head_dim`  (we infer n_heads = k / head_dim)
 /// - buffer sizes don't match the declared shapes
@@ -2066,6 +2280,10 @@ pub fn quantized_matmul_mm_tensor_perm021(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulPerm021Params,
 ) -> Result<()> {
+    validate_signed_metal_dimensions(
+        "quantized_matmul_mm_tensor_perm021",
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
     if params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "quantized_matmul_mm_tensor_perm021: M, N, and K must be non-zero".into(),
@@ -2073,6 +2291,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
     }
     let kernel_name = match params.ggml_type {
         GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_bf16_perm021",
+        GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_bf16_perm021",
         // ADR-022 Phase 3 — Q8_0 perm021 instantiation added so the
         // Q8_0-quantized attention path (e.g. iter-21 Track B HB-encoded
         // K cache for Qwen 3.5 / 3.6) can use the same tensor-tile
@@ -2082,7 +2301,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "quantized_matmul_mm_tensor_perm021: unsupported ggml_type {:?} \
-                 (only Q4_0 / Q8_0 / Q6_K are instantiated)",
+                 (only Q4_0 / Q5_0 / Q8_0 / Q6_K are instantiated)",
                 other
             )));
         }
@@ -2109,10 +2328,15 @@ pub fn quantized_matmul_mm_tensor_perm021(
             params.k, qk,
         )));
     }
-    if input_bf16.dtype() != DType::BF16 {
+    if input_bf16.dtype() != DType::BF16
+        || weight.dtype() != DType::U8
+        || output.dtype() != DType::F32
+    {
         return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_mm_tensor_perm021: input must be BF16, got {:?}",
+            "quantized_matmul_mm_tensor_perm021 requires BF16 input, native U8 GGUF blocks, and F32 output; got {:?}/{:?}/{:?}",
             input_bf16.dtype(),
+            weight.dtype(),
+            output.dtype(),
         )));
     }
 

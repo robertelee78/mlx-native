@@ -26,7 +26,8 @@ using namespace metal;
 ///
 /// Threadgroup: (min(1024, next_power_of_two(n_elements)), 1, 1)
 /// Grid:        (1, 1, 1) — single threadgroup
-/// Shared mem:  tg_size * (sizeof(float) + sizeof(uint)) bytes at index 0
+/// Shared mem:  tg_size * (sizeof(float) + 2*sizeof(uint)) bytes across
+///              indices 0, 1, and 2
 ///
 /// IMPORTANT: tg_size must be a power of 2 for the tree reduction to be
 /// correct.  The Rust dispatch ensures this.
@@ -39,16 +40,22 @@ kernel void argmax_f32(
     uint tid     [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]],
     threadgroup float* shared_vals [[threadgroup(0)]],
-    threadgroup uint*  shared_idxs [[threadgroup(1)]]
+    threadgroup uint*  shared_idxs [[threadgroup(1)]],
+    threadgroup uint*  shared_invalid [[threadgroup(2)]]
 ) {
     const uint n_elements = params[0];
 
     // Phase 1: each thread finds its local (max_val, max_idx) over its chunk.
     float local_max = -INFINITY;
     uint  local_idx = 0;
+    uint  local_invalid = 0;
 
     for (uint i = tid; i < n_elements; i += tg_size) {
         float v = input[i];
+        if (!isfinite(v)) {
+            local_invalid = 1;
+            continue;
+        }
         if (v > local_max) {
             local_max = v;
             local_idx = i;
@@ -58,11 +65,13 @@ kernel void argmax_f32(
     // Store in shared memory for reduction.
     shared_vals[tid] = local_max;
     shared_idxs[tid] = local_idx;
+    shared_invalid[tid] = local_invalid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: tree reduction — keep whichever slot has the larger value.
     for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
+            shared_invalid[tid] |= shared_invalid[tid + stride];
             float other_val = shared_vals[tid + stride];
             if (other_val > shared_vals[tid] ||
                 (other_val == shared_vals[tid] &&
@@ -76,7 +85,15 @@ kernel void argmax_f32(
 
     // Thread 0 writes the result.
     if (tid == 0) {
-        out_value[0] = shared_vals[0];
-        out_index[0] = shared_idxs[0];
+        // A non-finite logit must never collapse into an apparently valid
+        // token. Preserve a host-visible sentinel in the same required
+        // 8-byte result readback; consumers reject the non-finite value.
+        if (shared_invalid[0] != 0) {
+            out_value[0] = NAN;
+            out_index[0] = 0xffffffffu;
+        } else {
+            out_value[0] = shared_vals[0];
+            out_index[0] = shared_idxs[0];
+        }
     }
 }
