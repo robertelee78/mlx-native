@@ -1,10 +1,10 @@
 [package]
 name = "mlx-native"
-version = "0.12.3"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 authors = ["mlx-native contributors"]
 repository = "https://github.com/robertelee78/mlx-native"
 homepage = "https://github.com/robertelee78/mlx-native"

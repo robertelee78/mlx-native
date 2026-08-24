@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/mlx-native.svg)](https://crates.io/crates/mlx-native)
 [![docs.rs](https://docs.rs/mlx-native/badge.svg)](https://docs.rs/mlx-native)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT AND Apache-2.0](https://img.shields.io/badge/License-MIT%20AND%20Apache--2.0-blue.svg)](#license)
 
 Pure-Rust Metal GPU compute library for transformer inference on Apple Silicon. Built as the GPU backend for the [hf2q](https://github.com/robertelee78/hf2q) inference engine.
 
@@ -203,7 +203,7 @@ Use `resolve_dense_matmul_id_auto_route` when a caller must validate the exact
 plan/epoch/device/shape/weight extent before it mutates a graph encoder; the
 resolver is the same one used by auto dispatch and submits no work.
 
-See [the GGUF execution capability decision](docs/gguf-execution-capability-2026-08-19.md)
+See [the GGUF execution capability decision](https://github.com/robertelee78/mlx-native/blob/main/docs/gguf-execution-capability-2026-08-19.md)
 for allocator boundaries and remaining device-proof requirements.
 
 ### Normalization
@@ -323,4 +323,6 @@ Derived-kernel provenance and peer comparisons are consolidated in `docs/peer-be
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+The packaged crate combines MIT-licensed code with Apache-2.0-derived
+components. Recipients must comply with both licenses. See [LICENSE](LICENSE)
+and [`LICENSE-APACHE-candle`](LICENSE-APACHE-candle).
