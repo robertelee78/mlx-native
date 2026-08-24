@@ -452,7 +452,7 @@ fn q5_0_width_amortized_batch_broadcasts_one_native_weight() {
 }
 
 #[test]
-fn q5_0_simd_mm_fallback_and_bf16_perm021_match_cpu() {
+fn q5_0_simd_mm_fallback_matches_cpu() {
     let device = MlxDevice::new().unwrap();
     let weight_bytes = matrix_bytes(211);
     let weight = u8_buffer(&device, &weight_bytes);
@@ -491,7 +491,14 @@ fn q5_0_simd_mm_fallback_and_bf16_perm021_match_cpu() {
         &cpu_dense(&input_values, &weight_bytes, m),
         "forced simd MM",
     );
+}
 
+#[cfg(mlx_native_has_metal_tensor_artifact)]
+#[test]
+fn q5_0_bf16_perm021_matches_cpu() {
+    let device = MlxDevice::new().unwrap();
+    let weight_bytes = matrix_bytes(211);
+    let weight = u8_buffer(&device, &weight_bytes);
     let m = 9usize;
     let n_heads = 2usize;
     let head_dim = K / n_heads;
@@ -517,6 +524,7 @@ fn q5_0_simd_mm_fallback_and_bf16_perm021_match_cpu() {
     let permuted_output = device
         .alloc_buffer(m * N * 4, DType::F32, vec![m, N])
         .unwrap();
+    let mut registry = KernelRegistry::new();
     let mut encoder = device.command_encoder().unwrap();
     quantized_matmul_mm_tensor_perm021(
         &mut encoder,
