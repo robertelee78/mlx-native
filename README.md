@@ -237,9 +237,11 @@ for allocator boundaries and remaining device-proof requirements.
 - `moe_weighted_reduce` — Weighted sum across selected experts
 
 ### State-space (Mamba/Gated DeltaNet)
-- `ssm_conv` — Depthwise causal 1D convolution + SiLU
+- `ssm_conv` — Depthwise causal 1D convolution + SiLU, including exact
+  one-row selected-state capture inside a longer prefill
 - `ssm_norm_gate` — Norm + gate fusion (eliminates CPU bridge)
-- `gated_delta_net` — Fused GDN kernel (decode)
+- `gated_delta_net` — Fused GDN kernel (decode), including bounded selected
+  recurrent-state capture without materializing every intermediate row
 - `gated_delta_net_chunk` / `_chunk_o` / `_kkt` / `_recompute_wu` — chunk-mode forward
 - `chunk_gated_delta_rule` / `_tri_solve_invert` — chunk-rule decomposition with triangular inversion
 - `compute_g_beta` — GDN g/beta computation
