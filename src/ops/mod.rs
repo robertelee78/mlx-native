@@ -71,6 +71,7 @@ pub mod hadamard_quantize_kv;
 pub mod kv_cache_copy;
 pub mod l2_norm;
 pub mod log_elementwise;
+mod logical_range;
 pub mod moe_dispatch;
 pub mod moe_gate;
 pub mod moe_mm_id_map0;

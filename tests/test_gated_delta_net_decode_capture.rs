@@ -255,47 +255,78 @@ fn assert_byte_identical(label: &str, a: &[f32], b: &[f32]) {
 #[test]
 fn selected_capture_matches_all_position_capture_without_changing_forward() {
     let (device, mut registry) = setup();
-    let p = GatedDeltaNetParams {
-        d_k: 64,
-        d_v: 64,
-        n_k_heads: 2,
-        n_v_heads: 4,
-        n_tokens: 7,
-        n_seqs: 2,
-    };
-    let (q, k, v, g, beta, state_in) = random_inputs(p, 0xB0A7_DA7A);
-    let (ordinary_out, ordinary_state) =
-        run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
-    let (all_out, all_state, all_capture) =
-        run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
-    assert_byte_identical("all-capture output", &all_out, &ordinary_out);
-    assert_byte_identical("all-capture final state", &all_state, &ordinary_state);
+    for (p, seed) in [
+        (
+            GatedDeltaNetParams {
+                d_k: 32,
+                d_v: 32,
+                n_k_heads: 1,
+                n_v_heads: 2,
+                n_tokens: 3,
+                n_seqs: 1,
+            },
+            0xB0A7_DA71,
+        ),
+        (
+            GatedDeltaNetParams {
+                d_k: 64,
+                d_v: 64,
+                n_k_heads: 2,
+                n_v_heads: 4,
+                n_tokens: 7,
+                n_seqs: 2,
+            },
+            0xB0A7_DA72,
+        ),
+        (
+            GatedDeltaNetParams {
+                d_k: 128,
+                d_v: 128,
+                n_k_heads: 2,
+                n_v_heads: 4,
+                n_tokens: 3,
+                n_seqs: 1,
+            },
+            0xB0A7_DA74,
+        ),
+    ] {
+        let (q, k, v, g, beta, state_in) = random_inputs(p, seed);
+        let (ordinary_out, ordinary_state) =
+            run_decode(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+        let (all_out, all_state, all_capture) =
+            run_decode_with_capture(&device, &mut registry, &q, &k, &v, &g, &beta, &state_in, p);
+        assert_byte_identical("all-capture output", &all_out, &ordinary_out);
+        assert_byte_identical("all-capture final state", &all_state, &ordinary_state);
 
-    let per_seq_state = (p.d_k * p.d_v * p.n_v_heads) as usize;
-    let all_seq_stride = p.n_tokens as usize * per_seq_state;
-    for capture_token in [0u32, 3, 6] {
-        let (selected_out, selected_state, selected_capture) = run_decode_with_selected_capture(
-            &device,
-            &mut registry,
-            &q,
-            &k,
-            &v,
-            &g,
-            &beta,
-            &state_in,
-            capture_token,
-            p,
-        );
-        assert_byte_identical("selected output", &selected_out, &ordinary_out);
-        assert_byte_identical("selected final state", &selected_state, &ordinary_state);
-        for seq in 0..p.n_seqs as usize {
-            let all_start = seq * all_seq_stride + capture_token as usize * per_seq_state;
-            let selected_start = seq * per_seq_state;
-            assert_byte_identical(
-                &format!("selected token {capture_token} seq {seq}"),
-                &selected_capture[selected_start..selected_start + per_seq_state],
-                &all_capture[all_start..all_start + per_seq_state],
+        let per_seq_state = (p.d_k * p.d_v * p.n_v_heads) as usize;
+        let all_seq_stride = p.n_tokens as usize * per_seq_state;
+        for capture_token in [0, p.n_tokens / 2, p.n_tokens - 1] {
+            let (selected_out, selected_state, selected_capture) = run_decode_with_selected_capture(
+                &device,
+                &mut registry,
+                &q,
+                &k,
+                &v,
+                &g,
+                &beta,
+                &state_in,
+                capture_token,
+                p,
             );
+            assert_byte_identical("selected output", &selected_out, &ordinary_out);
+            assert_byte_identical("selected final state", &selected_state, &ordinary_state);
+            for seq in 0..p.n_seqs as usize {
+                let all_start = seq * all_seq_stride + capture_token as usize * per_seq_state;
+                let selected_start = seq * per_seq_state;
+                assert_byte_identical(
+                    &format!(
+                        "selected NSG={} token {capture_token} seq {seq}",
+                        p.d_k / 32
+                    ),
+                    &selected_capture[selected_start..selected_start + per_seq_state],
+                    &all_capture[all_start..all_start + per_seq_state],
+                );
+            }
         }
     }
 }
@@ -372,6 +403,140 @@ fn selected_capture_rejects_invalid_index_and_destination_before_encoding() {
     )
     .expect_err("short selected capture must fail");
     assert!(invalid_shape.to_string().contains("element count"));
+}
+
+#[test]
+fn selected_capture_rejects_state_and_output_aliases_before_encoding() {
+    let (device, mut registry) = setup();
+    let p = GatedDeltaNetParams {
+        d_k: 32,
+        d_v: 32,
+        n_k_heads: 1,
+        n_v_heads: 2,
+        n_tokens: 3,
+        n_seqs: 1,
+    };
+    let (q, k, v, g, beta, state) = random_inputs(p, 0xA11A_51A5);
+    let q = upload_f32(&device, &q);
+    let k = upload_f32(&device, &k);
+    let v = upload_f32(&device, &v);
+    let g = upload_f32(&device, &g);
+    let beta = upload_f32(&device, &beta);
+    let state = upload_f32(&device, &state);
+    let output_elems = (p.d_v * p.n_v_heads * p.n_tokens) as usize;
+    let state_elems = (p.d_k * p.d_v * p.n_v_heads) as usize;
+    let output = device
+        .alloc_buffer(output_elems * 4, DType::F32, vec![output_elems])
+        .expect("output");
+    let state_out = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("state out");
+    let capture = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("capture");
+    let params = build_gated_delta_net_params(&device, p).expect("params");
+
+    let mut encoder = device.command_encoder().expect("state alias encoder");
+    encoder.start_capture();
+    let error = dispatch_gated_delta_net_decode_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &state,
+        &output,
+        &state_out,
+        &params,
+        &state_out,
+        1,
+        p,
+    )
+    .expect_err("state_out/state_capture alias must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder
+        .take_capture()
+        .expect("state alias capture")
+        .is_empty());
+
+    let mut encoder = device.command_encoder().expect("output alias encoder");
+    encoder.start_capture();
+    let error = dispatch_gated_delta_net_decode_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &state,
+        &v,
+        &state_out,
+        &params,
+        &capture,
+        1,
+        p,
+    )
+    .expect_err("v/output alias must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder
+        .take_capture()
+        .expect("output alias capture")
+        .is_empty());
+}
+
+#[test]
+fn all_position_capture_rejects_state_alias_before_encoding() {
+    let (device, mut registry) = setup();
+    let p = GatedDeltaNetParams {
+        d_k: 32,
+        d_v: 32,
+        n_k_heads: 1,
+        n_v_heads: 2,
+        n_tokens: 1,
+        n_seqs: 1,
+    };
+    let (q, k, v, g, beta, state) = random_inputs(p, 0xA11A_C4A7);
+    let q = upload_f32(&device, &q);
+    let k = upload_f32(&device, &k);
+    let v = upload_f32(&device, &v);
+    let g = upload_f32(&device, &g);
+    let beta = upload_f32(&device, &beta);
+    let state = upload_f32(&device, &state);
+    let output_elems = (p.d_v * p.n_v_heads * p.n_tokens) as usize;
+    let state_elems = (p.d_k * p.d_v * p.n_v_heads) as usize;
+    let output = device
+        .alloc_buffer(output_elems * 4, DType::F32, vec![output_elems])
+        .expect("output");
+    let state_out = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("state out");
+    let params = build_gated_delta_net_params(&device, p).expect("params");
+    let mut encoder = device.command_encoder().expect("encoder");
+    encoder.start_capture();
+    let error = dispatch_gated_delta_net_decode_with_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &state,
+        &output,
+        &state_out,
+        &params,
+        &state_out,
+        p,
+    )
+    .expect_err("state_out/state_capture alias must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder.take_capture().expect("capture").is_empty());
 }
 
 /// AC#1+2: capture variant's output + state_out byte-identical to

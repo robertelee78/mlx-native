@@ -312,6 +312,180 @@ fn selected_capture_rejects_invalid_index_and_destination_before_encoding() {
 }
 
 #[test]
+fn selected_capture_rejects_bf16_and_aliases_before_encoding() {
+    let (device, mut registry) = setup();
+    let p = SsmConvParams {
+        channels: 32,
+        n_tokens: 3,
+        n_seqs: 1,
+        k_width: 4,
+    };
+    let x_elems = (p.channels * p.n_tokens) as usize;
+    let state_elems = ((p.k_width - 1) * p.channels) as usize;
+    let kernel_elems = (p.k_width * p.channels) as usize;
+    let x = upload_f32(&device, &vec![0.1; x_elems]);
+    let kernel = upload_f32(&device, &vec![0.2; kernel_elems]);
+    let old_state = upload_f32(&device, &vec![0.0; state_elems]);
+    let y = device
+        .alloc_buffer(x_elems * 4, DType::F32, vec![x_elems])
+        .expect("y");
+    let new_state = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("new state");
+    let capture = device
+        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+        .expect("capture");
+    let params = build_params_buf(&device, p);
+
+    let bf16_x = device
+        .alloc_buffer(x_elems * 2, DType::BF16, vec![x_elems])
+        .expect("bf16 x");
+    let bf16_kernel = device
+        .alloc_buffer(kernel_elems * 2, DType::BF16, vec![kernel_elems])
+        .expect("bf16 kernel");
+    let bf16_old_state = device
+        .alloc_buffer(state_elems * 2, DType::BF16, vec![state_elems])
+        .expect("bf16 old state");
+    let bf16_new_state = device
+        .alloc_buffer(state_elems * 2, DType::BF16, vec![state_elems])
+        .expect("bf16 new state");
+    let bf16_y = device
+        .alloc_buffer(x_elems * 2, DType::BF16, vec![x_elems])
+        .expect("bf16 y");
+    let mut encoder = device.command_encoder().expect("bf16 encoder");
+    encoder.start_capture();
+    let error = dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &bf16_x,
+        &bf16_kernel,
+        &bf16_old_state,
+        &bf16_new_state,
+        &bf16_y,
+        &capture,
+        &params,
+        1,
+        p,
+    )
+    .expect_err("BF16 selected capture must fail");
+    assert!(error.to_string().contains("only F32"));
+    assert!(encoder.take_capture().expect("BF16 capture").is_empty());
+
+    let mut encoder = device.command_encoder().expect("state alias encoder");
+    encoder.start_capture();
+    let error = dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x,
+        &kernel,
+        &old_state,
+        &old_state,
+        &y,
+        &capture,
+        &params,
+        1,
+        p,
+    )
+    .expect_err("old/new state alias must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder
+        .take_capture()
+        .expect("state alias capture")
+        .is_empty());
+
+    let mut encoder = device.command_encoder().expect("x/y alias encoder");
+    encoder.start_capture();
+    let error = dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x,
+        &kernel,
+        &old_state,
+        &new_state,
+        &x,
+        &capture,
+        &params,
+        1,
+        p,
+    )
+    .expect_err("x/y alias must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder
+        .take_capture()
+        .expect("x/y alias capture")
+        .is_empty());
+
+    let parent = device
+        .alloc_buffer((x_elems + 1) * 4, DType::F32, vec![x_elems + 1])
+        .expect("overlap parent");
+    let x_view = parent.slice_view(0, x_elems);
+    let y_view = parent.slice_view(4, x_elems);
+    let mut encoder = device.command_encoder().expect("partial alias encoder");
+    encoder.start_capture();
+    let error = dispatch_ssm_conv_with_selected_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x_view,
+        &kernel,
+        &old_state,
+        &new_state,
+        &y_view,
+        &capture,
+        &params,
+        1,
+        p,
+    )
+    .expect_err("partially overlapping x/y views must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder
+        .take_capture()
+        .expect("partial alias capture")
+        .is_empty());
+}
+
+#[test]
+fn all_position_capture_rejects_x_y_alias_before_encoding() {
+    let (device, mut registry) = setup();
+    let p = SsmConvParams {
+        channels: 32,
+        n_tokens: 3,
+        n_seqs: 1,
+        k_width: 4,
+    };
+    let x_elems = (p.channels * p.n_tokens) as usize;
+    let state_elems = ((p.k_width - 1) * p.channels) as usize;
+    let capture_elems = p.n_tokens as usize * state_elems;
+    let x = upload_f32(&device, &vec![0.1; x_elems]);
+    let kernel = upload_f32(&device, &vec![0.2; (p.k_width * p.channels) as usize]);
+    let old_state = upload_f32(&device, &vec![0.0; state_elems]);
+    let capture = device
+        .alloc_buffer(capture_elems * 4, DType::F32, vec![capture_elems])
+        .expect("capture");
+    let params = build_params_buf(&device, p);
+    let mut encoder = device.command_encoder().expect("encoder");
+    encoder.start_capture();
+    let error = dispatch_ssm_conv_with_capture(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &x,
+        &kernel,
+        &old_state,
+        &x,
+        &capture,
+        &params,
+        p,
+    )
+    .expect_err("x/y alias must fail");
+    assert!(error.to_string().contains("must not overlap"));
+    assert!(encoder.take_capture().expect("capture").is_empty());
+}
+
+#[test]
 fn selected_capture_records_a_raw_thread_dispatch() {
     let (device, mut registry) = setup();
     let p = SsmConvParams {
@@ -364,7 +538,11 @@ fn selected_capture_records_a_raw_thread_dispatch() {
     };
     assert!(matches!(dispatch_kind, DispatchKind::Threads));
     assert_eq!(
-        (threads_per_grid.width, threads_per_grid.height, threads_per_grid.depth),
+        (
+            threads_per_grid.width,
+            threads_per_grid.height,
+            threads_per_grid.depth
+        ),
         (p.channels as u64, p.n_tokens as u64, p.n_seqs as u64)
     );
     assert!(

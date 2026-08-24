@@ -53,14 +53,13 @@ use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
 use super::gated_delta_net::GatedDeltaNetParams;
+use super::logical_range::validate_no_write_aliases;
 
 pub static GATED_DELTA_NET_DECODE_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_decode.metal");
 
 /// ADR-034 task #90 (2026-05-21) — per-position state capture variant
-/// for K≥2 speculative decoding on hybrid Qwen 3.5/3.6 (the MTPLX-style
-/// rollback mechanism documented at
-/// [[project_adr034_mtplx_gdn_capture_2026_05_21]]).
+/// for K≥2 speculative decoding on hybrid Qwen 3.5/3.6.
 pub static GATED_DELTA_NET_DECODE_CAPTURE_SHADER_SOURCE: &str =
     include_str!("../shaders/gated_delta_net_decode_capture.metal");
 
@@ -291,8 +290,8 @@ pub fn dispatch_gated_delta_net_decode(
 }
 
 /// ADR-034 task #90 (2026-05-21) — Dispatch the Gated DeltaNet decode
-/// kernel with **per-position state capture**, the MTPLX-style rollback
-/// mechanism that unlocks K≥2 speculative decoding on hybrid Qwen 3.5/3.6.
+/// kernel with **per-position state capture** for K≥2 speculative decoding
+/// on hybrid Qwen 3.5/3.6.
 ///
 /// Identical math + identical state_out semantics to
 /// [`dispatch_gated_delta_net_decode`]; additionally writes the recurrent
@@ -377,6 +376,23 @@ pub fn dispatch_gated_delta_net_decode_with_capture(
             state_capture.dtype(),
         )));
     }
+    validate_no_write_aliases(
+        "gated_delta_net_decode_with_capture",
+        &[
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("g", g),
+            ("beta", beta),
+            ("state_in", state_in),
+            ("params_buf", params_buf),
+        ],
+        &[
+            ("output", output),
+            ("state_out", state_out),
+            ("state_capture", state_capture),
+        ],
+    )?;
 
     let nsg: u32 = p.d_k / 32;
     let kernel_name = match nsg {
@@ -423,9 +439,9 @@ pub fn dispatch_gated_delta_net_decode_with_capture(
 /// This is the bounded-memory counterpart to
 /// [`dispatch_gated_delta_net_decode_with_capture`]. It preserves every
 /// output and the final `state_out`, but `state_capture` is only
-/// `[D_k, D_v, n_v_heads, n_seqs]`; its sequence `s` slice is the state after
-/// `capture_token` for sequence `s`. The allocation is therefore independent
-/// of the enclosing prefill length.
+/// `[n_seqs, n_v_heads, D_v, D_k]` with `D_k` contiguous; its sequence `s`
+/// slice is the state after `capture_token` for sequence `s`. The allocation
+/// is therefore independent of the enclosing prefill length.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_gated_delta_net_decode_with_selected_capture(
     encoder: &mut CommandEncoder,
@@ -473,6 +489,23 @@ pub fn dispatch_gated_delta_net_decode_with_selected_capture(
             state_capture.dtype()
         )));
     }
+    validate_no_write_aliases(
+        "gated_delta_net_decode_with_selected_capture",
+        &[
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("g", g),
+            ("beta", beta),
+            ("state_in", state_in),
+            ("params_buf", params_buf),
+        ],
+        &[
+            ("output", output),
+            ("state_out", state_out),
+            ("state_capture", state_capture),
+        ],
+    )?;
 
     let nsg = p.d_k / 32;
     let kernel_name = match nsg {

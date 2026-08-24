@@ -48,12 +48,13 @@ use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::logical_range::validate_no_write_aliases;
+
 pub static SSM_CONV_SHADER_SOURCE: &str = include_str!("../shaders/ssm_conv.metal");
 
 /// ADR-034 task #90 Step 4b (2026-05-21) — per-position conv-state capture
 /// kernel for K=N speculative decoding rollback on hybrid Qwen 3.5/3.6.
-/// Source: `../shaders/ssm_conv_capture.metal` — port of MTPLX
-/// `gdn_capture.py:61-125`.
+/// Source: `../shaders/ssm_conv_capture.metal`.
 pub static SSM_CONV_CAPTURE_SHADER_SOURCE: &str = include_str!("../shaders/ssm_conv_capture.metal");
 
 /// Register SSM conv shader sources with the given kernel registry.
@@ -207,7 +208,6 @@ pub fn dispatch_ssm_conv(
     params: SsmConvParams,
 ) -> Result<()> {
     validate(&params, x, kernel_w, old_state, new_state, y)?;
-
     let (fwd_name, state_name) = match x.dtype() {
         DType::F32 => ("ssm_conv_forward_f32", "ssm_conv_state_update_f32"),
         DType::BF16 => ("ssm_conv_forward_bf16", "ssm_conv_state_update_bf16"),
@@ -391,6 +391,16 @@ pub fn dispatch_ssm_conv_with_capture(
             )));
         }
     }
+    validate_no_write_aliases(
+        "ssm_conv_with_capture",
+        &[
+            ("x", x),
+            ("kernel_w", kernel_w),
+            ("old_state", old_state),
+            ("params_buf", params_buf),
+        ],
+        &[("y", y), ("conv_capture", conv_capture)],
+    )?;
 
     let pipeline = registry.get_pipeline("ssm_conv_capture_forward_f32", device)?;
 
@@ -447,6 +457,12 @@ pub fn dispatch_ssm_conv_with_selected_capture(
     params: SsmConvParams,
 ) -> Result<()> {
     validate(&params, x, kernel_w, old_state, new_state, y)?;
+    if x.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "ssm_conv_with_selected_capture: only F32 is supported (got {})",
+            x.dtype()
+        )));
+    }
     if capture_token >= params.n_tokens {
         return Err(MlxError::InvalidArgument(format!(
             "ssm_conv_with_selected_capture: capture_token {} >= n_tokens {}",
@@ -474,6 +490,20 @@ pub fn dispatch_ssm_conv_with_selected_capture(
             params_buf.element_count()
         )));
     }
+    validate_no_write_aliases(
+        "ssm_conv_with_selected_capture",
+        &[
+            ("x", x),
+            ("kernel_w", kernel_w),
+            ("old_state", old_state),
+            ("params_buf", params_buf),
+        ],
+        &[
+            ("y", y),
+            ("new_state", new_state),
+            ("conv_capture", conv_capture),
+        ],
+    )?;
 
     let pipeline = registry.get_pipeline("ssm_conv_selected_capture_forward_f32", device)?;
     let (grid, tg) = selected_capture_dispatch_sizes(params);

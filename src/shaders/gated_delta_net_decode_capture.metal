@@ -3,8 +3,7 @@ using namespace metal;
 
 // ADR-034 task #90 (2026-05-21) — Gated DeltaNet recurrent kernel with
 // **per-position state capture** for K≥2 speculative decoding on hybrid
-// Qwen 3.5/3.6 (the structural lever MTPLX has and we don't, per the
-// 2026-05-21 deep-research synthesis; gdn_capture.py:128-201 reference).
+// Qwen 3.5/3.6.
 //
 // IDENTICAL math + threading model to `gated_delta_net_decode_f32_<NSG>`
 // (`gated_delta_net_decode.metal`), with ONE additional output buffer:
@@ -50,9 +49,8 @@ using namespace metal;
 //
 // # Memory cost
 //
-// For Qwen 3.5/3.6 (D_k=128, D_v=128, n_v_heads=8, n_seqs=1, K+1=4):
-//   per-call:   128 * 128 * 8 * 4 * 4 bytes = 2 MB per LA layer
-//   per-forward (30+ LA layers): ~60-90 MB total
+//   all-position bytes = n_seqs * n_tokens * n_v_heads * D_v * D_k * 4
+//   selected bytes     = n_seqs * n_v_heads * D_v * D_k * 4
 //
 // Caller allocates this buffer once per spec-decode iter and reads
 // states[accepted_idx] on partial-reject.
