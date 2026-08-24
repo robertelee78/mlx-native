@@ -46,6 +46,34 @@ fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     })
 }
 
+fn validate_native_quantized_dtypes(
+    operation: &str,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+) -> Result<()> {
+    if input.dtype() != DType::F32 || weight.dtype() != DType::U8 || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{operation} requires F32 input, native U8 GGUF blocks, and F32 output; got {:?}/{:?}/{:?}",
+            input.dtype(),
+            weight.dtype(),
+            output.dtype(),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_signed_metal_dimensions(operation: &str, dimensions: &[(&str, u32)]) -> Result<()> {
+    for (label, value) in dimensions {
+        if *value > i32::MAX as u32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "{operation}: {label} exceeds the signed Metal ABI"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---- Block format constants ----
 
 /// Q4_0: 32 values per block, 18 bytes per block (2 byte f16 scale + 16 bytes quants).
@@ -515,6 +543,12 @@ pub fn quantized_matmul_ggml_with_policy(
     // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
     // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
     // for the multi-thread encoding port (peer's n_cb=2 pattern).
+    validate_native_quantized_dtypes("quantized_matmul_ggml", input, weight, output)?;
+    validate_signed_metal_dimensions(
+        "quantized_matmul_ggml",
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
+
     let qk = params.ggml_type.block_values();
     let block_bytes = params.ggml_type.block_bytes();
 
@@ -860,6 +894,15 @@ pub fn quantized_matmul_ggml_batched_mm_strided_input_with_policy(
     input_strides: &GgmlBatchedQuantizedMatmulInputStrides,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
+    validate_signed_metal_dimensions(
+        "batched quantized MM",
+        &[
+            ("batch", params.batch),
+            ("M", params.m),
+            ("N", params.n),
+            ("K", params.k),
+        ],
+    )?;
     if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "batched quantized MM dimensions must all be nonzero".into(),
@@ -1013,6 +1056,15 @@ pub fn quantized_matmul_ggml_batched_mv_with_policy(
     params: &GgmlBatchedQuantizedMatmulParams,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
+    validate_signed_metal_dimensions(
+        "batched quantized MV",
+        &[
+            ("batch", params.batch),
+            ("M", params.m),
+            ("N", params.n),
+            ("K", params.k),
+        ],
+    )?;
     if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "batched quantized MV dimensions must all be nonzero".into(),
@@ -1239,6 +1291,7 @@ pub fn dispatch_mm_for_test(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    validate_native_quantized_dtypes("dispatch_mm_for_test", input, weight, output)?;
     validate_mm_for_test(params)?;
     let routing = GgmlRoutingPolicy::default();
     dispatch_mm(
@@ -1262,6 +1315,12 @@ pub fn dispatch_mm_q4_0_tensor_64x32_for_test(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    validate_native_quantized_dtypes(
+        "dispatch_mm_q4_0_tensor_64x32_for_test",
+        input,
+        weight,
+        output,
+    )?;
     validate_mm_for_test(params)?;
     dispatch_mm_q4_route_internal(
         encoder,
@@ -1288,6 +1347,7 @@ pub fn dispatch_mm_simd_for_test(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
+    validate_native_quantized_dtypes("dispatch_mm_simd_for_test", input, weight, output)?;
     validate_mm_for_test(params)?;
     let routing = GgmlRoutingPolicy {
         dense_tensor_mm: GgmlTensorMmPreference::ForceSimd,
@@ -2219,6 +2279,10 @@ pub fn quantized_matmul_mm_tensor_perm021(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulPerm021Params,
 ) -> Result<()> {
+    validate_signed_metal_dimensions(
+        "quantized_matmul_mm_tensor_perm021",
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
     if params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
             "quantized_matmul_mm_tensor_perm021: M, N, and K must be non-zero".into(),
@@ -2263,10 +2327,15 @@ pub fn quantized_matmul_mm_tensor_perm021(
             params.k, qk,
         )));
     }
-    if input_bf16.dtype() != DType::BF16 {
+    if input_bf16.dtype() != DType::BF16
+        || weight.dtype() != DType::U8
+        || output.dtype() != DType::F32
+    {
         return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_mm_tensor_perm021: input must be BF16, got {:?}",
+            "quantized_matmul_mm_tensor_perm021 requires BF16 input, native U8 GGUF blocks, and F32 output; got {:?}/{:?}/{:?}",
             input_bf16.dtype(),
+            weight.dtype(),
+            output.dtype(),
         )));
     }
 

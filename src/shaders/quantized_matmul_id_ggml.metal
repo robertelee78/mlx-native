@@ -37,7 +37,7 @@ using namespace metal;
 struct GgmlMatvecIdParams {
     int64_t ne00;           // K: input dimension
     int64_t ne01;           // N: output dimension per expert
-    int64_t ne02;           // 1 (unused, kept for struct compat)
+    int64_t ne02;           // number of experts (on-device ID bound)
     int64_t ne10;           // K: input dimension (redundant, == ne00)
     int64_t ne12;           // 1 (unused)
     int64_t ne0;            // N: output stride
@@ -48,6 +48,33 @@ struct GgmlMatvecIdParams {
     uint    n_tokens;       // number of input tokens
     int64_t expert_stride;  // bytes between expert weight slices
 };
+
+// Fail closed without a host readback: expert IDs may be produced by an
+// earlier kernel in the same command stream. All threads in one threadgroup
+// observe the same ID, return before any expert address calculation, and the
+// lane(s) that own this output-column tile replace it with NaN.
+inline bool poison_invalid_expert_id(
+    device float * dst,
+    constant GgmlMatvecIdParams & p,
+    uint expert_id,
+    int output_row,
+    int first_column,
+    int column_count,
+    bool write_poison
+) {
+    if ((uint64_t)expert_id < (uint64_t)p.ne02) {
+        return false;
+    }
+    if (write_poison) {
+        for (int column = 0; column < column_count; column++) {
+            const int output_column = first_column + column;
+            if (output_column < p.ne01) {
+                dst[output_row * p.ne0 + output_column] = NAN;
+            }
+        }
+    }
+    return true;
+}
 
 // K_SCALE_SIZE: bytes used for scales+mins in Q4_K and Q5_K super-blocks.
 #define K_SCALE_SIZE 12
@@ -361,6 +388,9 @@ kernel void kernel_mul_mv_id_q4_0_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
+
     // Point to the expert's weight slice
     device const block_q4_0 * x = (device const block_q4_0 *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
 
@@ -458,6 +488,9 @@ kernel void kernel_mul_mv_id_q4_0_f32_swiglu(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
+
     // Expert's weight slice.
     device const block_q4_0 * x = (device const block_q4_0 *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
 
@@ -550,6 +583,9 @@ kernel void kernel_mul_mv_id_q8_0_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
+
     device const block_q8_0 * x = (device const block_q8_0 *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
     device const float      * y = src1 + token_idx * p.ne10;
 
@@ -605,6 +641,8 @@ kernel void kernel_mul_mv_id_q2_K_f32(
     const uint token_idx = uint(output_row) / p.top_k;
     const uint expert_id = ids[output_row];
     const int first_row = (int(tgpig.x) * N_SIMDGROUP + int(sgitg)) * nr;
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
     device const block_q2_K * x = (device const block_q2_K *)(src0 + expert_id*p.expert_stride)
                                       + first_row*nb;
     device const float * y = src1 + token_idx*p.ne10;
@@ -683,6 +721,8 @@ kernel void kernel_mul_mv_id_q3_K_f32(
     const uint token_idx = uint(output_row)/p.top_k;
     const uint expert_id = ids[output_row];
     const int first_row = (int(tgpig.x)*nsg + int(sgitg))*nr;
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
     device const block_q3_K * x =
         (device const block_q3_K *)(src0 + expert_id*p.expert_stride) + first_row*nb;
     device const float * yy = src1 + token_idx*p.ne10;
@@ -823,6 +863,10 @@ kernel void kernel_mul_mv_id_q8_0_f32_nr2(
 
     const int first_row = r0 * NR0;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row_base, first_row, NR0,
+            tiisg == 0 && sgitg == 0)) return;
+
     // Per-row src0 pointers (unrolled NR0=2 iterations), with expert offset.
     device const block_q8_0 * ax[NR0];
     for (int row = 0; row < NR0; ++row) {
@@ -931,6 +975,9 @@ kernel void kernel_mul_mv_id_q5_1_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
+
     // Point to the expert's weight slice. Q5_1 block stride is 24 bytes
     // (vs 18 for Q4_0); the expert_stride byte offset is honored by the
     // host-side dispatcher.
@@ -997,6 +1044,8 @@ kernel void kernel_mul_mv_id_q5_0_f32(
     const uint token_idx = output_row / p.top_k;
     const uint expert_id = ids[output_row];
     const int first_row = (r0 * nsg + sgitg) * nr;
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
     device const block_q5_0 * x = (device const block_q5_0 *)((device const char *)src0
                                 + expert_id * p.expert_stride) + first_row * nb;
     device const float * y = src1 + token_idx * p.ne10;
@@ -1079,6 +1128,9 @@ kernel void kernel_mul_mv_id_iq4_xs_f32(
 
     const int first_row = (r0 * nsg + sgitg) * nr;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
+
     device const block_iq4_xs * x = (device const block_iq4_xs *)((device const char *)src0
                                   + expert_id * p.expert_stride) + first_row * nb;
 
@@ -1138,6 +1190,9 @@ kernel void kernel_mul_mv_id_iq4_nl_f32(
     const uint expert_id = ids[output_row];
 
     const int first_row = (r0 * nsg + sgitg) * nr;
+
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, first_row, nr, tiisg == 0)) return;
 
     device const block_iq4_nl * x = (device const block_iq4_nl *)((device const char *)src0
                                   + expert_id * p.expert_stride) + first_row * nb;
@@ -1212,6 +1267,9 @@ kernel void kernel_mul_mv_id_q5_K_f32(
     // Each threadgroup covers weight-row pair (2*r0, 2*r0+1);
     // sgitg selects which row this simdgroup computes.
     const int row = 2 * (int)r0 + (int)sgitg;
+
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, row, 1, tiisg == 0)) return;
 
     // Point to the expert's weight slice and the token's input row.
     device const block_q5_K * x  = (device const block_q5_K *)((device const char *)src0 + expert_id * p.expert_stride) + row * nb;
@@ -1344,6 +1402,9 @@ kernel void kernel_mul_mv_id_q6_K_f32(
 
     const int row = 2 * r0 + sgitg;
 
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row_base, row, 1, tiisg == 0)) return;
+
     device const block_q6_K * x  = (device const block_q6_K *)((device const char *)src0 + expert_id * p.expert_stride) + row * nb;
     device const float      * yy = src1 + token_idx * p.ne10;
 
@@ -1428,6 +1489,9 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
     const uint expert_id = ids[output_row_base];
 
     const int first_row = (int)((r0 * NSG + sgitg) * nr0);
+
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row_base, first_row, nr0, tiisg == 0)) return;
 
     device const block_q6_K * x_base = (device const block_q6_K *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
     device const float      * yy = src1 + token_idx * p.ne10;
@@ -1538,6 +1602,9 @@ kernel void kernel_mul_mv_id_q4_K_f32(
     // Each threadgroup covers weight-row pair (2*r0, 2*r0+1);
     // sgitg selects which row this simdgroup computes.
     const int row = 2 * (int)r0 + (int)sgitg;
+
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, output_row, row, 1, tiisg == 0)) return;
 
     device const block_q4_K * x  = (device const block_q4_K *)((device const char *)src0 + expert_id * p.expert_stride) + row * nb;
     device const float      * yy = src1 + token_idx * p.ne10;

@@ -162,7 +162,19 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const uint32_t route_state = tpe_u32[im];
+    if ((route_state & 0x80000000u) != 0u) {
+        if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
+            device float * out = (device float *) dst;
+            const uint64_t total =
+                (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+            for (uint64_t index = tiitg; index < total; index += 128) {
+                out[index] = NAN;
+            }
+        }
+        return;
+    }
+    const int32_t neh1 = (int32_t)route_state;
 
     if (r1 >= neh1) return;
 
@@ -177,7 +189,7 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
 
     const int id = ids_i32[im * args.ne21 + r1 + lr1];
     const short i11 = (id % args.ne20) % args.ne11;
-    const short i12 = (id / args.ne20);
+    const int   i12 = (id / args.ne20);
     const short i13 = 0;
 
     // Same expert's slab in BOTH weight buffers — gate_w and up_w have

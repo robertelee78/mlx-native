@@ -2,16 +2,17 @@
 
 use half::f16;
 use mlx_native::{
-    embedding_gather_q5_0, quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
-    quantized_matmul_ggml_batched_mm_strided_input, quantized_matmul_ggml_batched_mv,
-    quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml,
+    embedding_gather_q5_0, mul_mv_ext_dispatch, quantized_matmul_ggml,
+    quantized_matmul_ggml_batched_mm, quantized_matmul_ggml_batched_mm_strided_input,
+    quantized_matmul_ggml_batched_mv, quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml,
     quantized_matmul_id_ggml_mv_with_policy, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_slotted,
-    quantized_matmul_mm_tensor_perm021, DType, EmbeddingQ5_0Params,
-    GgmlBatchedQuantizedMatmulInputStrides, GgmlBatchedQuantizedMatmulParams,
+    quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,
+    quantized_matmul_id_ggml_pooled_slotted, quantized_matmul_id_ggml_with_policy,
+    quantized_matmul_id_swiglu_q4_0, quantized_matmul_mm_tensor_perm021, DType,
+    EmbeddingQ5_0Params, GgmlBatchedQuantizedMatmulInputStrides, GgmlBatchedQuantizedMatmulParams,
     GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlQuantizedMatmulPerm021Params,
     GgmlRoutingPolicy, GgmlTensorMmPreference, GgmlType, GgufFile, IdMmScratch, KernelRegistry,
-    MlxBuffer, MlxDevice,
+    MlxBuffer, MlxDevice, MulMvExtParams,
 };
 
 const QK5_0: usize = 32;
@@ -135,6 +136,12 @@ fn u32_buffer(device: &MlxDevice, values: &[u32]) -> MlxBuffer {
     buffer
 }
 
+fn empty_buffer(device: &MlxDevice, byte_len: usize, dtype: DType) -> MlxBuffer {
+    device
+        .alloc_buffer(byte_len, dtype, vec![byte_len / dtype.size_of()])
+        .unwrap()
+}
+
 fn assert_close(actual: &[f32], expected: &[f32], context: &str) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
@@ -143,6 +150,12 @@ fn assert_close(actual: &[f32], expected: &[f32], context: &str) {
             (got - want).abs() <= tolerance,
             "{context} value {index}: got {got}, expected {want}, tolerance {tolerance}"
         );
+    }
+}
+
+fn assert_all_nan(values: &[f32], context: &str) {
+    for (index, value) in values.iter().enumerate() {
+        assert!(value.is_nan(), "{context} value {index} was {value}");
     }
 }
 
@@ -184,6 +197,178 @@ fn dense_q5_0_executes_native_bytes_at_every_scheduler_width() {
 }
 
 #[test]
+fn q5_0_dispatchers_reject_representation_substitution_before_encoding() {
+    let device = MlxDevice::new().unwrap();
+    let input = f32_buffer(&device, &input_rows(1, 13));
+    let output = empty_buffer(&device, N * 4, DType::F32);
+    let native_weight_bytes = matrix_bytes(17).len();
+    let native_weight = u8_buffer(&device, &matrix_bytes(17));
+    let f16_labeled_weight = empty_buffer(&device, native_weight_bytes, DType::F16);
+    let params = GgmlQuantizedMatmulParams {
+        m: 1,
+        n: N as u32,
+        k: K as u32,
+        ggml_type: GgmlType::Q5_0,
+    };
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    let error = quantized_matmul_ggml(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &f16_labeled_weight,
+        &output,
+        &params,
+    )
+    .expect_err("Q5_0 weights must remain native U8 GGUF blocks");
+    assert!(
+        error.to_string().contains("native U8 GGUF blocks"),
+        "{error}"
+    );
+    assert!(encoder.take_capture().unwrap().is_empty());
+
+    for (case, wrong_input, wrong_output) in [
+        (
+            "dense input",
+            empty_buffer(&device, K * 4, DType::F16),
+            empty_buffer(&device, N * 4, DType::F32),
+        ),
+        (
+            "dense output",
+            f32_buffer(&device, &input_rows(1, 29)),
+            empty_buffer(&device, N * 4, DType::F16),
+        ),
+    ] {
+        let mut encoder = device.command_encoder().unwrap();
+        encoder.start_capture();
+        let error = quantized_matmul_ggml(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &wrong_input,
+            &native_weight,
+            &wrong_output,
+            &params,
+        )
+        .expect_err(case);
+        assert!(error.to_string().contains("F32 input"), "{case}: {error}");
+        assert!(encoder.take_capture().unwrap().is_empty());
+    }
+
+    let expert_weight = u8_buffer(&device, &stacked_expert_bytes());
+    let wrong_ids = empty_buffer(&device, TOP_K * 4, DType::F32);
+    let expert_output = empty_buffer(&device, TOP_K * N * 4, DType::F32);
+    let expert_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: 1,
+        top_k: TOP_K as u32,
+        n: N as u32,
+        k: K as u32,
+        n_experts: N_EXPERTS as u32,
+        expert_stride: (N * K / QK5_0 * BLOCK_BYTES + EXPERT_PADDING) as u64,
+        ggml_type: GgmlType::Q5_0,
+    };
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    let error = quantized_matmul_id_ggml(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &expert_weight,
+        &wrong_ids,
+        &expert_output,
+        &expert_params,
+    )
+    .expect_err("expert IDs must be U32");
+    assert!(error.to_string().contains("U32 expert IDs"), "{error}");
+    assert!(encoder.take_capture().unwrap().is_empty());
+
+    let valid_mv_ids = u32_buffer(&device, &[0, 1, 2, 3, 4, 5]);
+    let wrong_expert_output = empty_buffer(&device, TOP_K * N * 4, DType::F16);
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    let error = quantized_matmul_id_ggml(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &expert_weight,
+        &valid_mv_ids,
+        &wrong_expert_output,
+        &expert_params,
+    )
+    .expect_err("expert output must be F32");
+    assert!(error.to_string().contains("F32 output"), "{error}");
+    assert!(encoder.take_capture().unwrap().is_empty());
+
+    let mut scratch = IdMmScratch::alloc(&device, N_EXPERTS as u32, 1).unwrap();
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    let error = quantized_matmul_id_ggml_pooled(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &expert_weight,
+        &wrong_ids,
+        &expert_output,
+        &mut scratch,
+        &expert_params,
+    )
+    .expect_err("pooled expert IDs must be U32");
+    assert!(error.to_string().contains("U32 expert IDs"), "{error}");
+    assert!(encoder.take_capture().unwrap().is_empty());
+
+    let routed_input = f32_buffer(&device, &input_rows(TOP_K, 19));
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    let error = quantized_matmul_id_swiglu_q4_0(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &routed_input,
+        &routed_input,
+        &expert_weight,
+        &wrong_ids,
+        &expert_output,
+        &expert_params,
+    )
+    .expect_err("fused expert IDs must be U32");
+    assert!(error.to_string().contains("U32 expert IDs"), "{error}");
+    assert!(encoder.take_capture().unwrap().is_empty());
+
+    let valid_ids = u32_buffer(&device, &[0, 1, 2, 3, 4, 5]);
+    let mut pair_scratch = IdMmScratch::alloc(&device, N_EXPERTS as u32, 33).unwrap();
+    let pair_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: 33,
+        ..expert_params
+    };
+    let mut encoder = device.command_encoder().unwrap();
+    encoder.start_capture();
+    let error = quantized_matmul_id_ggml_pooled_pair(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &expert_weight,
+        &f16_labeled_weight,
+        &valid_ids,
+        &expert_output,
+        &expert_output,
+        &mut pair_scratch,
+        &pair_params,
+    )
+    .expect_err("both paired expert weights must be native U8 blocks");
+    assert!(
+        error.to_string().contains("native U8 GGUF blocks"),
+        "{error}"
+    );
+    assert!(encoder.take_capture().unwrap().is_empty());
+}
+
+#[test]
 fn q5_0_width_amortized_route_preserves_results() {
     let device = MlxDevice::new().unwrap();
     let weight_bytes = matrix_bytes(31);
@@ -222,6 +407,48 @@ fn q5_0_width_amortized_route_preserves_results() {
             &format!("mv_ext M={m}"),
         );
     }
+}
+
+#[test]
+fn q5_0_width_amortized_batch_broadcasts_one_native_weight() {
+    let device = MlxDevice::new().unwrap();
+    let weight_bytes = matrix_bytes(53);
+    let weight = u8_buffer(&device, &weight_bytes);
+    let batch = 3usize;
+    let m = 2usize;
+    let mut input_values = Vec::new();
+    let mut expected = Vec::new();
+    for batch_index in 0..batch {
+        let rows = input_rows(m, 131 + batch_index);
+        expected.extend(cpu_dense(&rows, &weight_bytes, m));
+        input_values.extend(rows);
+    }
+    let input = f32_buffer(&device, &input_values);
+    let output = empty_buffer(&device, batch * m * N * 4, DType::F32);
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    mul_mv_ext_dispatch(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &weight,
+        &input,
+        &output,
+        &MulMvExtParams {
+            m: m as u32,
+            n: N as u32,
+            k: K as u32,
+            batch: batch as u32,
+            ggml_type: GgmlType::Q5_0,
+        },
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    assert_close(
+        output.as_slice::<f32>().unwrap(),
+        &expected,
+        "mv_ext broadcast batch",
+    );
 }
 
 #[test]
@@ -796,6 +1023,133 @@ fn q5_0_expert_mv_mm_shared_slotted_and_pair_use_native_blocks() {
                 &shared_expected,
                 "expert pair second",
             );
+        }
+    }
+}
+
+#[test]
+fn q5_0_expert_ids_fail_closed_on_device_without_weight_oob() {
+    let device = MlxDevice::new().unwrap();
+    let weight = u8_buffer(&device, &stacked_expert_bytes());
+    let expert_stride = (N * K / QK5_0 * BLOCK_BYTES + EXPERT_PADDING) as u64;
+
+    // The matvec route has no multiplicity restriction, but every ID is
+    // bounds-checked before the expert stride is applied. Only the invalid
+    // row is poisoned because every other row remains independently valid.
+    let mv_ids_host = [0, 1, 2, 3, 4, u32::MAX];
+    let mv_ids = u32_buffer(&device, &mv_ids_host);
+    let mv_input = f32_buffer(&device, &input_rows(1, 5_001));
+    let mv_output = empty_buffer(&device, TOP_K * N * 4, DType::F32);
+    let mv_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: 1,
+        top_k: TOP_K as u32,
+        n: N as u32,
+        k: K as u32,
+        n_experts: N_EXPERTS as u32,
+        expert_stride,
+        ggml_type: GgmlType::Q5_0,
+    };
+    let mut registry = KernelRegistry::new();
+    let mut encoder = device.command_encoder().unwrap();
+    quantized_matmul_id_ggml_mv_with_policy(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &mv_input,
+        &weight,
+        &mv_ids,
+        &mv_output,
+        &mv_params,
+        &GgmlRoutingPolicy::default(),
+    )
+    .unwrap();
+    encoder.commit_and_wait().unwrap();
+    let mv_values = mv_output.as_slice::<f32>().unwrap();
+    assert!(mv_values[..(TOP_K - 1) * N]
+        .iter()
+        .all(|value| value.is_finite()));
+    assert_all_nan(&mv_values[(TOP_K - 1) * N..], "invalid expert MV row");
+
+    let n_tokens = 33usize;
+    let valid_ids: Vec<u32> = (0..n_tokens)
+        .flat_map(|token| (0..TOP_K).map(move |slot| ((token + slot) % N_EXPERTS) as u32))
+        .collect();
+    let mm_input = f32_buffer(&device, &input_rows(n_tokens, 5_101));
+    let mm_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: n_tokens as u32,
+        ..mv_params
+    };
+
+    for (case, mutate, tensor_preference) in [
+        (
+            "out-of-range SIMD",
+            0usize,
+            GgmlTensorMmPreference::ForceSimd,
+        ),
+        (
+            "duplicate-per-token SIMD",
+            1usize,
+            GgmlTensorMmPreference::ForceSimd,
+        ),
+        (
+            "duplicate-per-token device-selected",
+            1usize,
+            GgmlTensorMmPreference::AutoProbe,
+        ),
+    ] {
+        let mut invalid_ids = valid_ids.clone();
+        if mutate == 0 {
+            invalid_ids[TOP_K + 2] = u32::MAX;
+        } else {
+            invalid_ids[TOP_K + 1] = invalid_ids[TOP_K];
+        }
+        let ids = u32_buffer(&device, &invalid_ids);
+        let output = empty_buffer(&device, n_tokens * TOP_K * N * 4, DType::F32);
+        let mut encoder = device.command_encoder().unwrap();
+        let routing = GgmlRoutingPolicy {
+            expert_mm_threshold: 32,
+            expert_tensor_mm: tensor_preference,
+            ..GgmlRoutingPolicy::default()
+        };
+        quantized_matmul_id_ggml_with_policy(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &mm_input,
+            &weight,
+            &ids,
+            &output,
+            &mm_params,
+            &routing,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        assert_all_nan(output.as_slice::<f32>().unwrap(), case);
+
+        if mutate == 1 && tensor_preference == GgmlTensorMmPreference::AutoProbe {
+            let first = empty_buffer(&device, n_tokens * TOP_K * N * 4, DType::F32);
+            let second = empty_buffer(&device, n_tokens * TOP_K * N * 4, DType::F32);
+            let mut scratch =
+                IdMmScratch::alloc(&device, N_EXPERTS as u32, n_tokens as u32).unwrap();
+            let mut encoder = device.command_encoder().unwrap();
+            quantized_matmul_id_ggml_pooled_pair_with_policy(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &mm_input,
+                &weight,
+                &weight,
+                &ids,
+                &first,
+                &second,
+                &mut scratch,
+                &mm_params,
+                &routing,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+            assert_all_nan(first.as_slice::<f32>().unwrap(), "invalid pair first");
+            assert_all_nan(second.as_slice::<f32>().unwrap(), "invalid pair reuse");
         }
     }
 }

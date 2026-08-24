@@ -8,6 +8,7 @@ use mlx_native::gguf::{
     test_only_compute_byte_len, test_only_dequantize, test_only_ggml_type_from_u32,
     test_only_raw_tensor_dtype,
 };
+use mlx_native::ops::dequant_to_f16::test_only_dequant_to_f16_kernel_name;
 use mlx_native::{DType, GgmlType};
 
 const QK5_0: usize = 32;
@@ -232,6 +233,39 @@ fn q5_0_capability_covers_every_native_public_shape_family() {
         !fused.executable,
         "Q5_0 must use two native dense calls, not a codec-substitution fallback"
     );
+    let expert_fused = ggml_capability(request(
+        GgmlInvocation::ExpertSwiGluDownQ4 {
+            shape: decode_shape,
+        },
+        GgmlWorkloadClass::DecodeSingle,
+    ));
+    assert!(
+        !expert_fused.executable,
+        "Q5_0 must not enter the Q4_0-only fused expert route"
+    );
+
+    let mut invalid_bounds = prompt_shape;
+    invalid_bounds.ids_within_expert_range = false;
+    assert!(
+        !ggml_capability(request(
+            GgmlInvocation::ExpertAutoAllocated {
+                shape: invalid_bounds,
+            },
+            GgmlWorkloadClass::Prompt,
+        ))
+        .executable
+    );
+    let mut duplicate_ids = prompt_shape;
+    duplicate_ids.ids_are_distinct_per_token = false;
+    assert!(
+        !ggml_capability(request(
+            GgmlInvocation::ExpertAutoAllocated {
+                shape: duplicate_ids,
+            },
+            GgmlWorkloadClass::Prompt,
+        ))
+        .executable
+    );
 
     let encoded = serde_json::to_string(&embedding).expect("serialize Q5_0 capability");
     let decoded: GgmlCapability =
@@ -289,13 +323,30 @@ fn q5_0_shader_source_contract_has_every_native_route() {
             "Q5_0 source must preserve signed zero point"
         );
     }
+
+    assert!(expert_mv.contains("poison_invalid_expert_id"));
+    assert!(expert_mv.contains("expert_id, output_row, first_row, nr"));
+    assert!(expert_mm.contains("threadgroup uint32_t * sids"));
+    assert!(!expert_mm.contains("threadgroup uint16_t * sids"));
+    assert!(expert_mm.contains("sids[i20] >= ntg"));
+    assert!(expert_mm.contains("sids[i20] == sids[other]"));
+    for consumer in [expert_mm, expert_tensor] {
+        assert!(consumer.contains("route_state & 0x80000000u"));
+        assert!(consumer.contains("out[index] = NAN"));
+    }
 }
 
 #[test]
 fn q5_0_cannot_enter_the_f16_shadow_materialization_route() {
-    let dispatcher = include_str!("../src/ops/dequant_to_f16.rs");
+    assert!(test_only_dequant_to_f16_kernel_name(GgmlType::Q5_0).is_err());
+    assert_eq!(
+        test_only_dequant_to_f16_kernel_name(GgmlType::Q5_K).unwrap(),
+        "hf2q_dequant_q5_K_to_f16"
+    );
+
+    // Source absence is supplemental: the executable selector assertion
+    // above fails even if a wildcard arm silently admits Q5_0.
     let shader = include_str!("../src/shaders/dequant_to_f16.metal");
-    assert!(!dispatcher.contains("GgmlType::Q5_0"));
     assert!(!shader.contains("dequant_q5_0"));
     assert!(!shader.contains("block_q5_0"));
 }

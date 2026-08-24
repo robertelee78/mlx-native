@@ -3,8 +3,9 @@
 //!
 //! For greedy (temperature=0) decoding with vocab_size=262144, this replaces
 //! a 1MB GPU→CPU logits readback with an 8-byte readback: the (index, value)
-//! pair.  The kernel uses a single threadgroup with shared-memory tree
-//! reduction.
+//! pair. Any non-finite input writes `(u32::MAX, NaN)` instead of an
+//! apparently valid token. The kernel uses a single threadgroup with
+//! shared-memory tree reduction.
 
 use metal::MTLSize;
 
@@ -43,7 +44,8 @@ pub fn register(registry: &mut KernelRegistry) {
 /// Returns `MlxError::InvalidArgument` if:
 /// - `n_elements` is 0.
 /// - `input` element count does not match `n_elements`.
-/// - `out_index` or `out_value` element count is not 1.
+/// - `out_index`, `out_value`, or `params_buf` has no element.
+/// - Buffer dtypes do not match the F32/U32/F32/U32 shader ABI.
 pub fn dispatch_argmax_f32(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -58,6 +60,19 @@ pub fn dispatch_argmax_f32(
         return Err(MlxError::InvalidArgument(
             "argmax_f32: n_elements must be > 0".into(),
         ));
+    }
+    if input.dtype() != crate::DType::F32
+        || out_index.dtype() != crate::DType::U32
+        || out_value.dtype() != crate::DType::F32
+        || params_buf.dtype() != crate::DType::U32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "argmax_f32 requires F32 input, U32 index, F32 value, and U32 params; got {:?}/{:?}/{:?}/{:?}",
+            input.dtype(),
+            out_index.dtype(),
+            out_value.dtype(),
+            params_buf.dtype(),
+        )));
     }
     if input.element_count() != n_elements as usize {
         return Err(MlxError::InvalidArgument(format!(
@@ -76,29 +91,34 @@ pub fn dispatch_argmax_f32(
             "argmax_f32: out_value must have at least 1 element".into(),
         ));
     }
+    if params_buf.element_count() < 1 {
+        return Err(MlxError::InvalidArgument(
+            "argmax_f32: params_buf must have at least 1 element".into(),
+        ));
+    }
 
     let pipeline = registry.get_pipeline("argmax_f32", device)?;
 
     // Threadgroup size: next power-of-two of n_elements, capped at 1024.
     // Must be a power of 2 for the tree reduction to be correct.
-    let tg_size = std::cmp::min(1024, n_elements.next_power_of_two()) as u64;
+    let tg_size = if n_elements >= 1024 {
+        1024
+    } else {
+        n_elements.next_power_of_two()
+    } as u64;
 
     // Shared memory:
     //   index 0 — tg_size floats for value reduction
     //   index 1 — tg_size uints  for index tracking
+    //   index 2 — tg_size uints  for non-finite propagation
     let float_shared = tg_size * 4; // sizeof(float) = 4
-    let uint_shared  = tg_size * 4; // sizeof(uint)  = 4
+    let uint_shared = tg_size * 4; // sizeof(uint)  = 4
 
     encoder.encode_threadgroups_with_shared(
         pipeline,
-        &[
-            (0, input),
-            (1, out_index),
-            (2, out_value),
-            (3, params_buf),
-        ],
-        &[(0, float_shared), (1, uint_shared)],
-        MTLSize::new(1, 1, 1),       // single threadgroup
+        &[(0, input), (1, out_index), (2, out_value), (3, params_buf)],
+        &[(0, float_shared), (1, uint_shared), (2, uint_shared)],
+        MTLSize::new(1, 1, 1), // single threadgroup
         MTLSize::new(tg_size, 1, 1),
     );
 

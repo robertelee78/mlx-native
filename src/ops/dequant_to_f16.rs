@@ -10,10 +10,10 @@
 
 use metal::MTLSize;
 
+use crate::buffer::MlxBuffer;
 use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
-use crate::buffer::MlxBuffer;
 use crate::ops::encode_helpers::KernelArg;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 use crate::DType;
@@ -25,6 +25,44 @@ const QK_NL_K: u32 = 16;
 /// Number of legacy-block sub-groups per block_q4_0 / block_q8_0 / etc.
 /// Matches `nl = 2` in `dequant_to_f16.metal`.
 const QK_NL_LEGACY: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DequantToF16Config {
+    block_values: u32,
+    qk_nl: u32,
+    kernel_name: &'static str,
+}
+
+fn dequant_to_f16_config(ggml_type: GgmlType) -> Result<DequantToF16Config> {
+    let (block_values, qk_nl, kernel_name) = match ggml_type {
+        GgmlType::Q4_0 => (32u32, QK_NL_LEGACY, "hf2q_dequant_q4_0_to_f16"),
+        GgmlType::Q8_0 => (32, QK_NL_LEGACY, "hf2q_dequant_q8_0_to_f16"),
+        GgmlType::Q5_1 => (32, QK_NL_LEGACY, "hf2q_dequant_q5_1_to_f16"),
+        GgmlType::IQ4_NL => (32, QK_NL_LEGACY, "hf2q_dequant_iq4_nl_to_f16"),
+        GgmlType::Q4_K => (256, QK_NL_K, "hf2q_dequant_q4_K_to_f16"),
+        GgmlType::Q5_K => (256, QK_NL_K, "hf2q_dequant_q5_K_to_f16"),
+        GgmlType::Q6_K => (256, QK_NL_K, "hf2q_dequant_q6_K_to_f16"),
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_dequant_to_f16: unsupported ggml_type {:?} \
+                 (only Q4_0 / Q8_0 / Q5_1 / IQ4_NL / Q4_K / Q5_K / Q6_K)",
+                other
+            )));
+        }
+    };
+    Ok(DequantToF16Config {
+        block_values,
+        qk_nl,
+        kernel_name,
+    })
+}
+
+/// Pure contract hook used by source-only tests to prove that an unsupported
+/// codec cannot acquire an F16-shadow route through a wildcard dispatcher.
+#[doc(hidden)]
+pub fn test_only_dequant_to_f16_kernel_name(ggml_type: GgmlType) -> Result<&'static str> {
+    Ok(dequant_to_f16_config(ggml_type)?.kernel_name)
+}
 
 /// Dispatch the whole-tensor dequant-to-F16 kernel.
 ///
@@ -49,23 +87,8 @@ pub fn dispatch_dequant_to_f16(
     n_cols: u32,
     ggml_type: GgmlType,
 ) -> Result<()> {
-    // Block size + sub-groups-per-block.
-    let (block_values, qk_nl, kernel_name) = match ggml_type {
-        GgmlType::Q4_0 => (32u32, QK_NL_LEGACY, "hf2q_dequant_q4_0_to_f16"),
-        GgmlType::Q8_0 => (32, QK_NL_LEGACY, "hf2q_dequant_q8_0_to_f16"),
-        GgmlType::Q5_1 => (32, QK_NL_LEGACY, "hf2q_dequant_q5_1_to_f16"),
-        GgmlType::IQ4_NL => (32, QK_NL_LEGACY, "hf2q_dequant_iq4_nl_to_f16"),
-        GgmlType::Q4_K => (256, QK_NL_K, "hf2q_dequant_q4_K_to_f16"),
-        GgmlType::Q5_K => (256, QK_NL_K, "hf2q_dequant_q5_K_to_f16"),
-        GgmlType::Q6_K => (256, QK_NL_K, "hf2q_dequant_q6_K_to_f16"),
-        other => {
-            return Err(MlxError::InvalidArgument(format!(
-                "dispatch_dequant_to_f16: unsupported ggml_type {:?} \
-                 (only Q4_0 / Q8_0 / Q5_1 / IQ4_NL / Q4_K / Q5_K / Q6_K)",
-                other
-            )));
-        }
-    };
+    let config = dequant_to_f16_config(ggml_type)?;
+    let block_values = config.block_values;
 
     // Validate shapes and buffer sizes.
     if n_rows == 0 || n_cols == 0 {
@@ -79,6 +102,12 @@ pub fn dispatch_dequant_to_f16(
             n_cols, block_values, ggml_type
         )));
     }
+    if weight.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_dequant_to_f16: weight must contain native U8 GGUF blocks, got {:?}",
+            weight.dtype()
+        )));
+    }
     if f16_shadow.dtype() != DType::F16 {
         return Err(MlxError::InvalidArgument(format!(
             "dispatch_dequant_to_f16: f16_shadow must be DType::F16, got {:?}",
@@ -87,6 +116,19 @@ pub fn dispatch_dequant_to_f16(
     }
 
     let n_elements = (n_rows as u64) * (n_cols as u64);
+    let needed_weight_bytes = n_elements
+        .checked_div(u64::from(block_values))
+        .and_then(|blocks| blocks.checked_mul(u64::from(ggml_type.block_bytes())))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("dispatch_dequant_to_f16: weight size overflow".into())
+        })?;
+    if (weight.data_byte_len() as u64) < needed_weight_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_dequant_to_f16: weight too small ({} bytes; need {})",
+            weight.data_byte_len(),
+            needed_weight_bytes
+        )));
+    }
     let needed_bytes = n_elements * 2;
     if (f16_shadow.byte_len() as u64) < needed_bytes {
         return Err(MlxError::InvalidArgument(format!(
@@ -107,7 +149,7 @@ pub fn dispatch_dequant_to_f16(
         )));
     }
 
-    let pipeline = registry.get_pipeline(kernel_name, device)?;
+    let pipeline = registry.get_pipeline(config.kernel_name, device)?;
 
     // Threadgroup size: pick 256 for good occupancy.  Total grid = n_groups
     // threadgroups of 256 threads, rounded up.
@@ -133,7 +175,7 @@ pub fn dispatch_dequant_to_f16(
     // ABI sanity: silence dead-arg warning when block_values is only used
     // in the validation arm above.
     let _ = block_values;
-    let _ = qk_nl;
+    let _ = config.qk_nl;
     Ok(())
 }
 
@@ -151,9 +193,41 @@ pub fn materialize_f16_shadow(
     n_cols: u32,
     ggml_type: GgmlType,
 ) -> Result<MlxBuffer> {
-    let n_elements = (n_rows as usize) * (n_cols as usize);
+    // Reject unsupported codecs before allocation. In particular, native
+    // Q5_0 must never gain an F16 representation shadow as a side effect of
+    // calling this convenience API.
+    let config = dequant_to_f16_config(ggml_type)?;
+    if n_rows == 0 || n_cols == 0 {
+        return Err(MlxError::InvalidArgument(
+            "materialize_f16_shadow: n_rows and n_cols must be > 0".into(),
+        ));
+    }
+    if n_cols % config.block_values != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "materialize_f16_shadow: n_cols ({n_cols}) must be divisible by block values ({})",
+            config.block_values
+        )));
+    }
+    if weight.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "materialize_f16_shadow: weight must contain native U8 GGUF blocks, got {:?}",
+            weight.dtype()
+        )));
+    }
+    let n_elements = (n_rows as usize)
+        .checked_mul(n_cols as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("materialize_f16_shadow size overflow".into()))?;
+    let shadow_bytes = n_elements
+        .checked_mul(DType::F16.size_of())
+        .ok_or_else(|| {
+            MlxError::InvalidArgument("materialize_f16_shadow byte count overflow".into())
+        })?;
     let f16_shadow = device
-        .alloc_buffer(n_elements * 2, DType::F16, vec![n_rows as usize, n_cols as usize])
+        .alloc_buffer(
+            shadow_bytes,
+            DType::F16,
+            vec![n_rows as usize, n_cols as usize],
+        )
         .map_err(|e| MlxError::InvalidArgument(format!("materialize_f16_shadow alloc: {e}")))?;
 
     let mut encoder = device
@@ -244,10 +318,22 @@ mod tests {
         // Read back and confirm element 0 = d * qs[0] = 0.5 * 0 = 0.
         let out: &[u16] = f16_shadow.as_slice().expect("read f16");
         // F16 0.0 = 0x0000.
-        assert_eq!(out[0], 0x0000, "out[0] should be F16 0.0, got 0x{:04X}", out[0]);
+        assert_eq!(
+            out[0], 0x0000,
+            "out[0] should be F16 0.0, got 0x{:04X}",
+            out[0]
+        );
         // F16(0.5 * 1) = F16(0.5) = 0x3800.
-        assert_eq!(out[1], 0x3800, "out[1] should be F16 0.5, got 0x{:04X}", out[1]);
+        assert_eq!(
+            out[1], 0x3800,
+            "out[1] should be F16 0.5, got 0x{:04X}",
+            out[1]
+        );
         // F16(0.5 * 2) = F16(1.0) = 0x3C00.
-        assert_eq!(out[2], 0x3C00, "out[2] should be F16 1.0, got 0x{:04X}", out[2]);
+        assert_eq!(
+            out[2], 0x3C00,
+            "out[2] should be F16 1.0, got 0x{:04X}",
+            out[2]
+        );
     }
 }

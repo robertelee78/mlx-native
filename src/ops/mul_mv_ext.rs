@@ -178,6 +178,31 @@ pub fn mul_mv_ext_dispatch(
     output: &MlxBuffer,
     params: &MulMvExtParams,
 ) -> Result<()> {
+    if weight.dtype() != DType::U8 || input.dtype() != DType::F32 || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "mul_mv_ext requires native U8 GGUF blocks, F32 input, and F32 output; got {:?}/{:?}/{:?}",
+            weight.dtype(),
+            input.dtype(),
+            output.dtype(),
+        )));
+    }
+    for (label, value) in [
+        ("M", params.m),
+        ("N", params.n),
+        ("K", params.k),
+        ("batch", params.batch),
+    ] {
+        if value > i32::MAX as u32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "mul_mv_ext: {label} exceeds the signed Metal ABI"
+            )));
+        }
+    }
+    if params.batch > i16::MAX as u32 {
+        return Err(MlxError::InvalidArgument(
+            "mul_mv_ext: batch exceeds the signed r2 broadcast ABI".into(),
+        ));
+    }
     if params.m == 0 || params.n == 0 || params.k == 0 || params.batch == 0 {
         return Err(MlxError::InvalidArgument(
             "mul_mv_ext: m, n, k, batch must all be > 0".into(),
@@ -214,35 +239,40 @@ pub fn mul_mv_ext_dispatch(
 
     // Buffer-size validation. Use the block-aware formula so K-quants
     // (256-element blocks) work alongside legacy 32-element types.
-    let block_bytes_per_row =
-        (params.k as usize / block_qk as usize) * (params.ggml_type.block_bytes() as usize);
-    let weight_required = (params.n as usize) * block_bytes_per_row;
-    if weight.byte_len() < weight_required {
+    let block_bytes_per_row = (params.k as usize / block_qk as usize)
+        .checked_mul(params.ggml_type.block_bytes() as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("mul_mv_ext weight row size overflow".into()))?;
+    let weight_required = (params.n as usize)
+        .checked_mul(block_bytes_per_row)
+        .ok_or_else(|| MlxError::InvalidArgument("mul_mv_ext weight size overflow".into()))?;
+    if weight.data_byte_len() < weight_required {
         return Err(MlxError::InvalidArgument(format!(
             "mul_mv_ext: weight buffer too small: {} < {} bytes",
-            weight.byte_len(),
+            weight.data_byte_len(),
             weight_required
         )));
     }
     let input_required = (params.batch as usize)
-        * (params.m as usize)
-        * (params.k as usize)
-        * DType::F32.size_of();
-    if input.byte_len() < input_required {
+        .checked_mul(params.m as usize)
+        .and_then(|elements| elements.checked_mul(params.k as usize))
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("mul_mv_ext input size overflow".into()))?;
+    if input.data_byte_len() < input_required {
         return Err(MlxError::InvalidArgument(format!(
             "mul_mv_ext: input buffer too small: {} < {} bytes",
-            input.byte_len(),
+            input.data_byte_len(),
             input_required
         )));
     }
     let output_required = (params.batch as usize)
-        * (params.m as usize)
-        * (params.n as usize)
-        * DType::F32.size_of();
-    if output.byte_len() < output_required {
+        .checked_mul(params.m as usize)
+        .and_then(|elements| elements.checked_mul(params.n as usize))
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument("mul_mv_ext output size overflow".into()))?;
+    if output.data_byte_len() < output_required {
         return Err(MlxError::InvalidArgument(format!(
             "mul_mv_ext: output buffer too small: {} < {} bytes",
-            output.byte_len(),
+            output.data_byte_len(),
             output_required
         )));
     }
@@ -280,7 +310,10 @@ pub fn mul_mv_ext_dispatch(
         nb13: nb12, // unused
         ne0: params.n as i32,
         ne1: params.m as i32,
-        r2: 1,
+        // src0 has one weight matrix broadcast across every input batch.
+        // The shader addresses expert/batch `i12 / r2`, so r2=batch keeps
+        // that quotient zero for every launched z slice.
+        r2: params.batch as i16,
         r3: 1,
         _pad2: 0,
     };
@@ -288,8 +321,8 @@ pub fn mul_mv_ext_dispatch(
     use crate::encoder::{as_bytes, KernelArg};
 
     let args_bytes = as_bytes(&args);
-    let r0_groups = ((params.n as i32) + r0ptg - 1) / r0ptg;
-    let r1_groups = ((params.m as i32) + r1ptg - 1) / r1ptg;
+    let r0_groups = u64::from(params.n).div_ceil(r0ptg as u64);
+    let r1_groups = u64::from(params.m).div_ceil(r1ptg as u64);
 
     encoder.encode_threadgroups_with_args(
         &pipeline,
@@ -299,7 +332,7 @@ pub fn mul_mv_ext_dispatch(
             (2, KernelArg::Buffer(input)),
             (3, KernelArg::Buffer(output)),
         ],
-        crate::MTLSize::new(r0_groups as u64, r1_groups as u64, params.batch as u64),
+        crate::MTLSize::new(r0_groups, r1_groups, params.batch as u64),
         crate::MTLSize::new(32, nsg as u64, 1),
     );
 
@@ -380,13 +413,21 @@ mod tests {
     fn kernel_name_rejects_unsupported_combinations() {
         // r1 outside [2, 5] is rejected for ALL types (including
         // Phase 1 + Phase 4 covered ones).
-        assert!(kernel_name(GgmlType::Q5_1, 1).is_err(),
-            "r1=1 not supported by any phase");
-        assert!(kernel_name(GgmlType::Q5_1, 6).is_err(),
-            "r1=6 not supported by any phase");
-        assert!(kernel_name(GgmlType::Q4_0, 0).is_err(),
-            "r1=0 not supported");
-        assert!(kernel_name(GgmlType::Q4_0, -1).is_err(),
-            "r1=-1 not supported");
+        assert!(
+            kernel_name(GgmlType::Q5_1, 1).is_err(),
+            "r1=1 not supported by any phase"
+        );
+        assert!(
+            kernel_name(GgmlType::Q5_1, 6).is_err(),
+            "r1=6 not supported by any phase"
+        );
+        assert!(
+            kernel_name(GgmlType::Q4_0, 0).is_err(),
+            "r1=0 not supported"
+        );
+        assert!(
+            kernel_name(GgmlType::Q4_0, -1).is_err(),
+            "r1=-1 not supported"
+        );
     }
 }

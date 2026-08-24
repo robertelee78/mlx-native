@@ -412,7 +412,19 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const uint32_t route_state = tpe_u32[im];
+    if ((route_state & 0x80000000u) != 0u) {
+        if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
+            device float * out = (device float *) dst;
+            const uint64_t total =
+                (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+            for (uint64_t index = tiitg; index < total; index += 128) {
+                out[index] = NAN;
+            }
+        }
+        return;
+    }
+    const int32_t neh1 = (int32_t)route_state;
     if (r1 >= neh1) return;
 
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;

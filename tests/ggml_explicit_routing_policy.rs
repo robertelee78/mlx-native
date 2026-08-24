@@ -678,6 +678,7 @@ fn explicit_dispatch_record_policy_helper() {
         4,
         256,
         1,
+        1,
         4 * 210,
         &policy,
     )
@@ -688,6 +689,7 @@ fn explicit_dispatch_record_policy_helper() {
         device.metal_device(),
         32,
         32,
+        1,
         1,
         32 * 34,
         &policy,
@@ -703,16 +705,28 @@ fn explicit_dispatch_record_policy_helper() {
             .expect("legacy dense Q6 record")
             .is_none()
     );
-    assert!(
-        build_q6k_id_nr2_m1_record(&mut registry, device.metal_device(), 4, 256, 1, 4 * 210,)
-            .expect("legacy expert Q6 record")
-            .is_none()
-    );
-    assert!(
-        build_q8_0_id_decode_record(&mut registry, device.metal_device(), 32, 32, 1, 32 * 34,)
-            .expect("legacy expert Q8 record")
-            .is_none()
-    );
+    assert!(build_q6k_id_nr2_m1_record(
+        &mut registry,
+        device.metal_device(),
+        4,
+        256,
+        1,
+        1,
+        4 * 210,
+    )
+    .expect("legacy expert Q6 record")
+    .is_none());
+    assert!(build_q8_0_id_decode_record(
+        &mut registry,
+        device.metal_device(),
+        32,
+        32,
+        1,
+        1,
+        32 * 34,
+    )
+    .expect("legacy expert Q8 record")
+    .is_none());
 }
 
 #[test]

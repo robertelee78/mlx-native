@@ -482,7 +482,9 @@ void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & re
 // ====================================================================
 //
 // Input:  src2 — per-token expert ids `[n_tokens, n_expert_used]` int32.
-// Output: htpe — per-expert routed count  `[n_experts]` uint32.
+// Output: htpe — per-expert routed count `[n_experts]` uint32. Bit 31 is
+//                set in every entry when any token has an out-of-range or
+//                duplicate expert ID; consumers then poison the operation.
 // Output: hids — per-expert routed-token list `[n_experts, n_tokens]` int32.
 //         Each slot holds `(token_idx * ne20 + slot_idx)` packed.
 //
@@ -507,35 +509,53 @@ kernel void hf2q_mul_mm_id_map0_impl(
     const short ide = tpitg;    // expert id owned by this thread
 
     uint32_t n_all = 0;
+    bool routing_invalid = false;
     device int32_t * ids_i32 = (device int32_t *) hids + ide * args.ne21;
 
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
         if (i21 + tpitg < args.ne21) {
-            device const int32_t * src2_i32 =
-                (device const int32_t *) (src2 + (i21 + tpitg) * args.nb21);
-            threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem + tpitg * ne20;
+            device const uint32_t * src2_u32 =
+                (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
+            threadgroup uint32_t * sids = (threadgroup uint32_t *) shmem + tpitg * ne20;
             for (short i20 = 0; i20 < ne20; i20++) {
-                sids[i20] = src2_i32[i20];
+                sids[i20] = src2_u32[i20];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (short t = 0; t < ntg; t++) {
             if (i21 + t >= args.ne21) break;
-            threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t * ne20;
+            threadgroup const uint32_t * sids =
+                (threadgroup const uint32_t *) shmem + t * ne20;
 
-            short sel = 0;
+            bool token_invalid = false;
             for (short i20 = 0; i20 < ne20; i20++) {
-                sel += (sids[i20] == ide) * (i20 + 1);
+                token_invalid |= sids[i20] >= ntg;
+                for (short other = 0; other < i20; other++) {
+                    token_invalid |= sids[i20] == sids[other];
+                }
             }
-            ids_i32[n_all] = (i21 + t) * ne20 + sel - 1;
-            n_all += sel > 0;
+            routing_invalid |= token_invalid;
+            if (token_invalid) {
+                continue;
+            }
+
+            short selected_slot = -1;
+            for (short i20 = 0; i20 < ne20; i20++) {
+                if (sids[i20] == ide) {
+                    selected_slot = i20;
+                    break;
+                }
+            }
+            if (selected_slot >= 0) {
+                ids_i32[n_all++] = (i21 + t) * ne20 + selected_slot;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-    tpe_u32[ide] = n_all;
+    tpe_u32[ide] = n_all | (routing_invalid ? 0x80000000u : 0u);
 }
 
 // Gemma 4 uses top_k = 8 for the MoE gate_up call and top_k = 1 for the
@@ -620,7 +640,24 @@ kernel void hf2q_mul_mm_id_impl(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const uint32_t route_state = tpe_u32[im];
+    if ((route_state & 0x80000000u) != 0u) {
+        // Invalid IDs poison the whole operation. Exactly one threadgroup
+        // fills the complete logical output with NaN; every threadgroup exits
+        // before constructing an expert weight or activation address. The
+        // consuming graph is responsible for rejecting this sentinel at an
+        // existing host-visible result readback.
+        if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
+            device float * out = (device float *) dst;
+            const uint64_t total =
+                (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+            for (uint64_t index = tiitg; index < total; index += 128) {
+                out[index] = NAN;
+            }
+        }
+        return;
+    }
+    const int32_t neh1 = (int32_t)route_state;
 
     // Early exit: this expert has fewer routed tokens than our tile's
     // M-base.  Whole threadgroup returns.
