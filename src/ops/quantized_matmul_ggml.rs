@@ -17,8 +17,9 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
-    plan_dense_auto_route, DenseAutoPlan, GgmlCapabilityRequest, GgmlInvocation, GgmlRoutingPolicy,
-    GgmlTensorMmPreference, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+    plan_dense_auto_route, tensor_mm_auto_selected, DenseAutoPlan, GgmlCapabilityRequest,
+    GgmlInvocation, GgmlRoutingPolicy, GgmlTensorMmPreference, GgmlWorkloadClass,
+    GGML_CAPABILITY_SCHEMA_VERSION,
 };
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
 use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
@@ -2030,7 +2031,7 @@ fn dispatch_mm_impl(
     // variant on M3+ (hardware tensor cores); fall back to the simdgroup
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
-    let use_tensor = routing.dense_tensor_mm == GgmlTensorMmPreference::AutoProbe
+    let use_tensor = tensor_mm_auto_selected(params.ggml_type, routing.dense_tensor_mm)
         && probe_tensor_mm(registry, device)?;
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at

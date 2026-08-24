@@ -564,8 +564,21 @@ fn dense_mv_route(request: &GgmlCapabilityRequest, batched: bool) -> GgmlKernelR
     }
 }
 
+/// Whether the default device-selected MM route may use the tensor pipeline.
+///
+/// Q5_0 stays on the native simdgroup kernels: the M5 tensor path exceeded
+/// the independent F32 parity bound at dense and expert prompt widths, while
+/// the simdgroup path passed the same bytes and shapes. An explicit future
+/// qualification can reopen this predicate without changing the artifact.
+pub(crate) fn tensor_mm_auto_selected(
+    ggml_type: GgmlType,
+    preference: GgmlTensorMmPreference,
+) -> bool {
+    preference == GgmlTensorMmPreference::AutoProbe && ggml_type != GgmlType::Q5_0
+}
+
 fn dense_mm_route(request: &GgmlCapabilityRequest, batched: bool) -> (GgmlKernelRoute, bool) {
-    if request.routing.dense_tensor_mm == GgmlTensorMmPreference::AutoProbe {
+    if tensor_mm_auto_selected(request.ggml_type, request.routing.dense_tensor_mm) {
         (
             if batched {
                 GgmlKernelRoute::DenseBatchedMmDeviceSelected
@@ -939,7 +952,7 @@ fn expert_mm_route(
     request: &GgmlCapabilityRequest,
     entrypoint: ExpertEntrypoint,
 ) -> (GgmlKernelRoute, bool) {
-    let tensor = request.routing.expert_tensor_mm == GgmlTensorMmPreference::AutoProbe;
+    let tensor = tensor_mm_auto_selected(request.ggml_type, request.routing.expert_tensor_mm);
     let route = match (entrypoint, tensor) {
         (ExpertEntrypoint::AutoAllocated, true) => GgmlKernelRoute::ExpertMmDeviceSelected,
         (ExpertEntrypoint::AutoAllocated, false) => GgmlKernelRoute::ExpertMmSimdgroup,
@@ -1022,7 +1035,7 @@ fn expert(
         );
     }
     if entrypoint != ExpertEntrypoint::ForcedMv && mm_eligible {
-        let (route, _tensor_probe) = expert_mm_route(request, entrypoint);
+        let (route, tensor_probe) = expert_mm_route(request, entrypoint);
         let Some(htpe_bytes) = u64::from(shape.n_experts).checked_mul(4) else {
             return GgmlCapability::unsupported(
                 request,
@@ -1051,7 +1064,7 @@ fn expert(
             route,
             request.workload == GgmlWorkloadClass::Prompt,
             request.workload != GgmlWorkloadClass::Prompt,
-            true,
+            tensor_probe,
             if entrypoint == ExpertEntrypoint::PooledPair {
                 2
             } else {

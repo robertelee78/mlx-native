@@ -17,8 +17,8 @@ Native source coverage includes:
 - GGUF header parsing, checked row-local byte sizing, raw mapped storage, and
   diagnostic CPU dequantization;
 - dense matvec for any admitted M through the ordinary per-row route, the
-  opt-in width-amortized route for M=2..8, and simdgroup/tensor matrix-matrix
-  routes for arbitrary prompt M including tail tiles;
+  opt-in width-amortized route for M=2..8, and the simdgroup matrix-matrix
+  route for arbitrary prompt M including tail tiles;
 - independent batched matvec and contiguous or explicitly strided batched
   matrix-matrix execution;
 - BF16-input permuted-021 matrix-matrix execution;
@@ -82,5 +82,16 @@ Once the shared Apple hardware lane is available, the blocking validation is:
    complete locked test suite;
 7. downstream hf2q source-to-stored-to-mapped-to-executed receipts for real
    Q5_0 artifacts, followed by matched quality and performance gates.
+
+## M5 tensor-MM falsification
+
+The first hardware execution rejected the source hypothesis that Q5_0 could
+share the default tensor-MM route. Dense, batched, and expert prompt cases at
+M=9 and M=33 exceeded the predeclared `2e-3 * max(abs(expected), 1)` error
+bound. Re-running the identical packed bytes and shapes on the native
+simdgroup path passed all ten Q5_0 Metal cases. The default dispatcher and its
+capability receipt therefore select simdgroup MM for Q5_0. Tensor symbols may
+remain compiled for future qualification, but they are not advertised or
+selected by the public auto route.
 
 No performance claim is made until those gates complete.

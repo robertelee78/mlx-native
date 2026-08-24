@@ -110,7 +110,7 @@ fn test_swiglu_q4_0_vs_unfused_reference() {
     up_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&up_data);
 
     let mut weight_buf = device
-        .alloc_buffer(stacked_bytes.len(), DType::U32, vec![stacked_bytes.len() / 4])
+        .alloc_buffer(stacked_bytes.len(), DType::U8, vec![stacked_bytes.len()])
         .unwrap();
     weight_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&stacked_bytes);
 

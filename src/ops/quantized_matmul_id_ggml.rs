@@ -16,8 +16,8 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
-    ggml_expert_bytes, plan_expert_auto_route, ExpertAutoPlan, GgmlRoutingPolicy,
-    GgmlTensorMmPreference,
+    ggml_expert_bytes, plan_expert_auto_route, tensor_mm_auto_selected, ExpertAutoPlan,
+    GgmlRoutingPolicy, GgmlTensorMmPreference,
 };
 use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
 use std::sync::atomic::AtomicI8;
@@ -2333,7 +2333,7 @@ fn dispatch_id_mm_with_layout(
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // mm_id variant on M3+. The device-bound registry caches the exact
     // pipeline result after the first dispatch.
-    let use_tensor = routing.expert_tensor_mm == GgmlTensorMmPreference::AutoProbe
+    let use_tensor = tensor_mm_auto_selected(params.ggml_type, routing.expert_tensor_mm)
         && probe_tensor_mm_id(registry, device)?;
     // Fall through to the simdgroup variant when the per-type tensor
     // kernel isn't shipped — e.g. IQ4_XS (ADR-033 §Pi Task #20 shipped

@@ -114,6 +114,14 @@ fn q5_0_capability_covers_every_native_public_shape_family() {
         );
         assert_eq!(capability.block_values, 32);
         assert_eq!(capability.block_bytes, 22);
+        if m > 8 {
+            assert_eq!(
+                capability.route,
+                Some(GgmlKernelRoute::DenseMmSimdgroup),
+                "Q5_0 prompt MM stays on the qualified native SIMD route"
+            );
+            assert!(!capability.requires_device_probe);
+        }
     }
 
     for m in [1, 2, 8] {
@@ -213,6 +221,7 @@ fn q5_0_capability_covers_every_native_public_shape_family() {
             "expert MM: {}",
             capability.diagnostic
         );
+        assert!(!capability.requires_device_probe);
     }
 
     let embedding = ggml_capability(request(

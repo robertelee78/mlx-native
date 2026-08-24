@@ -93,7 +93,7 @@ fn pooled_pair_rejects_overlapping_outputs_and_decode_sized_work() {
         &weight,
         &ids,
         &first_output,
-        &weight,
+        &input,
         &mut scratch,
         &params(N_TOKENS),
     ) {
@@ -105,7 +105,7 @@ fn pooled_pair_rejects_overlapping_outputs_and_decode_sized_work() {
 
     let mut aliased_scratch =
         IdMmScratch::alloc(&device, N_EXPERTS, N_TOKENS).expect("aliased routing scratch");
-    aliased_scratch.htpe = input.clone();
+    aliased_scratch.htpe = ids.clone();
     let mut encoder = device
         .command_encoder()
         .expect("scratch/read-alias encoder");
@@ -123,7 +123,7 @@ fn pooled_pair_rejects_overlapping_outputs_and_decode_sized_work() {
         &params(N_TOKENS),
     ) {
         Err(MlxError::InvalidArgument(message)) => {
-            assert!(message.contains("scratch range must not overlap input"));
+            assert!(message.contains("scratch range must not overlap ids"));
         }
         other => panic!("pair scratch/read alias must fail before encoding: {other:?}"),
     }
