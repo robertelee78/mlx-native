@@ -54,3 +54,17 @@ Each number is the median of five samples containing 100 dispatches. The exact
 route recovers a measured part of the weight-reload cost without changing any
 output bit. The remaining gap to `mul_mv_ext` is real: its vector-dot reduction
 is faster but does not meet this route's scalar-identity contract.
+
+## Fused gate/up row-identity release proof
+
+The dense fused gate/up/SiLU primitive is a separate operator and therefore has
+its own width-invariance gate. The focused Metal test enumerates the complete
+capability-admitted codec set—Q8_0, Q4_K, Q5_K, Q6_K, and IQ4_NL—and compares
+every output F32 bit from one multi-row dispatch with independent `m=1` fused
+dispatches over distinct input rows. All codecs passed at every width 2 through
+8 with `N=64` and `K=512`.
+
+The gate passed in release mode through both the packaged precompiled metallib
+and forced runtime-source compilation. The five existing codec-specific fused
+versus unfused parity suites also remained green (15 tests total). No runtime
+change was required.
