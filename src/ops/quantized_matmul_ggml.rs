@@ -689,16 +689,13 @@ pub fn quantized_matmul_ggml_with_policy(
     // has no parity test at all). So it stays OFF by default (byte-identical
     // bar) until the mv_ext kernels are proven/made bit-exact (Q6_K especially);
     // the env preserves the validated speedup for that follow-up. NON-blocking.
-    // ADR-040 §0.21c decode mvN lever — BIT-IDENTICAL column-amortizing Q6_K
-    // mat-vec. Reads each Q6_K weight block once and reuses its dequant across
-    // m∈[2,8] src1 columns (vs plain mv's per-column weight reload). Unlike
-    // mul_mv_ext (which is NOT bit-exact for the model's shapes and stays
-    // default-off), this kernel is a literal clone of plain mv's accumulation
-    // tree, so batched decode stays byte-exact to the serial m=1 path — proven
-    // by adr_040_q6k_mv_mN_byte_parity (GPU u32 bit-compare) AND the gemma4
-    // slot_aware_n8_per_slot_parity_vs_serial model test. Tile width R1 = m
-    // (single TG covers all m columns; any column-tiling stays bit-identical
-    // since columns are independent).
+    // Exact decode mvN lever — BIT-IDENTICAL column-amortizing Q4_K, Q5_K,
+    // and Q6_K mat-vec. Each physical kernel preserves its production scalar
+    // accumulation tree independently per src1 column while sharing packed
+    // weight reads. Q4_K and Q5_K clone their ordinary scalar kernels; Q6_K
+    // clones its default NR2 kernel. The to_bits gates cover every logical
+    // width m∈[2,8], including multi-tile buffer offsets. mul_mv_ext remains a
+    // separate non-bit-identical diagnostic route.
     // ADR-040 §0.21c-track2: DEFAULT-ON (lead-approved 2026-06-26). Opt out with
     // HF2Q_DECODE_MVN=0. Bar met: byte-equal spike GREEN under the precompiled
     // -O3 metallib + release-deterministic parity (after the encoder-retain root
@@ -717,6 +714,19 @@ pub fn quantized_matmul_ggml_with_policy(
                 );
             }
             dispatch_mv_q4k_mn_adaptive(encoder, registry, device, input, weight, output, params)
+        }
+        DenseAutoPlan::Q5kWidthMn => {
+            debug_assert!(params.k % QK5_K == 0);
+            if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {
+                eprintln!(
+                    "[mvN-route] Q5_K m={} n={} k={} → mN tiles={:?}",
+                    params.m,
+                    params.n,
+                    params.k,
+                    mn_column_tiling(params.m as usize)
+                );
+            }
+            dispatch_mv_q5k_mn_adaptive(encoder, registry, device, input, weight, output, params)
         }
         DenseAutoPlan::Q6kWidthMn => {
             debug_assert!(params.k % QK6_K == 0);
@@ -1659,6 +1669,110 @@ pub fn dispatch_mv_q4k_mn_adaptive(
     }
     for (col0, width) in mn_column_tiling(m) {
         dispatch_mv_q4k_mn_chunk(
+            encoder, registry, device, input, weight, output, params, width, col0, width,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mv_q5k_mn_chunk(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    r1ptg: usize,
+    col0: usize,
+    width: usize,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q5_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q5k_mn: expected Q5_K weights, got {:?}",
+            params.ggml_type
+        )));
+    }
+    if !(2..=5).contains(&r1ptg) || r1ptg != width {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q5k_mn: tile width must equal r1ptg in 2..=5, got width={width}, r1ptg={r1ptg}"
+        )));
+    }
+
+    let kernel_name = match r1ptg {
+        2 => "kernel_mul_mv_q5_K_f32_mN_r1_2",
+        3 => "kernel_mul_mv_q5_K_f32_mN_r1_3",
+        4 => "kernel_mul_mv_q5_K_f32_mN_r1_4",
+        5 => "kernel_mul_mv_q5_K_f32_mN_r1_5",
+        _ => unreachable!(),
+    };
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, 1), (701, 1), (702, 1)],
+    )?;
+    let gpu_params = GgmlMatvecGpuParams {
+        ne00: params.k as i64,
+        ne01: params.n as i64,
+        ne02: 1,
+        ne10: params.k as i64,
+        ne12: 1,
+        ne0: params.n as i64,
+        ne1: width as i64,
+        r2: 1,
+        r3: 1,
+    };
+    let f32_sz = DType::F32.size_of() as u64;
+    let input_off = (col0 as u64) * (params.k as u64) * f32_sz;
+    let output_off = (col0 as u64) * (params.n as u64) * f32_sz;
+    encoder.dispatch_tracked_threadgroups_with_args(
+        &pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::BufferWithOffset(input, input_off)),
+            (2, KernelArg::BufferWithOffset(output, output_off)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[weight, input],
+        &[output],
+        metal::MTLSize::new(
+            div_ceil(params.n as usize, 2) as u64,
+            div_ceil(width, r1ptg) as u64,
+            1,
+        ),
+        metal::MTLSize::new(2, 32, 1),
+    );
+    Ok(())
+}
+
+/// Tile a Q5_K m∈[2,8] batch into register-safe widths while preserving the
+/// scalar Q5_K floating-point tree independently for every column.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mv_q5k_mn_adaptive(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    let m = params.m as usize;
+    if params.ggml_type != GgmlType::Q5_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q5k_mn_adaptive: expected Q5_K weights, got {:?}",
+            params.ggml_type
+        )));
+    }
+    if !(2..=MM_ROUTING_THRESHOLD as usize).contains(&m) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q5k_mn_adaptive: m must be 2..={MM_ROUTING_THRESHOLD}, got {m}"
+        )));
+    }
+    for (col0, width) in mn_column_tiling(m) {
+        dispatch_mv_q5k_mn_chunk(
             encoder, registry, device, input, weight, output, params, width, col0, width,
         )?;
     }

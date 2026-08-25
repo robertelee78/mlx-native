@@ -261,6 +261,11 @@ impl KernelRegistry {
         }
         // ADR-022 Phase 2 — Q5_K dense mv kernel.
         sources.insert("kernel_mul_mv_q5_K_f32".into(), ggml_src);
+        // Exact multi-column variants retain the scalar floating-point tree
+        // while sharing packed weight reads across independent columns.
+        for r1 in 2..=5 {
+            sources.insert(format!("kernel_mul_mv_q5_K_f32_mN_r1_{r1}"), ggml_src);
+        }
 
         // GGML block-format quantized matrix-matrix kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of kernel_mul_mm_<q>_f32).

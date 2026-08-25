@@ -178,7 +178,8 @@ pub use ops::q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinte
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
     dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test,
-    dispatch_mv_q4k_mn_adaptive, dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive,
+    dispatch_mv_q4k_mn_adaptive, dispatch_mv_q5k_mn_adaptive, dispatch_mv_q6k_mn,
+    dispatch_mv_q6k_mn_adaptive,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
     quantized_matmul_ggml_batched_mm_strided_input,
     quantized_matmul_ggml_batched_mm_strided_input_with_policy,

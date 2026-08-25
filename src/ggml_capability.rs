@@ -211,6 +211,7 @@ pub enum GgmlKernelRoute {
     DenseMv,
     DenseMvNr2,
     DenseQ4kWidthMn,
+    DenseQ5kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
     DenseMmSimdgroup,
@@ -606,6 +607,7 @@ fn dense_mm_route(request: &GgmlCapabilityRequest, batched: bool) -> (GgmlKernel
 pub(crate) enum DenseAutoPlan {
     Mv,
     Q4kWidthMn,
+    Q5kWidthMn,
     Q6kWidthMn,
     WidthMvExt,
     Mm,
@@ -622,6 +624,12 @@ pub(crate) fn plan_dense_auto_route(
         && (2..=MM_ROUTING_THRESHOLD).contains(&m)
     {
         return DenseAutoPlan::Q4kWidthMn;
+    }
+    if routing.dense_decode_mvn
+        && ggml_type == GgmlType::Q5_K
+        && (2..=MM_ROUTING_THRESHOLD).contains(&m)
+    {
+        return DenseAutoPlan::Q5kWidthMn;
     }
     if routing.dense_decode_mvn
         && ggml_type == GgmlType::Q6_K
@@ -692,6 +700,19 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
             dense_mn_dispatch_count(m),
             0,
             "Q4_K byte-identical multi-column matvec route",
+        ),
+        DenseAutoPlan::Q5kWidthMn => GgmlCapability::supported(
+            request,
+            GgmlKernelRoute::DenseQ5kWidthMn,
+            request.workload == GgmlWorkloadClass::ContinuousWidth,
+            request.workload != GgmlWorkloadClass::ContinuousWidth,
+            false,
+            1,
+            bytes,
+            GgmlScratchRequirement::None,
+            dense_mn_dispatch_count(m),
+            0,
+            "Q5_K byte-identical multi-column matvec route",
         ),
         DenseAutoPlan::Q6kWidthMn => GgmlCapability::supported(
             request,

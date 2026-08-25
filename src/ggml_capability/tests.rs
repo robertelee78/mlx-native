@@ -54,6 +54,25 @@ fn dense_auto_routing_policy_is_explicit() {
         Some(GgmlKernelRoute::DenseQ4kWidthMn)
     );
 
+    request.ggml_type = GgmlType::Q5_K;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ5kWidthMn)
+    );
+    request.routing.dense_decode_mv_ext = true;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ5kWidthMn),
+        "exact mvN must take precedence when both width routes are enabled"
+    );
+    request.routing.dense_decode_mv_ext = false;
+    request.routing.dense_decode_mvn = false;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseMv)
+    );
+
+    request.routing.dense_decode_mvn = true;
     request.ggml_type = GgmlType::Q6_K;
     assert_eq!(
         ggml_capability(request).route,
@@ -328,9 +347,9 @@ fn batched_mv_accepts_width_eight_and_rejects_width_nine_or_prompt_contract() {
 }
 
 #[test]
-fn q4_and_q6_width_dispatch_count_matches_runtime_tiling() {
+fn q4_q5_and_q6_width_dispatch_count_matches_runtime_tiling() {
     for (m, expected) in [(2, 1), (3, 1), (4, 1), (5, 1), (6, 2), (7, 2), (8, 2)] {
-        for ggml_type in [GgmlType::Q4_K, GgmlType::Q6_K] {
+        for ggml_type in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
             let mut request = dense_request(m, GgmlWorkloadClass::ContinuousWidth);
             request.ggml_type = ggml_type;
             let capability = ggml_capability(request);
