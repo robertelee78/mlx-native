@@ -39,6 +39,7 @@ pub enum GgmlResolvedKernelRoute {
     DenseMv,
     DenseMvNr2,
     DenseQ4kWidthMn,
+    DenseQ5kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
     DenseMmSimdgroup,
@@ -249,10 +250,21 @@ fn validate_dense_dispatches(
                 GgmlResolvedKernelRoute::DenseMv
             })
         }
-        GgmlKernelRoute::DenseQ4kWidthMn | GgmlKernelRoute::DenseQ6kWidthMn => {
-            let is_q4 = structural_route == GgmlKernelRoute::DenseQ4kWidthMn;
-            let type_name = if is_q4 { "Q4_K" } else { "Q6_K" };
-            let kernel_type = if is_q4 { "q4_K" } else { "q6_K" };
+        GgmlKernelRoute::DenseQ4kWidthMn
+        | GgmlKernelRoute::DenseQ5kWidthMn
+        | GgmlKernelRoute::DenseQ6kWidthMn => {
+            let (type_name, kernel_type, align, resolved) = match structural_route {
+                GgmlKernelRoute::DenseQ4kWidthMn => {
+                    ("Q4_K", "q4_K", 2, GgmlResolvedKernelRoute::DenseQ4kWidthMn)
+                }
+                GgmlKernelRoute::DenseQ5kWidthMn => {
+                    ("Q5_K", "q5_K", 2, GgmlResolvedKernelRoute::DenseQ5kWidthMn)
+                }
+                GgmlKernelRoute::DenseQ6kWidthMn => {
+                    ("Q6_K", "q6_K", 4, GgmlResolvedKernelRoute::DenseQ6kWidthMn)
+                }
+                _ => unreachable!(),
+            };
             let widths: &[u32] = match m {
                 2 => &[2],
                 3 => &[3],
@@ -280,16 +292,12 @@ fn validate_dense_dispatches(
                     dispatch,
                     &kernel,
                     &single_batch_pipeline_label(&kernel),
-                    [div_ceil_u64(n, if is_q4 { 2 } else { 4 }), 1, 1],
+                    [div_ceil_u64(n, align), 1, 1],
                     [2, 32, 1],
                     &[],
                 )?;
             }
-            Ok(if is_q4 {
-                GgmlResolvedKernelRoute::DenseQ4kWidthMn
-            } else {
-                GgmlResolvedKernelRoute::DenseQ6kWidthMn
-            })
+            Ok(resolved)
         }
         GgmlKernelRoute::DenseWidthMvExt => {
             let dispatch = require_one(dispatches)?;

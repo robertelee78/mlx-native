@@ -180,6 +180,29 @@ fn trace_binds_actual_dense_routes_and_drains_failures() {
     );
     assert_eq!(q4_trace.dispatches.len(), 2);
 
+    let q5_width = GgmlQuantizedMatmulParams {
+        ggml_type: GgmlType::Q5_K,
+        ..width
+    };
+    let (q5_input, q5_weight, q5_output) = buffers(&device, q5_width);
+    let q5_trace = quantized_matmul_ggml_with_policy_and_trace(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q5_input,
+        &q5_weight,
+        &q5_output,
+        &q5_width,
+        &GgmlRoutingPolicy::default(),
+        GgmlWorkloadClass::ContinuousWidth,
+    )
+    .expect("Q5_K width trace");
+    assert_eq!(
+        q5_trace.resolved_route,
+        GgmlResolvedKernelRoute::DenseQ5kWidthMn
+    );
+    assert_eq!(q5_trace.dispatches.len(), 2);
+
     let short_weight = device
         .alloc_buffer(1, DType::U8, vec![1])
         .expect("short weight");

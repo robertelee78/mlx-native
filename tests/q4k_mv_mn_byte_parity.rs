@@ -8,8 +8,8 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use mlx_native::{
-    dispatch_mv_q4k_mn_adaptive, quantized_matmul_ggml_with_policy, DType,
-    GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType, KernelRegistry, MlxDevice,
+    quantized_matmul_ggml_with_policy, DType, GgmlQuantizedMatmulParams, GgmlRoutingPolicy,
+    GgmlType, KernelRegistry, MlxDevice,
 };
 
 const QK_K: usize = 256;
@@ -119,7 +119,7 @@ fn assert_q4k_mn_matches_serial(m: usize, seed: u64) {
         ggml_type: GgmlType::Q4_K,
     };
     let mut encoder = device.command_encoder().expect("mN encoder");
-    dispatch_mv_q4k_mn_adaptive(
+    quantized_matmul_ggml_with_policy(
         &mut encoder,
         &mut registry,
         &device,
@@ -127,6 +127,11 @@ fn assert_q4k_mn_matches_serial(m: usize, seed: u64) {
         &weight,
         &output,
         &params,
+        &GgmlRoutingPolicy {
+            dense_decode_mvn: true,
+            dense_decode_mv_ext: false,
+            ..GgmlRoutingPolicy::default()
+        },
     )
     .expect("mN dispatch");
     encoder.commit_and_wait().expect("mN GPU execution");
