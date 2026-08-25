@@ -1,6 +1,7 @@
 # Q5_K exact multi-column matvec
 
-Status: implemented and locally proven on Apple Silicon; not published.
+Status: release candidate for 0.14.0; registry publication and downstream
+exact-artifact gates remain open.
 
 ## Contract
 
