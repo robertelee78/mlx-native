@@ -1561,6 +1561,27 @@ fn dispatch_mv_batched(
     Ok(())
 }
 
+/// Resolve a column tile's explicit Metal binding offset relative to the
+/// underlying allocation. `KernelArg::BufferWithOffset` is intentionally
+/// absolute, so callers must compose the logical view's base offset here.
+fn checked_mn_tile_byte_offset(
+    logical_base: u64,
+    col0: usize,
+    row_elements: u32,
+    label: &str,
+) -> Result<u64> {
+    let relative = u64::try_from(col0)
+        .ok()
+        .and_then(|column| column.checked_mul(u64::from(row_elements)))
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of() as u64))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{label} mN tile relative byte offset overflow"))
+        })?;
+    logical_base.checked_add(relative).ok_or_else(|| {
+        MlxError::InvalidArgument(format!("{label} mN tile absolute byte offset overflow"))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_mv_q4k_mn_chunk(
     encoder: &mut CommandEncoder,
@@ -1585,6 +1606,12 @@ fn dispatch_mv_q4k_mn_chunk(
             "dispatch_mv_q4k_mn: tile width must equal r1ptg in 2..=5, got width={width}, r1ptg={r1ptg}"
         )));
     }
+
+    // Fail before pipeline resolution or command encoding if a logical-view
+    // base cannot be composed with this tile's relative column offset.
+    let input_off = checked_mn_tile_byte_offset(input.byte_offset(), col0, params.k, "Q4_K input")?;
+    let output_off =
+        checked_mn_tile_byte_offset(output.byte_offset(), col0, params.n, "Q4_K output")?;
 
     let kernel_name = match r1ptg {
         2 => "kernel_mul_mv_q4_K_f32_mN_r1_2",
@@ -1617,9 +1644,6 @@ fn dispatch_mv_q4k_mn_chunk(
         r3: 1,
     };
 
-    let f32_sz = DType::F32.size_of() as u64;
-    let input_off = (col0 as u64) * (params.k as u64) * f32_sz;
-    let output_off = (col0 as u64) * (params.n as u64) * f32_sz;
     let threadgroups = metal::MTLSize::new(
         div_ceil(params.n as usize, 2) as u64,
         div_ceil(width, r1ptg) as u64,
@@ -1646,7 +1670,7 @@ fn dispatch_mv_q4k_mn_chunk(
 
 /// Tile a Q4_K m∈[2,8] batch into the same register-safe widths used by
 /// Q6_K. Columns are independent, so tiling preserves serial byte identity.
-pub fn dispatch_mv_q4k_mn_adaptive(
+pub(crate) fn dispatch_mv_q4k_mn_adaptive(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -1699,6 +1723,10 @@ fn dispatch_mv_q5k_mn_chunk(
             "dispatch_mv_q5k_mn: tile width must equal r1ptg in 2..=5, got width={width}, r1ptg={r1ptg}"
         )));
     }
+    // BufferWithOffset is absolute, not relative to an MlxBuffer view.
+    let input_off = checked_mn_tile_byte_offset(input.byte_offset(), col0, params.k, "Q5_K input")?;
+    let output_off =
+        checked_mn_tile_byte_offset(output.byte_offset(), col0, params.n, "Q5_K output")?;
 
     let kernel_name = match r1ptg {
         2 => "kernel_mul_mv_q5_K_f32_mN_r1_2",
@@ -1724,9 +1752,6 @@ fn dispatch_mv_q5k_mn_chunk(
         r2: 1,
         r3: 1,
     };
-    let f32_sz = DType::F32.size_of() as u64;
-    let input_off = (col0 as u64) * (params.k as u64) * f32_sz;
-    let output_off = (col0 as u64) * (params.n as u64) * f32_sz;
     encoder.dispatch_tracked_threadgroups_with_args(
         &pipeline,
         &[
@@ -1750,7 +1775,7 @@ fn dispatch_mv_q5k_mn_chunk(
 /// Tile a Q5_K m∈[2,8] batch into register-safe widths while preserving the
 /// scalar Q5_K floating-point tree independently for every column.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_mv_q5k_mn_adaptive(
+pub(crate) fn dispatch_mv_q5k_mn_adaptive(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -1779,49 +1804,9 @@ pub fn dispatch_mv_q5k_mn_adaptive(
     Ok(())
 }
 
-/// ADR-040 §0.21c — dispatch the bit-identical column-amortizing Q6_K mat-vec
-/// (`kernel_mul_mv_q6_K_f32_mN_r1_{R1}`) as a SINGLE tile of width `r1ptg` over
-/// a width-`params.m` batch (so `r1ptg` must equal `params.m`). For arbitrary
-/// m∈[2,8] with register-safe tiling, prefer [`dispatch_mv_q6k_mn_adaptive`].
-///
-/// The kernel is BYTE-IDENTICAL to `kernel_mul_mv_q6_K_f32_nr2` (the gemma4
-/// model's default serial decode kernel) — it is a literal clone of NR2's
-/// per-row block body (same `yl` cache, same operand form, same array `sumf`,
-/// same `short` indexing) specialized across R1 columns instead of NR2's nr0=2
-/// rows. NR2 is NOT byte-equal to plain mv in general, so cloning NR2 (not plain
-/// mv) is what keeps the model's m=1-serial-vs-m=8-batched parity bit-exact.
-/// The weight bytes for this SG's nr0 rows are read + dequantized once per block
-/// and reused across all R1 columns (the amortization).
-///
-/// Geometry matches NR2: (2,32) threadgroup, 2 SGs × nr0=2 rows/SG → 4 rows/TG
-/// (align=4 on N); the M axis is tiled by R1 (grid.y = ceil(m / R1)).
-pub fn dispatch_mv_q6k_mn(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    input: &MlxBuffer,
-    weight: &MlxBuffer,
-    output: &MlxBuffer,
-    params: &GgmlQuantizedMatmulParams,
-    r1ptg: usize,
-) -> Result<()> {
-    dispatch_mv_q6k_mn_chunk(
-        encoder,
-        registry,
-        device,
-        input,
-        weight,
-        output,
-        params,
-        r1ptg,
-        0,
-        params.m as usize,
-    )
-}
-
 /// Dispatch a single mN tile for a contiguous column range `[col0, col0+width)`
 /// of the m=`params.m` batch. `r1ptg` is the template width (must equal `width`,
-/// in 2..=8). The src1/dst buffers are bound with byte offsets so the kernel's
+/// in 2..=5). The src1/dst buffers are bound with byte offsets so the kernel's
 /// chunk-local column index `c ∈ [0, width)` maps to the global column `col0+c`;
 /// since columns are independent, any such tiling stays bit-identical.
 #[allow(clippy::too_many_arguments)]
@@ -1838,20 +1823,23 @@ fn dispatch_mv_q6k_mn_chunk(
     width: usize,
 ) -> Result<()> {
     debug_assert!(matches!(params.ggml_type, GgmlType::Q6_K));
-    debug_assert!((2..=8).contains(&r1ptg));
+    debug_assert!((2..=5).contains(&r1ptg));
     debug_assert_eq!(r1ptg, width);
+
+    // Compose tile offsets with any logical-view base before resolving a
+    // pipeline or appending a dispatch. This keeps failure transactional.
+    let input_off = checked_mn_tile_byte_offset(input.byte_offset(), col0, params.k, "Q6_K input")?;
+    let output_off =
+        checked_mn_tile_byte_offset(output.byte_offset(), col0, params.n, "Q6_K output")?;
 
     let kernel_name = match r1ptg {
         2 => "kernel_mul_mv_q6_K_f32_mN_r1_2",
         3 => "kernel_mul_mv_q6_K_f32_mN_r1_3",
         4 => "kernel_mul_mv_q6_K_f32_mN_r1_4",
         5 => "kernel_mul_mv_q6_K_f32_mN_r1_5",
-        6 => "kernel_mul_mv_q6_K_f32_mN_r1_6",
-        7 => "kernel_mul_mv_q6_K_f32_mN_r1_7",
-        8 => "kernel_mul_mv_q6_K_f32_mN_r1_8",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
-                "dispatch_mv_q6k_mn: r1ptg must be 2..=8, got {r1ptg}"
+                "dispatch_mv_q6k_mn: r1ptg must be 2..=5, got {r1ptg}"
             )))
         }
     };
@@ -1884,10 +1872,6 @@ fn dispatch_mv_q6k_mn_chunk(
     // chunk-local column index c∈[0,width) then maps to global column col0+c.
     //   src1 column stride = ne10 = k f32 elements
     //   dst  column stride = ne0  = n f32 elements
-    let f32_sz = DType::F32.size_of() as u64;
-    let input_off = (col0 as u64) * (params.k as u64) * f32_sz;
-    let output_off = (col0 as u64) * (params.n as u64) * f32_sz;
-
     // Geometry matches NR2 (the bit-identity target): 2 SGs × 32 threads,
     // nr0=2 rows/SG → 4 rows/TG (align=4 on N). grid.y tiles this chunk's
     // `width` columns by R1 (= 1 TG-row since width == r1ptg).
@@ -1941,7 +1925,7 @@ pub(crate) fn dense_mn_dispatch_count(m: u32) -> u32 {
 /// chunks (each width 2..=5) and dispatch one mN tile per chunk. Bit-identity
 /// is preserved because columns are independent — any column-tiling produces
 /// the same per-column output. This is the routing target for HF2Q_DECODE_MVN.
-pub fn dispatch_mv_q6k_mn_adaptive(
+pub(crate) fn dispatch_mv_q6k_mn_adaptive(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -2682,4 +2666,26 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod mn_tile_offset_tests {
+    use super::checked_mn_tile_byte_offset;
+    use crate::MlxError;
+
+    #[test]
+    fn logical_base_and_tile_offset_are_composed_with_checked_arithmetic() {
+        assert_eq!(
+            checked_mn_tile_byte_offset(128, 4, 512, "test input").expect("valid offset"),
+            128 + 4 * 512 * 4
+        );
+
+        let relative = checked_mn_tile_byte_offset(0, usize::MAX, u32::MAX, "test input")
+            .expect_err("relative offset must overflow");
+        assert!(matches!(relative, MlxError::InvalidArgument(_)));
+
+        let absolute = checked_mn_tile_byte_offset(u64::MAX - 3, 1, 1, "test output")
+            .expect_err("absolute offset must overflow");
+        assert!(matches!(absolute, MlxError::InvalidArgument(_)));
+    }
 }

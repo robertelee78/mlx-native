@@ -69,3 +69,43 @@ The gate passed in release mode through both the packaged precompiled metallib
 and forced runtime-source compilation. The five existing codec-specific fused
 versus unfused parity suites also remained green (15 tests total). No runtime
 change was required.
+
+## Corrective bounds and logical-view audit
+
+Independent review after the first implementation found two release blockers
+that ordinary output parity could not expose:
+
+- the final padded SIMD group formed and dereferenced a packed Q5_K row before
+  the old output-store guard rejected it when `N` was odd; and
+- exact-mN tiles supplied relative column offsets to the deliberately absolute
+  `BufferWithOffset` API, losing a nonzero `MlxBuffer::byte_offset()`.
+
+The source audit found both patterns in the inherited Q4_K and Q6_K exact
+routes as well. Q4_K, Q5_K, and the baseline Q6_K scalar kernels now return
+SIMD-group-uniformly before forming a padded row pointer. Q6_K NR2 and exact-mN
+also guard the second row of a partially valid two-row group before forming its
+row pointer. A static source-order gate pins those guards before `offset0`,
+`x`, `x_base`, and per-row `xr` formation because a later store guard is not a
+memory-safety proof.
+
+All exact-mN tile bindings now checked-add the logical view base to the tile's
+relative input/output offset before pipeline resolution or command encoding.
+The dataflow audit found no additional change necessary: tracked ranges already
+use each view's logical base and extent, while captured `BufferWithOffset`
+bindings record the now-correct absolute offset.
+
+The hardware gate uses odd `N=513`. Q5_K passes `to_bits()` parity against
+independent scalar authorities at every logical width 2 through 8 and asserts
+the resolved production route plus physical dispatch count. A second canonical
+test covers Q4_K, Q5_K, and Q6_K at widths 4 and 7 using distinct input rows
+inside nonzero-base parent views; every logical output row is bit-identical and
+all input/output parent prefix and suffix canaries remain unchanged. Both tests
+pass through the packaged metallib and forced runtime-source compilation.
+
+Raw Q4_K/Q5_K/Q6_K mN dispatch helpers are no longer public. The validated
+`quantized_matmul_ggml_with_policy` entry point is the sole external route; the
+redundant direct Q6_K helper and unreachable physical width-6/7/8 Q6_K kernels
+were removed. `cargo +stable semver-checks check-release` against published
+0.13.0 reports the intended missing-helper APIs and route-enum discriminant
+changes, so publication follows the README's pre-1.0 breaking-change contract
+as 0.14.0 rather than a patch release.

@@ -960,6 +960,12 @@ kernel void kernel_mul_mv_q6_K_f32(
 
     const int row = 2 * r0 + sgitg;
 
+    // `ceil(ne01/2)` may launch one padded SIMD group. The predicate is
+    // SIMD-group-uniform and must precede packed-row pointer formation.
+    if (row >= p.ne01) {
+        return;
+    }
+
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);
 
@@ -1047,6 +1053,12 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 
     const int first_row = (int)((r0 * NSG + sgitg) * nr0);
 
+    // A whole SIMD group can lie beyond the logical tail. Return before
+    // forming x_base; a partially valid group is handled per row below.
+    if (first_row >= p.ne01) {
+        return;
+    }
+
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);
 
@@ -1089,6 +1101,9 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
         }
 
         for (int row = 0; row < nr0; ++row) {
+            if (first_row + row >= p.ne01) {
+                continue;
+            }
             device const block_q6_K * xr = x_base + row * nb;
             device const uint8_t * q1 = xr[i].ql + q_offset_l;
             device const uint8_t * q2 = q1 + 32;
@@ -1122,25 +1137,24 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 // ---- Q6_K mat-vec kernel, mN (column-amortizing) variant (ADR-040 §0.21c) ----
 //
 // Weight-amortizing analogue of `kernel_mul_mv_q6_K_f32_nr2`, but amortizing
-// across N src1 COLUMNS (the batched-decode / m axis) instead of across weight
-// ROWS.  Plain `kernel_mul_mv_q6_K_f32` re-reads + re-dequantizes the entire
-// Q6_K weight once PER src1 column (measured ~5.15× weight traffic at m=8).
+// across M src1 COLUMNS (the batched-decode / m axis) in addition to NR2's
+// two-row grouping. Production NR2 with grid.y=m re-reads + re-dequantizes the
+// entire Q6_K weight once per src1 column (measured ~5.15× traffic at m=8).
 // This kernel reads each weight block + integer-unpacks its 4 dequantized
 // values ONCE, then reuses them across R1 columns — closing the batched-decode
 // weight-reload gap WITHOUT a coherence tradeoff.
 //
-// BIT-IDENTITY (codex's mandatory bar): the per-column accumulation is a
-// LITERAL clone of plain mv's `sums[4]` / `sc` / `dall` / `simd_sum` tree.  The
-// only column-dependent state is the per-column `yy_c` input pointer and the
-// `dst` store index; the dequant unpack (`w0..w3`, kept as `int` so the
-// `float * int` promotion matches plain mv exactly) is column-independent and
-// hoisted.  No `dot()`, no float4 horizontal reductions, no loop reordering.
-// Result: `dst_mN[c][row]` is bit-equal (u32 to_bits) to plain mv's `dst` for
-// column c — proven by tests/adr_040_q6k_mv_mN_byte_parity.rs.
+// BIT-IDENTITY: each column is a literal clone of production NR2's `yl` cache,
+// `sums`, `sc`, `dall`, and `simd_sum` tree. The only column-dependent state is
+// `yy_c` plus its output index; packed weight decode is shared. No `dot()`, no
+// horizontal reduction change, and no accumulation reordering. Therefore
+// `dst_mN[c][row]` is bit-equal to an independent NR2 invocation for column c,
+// as proven by tests/adr_040_q6k_mv_mN_byte_parity.rs.
 //
-// Dispatch: threadgroups=(ceil(N/2), ceil(M/R1), B), threads_per_tg=(2, 32, 1).
-// Each SIMD group handles 1 weight row × R1 columns.  `r1_base = R1 * tgpig.y`.
-// R1 is a compile-time template arg; instantiated for R1 ∈ {2..8} below.
+// Dispatch: threadgroups=(ceil(N/4), ceil(M/R1), B), threads_per_tg=(2, 32, 1).
+// Each SIMD group handles 2 weight rows × R1 columns. `r1_base = R1 * tgpig.y`.
+// R1 is a compile-time template arg; adaptive production tiling instantiates
+// only the register-safe physical widths R1 ∈ {2..5} below.
 template <short R1>
 kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
     device const  void  * src0   [[buffer(0)]],
@@ -1165,6 +1179,12 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
 
     // Match nr2's row grouping EXACTLY: NSG=2 simdgroups × nr0=2 rows per SG.
     const int first_row = (int)((r0 * 2 + sgitg) * nr0);
+
+    // Match NR2's tail safety before x_base formation. A partially valid
+    // two-row group is guarded inside the row loop.
+    if (first_row >= p.ne01) {
+        return;
+    }
 
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);
@@ -1228,6 +1248,9 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
         }
 
         for (int row = 0; row < nr0; ++row) {
+            if (first_row + row >= p.ne01) {
+                continue;
+            }
             device const block_q6_K * xr = x_base + row * nb;
             device const uint8_t * q1 = xr[i].ql + q_offset_l;
             device const uint8_t * q2 = q1 + 32;
@@ -1262,7 +1285,7 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
     }
 }
 
-// Explicit R1 ∈ {2..8} instantiations (mirrors mul_mv_ext's host_name pattern).
+// Explicit physical R1 ∈ {2..5} instantiations.
 template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_2")]]
 kernel void hf2q_mul_mv_q6_K_f32_mN_impl<2>(
     device const void *, device const float *, device float *,
@@ -1277,18 +1300,6 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl<4>(
     constant GgmlMatvecParams &, uint3, uint, uint);
 template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_5")]]
 kernel void hf2q_mul_mv_q6_K_f32_mN_impl<5>(
-    device const void *, device const float *, device float *,
-    constant GgmlMatvecParams &, uint3, uint, uint);
-template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_6")]]
-kernel void hf2q_mul_mv_q6_K_f32_mN_impl<6>(
-    device const void *, device const float *, device float *,
-    constant GgmlMatvecParams &, uint3, uint, uint);
-template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_7")]]
-kernel void hf2q_mul_mv_q6_K_f32_mN_impl<7>(
-    device const void *, device const float *, device float *,
-    constant GgmlMatvecParams &, uint3, uint, uint);
-template [[host_name("kernel_mul_mv_q6_K_f32_mN_r1_8")]]
-kernel void hf2q_mul_mv_q6_K_f32_mN_impl<8>(
     device const void *, device const float *, device float *,
     constant GgmlMatvecParams &, uint3, uint, uint);
 
@@ -1455,6 +1466,12 @@ kernel void kernel_mul_mv_q4_K_f32(
 
     const int row = 2 * (int)r0 + (int)sgitg;
 
+    // `ceil(ne01/2)` launches one padded SIMD group when N is odd. Return
+    // uniformly before forming offset0/x for a nonexistent packed row.
+    if (row >= (int)p.ne01) {
+        return;
+    }
+
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);
 
@@ -1569,6 +1586,12 @@ kernel void hf2q_mul_mv_q4_K_f32_mN_impl(
     const int im = tgpig.z;
 
     const int row = 2 * (int)r0 + (int)sgitg;
+
+    // The last SIMD group is padding for odd N; do not form a packed-row
+    // pointer for it. The predicate is identical for all SIMD lanes.
+    if (row >= (int)p.ne01) {
+        return;
+    }
 
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);
@@ -1699,6 +1722,12 @@ kernel void kernel_mul_mv_q5_K_f32(
 
     const int row = 2 * (int)r0 + (int)sgitg;
 
+    // `ceil(ne01/2)` launches one padded SIMD group when N is odd. Return
+    // uniformly before forming offset0/x for a nonexistent packed row.
+    if (row >= (int)p.ne01) {
+        return;
+    }
+
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);
 
@@ -1811,6 +1840,12 @@ kernel void hf2q_mul_mv_q5_K_f32_mN_impl(
     const int im = tgpig.z;
 
     const int row = 2 * (int)r0 + (int)sgitg;
+
+    // The last SIMD group is padding for odd N; do not form a packed-row
+    // pointer for it. The predicate is identical for all SIMD lanes.
+    if (row >= (int)p.ne01) {
+        return;
+    }
 
     const uint i12 = im % QMM_NE12(p);
     const uint i13 = im / QMM_NE12(p);

@@ -4,13 +4,14 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use mlx_native::{
-    quantized_matmul_ggml_with_policy, DType, GgmlQuantizedMatmulParams, GgmlRoutingPolicy,
-    GgmlType, KernelRegistry, MlxDevice,
+    quantized_matmul_ggml_with_policy, quantized_matmul_ggml_with_policy_and_trace, DType,
+    GgmlQuantizedMatmulParams, GgmlResolvedKernelRoute, GgmlRoutingPolicy, GgmlType,
+    GgmlWorkloadClass, KernelRegistry, MlxDevice,
 };
 
 const QK_K: usize = 256;
 const BLOCK_Q5_K_BYTES: usize = 176;
-const N: usize = 512;
+const N: usize = 513;
 const K: usize = 5_120;
 
 fn next_u64(state: &mut u64) -> u64 {
@@ -102,9 +103,14 @@ fn assert_q5k_mn_matches_serial(m: usize, seed: u64) {
         .as_mut_slice::<f32>()
         .expect("mN input slice")
         .copy_from_slice(&input);
-    let output = device
+    let mut output = device
         .alloc_buffer(m * N * 4, DType::F32, vec![m, N])
         .expect("mN output");
+    const UNWRITTEN: u32 = 0x7fc1_2345;
+    output
+        .as_mut_slice::<f32>()
+        .expect("mN output slice")
+        .fill(f32::from_bits(UNWRITTEN));
     let params = GgmlQuantizedMatmulParams {
         m: m as u32,
         n: N as u32,
@@ -117,7 +123,7 @@ fn assert_q5k_mn_matches_serial(m: usize, seed: u64) {
         ..GgmlRoutingPolicy::default()
     };
     let mut encoder = device.command_encoder().expect("mN encoder");
-    quantized_matmul_ggml_with_policy(
+    let trace = quantized_matmul_ggml_with_policy_and_trace(
         &mut encoder,
         &mut registry,
         &device,
@@ -126,12 +132,27 @@ fn assert_q5k_mn_matches_serial(m: usize, seed: u64) {
         &output,
         &params,
         &exact_width_policy,
+        GgmlWorkloadClass::ContinuousWidth,
     )
-    .expect("mN dispatch");
+    .expect("traced mN dispatch");
+    assert_eq!(
+        trace.resolved_route,
+        GgmlResolvedKernelRoute::DenseQ5kWidthMn
+    );
+    assert_eq!(trace.dispatches.len(), if m <= 5 { 1 } else { 2 });
     encoder.commit_and_wait().expect("mN GPU execution");
 
     let actual = output.as_slice::<f32>().expect("mN result");
     for (index, (&want, &got)) in expected.iter().zip(actual).enumerate() {
+        assert_ne!(
+            got.to_bits(),
+            UNWRITTEN,
+            "Q5_K mN row was not executed: m={m}, index={index}"
+        );
+        assert!(
+            got.is_finite(),
+            "Q5_K mN produced non-finite output: m={m}, index={index}, value={got:?}"
+        );
         assert_eq!(
             got.to_bits(),
             want.to_bits(),

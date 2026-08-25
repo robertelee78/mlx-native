@@ -243,10 +243,10 @@ impl KernelRegistry {
         // `HF2Q_Q6K_MV_NR2=1` in the dispatcher.
         sources.insert("kernel_mul_mv_q6_K_f32_nr2".into(), ggml_src);
         // ADR-040 §0.21c — q6_K column-amortizing mat-vec (mN). Reads each
-        // weight block once and reuses its dequant across R1 ∈ {2..8} src1
-        // columns (batched-decode m axis). BIT-IDENTICAL to plain mv (literal
-        // sums[4]/sc/dall/simd_sum clone); gated via HF2Q_DECODE_MVN.
-        for r1 in 2..=8 {
+        // weight block once and reuses its dequant across R1 ∈ {2..5} src1
+        // columns (batched-decode m axis). BIT-IDENTICAL to production NR2's
+        // cached-yl/sums/sc/dall/simd_sum tree; gated via HF2Q_DECODE_MVN.
+        for r1 in 2..=5 {
             sources.insert(format!("kernel_mul_mv_q6_K_f32_mN_r1_{r1}"), ggml_src);
         }
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL dense mat-vec.

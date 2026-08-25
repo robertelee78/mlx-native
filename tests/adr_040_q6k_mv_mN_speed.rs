@@ -3,9 +3,11 @@
 //!
 //! Measures GPU-busy time (commit_wait_with_gpu_time) for the bit-identical
 //! column-amortizing mN kernel at m=2..8 on an lm_head-like shape (large N,
-//! K~2560), vs plain `kernel_mul_mv_q6_K_f32` run m times (once per column).
-//! Each measurement batches REPS dispatches into one command buffer so GPU
-//! launch overhead amortizes and the busy-time delta reflects kernel work.
+//! K~2560), vs the canonical NR2 baseline. NR2 is one Metal dispatch with
+//! grid.y=m but rereads each packed weight row for every input column; exact
+//! mN shares weight reads and uses one physical dispatch for m<=5 or two
+//! register-safe tiles for m=6..8. Each measurement batches REPS canonical
+//! calls into one command buffer so the busy-time delta reflects kernel work.
 //!
 //! Ignored by default (`#[ignore]`) — it is a benchmark, run explicitly with
 //! `--ignored`. Requires a single-tenant GPU for meaningful numbers.
@@ -14,7 +16,7 @@
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::{
-    dispatch_mv_q6k_mn_adaptive, quantized_matmul_ggml, DType, GgmlQuantizedMatmulParams,
+    quantized_matmul_ggml_with_policy, DType, GgmlQuantizedMatmulParams, GgmlRoutingPolicy,
     GgmlType, KernelRegistry, MlxDevice,
 };
 
@@ -111,11 +113,6 @@ const REPS: usize = 200;
 #[test]
 #[ignore]
 fn q6k_mvN_speed_sweep_lmhead() {
-    // Compare against the PRODUCTION default decode kernel: NR2 (default-on).
-    std::env::set_var("HF2Q_Q6K_MV_NR2", "1");
-    std::env::remove_var("HF2Q_DECODE_MVN");
-    std::env::remove_var("HF2Q_DECODE_MV_EXT");
-
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
 
@@ -133,8 +130,20 @@ fn q6k_mvN_speed_sweep_lmhead() {
         .expect("w mut")
         .copy_from_slice(&weight_bytes);
 
-    eprintln!("[mvN-speed] lm_head N={n} K={k}, REPS={REPS} dispatches/measure");
-    eprintln!("[mvN-speed]  m | NR2(m dispatches) us | mN(1 dispatch) us | speedup");
+    eprintln!("[mvN-speed] lm_head N={n} K={k}, REPS={REPS} canonical calls/measure");
+    eprintln!("[mvN-speed]  m | NR2(weight rereads) us | exact mN(1-2 tiles) us | speedup");
+
+    let nr2_policy = GgmlRoutingPolicy {
+        dense_decode_mvn: false,
+        dense_decode_mv_ext: false,
+        dense_q6k_mv_nr2: true,
+        ..GgmlRoutingPolicy::default()
+    };
+    let mn_policy = GgmlRoutingPolicy {
+        dense_decode_mvn: true,
+        dense_decode_mv_ext: false,
+        ..GgmlRoutingPolicy::default()
+    };
 
     for m in 2..=8usize {
         let input = pseudo_random_f32(0xbeef ^ (m as u64), m * k);
@@ -159,45 +168,90 @@ fn q6k_mvN_speed_sweep_lmhead() {
             ggml_type: GgmlType::Q6_K,
         };
 
-        // --- plain mv: m separate column dispatches per rep ---
+        // --- NR2: one dispatch whose grid.y=m rereads weights per column ---
         // warmup
         {
             let mut enc = device.command_encoder().expect("enc");
-            quantized_matmul_ggml(&mut enc, &mut registry, &device, &input_buf, &weight_buf, &mut out_buf, &params).expect("plain");
+            quantized_matmul_ggml_with_policy(
+                &mut enc,
+                &mut registry,
+                &device,
+                &input_buf,
+                &weight_buf,
+                &mut out_buf,
+                &params,
+                &nr2_policy,
+            )
+            .expect("NR2 baseline");
             enc.commit_and_wait().expect("gpu");
         }
         let mut plain_best = f64::MAX;
         for _ in 0..3 {
             let mut enc = device.command_encoder().expect("enc");
             for _ in 0..REPS {
-                quantized_matmul_ggml(&mut enc, &mut registry, &device, &input_buf, &weight_buf, &mut out_buf, &params).expect("plain");
+                quantized_matmul_ggml_with_policy(
+                    &mut enc,
+                    &mut registry,
+                    &device,
+                    &input_buf,
+                    &weight_buf,
+                    &mut out_buf,
+                    &params,
+                    &nr2_policy,
+                )
+                .expect("NR2 baseline");
             }
             let (s, e) = enc.commit_wait_with_gpu_time().expect("gpu time");
             let us = (e - s) * 1e6 / REPS as f64;
-            if us < plain_best { plain_best = us; }
+            if us < plain_best {
+                plain_best = us;
+            }
         }
 
-        // --- mN adaptive: register-safe column-tiled dispatch(es) per rep ---
+        // --- exact mN: shared weight reads in one or two physical tiles ---
         {
             let mut enc = device.command_encoder().expect("enc");
-            dispatch_mv_q6k_mn_adaptive(&mut enc, &mut registry, &device, &input_buf, &weight_buf, &out_buf, &params).expect("mN");
+            quantized_matmul_ggml_with_policy(
+                &mut enc,
+                &mut registry,
+                &device,
+                &input_buf,
+                &weight_buf,
+                &out_buf,
+                &params,
+                &mn_policy,
+            )
+            .expect("canonical mN");
             enc.commit_and_wait().expect("gpu");
         }
         let mut mn_best = f64::MAX;
         for _ in 0..3 {
             let mut enc = device.command_encoder().expect("enc");
             for _ in 0..REPS {
-                dispatch_mv_q6k_mn_adaptive(&mut enc, &mut registry, &device, &input_buf, &weight_buf, &out_buf, &params).expect("mN");
+                quantized_matmul_ggml_with_policy(
+                    &mut enc,
+                    &mut registry,
+                    &device,
+                    &input_buf,
+                    &weight_buf,
+                    &out_buf,
+                    &params,
+                    &mn_policy,
+                )
+                .expect("canonical mN");
             }
             let (s, e) = enc.commit_wait_with_gpu_time().expect("gpu time");
             let us = (e - s) * 1e6 / REPS as f64;
-            if us < mn_best { mn_best = us; }
+            if us < mn_best {
+                mn_best = us;
+            }
         }
 
         eprintln!(
             "[mvN-speed]  {m} | {:8.2} | {:8.2} | {:.3}x",
-            plain_best, mn_best, plain_best / mn_best
+            plain_best,
+            mn_best,
+            plain_best / mn_best
         );
     }
-    std::env::remove_var("HF2Q_Q6K_MV_NR2");
 }

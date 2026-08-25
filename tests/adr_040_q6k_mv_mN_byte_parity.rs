@@ -2,28 +2,28 @@
 #![allow(non_snake_case)] // mN/mvN camel-case preserved for kernel-naming parity
 //!
 //! The mN kernel amortizes the Q6_K weight read + dequant across R1 src1
-//! COLUMNS (the batched-decode m axis), vs plain `kernel_mul_mv_q6_K_f32` which
-//! re-reads the weight once per column.  Because the per-column accumulation is
-//! a LITERAL clone of plain mv's `sums[4]`/`sc`/`dall`/`simd_sum` tree (only the
-//! per-column src1 pointer and dst index differ), the result MUST be BIT-EQUAL
-//! — not merely fp-tolerant — to running plain mv once per column.
+//! columns (the batched-decode m axis), vs production NR2 with grid.y=m, which
+//! rereads the weights for every column. Because each column's accumulation is
+//! a literal clone of NR2's `yl` cache, `sums`, `sc`, `dall`, and `simd_sum`
+//! tree, the result must be bit-equal—not merely fp-tolerant—to independent
+//! production NR2 invocations.
 //!
 //! This is the GATE for the ADR-040 §0.21c lever: it must pass via `.to_bits()`
-//! u32 compare for ALL R1 ∈ {2..8}.  If any bit differs, the source shape is
+//! u32 compare for all logical widths m∈{2..8}, tiled through physical
+//! R1∈{2..5}. If any bit differs, the source shape is
 //! wrong and the kernel may NOT ship default-on.
 //!
-//! Both compile paths: this test runs under the runtime source-compile path
-//! always.  Set `MLX_PRECOMPILED_METALLIB=1` (with a Metal-toolchain build that
-//! actually populated default.metallib) to additionally exercise the
-//! precompiled path — same registered source + host_name instantiation, so the
-//! entry point resolves identically.
+//! The packaged precompiled metallib is the default. Set
+//! `MLX_PRECOMPILED_METALLIB=0` to force runtime-source compilation; release
+//! proof runs this gate once through each delivery path.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(target_vendor = "apple")]
 
 use mlx_native::{
-    dispatch_mv_q6k_mn, dispatch_mv_q6k_mn_adaptive, DType, GgmlQuantizedMatmulParams, GgmlType,
-    KernelRegistry, MlxDevice,
+    quantized_matmul_ggml_with_policy, quantized_matmul_ggml_with_policy_and_trace, DType,
+    GgmlQuantizedMatmulParams, GgmlResolvedKernelRoute, GgmlRoutingPolicy, GgmlType,
+    GgmlWorkloadClass, KernelRegistry, MlxDevice,
 };
 
 // PRNG matching adr_028_iter309_q6k_mv_nr2_parity.rs.
@@ -141,10 +141,6 @@ fn run_nr2_single_col(
     weight_bytes: &[u8],
     col_input: &[f32],
 ) -> Vec<f32> {
-    std::env::set_var("HF2Q_Q6K_MV_NR2", "1");
-    std::env::remove_var("HF2Q_DECODE_MVN");
-    std::env::remove_var("HF2Q_DECODE_MV_EXT");
-
     let mut input_buf = device
         .alloc_buffer(k * 4, DType::F32, vec![1, k])
         .expect("alloc input");
@@ -162,7 +158,11 @@ fn run_nr2_single_col(
     let mut output_buf = device
         .alloc_buffer(n * 4, DType::F32, vec![1, n])
         .expect("alloc output");
-    for v in output_buf.as_mut_slice::<f32>().expect("out mut").iter_mut() {
+    for v in output_buf
+        .as_mut_slice::<f32>()
+        .expect("out mut")
+        .iter_mut()
+    {
         *v = 0.0;
     }
     let params = GgmlQuantizedMatmulParams {
@@ -172,7 +172,7 @@ fn run_nr2_single_col(
         ggml_type: GgmlType::Q6_K,
     };
     let mut encoder = device.command_encoder().expect("encoder");
-    mlx_native::quantized_matmul_ggml(
+    quantized_matmul_ggml_with_policy(
         &mut encoder,
         registry,
         device,
@@ -180,10 +180,15 @@ fn run_nr2_single_col(
         &weight_buf,
         &mut output_buf,
         &params,
+        &GgmlRoutingPolicy {
+            dense_decode_mvn: false,
+            dense_decode_mv_ext: false,
+            dense_q6k_mv_nr2: true,
+            ..GgmlRoutingPolicy::default()
+        },
     )
     .expect("nr2 dispatch");
     encoder.commit_and_wait().expect("gpu");
-    std::env::remove_var("HF2Q_Q6K_MV_NR2");
     output_buf.as_slice::<f32>().expect("read out").to_vec()
 }
 
@@ -199,11 +204,6 @@ fn run_plain_mv_single_col(
     weight_bytes: &[u8],
     col_input: &[f32], // length k
 ) -> Vec<f32> {
-    // Force the true baseline kernel (not NR2, not MVN, not mv_ext).
-    std::env::set_var("HF2Q_Q6K_MV_NR2", "0");
-    std::env::remove_var("HF2Q_DECODE_MVN");
-    std::env::remove_var("HF2Q_DECODE_MV_EXT");
-
     let mut input_buf = device
         .alloc_buffer(k * 4, DType::F32, vec![1, k])
         .expect("alloc input");
@@ -223,7 +223,11 @@ fn run_plain_mv_single_col(
     let mut output_buf = device
         .alloc_buffer(n * 4, DType::F32, vec![1, n])
         .expect("alloc output");
-    for v in output_buf.as_mut_slice::<f32>().expect("out mut").iter_mut() {
+    for v in output_buf
+        .as_mut_slice::<f32>()
+        .expect("out mut")
+        .iter_mut()
+    {
         *v = 0.0;
     }
 
@@ -235,7 +239,7 @@ fn run_plain_mv_single_col(
     };
 
     let mut encoder = device.command_encoder().expect("encoder");
-    mlx_native::quantized_matmul_ggml(
+    quantized_matmul_ggml_with_policy(
         &mut encoder,
         registry,
         device,
@@ -243,68 +247,14 @@ fn run_plain_mv_single_col(
         &weight_buf,
         &mut output_buf,
         &params,
+        &GgmlRoutingPolicy {
+            dense_decode_mvn: false,
+            dense_decode_mv_ext: false,
+            dense_q6k_mv_nr2: false,
+            ..GgmlRoutingPolicy::default()
+        },
     )
     .expect("plain mv dispatch");
-    encoder.commit_and_wait().expect("gpu");
-
-    std::env::remove_var("HF2Q_Q6K_MV_NR2");
-    output_buf.as_slice::<f32>().expect("read out").to_vec()
-}
-
-/// Run the mN kernel for the full [m, k] input at the given R1 width; returns
-/// the [m, n] output (row-major: out[col*n + row]).
-fn run_mN(
-    device: &MlxDevice,
-    registry: &mut KernelRegistry,
-    r1: usize,
-    m: usize,
-    n: usize,
-    k: usize,
-    weight_bytes: &[u8],
-    input: &[f32], // [m, k]
-) -> Vec<f32> {
-    let mut input_buf = device
-        .alloc_buffer(m * k * 4, DType::F32, vec![m, k])
-        .expect("alloc input");
-    input_buf
-        .as_mut_slice::<f32>()
-        .expect("input mut")
-        .copy_from_slice(input);
-
-    let mut weight_buf = device
-        .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
-        .expect("alloc weight");
-    weight_buf
-        .as_mut_slice::<u8>()
-        .expect("weight mut")
-        .copy_from_slice(weight_bytes);
-
-    let mut output_buf = device
-        .alloc_buffer(m * n * 4, DType::F32, vec![m, n])
-        .expect("alloc output");
-    for v in output_buf.as_mut_slice::<f32>().expect("out mut").iter_mut() {
-        *v = 0.0;
-    }
-
-    let params = GgmlQuantizedMatmulParams {
-        m: m as u32,
-        n: n as u32,
-        k: k as u32,
-        ggml_type: GgmlType::Q6_K,
-    };
-
-    let mut encoder = device.command_encoder().expect("encoder");
-    dispatch_mv_q6k_mn(
-        &mut encoder,
-        registry,
-        device,
-        &input_buf,
-        &weight_buf,
-        &output_buf,
-        &params,
-        r1,
-    )
-    .expect("mN dispatch");
     encoder.commit_and_wait().expect("gpu");
 
     output_buf.as_slice::<f32>().expect("read out").to_vec()
@@ -325,15 +275,25 @@ fn run_mN_adaptive(
     let mut input_buf = device
         .alloc_buffer(m * k * 4, DType::F32, vec![m, k])
         .expect("alloc input");
-    input_buf.as_mut_slice::<f32>().expect("in mut").copy_from_slice(input);
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("in mut")
+        .copy_from_slice(input);
     let mut weight_buf = device
         .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
         .expect("alloc weight");
-    weight_buf.as_mut_slice::<u8>().expect("w mut").copy_from_slice(weight_bytes);
+    weight_buf
+        .as_mut_slice::<u8>()
+        .expect("w mut")
+        .copy_from_slice(weight_bytes);
     let mut output_buf = device
         .alloc_buffer(m * n * 4, DType::F32, vec![m, n])
         .expect("alloc output");
-    for v in output_buf.as_mut_slice::<f32>().expect("out mut").iter_mut() {
+    for v in output_buf
+        .as_mut_slice::<f32>()
+        .expect("out mut")
+        .iter_mut()
+    {
         *v = 0.0;
     }
     let params = GgmlQuantizedMatmulParams {
@@ -343,8 +303,27 @@ fn run_mN_adaptive(
         ggml_type: GgmlType::Q6_K,
     };
     let mut encoder = device.command_encoder().expect("encoder");
-    dispatch_mv_q6k_mn_adaptive(&mut encoder, registry, device, &input_buf, &weight_buf, &output_buf, &params)
-        .expect("mN adaptive dispatch");
+    let trace = quantized_matmul_ggml_with_policy_and_trace(
+        &mut encoder,
+        registry,
+        device,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        &params,
+        &GgmlRoutingPolicy {
+            dense_decode_mvn: true,
+            dense_decode_mv_ext: false,
+            ..GgmlRoutingPolicy::default()
+        },
+        GgmlWorkloadClass::ContinuousWidth,
+    )
+    .expect("traced canonical mN dispatch");
+    assert_eq!(
+        trace.resolved_route,
+        GgmlResolvedKernelRoute::DenseQ6kWidthMn
+    );
+    assert_eq!(trace.dispatches.len(), if m <= 5 { 1 } else { 2 });
     encoder.commit_and_wait().expect("gpu");
     output_buf.as_slice::<f32>().expect("read out").to_vec()
 }
@@ -365,7 +344,14 @@ fn q6k_mN_adaptive_vs_nr2_real_shapes_all_m() {
             let mut nr2_ref: Vec<Vec<f32>> = Vec::with_capacity(m);
             for col in 0..m {
                 let ci = &input[col * k..(col + 1) * k];
-                nr2_ref.push(run_nr2_single_col(&device, &mut registry, n, k, &weight_bytes, ci));
+                nr2_ref.push(run_nr2_single_col(
+                    &device,
+                    &mut registry,
+                    n,
+                    k,
+                    &weight_bytes,
+                    ci,
+                ));
             }
             let out = run_mN_adaptive(&device, &mut registry, m, n, k, &weight_bytes, &input);
             let mut mis = 0usize;
@@ -383,11 +369,14 @@ fn q6k_mN_adaptive_vs_nr2_real_shapes_all_m() {
                 }
             }
             assert_eq!(
-                mis, 0,
+                mis,
+                0,
                 "adaptive mN(m={m}) vs NR2 at n={n} k={k}: {mis} mismatches; first \
                  col={:?} row={:?} nr2=0x{:08x} mN=0x{:08x}",
-                first.map(|f| f.0), first.map(|f| f.1),
-                first.map(|f| f.2).unwrap_or(0), first.map(|f| f.3).unwrap_or(0),
+                first.map(|f| f.0),
+                first.map(|f| f.1),
+                first.map(|f| f.2).unwrap_or(0),
+                first.map(|f| f.3).unwrap_or(0),
             );
         }
         eprintln!("[mvN-adaptive] n={n} k={k}: adaptive mN == NR2 bit-exact for all m=2..8");
@@ -438,7 +427,8 @@ fn check_byte_identity(label: &str, m: usize, n: usize, k: usize) {
         }
     }
     assert_eq!(
-        mismatches, 0,
+        mismatches,
+        0,
         "[{label}] m={m}: {mismatches} bit-mismatches (of {} elems); first \
          col={:?} row={:?} nr2.bits=0x{:08x} mN.bits=0x{:08x}",
         m * n,
@@ -447,7 +437,10 @@ fn check_byte_identity(label: &str, m: usize, n: usize, k: usize) {
         first.map(|f| f.2).unwrap_or(0),
         first.map(|f| f.3).unwrap_or(0),
     );
-    eprintln!("[mvN-byte-parity] {label} m={m} N={n} K={k}: BYTE-EQUAL vs NR2 ({} elems)", m * n);
+    eprintln!(
+        "[mvN-byte-parity] {label} m={m} N={n} K={k}: BYTE-EQUAL vs NR2 ({} elems)",
+        m * n
+    );
 }
 
 /// CRUX: the gemma4 model runs Q6_K decode through NR2 (default-on). The serial
@@ -471,11 +464,25 @@ fn q6k_nr2_vs_plain_and_mN_vs_nr2_bit_exact() {
     let mut nr2_ref: Vec<Vec<f32>> = Vec::with_capacity(m);
     for col in 0..m {
         let ci = &input[col * k..(col + 1) * k];
-        plain_ref.push(run_plain_mv_single_col(&device, &mut registry, n, k, &weight_bytes, ci));
-        nr2_ref.push(run_nr2_single_col(&device, &mut registry, n, k, &weight_bytes, ci));
+        plain_ref.push(run_plain_mv_single_col(
+            &device,
+            &mut registry,
+            n,
+            k,
+            &weight_bytes,
+            ci,
+        ));
+        nr2_ref.push(run_nr2_single_col(
+            &device,
+            &mut registry,
+            n,
+            k,
+            &weight_bytes,
+            ci,
+        ));
     }
 
-    // (1) NR2 vs plain mv, bit-exact.
+    // (1) Count the known NR2-vs-plain-mv drift diagnostically.
     let mut nr2_vs_plain = 0usize;
     for col in 0..m {
         for row in 0..n {
@@ -484,10 +491,14 @@ fn q6k_nr2_vs_plain_and_mN_vs_nr2_bit_exact() {
             }
         }
     }
-    eprintln!("[mvN-crux] NR2 vs plain-mv bit-mismatches: {nr2_vs_plain} / {}", m * n);
+    eprintln!(
+        "[mvN-crux] NR2 vs plain-mv bit-mismatches: {nr2_vs_plain} / {}",
+        m * n
+    );
 
-    // (2) mN (R1=m) vs NR2, bit-exact — this is what the model needs.
-    let out = run_mN(&device, &mut registry, m, m, n, k, &weight_bytes, &input);
+    // (2) The canonical exact-mN route vs NR2, bit-exact — this is what the
+    // model needs and what production actually dispatches.
+    let out = run_mN_adaptive(&device, &mut registry, m, n, k, &weight_bytes, &input);
     let mut mN_vs_nr2 = 0usize;
     let mut mN_vs_plain = 0usize;
     for col in 0..m {
@@ -501,8 +512,14 @@ fn q6k_nr2_vs_plain_and_mN_vs_nr2_bit_exact() {
             }
         }
     }
-    eprintln!("[mvN-crux] mN vs NR2 bit-mismatches:      {mN_vs_nr2} / {}", m * n);
-    eprintln!("[mvN-crux] mN vs plain-mv bit-mismatches: {mN_vs_plain} / {}", m * n);
+    eprintln!(
+        "[mvN-crux] mN vs NR2 bit-mismatches:      {mN_vs_nr2} / {}",
+        m * n
+    );
+    eprintln!(
+        "[mvN-crux] mN vs plain-mv bit-mismatches: {mN_vs_plain} / {}",
+        m * n
+    );
     // Diagnostic only — assertions live in the dedicated tests below.
 }
 
@@ -526,9 +543,16 @@ fn q6k_mN_vs_nr2_real_shapes_all_m() {
             let mut nr2_ref: Vec<Vec<f32>> = Vec::with_capacity(m);
             for col in 0..m {
                 let ci = &input[col * k..(col + 1) * k];
-                nr2_ref.push(run_nr2_single_col(&device, &mut registry, n, k, &weight_bytes, ci));
+                nr2_ref.push(run_nr2_single_col(
+                    &device,
+                    &mut registry,
+                    n,
+                    k,
+                    &weight_bytes,
+                    ci,
+                ));
             }
-            let out = run_mN(&device, &mut registry, m, m, n, k, &weight_bytes, &input);
+            let out = run_mN_adaptive(&device, &mut registry, m, n, k, &weight_bytes, &input);
             let mut mis = 0usize;
             let mut first: Option<(usize, usize, u32, u32)> = None;
             for col in 0..m {
@@ -544,7 +568,8 @@ fn q6k_mN_vs_nr2_real_shapes_all_m() {
                 }
             }
             assert_eq!(
-                mis, 0,
+                mis,
+                0,
                 "mN(m={m}) vs NR2 at n={n} k={k}: {mis} bit-mismatches; first \
                  col={:?} row={:?} nr2.bits=0x{:08x} mN.bits=0x{:08x}",
                 first.map(|f| f.0),
@@ -578,9 +603,8 @@ fn q6k_mvN_byte_parity_lmhead_shape() {
 
 #[test]
 fn q6k_mvN_byte_parity_m_each_2_to_8() {
-    // Exercise every m so the single-tile R1=m routing the model uses is
-    // covered, and so the boundary store guard (r1_base+c < ne1) is hit when
-    // m is not a multiple of R1 for the wider sweeps.
+    // Exercise every logical width. Widths 2..=5 use one physical tile;
+    // widths 6..=8 use the production 3+3, 4+3, and 4+4 tilings.
     for m in 2..=8usize {
         check_byte_identity(&format!("m={m} N=96 K=512"), m, 96, 512);
     }
