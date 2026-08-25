@@ -103,9 +103,11 @@ all input/output parent prefix and suffix canaries remain unchanged. Both tests
 pass through the packaged metallib and forced runtime-source compilation.
 
 Raw Q4_K/Q5_K/Q6_K mN dispatch helpers are no longer public. The validated
-`quantized_matmul_ggml_with_policy` entry point is the sole external route; the
-redundant direct Q6_K helper and unreachable physical width-6/7/8 Q6_K kernels
-were removed. `cargo +stable semver-checks check-release` against published
+canonical dispatcher surface is the only external route: its default,
+explicit-policy, and traced wrappers all share the same validation before the
+private codec tiles are selected. The redundant direct Q6_K helper and
+unreachable physical width-6/7/8 Q6_K kernels were removed.
+`cargo +stable semver-checks check-release` against published
 0.13.0 reports the intended missing-helper APIs and route-enum discriminant
 changes, so publication follows the README's pre-1.0 breaking-change contract
 as 0.14.0 rather than a patch release.

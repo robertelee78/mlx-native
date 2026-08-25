@@ -11,7 +11,7 @@
 use mlx_native::{
     quantized_matmul_ggml_with_policy, quantized_matmul_ggml_with_policy_and_trace, DType,
     GgmlQuantizedMatmulParams, GgmlResolvedKernelRoute, GgmlRoutingPolicy, GgmlType,
-    GgmlWorkloadClass, KernelRegistry, MlxDevice,
+    GgmlWorkloadClass, KernelPipelineOrigin, KernelRegistry, MlxDevice,
 };
 
 const N: usize = 513;
@@ -199,6 +199,31 @@ fn assert_logical_view_case(kind: GgmlType, m: usize) {
     .expect("traced mN dispatch");
     assert_eq!(trace.resolved_route, expected_route(kind));
     assert_eq!(trace.dispatches.len(), if m == 7 { 2 } else { 1 });
+    let precompiled_disabled = |name| {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    };
+    let expected_origin = if precompiled_disabled("MLX_PRECOMPILED_METALLIB")
+        || precompiled_disabled("MLX_PRECOMPILED_METALLIB_FCV")
+    {
+        KernelPipelineOrigin::RuntimeSource
+    } else {
+        KernelPipelineOrigin::PrecompiledMetallib
+    };
+    assert!(
+        trace
+            .dispatches
+            .iter()
+            .all(|dispatch| dispatch.pipeline.origin == expected_origin),
+        "{kind:?} width {m} delivery path mismatch: expected {expected_origin:?}, got {:?}",
+        trace
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.pipeline.origin)
+            .collect::<Vec<_>>()
+    );
     encoder.commit_and_wait().expect("mN execution");
 
     let actual = output_view

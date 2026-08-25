@@ -6,7 +6,7 @@
 use mlx_native::{
     quantized_matmul_ggml_with_policy, quantized_matmul_ggml_with_policy_and_trace, DType,
     GgmlQuantizedMatmulParams, GgmlResolvedKernelRoute, GgmlRoutingPolicy, GgmlType,
-    GgmlWorkloadClass, KernelRegistry, MlxDevice,
+    GgmlWorkloadClass, KernelPipelineOrigin, KernelRegistry, MlxDevice,
 };
 
 const QK_K: usize = 256;
@@ -140,6 +140,31 @@ fn assert_q5k_mn_matches_serial(m: usize, seed: u64) {
         GgmlResolvedKernelRoute::DenseQ5kWidthMn
     );
     assert_eq!(trace.dispatches.len(), if m <= 5 { 1 } else { 2 });
+    let precompiled_disabled = |name| {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    };
+    let expected_origin = if precompiled_disabled("MLX_PRECOMPILED_METALLIB")
+        || precompiled_disabled("MLX_PRECOMPILED_METALLIB_FCV")
+    {
+        KernelPipelineOrigin::RuntimeSource
+    } else {
+        KernelPipelineOrigin::PrecompiledMetallib
+    };
+    assert!(
+        trace
+            .dispatches
+            .iter()
+            .all(|dispatch| dispatch.pipeline.origin == expected_origin),
+        "Q5_K mN delivery path mismatch: expected {expected_origin:?}, got {:?}",
+        trace
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.pipeline.origin)
+            .collect::<Vec<_>>()
+    );
     encoder.commit_and_wait().expect("mN GPU execution");
 
     let actual = output.as_slice::<f32>().expect("mN result");
