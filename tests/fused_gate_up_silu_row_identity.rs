@@ -12,9 +12,6 @@ use mlx_native::ops::fused_gate_up_silu_iq4_nl::{
 use mlx_native::ops::fused_gate_up_silu_q4_K::{
     dispatch_fused_gate_up_silu_q4_K, FusedGateUpSiluQ4_KArgs,
 };
-use mlx_native::ops::fused_gate_up_silu_q5_K::{
-    dispatch_fused_gate_up_silu_q5_K, FusedGateUpSiluQ5_KArgs,
-};
 use mlx_native::ops::fused_gate_up_silu_q6_K::{
     dispatch_fused_gate_up_silu_q6_K, FusedGateUpSiluQ6_KArgs,
 };
@@ -30,19 +27,17 @@ const K: usize = 512;
 enum Codec {
     Q8_0,
     Q4K,
-    Q5K,
     Q6K,
     Iq4Nl,
 }
 
 impl Codec {
-    const ALL: [Self; 5] = [Self::Q8_0, Self::Q4K, Self::Q5K, Self::Q6K, Self::Iq4Nl];
+    const ALL: [Self; 4] = [Self::Q8_0, Self::Q4K, Self::Q6K, Self::Iq4Nl];
 
     fn block_shape(self) -> (usize, usize) {
         match self {
             Self::Q8_0 => (32, 34),
             Self::Q4K => (256, 144),
-            Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
             Self::Iq4Nl => (32, 18),
         }
@@ -70,7 +65,7 @@ fn valid_weight_bytes(codec: Codec, seed: u64) -> Vec<u8> {
             .to_le_bytes();
         match codec {
             Codec::Q8_0 | Codec::Iq4Nl => block[..2].copy_from_slice(&d),
-            Codec::Q4K | Codec::Q5K => {
+            Codec::Q4K => {
                 block[..2].copy_from_slice(&d);
                 let dmin = half::f16::from_f32(0.000_5 + (block_index % 17) as f32 * 0.000_015_625)
                     .to_bits()
@@ -134,20 +129,6 @@ fn dispatch(
             input,
             output,
             FusedGateUpSiluQ4_KArgs {
-                m: m as u32,
-                intermediate_size: N as u32,
-                hidden_size: K as u32,
-            },
-        ),
-        Codec::Q5K => dispatch_fused_gate_up_silu_q5_K(
-            encoder,
-            registry,
-            device,
-            gate,
-            up,
-            input,
-            output,
-            FusedGateUpSiluQ5_KArgs {
                 m: m as u32,
                 intermediate_size: N as u32,
                 hidden_size: K as u32,

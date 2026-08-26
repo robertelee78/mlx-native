@@ -11,7 +11,8 @@
 
 use mlx_native::gguf::{test_only_dequantize_iq4_nl, test_only_dequantize_q5_1, test_only_kvalues_iq4_nl};
 use mlx_native::{
-    mul_mv_ext_dispatch, DType, GgmlType, KernelRegistry, MlxDevice, MulMvExtParams,
+    quantized_matmul_ggml_with_policy, DType, GgmlQuantizedMatmulParams, GgmlRoutingPolicy,
+    GgmlType, KernelRegistry, MlxDevice,
 };
 
 const QK5_1: usize = 32;
@@ -164,18 +165,23 @@ fn run_mv_ext_parity(
         .unwrap();
     for v in output_buf.as_mut_slice::<f32>().unwrap().iter_mut() { *v = 0.0; }
 
-    let params = MulMvExtParams {
+    let params = GgmlQuantizedMatmulParams {
         m: m as u32,
         n: n as u32,
         k: k as u32,
-        batch: 1,
         ggml_type,
+    };
+    let routing = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
+        dense_decode_mvn: false,
+        dense_decode_mv_ext: true,
+        ..GgmlRoutingPolicy::default()
     };
 
     let mut encoder = device.command_encoder().unwrap();
-    mul_mv_ext_dispatch(
+    quantized_matmul_ggml_with_policy(
         &mut encoder, &mut registry, &device,
-        &weight_buf, &input_buf, &mut output_buf, &params,
+        &input_buf, &weight_buf, &mut output_buf, &params, &routing,
     ).unwrap();
     encoder.commit_and_wait().unwrap();
 

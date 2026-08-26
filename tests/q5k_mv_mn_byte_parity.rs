@@ -58,6 +58,7 @@ fn assert_q5k_mn_matches_serial(m: usize, seed: u64) {
         .copy_from_slice(&weight_bytes);
 
     let serial_policy = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
         dense_decode_mvn: false,
         dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()
@@ -118,6 +119,7 @@ fn assert_q5k_mn_matches_serial(m: usize, seed: u64) {
         ggml_type: GgmlType::Q5_K,
     };
     let exact_width_policy = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
         dense_decode_mvn: true,
         dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()

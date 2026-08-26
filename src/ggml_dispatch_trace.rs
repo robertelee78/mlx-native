@@ -16,7 +16,7 @@ use crate::ggml_capability::{
 use crate::kernel_registry::{KernelPipelineIdentity, KernelRegistry};
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
-pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 2;
+pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +38,7 @@ pub struct GgmlKernelDispatchReceipt {
 pub enum GgmlResolvedKernelRoute {
     DenseMv,
     DenseMvNr2,
+    DenseQ5kCanonicalQ4x4,
     DenseQ4kWidthMn,
     DenseQ5kWidthMn,
     DenseQ6kWidthMn,
@@ -250,6 +251,34 @@ fn validate_dense_dispatches(
                 GgmlResolvedKernelRoute::DenseMv
             })
         }
+        GgmlKernelRoute::DenseQ5kCanonicalQ4x4 => {
+            let dispatch = require_one(dispatches)?;
+            if request.ggml_type != GgmlType::Q5_K {
+                return Err(MlxError::InvalidArgument(
+                    "canonical Q5_K q4x4 route selected for a different codec".into(),
+                ));
+            }
+            let r1 = match m {
+                1..=5 => m,
+                6 => 3,
+                7 | 8 => 4,
+                _ => {
+                    return Err(MlxError::InvalidArgument(
+                        "canonical Q5_K q4x4 trace requires M in 1..=8".into(),
+                    ))
+                }
+            };
+            let kernel = format!("kernel_mul_mv_ext_q5_K_f32_r1_{r1}");
+            require_dispatch(
+                dispatch,
+                &kernel,
+                &format!("{kernel}|600:i2|601:i8"),
+                [div_ceil_u64(n, 8), div_ceil_u64(m, u64::from(r1)), 1],
+                [32, 2, 1],
+                &[],
+            )?;
+            Ok(GgmlResolvedKernelRoute::DenseQ5kCanonicalQ4x4)
+        }
         GgmlKernelRoute::DenseQ4kWidthMn
         | GgmlKernelRoute::DenseQ5kWidthMn
         | GgmlKernelRoute::DenseQ6kWidthMn => {
@@ -427,12 +456,6 @@ fn validate_dense_dispatches(
             let (kernel, output_rows_per_group, threads, shmem) = match request.ggml_type {
                 GgmlType::Q4_K => (
                     "kernel_fused_gate_up_silu_q4_K_f32",
-                    2,
-                    [32, 2, 1],
-                    Vec::new(),
-                ),
-                GgmlType::Q5_K => (
-                    "kernel_fused_gate_up_silu_q5_K_f32",
                     2,
                     [32, 2, 1],
                     Vec::new(),

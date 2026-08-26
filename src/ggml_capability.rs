@@ -17,7 +17,7 @@ use crate::ops::quantized_matmul_ggml::{dense_mn_dispatch_count, GgmlType, MM_RO
 use crate::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD;
 
 /// Schema version for serialized [`GgmlCapability`] receipts.
-pub const GGML_CAPABILITY_SCHEMA_VERSION: u32 = 1;
+pub const GGML_CAPABILITY_SCHEMA_VERSION: u32 = 2;
 
 /// Workload class for which the caller requires execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +145,7 @@ impl GgmlInvocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GgmlRoutingPolicy {
+    pub dense_q5k_canonical_q4x4: bool,
     pub dense_decode_mvn: bool,
     pub dense_decode_mv_ext: bool,
     pub dense_q6k_mv_nr2: bool,
@@ -167,6 +168,7 @@ pub enum GgmlTensorMmPreference {
 impl Default for GgmlRoutingPolicy {
     fn default() -> Self {
         Self {
+            dense_q5k_canonical_q4x4: true,
             dense_decode_mvn: true,
             dense_decode_mv_ext: false,
             dense_q6k_mv_nr2: true,
@@ -210,6 +212,7 @@ pub enum GgmlKernelRoute {
     DenseBF16Mm,
     DenseMv,
     DenseMvNr2,
+    DenseQ5kCanonicalQ4x4,
     DenseQ4kWidthMn,
     DenseQ5kWidthMn,
     DenseQ6kWidthMn,
@@ -476,12 +479,13 @@ fn workload_shape_valid(request: &GgmlCapabilityRequest) -> bool {
 
 fn packed_matrix_bytes(request: &GgmlCapabilityRequest) -> Option<u64> {
     let (_, n, k) = request.invocation.dimensions();
-    if matches!(request.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+    if matches!(
+        request.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    ) {
         return u64::from(n)
             .checked_mul(u64::from(k))
-            .and_then(|elements| {
-                elements.checked_mul(u64::from(request.ggml_type.block_bytes()))
-            });
+            .and_then(|elements| elements.checked_mul(u64::from(request.ggml_type.block_bytes())));
     }
     ggml_matrix_bytes(request.ggml_type, n, k).ok()
 }
@@ -606,6 +610,7 @@ fn dense_mm_route(request: &GgmlCapabilityRequest, batched: bool) -> (GgmlKernel
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenseAutoPlan {
     Mv,
+    Q5kCanonicalQ4x4,
     Q4kWidthMn,
     Q5kWidthMn,
     Q6kWidthMn,
@@ -619,6 +624,12 @@ pub(crate) fn plan_dense_auto_route(
     k: u32,
     routing: &GgmlRoutingPolicy,
 ) -> DenseAutoPlan {
+    if routing.dense_q5k_canonical_q4x4
+        && ggml_type == GgmlType::Q5_K
+        && (1..=MM_ROUTING_THRESHOLD).contains(&m)
+    {
+        return DenseAutoPlan::Q5kCanonicalQ4x4;
+    }
     if routing.dense_decode_mvn
         && ggml_type == GgmlType::Q4_K
         && (2..=MM_ROUTING_THRESHOLD).contains(&m)
@@ -688,6 +699,25 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
         );
     }
     match plan_dense_auto_route(request.ggml_type, m, k, &request.routing) {
+        DenseAutoPlan::Q5kCanonicalQ4x4 => GgmlCapability::supported(
+            request,
+            GgmlKernelRoute::DenseQ5kCanonicalQ4x4,
+            matches!(
+                request.workload,
+                GgmlWorkloadClass::DecodeSingle | GgmlWorkloadClass::ContinuousWidth
+            ),
+            !matches!(
+                request.workload,
+                GgmlWorkloadClass::DecodeSingle | GgmlWorkloadClass::ContinuousWidth
+            ),
+            false,
+            1,
+            bytes,
+            GgmlScratchRequirement::None,
+            1,
+            0,
+            "Q5_K width-invariant q4x4 matvec route",
+        ),
         DenseAutoPlan::Q4kWidthMn => GgmlCapability::supported(
             request,
             GgmlKernelRoute::DenseQ4kWidthMn,
@@ -904,13 +934,13 @@ fn perm021(request: &GgmlCapabilityRequest, head_dim: u32, bytes: u64) -> GgmlCa
 fn fused_gate_up(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
     if !matches!(
         request.ggml_type,
-        GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_NL
+        GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::IQ4_NL
     ) || request.workload == GgmlWorkloadClass::Embedding
     {
         return GgmlCapability::unsupported(
             request,
             GgmlRejectionCode::UnsupportedType,
-            "fused gate+up+SiLU supports Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL",
+            "fused gate+up+SiLU supports Q8_0/Q4_K/Q6_K/IQ4_NL",
         );
     }
     let specialized = request.workload == GgmlWorkloadClass::DecodeSingle;

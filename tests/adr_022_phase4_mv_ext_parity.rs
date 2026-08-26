@@ -11,8 +11,8 @@
 //! mv_ext as the only variable.
 
 use mlx_native::{
-    mul_mv_ext_dispatch, quantized_matmul_ggml, DType, GgmlQuantizedMatmulParams, GgmlType,
-    KernelRegistry, MlxDevice, MulMvExtParams,
+    quantized_matmul_ggml_with_policy, DType, GgmlQuantizedMatmulParams, GgmlRoutingPolicy,
+    GgmlType, KernelRegistry, MlxDevice,
 };
 
 const QK4_0: usize = 32;
@@ -276,10 +276,16 @@ fn run_mv_ext_vs_mv(
         k: k as u32,
         ggml_type,
     };
+    let mv_routing = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
+        dense_decode_mvn: false,
+        dense_decode_mv_ext: false,
+        ..GgmlRoutingPolicy::default()
+    };
     let mut enc = device.command_encoder().unwrap();
-    quantized_matmul_ggml(
+    quantized_matmul_ggml_with_policy(
         &mut enc, &mut registry, &device,
-        &input_buf, &weight_buf, &mut mv_buf, &mv_params,
+        &input_buf, &weight_buf, &mut mv_buf, &mv_params, &mv_routing,
     ).unwrap();
     enc.commit_and_wait().unwrap();
     mv_output.copy_from_slice(mv_buf.as_slice().unwrap());
@@ -290,17 +296,16 @@ fn run_mv_ext_vs_mv(
         .unwrap();
     for v in mv_ext_buf.as_mut_slice::<f32>().unwrap().iter_mut() { *v = 0.0; }
 
-    let ext_params = MulMvExtParams {
-        m: m as u32,
-        n: n as u32,
-        k: k as u32,
-        batch: 1,
-        ggml_type,
+    let ext_routing = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
+        dense_decode_mvn: false,
+        dense_decode_mv_ext: true,
+        ..GgmlRoutingPolicy::default()
     };
     let mut enc = device.command_encoder().unwrap();
-    mul_mv_ext_dispatch(
+    quantized_matmul_ggml_with_policy(
         &mut enc, &mut registry, &device,
-        &weight_buf, &input_buf, &mut mv_ext_buf, &ext_params,
+        &input_buf, &weight_buf, &mut mv_ext_buf, &mv_params, &ext_routing,
     ).unwrap();
     enc.commit_and_wait().unwrap();
 

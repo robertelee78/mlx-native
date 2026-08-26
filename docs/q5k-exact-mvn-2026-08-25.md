@@ -1,7 +1,8 @@
 # Q5_K exact multi-column matvec
 
-Status: release candidate for 0.14.0; registry publication and downstream
-exact-artifact gates remain open.
+Status: the exact multi-column route shipped in 0.14.0. The canonical Q4x4
+decode promotion is a 0.15.0 release candidate; registry publication and
+downstream clean-source gates remain open.
 
 ## Contract
 
@@ -56,7 +57,7 @@ route recovers a measured part of the weight-reload cost without changing any
 output bit. The remaining gap to `mul_mv_ext` is real: its vector-dot reduction
 is faster but does not meet this route's scalar-identity contract.
 
-## Fused gate/up row-identity release proof
+## Historical 0.14 fused gate/up row-identity proof
 
 The dense fused gate/up/SiLU primitive is a separate operator and therefore has
 its own width-invariance gate. The focused Metal test enumerates the complete
@@ -111,3 +112,41 @@ unreachable physical width-6/7/8 Q6_K kernels were removed.
 0.13.0 reports the intended missing-helper APIs and route-enum discriminant
 changes, so publication follows the README's pre-1.0 breaking-change contract
 as 0.14.0 rather than a patch release.
+
+## Canonical Q4x4 decode promotion
+
+The follow-up route keeps the public validated matmul dispatcher as the only
+caller-facing surface. Internally, Q5_K decode widths 1 through 8 use one
+fixed-width Q4x4 Metal kernel and tile wider logical batches without exposing a
+raw dispatch helper. The kernel preserves the scalar Q5_K dequantization,
+accumulation, and reduction tree for each output value; it never dequantizes or
+requantizes the weight tensor.
+
+Model-free hardware gates passed bit equality for packaged and runtime-compiled
+Metal, odd output dimensions, nonzero logical buffer offsets, every continuous
+logical width 1 through 8, and the staged physical widths. Mutation tests prove
+the candidate flag reaches the actual resolved route rather than merely a
+receipt field. The production default is enabled for the codec, independent of
+model labels; `HF2Q_Q5K_CANONICAL_Q4X4=0` remains a diagnostic opt-out.
+
+On the idle M5 Max host, the real Qwen3.8 Q5_K artifact exercised 508 target
+decisions without a bit mismatch. A same-process paired verifier measurement
+reported 6,105.525 ms for the prior exact route and 4,527.208 ms for Q4x4, a
+25.851% reduction, with median rounds of 94.818 ms and 70.389 ms. A fixed
+139-sample corpus retained 1.0 argmax agreement and changed perplexity from
+1.514567 to 1.513641. A Qwen3.6 Q5_K hardware gate separately proved the same
+canonical route at scalar and four-row widths while MoE expert projections
+remained on the independent `mm_id` path.
+
+The older fused Q5_K gate/up operator was removed during promotion: its own
+row-invariance test passed, but its results were not numerically coherent with
+the canonical exact projection route. hf2q had already retired that operator.
+Keeping Q5_K on the canonical pair of validated projections preserves the
+model's native GGUF bytes and one arithmetic authority.
+
+The added routing-policy field and serialized capability/trace discriminants
+are a public pre-1.0 contract change, so the candidate is versioned 0.15.0 and
+is checked against the published 0.14.0 baseline. Final performance claims
+remain downstream-gated on a published registry artifact, exact dependency
+pin, multi-artifact and multi-slot serving, model swaps, and a matched peer
+comparison.

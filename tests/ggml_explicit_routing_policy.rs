@@ -20,9 +20,6 @@ use mlx_native::ops::fused_gate_up_silu_iq4_nl::{
 use mlx_native::ops::fused_gate_up_silu_q4_K::{
     dispatch_fused_gate_up_silu_q4_K, FusedGateUpSiluQ4_KArgs,
 };
-use mlx_native::ops::fused_gate_up_silu_q5_K::{
-    dispatch_fused_gate_up_silu_q5_K, FusedGateUpSiluQ5_KArgs,
-};
 use mlx_native::ops::fused_gate_up_silu_q6_K::{
     dispatch_fused_gate_up_silu_q6_K, FusedGateUpSiluQ6_KArgs,
 };
@@ -180,17 +177,6 @@ fn fused_and_embedding_entrypoints_reject_short_logical_views() {
             hidden_size: 256,
         },
         144,
-        256,
-        1
-    );
-    reject_short_fused_weight!(
-        dispatch_fused_gate_up_silu_q5_K,
-        FusedGateUpSiluQ5_KArgs {
-            m: 1,
-            intermediate_size: 1,
-            hidden_size: 256,
-        },
-        176,
         256,
         1
     );

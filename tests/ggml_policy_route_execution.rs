@@ -106,6 +106,26 @@ fn width_and_dense_mm_policy_knobs_bind_production_dispatch() {
     assert!(mv_ext.iter().all(|label| label.contains("mul_mv_ext_q6_K")));
     assert_ne!(width_mn, mv_ext);
 
+    let q5_width = GgmlQuantizedMatmulParams {
+        ggml_type: GgmlType::Q5_K,
+        ..width
+    };
+    let q5_canonical = capture_dense(
+        &device,
+        &mut registry,
+        q5_width,
+        GgmlRoutingPolicy {
+            dense_q5k_canonical_q4x4: true,
+            ..GgmlRoutingPolicy::default()
+        },
+    );
+    assert!(
+        q5_canonical
+            .iter()
+            .all(|label| label.contains("mul_mv_ext_q5_K") && label.contains("601:i8")),
+        "{q5_canonical:?}"
+    );
+
     let prompt = GgmlQuantizedMatmulParams {
         m: 9,
         n: 64,

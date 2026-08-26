@@ -38,6 +38,7 @@ fn combine_routing_policies(
     expert: GgmlRoutingPolicy,
 ) -> GgmlRoutingPolicy {
     GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: dense.dense_q5k_canonical_q4x4,
         dense_decode_mvn: dense.dense_decode_mvn,
         dense_decode_mv_ext: dense.dense_decode_mv_ext,
         dense_q6k_mv_nr2: dense.dense_q6k_mv_nr2,
@@ -59,6 +60,7 @@ mod tests {
     #[test]
     fn canonical_resolver_combines_dense_and_expert_halves() {
         let dense = GgmlRoutingPolicy {
+            dense_q5k_canonical_q4x4: true,
             dense_decode_mvn: false,
             dense_decode_mv_ext: true,
             dense_q6k_mv_nr2: false,
@@ -75,6 +77,7 @@ mod tests {
             ..GgmlRoutingPolicy::default()
         };
         let policy = combine_routing_policies(dense, expert);
+        assert!(policy.dense_q5k_canonical_q4x4);
         assert!(!policy.dense_decode_mvn);
         assert!(policy.dense_decode_mv_ext);
         assert!(!policy.dense_q6k_mv_nr2);
@@ -93,6 +96,9 @@ mod tests {
             return;
         }
         let policy = ggml_routing_policy_from_environment();
+        let expected_q5 =
+            std::env::var("MLX_NATIVE_ROUTING_POLICY_EXPECT_Q5").as_deref() == Ok("1");
+        assert_eq!(policy.dense_q5k_canonical_q4x4, expected_q5);
         assert!(!policy.dense_decode_mvn);
         assert!(policy.dense_decode_mv_ext);
         assert!(!policy.dense_q6k_mv_nr2);
@@ -107,23 +113,46 @@ mod tests {
 
     #[test]
     fn public_resolver_matches_process_overrides() {
-        let status = std::process::Command::new(std::env::current_exe().expect("current test exe"))
-            .arg("--exact")
-            .arg("ggml_routing_policy::tests::environment_override_helper")
-            .arg("--nocapture")
-            .env("MLX_NATIVE_ROUTING_POLICY_TEST_CHILD", "1")
-            .env("HF2Q_DECODE_MVN", "0")
-            .env("HF2Q_DECODE_MV_EXT", "1")
-            .env("HF2Q_Q6K_MV_NR2", "0")
-            .env("HF2Q_Q8_0_MV_NR2", "0")
-            .env("HF2Q_DISABLE_TENSOR_MM", "1")
-            .env("HF2Q_LARGE_TILE_MM", "0")
-            .env("HF2Q_MM_ID_ROUTING_THRESHOLD", "77")
-            .env("HF2Q_Q6K_ID_MV_NR2", "0")
-            .env("HF2Q_Q8_0_ID_MV_NR2", "1")
-            .env("HF2Q_DISABLE_TENSOR_MM_ID", "1")
-            .status()
-            .expect("run isolated routing-policy helper");
-        assert!(status.success());
+        let run = |q5: Option<&str>, expected_q5: &str| {
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("current test exe"));
+            command
+                .arg("--exact")
+                .arg("ggml_routing_policy::tests::environment_override_helper")
+                .arg("--nocapture")
+                .env("MLX_NATIVE_ROUTING_POLICY_TEST_CHILD", "1")
+                .env("MLX_NATIVE_ROUTING_POLICY_EXPECT_Q5", expected_q5)
+                .env("HF2Q_DECODE_MVN", "0")
+                .env("HF2Q_DECODE_MV_EXT", "1")
+                .env("HF2Q_Q6K_MV_NR2", "0")
+                .env("HF2Q_Q8_0_MV_NR2", "0")
+                .env("HF2Q_DISABLE_TENSOR_MM", "1")
+                .env("HF2Q_LARGE_TILE_MM", "0")
+                .env("HF2Q_MM_ID_ROUTING_THRESHOLD", "77")
+                .env("HF2Q_Q6K_ID_MV_NR2", "0")
+                .env("HF2Q_Q8_0_ID_MV_NR2", "1")
+                .env("HF2Q_DISABLE_TENSOR_MM_ID", "1");
+            if let Some(value) = q5 {
+                command.env("HF2Q_Q5K_CANONICAL_Q4X4", value);
+            } else {
+                command.env_remove("HF2Q_Q5K_CANONICAL_Q4X4");
+            }
+            command
+                .output()
+                .expect("run isolated routing-policy helper")
+        };
+        for (value, expected) in [(None, "1"), (Some("1"), "1"), (Some("0"), "0")] {
+            let output = run(value, expected);
+            assert!(
+                output.status.success(),
+                "routing-policy child failed for {value:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "routing-policy child executed no exact test for {value:?}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 }

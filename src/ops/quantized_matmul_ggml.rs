@@ -32,6 +32,7 @@ use std::sync::atomic::AtomicI8;
 // each hitting these 2 env reads.
 static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_MV_NR2: AtomicI8 = AtomicI8::new(-1);
+static CACHED_Q5K_CANONICAL_Q4X4: AtomicI8 = AtomicI8::new(-1);
 // ADR-040 §0.21 decode mul_mv_ext lever (opt-in, default off — see routing site).
 static CACHED_DECODE_MV_EXT: AtomicI8 = AtomicI8::new(-1);
 // Decode mvN lever (bit-identical column-amortizing Q4_K/Q6_K mv).
@@ -378,6 +379,10 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> Result<
 
 pub(crate) fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
     GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: cached_env_default_true(
+            &CACHED_Q5K_CANONICAL_Q4X4,
+            "HF2Q_Q5K_CANONICAL_Q4X4",
+        ),
         dense_decode_mvn: cached_env_default_true(&CACHED_DECODE_MVN, "HF2Q_DECODE_MVN"),
         dense_decode_mv_ext: cached_env_eq_one(&CACHED_DECODE_MV_EXT, "HF2Q_DECODE_MV_EXT"),
         dense_q6k_mv_nr2: cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2"),
@@ -668,40 +673,35 @@ pub fn quantized_matmul_ggml_with_policy(
     // Types without a parity-proven MM kernel remain on the matvec fallback.
     // Q2_K joins the proven K-quant MM family; IQ4_XS is still mv-only here.
     let mm_supported = !matches!(params.ggml_type, GgmlType::IQ4_XS);
-    // ADR-040 §0.21 decode F3 lever: at small continuous-batching decode width
-    // m∈[2,8], route quantized matmuls to the weight-amortizing `mul_mv_ext`
-    // kernel (the reference small-batch path:
-    // `r1ptg` src1 columns processed per threadgroup, so each quantized weight
-    // block is read ONCE across the m columns — vs the regular `mv` which
-    // re-reads the weight per column, measured ~5× at m=8). mul_mv_ext is
-    // Numerically close but not generally byte-identical to mv: the wider
-    // kernel uses a different reduction tree. A family must therefore qualify
-    // model decisions and cache handoff before enabling it in production.
-    // K-quants use m=4..8; legacy Q4_0/Q5_0/Q8_0 retain m=2..8. Unsupported shapes
-    // fall through unchanged.
-    // ADR-040 §0.21 decode F3 lever (mul_mv_ext weight-amortization) — opt-in,
-    // DEFAULT OFF (HF2Q_DECODE_MV_EXT=1). MEASURED: routing decode m∈[2,8] to
-    // mul_mv_ext gives N=8 decode 197→245.8 t/s (+25%, toward llama 291) — the
-    // weight-reload gap is real and this closes a big chunk. BUT it currently
-    // BREAKS slot_aware_n8_per_slot_parity (bit-exact) in the gemma4 model —
-    // mul_mv_ext is NOT bit-identical to the regular mv for the model's shapes
-    // (the adr_022_phase4 mv_ext parity tests use fp-tolerance, and Q6_K mv_ext
-    // has no parity test at all). So it stays OFF by default (byte-identical
-    // bar) until the mv_ext kernels are proven/made bit-exact (Q6_K especially);
-    // the env preserves the validated speedup for that follow-up. NON-blocking.
-    // Exact decode mvN lever — BIT-IDENTICAL column-amortizing Q4_K, Q5_K,
-    // and Q6_K mat-vec. Each physical kernel preserves its production scalar
-    // accumulation tree independently per src1 column while sharing packed
-    // weight reads. Q4_K and Q5_K clone their ordinary scalar kernels; Q6_K
-    // clones its default NR2 kernel. The to_bits gates cover every logical
-    // width m∈[2,8], including multi-tile buffer offsets. mul_mv_ext remains a
-    // separate non-bit-identical diagnostic route.
-    // ADR-040 §0.21c-track2: DEFAULT-ON (lead-approved 2026-06-26). Opt out with
-    // HF2Q_DECODE_MVN=0. Bar met: byte-equal spike GREEN under the precompiled
-    // -O3 metallib + release-deterministic parity (after the encoder-retain root
-    // fix that the mvN flake surfaced — encoder.rs §0.21c-track2) + measured
-    // +12.5% net N=8 decode throughput (clean single-tenant).
+    // Narrow continuous batches use one of two independently qualified
+    // weight-amortizing routes. Q5_K widths 1..=8 use the default-on canonical
+    // Q4x4 path, whose fixed lane partition is bit-identical to its independent
+    // r1=1 authority. Other admitted codecs may opt into the generic
+    // `mul_mv_ext` path at widths 2..=8; that path is not generally
+    // bit-identical and therefore remains diagnostic/default-off. Q4_K and
+    // Q6_K retain their default-on exact multi-column routes. Every route is
+    // selected only after the canonical validation above.
     match plan_dense_auto_route(params.ggml_type, params.m, params.k, routing) {
+        DenseAutoPlan::Q5kCanonicalQ4x4 => {
+            debug_assert_eq!(params.ggml_type, GgmlType::Q5_K);
+            debug_assert!(params.k % QK5_K == 0);
+            let ext_params = crate::ops::mul_mv_ext::MulMvExtParams {
+                m: params.m,
+                n: params.n,
+                k: params.k,
+                batch: 1,
+                ggml_type: params.ggml_type,
+            };
+            crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                output,
+                &ext_params,
+            )
+        }
         DenseAutoPlan::Q4kWidthMn => {
             debug_assert!(params.k % QK4_K == 0);
             if std::env::var("HF2Q_DECODE_MVN_TRACE").is_ok() {

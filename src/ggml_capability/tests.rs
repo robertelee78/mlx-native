@@ -57,7 +57,14 @@ fn dense_auto_routing_policy_is_explicit() {
     request.ggml_type = GgmlType::Q5_K;
     assert_eq!(
         ggml_capability(request).route,
-        Some(GgmlKernelRoute::DenseQ5kWidthMn)
+        Some(GgmlKernelRoute::DenseQ5kCanonicalQ4x4),
+        "qualified Q5 route is the production default"
+    );
+    request.routing.dense_q5k_canonical_q4x4 = false;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ5kWidthMn),
+        "explicit opt-out restores exact mN"
     );
     request.routing.dense_decode_mv_ext = true;
     assert_eq!(
@@ -65,6 +72,13 @@ fn dense_auto_routing_policy_is_explicit() {
         Some(GgmlKernelRoute::DenseQ5kWidthMn),
         "exact mvN must take precedence when both width routes are enabled"
     );
+    request.routing.dense_q5k_canonical_q4x4 = true;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ5kCanonicalQ4x4),
+        "the qualified Q5-only route must take precedence over generic width routes"
+    );
+    request.routing.dense_q5k_canonical_q4x4 = false;
     request.routing.dense_decode_mv_ext = false;
     request.routing.dense_decode_mvn = false;
     assert_eq!(
@@ -89,6 +103,59 @@ fn dense_auto_routing_policy_is_explicit() {
     assert_eq!(
         ggml_capability(request).route,
         Some(GgmlKernelRoute::DenseWidthMvExt)
+    );
+}
+
+#[test]
+fn q5k_canonical_route_is_codec_and_width_scoped() {
+    let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
+    request.ggml_type = GgmlType::Q5_K;
+    request.routing.dense_q5k_canonical_q4x4 = true;
+    for m in 1..=MM_ROUTING_THRESHOLD {
+        request.invocation = GgmlInvocation::DenseAuto {
+            m,
+            n: 5_120,
+            k: 5_120,
+        };
+        request.workload = if m == 1 {
+            GgmlWorkloadClass::DecodeSingle
+        } else {
+            GgmlWorkloadClass::ContinuousWidth
+        };
+        assert_eq!(
+            ggml_capability(request).route,
+            Some(GgmlKernelRoute::DenseQ5kCanonicalQ4x4),
+            "Q5_K width {m} must use the dedicated route"
+        );
+    }
+
+    request.invocation = GgmlInvocation::DenseAuto {
+        m: 4,
+        n: 5_120,
+        k: 5_120,
+    };
+    request.workload = GgmlWorkloadClass::ContinuousWidth;
+    request.ggml_type = GgmlType::Q4_K;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ4kWidthMn)
+    );
+    request.ggml_type = GgmlType::Q6_K;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ6kWidthMn)
+    );
+
+    request.ggml_type = GgmlType::Q5_K;
+    request.invocation = GgmlInvocation::DenseAuto {
+        m: 9,
+        n: 5_120,
+        k: 5_120,
+    };
+    request.workload = GgmlWorkloadClass::Prompt;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseMmDeviceSelected)
     );
 }
 
@@ -151,7 +218,7 @@ fn mv_ext_widths_are_type_sensitive() {
     request.routing.dense_decode_mvn = false;
     request.routing.dense_decode_mv_ext = true;
 
-    for ggml_type in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+    for ggml_type in [GgmlType::Q4_K, GgmlType::Q6_K] {
         request.ggml_type = ggml_type;
         for width in 2..=3 {
             request.invocation = GgmlInvocation::DenseAuto {
@@ -176,6 +243,24 @@ fn mv_ext_widths_are_type_sensitive() {
             "{ggml_type:?} width 4 must use mul_mv_ext"
         );
     }
+
+    request.ggml_type = GgmlType::Q5_K;
+    request.invocation = GgmlInvocation::DenseAuto {
+        m: 4,
+        n: 5_120,
+        k: 5_120,
+    };
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseQ5kCanonicalQ4x4),
+        "Q5_K uses the exact canonical route before the approximate mv_ext route"
+    );
+    request.routing.dense_q5k_canonical_q4x4 = false;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseWidthMvExt),
+        "diagnostic Q5_K canonical opt-out may still select mul_mv_ext"
+    );
 
     for ggml_type in [GgmlType::Q4_0, GgmlType::Q5_0, GgmlType::Q8_0] {
         request.ggml_type = ggml_type;
@@ -237,7 +322,7 @@ fn fused_gate_up_is_a_two_weight_atomic_operation() {
         n: 17_408,
         k: 5_120,
     };
-    request.ggml_type = GgmlType::Q5_K;
+    request.ggml_type = GgmlType::Q4_K;
     let capability = ggml_capability(request);
     assert_eq!(capability.route, Some(GgmlKernelRoute::FusedGateUpSilu));
     assert_eq!(capability.weight_buffer_count, 2);
@@ -246,6 +331,9 @@ fn fused_gate_up_is_a_two_weight_atomic_operation() {
         capability.minimum_total_weight_bytes,
         capability.minimum_weight_buffer_bytes * 2
     );
+
+    request.ggml_type = GgmlType::Q5_K;
+    assert!(!ggml_capability(request).executable);
 
     request.ggml_type = GgmlType::Q4_0;
     assert!(!ggml_capability(request).executable);
@@ -349,12 +437,17 @@ fn batched_mv_accepts_width_eight_and_rejects_width_nine_or_prompt_contract() {
 #[test]
 fn q4_q5_and_q6_width_dispatch_count_matches_runtime_tiling() {
     for (m, expected) in [(2, 1), (3, 1), (4, 1), (5, 1), (6, 2), (7, 2), (8, 2)] {
-        for ggml_type in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+        for ggml_type in [GgmlType::Q4_K, GgmlType::Q6_K] {
             let mut request = dense_request(m, GgmlWorkloadClass::ContinuousWidth);
             request.ggml_type = ggml_type;
             let capability = ggml_capability(request);
             assert_eq!(capability.dispatches, expected, "{ggml_type:?} M={m}");
         }
+
+        let mut request = dense_request(m, GgmlWorkloadClass::ContinuousWidth);
+        request.ggml_type = GgmlType::Q5_K;
+        let capability = ggml_capability(request);
+        assert_eq!(capability.dispatches, 1, "Q5_K Q4x4 M={m}");
     }
 }
 
@@ -528,10 +621,7 @@ fn embedding_contract_is_exact() {
     request.ggml_type = GgmlType::BF16;
     let bf16 = ggml_capability(request);
     assert_eq!(bf16.route, Some(GgmlKernelRoute::EmbeddingBF16));
-    assert_eq!(
-        bf16.minimum_weight_buffer_bytes,
-        151_936_u64 * 5_120 * 2
-    );
+    assert_eq!(bf16.minimum_weight_buffer_bytes, 151_936_u64 * 5_120 * 2);
     request.ggml_type = GgmlType::Q5_1;
     let unsupported = ggml_capability(request);
     assert!(!unsupported.executable);
@@ -594,4 +684,16 @@ fn request_and_receipt_round_trip_as_json() {
     let json = serde_json::to_string(&capability).expect("serialize capability");
     let decoded: GgmlCapability = serde_json::from_str(&json).expect("deserialize capability");
     assert_eq!(decoded, capability);
+}
+
+#[test]
+fn stale_request_schema_fails_closed() {
+    let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
+    request.schema_version = GGML_CAPABILITY_SCHEMA_VERSION - 1;
+    let capability = ggml_capability(request);
+    assert!(!capability.executable);
+    assert_eq!(
+        capability.rejection_code,
+        Some(GgmlRejectionCode::InvalidOperationContract)
+    );
 }
