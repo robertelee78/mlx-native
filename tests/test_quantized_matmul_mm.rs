@@ -181,6 +181,62 @@ fn pack_q6_k(values: &[f32]) -> Vec<u8> {
     buf
 }
 
+fn q5_k_fixture_weights(seed: u64, n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(k % 256, 0);
+    let mut state = seed;
+    let mut bytes = Vec::with_capacity(n * (k / 256) * 176);
+    for block in 0..n * (k / 256) {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let d = half::f16::from_f32(0.001 + (block % 31) as f32 * 0.000_031_25);
+        let dmin = half::f16::from_f32(0.000_5 + (block % 17) as f32 * 0.000_015_625);
+        bytes.extend_from_slice(&d.to_bits().to_le_bytes());
+        bytes.extend_from_slice(&dmin.to_bits().to_le_bytes());
+        for _ in 0..12 + 32 + 128 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.push((state >> 32) as u8);
+        }
+    }
+    bytes
+}
+
+fn q5_0_fixture_weights(seed: u64, n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(k % 32, 0);
+    let mut state = seed;
+    let mut bytes = Vec::with_capacity(n * (k / 32) * 22);
+    for block in 0..n * (k / 32) {
+        let scale = half::f16::from_f32(0.01 + (block % 13) as f32 * 0.001);
+        bytes.extend_from_slice(&scale.to_bits().to_le_bytes());
+        for _ in 0..4 + 16 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.push((state >> 32) as u8);
+        }
+    }
+    bytes
+}
+
+fn q6_k_fixture_weights(seed: u64, n: usize, k: usize) -> Vec<u8> {
+    assert_eq!(k % 256, 0);
+    let mut state = seed;
+    let mut bytes = Vec::with_capacity(n * (k / 256) * 210);
+    for block in 0..n * (k / 256) {
+        for _ in 0..128 + 64 + 16 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.push((state >> 32) as u8);
+        }
+        let scale = half::f16::from_f32(0.000_5 + (block % 29) as f32 * 0.000_015_625);
+        bytes.extend_from_slice(&scale.to_bits().to_le_bytes());
+    }
+    bytes
+}
+
 // --------------------------------------------------------------------------
 // Kernel dispatch helpers.  Phase 3 Wave P3a lands the mm kernel but keeps
 // production routing on mv — to verify the mm kernel's output agrees with
@@ -357,6 +413,135 @@ fn run_batched_mm_gpu(
     output_buf
         .as_slice::<f32>()
         .expect("read batched output")
+        .to_vec()
+}
+
+fn run_broadcast_batched_mm_gpu(
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    ggml_type: GgmlType,
+    weight_bytes: &[u8],
+    input: &[f32],
+) -> Vec<f32> {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+
+    let mut input_buf = device
+        .alloc_buffer(input.len() * 4, DType::F32, vec![batch, m, k])
+        .expect("alloc shared-weight batched input");
+    input_buf
+        .as_mut_slice::<f32>()
+        .expect("shared-weight batched input mut slice")
+        .copy_from_slice(input);
+    let mut weight_buf = device
+        .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
+        .expect("alloc shared weight");
+    weight_buf
+        .as_mut_slice::<u8>()
+        .expect("shared weight mut slice")
+        .copy_from_slice(weight_bytes);
+    let output_buf = device
+        .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+        .expect("alloc shared-weight batched output");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    mlx_native::quantized_matmul_ggml_broadcast_batched_mm(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input_buf,
+        &weight_buf,
+        &output_buf,
+        &GgmlBatchedQuantizedMatmulParams {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        },
+    )
+    .expect("shared-weight batched MM dispatch");
+    encoder
+        .commit_and_wait()
+        .expect("shared-weight batched GPU execution");
+    output_buf
+        .as_slice::<f32>()
+        .expect("read shared-weight batched output")
+        .to_vec()
+}
+
+fn run_perm021_gpu(
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    head_dim: usize,
+    ggml_type: GgmlType,
+    weight_bytes: &[u8],
+    input_bf16: &[u16],
+) -> Vec<f32> {
+    let device = MlxDevice::new().expect("Metal device");
+    let n_heads = k / head_dim;
+    let mut registry = KernelRegistry::new();
+    let mut input = device
+        .alloc_buffer(
+            input_bf16.len() * 2,
+            DType::BF16,
+            vec![batch, n_heads, m, head_dim],
+        )
+        .expect("alloc BF16 head-major input");
+    input
+        .as_mut_slice::<u16>()
+        .expect("BF16 head-major input bits")
+        .copy_from_slice(input_bf16);
+    let mut weight = device
+        .alloc_buffer(weight_bytes.len(), DType::U8, vec![weight_bytes.len()])
+        .expect("alloc perm021 weight");
+    weight
+        .as_mut_slice::<u8>()
+        .expect("perm021 weight bytes")
+        .copy_from_slice(weight_bytes);
+    let output = device
+        .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+        .expect("alloc perm021 output");
+    let params = mlx_native::GgmlQuantizedMatmulPerm021Params {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        head_dim: head_dim as u32,
+        ggml_type,
+    };
+    let mut encoder = device.command_encoder().expect("perm021 encoder");
+    if batch == 1 {
+        mlx_native::quantized_matmul_mm_tensor_perm021(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &weight,
+            &output,
+            &params,
+        )
+        .expect("scalar perm021 dispatch");
+    } else {
+        mlx_native::quantized_matmul_mm_tensor_perm021_broadcast_batched(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &weight,
+            &output,
+            batch as u32,
+            &params,
+        )
+        .expect("broadcast perm021 dispatch");
+    }
+    encoder.commit_and_wait().expect("perm021 execution");
+    output
+        .as_slice::<f32>()
+        .expect("read perm021 output")
         .to_vec()
 }
 
@@ -698,6 +883,207 @@ fn test_q8_0_batched_mm_is_byte_identical_to_independent_dispatches() {
     assert_eq!(
         batched_bits, reference_bits,
         "native batch addressing changed Q8_0 MM output bytes"
+    );
+}
+
+#[test]
+fn test_shared_weight_broadcast_batched_mm_is_byte_identical_to_scalar_lanes() {
+    let m = 32usize;
+    let n = 72usize;
+    let k = 256usize;
+
+    for (case, ggml_type) in [
+        ("Q4_0", GgmlType::Q4_0),
+        ("Q8_0", GgmlType::Q8_0),
+        ("Q5_K", GgmlType::Q5_K),
+        ("Q6_K", GgmlType::Q6_K),
+    ] {
+        let weight_bytes = if ggml_type == GgmlType::Q5_K {
+            q5_k_fixture_weights(0xB04D_C457, n, k)
+        } else {
+            let weights_f32 = pseudo_random_f32(0xB04D_C457 ^ ggml_type as u64, n * k);
+            let mut packed = Vec::new();
+            for row in 0..n {
+                let values = &weights_f32[row * k..(row + 1) * k];
+                packed.extend_from_slice(&match ggml_type {
+                    GgmlType::Q4_0 => pack_q4_0(values),
+                    GgmlType::Q8_0 => pack_q8_0(values),
+                    GgmlType::Q6_K => pack_q6_k(values),
+                    _ => unreachable!(),
+                });
+            }
+            packed
+        };
+
+        for batch in [2usize, 4] {
+            let input = pseudo_random_f32(
+                0xBA7C_0000 ^ ((batch as u64) << 8) ^ ggml_type as u64,
+                batch * m * k,
+            );
+            let mut scalar = Vec::with_capacity(batch * m * n);
+            for lane in 0..batch {
+                let lane_start = lane * m * k;
+                scalar.extend_from_slice(&run_mv_gpu(
+                    m,
+                    n,
+                    k,
+                    ggml_type,
+                    &weight_bytes,
+                    &input[lane_start..lane_start + m * k],
+                ));
+            }
+
+            let broadcast =
+                run_broadcast_batched_mm_gpu(batch, m, n, k, ggml_type, &weight_bytes, &input);
+            let scalar_bits: Vec<u32> = scalar.iter().map(|value| value.to_bits()).collect();
+            let broadcast_bits: Vec<u32> = broadcast.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(
+                broadcast_bits, scalar_bits,
+                "{case} shared-weight batch B={batch} changed scalar route output bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_gemma_layer0_q6_k_o_shape_broadcast_mm_is_byte_identical() {
+    let (batch, m, n, k) = (2usize, 32usize, 2_816usize, 4_096usize);
+    let weight_bytes = q6_k_fixture_weights(0x6A45_4D4D, n, k);
+    let input = pseudo_random_f32(0x6A45_494E, batch * m * k);
+    let mut scalar = Vec::with_capacity(batch * m * n);
+    for lane in 0..batch {
+        let lane_start = lane * m * k;
+        scalar.extend_from_slice(&run_mv_gpu(
+            m,
+            n,
+            k,
+            GgmlType::Q6_K,
+            &weight_bytes,
+            &input[lane_start..lane_start + m * k],
+        ));
+    }
+    let broadcast = run_broadcast_batched_mm_gpu(
+        batch,
+        m,
+        n,
+        k,
+        GgmlType::Q6_K,
+        &weight_bytes,
+        &input,
+    );
+    assert_eq!(
+        broadcast.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        scalar.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        "Gemma layer-0 Q6_K O projection changed scalar output bytes"
+    );
+}
+
+#[cfg(mlx_native_has_metal_tensor_artifact)]
+#[test]
+fn test_shared_weight_broadcast_perm021_is_byte_identical_to_scalar_lanes() {
+    let (m, n, k, head_dim) = (32usize, 72usize, 256usize, 128usize);
+    for (case, ggml_type) in [
+        ("Q4_0", GgmlType::Q4_0),
+        ("Q5_0", GgmlType::Q5_0),
+        ("Q8_0", GgmlType::Q8_0),
+        ("Q6_K", GgmlType::Q6_K),
+    ] {
+        let weight_bytes = match ggml_type {
+            GgmlType::Q5_0 => q5_0_fixture_weights(0xBF16_0500, n, k),
+            GgmlType::Q6_K => q6_k_fixture_weights(0xBF16_0600, n, k),
+            _ => {
+                let weights_f32 = pseudo_random_f32(0xBF16_0000 ^ ggml_type as u64, n * k);
+                let mut packed = Vec::new();
+                for row in 0..n {
+                    let values = &weights_f32[row * k..(row + 1) * k];
+                    packed.extend_from_slice(&match ggml_type {
+                        GgmlType::Q4_0 => pack_q4_0(values),
+                        GgmlType::Q8_0 => pack_q8_0(values),
+                        _ => unreachable!(),
+                    });
+                }
+                packed
+            }
+        };
+        for batch in [2usize, 4] {
+            let input_f32 = pseudo_random_f32(
+                0xBF16_BA7C ^ ((batch as u64) << 8) ^ ggml_type as u64,
+                batch * m * k,
+            );
+            let input_bf16: Vec<u16> = input_f32
+                .into_iter()
+                .map(|value| half::bf16::from_f32(value).to_bits())
+                .collect();
+            let mut scalar = Vec::with_capacity(batch * m * n);
+            for lane in 0..batch {
+                let lane_start = lane * m * k;
+                scalar.extend_from_slice(&run_perm021_gpu(
+                    1,
+                    m,
+                    n,
+                    k,
+                    head_dim,
+                    ggml_type,
+                    &weight_bytes,
+                    &input_bf16[lane_start..lane_start + m * k],
+                ));
+            }
+            let broadcast = run_perm021_gpu(
+                batch,
+                m,
+                n,
+                k,
+                head_dim,
+                ggml_type,
+                &weight_bytes,
+                &input_bf16,
+            );
+            assert_eq!(
+                broadcast.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                scalar.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "{case} BF16 perm021 shared-weight batch B={batch} changed scalar bytes"
+            );
+        }
+    }
+}
+
+#[cfg(mlx_native_has_metal_tensor_artifact)]
+#[test]
+fn test_gemma_layer0_q6_k_o_shape_broadcast_perm021_is_byte_identical() {
+    let (batch, m, n, k, head_dim) = (2usize, 32usize, 2_816usize, 4_096usize, 256usize);
+    let weight_bytes = q6_k_fixture_weights(0x6A45_BF16, n, k);
+    let input_bf16: Vec<u16> = pseudo_random_f32(0x6A45_484D, batch * m * k)
+        .into_iter()
+        .map(|value| half::bf16::from_f32(value).to_bits())
+        .collect();
+    let mut scalar = Vec::with_capacity(batch * m * n);
+    for lane in 0..batch {
+        let lane_start = lane * m * k;
+        scalar.extend_from_slice(&run_perm021_gpu(
+            1,
+            m,
+            n,
+            k,
+            head_dim,
+            GgmlType::Q6_K,
+            &weight_bytes,
+            &input_bf16[lane_start..lane_start + m * k],
+        ));
+    }
+    let broadcast = run_perm021_gpu(
+        batch,
+        m,
+        n,
+        k,
+        head_dim,
+        GgmlType::Q6_K,
+        &weight_bytes,
+        &input_bf16,
+    );
+    assert_eq!(
+        broadcast.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        scalar.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        "Gemma layer-0 Q6_K BF16 O projection changed scalar output bytes"
     );
 }
 

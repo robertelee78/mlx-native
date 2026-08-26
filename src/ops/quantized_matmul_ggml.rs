@@ -76,6 +76,62 @@ fn validate_signed_metal_dimensions(operation: &str, dimensions: &[(&str, u32)])
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct RequiredBufferRange {
+    buffer_id: usize,
+    start: u64,
+    end: u64,
+}
+
+fn validate_required_buffer_range(
+    operation: &str,
+    label: &str,
+    buffer: &MlxBuffer,
+    required_bytes: usize,
+) -> Result<RequiredBufferRange> {
+    if buffer.data_byte_len() < required_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "{operation} {label} buffer needs {required_bytes} bytes, got {}",
+            buffer.data_byte_len()
+        )));
+    }
+    let required_bytes = u64::try_from(required_bytes).map_err(|_| {
+        MlxError::InvalidArgument(format!("{operation} {label} byte extent exceeds u64"))
+    })?;
+    let end = buffer
+        .byte_offset()
+        .checked_add(required_bytes)
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("{operation} {label} byte range overflows"))
+        })?;
+    if end > buffer.byte_len() as u64 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{operation} {label} byte range ends at {end}, beyond allocation length {}",
+            buffer.byte_len()
+        )));
+    }
+    Ok(RequiredBufferRange {
+        buffer_id: buffer.contents_ptr() as usize,
+        start: buffer.byte_offset(),
+        end,
+    })
+}
+
+fn validate_output_disjoint(
+    operation: &str,
+    output: RequiredBufferRange,
+    reads: &[(&str, RequiredBufferRange)],
+) -> Result<()> {
+    if let Some((label, _)) = reads.iter().find(|(_, read)| {
+        output.buffer_id == read.buffer_id && output.start < read.end && read.start < output.end
+    }) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{operation} output range must not overlap {label}"
+        )));
+    }
+    Ok(())
+}
+
 // ---- Block format constants ----
 
 /// Q4_0: 32 values per block, 18 bytes per block (2 byte f16 scale + 16 bytes quants).
@@ -491,6 +547,39 @@ struct GgmlMatmulMmGpuParams {
     _pad1: u32, // trailing pad so sizeof == multiple of 8 (u64 align)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GgmlMmBatchGeometry {
+    weight_batch: u32,
+    input_batch: u32,
+    route_batch: u32,
+    r2: i16,
+}
+
+impl GgmlMmBatchGeometry {
+    fn independent(batch: u32) -> Self {
+        Self {
+            weight_batch: batch,
+            input_batch: batch,
+            route_batch: batch,
+            r2: 1,
+        }
+    }
+
+    fn shared_weight(batch: u32) -> Result<Self> {
+        let r2 = i16::try_from(batch).map_err(|_| {
+            MlxError::InvalidArgument(
+                "shared-weight batched quantized MM batch exceeds the signed broadcast ABI".into(),
+            )
+        })?;
+        Ok(Self {
+            weight_batch: 1,
+            input_batch: batch,
+            route_batch: 1,
+            r2,
+        })
+    }
+}
+
 /// Quantized matmul for GGML block format weights.
 ///
 /// Weight buffer contains raw GGML blocks (same bytes as GGUF on disk).
@@ -804,6 +893,146 @@ pub fn quantized_matmul_ggml_with_policy_and_trace(
             encoder, registry, device, input, weight, output, params, routing,
         )
     })
+}
+
+/// Execute independent activation batches against one shared native GGUF
+/// weight through the same MM route selected for one `[m, k]` activation.
+///
+/// Buffers use packed `[batch, m, k]` F32 input, one `[n, k]` native GGUF
+/// weight, and packed `[batch, m, n]` F32 output. The weight remains in its
+/// original block format and is broadcast by the Metal batch geometry; it is
+/// never copied, dequantized, or requantized.
+pub fn quantized_matmul_ggml_broadcast_batched_mm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+) -> Result<()> {
+    let routing = ggml_routing_policy_for_registry(registry);
+    quantized_matmul_ggml_broadcast_batched_mm_with_policy(
+        encoder, registry, device, input, weight, output, params, &routing,
+    )
+}
+
+/// Shared-weight batched MM under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantized_matmul_ggml_broadcast_batched_mm_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlBatchedQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
+    const OPERATION: &str = "shared-weight batched quantized MM";
+    validate_native_quantized_dtypes(OPERATION, input, weight, output)?;
+    validate_signed_metal_dimensions(
+        OPERATION,
+        &[
+            ("batch", params.batch),
+            ("M", params.m),
+            ("N", params.n),
+            ("K", params.k),
+        ],
+    )?;
+    if params.batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION} dimensions must all be nonzero"
+        )));
+    }
+    let batch_geometry = GgmlMmBatchGeometry::shared_weight(params.batch)?;
+    if !matches!(
+        params.ggml_type,
+        GgmlType::Q4_0
+            | GgmlType::Q5_0
+            | GgmlType::Q8_0
+            | GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::Q5_1
+            | GgmlType::IQ4_NL
+    ) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION} does not support {:?}",
+            params.ggml_type
+        )));
+    }
+
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION} K ({}) must be divisible by block QK ({qk})",
+            params.k
+        )));
+    }
+    let scalar = GgmlQuantizedMatmulParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+        ggml_type: params.ggml_type,
+    };
+    if plan_dense_auto_route(params.ggml_type, params.m, params.k, routing) != DenseAutoPlan::Mm {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION} requires the canonical scalar route to select MM"
+        )));
+    }
+
+    let blocks_per_row = params.k / qk;
+    let weight_bytes = checked_byte_extent(
+        "shared-weight batched weight",
+        &[
+            params.n as usize,
+            blocks_per_row as usize,
+            params.ggml_type.block_bytes() as usize,
+        ],
+    )?;
+    let input_bytes = checked_byte_extent(
+        "shared-weight batched input",
+        &[
+            params.batch as usize,
+            params.m as usize,
+            params.k as usize,
+            DType::F32.size_of(),
+        ],
+    )?;
+    let output_bytes = checked_byte_extent(
+        "shared-weight batched output",
+        &[
+            params.batch as usize,
+            params.m as usize,
+            params.n as usize,
+            DType::F32.size_of(),
+        ],
+    )?;
+    let input_range = validate_required_buffer_range(OPERATION, "input", input, input_bytes)?;
+    let weight_range = validate_required_buffer_range(OPERATION, "weight", weight, weight_bytes)?;
+    let output_range = validate_required_buffer_range(OPERATION, "output", output, output_bytes)?;
+    validate_output_disjoint(
+        OPERATION,
+        output_range,
+        &[("input", input_range), ("weight", weight_range)],
+    )?;
+
+    dispatch_mm_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        &scalar,
+        batch_geometry,
+        None,
+        routing,
+        None,
+    )
 }
 
 /// Execute independent quantized matrix products through the MM kernel's
@@ -2062,7 +2291,7 @@ fn dispatch_mm(
         weight,
         output,
         params,
-        batch,
+        GgmlMmBatchGeometry::independent(batch),
         input_strides,
         routing,
         None,
@@ -2104,7 +2333,7 @@ pub(crate) fn dispatch_mm_q4_route_internal(
         weight,
         output,
         params,
-        1,
+        GgmlMmBatchGeometry::independent(1),
         None,
         &GgmlRoutingPolicy::default(),
         Some(route),
@@ -2120,7 +2349,7 @@ fn dispatch_mm_impl(
     weight: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
-    batch: u32,
+    batch: GgmlMmBatchGeometry,
     input_strides: Option<&GgmlBatchedQuantizedMatmulInputStrides>,
     routing: &GgmlRoutingPolicy,
     forced_q4_route: Option<DenseQ4Route>,
@@ -2146,14 +2375,14 @@ fn dispatch_mm_impl(
         registry,
         device,
         params,
-        batch,
+        batch.route_batch,
         input_strides.is_none(),
         routing,
     );
     let q4_route = forced_q4_route.unwrap_or(q4_decision.route);
     let mut use_q4_short_tile = use_v2_large_tile
         && params.ggml_type == GgmlType::Q4_0
-        && batch == 1
+        && batch.route_batch == 1
         && input_strides.is_none()
         && q4_route == DenseQ4Route::Tensor64x32;
     if forced_q4_route == Some(DenseQ4Route::Tensor64x32) && !use_q4_short_tile {
@@ -2204,11 +2433,11 @@ fn dispatch_mm_impl(
 
     let gpu_params = GgmlMatmulMmGpuParams {
         ne00: params.k as i32,
-        ne02: batch as i32,
+        ne02: batch.weight_batch as i32,
         nb01,
         nb02: nb01 * (params.n as u64),
         nb03: 0,
-        ne12: batch as i32,
+        ne12: batch.input_batch as i32,
         _pad0: 0,
         nb10: DType::F32.size_of() as u64,
         nb11,
@@ -2216,7 +2445,7 @@ fn dispatch_mm_impl(
         nb13: 0,
         ne0: params.n as i32,
         ne1: params.m as i32,
-        r2: 1,
+        r2: batch.r2,
         r3: 1,
         _pad1: 0,
     };
@@ -2259,7 +2488,7 @@ fn dispatch_mm_impl(
         )
     };
 
-    let threadgroups = metal::MTLSize::new(tg_x, tg_y, batch as u64);
+    let threadgroups = metal::MTLSize::new(tg_x, tg_y, batch.input_batch as u64);
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     encoder.encode_threadgroups_with_args_and_shared(
@@ -2378,15 +2607,58 @@ pub fn quantized_matmul_mm_tensor_perm021(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulPerm021Params,
 ) -> Result<()> {
+    quantized_matmul_mm_tensor_perm021_impl(
+        encoder, registry, device, input_bf16, weight, output, 1, params,
+    )
+}
+
+/// Dispatch the BF16 head-major tensor-MM route for packed activation batches
+/// sharing one native GGUF weight.
+///
+/// Input is `[batch, n_heads, m, head_dim]`, weight is one `[n, k]` GGUF
+/// block matrix, and output is `[batch, m, n]` F32.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_mm_tensor_perm021_broadcast_batched(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    batch: u32,
+    params: &GgmlQuantizedMatmulPerm021Params,
+) -> Result<()> {
+    quantized_matmul_mm_tensor_perm021_impl(
+        encoder, registry, device, input_bf16, weight, output, batch, params,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantized_matmul_mm_tensor_perm021_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    batch: u32,
+    params: &GgmlQuantizedMatmulPerm021Params,
+) -> Result<()> {
     validate_signed_metal_dimensions(
         "quantized_matmul_mm_tensor_perm021",
-        &[("M", params.m), ("N", params.n), ("K", params.k)],
+        &[
+            ("batch", batch),
+            ("M", params.m),
+            ("N", params.n),
+            ("K", params.k),
+        ],
     )?;
-    if params.m == 0 || params.n == 0 || params.k == 0 {
+    if batch == 0 || params.m == 0 || params.n == 0 || params.k == 0 {
         return Err(MlxError::InvalidArgument(
-            "quantized_matmul_mm_tensor_perm021: M, N, and K must be non-zero".into(),
+            "quantized_matmul_mm_tensor_perm021: batch, M, N, and K must be non-zero".into(),
         ));
     }
+    let batch_geometry = GgmlMmBatchGeometry::shared_weight(batch)?;
     let kernel_name = match params.ggml_type {
         GgmlType::Q4_0 => "kernel_mul_mm_q4_0_tensor_bf16_perm021",
         GgmlType::Q5_0 => "kernel_mul_mm_q5_0_tensor_bf16_perm021",
@@ -2443,20 +2715,20 @@ pub fn quantized_matmul_mm_tensor_perm021(
     let expected_input_bytes = checked_byte_extent(
         "perm021 input",
         &[
+            batch as usize,
             n_heads as usize,
             params.m as usize,
             params.head_dim as usize,
             DType::BF16.size_of(),
         ],
     )?;
-    if input_bf16.data_byte_len() < expected_input_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_mm_tensor_perm021: input_bf16 buffer too small \
-             (have {}, need {})",
-            input_bf16.data_byte_len(),
-            expected_input_bytes
-        )));
-    }
+    const OPERATION: &str = "quantized_matmul_mm_tensor_perm021";
+    let input_range = validate_required_buffer_range(
+        OPERATION,
+        "input_bf16",
+        input_bf16,
+        expected_input_bytes,
+    )?;
 
     let blocks_per_row = params.k / qk;
     let block_bytes = params.ggml_type.block_bytes();
@@ -2464,24 +2736,20 @@ pub fn quantized_matmul_mm_tensor_perm021(
         .checked_mul(blocks_per_row as usize)
         .and_then(|blocks| blocks.checked_mul(block_bytes as usize))
         .ok_or_else(|| MlxError::InvalidArgument("perm021 weight bytes overflow".into()))?;
-    if weight.data_byte_len() < expected_weight_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_mm_tensor_perm021: weight buffer too small (have {}, need {})",
-            weight.data_byte_len(),
-            expected_weight_bytes,
-        )));
-    }
-    let expected_output_bytes = (params.m as usize)
-        .checked_mul(params.n as usize)
+    let weight_range =
+        validate_required_buffer_range(OPERATION, "weight", weight, expected_weight_bytes)?;
+    let expected_output_bytes = (batch as usize)
+        .checked_mul(params.m as usize)
+        .and_then(|elements| elements.checked_mul(params.n as usize))
         .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
         .ok_or_else(|| MlxError::InvalidArgument("perm021 output bytes overflow".into()))?;
-    if output.data_byte_len() < expected_output_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "quantized_matmul_mm_tensor_perm021: output buffer too small (have {}, need {})",
-            output.data_byte_len(),
-            expected_output_bytes,
-        )));
-    }
+    let output_range =
+        validate_required_buffer_range(OPERATION, "output", output, expected_output_bytes)?;
+    validate_output_disjoint(
+        OPERATION,
+        output_range,
+        &[("input_bf16", input_range), ("weight", weight_range)],
+    )?;
 
     let pipeline = registry.get_pipeline_with_constants(
         kernel_name,
@@ -2498,15 +2766,15 @@ pub fn quantized_matmul_mm_tensor_perm021(
         nb01,
         nb02: nb01 * (params.n as u64),
         nb03: 0,
-        ne12: 1,
+        ne12: batch as i32,
         _pad0: 0,
         nb10: 2, // sizeof(bfloat)
         nb11: 0, // unused; B-stage computes addresses directly
-        nb12: 0,
+        nb12: (params.m as u64) * (params.k as u64) * (DType::BF16.size_of() as u64),
         nb13: 0,
         ne0: params.n as i32,
         ne1: params.m as i32,
-        r2: 1,
+        r2: batch_geometry.r2,
         r3: 1,
         head_dim: params.head_dim as i32,
         seq_len: params.m as i32,
@@ -2521,7 +2789,7 @@ pub fn quantized_matmul_mm_tensor_perm021(
     let threadgroups = metal::MTLSize::new(
         (params.m as u64 + NR1 - 1) / NR1,
         (params.n as u64 + NR0 - 1) / NR0,
-        1,
+        batch as u64,
     );
     let threads_per_tg = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
@@ -2687,5 +2955,237 @@ mod mn_tile_offset_tests {
         let absolute = checked_mn_tile_byte_offset(u64::MAX - 3, 1, 1, "test output")
             .expect_err("absolute offset must overflow");
         assert!(matches!(absolute, MlxError::InvalidArgument(_)));
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod shared_weight_batch_route_tests {
+    use super::*;
+
+    fn assert_receipt_identity(
+        scalar: &[crate::encoder::EncodedKernelDispatch],
+        batched: &[crate::encoder::EncodedKernelDispatch],
+        batch: usize,
+    ) {
+        assert_eq!(scalar.len(), 1);
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].pipeline_label, scalar[0].pipeline_label);
+        assert_eq!(batched[0].dispatch_kind, scalar[0].dispatch_kind);
+        assert_eq!(&batched[0].grid[..2], &scalar[0].grid[..2]);
+        assert_eq!(batched[0].grid[2], batch as u64);
+        assert_eq!(scalar[0].grid[2], 1);
+        assert_eq!(
+            batched[0].threads_per_threadgroup,
+            scalar[0].threads_per_threadgroup
+        );
+        assert_eq!(batched[0].threadgroup_memory, scalar[0].threadgroup_memory);
+    }
+
+    fn assert_f32_broadcast_receipt(ggml_type: GgmlType, n: usize, k: usize) {
+        let (batch, m) = (2usize, 32usize);
+        let device = MlxDevice::new().expect("Metal device");
+        let mut registry = KernelRegistry::new();
+        let policy = GgmlRoutingPolicy::default();
+        assert_eq!(
+            plan_dense_auto_route(ggml_type, m as u32, k as u32, &policy),
+            DenseAutoPlan::Mm
+        );
+        let weight_bytes = n * (k / ggml_type.block_values() as usize)
+            * ggml_type.block_bytes() as usize;
+        let weight = device
+            .alloc_buffer(weight_bytes, DType::U8, vec![weight_bytes])
+            .expect("weight");
+        let scalar_input = device
+            .alloc_buffer(m * k * 4, DType::F32, vec![m, k])
+            .expect("scalar input");
+        let scalar_output = device
+            .alloc_buffer(m * n * 4, DType::F32, vec![m, n])
+            .expect("scalar output");
+        let batched_input = device
+            .alloc_buffer(batch * m * k * 4, DType::F32, vec![batch, m, k])
+            .expect("batched input");
+        let batched_output = device
+            .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+            .expect("batched output");
+
+        let scalar_params = GgmlQuantizedMatmulParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        };
+        let mut scalar_encoder = device.command_encoder().expect("scalar encoder");
+        scalar_encoder
+            .start_encoded_dispatch_receipt(1)
+            .expect("scalar receipt");
+        quantized_matmul_ggml_with_policy(
+            &mut scalar_encoder,
+            &mut registry,
+            &device,
+            &scalar_input,
+            &weight,
+            &scalar_output,
+            &scalar_params,
+            &policy,
+        )
+        .expect("scalar dispatch");
+        let scalar = scalar_encoder
+            .take_encoded_dispatch_receipt()
+            .expect("scalar receipt result");
+
+        let batched_params = GgmlBatchedQuantizedMatmulParams {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        };
+        let mut batched_encoder = device.command_encoder().expect("batched encoder");
+        batched_encoder
+            .start_encoded_dispatch_receipt(1)
+            .expect("batched receipt");
+        quantized_matmul_ggml_broadcast_batched_mm_with_policy(
+            &mut batched_encoder,
+            &mut registry,
+            &device,
+            &batched_input,
+            &weight,
+            &batched_output,
+            &batched_params,
+            &policy,
+        )
+        .expect("batched dispatch");
+        let batched = batched_encoder
+            .take_encoded_dispatch_receipt()
+            .expect("batched receipt result");
+
+        assert_receipt_identity(&scalar, &batched, batch);
+    }
+
+    fn assert_perm021_broadcast_receipt(n: usize, k: usize, head_dim: usize) {
+        let (batch, m) = (2usize, 32usize);
+        let device = MlxDevice::new().expect("Metal device");
+        let mut registry = KernelRegistry::new();
+        let weight_bytes = n * (k / GgmlType::Q6_K.block_values() as usize)
+            * GgmlType::Q6_K.block_bytes() as usize;
+        let weight = device
+            .alloc_buffer(weight_bytes, DType::U8, vec![weight_bytes])
+            .expect("weight");
+        let scalar_input = device
+            .alloc_buffer(m * k * 2, DType::BF16, vec![k / head_dim, m, head_dim])
+            .expect("scalar input");
+        let scalar_output = device
+            .alloc_buffer(m * n * 4, DType::F32, vec![m, n])
+            .expect("scalar output");
+        let batched_input = device
+            .alloc_buffer(
+                batch * m * k * 2,
+                DType::BF16,
+                vec![batch, k / head_dim, m, head_dim],
+            )
+            .expect("batched input");
+        let batched_output = device
+            .alloc_buffer(batch * m * n * 4, DType::F32, vec![batch, m, n])
+            .expect("batched output");
+        let params = GgmlQuantizedMatmulPerm021Params {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            head_dim: head_dim as u32,
+            ggml_type: GgmlType::Q6_K,
+        };
+
+        let mut scalar_encoder = device.command_encoder().expect("scalar encoder");
+        scalar_encoder
+            .start_encoded_dispatch_receipt(1)
+            .expect("scalar receipt");
+        quantized_matmul_mm_tensor_perm021(
+            &mut scalar_encoder,
+            &mut registry,
+            &device,
+            &scalar_input,
+            &weight,
+            &scalar_output,
+            &params,
+        )
+        .expect("scalar dispatch");
+        let scalar = scalar_encoder
+            .take_encoded_dispatch_receipt()
+            .expect("scalar receipt result");
+
+        let mut batched_encoder = device.command_encoder().expect("batched encoder");
+        batched_encoder
+            .start_encoded_dispatch_receipt(1)
+            .expect("batched receipt");
+        quantized_matmul_mm_tensor_perm021_broadcast_batched(
+            &mut batched_encoder,
+            &mut registry,
+            &device,
+            &batched_input,
+            &weight,
+            &batched_output,
+            batch as u32,
+            &params,
+        )
+        .expect("batched dispatch");
+        let batched = batched_encoder
+            .take_encoded_dispatch_receipt()
+            .expect("batched receipt result");
+        assert_receipt_identity(&scalar, &batched, batch);
+    }
+
+    #[test]
+    fn q5_k_broadcast_batch_preserves_scalar_pipeline_and_tile() {
+        assert_f32_broadcast_receipt(GgmlType::Q5_K, 72, 256);
+    }
+
+    #[test]
+    fn served_q6_k_o_broadcast_preserves_scalar_pipeline_and_tile() {
+        assert_f32_broadcast_receipt(GgmlType::Q6_K, 2_816, 4_096);
+    }
+
+    #[test]
+    fn served_q6_k_o_perm021_broadcast_preserves_scalar_pipeline_and_tile() {
+        assert_perm021_broadcast_receipt(2_816, 4_096, 256);
+    }
+
+    #[test]
+    fn broadcast_rejects_output_aliasing_input_before_encoding() {
+        let (batch, m, n, k) = (2usize, 32usize, 32usize, 256usize);
+        let device = MlxDevice::new().expect("Metal device");
+        let mut registry = KernelRegistry::new();
+        let input = device
+            .alloc_buffer(batch * m * k * 4, DType::F32, vec![batch, m, k])
+            .expect("input");
+        let weight_bytes = n * (k / GgmlType::Q5_K.block_values() as usize)
+            * GgmlType::Q5_K.block_bytes() as usize;
+        let weight = device
+            .alloc_buffer(weight_bytes, DType::U8, vec![weight_bytes])
+            .expect("weight");
+        let mut encoder = device.command_encoder().expect("encoder");
+        encoder
+            .start_encoded_dispatch_receipt(1)
+            .expect("receipt");
+        let error = quantized_matmul_ggml_broadcast_batched_mm(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &weight,
+            &input,
+            &GgmlBatchedQuantizedMatmulParams {
+                batch: batch as u32,
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                ggml_type: GgmlType::Q5_K,
+            },
+        )
+        .expect_err("output/input alias must fail");
+        assert!(error.to_string().contains("must not overlap input"));
+        assert!(encoder
+            .take_encoded_dispatch_receipt()
+            .expect("receipt result")
+            .is_empty());
     }
 }
