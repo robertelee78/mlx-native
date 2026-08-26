@@ -129,6 +129,7 @@ fn assert_logical_view_case(kind: GgmlType, m: usize) {
         .collect();
 
     let scalar_policy = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
         dense_decode_mvn: false,
         dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()
@@ -180,6 +181,7 @@ fn assert_logical_view_case(kind: GgmlType, m: usize) {
         ggml_type: kind,
     };
     let policy = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
         dense_decode_mvn: true,
         dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()

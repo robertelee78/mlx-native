@@ -3,18 +3,21 @@
 //! Wraps the Metal kernels in `shaders/mul_mv_ext.metal`:
 //!
 //!   `kernel_mul_mv_ext_<q>_f32_r1_<r1>` for each admitted block codec,
-//!   r1 ∈ {2, 3, 4, 5}.
+//!   r1 ∈ {2, 3, 4, 5}, plus the canonical Q5_K r1=1 kernel.
 //!
-//! The host dispatcher mirrors the reference small-batch dispatch:
+//! The internal host dispatcher uses:
 //!   - `nsg = 2` (constant)
-//!   - `nxpsg = 16` if `K % 256 == 0 && M < 3`,
+//!   - Q5_K: `nxpsg = 8` at every admitted width
+//!   - other codecs: `nxpsg = 16` if `K % 256 == 0 && M < 3`,
 //!     else `8` if `K % 128 == 0`,
 //!     else `4`
-//!   - `r1ptg` selected by m: m=2→2, m∈{3,6}→3, m∈{4,7,8}→4, m=5→5
+//!   - `r1ptg` selected by m: Q5_K m=1→1; otherwise m=2→2,
+//!     m∈{3,6}→3, m∈{4,7,8}→4, m=5→5
 //!   - threadgroups = (N/r0ptg, M/r1ptg, batch)
 //!   - threads-per-tg = (32, nsg, 1)
 //!
-//! Falls within the public dispatcher's m=2..8 batch range.
+//! Callers reach these kernels only through the validated canonical GGML
+//! dispatcher, which owns routing policy, capability, and trace contracts.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -33,18 +36,18 @@ use crate::ops::quantized_matmul_ggml::GgmlType;
 ///
 /// `r2`, `r3` model the reference batch-broadcast (default 1, 1).
 #[derive(Debug, Clone, Copy)]
-pub struct MulMvExtParams {
-    /// M — number of src1 rows (small batch, must be ∈ [2, 8]).
-    pub m: u32,
+pub(super) struct MulMvExtParams {
+    /// M — number of src1 rows (Q5_K: 1..=8; other codecs: 2..=8).
+    pub(super) m: u32,
     /// N — number of weight rows (output dim).
-    pub n: u32,
+    pub(super) n: u32,
     /// K — contract dim (input dim, must be divisible by 32).
-    pub k: u32,
+    pub(super) k: u32,
     /// Batch-broadcast factor for src0 vs src1 (typical 1).
-    pub batch: u32,
+    pub(super) batch: u32,
     /// GGUF weight type. Unsupported codecs return
     /// `MlxError::InvalidArgument`.
-    pub ggml_type: GgmlType,
+    pub(super) ggml_type: GgmlType,
 }
 
 /// GPU args struct — must match `hf2q_mul_mv_ext_args` in
@@ -85,7 +88,7 @@ struct MulMvExtGpuArgs {
     _pad2: u32,
 }
 
-/// Pick `nxpsg` per the reference selection rule.
+/// Pick `nxpsg` for the legacy multi-codec route.
 fn pick_nxpsg(k: u32, m: u32) -> i32 {
     if k % 256 == 0 && m < 3 {
         16
@@ -96,17 +99,17 @@ fn pick_nxpsg(k: u32, m: u32) -> i32 {
     }
 }
 
-/// Pick `r1ptg` per the reference selection switch.
+/// Pick the physical column width for one threadgroup.
 /// Returns `Err(InvalidArgument)` for unsupported m values.
 fn pick_r1ptg(m: u32) -> Result<i32> {
     match m {
+        1 => Ok(1),
         2 => Ok(2),
         3 | 6 => Ok(3),
         4 | 7 | 8 => Ok(4),
         5 => Ok(5),
         other => Err(MlxError::InvalidArgument(format!(
-            "mul_mv_ext: unsupported m {} (peer mapping covers 2..=8 only)",
-            other
+            "mul_mv_ext: unsupported m {other} (supported range is 1..=8)"
         ))),
     }
 }
@@ -115,9 +118,10 @@ fn pick_r1ptg(m: u32) -> Result<i32> {
 /// shader's `[[host_name(...)]]` attributes.
 ///
 /// Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q5_1, and IQ4_NL each provide
-/// r1∈{2,3,4,5}.
+/// Q5_K provides r1∈{1,2,3,4,5}; the other codecs provide r1∈{2,3,4,5}.
 fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
     Ok(match (ggml_type, r1ptg) {
+        (GgmlType::Q5_K, 1) => "kernel_mul_mv_ext_q5_K_f32_r1_1",
         (GgmlType::Q5_1, 2) => "kernel_mul_mv_ext_q5_1_f32_r1_2",
         (GgmlType::Q5_1, 3) => "kernel_mul_mv_ext_q5_1_f32_r1_3",
         (GgmlType::Q5_1, 4) => "kernel_mul_mv_ext_q5_1_f32_r1_4",
@@ -152,8 +156,7 @@ fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
         (GgmlType::Q6_K, 5) => "kernel_mul_mv_ext_q6_K_f32_r1_5",
         (other_type, other_r1) => {
             return Err(MlxError::InvalidArgument(format!(
-                "mul_mv_ext: no kernel for type {:?} × r1ptg {} (supported: Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K/Q5_1/IQ4_NL × r1∈{{2,3,4,5}})",
-                other_type, other_r1
+                "mul_mv_ext: no kernel for type {other_type:?} × r1ptg {other_r1} (Q5_K supports r1=1..=5; other codecs support r1=2..=5)"
             )));
         }
     })
@@ -165,11 +168,11 @@ fn kernel_name(ggml_type: GgmlType, r1ptg: i32) -> Result<&'static str> {
 ///
 /// Returns `MlxError::InvalidArgument` if:
 ///   - `ggml_type` has no width-amortized kernel,
-///   - `m` is outside [2, 8],
+///   - `m` is outside 1..=8 for Q5_K or 2..=8 for another codec,
 ///   - `k` is not divisible by 32,
 ///   - any of `m`, `n`, `k`, `batch` is zero,
 ///   - any buffer is too small.
-pub fn mul_mv_ext_dispatch(
+pub(super) fn mul_mv_ext_dispatch(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -220,7 +223,14 @@ pub fn mul_mv_ext_dispatch(
     }
 
     let r1ptg = pick_r1ptg(params.m)?;
-    let nxpsg = pick_nxpsg(params.k, params.m);
+    // Q5_K uses one frozen lane partition at every decode width so an
+    // independently encoded R1=1 column can be the arithmetic authority for
+    // R1=2..8 verification. Other codecs retain their qualified policy.
+    let nxpsg = if params.ggml_type == GgmlType::Q5_K {
+        8
+    } else {
+        pick_nxpsg(params.k, params.m)
+    };
     let nsg: i32 = 2;
     let nypsg = 32 / nxpsg;
     let r0ptg = nypsg * nsg;
@@ -324,7 +334,7 @@ pub fn mul_mv_ext_dispatch(
     let r0_groups = u64::from(params.n).div_ceil(r0ptg as u64);
     let r1_groups = u64::from(params.m).div_ceil(r1ptg as u64);
 
-    encoder.encode_threadgroups_with_args(
+    encoder.dispatch_tracked_threadgroups_with_args(
         &pipeline,
         &[
             (0, KernelArg::Bytes(args_bytes)),
@@ -332,6 +342,8 @@ pub fn mul_mv_ext_dispatch(
             (2, KernelArg::Buffer(input)),
             (3, KernelArg::Buffer(output)),
         ],
+        &[weight, input],
+        &[output],
         crate::MTLSize::new(r0_groups, r1_groups, params.batch as u64),
         crate::MTLSize::new(32, nsg as u64, 1),
     );
@@ -344,7 +356,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pick_nxpsg_matches_peer_logic() {
+    fn pick_nxpsg_covers_legacy_geometry() {
         // K=128, M=1 → not %256 / yes %128 → 8
         assert_eq!(pick_nxpsg(128, 1), 8);
         // K=256, M=2 → yes %256 + M<3 → 16
@@ -362,7 +374,8 @@ mod tests {
     }
 
     #[test]
-    fn pick_r1ptg_matches_peer_switch() {
+    fn pick_r1ptg_covers_supported_widths() {
+        assert_eq!(pick_r1ptg(1).unwrap(), 1);
         assert_eq!(pick_r1ptg(2).unwrap(), 2);
         assert_eq!(pick_r1ptg(3).unwrap(), 3);
         assert_eq!(pick_r1ptg(4).unwrap(), 4);
@@ -370,7 +383,7 @@ mod tests {
         assert_eq!(pick_r1ptg(6).unwrap(), 3);
         assert_eq!(pick_r1ptg(7).unwrap(), 4);
         assert_eq!(pick_r1ptg(8).unwrap(), 4);
-        assert!(pick_r1ptg(1).is_err());
+        assert!(pick_r1ptg(0).is_err());
         assert!(pick_r1ptg(9).is_err());
     }
 
@@ -411,11 +424,10 @@ mod tests {
 
     #[test]
     fn kernel_name_rejects_unsupported_combinations() {
-        // r1 outside [2, 5] is rejected for ALL types (including
-        // Phase 1 + Phase 4 covered ones).
+        // r1=1 is Q5_K-only; every codec rejects widths above five.
         assert!(
             kernel_name(GgmlType::Q5_1, 1).is_err(),
-            "r1=1 not supported by any phase"
+            "r1=1 is not supported for Q5_1"
         );
         assert!(
             kernel_name(GgmlType::Q5_1, 6).is_err(),

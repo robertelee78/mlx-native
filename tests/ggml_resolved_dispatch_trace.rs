@@ -193,7 +193,10 @@ fn trace_binds_actual_dense_routes_and_drains_failures() {
         &q5_weight,
         &q5_output,
         &q5_width,
-        &GgmlRoutingPolicy::default(),
+        &GgmlRoutingPolicy {
+            dense_q5k_canonical_q4x4: false,
+            ..GgmlRoutingPolicy::default()
+        },
         GgmlWorkloadClass::ContinuousWidth,
     )
     .expect("Q5_K width trace");
@@ -202,6 +205,31 @@ fn trace_binds_actual_dense_routes_and_drains_failures() {
         GgmlResolvedKernelRoute::DenseQ5kWidthMn
     );
     assert_eq!(q5_trace.dispatches.len(), 2);
+
+    let q5_canonical = quantized_matmul_ggml_with_policy_and_trace(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &q5_input,
+        &q5_weight,
+        &q5_output,
+        &q5_width,
+        &GgmlRoutingPolicy {
+            dense_q5k_canonical_q4x4: true,
+            ..GgmlRoutingPolicy::default()
+        },
+        GgmlWorkloadClass::ContinuousWidth,
+    )
+    .expect("canonical Q5_K q4x4 width trace");
+    assert_eq!(
+        q5_canonical.resolved_route,
+        GgmlResolvedKernelRoute::DenseQ5kCanonicalQ4x4
+    );
+    assert_eq!(q5_canonical.dispatches.len(), 1);
+    assert_eq!(
+        q5_canonical.dispatches[0].pipeline.kernel_name,
+        "kernel_mul_mv_ext_q5_K_f32_r1_4"
+    );
 
     let short_weight = device
         .alloc_buffer(1, DType::U8, vec![1])

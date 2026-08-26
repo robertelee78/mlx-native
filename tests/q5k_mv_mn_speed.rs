@@ -10,9 +10,6 @@ use mlx_native::{
 
 const QK_K: usize = 256;
 const BLOCK_Q5_K_BYTES: usize = 176;
-const M: usize = 4;
-const N: usize = 5_120;
-const K: usize = 5_120;
 const REPS: usize = 100;
 
 fn next_u64(state: &mut u64) -> u64 {
@@ -94,14 +91,10 @@ fn median_gpu_us(
     samples[samples.len() / 2]
 }
 
-#[test]
-#[ignore = "single-tenant performance receipt"]
-fn q5k_width_four_gpu_time() {
-    let device = MlxDevice::new().expect("Metal device");
-    let mut registry = KernelRegistry::new();
-    let mut state = 0x5135_5350_4545_4404;
+fn measure_shape(device: &MlxDevice, registry: &mut KernelRegistry, m: usize, n: usize, k: usize) {
+    let mut state = 0x5135_5350_4545_4404 ^ m as u64 ^ n as u64 ^ (k as u64).rotate_left(17);
 
-    let blocks = N * (K / QK_K);
+    let blocks = n * (k / QK_K);
     let mut weight = device
         .alloc_buffer(
             blocks * BLOCK_Q5_K_BYTES,
@@ -111,38 +104,41 @@ fn q5k_width_four_gpu_time() {
         .expect("weight buffer");
     fill_q5k(&mut weight, &mut state);
     let mut input = device
-        .alloc_buffer(M * K * 4, DType::F32, vec![M, K])
+        .alloc_buffer(m * k * 4, DType::F32, vec![m, k])
         .expect("input buffer");
     fill_f32(&mut input, &mut state);
     let output = device
-        .alloc_buffer(M * N * 4, DType::F32, vec![M, N])
+        .alloc_buffer(m * n * 4, DType::F32, vec![m, n])
         .expect("output buffer");
     let params = GgmlQuantizedMatmulParams {
-        m: M as u32,
-        n: N as u32,
-        k: K as u32,
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
         ggml_type: GgmlType::Q5_K,
     };
 
     let scalar_tree = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
         dense_decode_mvn: false,
         dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()
     };
     let exact_mn = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: false,
         dense_decode_mvn: true,
         dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()
     };
     let mv_ext = GgmlRoutingPolicy {
+        dense_q5k_canonical_q4x4: true,
         dense_decode_mvn: false,
-        dense_decode_mv_ext: true,
+        dense_decode_mv_ext: false,
         ..GgmlRoutingPolicy::default()
     };
 
     let scalar_us = median_gpu_us(
-        &device,
-        &mut registry,
+        device,
+        registry,
         &input,
         &weight,
         &output,
@@ -150,26 +146,31 @@ fn q5k_width_four_gpu_time() {
         &scalar_tree,
     );
     let exact_us = median_gpu_us(
-        &device,
-        &mut registry,
-        &input,
-        &weight,
-        &output,
-        &params,
-        &exact_mn,
+        device, registry, &input, &weight, &output, &params, &exact_mn,
     );
-    let mv_ext_us = median_gpu_us(
-        &device,
-        &mut registry,
-        &input,
-        &weight,
-        &output,
-        &params,
-        &mv_ext,
-    );
+    let mv_ext_us = median_gpu_us(device, registry, &input, &weight, &output, &params, &mv_ext);
 
     eprintln!(
-        "Q5_K m=4 N={N} K={K}: scalar={scalar_us:.3} us, exact_mN={exact_us:.3} us ({:.3}x), mv_ext={mv_ext_us:.3} us; medians of 5x{REPS} GPU-timed calls",
+        "Q5_K m={m} N={n} K={k}: scalar={scalar_us:.3} us, exact_mN={exact_us:.3} us ({:.3}x), canonical={mv_ext_us:.3} us ({:.3}x vs exact); medians of 5x{REPS} GPU-timed calls",
         scalar_us / exact_us,
+        exact_us / mv_ext_us,
     );
+}
+
+#[test]
+#[ignore = "single-tenant performance receipt"]
+fn q5k_width_four_gpu_time() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    for (n, k) in [
+        (5_120, 5_120),
+        (6_144, 5_120),
+        (10_240, 5_120),
+        (17_408, 5_120),
+        (5_120, 17_408),
+    ] {
+        for m in [1, 4] {
+            measure_shape(&device, &mut registry, m, n, k);
+        }
+    }
 }

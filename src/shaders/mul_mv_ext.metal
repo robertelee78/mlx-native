@@ -672,6 +672,11 @@ kernel void hf2q_mul_mv_ext_q4x4_f32_impl<5, block_q4_K, 16, dequantize_q4_K_t4x
 
 // --- Q5_K mv_ext (K-quant, q4x4 variant) ---
 
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_1")]]
+kernel void hf2q_mul_mv_ext_q4x4_f32_impl<1, block_q5_K, 16, dequantize_q5_K_t4x4>(
+    constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
+    device char *, uint3, ushort, ushort);
+
 template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_2")]]
 kernel void hf2q_mul_mv_ext_q4x4_f32_impl<2, block_q5_K, 16, dequantize_q5_K_t4x4>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,

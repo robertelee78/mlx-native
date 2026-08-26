@@ -55,7 +55,6 @@ pub mod fused_gate_up_silu_iq4_nl;
 #[allow(non_snake_case)]
 pub mod fused_gate_up_silu_q4_K;
 #[allow(non_snake_case)]
-pub mod fused_gate_up_silu_q5_K;
 #[allow(non_snake_case)]
 pub mod fused_gate_up_silu_q6_K;
 pub mod fused_gate_up_silu_q8_0;
@@ -76,7 +75,7 @@ pub mod moe_gate;
 pub mod moe_mm_id_map0;
 pub mod moe_softmax_topk;
 pub mod moe_weighted_reduce;
-pub mod mul_mv_ext;
+mod mul_mv_ext;
 pub mod q_gate_deinterleave;
 pub mod qkv_split;
 pub mod quantized_matmul;

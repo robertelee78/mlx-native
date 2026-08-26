@@ -190,7 +190,6 @@ pub use ops::quantized_matmul_ggml::{
     GgmlQuantizedMatmulParams,
     GgmlQuantizedMatmulPerm021Params, GgmlType, MM_ROUTING_THRESHOLD,
 };
-pub use ops::mul_mv_ext::{mul_mv_ext_dispatch, MulMvExtParams};
 pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
 };

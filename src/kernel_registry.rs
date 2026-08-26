@@ -417,7 +417,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_4".into(), mul_mv_ext_src);
         sources.insert("kernel_mul_mv_ext_iq4_nl_f32_r1_5".into(), mul_mv_ext_src);
         // Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K mv_ext.
-        // 6 types × 4 r1ptg widths = 24 instantiations.
+        // 6 types × 4 shared widths plus Q5_K r1=1 = 25 instantiations.
+        sources.insert("kernel_mul_mv_ext_q5_K_f32_r1_1".into(), mul_mv_ext_src);
         for r1 in [2, 3, 4, 5].iter() {
             for ty in ["q4_0", "q5_0", "q8_0", "q4_K", "q5_K", "q6_K"].iter() {
                 let name = format!("kernel_mul_mv_ext_{ty}_f32_r1_{r1}");
@@ -1035,14 +1036,6 @@ impl KernelRegistry {
         sources.insert(
             "kernel_fused_gate_up_silu_iq4_nl_f32".into(),
             fused_gate_up_silu_iq4_nl_src,
-        );
-        // ADR-034 task #93 cont. 27 — fused gate+up+silu_mul Q5_K.
-        #[allow(non_snake_case)]
-        let fused_gate_up_silu_q5_K_src: &'static str =
-            include_str!("shaders/fused_gate_up_silu_q5_K.metal");
-        sources.insert(
-            "kernel_fused_gate_up_silu_q5_K_f32".into(),
-            fused_gate_up_silu_q5_K_src,
         );
         // ADR-034 task #93 cont. 28 — fused gate+up+silu_mul Q6_K.
         #[allow(non_snake_case)]

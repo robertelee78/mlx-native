@@ -2,7 +2,7 @@
 
 use half::f16;
 use mlx_native::{
-    embedding_gather_q5_0, mul_mv_ext_dispatch, quantized_matmul_ggml,
+    embedding_gather_q5_0, quantized_matmul_ggml,
     quantized_matmul_ggml_batched_mm, quantized_matmul_ggml_batched_mm_strided_input,
     quantized_matmul_ggml_batched_mv, quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml,
     quantized_matmul_id_ggml_mv_with_policy, quantized_matmul_id_ggml_pooled,
@@ -12,7 +12,7 @@ use mlx_native::{
     EmbeddingQ5_0Params, GgmlBatchedQuantizedMatmulInputStrides, GgmlBatchedQuantizedMatmulParams,
     GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlQuantizedMatmulPerm021Params,
     GgmlRoutingPolicy, GgmlTensorMmPreference, GgmlType, GgufFile, IdMmScratch, KernelRegistry,
-    MlxBuffer, MlxDevice, MulMvExtParams,
+    MlxBuffer, MlxDevice,
 };
 
 const QK5_0: usize = 32;
@@ -407,48 +407,6 @@ fn q5_0_width_amortized_route_preserves_results() {
             &format!("mv_ext M={m}"),
         );
     }
-}
-
-#[test]
-fn q5_0_width_amortized_batch_broadcasts_one_native_weight() {
-    let device = MlxDevice::new().unwrap();
-    let weight_bytes = matrix_bytes(53);
-    let weight = u8_buffer(&device, &weight_bytes);
-    let batch = 3usize;
-    let m = 2usize;
-    let mut input_values = Vec::new();
-    let mut expected = Vec::new();
-    for batch_index in 0..batch {
-        let rows = input_rows(m, 131 + batch_index);
-        expected.extend(cpu_dense(&rows, &weight_bytes, m));
-        input_values.extend(rows);
-    }
-    let input = f32_buffer(&device, &input_values);
-    let output = empty_buffer(&device, batch * m * N * 4, DType::F32);
-    let mut registry = KernelRegistry::new();
-    let mut encoder = device.command_encoder().unwrap();
-    mul_mv_ext_dispatch(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &weight,
-        &input,
-        &output,
-        &MulMvExtParams {
-            m: m as u32,
-            n: N as u32,
-            k: K as u32,
-            batch: batch as u32,
-            ggml_type: GgmlType::Q5_0,
-        },
-    )
-    .unwrap();
-    encoder.commit_and_wait().unwrap();
-    assert_close(
-        output.as_slice::<f32>().unwrap(),
-        &expected,
-        "mv_ext broadcast batch",
-    );
 }
 
 #[test]
