@@ -203,6 +203,7 @@ fn q5_k_fixture_weights(seed: u64, n: usize, k: usize) -> Vec<u8> {
     bytes
 }
 
+#[cfg(mlx_native_has_metal_tensor_artifact)]
 fn q5_0_fixture_weights(seed: u64, n: usize, k: usize) -> Vec<u8> {
     assert_eq!(k % 32, 0);
     let mut state = seed;
@@ -472,6 +473,7 @@ fn run_broadcast_batched_mm_gpu(
         .to_vec()
 }
 
+#[cfg(mlx_native_has_metal_tensor_artifact)]
 fn run_perm021_gpu(
     batch: usize,
     m: usize,

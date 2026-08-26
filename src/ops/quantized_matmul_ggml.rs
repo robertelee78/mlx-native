@@ -3062,6 +3062,7 @@ mod shared_weight_batch_route_tests {
         assert_receipt_identity(&scalar, &batched, batch);
     }
 
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
     fn assert_perm021_broadcast_receipt(n: usize, k: usize, head_dim: usize) {
         let (batch, m) = (2usize, 32usize);
         let device = MlxDevice::new().expect("Metal device");
@@ -3144,6 +3145,7 @@ mod shared_weight_batch_route_tests {
         assert_f32_broadcast_receipt(GgmlType::Q6_K, 2_816, 4_096);
     }
 
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
     #[test]
     fn served_q6_k_o_perm021_broadcast_preserves_scalar_pipeline_and_tile() {
         assert_perm021_broadcast_receipt(2_816, 4_096, 256);
