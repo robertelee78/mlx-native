@@ -160,13 +160,19 @@ pub fn build_chunk_tri_solve_invert_params(
     device: &crate::MlxDevice,
     p: ChunkTriSolveInvertParams,
 ) -> Result<MlxBuffer> {
-    let mut buf = device.alloc_buffer(4 * 4, DType::U32, vec![4])?;
-    {
-        let s = buf.as_mut_slice::<u32>()?;
-        s[0] = p.b;
-        s[1] = p.t;
-        s[2] = p.h;
-        s[3] = p.bt;
-    }
+    let mut buf =
+        device.alloc_buffer(INVERT_PARAM_WORDS * 4, DType::U32, vec![INVERT_PARAM_WORDS])?;
+    buf.as_mut_slice::<u32>()?
+        .copy_from_slice(&chunk_tri_solve_invert_param_words(p));
+
     Ok(buf)
+}
+
+pub(crate) const INVERT_PARAM_WORDS: usize = 4;
+
+/// Shared serialization used by standalone builders and the arena.
+pub(crate) fn chunk_tri_solve_invert_param_words(
+    p: ChunkTriSolveInvertParams,
+) -> [u32; INVERT_PARAM_WORDS] {
+    [p.b, p.t, p.h, p.bt]
 }

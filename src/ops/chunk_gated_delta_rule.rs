@@ -74,6 +74,10 @@
 //! - chunk_gated_delta_rule_fwd_h : chunk_delta_h.py:43-298
 //! - chunk_fwd_o              : chunk_o.py:42-138
 
+#[path = "chunk_gated_delta_rule/arena_plan.rs"]
+mod arena_plan;
+pub use arena_plan::{ChunkArenaBufferPlan, ChunkArenaRole, ChunkInternalArenaPlan};
+
 use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
@@ -292,16 +296,17 @@ pub(crate) fn build_chunk_local_cumsum_g_params(
     device: &MlxDevice,
     p: &ChunkGatedDeltaRuleParams,
 ) -> Result<MlxBuffer> {
-    let mut buf = device.alloc_buffer(5 * 4, DType::U32, vec![5])?;
-    {
-        let s = buf.as_mut_slice::<u32>()?;
-        s[0] = p.b;
-        s[1] = p.t;
-        s[2] = p.h;
-        s[3] = p.bt;
-        s[4] = p.num_chunks();
-    }
+    let mut buf =
+        device.alloc_buffer(CUMSUM_PARAM_WORDS * 4, DType::U32, vec![CUMSUM_PARAM_WORDS])?;
+    buf.as_mut_slice::<u32>()?
+        .copy_from_slice(&chunk_cumsum_param_words(p.b, p.t, p.h, p.bt));
+
     Ok(buf)
+}
+
+pub(crate) const CUMSUM_PARAM_WORDS: usize = 5;
+fn chunk_cumsum_param_words(b: u32, t: u32, h: u32, bt: u32) -> [u32; CUMSUM_PARAM_WORDS] {
+    [b, t, h, bt, t.div_ceil(bt)]
 }
 
 /// Build the 2-f32 params buffer for `dispatch_l2_norm`: `[eps, dim]`.
@@ -670,7 +675,7 @@ pub fn dispatch_chunk_gated_delta_rule_fwd(
 /// | `u_buf` | BF16 | B*T*H*V*2 = 33.6 MB |
 /// | `h_buf` | BF16 | B*NT*H*V*K*2 = 67.1 MB |
 /// | `v_new_buf` | BF16 | B*T*H*V*2 = 33.6 MB |
-/// | param bufs (×5) | U32/F32 | ~120 B total |
+/// | param bufs (×6) | U32 | 176 B total |
 /// | **Total** | | **~235 MB** |
 ///
 /// Allocated ONCE per prefill, reused across all DN layers (30 in
@@ -695,16 +700,16 @@ pub struct ChunkInternalArena {
     // ---- Small param buffers (caller-owned to avoid per-call alloc) ----
     /// 5-u32 cumsum params: `[B, T, H, BT, NT]`.
     pub cumsum_params_buf: MlxBuffer,
-    /// 6-u32 kkt params (size determined by sub-kernel; see
+    /// 8-u32 kkt params (size determined by sub-kernel; see
     /// `build_gated_delta_net_kkt_params`).
     pub kkt_params_buf: MlxBuffer,
     /// 4-u32 invert params: `[B, T, H, BT]`.
     pub invert_params_buf: MlxBuffer,
-    /// 7-u32 recompute_wu params.
+    /// 8-u32 recompute_wu params.
     pub recompute_wu_params_buf: MlxBuffer,
-    /// 7-u32 chunk params (chunk_inter_state).
+    /// 8-u32 chunk params (chunk_inter_state).
     pub chunk_params_buf: MlxBuffer,
-    /// 8-u32+f32 chunk_o params (with scale).
+    /// 11-u32 chunk_o params (including scale bits).
     pub chunk_o_params_buf: MlxBuffer,
 
     // ---- Capacity bookkeeping ----
@@ -749,137 +754,89 @@ impl ChunkInternalArena {
         v: u32,
         bt: u32,
     ) -> Result<Self> {
-        if b == 0 || t == 0 || hg == 0 || h == 0 || k == 0 || v == 0 || bt == 0 {
-            return Err(MlxError::InvalidArgument(format!(
-                "ChunkInternalArena::new: zero dim b={} t={} hg={} h={} k={} v={} bt={}",
-                b, t, hg, h, k, v, bt,
-            )));
-        }
-        if h % hg != 0 {
-            return Err(MlxError::InvalidArgument(format!(
-                "ChunkInternalArena::new: H ({}) must be a multiple of Hg ({})",
-                h, hg
-            )));
-        }
-        if k != MAX_K {
-            return Err(MlxError::InvalidArgument(format!(
-                "ChunkInternalArena::new: K ({}) must equal MAX_K = {} \
-                 (sub-kernel hard constraint)",
-                k, MAX_K
-            )));
-        }
-        if v > MAX_V {
-            return Err(MlxError::InvalidArgument(format!(
-                "ChunkInternalArena::new: V ({}) > MAX_V ({})",
-                v, MAX_V
-            )));
-        }
-        if bt != FIXED_BT {
-            return Err(MlxError::InvalidArgument(format!(
-                "ChunkInternalArena::new: bt ({}) must equal FIXED_BT ({})",
-                bt, FIXED_BT
-            )));
-        }
-        if t % bt != 0 {
-            return Err(MlxError::InvalidArgument(format!(
-                "ChunkInternalArena::new: t ({}) must be a multiple of bt ({})",
-                t, bt
-            )));
-        }
-
-        let nt = t.div_ceil(bt);
-        let g_elems = (b * t * h) as usize;
-        let a_elems = (b * t * h * bt) as usize;
-        let w_elems = (b * t * h * k) as usize;
-        let u_elems = (b * t * h * v) as usize;
-        let h_elems = (b * nt * h * v * k) as usize;
-        let v_new_elems = (b * t * h * v) as usize;
-
-        let g_cumsum_buf = device.alloc_buffer(g_elems * 4, DType::F32, vec![g_elems])?;
-        let a_strict_buf = device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
-        let a_inv_buf = device.alloc_buffer(a_elems * 4, DType::F32, vec![a_elems])?;
-        let w_buf = device.alloc_buffer(w_elems * 2, DType::BF16, vec![w_elems])?;
-        let u_buf = device.alloc_buffer(u_elems * 2, DType::BF16, vec![u_elems])?;
-        let h_buf = device.alloc_buffer(h_elems * 2, DType::BF16, vec![h_elems])?;
-        let v_new_buf = device.alloc_buffer(v_new_elems * 2, DType::BF16, vec![v_new_elems])?;
-
-        // Pre-allocate the small param buffers. They are filled per-call
-        // in `dispatch_chunk_gated_delta_rule_fwd_with_arena` since
-        // sub-kernel param structs encode per-call shape data identically
-        // across layers in a single prefill, but defensive re-fill on
-        // each call costs ~50 ns and avoids any risk of shape drift.
-        let cumsum_params_buf = device.alloc_buffer(5 * 4, DType::U32, vec![5])?;
-        let kkt_params_buf =
-            build_gated_delta_net_kkt_params(device, GatedDeltaNetKktParams {
+        let plan = ChunkInternalArenaPlan::for_shape(b, t, hg, h, k, v, bt)?;
+        let allocate = |role| {
+            let root = plan.root(role);
+            device.alloc_buffer(root.requested_bytes(), root.dtype(), root.shape().to_vec())
+        };
+        use ChunkArenaRole::*;
+        let g_cumsum_buf = allocate(Cumsum)?;
+        let a_strict_buf = allocate(Strict)?;
+        let a_inv_buf = allocate(Inverse)?;
+        let w_buf = allocate(W)?;
+        let u_buf = allocate(U)?;
+        let h_buf = allocate(Hidden)?;
+        let v_new_buf = allocate(VNew)?;
+        // Preserve original allocation and parameter initialization order:
+        // cumsum is allocated now but filled after the other five parameters.
+        let mut cumsum_params_buf = allocate(CumsumParams)?;
+        let mut kkt_params_buf = allocate(KktParams)?;
+        kkt_params_buf.as_mut_slice::<u32>()?.copy_from_slice(
+            &crate::ops::gated_delta_net_kkt::gated_delta_net_kkt_param_words(GatedDeltaNetKktParams {
                 b,
                 t,
                 hg,
                 h,
                 k,
                 bt,
-            })?;
-        let invert_params_buf =
-            build_chunk_tri_solve_invert_params(device, ChunkTriSolveInvertParams {
-                b,
-                t,
-                h,
-                bt,
-            })?;
-        let recompute_wu_params_buf = build_gated_delta_net_recompute_wu_params(
-            device,
-            GatedDeltaNetRecomputeWuParams {
-                b,
-                t,
-                hg,
-                h,
-                k,
-                v,
-                bt,
-            },
-        )?;
-        let chunk_params_buf = build_gated_delta_net_chunk_params(
-            device,
-            GatedDeltaNetChunkParams {
-                b,
-                t,
-                hg,
-                h,
-                k,
-                v,
-                bt,
-            },
-        )?;
-        // chunk_o needs a scale param; we pre-build with scale=1.0 and
-        // OVERWRITE per-call inside the _with_arena dispatch since the
-        // caller's `p.scale` is the only field that varies (and is
-        // passed in via params). For Qwen3.6 35B-A3B prefill, scale is
-        // constant 1.0 across layers but we keep the per-call rebuild
-        // safety pattern of the non-arena variant.
-        let chunk_o_params_buf = build_gated_delta_net_chunk_o_params(
-            device,
-            GatedDeltaNetChunkOParams {
-                b,
-                t,
-                hg,
-                h,
-                k,
-                v,
-                bt,
-                scale: 1.0,
-            },
-        )?;
-
-        // Pre-fill the cumsum params (the only one we don't fill via a
-        // sub-kernel build_*_params helper).
-        let mut cumsum_params_buf = cumsum_params_buf;
-        {
-            let s = cumsum_params_buf.as_mut_slice::<u32>()?;
-            s[0] = b;
-            s[1] = t;
-            s[2] = h;
-            s[3] = bt;
-            s[4] = nt;
-        }
+            }),
+        );
+        let mut invert_params_buf = allocate(InvertParams)?;
+        invert_params_buf.as_mut_slice::<u32>()?.copy_from_slice(
+            &crate::ops::chunk_gated_delta_rule_tri_solve_invert::chunk_tri_solve_invert_param_words(
+                ChunkTriSolveInvertParams { b, t, h, bt },
+            ),
+        );
+        let mut recompute_wu_params_buf = allocate(RecomputeWuParams)?;
+        recompute_wu_params_buf
+            .as_mut_slice::<u32>()?
+            .copy_from_slice(
+                &crate::ops::gated_delta_net_recompute_wu::gated_delta_net_recompute_wu_param_words(
+                    GatedDeltaNetRecomputeWuParams {
+                        b,
+                        t,
+                        hg,
+                        h,
+                        k,
+                        v,
+                        bt,
+                    },
+                ),
+            );
+        let mut chunk_params_buf = allocate(ChunkParams)?;
+        chunk_params_buf.as_mut_slice::<u32>()?.copy_from_slice(
+            &crate::ops::gated_delta_net_chunk::gated_delta_net_chunk_param_words(
+                GatedDeltaNetChunkParams {
+                    b,
+                    t,
+                    hg,
+                    h,
+                    k,
+                    v,
+                    bt,
+                },
+            ),
+        );
+        // Scale remains initialized to1.0 and overwritten by existing per-call
+        // dispatch logic; this plan does not change its value or lifetime.
+        let mut chunk_o_params_buf = allocate(ChunkOParams)?;
+        chunk_o_params_buf.as_mut_slice::<u32>()?.copy_from_slice(
+            &crate::ops::gated_delta_net_chunk_o::gated_delta_net_chunk_o_param_words(
+                GatedDeltaNetChunkOParams {
+                    b,
+                    t,
+                    hg,
+                    h,
+                    k,
+                    v,
+                    bt,
+                    scale: 1.0,
+                },
+            ),
+        );
+        cumsum_params_buf
+            .as_mut_slice::<u32>()?
+            .copy_from_slice(&chunk_cumsum_param_words(b, t, h, bt));
 
         Ok(Self {
             g_cumsum_buf,
@@ -961,7 +918,7 @@ impl ChunkInternalArena {
 ///
 /// Threads through caller-owned [`ChunkInternalArena`] slots instead of
 /// allocating fresh `MlxBuffer`s for each of the 7 large internal
-/// scratches + 5 small param buffers. Otherwise byte-identical:
+/// scratches + 6 small param buffers. Otherwise byte-identical:
 /// same encoder choreography, same memory_barrier placement, same
 /// `commit_and_wait` discipline (driven by the caller's encoder).
 ///
