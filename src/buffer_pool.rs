@@ -20,6 +20,10 @@
 //! that `reset` can bulk-recycle without requiring callers to enumerate every
 //! buffer individually.  ARC retain on `metal::Buffer` is cheap (refcount inc).
 
+#[path = "buffer_pool/growth.rs"]
+mod growth;
+pub use growth::GrowthLimitedMlxBufferPool;
+
 use std::collections::HashMap;
 
 use crate::buffer::MlxBuffer;
@@ -51,6 +55,7 @@ use crate::error::{MlxError, Result};
 /// cost amortizes to near zero.  See ADR-012 §Optimize / Task #15 for the
 /// MoE dwq46 0.90× parity gap that motivated this work.
 pub struct MlxBufferPool {
+    growth: Option<crate::legacy_growth::Binding>,
     /// Free buffers keyed by their power-of-two bucket size.
     free: HashMap<usize, Vec<metal::Buffer>>,
     /// Buffers handed out by [`alloc`] since the last [`reset`].  Each entry
@@ -77,6 +82,7 @@ impl MlxBufferPool {
     /// [`alloc`] at every call site, so the pool itself is lifetime-free.
     pub fn new() -> Self {
         Self {
+            growth: None,
             free: HashMap::new(),
             in_use: Vec::new(),
             residency_set: None,
@@ -168,56 +174,53 @@ impl MlxBufferPool {
         shape: Vec<usize>,
         zero_fresh: bool,
     ) -> Result<(MlxBuffer, bool)> {
-        let bucket = bucket_size(byte_len);
-        let mut added_residency = false;
-
-        // Try to reuse a free buffer from this bucket.
-        let metal_buf = self
-            .free
-            .get_mut(&bucket)
-            .and_then(|free_list| free_list.pop());
-
-        let metal_buf = match metal_buf {
-            Some(b) => b,
+        let (bucket, metal_buf, fresh) = match &self.growth {
+            Some(binding) => binding.select(device, byte_len, shape.len(), &mut self.free)?,
             None => {
-                // Fresh allocation at bucket size.
-                let raw = device.new_shared_buffer(bucket)?;
-                // ADR-015 iter61a-2 (broken-window B-W-1 residual fix): `alloc`
-                // and `alloc_batch` zero-init every fresh pool allocation. The
-                // same MTLResourceOptions::
-                // StorageModeShared recycling that affects MlxDevice::alloc_buffer
-                // (closed in iter61a, src/device.rs) ALSO affects the pool's
-                // fresh-allocation path. iter61a closed device-direct allocations
-                // but the per-decode-token / per-prefill-chunk arena pool grew its
-                // free list via this `new_buffer` call without zero-init — so on
-                // the FIRST cold-process prefill (where the pool is empty and
-                // every alloc takes the fresh path), kernels reading scratch /
-                // intermediate buffers before fully populating them propagated
-                // recycled-page garbage into logits. Empirically: 5/5 cold-run
-                // first-token logit dumps on 27B-dwq46 produced 5 distinct
-                // hashes, with max abs logit diff up to 5.06 across runs and
-                // 248044/248044 logits differing — far above kernel-reduction
-                // ULP noise, consistent with structural memory contamination.
-                //
-                // Cost: one memset per fresh allocation. Reused buffers skip
-                // this entirely. `alloc_uninitialized` also skips it for
-                // graphs whose callers have proven complete producer coverage.
-                //
-                // Safety: `raw.contents()` is non-null (verified above), points
-                // to exactly `bucket` bytes of `StorageModeShared` memory we
-                // just allocated and have exclusive access to. The buffer is
-                // not yet wrapped in `MlxBuffer` and not yet in `in_use` /
-                // residency set, so no other thread or GPU dispatch references
-                // it. Writing zero bytes is well-defined for any DType.
-                if zero_fresh {
-                    unsafe {
-                        std::ptr::write_bytes(raw.contents() as *mut u8, 0, bucket);
-                    }
+                let bucket = bucket_size(byte_len);
+                match self.free.get_mut(&bucket).and_then(|list| list.pop()) {
+                    Some(buffer) => (bucket, buffer, false),
+                    None => (bucket, device.new_shared_buffer(bucket)?, true),
                 }
-                added_residency = self.register_residency_allocation(device, &raw)?;
-                raw
             }
         };
+        let mut added_residency = false;
+        if fresh {
+            let raw = &metal_buf;
+            // ADR-015 iter61a-2 (broken-window B-W-1 residual fix): `alloc`
+            // and `alloc_batch` zero-init every fresh pool allocation. The
+            // same MTLResourceOptions::
+            // StorageModeShared recycling that affects MlxDevice::alloc_buffer
+            // (closed in iter61a, src/device.rs) ALSO affects the pool's
+            // fresh-allocation path. iter61a closed device-direct allocations
+            // but the per-decode-token / per-prefill-chunk arena pool grew its
+            // free list via this `new_buffer` call without zero-init — so on
+            // the FIRST cold-process prefill (where the pool is empty and
+            // every alloc takes the fresh path), kernels reading scratch /
+            // intermediate buffers before fully populating them propagated
+            // recycled-page garbage into logits. Empirically: 5/5 cold-run
+            // first-token logit dumps on 27B-dwq46 produced 5 distinct
+            // hashes, with max abs logit diff up to 5.06 across runs and
+            // 248044/248044 logits differing — far above kernel-reduction
+            // ULP noise, consistent with structural memory contamination.
+            //
+            // Cost: one memset per fresh allocation. Reused buffers skip
+            // this entirely. `alloc_uninitialized` also skips it for
+            // graphs whose callers have proven complete producer coverage.
+            //
+            // Safety: `raw.contents()` is non-null (verified above), points
+            // to exactly `bucket` bytes of `StorageModeShared` memory we
+            // just allocated and have exclusive access to. The buffer is
+            // not yet wrapped in `MlxBuffer` and not yet in `in_use` /
+            // residency set, so no other thread or GPU dispatch references
+            // it. Writing zero bytes is well-defined for any DType.
+            if zero_fresh {
+                unsafe {
+                    std::ptr::write_bytes(raw.contents() as *mut u8, 0, bucket);
+                }
+            }
+            added_residency = self.register_residency_allocation(device, raw)?;
+        }
 
         // Track the handout so reset() can recycle it.  ARC clone is cheap.
         self.in_use.push((bucket, metal_buf.clone()));
