@@ -467,3 +467,21 @@ impl std::fmt::Debug for MlxDevice {
             .finish()
     }
 }
+
+#[cfg(test)]
+impl MlxDevice {
+    pub(crate) fn bounded_pool_test_other_queue(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            queue: self.device.new_command_queue(),
+            residency_set: self.residency_set.clone(),
+        }
+    }
+    pub(crate) fn bounded_pool_test_without_residency(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            residency_set: None,
+        }
+    }
+}
