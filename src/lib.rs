@@ -48,6 +48,7 @@
 mod error;
 mod buffer;
 mod buffer_pool;
+mod bounded_pool;
 pub mod affine_capability;
 mod device;
 mod dtypes;
@@ -92,6 +93,10 @@ pub use ggml_dispatch_trace::{
 };
 pub use ggml_routing_policy::ggml_routing_policy_from_environment;
 pub use buffer_pool::MlxBufferPool;
+pub use bounded_pool::{
+    BoundedMlxBufferPool, BoundedPoolConfig, BoundedPoolError, BoundedPoolSnapshot, PoolLease,
+    PoolRequest, ProcessPoolAuthority, ProcessPoolLimits, ReturnFailure,
+};
 pub use device::MlxDevice;
 pub use dtypes::DType;
 pub use encoder::{

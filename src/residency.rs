@@ -77,6 +77,10 @@ pub(crate) struct ResidencySet {
 }
 
 impl ResidencySet {
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     /// Create a new `MTLResidencySet`.
     ///
     /// On macOS versions before 15.0 this returns a true no-op wrapper without
