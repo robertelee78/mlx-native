@@ -540,3 +540,9 @@ fn dispatch_deepseek_indexer_into_with_score_kernel(
     );
     Ok(())
 }
+
+mod query_tiles;
+pub use query_tiles::{
+    deepseek_indexer_query_tile_plan, dispatch_deepseek_indexer_into_mma_tiled,
+    DeepSeekIndexerQueryTilePlan,
+};
