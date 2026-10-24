@@ -136,6 +136,19 @@ jobs:
             --test command_buffer_autorelease \
             --test test_cb_label_propagation \
             -- --test-threads=1
+          # Verify the published payload includes and executes every witness,
+          # rather than accepting a successful zero-test filter.
+          crate_root="$unpacked/mlx-native-${EXPECTED_VERSION}"
+          witness="$crate_root/src/device/mapped_backing_tests.rs"
+          test -f "$witness"
+          expected=$(grep -c '^#\[test\]' "$witness")
+          test "$expected" -gt 0
+          listing=$(cargo +1.96.0 test --locked --manifest-path "$crate_root/Cargo.toml" \
+            --lib device::mapped_backing_tests -- --list)
+          observed=$(printf '%s\n' "$listing" | grep -c '^device::mapped_backing_tests::.*: test$' || true)
+          test "$observed" -eq "$expected"
+          cargo +1.96.0 test --locked --manifest-path "$crate_root/Cargo.toml" \
+            --lib device::mapped_backing_tests -- --nocapture --test-threads=1
 
       - name: Tag and create GitHub release
         env:

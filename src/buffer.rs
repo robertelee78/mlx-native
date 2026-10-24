@@ -65,8 +65,9 @@ pub struct MlxBuffer {
 /// at most one commit per CB submission.
 pub(crate) struct MlxBufferStorage {
     // Keep the Metal object before `file_backing`: Rust drops fields in
-    // declaration order after `Drop::drop`, so Metal releases its no-copy
-    // view before the mmap that supplies the bytes is unmapped.
+    // declaration order after `Drop::drop`. This releases the wrapper's Metal
+    // reference before its backing reference; separately retained Metal owners
+    // keep backing alive through the resource's captured deallocator block.
     inner: MetalBuffer,
     residency_set: Option<ResidencySet>,
     file_backing: Option<Arc<Mmap>>,

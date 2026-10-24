@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
@@ -31,6 +31,7 @@ default = []
 test-utils = []
 
 [dependencies]
+block = "=0.1.6"
 metal = "0.33"
 objc = "0.2"
 thiserror = "2"
