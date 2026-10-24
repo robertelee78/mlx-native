@@ -22,6 +22,10 @@ use crate::residency::{macos_15_or_newer, residency_disabled_by_env, ResidencySe
 #[path = "device/mapped_backing_tests.rs"]
 mod mapped_backing_tests;
 
+#[cfg(test)]
+#[path = "device/allocation_metric_tests.rs"]
+mod allocation_metric_tests;
+
 pub(crate) fn metal_device_registry_id(device: &metal::DeviceRef) -> u64 {
     // SAFETY: `registryID` is a read-only MTLDevice property available on
     // every macOS version supported by mlx-native. `device` is a live retained
