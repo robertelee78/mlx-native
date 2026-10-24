@@ -23,6 +23,14 @@ use crate::residency::{macos_15_or_newer, residency_disabled_by_env, ResidencySe
 mod mapped_backing_tests;
 
 #[cfg(test)]
+#[path = "device/shared_heap_tests.rs"]
+mod shared_heap_tests;
+
+#[cfg(test)]
+#[path = "device/shared_heap_gpu_tests.rs"]
+mod shared_heap_gpu_tests;
+
+#[cfg(test)]
 #[path = "device/allocation_metric_tests.rs"]
 mod allocation_metric_tests;
 
