@@ -1382,4 +1382,9 @@ fn test_backward_gqa_accumulation() {
     assert_close(&gpu_dv, &ref_dv, 5e-3, "gqa_bwd_dV");
 }
 
+mod selected_shader_runtime {
+    use super::*;
+    include!("support/selected_train_runtime.rs");
+}
+
 } // mod flash_attn_train_tests

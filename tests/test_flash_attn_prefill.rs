@@ -5972,6 +5972,11 @@ fn test_gpu_f16_d256_with_blk_smoke() {
     );
 }
 
+mod selected_shader_runtime {
+    use super::*;
+    include!("support/selected_prefill_runtime.rs");
+}
+
 } // mod flash_attn_prefill_tests
 
 // ─── Non-macOS stub ───────────────────────────────────────────────────────────

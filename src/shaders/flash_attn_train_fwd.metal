@@ -544,15 +544,15 @@ struct MMATile {
     for (short i = 0; i < kNumFrags; ++i) val_frags[i] = frag_type(0);
   }
 
-  METAL_FUNC constexpr thread frag_type& frag_at(short i, short j) {
+  METAL_FUNC constexpr thread frag_type& frag_at(short i, short j) thread {
     return val_frags[i * kTileCols + j];
   }
-  METAL_FUNC constexpr const thread frag_type& frag_at(short i, short j) const {
+  METAL_FUNC constexpr const thread frag_type& frag_at(short i, short j) const thread {
     return val_frags[i * kTileCols + j];
   }
 
   template <typename Op>
-  METAL_FUNC void row_reduce(thread T vals[kRowsPerThread]) const {
+  METAL_FUNC void row_reduce(thread T vals[kRowsPerThread]) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i)
       STEEL_PRAGMA_UNROLL
@@ -561,7 +561,7 @@ struct MMATile {
   }
 
   template <typename Op>
-  METAL_FUNC void row_bin_op(thread T vals[kRowsPerThread]) {
+  METAL_FUNC void row_bin_op(thread T vals[kRowsPerThread]) thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i)
       STEEL_PRAGMA_UNROLL
@@ -571,7 +571,7 @@ struct MMATile {
 
   // Load from threadgroup (str_x, str_y as compile-time constants)
   template <typename U, int w_x, int w_y, int str_x, int str_y>
-  METAL_FUNC void load(const threadgroup U* src) {
+  METAL_FUNC void load(const threadgroup U* src) thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i)
       STEEL_PRAGMA_UNROLL
@@ -583,7 +583,7 @@ struct MMATile {
 
   // Store to device (w_x, w_y direction, ld runtime stride)
   template <typename U, int w_x, int w_y>
-  METAL_FUNC void store(device U* dst, const int ld) const {
+  METAL_FUNC void store(device U* dst, const int ld) const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i)
       STEEL_PRAGMA_UNROLL
@@ -595,7 +595,7 @@ struct MMATile {
 
   // Store to device with bounds check
   template <typename U, int w_x, int w_y>
-  METAL_FUNC void store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
+  METAL_FUNC void store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const thread {
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < kTileRows; ++i)
       STEEL_PRAGMA_UNROLL
