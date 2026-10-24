@@ -70,3 +70,16 @@ jobs:
             --test command_buffer_autorelease \
             --test test_cb_label_propagation \
             -- --test-threads=1
+          # Exercise the library regression from the unpacked crate too;
+          # integration-test selectors above do not run library unit tests.
+          crate_root="$unpacked/mlx-native-${version}"
+          witness="$crate_root/src/device/mapped_backing_tests.rs"
+          test -f "$witness"
+          expected=$(grep -c '^#\[test\]' "$witness")
+          test "$expected" -gt 0
+          listing=$(cargo +1.96.0 test --locked --manifest-path "$crate_root/Cargo.toml" \
+            --lib device::mapped_backing_tests -- --list)
+          observed=$(printf '%s\n' "$listing" | grep -c '^device::mapped_backing_tests::.*: test$' || true)
+          test "$observed" -eq "$expected"
+          cargo +1.96.0 test --locked --manifest-path "$crate_root/Cargo.toml" \
+            --lib device::mapped_backing_tests -- --nocapture --test-threads=1

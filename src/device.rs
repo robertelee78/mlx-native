@@ -18,6 +18,10 @@ use crate::encoder_session::EncoderSession;
 use crate::error::{MlxError, Result};
 use crate::residency::{macos_15_or_newer, residency_disabled_by_env, ResidencySet};
 
+#[cfg(test)]
+#[path = "device/mapped_backing_tests.rs"]
+mod mapped_backing_tests;
+
 pub(crate) fn metal_device_registry_id(device: &metal::DeviceRef) -> u64 {
     // SAFETY: `registryID` is a read-only MTLDevice property available on
     // every macOS version supported by mlx-native. `device` is a live retained
@@ -132,23 +136,22 @@ impl MlxDevice {
             )));
         }
 
-        let deallocator: *mut objc::runtime::Object = std::ptr::null_mut();
-        let raw: *mut metal::MTLBuffer = unsafe {
-            objc::msg_send![
-                &*self.device,
-                newBufferWithBytesNoCopy: mapped_ptr as *const std::ffi::c_void
-                length: mapped_len as u64
-                options: MTLResourceOptions::StorageModeShared
-                deallocator: deallocator
-            ]
-        };
-        if raw.is_null() {
-            return Err(MlxError::BufferAllocationError { bytes: mapped_len });
-        }
-
-        // SAFETY: the Objective-C initializer returned a non-null owned Metal
-        // buffer. `MlxBufferStorage` releases it before dropping `file_backing`.
-        let metal_buf = unsafe { metal::Buffer::from_ptr(raw) };
+        let metal_buf =
+            mapped_resource_with(Arc::clone(&file_backing), mapped_len, |deallocator| {
+                // SAFETY: the validated pointer and page-rounded length describe
+                // this mapping. The heap-copied block has the metal-rs/SDK ABI;
+                // Metal retains it for the no-copy resource's lifetime. Keep the
+                // raw nullable result rather than wrapping nil in metal::Buffer.
+                unsafe {
+                    objc::msg_send![
+                        &*self.device,
+                        newBufferWithBytesNoCopy: mapped_ptr as *const std::ffi::c_void
+                        length: mapped_len as metal::NSUInteger
+                        options: MTLResourceOptions::StorageModeShared
+                        deallocator: deallocator
+                    ]
+                }
+            })?;
         Ok(MlxBuffer::from_file_mapping(
             metal_buf,
             dtype,
@@ -394,6 +397,39 @@ impl MlxDevice {
     pub fn registry_id(&self) -> u64 {
         metal_device_registry_id(&self.device)
     }
+}
+
+/// The same ownership boundary is used by the real constructor and the tiny
+/// deterministic nil-result test. The block never owns a Metal object, so
+/// there is no resource/block cycle. Its capture, not an extra mmap, owns the
+/// backing through raw Metal clones, recorded bindings and retained commands.
+fn mapped_resource_with(
+    backing: Arc<Mmap>,
+    mapped_len: usize,
+    create: impl FnOnce(
+        &block::Block<(*const std::ffi::c_void, metal::NSUInteger), ()>,
+    ) -> *mut metal::MTLBuffer,
+) -> Result<metal::Buffer> {
+    let callback = move |_pointer: *const std::ffi::c_void, _length: metal::NSUInteger| {
+        // The Fn callback does not consume the Arc or touch payload. The
+        // block dispose helper drops the capture after the final block owner;
+        // never free/munmap Metal's pointer independently of memmap2.
+        let _keep_backing_alive = &backing;
+    };
+    // Metal may invoke/dispose on another thread. Check the captured closure,
+    // without claiming RcBlock itself can be transferred across threads.
+    fn require_send_sync<T: Send + Sync>(_: &T) {}
+    require_send_sync(&callback);
+    let deallocator = block::ConcreteBlock::new(callback).copy();
+    let raw = create(&deallocator);
+    if raw.is_null() {
+        // Normal RcBlock disposal releases the capture even when Metal never
+        // invokes the deallocator. No into_raw/callback-only rollback owner.
+        return Err(MlxError::BufferAllocationError { bytes: mapped_len });
+    }
+    // SAFETY: create returned a nonnull owned (+1) Metal buffer. The actual
+    // constructor retains its deallocator; the local block owner can end.
+    Ok(unsafe { metal::Buffer::from_ptr(raw) })
 }
 
 fn host_page_size() -> Result<usize> {
