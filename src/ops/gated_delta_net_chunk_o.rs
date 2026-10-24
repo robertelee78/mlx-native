@@ -361,22 +361,36 @@ pub fn build_gated_delta_net_chunk_o_params(
     device: &crate::MlxDevice,
     p: GatedDeltaNetChunkOParams,
 ) -> Result<MlxBuffer> {
-    let mut buf = device.alloc_buffer(11 * 4, DType::U32, vec![11])?;
-    {
-        let s = buf.as_mut_slice::<u32>()?;
-        s[0] = p.b;
-        s[1] = p.t;
-        s[2] = p.hg;
-        s[3] = p.h;
-        s[4] = p.k;
-        s[5] = p.v;
-        s[6] = p.bt;
-        s[7] = p.num_chunks();
-        s[8] = DEFAULT_BK;
-        s[9] = DEFAULT_BV;
-        s[10] = p.scale.to_bits();
-    }
+    let mut buf = device.alloc_buffer(
+        CHUNK_O_PARAM_WORDS * 4,
+        DType::U32,
+        vec![CHUNK_O_PARAM_WORDS],
+    )?;
+    buf.as_mut_slice::<u32>()?
+        .copy_from_slice(&gated_delta_net_chunk_o_param_words(p));
+
     Ok(buf)
+}
+
+pub(crate) const CHUNK_O_PARAM_WORDS: usize = 11;
+
+/// Shared serialization used by standalone builders and the arena.
+pub(crate) fn gated_delta_net_chunk_o_param_words(
+    p: GatedDeltaNetChunkOParams,
+) -> [u32; CHUNK_O_PARAM_WORDS] {
+    [
+        p.b,
+        p.t,
+        p.hg,
+        p.h,
+        p.k,
+        p.v,
+        p.bt,
+        p.num_chunks(),
+        DEFAULT_BK,
+        DEFAULT_BV,
+        p.scale.to_bits(),
+    ]
 }
 
 #[cfg(test)]
@@ -439,4 +453,3 @@ mod tests {
         );
     }
 }
-

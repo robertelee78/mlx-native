@@ -199,6 +199,13 @@ fn test_chunk_gated_delta_rule_fwd_matches_fla_reference() {
         "final_state length mismatch"
     );
 
+    // Reject non-finite values explicitly: NaN can evade ordered error checks.
+    assert!(got_o.iter().chain(ref_o.iter()).all(|value| value.is_finite()));
+    assert!(got_final_state
+        .iter()
+        .chain(ref_final_state.iter())
+        .all(|value| value.is_finite()));
+
     // End-to-end tolerance bar — 6 bf16 stages compound (looser than the
     // 5e-3 atol / 2e-2 rtol bar each per-kernel test uses individually).
     let o_atol: f32 = 1e-2;
