@@ -48,6 +48,7 @@
 mod error;
 mod buffer;
 mod buffer_pool;
+mod legacy_growth;
 mod bounded_pool;
 pub mod affine_capability;
 mod device;
@@ -92,7 +93,11 @@ pub use ggml_dispatch_trace::{
     GgmlResolvedKernelRoute, GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION,
 };
 pub use ggml_routing_policy::ggml_routing_policy_from_environment;
-pub use buffer_pool::MlxBufferPool;
+pub use buffer_pool::{GrowthLimitedMlxBufferPool, MlxBufferPool};
+pub use legacy_growth::{
+    GrowthBucket, GrowthCounts, GrowthPoolKey, GrowthQuota, LegacyGrowthLimits,
+    LegacyGrowthSnapshot, LegacyPoolGrowthAuthority,
+};
 pub use bounded_pool::{
     BoundedMlxBufferPool, BoundedPoolConfig, BoundedPoolError, BoundedPoolSnapshot, PoolLease,
     PoolRequest, ProcessPoolAuthority, ProcessPoolLimits, ReturnFailure,
