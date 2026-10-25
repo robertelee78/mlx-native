@@ -452,16 +452,24 @@ pub fn safetensors_to_metal_buffer(
 
     let byte_len = data.len();
     let metal_buf = device.new_shared_buffer(byte_len)?;
+    let publication = crate::root_authority::publication_guard();
+    metal_buf.check_device(device.metal_device())?;
 
     // Copy tensor bytes into the Metal buffer.
     // SAFETY: Metal guarantees the buffer contents pointer is valid for
     // `byte_len` bytes.  The source slice is valid for `byte_len` bytes.
     // The regions do not overlap (one is mmap, the other is Metal allocation).
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), metal_buf.contents() as *mut u8, byte_len);
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            metal_buf.metal().contents() as *mut u8,
+            byte_len,
+        );
     }
 
-    Ok(MlxBuffer::from_raw(metal_buf, dtype, shape))
+    let buffer = MlxBuffer::from_known(metal_buf, dtype, shape)?;
+    publication.complete();
+    Ok(buffer)
 }
 
 // ---------------------------------------------------------------------------

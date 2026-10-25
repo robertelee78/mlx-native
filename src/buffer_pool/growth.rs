@@ -128,7 +128,7 @@ impl GrowthLimitedMlxBufferPool {
             for buffer in list.drain(..) {
                 if let Some(root) = self.inner.resident_buffers.remove(&buffer_key(&buffer)) {
                     if let Some(set) = &self.inner.residency_set {
-                        set.remove_allocation(&root);
+                        set.remove_allocation(root.metal());
                         removed = true;
                     }
                 }

@@ -86,6 +86,8 @@ pub mod repeat_tiled;
 pub mod rms_norm;
 pub mod rope;
 mod rope_freqs;
+#[cfg(test)]
+pub(crate) use rope_freqs::with_inv_freqs as native57_control_with_inv_freqs;
 pub mod rope_multi;
 pub mod rope_train;
 pub mod row_sum;

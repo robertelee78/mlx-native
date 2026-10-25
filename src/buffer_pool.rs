@@ -57,18 +57,18 @@ use crate::error::{MlxError, Result};
 pub struct MlxBufferPool {
     growth: Option<crate::legacy_growth::Binding>,
     /// Free buffers keyed by their power-of-two bucket size.
-    free: HashMap<usize, Vec<metal::Buffer>>,
+    free: HashMap<usize, Vec<crate::root_authority::KnownRoot>>,
     /// Buffers handed out by [`alloc`] since the last [`reset`].  Each entry
     /// holds an ARC-cloned `metal::Buffer` so the pool's reference keeps the
     /// underlying GPU allocation alive even after the caller's `MlxBuffer`
     /// goes out of scope.  [`reset`] drains this into [`free`].
-    in_use: Vec<(usize, metal::Buffer)>,
+    in_use: Vec<(usize, crate::root_authority::KnownRoot)>,
     /// Residency set that owns the allocations registered by this pool.
     residency_set: Option<crate::residency::ResidencySet>,
     /// Unique Metal buffers this pool added to the residency set, keyed by
     /// their stable contents pointer. This avoids double-removing buffers if
     /// callers mix release/reset despite that pattern being unsupported.
-    resident_buffers: HashMap<usize, metal::Buffer>,
+    resident_buffers: HashMap<usize, crate::root_authority::KnownRoot>,
 }
 
 impl Default for MlxBufferPool {
@@ -178,12 +178,17 @@ impl MlxBufferPool {
             Some(binding) => binding.select(device, byte_len, shape.len(), &mut self.free)?,
             None => {
                 let bucket = bucket_size(byte_len);
+                if let Some(root) = self.free.get(&bucket).and_then(|list| list.last()) {
+                    root.check_device(device.metal_device())?;
+                }
                 match self.free.get_mut(&bucket).and_then(|list| list.pop()) {
                     Some(buffer) => (bucket, buffer, false),
                     None => (bucket, device.new_shared_buffer(bucket)?, true),
                 }
             }
         };
+        let publication = crate::root_authority::publication_guard();
+        metal_buf.check_device(device.metal_device())?;
         let mut added_residency = false;
         if fresh {
             let raw = &metal_buf;
@@ -208,7 +213,7 @@ impl MlxBufferPool {
             // this entirely. `alloc_uninitialized` also skips it for
             // graphs whose callers have proven complete producer coverage.
             //
-            // Safety: `raw.contents()` is non-null (verified above), points
+            // Safety: `raw.metal().contents()` is non-null (verified above), points
             // to exactly `bucket` bytes of `StorageModeShared` memory we
             // just allocated and have exclusive access to. The buffer is
             // not yet wrapped in `MlxBuffer` and not yet in `in_use` /
@@ -216,7 +221,7 @@ impl MlxBufferPool {
             // it. Writing zero bytes is well-defined for any DType.
             if zero_fresh {
                 unsafe {
-                    std::ptr::write_bytes(raw.contents() as *mut u8, 0, bucket);
+                    std::ptr::write_bytes(raw.metal().contents() as *mut u8, 0, bucket);
                 }
             }
             added_residency = self.register_residency_allocation(device, raw)?;
@@ -231,9 +236,10 @@ impl MlxBufferPool {
         // breaks strict kernel boundaries (for example a 20 KiB Q4_K
         // embedding row lives in a 32 KiB bucket) and lets overlap/size
         // validation reason about bytes outside the tensor.
-        let bucket_view = MlxBuffer::from_raw(metal_buf, dtype, shape.clone());
+        let bucket_view = MlxBuffer::from_known(metal_buf, dtype, shape.clone())?;
         let logical_view = bucket_view.data_view(0, byte_len, dtype, shape)?;
 
+        publication.complete();
         Ok((logical_view, added_residency))
     }
 
@@ -260,6 +266,9 @@ impl MlxBufferPool {
         }
         let bucket = bucket_size(buffer.byte_len());
         let metal_buf = buffer.into_inner();
+        if metal_buf.check().is_err() {
+            return;
+        }
         self.free.entry(bucket).or_default().push(metal_buf);
     }
 
@@ -346,6 +355,9 @@ impl MlxBufferPool {
     /// Returns `MlxError::InvalidArgument` if the buffer was allocated on a
     /// different `MlxDevice` than any previously registered buffer.
     pub fn register_existing(&mut self, device: &MlxDevice, buffer: &MlxBuffer) -> Result<()> {
+        buffer
+            .known_root_clone()
+            .check_device(device.metal_device())?;
         // ADR-015 iter8e (Phase 3b): MlxDevice::alloc_buffer now
         // auto-registers each new buffer with the device's residency set
         // via Arc<MlxBufferStorage>. If this caller's buffer already owns
@@ -381,7 +393,7 @@ impl MlxBufferPool {
             return Ok(());
         }
 
-        let added = self.register_residency_allocation(device, buffer.metal_buffer())?;
+        let added = self.register_residency_allocation(device, &buffer.known_root_clone())?;
         if added {
             if let Some(set) = self.residency_set.as_ref() {
                 // Batched-add path: explicit commit (counts in the
@@ -420,7 +432,7 @@ impl MlxBufferPool {
             for metal_buf in self.free.values().flatten() {
                 let key = buffer_key(metal_buf);
                 if let Some(resident_buf) = self.resident_buffers.remove(&key) {
-                    set.remove_allocation(&resident_buf);
+                    set.remove_allocation(resident_buf.metal());
                     removed_any = true;
                 }
             }
@@ -436,7 +448,7 @@ impl MlxBufferPool {
     fn register_residency_allocation(
         &mut self,
         device: &MlxDevice,
-        buffer: &metal::Buffer,
+        buffer: &crate::root_authority::KnownRoot,
     ) -> Result<bool> {
         let Some(device_set) = device.residency_set() else {
             return Ok(false);
@@ -473,7 +485,8 @@ impl MlxBufferPool {
         // MTLBuffer is somehow already-known to Apple's set despite our
         // HashMap saying it isn't. Logged BEFORE the addAllocation so the
         // log line precedes any abort.
-        let mtl_ptr = (&**buffer as *const metal::BufferRef as *const std::ffi::c_void) as usize;
+        let mtl_ptr =
+            (&**buffer.metal() as *const metal::BufferRef as *const std::ffi::c_void) as usize;
         let dup = self.resident_buffers.contains_key(&key);
         if std::env::var("HF2Q_PROFILE_RESIDENCY_ABORT").is_ok() {
             eprintln!(
@@ -486,7 +499,7 @@ impl MlxBufferPool {
         }
 
         if !dup {
-            device_set.add_allocation(buffer);
+            device_set.add_allocation(buffer.metal());
             self.resident_buffers.insert(key, buffer.clone());
             return Ok(true);
         }
@@ -504,7 +517,7 @@ impl MlxBufferPool {
         }
 
         for buffer in self.resident_buffers.values() {
-            set.remove_allocation(buffer);
+            set.remove_allocation(buffer.metal());
         }
         set.commit();
         self.resident_buffers.clear();
@@ -528,8 +541,8 @@ fn bucket_size(n: usize) -> usize {
 }
 
 #[inline]
-fn buffer_key(buffer: &metal::Buffer) -> usize {
-    buffer.contents() as usize
+fn buffer_key(buffer: &crate::root_authority::KnownRoot) -> usize {
+    buffer.metal().contents() as usize
 }
 
 #[cfg(test)]
@@ -842,5 +855,32 @@ mod tests {
             .expect("alloc 2");
         assert_eq!(pool.free_count(), 0);
         assert_eq!(pool.in_use_count(), 2);
+    }
+
+    #[test]
+    #[ignore = "requires separately reviewed 1024-byte Metal allocation control"]
+    fn test_pool_release_view_preserves_root_extent_bucket() {
+        use metal::foreign_types::ForeignType;
+
+        let device = MlxDevice::new().expect("device");
+        let mut pool = MlxBufferPool::new();
+        let parent = device
+            .alloc_buffer(1024, DType::F32, vec![256])
+            .expect("parent");
+        let view = parent.slice_view(0, 16);
+        assert_eq!(view.data_byte_len(), 64);
+        assert_eq!(view.byte_len(), 1024);
+        assert_eq!(view.metal_buffer().length(), 1024);
+        let identity = parent.metal_buffer().as_ptr() as usize;
+        drop(parent);
+        pool.release(view);
+        assert_eq!(pool.free.get(&bucket_size(1024)).map(Vec::len), Some(1));
+        assert!(!pool.free.contains_key(&bucket_size(64)));
+        let reused = pool
+            .alloc(&device, 1024, DType::F32, vec![256])
+            .expect("reuse");
+        assert_eq!(reused.metal_buffer().as_ptr() as usize, identity);
+        assert_eq!(pool.free_count(), 0);
+        println!("NATIVE57_ACTUAL_LEGACY_VIEW_COMPLETE roots=1 bytes=1024 logical=64 gpu=false");
     }
 }
