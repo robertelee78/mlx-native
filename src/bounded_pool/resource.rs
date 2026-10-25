@@ -8,6 +8,7 @@ pub(super) fn options() -> metal::MTLResourceOptions {
         | metal::MTLResourceOptions::HazardTrackingModeTracked
 }
 pub(super) fn heap(device: &MlxDevice, bytes: u64) -> Result<metal::Heap> {
+    crate::root_authority::require_no_heap().map_err(|_| E::Unsupported)?;
     #[cfg(test)]
     if faults::heap_call() {
         return Err(E::AllocationFailed);
@@ -92,6 +93,7 @@ impl Identity {
 }
 
 pub(super) fn child(heap: &metal::HeapRef, bytes: u64) -> Option<metal::Buffer> {
+    crate::root_authority::require_no_heap().ok()?;
     #[cfg(test)]
     if faults::child_call() {
         return None;

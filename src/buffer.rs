@@ -69,6 +69,7 @@ pub(crate) struct MlxBufferStorage {
     // reference before its backing reference; separately retained Metal owners
     // keep backing alive through the resource's captured deallocator block.
     inner: MetalBuffer,
+    origin: crate::root_authority::Origin,
     residency_set: Option<ResidencySet>,
     file_backing: Option<Arc<Mmap>>,
     cpu_writable: bool,
@@ -134,6 +135,7 @@ impl MlxBuffer {
         Self {
             storage: Arc::new(MlxBufferStorage {
                 inner,
+                origin: crate::root_authority::import_origin(),
                 residency_set: None,
                 file_backing: None,
                 cpu_writable: true,
@@ -158,11 +160,12 @@ impl MlxBuffer {
     /// Crate-private — external callers should go through
     /// [`MlxDevice::alloc_buffer`](crate::MlxDevice::alloc_buffer).
     pub(crate) fn with_residency(
-        inner: MetalBuffer,
+        root: crate::root_authority::KnownRoot,
         dtype: DType,
         shape: Vec<usize>,
         residency_set: ResidencySet,
     ) -> Self {
+        let (inner, origin) = root.into_parts();
         // Stage the addAllocation; the actual `[set commit]` is deferred to
         // the next encoder.commit* boundary via flush_pending. This is the
         // structural fix for the per-allocation commit storm; the
@@ -173,6 +176,7 @@ impl MlxBuffer {
         Self {
             storage: Arc::new(MlxBufferStorage {
                 inner,
+                origin,
                 residency_set: Some(residency_set),
                 file_backing: None,
                 cpu_writable: true,
@@ -190,7 +194,7 @@ impl MlxBuffer {
     /// Metal view. The mapping is retained by the shared storage so clones and
     /// slice views cannot outlive the file-backed bytes.
     pub(crate) fn from_file_mapping(
-        inner: MetalBuffer,
+        root: crate::root_authority::KnownRoot,
         dtype: DType,
         shape: Vec<usize>,
         byte_offset: u64,
@@ -198,6 +202,7 @@ impl MlxBuffer {
         file_backing: Arc<Mmap>,
         residency_set: Option<ResidencySet>,
     ) -> Self {
+        let (inner, origin) = root.into_parts();
         if let Some(set) = residency_set.as_ref() {
             set.add_allocation(&inner);
         }
@@ -205,6 +210,7 @@ impl MlxBuffer {
         Self {
             storage: Arc::new(MlxBufferStorage {
                 inner,
+                origin,
                 residency_set,
                 file_backing: Some(file_backing),
                 cpu_writable: false,
@@ -391,8 +397,43 @@ impl MlxBuffer {
     /// Pool-internal buffers do not carry guards, so this is a no-op for
     /// the pool's `release` path.
     #[inline]
-    pub(crate) fn into_inner(self) -> MetalBuffer {
-        self.storage.inner.clone()
+    pub(crate) fn into_inner(self) -> crate::root_authority::KnownRoot {
+        self.known_root_clone()
+    }
+
+    pub(crate) fn known_root_clone(&self) -> crate::root_authority::KnownRoot {
+        crate::root_authority::KnownRoot::from_parts(
+            self.storage.inner.clone(),
+            self.storage.origin.clone(),
+        )
+    }
+
+    pub(crate) fn from_known(
+        root: crate::root_authority::KnownRoot,
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<Self> {
+        root.check()?;
+        let (inner, origin) = root.into_parts();
+        let data_byte_len = inner.length() as usize;
+        Ok(Self {
+            storage: Arc::new(MlxBufferStorage {
+                inner,
+                origin,
+                residency_set: None,
+                file_backing: None,
+                cpu_writable: true,
+            }),
+            dtype,
+            shape,
+            byte_offset: 0,
+            data_byte_len,
+        })
+    }
+
+    /// Informational native lineage, not a physical-memory or import certificate.
+    pub fn root_origin_snapshot(&self) -> crate::RootOriginSnapshot {
+        self.known_root_clone().snapshot()
     }
 
     /// Borrow the residency set that this buffer was registered with, if any.

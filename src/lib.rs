@@ -519,3 +519,9 @@ mod tests {
         assert_eq!(pool.free_count(), 2, "Two different bucket sizes in pool");
     }
 }
+
+mod root_authority;
+pub use root_authority::{
+    NativeRootAuthority, RootAuthorityHandle, RootCreationLimits, RootCreationSnapshot,
+    RootOriginSnapshot,
+};

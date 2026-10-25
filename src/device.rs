@@ -75,26 +75,11 @@ impl MlxDevice {
     /// non-null assertion. Query the hard per-buffer limit up front, then
     /// request the raw Objective-C object and classify `nil` as the typed
     /// allocation error promised by mlx-native's public API.
-    pub(crate) fn new_shared_buffer(&self, byte_len: usize) -> Result<metal::Buffer> {
-        if byte_len == 0 || byte_len as u64 > self.device.max_buffer_length() as u64 {
-            return Err(MlxError::BufferAllocationError { bytes: byte_len });
-        }
-
-        let raw: *mut metal::MTLBuffer = unsafe {
-            objc::msg_send![
-                &*self.device,
-                newBufferWithLength: byte_len as u64
-                options: MTLResourceOptions::StorageModeShared
-            ]
-        };
-        if raw.is_null() {
-            return Err(MlxError::BufferAllocationError { bytes: byte_len });
-        }
-
-        // SAFETY: `newBufferWithLength:options:` returned a non-null owned
-        // (+1 retain-count) MTLBuffer. The wrapper assumes that ownership and
-        // releases it exactly once on drop.
-        Ok(unsafe { metal::Buffer::from_ptr(raw) })
+    pub(crate) fn new_shared_buffer(
+        &self,
+        byte_len: usize,
+    ) -> Result<crate::root_authority::KnownRoot> {
+        new_shared_on_device(self.metal_device(), byte_len, false)
     }
 
     /// Create a read-only Metal view over bytes in a file mapping.
@@ -149,22 +134,26 @@ impl MlxDevice {
         }
 
         let metal_buf =
-            mapped_resource_with(Arc::clone(&file_backing), mapped_len, |deallocator| {
-                // SAFETY: the validated pointer and page-rounded length describe
-                // this mapping. The heap-copied block has the metal-rs/SDK ABI;
-                // Metal retains it for the no-copy resource's lifetime. Keep the
-                // raw nullable result rather than wrapping nil in metal::Buffer.
-                unsafe {
-                    objc::msg_send![
-                        &*self.device,
-                        newBufferWithBytesNoCopy: mapped_ptr as *const std::ffi::c_void
-                        length: mapped_len as metal::NSUInteger
-                        options: MTLResourceOptions::StorageModeShared
-                        deallocator: deallocator
-                    ]
-                }
+            crate::root_authority::shared_with(self.metal_device(), mapped_len, false, || {
+                mapped_resource_with(Arc::clone(&file_backing), mapped_len, |deallocator| {
+                    // SAFETY: the validated pointer and page-rounded length describe
+                    // this mapping. The heap-copied block has the metal-rs/SDK ABI;
+                    // Metal retains it for the no-copy resource's lifetime. Keep the
+                    // raw nullable result rather than wrapping nil in metal::Buffer.
+                    unsafe {
+                        objc::msg_send![
+                            &*self.device,
+                            newBufferWithBytesNoCopy: mapped_ptr as *const std::ffi::c_void
+                            length: mapped_len as metal::NSUInteger
+                            options: MTLResourceOptions::StorageModeShared
+                            deallocator: deallocator
+                        ]
+                    }
+                })
             })?;
-        Ok(MlxBuffer::from_file_mapping(
+        let publication = crate::root_authority::publication_guard();
+        metal_buf.check_device(self.metal_device())?;
+        let buffer = MlxBuffer::from_file_mapping(
             metal_buf,
             dtype,
             shape,
@@ -172,7 +161,19 @@ impl MlxDevice {
             byte_len,
             file_backing,
             self.residency_set.clone(),
-        ))
+        );
+        publication.complete();
+        Ok(buffer)
+    }
+
+    /// Exact initialized shared upload, subject to an installed root authority.
+    pub fn upload_shared_bytes(
+        &self,
+        data: &[u8],
+        dtype: DType,
+        shape: Vec<usize>,
+    ) -> Result<MlxBuffer> {
+        crate::root_authority::upload_on_device(self.metal_device(), data, dtype, shape, false)
     }
 
     /// Initialize the Metal GPU device and create a command queue.
@@ -297,6 +298,8 @@ impl MlxDevice {
             ));
         }
         let metal_buf = self.new_shared_buffer(byte_len)?;
+        let publication = crate::root_authority::publication_guard();
+        metal_buf.check_device(self.metal_device())?;
         // ADR-015 iter61a (broken-window B-W-1 fix): explicitly zero every
         // newly-allocated GPU buffer. `MTLResourceOptions::StorageModeShared`
         // does NOT guarantee zeroed pages on Apple Silicon — Metal's allocator
@@ -312,14 +315,14 @@ impl MlxDevice {
         // logits → argmax → divergent generations across cold runs.
         // The cost is one memset per allocation; on workloads dominated by
         // weight-load (one-time) and kvcache (one-time), this is negligible.
-        // Safety: `metal_buf.contents()` is non-null (verified above), points
+        // Safety: `metal_buf.metal().contents()` is non-null (verified above), points
         // to exactly `byte_len` bytes of `StorageModeShared` memory we just
         // allocated and have exclusive access to (no other thread or GPU
         // dispatch references it yet — we haven't returned the MlxBuffer
         // wrapper yet, and the underlying CB queue is not in flight on this
         // allocation). Writing zero bytes is well-defined for any DType.
         unsafe {
-            std::ptr::write_bytes(metal_buf.contents() as *mut u8, 0, byte_len);
+            std::ptr::write_bytes(metal_buf.metal().contents() as *mut u8, 0, byte_len);
         }
         // ADR-015 iter8e (Phase 3b): auto-register the new allocation with the
         // device's residency set so it gets the MTLResidencySet hint on the
@@ -330,15 +333,12 @@ impl MlxDevice {
         //
         // No-op when residency_set is None (HF2Q_NO_RESIDENCY=1, macOS<15,
         // or no Metal device).
-        match self.residency_set.as_ref() {
-            Some(set) => Ok(MlxBuffer::with_residency(
-                metal_buf,
-                dtype,
-                shape,
-                set.clone(),
-            )),
-            None => Ok(MlxBuffer::from_raw(metal_buf, dtype, shape)),
-        }
+        let buffer = match self.residency_set.as_ref() {
+            Some(set) => MlxBuffer::with_residency(metal_buf, dtype, shape, set.clone()),
+            None => MlxBuffer::from_known(metal_buf, dtype, shape)?,
+        };
+        publication.complete();
+        Ok(buffer)
     }
 
     /// Allocate a shared Metal buffer for a producer that overwrites every
@@ -370,7 +370,11 @@ impl MlxDevice {
             ));
         }
         let metal_buf = self.new_shared_buffer(byte_len)?;
-        Ok(MlxBuffer::from_raw(metal_buf, dtype, shape))
+        let publication = crate::root_authority::publication_guard();
+        metal_buf.check_device(self.metal_device())?;
+        let buffer = MlxBuffer::from_known(metal_buf, dtype, shape)?;
+        publication.complete();
+        Ok(buffer)
     }
 
     /// Borrow the underlying `metal::Device` for direct Metal API calls
@@ -484,4 +488,33 @@ impl MlxDevice {
             residency_set: None,
         }
     }
+}
+
+/// Bare-device factory also used by cached RoPE uploads; creates no queue.
+pub(crate) fn new_shared_on_device(
+    device: &metal::DeviceRef,
+    byte_len: usize,
+    cache: bool,
+) -> Result<crate::root_authority::KnownRoot> {
+    if byte_len == 0 || byte_len as u64 > device.max_buffer_length() as u64 {
+        return Err(MlxError::BufferAllocationError { bytes: byte_len });
+    }
+    crate::root_authority::shared_with(device, byte_len, cache, || {
+        raw_shared_buffer(device, byte_len)
+    })
+}
+
+// Only called inside an already-reserved factory closure.
+pub(crate) fn raw_shared_buffer(
+    device: &metal::DeviceRef,
+    byte_len: usize,
+) -> Result<metal::Buffer> {
+    let raw: *mut metal::MTLBuffer = unsafe {
+        objc::msg_send![device,
+        newBufferWithLength: byte_len as u64 options: MTLResourceOptions::StorageModeShared]
+    };
+    if raw.is_null() {
+        return Err(MlxError::BufferAllocationError { bytes: byte_len });
+    }
+    Ok(unsafe { metal::Buffer::from_ptr(raw) })
 }

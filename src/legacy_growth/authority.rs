@@ -142,14 +142,17 @@ impl Binding {
         device: &MlxDevice,
         bytes: usize,
         rank: usize,
-        free: &mut std::collections::HashMap<usize, Vec<metal::Buffer>>,
-    ) -> Result<(usize, metal::Buffer, bool)> {
+        free: &mut std::collections::HashMap<usize, Vec<crate::root_authority::KnownRoot>>,
+    ) -> Result<(usize, crate::root_authority::KnownRoot, bool)> {
         let mut state = self
             .authority
             .state
             .lock()
             .map_err(|_| fail("authority poisoned"))?;
         let bucket = Self::request_locked(&state, self.index, device, bytes, rank)?;
+        if let Some(root) = free.get(&bucket).and_then(|list| list.last()) {
+            root.check_device(device.metal_device())?;
+        }
         if let Some(buffer) = free.get_mut(&bucket).and_then(|list| list.pop()) {
             return Ok((bucket, buffer, false));
         }
@@ -158,6 +161,8 @@ impl Binding {
         let buffer = state
             .ledger
             .construct(self.index, bucket, || device.new_shared_buffer(bucket))?;
+        // The local ledger has committed nonnil creation BEFORE checked use.
+        buffer.check_device(device.metal_device())?;
         Ok((bucket, buffer, true))
     }
     pub fn batch_limit(&self) -> Result<usize> {
@@ -175,5 +180,76 @@ impl Binding {
             .lock()
             .map_err(|_| fail("authority poisoned"))?;
         Ok(state.ledger.snapshot(self.index))
+    }
+}
+
+#[cfg(test)]
+mod root_history_composition_tests {
+    use super::super::*;
+    use crate::root_authority::{state::DeviceKey, Core, RootCreationLimits};
+    #[test]
+    fn root_history_native55_nonnil_health_error_keeps_local_commit_but_nil_refunds_local() {
+        for nil in [false, true] {
+            let quota = GrowthQuota {
+                bytes: 64,
+                roots: 1,
+                attempts: 1,
+            };
+            let limits = LegacyGrowthLimits {
+                quota,
+                max_pools: 1,
+                max_buckets_per_pool: 1,
+                max_rank: 1,
+                max_batch: 1,
+            };
+            let mut local = ledger::Ledger::prepare(limits).unwrap();
+            local
+                .register(
+                    GrowthPoolKey {
+                        kind: 1,
+                        worker_generation: 1,
+                    },
+                    quota,
+                    &[GrowthBucket { bytes: 64, quota }],
+                )
+                .unwrap();
+            let global = Core::default();
+            let key = DeviceKey {
+                object: 1,
+                registry: 1,
+            };
+            {
+                let mut s = global.lock().unwrap();
+                s.install(RootCreationLimits {
+                    max_attempted_requested_bytes: 64,
+                    max_root_attempts: 1,
+                    max_raw_constructor_attempts: 1,
+                    max_registered_devices: 1,
+                    max_rope_cache_entries: 0,
+                })
+                .unwrap();
+                s.register(key).unwrap();
+            }
+            let result = local.construct(0, 64, || {
+                global.create(key, 64, false, || {
+                    if nil {
+                        Err(fail("nil"))
+                    } else {
+                        global.unknown("postcreate bookkeeping failure");
+                        Ok(())
+                    }
+                })
+            });
+            assert_eq!(result.is_err(), nil);
+            let snapshot = local.snapshot(0);
+            assert_eq!(snapshot.pool.bytes, if nil { 0 } else { 64 });
+            assert_eq!(snapshot.pool.roots, if nil { 0 } else { 1 });
+            assert_eq!(snapshot.pool.attempts, 1);
+            let state = global.lock().unwrap();
+            assert_eq!((state.bytes, state.roots), (64, 1));
+            if !nil {
+                assert!(state.health().is_err());
+            }
+        }
     }
 }
