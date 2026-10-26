@@ -8,11 +8,12 @@ pub(crate) struct DeviceKey {
     pub object: usize,
     pub registry: u64,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Charge {
     pub id: usize,
     pub device: DeviceKey,
     pub bytes: usize,
+    pub live: Option<std::sync::Arc<super::live::Ticket>>,
 }
 #[derive(Default, Debug)]
 pub(crate) struct State {
@@ -28,6 +29,7 @@ pub(crate) struct State {
     pub cache_slots: usize,
     pub published_cache: usize,
     pub denied: usize,
+    pub live: super::live::Counters,
 }
 impl State {
     pub fn install(&mut self, limits: RootCreationLimits) -> Result<()> {
@@ -114,6 +116,7 @@ impl State {
             self.denied = self.denied.saturating_add(1);
             return Err(fail("historical creation quota exhausted or overflow"));
         };
+        self.live.reserve(bytes)?;
         self.bytes = b;
         self.roots = r;
         self.raw = a;
@@ -123,6 +126,7 @@ impl State {
             id: r,
             device,
             bytes,
+            live: None,
         }))
     }
     pub fn finish(&mut self, success: bool, abandoned: bool) {
