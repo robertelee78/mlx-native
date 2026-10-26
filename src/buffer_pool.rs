@@ -22,6 +22,9 @@
 
 #[path = "buffer_pool/growth.rs"]
 mod growth;
+#[path = "buffer_pool/telemetry.rs"]
+mod telemetry;
+pub use telemetry::{PoolMemorySnapshot, PoolMemoryUnavailable, PoolRootCapacity};
 pub use growth::GrowthLimitedMlxBufferPool;
 
 use std::collections::HashMap;
