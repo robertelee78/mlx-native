@@ -139,6 +139,10 @@ impl GrowthLimitedMlxBufferPool {
         }
         Ok(())
     }
+    /// Current pool-owned root union; creation history remains in `snapshot`.
+    pub fn memory_snapshot(&self) -> Result<super::PoolMemorySnapshot> {
+        self.inner.memory_snapshot()
+    }
     pub fn snapshot(&self) -> Result<LegacyGrowthSnapshot> {
         self.binding().snapshot()
     }

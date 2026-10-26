@@ -93,7 +93,10 @@ pub use ggml_dispatch_trace::{
     GgmlResolvedKernelRoute, GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION,
 };
 pub use ggml_routing_policy::ggml_routing_policy_from_environment;
-pub use buffer_pool::{GrowthLimitedMlxBufferPool, MlxBufferPool};
+pub use buffer_pool::{
+    GrowthLimitedMlxBufferPool, MlxBufferPool, PoolMemorySnapshot, PoolMemoryUnavailable,
+    PoolRootCapacity,
+};
 pub use legacy_growth::{
     GrowthBucket, GrowthCounts, GrowthPoolKey, GrowthQuota, LegacyGrowthLimits,
     LegacyGrowthSnapshot, LegacyPoolGrowthAuthority,
