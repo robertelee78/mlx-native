@@ -1,9 +1,15 @@
 //! Optional immutable native-mediated requested-root history. Not physical admission.
+mod live;
 pub(crate) mod state;
-#[cfg(test)]
-mod tests;
+pub use live::{LiveRootLimits, LiveRootSnapshot};
 #[cfg(test)]
 mod control_tests;
+#[cfg(test)]
+mod live_control_tests;
+#[cfg(test)]
+mod live_tests;
+#[cfg(test)]
+mod tests;
 use crate::{DType, MlxBuffer, MlxDevice, Result};
 use state::{fail, Charge, DeviceKey, State};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,17 +114,21 @@ impl KnownRoot {
     }
 }
 pub(crate) struct Core {
-    state: Mutex<State>,
-    poisoned: AtomicBool,
+    state: Arc<Mutex<State>>,
+    poisoned: Arc<AtomicBool>,
     // Published only AFTER Fresh->permanently legacy under the state mutex.
     legacy_fast: AtomicBool,
+    #[cfg(test)]
+    after_lock_precheck: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl Default for Core {
     fn default() -> Self {
         Self {
-            state: Mutex::new(State::default()),
-            poisoned: AtomicBool::new(false),
+            state: Arc::new(Mutex::new(State::default())),
+            poisoned: Arc::new(AtomicBool::new(false)),
             legacy_fast: AtomicBool::new(false),
+            #[cfg(test)]
+            after_lock_precheck: Mutex::new(None),
         }
     }
 }
@@ -127,10 +137,20 @@ impl Core {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(fail("state poisoned"));
         }
-        self.state.lock().map_err(|_| {
+        #[cfg(test)]
+        if let Some(hook) = self.after_lock_precheck.lock().unwrap().take() {
+            hook();
+        }
+        let guard = self.state.lock().map_err(|_| {
             self.poisoned.store(true, Ordering::Release);
             fail("state poisoned")
-        })
+        })?;
+        // A waiter can pass the fast precheck before another thread marks an
+        // uncertain resource. Never publish its now-stale healthy guard.
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(fail("state poisoned"));
+        }
+        Ok(guard)
     }
     pub(crate) fn health(&self) -> Result<()> {
         if self.legacy_fast.load(Ordering::Acquire) {
@@ -154,6 +174,7 @@ impl Core {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn create<T>(
         &self,
         key: DeviceKey,
@@ -161,26 +182,48 @@ impl Core {
         cache: bool,
         raw: impl FnOnce() -> Result<T>,
     ) -> Result<(T, Origin)> {
+        self.create_with_origin(key, bytes, cache, |_| raw())
+    }
+    fn create_with_origin<T>(
+        &self,
+        key: DeviceKey,
+        bytes: usize,
+        cache: bool,
+        raw: impl FnOnce(&Origin) -> Result<T>,
+    ) -> Result<(T, Origin)> {
         if bytes == 0 {
             return Err(fail("zero creation request"));
         }
         if self.legacy_fast.load(Ordering::Acquire) {
-            return raw().map(|value| (value, Origin::Legacy));
+            return raw(&Origin::Legacy).map(|value| (value, Origin::Legacy));
         }
-        let charge = self.lock()?.reserve(key, bytes, cache)?;
+        let (charge, live_enabled) = {
+            let mut state = self.lock()?;
+            let charge = state.reserve(key, bytes, cache)?;
+            (charge, state.live.limits.is_some())
+        };
         if charge.is_none() {
             self.legacy_fast.store(true, Ordering::Release);
         }
         // Allocate all certificate metadata BEFORE invoking the raw constructor.
         let origin = charge
-            .map(|c| Origin::Known(Arc::new(c)))
+            .map(|mut c| {
+                if live_enabled {
+                    c.live = Some(Arc::new(live::Ticket::new(self, bytes)));
+                }
+                Origin::Known(Arc::new(c))
+            })
             .unwrap_or(Origin::Legacy);
         let mut attempt = Attempt {
             core: self,
             tracked: matches!(origin, Origin::Known(_)),
             closed: false,
+            live: match &origin {
+                Origin::Known(c) => c.live.clone(),
+                _ => None,
+            },
         };
-        let result = raw();
+        let result = raw(&origin);
         // Nonnil/raw success MUST remain Ok, even if diagnostic completion fails:
         // Native55 construct interprets every Err as no resource created.
         attempt.finish(result.is_ok(), false);
@@ -191,6 +234,7 @@ struct Attempt<'a> {
     core: &'a Core,
     tracked: bool,
     closed: bool,
+    live: Option<Arc<live::Ticket>>,
 }
 impl Attempt<'_> {
     fn finish(&mut self, success: bool, abandoned: bool) {
@@ -198,6 +242,13 @@ impl Attempt<'_> {
             match self.core.lock() {
                 Ok(mut s) => s.finish(success, abandoned),
                 Err(_) => self.core.poisoned.store(true, Ordering::Release),
+            }
+        }
+        if let Some(ticket) = &self.live {
+            if abandoned || self.core.poisoned.load(Ordering::Acquire) {
+                ticket.uncertain();
+            } else {
+                ticket.finish(success);
             }
         }
         self.closed = true;
@@ -266,6 +317,24 @@ pub struct RootAuthorityHandle {
 }
 impl NativeRootAuthority {
     pub fn install_early(limits: RootCreationLimits) -> Result<RootAuthorityHandle> {
+        Self::install(limits, None)
+    }
+    /// Optional immutable live+pending requested extents. Not physical admission.
+    /// Association capability is restricted to observed Apple M5 Max/macOS27.2
+    /// AGXG17XFamilyBuffer/build26B5112a; unknown actual classes poison coverage after raw success.
+    pub fn install_early_with_live(
+        limits: RootCreationLimits,
+        live: LiveRootLimits,
+    ) -> Result<RootAuthorityHandle> {
+        if live.max_live_and_pending_requested_bytes == 0 || live.max_live_and_pending_roots == 0 {
+            return Err(fail("live limits must be nonzero"));
+        }
+        Self::install(limits, Some(live))
+    }
+    fn install(
+        limits: RootCreationLimits,
+        live: Option<LiveRootLimits>,
+    ) -> Result<RootAuthorityHandle> {
         let g = global();
         let mut devices = g
             .devices
@@ -284,10 +353,16 @@ impl NativeRootAuthority {
             .try_reserve_exact(limits.max_registered_devices)
             .map_err(|_| fail("device handle reservation failed"))?;
         state.install(limits)?;
+        state.live.limits = live;
         Ok(RootAuthorityHandle { _private: () })
     }
 }
 impl RootAuthorityHandle {
+    /// Current component accounting only; unavailable on poison. No OS/physical proof.
+    pub fn live_snapshot(&self) -> Result<LiveRootSnapshot> {
+        global().core.live_snapshot()
+    }
+
     /// Retains the actual device. Different queues share this process history.
     pub fn register_device(&self, device: &MlxDevice) -> Result<()> {
         let g = global();
@@ -350,7 +425,13 @@ pub(crate) fn shared_with(
 ) -> Result<KnownRoot> {
     global()
         .core
-        .create(device_key(device), bytes, cache, raw)
+        .create_with_origin(device_key(device), bytes, cache, |origin| {
+            let ticket = match origin {
+                Origin::Known(c) => c.live.as_ref(),
+                _ => None,
+            };
+            live::create_attached(device, ticket, raw)
+        })
         .map(|(metal, origin)| KnownRoot { metal, origin })
 }
 pub(crate) fn healthy() -> Result<()> {

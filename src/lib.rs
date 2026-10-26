@@ -525,6 +525,6 @@ mod tests {
 
 mod root_authority;
 pub use root_authority::{
-    NativeRootAuthority, RootAuthorityHandle, RootCreationLimits, RootCreationSnapshot,
-    RootOriginSnapshot,
+    LiveRootLimits, LiveRootSnapshot, NativeRootAuthority, RootAuthorityHandle, RootCreationLimits,
+    RootCreationSnapshot, RootOriginSnapshot,
 };
