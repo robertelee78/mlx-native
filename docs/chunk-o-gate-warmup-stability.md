@@ -22,4 +22,4 @@ serial dependence and eight-block uncertainty explicitly unresolved.
 Increase only the fixed warmup count to250. Keep50 timed dispatches, buffers,
 initialization, kernel, timer,720us threshold and the M5-only calibration gate.
 The old failure remains evidence; fresh all-feature validation is required for
-the changed test. This change adds no production behavior or GPU allocation.
+the changed test. This change adds no production behavior or GPU payload buffers.
