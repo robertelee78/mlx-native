@@ -259,3 +259,49 @@ fn live_root_same_product_version_different_driver_build_is_unobserved() {
         b""
     ));
 }
+
+#[test]
+fn live_root_host_identity_cache_initializes_once_under_contention() {
+    use std::sync::OnceLock;
+    let cache = Arc::new(OnceLock::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(8));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let cache = cache.clone();
+        let calls = calls.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            *live::cached_host(&cache, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                live::HostBytes::from_slices(b"27.2\0", b"26B5112a\0")
+            })
+            .unwrap()
+        }));
+    }
+    let values: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(values.iter().all(|v| *v == values[0]));
+    assert!(values[0].allows("AGXG17XFamilyBuffer", "Apple M5 Max"));
+    assert!(!values[0].allows("OtherBuffer", "Apple M5 Max"));
+    assert!(!values[0].allows("AGXG17XFamilyBuffer", "OtherDevice"));
+}
+#[test]
+fn live_root_host_identity_failure_and_wrong_build_cache_never_heal() {
+    use std::sync::OnceLock;
+    let cache = OnceLock::new();
+    assert!(live::cached_host(&cache, || None).is_none());
+    assert!(live::cached_host(&cache, || panic!("cached error must not retry")).is_none());
+    let wrong = OnceLock::new();
+    let host = live::cached_host(&wrong, || {
+        live::HostBytes::from_slices(b"27.2\0", b"26B5112b\0")
+    })
+    .unwrap();
+    assert!(!host.allows("AGXG17XFamilyBuffer", "Apple M5 Max"));
+    assert_eq!(
+        Some(host),
+        live::cached_host(&wrong, || panic!("wrong build must remain cached"))
+    );
+    assert!(live::HostBytes::from_slices(&[1; 65], b"x").is_none());
+}

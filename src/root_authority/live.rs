@@ -6,7 +6,7 @@ use super::{
 use crate::Result;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
-    Arc, Mutex, Weak,
+    Arc, Mutex, OnceLock, Weak,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -226,13 +226,46 @@ pub(super) fn eligible(class: &str, device: &str, os: &[u8], build: &[u8]) -> bo
         && os == b"27.2\0"
         && build == b"26B5112a\0"
 }
-fn known_platform(resource: &metal::BufferRef, device: &metal::DeviceRef) -> bool {
-    use metal::foreign_types::ForeignTypeRef;
-    let class = unsafe {
-        (&*resource.as_ptr().cast::<objc::runtime::Object>())
-            .class()
-            .name()
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HostBytes {
+    product: [u8; 64],
+    build: [u8; 64],
+    product_len: usize,
+    build_len: usize,
+}
+impl HostBytes {
+    pub(super) fn from_slices(product: &[u8], build: &[u8]) -> Option<Self> {
+        if product.is_empty() || product.len() > 64 || build.is_empty() || build.len() > 64 {
+            return None;
+        }
+        let mut out = Self {
+            product: [0; 64],
+            build: [0; 64],
+            product_len: product.len(),
+            build_len: build.len(),
+        };
+        out.product[..product.len()].copy_from_slice(product);
+        out.build[..build.len()].copy_from_slice(build);
+        Some(out)
+    }
+    pub(super) fn allows(&self, class: &str, device: &str) -> bool {
+        eligible(
+            class,
+            device,
+            &self.product[..self.product_len],
+            &self.build[..self.build_len],
+        )
+    }
+}
+// Same helper used by production and local-cache pure controls. Cache failures
+// too: an unavailable initial query can never heal into eligibility midprocess.
+pub(super) fn cached_host(
+    cache: &OnceLock<Option<HostBytes>>,
+    query: impl FnOnce() -> Option<HostBytes>,
+) -> Option<&HostBytes> {
+    cache.get_or_init(query).as_ref()
+}
+fn query_host() -> Option<HostBytes> {
     let query = |name: &[u8], out: &mut [u8; 64]| -> Option<usize> {
         let mut len = out.len();
         let status = unsafe {
@@ -252,9 +285,21 @@ fn known_platform(resource: &metal::BufferRef, device: &metal::DeviceRef) -> boo
         query(b"kern.osproductversion\0", &mut os),
         query(b"kern.osversion\0", &mut build),
     ) else {
-        return false;
+        return None;
     };
-    eligible(class, device.name(), &os[..n], &build[..b])
+    HostBytes::from_slices(&os[..n], &build[..b])
+}
+fn known_platform(resource: &metal::BufferRef, device: &metal::DeviceRef) -> bool {
+    use metal::foreign_types::ForeignTypeRef;
+    // This is outside StateMutex, after raw success; class/device are checked
+    // on EVERY actual resource. Only immutable boot OS identity is cached.
+    static HOST: OnceLock<Option<HostBytes>> = OnceLock::new();
+    let class = unsafe {
+        (&*resource.as_ptr().cast::<objc::runtime::Object>())
+            .class()
+            .name()
+    };
+    cached_host(&HOST, query_host).is_some_and(|host| host.allows(class, device.name()))
 }
 
 pub(super) fn attach_checked(ticket: &Ticket, eligible: bool, attach: impl FnOnce() -> bool) {

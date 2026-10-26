@@ -32,7 +32,10 @@ never calls Metal or panics; resource/blocklastDrop is outside that lock.
 
 Before association each actual resource is restricted to observed capability:
 ObjCclass AGXG17XFamilyBuffer, device Apple M5 Max, kernel-reported productversion
-27.2/build26B5112a. Two OSqueries are bounded64B each, direct sysctlbyname, no subprocess. This intentionally
+27.2/build26B5112a. Two initial OSqueries are bounded64B each, direct sysctlbyname, no subprocess.
+Only immutable boot product/build bytes (including failure) are cached in a
+OnceLock outside StateMutex. Each actual resourceclass/device is still checked;
+initial unavailable/wrong identity never heals by a later query. This intentionally
 narrow prototype refuses unseen classes/platforms conservatively; tinyclass proof
 must not be generalized to every large/NoCopydriverresource. Unknown eligibility
 means noassociationattempt, rawsuccess preserved, charge retained uncertain,
@@ -60,7 +63,7 @@ No failed-spike test is added to production candidate.
 ## Root-owned validation packet
 
 Pure filter: `cargo test --locked --lib root_authority::live_tests -- --nocapture`.
-Eleven actual-core controls: origin/resource final-owner join; nilrollback/history;
+Thirteen actual-core controls: origin/resource final-owner join; nilrollback/history;
 denybeforefactory/overflow; pendingrace; postrawuncertaintymustpreserveOk;
 rawunwind; postrawmutexpoison; legacy/history-onlycompatibility; actualeligibility/
 attachmentdecision unknown/readbackfailure, same-product/different-build rejection,
