@@ -16,8 +16,8 @@
 //! - Single-process, single-threadgroup test (no inter-test isolation
 //!   needed; the kernel is stateless across dispatches).
 //! - Buffer allocation hoisted out of the timed loop.
-//! - First 25 dispatches warm the pipeline cache and bring the target GPU out
-//!   of its idle power state (excluded from the median).
+//! - First 250 dispatches are fixed pipeline/GPU warmup, excluded from the median.
+//!   This count is calibrated by the stock/candidate stability experiment.
 //! - 50 timed dispatches; median used as the wall-time statistic (robust
 //!   to OS-jitter outliers).
 //! - Wall = `command_buffer.commit + wait_until_completed` per dispatch
@@ -67,7 +67,7 @@ const K: u32 = 128;
 const V: u32 = 128;
 const BT: u32 = 64;
 
-const WARMUP_DISPATCHES: usize = 25;
+const WARMUP_DISPATCHES: usize = 250;
 const TIMED_DISPATCHES: usize = 50;
 
 /// 3× speedup vs 2.155 ms baseline = 718 µs; +0.3% jitter headroom = 720 µs.
