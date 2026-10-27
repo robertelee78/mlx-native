@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, Weak},
     time::Instant,
 };
+#[path = "mapping_retirement/region.rs"]
 mod region;
 #[derive(Clone, Copy, Debug)]
 struct Summary {
@@ -97,7 +98,7 @@ impl Observer {
                 );
                 vectors[index] = Some(bits);
                 self.queries += 1;
-                identities.push(json!({"alias":["A0","A1","B0","B1"][index],"base":map.as_ptr()as usize,"bytes":map.len()}));
+                identities.push(json!({"alias":(["A0","A1","B0","B1"][index]),"base":map.as_ptr()as usize,"bytes":map.len()}));
             }
         }
         let mut summary = Summary {
