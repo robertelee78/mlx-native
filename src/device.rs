@@ -518,3 +518,7 @@ pub(crate) fn raw_shared_buffer(
     }
     Ok(unsafe { metal::Buffer::from_ptr(raw) })
 }
+
+#[cfg(test)]
+#[path = "device/nocopy_residency_tests.rs"]
+mod nocopy_residency_tests;
