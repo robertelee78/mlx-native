@@ -209,3 +209,6 @@ fn scoped_residency_two_owned_parents_later_switch_observation(){
         "entry_local_wired":"Unavailable","sentinel_GPU_reads":3,"checked_drain":true,
         "cleanup":true,"model_credit_bytes":0,"model_scale_qualified":false,"physical_admission":false}));
 }
+
+#[path = "scoped_membership/startup_graph.rs"]
+mod startup_graph;
