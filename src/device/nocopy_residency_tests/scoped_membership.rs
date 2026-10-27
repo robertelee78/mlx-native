@@ -490,3 +490,6 @@ fn scoped_residency_two_owned_parents_later_switch_observation() {
 
 #[path = "scoped_membership/startup_graph.rs"]
 mod startup_graph;
+
+#[path = "scoped_membership/mapping_retirement.rs"]
+mod mapping_retirement;
