@@ -77,7 +77,12 @@ fn encode(
 ) -> (f64, f64) {
     let start = Instant::now();
     let mut enc = device.command_encoder().expect("encoder");
-    for _ in 0..reps {
+    for repetition in 0..reps {
+        // The same output is reused. Explicitly order
+        // calls in the concurrent encoder; charge this barrier to BOTH arms.
+        if repetition > 0 {
+            enc.memory_barrier();
+        }
         quantized_matmul_ggml_with_policy(
             &mut enc, registry, device, input, weight, out, params, policy,
         )
