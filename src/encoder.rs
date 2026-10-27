@@ -1078,7 +1078,10 @@ impl CommandEncoder {
         if let Some(observer) = &self.observation {
             self.capture_scopes = match observer.capture_scopes() {
                 Ok(scopes) => Some(scopes),
-                Err(_) => { observer.invalid(); None }
+                Err(_) => {
+                    observer.invalid();
+                    None
+                }
             };
         }
     }
@@ -1098,61 +1101,98 @@ impl CommandEncoder {
 
     pub fn take_observed_capture(&mut self) -> Option<ObservedCapture> {
         self.capture.take().map(|nodes| {
-            if let Some(tags)=&self.capture_scopes {tags.aligned(nodes.len());}
-            ObservedCapture {nodes,scopes:self.capture_scopes.take()}
+            if let Some(tags) = &self.capture_scopes {
+                tags.aligned(nodes.len());
+            }
+            ObservedCapture {
+                nodes,
+                scopes: self.capture_scopes.take(),
+            }
         })
     }
 
     /// Explicit opt-in before this CB has encoded/committed any work. The epoch
     /// identifies a fresh invocation, not a timeless slot or tensor shape.
-    pub fn enable_submission_observation(&mut self, epoch:u64) -> Result<()> {
+    pub fn enable_submission_observation(&mut self, epoch: u64) -> Result<()> {
         if self.observation_has_work || self.observation.is_some() {
-            return Err(MlxError::InvalidArgument("observation requires a fresh encoder".into()));
+            return Err(MlxError::InvalidArgument(
+                "observation requires a fresh encoder".into(),
+            ));
         }
-        let observer=crate::submission_observer::CommandObservation::create(
+        let observer = crate::submission_observer::CommandObservation::create(
             &*self.queue as *const metal::CommandQueueRef as u64,
-            metal_device_registry_id(self.queue.device()),epoch)
-            .map_err(|e|MlxError::InvalidArgument(e.into()))?;
+            metal_device_registry_id(self.queue.device()),
+            epoch,
+        )
+        .map_err(|e| MlxError::InvalidArgument(e.into()))?;
         if self.capture.is_some() {
-            self.capture_scopes=Some(observer.capture_scopes()
-                .map_err(|e|MlxError::InvalidArgument(e.into()))?);
+            self.capture_scopes = Some(
+                observer
+                    .capture_scopes()
+                    .map_err(|e| MlxError::InvalidArgument(e.into()))?,
+            );
         }
-        self.observation=Some(observer);Ok(())
+        self.observation = Some(observer);
+        Ok(())
     }
 
-    pub fn set_observation_scope(&mut self, scope:Option<crate::submission_observer::ObservationScope>) {
-        if let Some(observer)=&mut self.observation {observer.set_scope(scope);}
+    pub fn set_observation_scope(
+        &mut self,
+        scope: Option<crate::submission_observer::ObservationScope>,
+    ) {
+        if let Some(observer) = &mut self.observation {
+            observer.set_scope(scope);
+        }
     }
 
-    pub fn set_observation_replay_bindings(&mut self,
-        bindings:&[(crate::submission_observer::ObservationScope,crate::submission_observer::ObservationScope)])
-        ->Result<()>
-    {
-        if self.observation_has_work {return Err(MlxError::InvalidArgument("replay bindings precede encoding".into()));}
-        self.observation.as_mut().ok_or_else(||MlxError::InvalidArgument("observer not enabled".into()))?
-            .replay_map(bindings).map_err(|e|MlxError::InvalidArgument(e.into()))
+    pub fn set_observation_replay_bindings(
+        &mut self,
+        bindings: &[(
+            crate::submission_observer::ObservationScope,
+            crate::submission_observer::ObservationScope,
+        )],
+    ) -> Result<()> {
+        if self.observation_has_work {
+            return Err(MlxError::InvalidArgument(
+                "replay bindings precede encoding".into(),
+            ));
+        }
+        self.observation
+            .as_mut()
+            .ok_or_else(|| MlxError::InvalidArgument("observer not enabled".into()))?
+            .replay_map(bindings)
+            .map_err(|e| MlxError::InvalidArgument(e.into()))
     }
 
-    pub(crate) fn observation_enabled(&self)->bool { self.observation.is_some() }
-    pub(crate) fn observation_command_id(&self)->Option<u64> {self.observation.as_ref().map(|o|o.id())}
-
-    pub(crate) fn bind_observed_replay(&mut self, scope:Option<crate::submission_observer::ObservationScope>,
-        permit:Option<crate::submission_observer::ReplayPermit>) {
-        if let Some(observer)=&mut self.observation {observer.bind_replay(scope,permit);}
-        self.observation_replay_bound=true;
+    pub(crate) fn observation_enabled(&self) -> bool {
+        self.observation.is_some()
+    }
+    pub(crate) fn observation_command_id(&self) -> Option<u64> {
+        self.observation.as_ref().map(|o| o.id())
     }
 
-    fn push_captured(&mut self,node:CapturedNode) {
-        self.observation_has_work=true;
-        let scope=self.observation.as_ref().and_then(|o|o.scope);
-        if let Some(nodes)=&mut self.capture {
-            if let Some(tags)=&mut self.capture_scopes {
-                tags.aligned(nodes.len());tags.push(scope);
+    pub(crate) fn bind_observed_replay(
+        &mut self,
+        scope: Option<crate::submission_observer::ObservationScope>,
+        permit: Option<crate::submission_observer::ReplayPermit>,
+    ) {
+        if let Some(observer) = &mut self.observation {
+            observer.bind_replay(scope, permit);
+        }
+        self.observation_replay_bound = true;
+    }
+
+    fn push_captured(&mut self, node: CapturedNode) {
+        self.observation_has_work = true;
+        let scope = self.observation.as_ref().and_then(|o| o.scope);
+        if let Some(nodes) = &mut self.capture {
+            if let Some(tags) = &mut self.capture_scopes {
+                tags.aligned(nodes.len());
+                tags.push(scope);
             }
             nodes.push(node);
         }
     }
-
 
     pub(crate) fn start_encoded_dispatch_receipt(&mut self, max_dispatches: usize) -> Result<()> {
         if self.capture.is_some() {
@@ -1204,13 +1244,17 @@ impl CommandEncoder {
         threads_per_threadgroup: MTLSize,
         threadgroup_memory: &[(u64, u64)],
     ) {
-        self.observation_has_work=true;
-        if let Some(observer)=&mut self.observation {
+        self.observation_has_work = true;
+        if let Some(observer) = &mut self.observation {
             observer.dispatch(crate::submission_observer::DispatchGeometry {
-                pipeline_identity:pipeline as *const ComputePipelineStateRef as u64,
-                dispatch_kind,grid:[grid.width,grid.height,grid.depth],
-                threads_per_threadgroup:[threads_per_threadgroup.width,
-                    threads_per_threadgroup.height,threads_per_threadgroup.depth],
+                pipeline_identity: pipeline as *const ComputePipelineStateRef as u64,
+                dispatch_kind,
+                grid: [grid.width, grid.height, grid.depth],
+                threads_per_threadgroup: [
+                    threads_per_threadgroup.width,
+                    threads_per_threadgroup.height,
+                    threads_per_threadgroup.depth,
+                ],
             });
         }
         if let Some(state) = self.encoded_dispatch_receipt.as_mut() {
@@ -1489,7 +1533,7 @@ impl CommandEncoder {
         destination_offset: u64,
         byte_len: u64,
     ) -> Result<()> {
-        self.observation_has_work=true;
+        self.observation_has_work = true;
         const OP: &str = "CommandEncoder::blit_copy_bytes";
 
         let source_end = source_offset.checked_add(byte_len).ok_or_else(|| {
@@ -1572,7 +1616,9 @@ impl CommandEncoder {
             blit.end_encoding();
         });
 
-        if let Some(observer)=&self.observation {observer.noncompute();}
+        if let Some(observer) = &self.observation {
+            observer.noncompute();
+        }
 
         // Ending the compute pass plus the ordered blit is a full scheduling
         // boundary. A later tracked dispatch starts a fresh dependency group.
@@ -2394,7 +2440,9 @@ impl CommandEncoder {
         dispatch_kind: DispatchKind,
     ) {
         if !std::mem::take(&mut self.observation_replay_bound) {
-            if let Some(observer)=&mut self.observation {observer.bind_replay(None,None);}
+            if let Some(observer) = &mut self.observation {
+                observer.bind_replay(None, None);
+            }
         }
 
         // ADR-015: mirror the per-dispatch sampling
@@ -2766,22 +2814,28 @@ impl CommandEncoder {
     }
 
     fn commit_observed(&mut self) {
-        self.observation_has_work=true;
-        let begin=self.observation.as_ref().and_then(|_|crate::submission_observer::clock_ns());
+        self.observation_has_work = true;
+        let begin = self
+            .observation
+            .as_ref()
+            .and_then(|_| crate::submission_observer::clock_ns());
         self.cmd_buf.commit();
-        if let Some(observer)=&self.observation {
-            observer.submitted(begin,crate::submission_observer::clock_ns());
+        if let Some(observer) = &self.observation {
+            observer.submitted(begin, crate::submission_observer::clock_ns());
         } else {
             crate::submission_observer::unobserved_commit();
         }
     }
 
-    fn wait_observed(&self)->MTLCommandBufferStatus {
-        let begin=self.observation.as_ref().and_then(|_|crate::submission_observer::clock_ns());
+    fn wait_observed(&self) -> MTLCommandBufferStatus {
+        let begin = self
+            .observation
+            .as_ref()
+            .and_then(|_| crate::submission_observer::clock_ns());
         self.cmd_buf.wait_until_completed();
-        let status=self.cmd_buf.status();
-        if let Some(observer)=&self.observation {
-            observer.drained(begin,crate::submission_observer::clock_ns(),status as u64);
+        let status = self.cmd_buf.status();
+        if let Some(observer) = &self.observation {
+            observer.drained(begin, crate::submission_observer::clock_ns(), status as u64);
         }
         status
     }
@@ -2805,7 +2859,7 @@ impl CommandEncoder {
 
         COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         self.commit_observed();
-        let completed_status=self.wait_observed();
+        let completed_status = self.wait_observed();
 
         // ADR-040 §0.21 — accumulate GPU-busy time (gated; 2 ObjC reads/sync).
         if *GPU_BUSY_ON {
@@ -3030,7 +3084,7 @@ impl CommandEncoder {
     ///
     /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
     pub fn wait_until_completed(&self) -> Result<()> {
-        let completed_status=self.wait_observed();
+        let completed_status = self.wait_observed();
         match completed_status {
             MTLCommandBufferStatus::Completed => Ok(()),
             MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
@@ -3049,7 +3103,9 @@ impl CommandEncoder {
     /// conservatively scope this owner's eventual release.
     #[inline]
     pub fn metal_command_buffer(&self) -> &CommandBuffer {
-        if let Some(observer)=&self.observation {observer.raw_escape();}
+        if let Some(observer) = &self.observation {
+            observer.raw_escape();
+        }
         self.cmd_buf.require_pooled_drop();
         &self.cmd_buf
     }
@@ -3136,11 +3192,18 @@ impl CommandEncoder {
         });
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
         self.cmd_buf = PooledCommandBuffer::new(cmd_buf);
-        self.observation = self.observation.as_ref().and_then(|old| match old.rotate() {
-            Ok(next)=>Some(next), Err(_)=>{old.invalid();None}
-        });
-        self.observation_has_work=false;
-        self.observation_replay_bound=false;
+        self.observation = self
+            .observation
+            .as_ref()
+            .and_then(|old| match old.rotate() {
+                Ok(next) => Some(next),
+                Err(_) => {
+                    old.invalid();
+                    None
+                }
+            });
+        self.observation_has_work = false;
+        self.observation_replay_bound = false;
         // Per-CB scratch state — every field that's documented as being
         // bounded by a CB lifetime resets here.
         self.active_encoder = std::ptr::null();
@@ -3216,7 +3279,9 @@ impl CommandEncoder {
              — wait must precede the first dispatch on the new CB"
         );
         self.cmd_buf.encode_wait_for_event(event, value);
-        if let Some(observer)=&self.observation {observer.noncompute();}
+        if let Some(observer) = &self.observation {
+            observer.noncompute();
+        }
     }
 
     /// End the active compute encoder, encode a stage-fence signal, and
@@ -3269,7 +3334,9 @@ impl CommandEncoder {
         self.end_active_encoder();
         // Step 3: encode the signal at CB-level.
         self.cmd_buf.encode_signal_event(event, new_value);
-        if let Some(observer)=&self.observation {observer.noncompute();}
+        if let Some(observer) = &self.observation {
+            observer.noncompute();
+        }
         // Step 4 + 5: same as commit() — flush residency staging, then
         // hand the CB to Metal.
         self.flush_residency_pending();

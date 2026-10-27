@@ -64,9 +64,11 @@ mod mem_ranges;
 mod residency;
 mod ggml_routing_policy;
 pub mod gguf;
-pub mod kernel_profile;
-pub mod submission_observer;
 pub mod graph;
+pub mod kernel_profile;
+mod kernel_registry;
+mod legacy_growth;
+mod mem_ranges;
 pub mod metal_capture;
 pub mod ops;
 pub mod turboquant;
@@ -112,8 +114,8 @@ pub use encoder::{
     auto_barrier_concurrent_count, auto_barrier_count, barrier_count, barrier_total_ns,
     cmd_buf_count, commit_count, dispatch_count, gpu_busy_ns, pipeline_dispatch_buckets,
     reset_counters, reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode,
-    CapturedOpKind, CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg, ObservedCapture,
-    RecordedBinding,
+    CapturedOpKind, CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
+    ObservedCapture, RecordedBinding,
 };
 pub use encoder_session::EncoderSession;
 pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
