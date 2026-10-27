@@ -298,3 +298,7 @@ fn nocopy_default_residency_owned_file_observation() {
     assert!(fixture.cleanup(), "owned identity-checked cleanup failed");
     println!("NOCOPY_WITNESS_COMPLETE phases=6 GPU_sentinels=4 checked_drain=true cleanup=true model_loaded=false physical_admission=false model_scale_qualified=false");
 }
+
+#[cfg(test)]
+#[path = "nocopy_residency_tests/scoped_membership.rs"]
+mod scoped_membership;
