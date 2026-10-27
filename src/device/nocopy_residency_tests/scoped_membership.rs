@@ -89,7 +89,7 @@ impl Observer{
         let duration_ns=end_ns.checked_sub(begin_ns).expect("monotonic phase clock");
         assert_eq!(begin_ns.checked_add(duration_ns),Some(end_ns));self.last_end_ns=end_ns;
         let alias_identity:Vec<_>=aliases.iter().enumerate().map(|(i,a)|json!({
-            "alias":["A0","A1","B0","B1"][i],"parent":if i<2{"A"}else{"B"},
+            "alias":(["A0","A1","B0","B1"][i]),"parent":if i<2{"A"}else{"B"},
             "base_address":a.as_ptr()as usize,"range_bytes":a.len(),"file_offset_bytes":0})).collect();
         let data=json!({"phase":name,"phase_index":self.phases,"declared_membership":membership,
             "phase_begin_ns":begin_ns,"phase_end_ns":end_ns,"query_duration_ns":duration_ns,
