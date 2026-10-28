@@ -177,11 +177,6 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
     ] {
         let e = values.len();
         let l = input(&d, &values);
-        let l = if matches!(kind, 1 | 3 | 4 | 5) {
-            l.with_shape(vec![1, 256]).unwrap()
-        } else {
-            l
-        };
         let scales = input(
             &d,
             &(0..e).map(|i| 1.0 + i as f32 / 32.0).collect::<Vec<_>>(),
