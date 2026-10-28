@@ -652,17 +652,9 @@ pub fn dispatch_fused_moe_routing_f32(
     // faster, of course default").  Opt-out via HF2Q_FUSED_MOE_ROUTING_V3=0.
     // HF2Q_FUSED_MOE_ROUTING_V2 still respected as second-level opt-out
     // (V3 OFF + V2 OFF → V1 legacy path for forensic A/B).
-    static CACHED_MOE_ROUTING_V2: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-    static CACHED_MOE_ROUTING_V3: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-    let use_v3 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V3, "HF2Q_FUSED_MOE_ROUTING_V3");
-    let use_v2 = !use_v3 && crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V2, "HF2Q_FUSED_MOE_ROUTING_V2");
-    let kernel_name = if use_v3 {
-        "fused_moe_routing_f32_v3"
-    } else if use_v2 {
-        "fused_moe_routing_f32_v2"
-    } else {
-        "fused_moe_routing_f32"
-    };
+    let kernel_name = selected_fused_moe_routing_f32_kernel();
+    let use_v3 = kernel_name == "fused_moe_routing_f32_v3";
+    let use_v2 = kernel_name == "fused_moe_routing_f32_v2";
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let gpu_params = GpuFusedMoeRoutingParams {
@@ -851,4 +843,19 @@ pub fn dispatch_fused_norm_add_scalar_f32(
     );
 
     Ok(())
+}
+
+// Shared actual cached selector for ordinary and explicit diagnostic dispatch.
+pub(super) fn selected_fused_moe_routing_f32_kernel() -> &'static str {
+    static CACHED_MOE_ROUTING_V2: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    static CACHED_MOE_ROUTING_V3: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let use_v3 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V3, "HF2Q_FUSED_MOE_ROUTING_V3");
+    let use_v2 = !use_v3 && crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V2, "HF2Q_FUSED_MOE_ROUTING_V2");
+    if use_v3 {
+        "fused_moe_routing_f32_v3"
+    } else if use_v2 {
+        "fused_moe_routing_f32_v2"
+    } else {
+        "fused_moe_routing_f32"
+    }
 }

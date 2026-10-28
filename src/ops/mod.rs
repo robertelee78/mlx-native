@@ -144,3 +144,6 @@ pub mod bilinear_resize_2d;
 pub mod block_merge_2x2;
 pub mod feature_concat;
 pub mod im2col_2d_3ch;
+
+/// Explicit actual-kernel MoE selection boundary diagnostics; never enabled by default.
+pub mod routing_selection_witness;
