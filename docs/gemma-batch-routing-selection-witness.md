@@ -47,3 +47,5 @@ request by its fixed shape; process/compiler/driver extents are not that bound.
 No controls/builds/Metal/model have run at author freeze. Tiny old/new fixture
 parity, when actually proven, would still not establish HF model endpoint
 parity, numerical tolerance, all144 routing evidence, Q1 completion or speed.
+
+Release candidate 0.15.11: additive optional batch diagnostics. Root source 88cab917e8bd6e86255d6dc29b6775e64e76a682 passed the bounded geometry control and actual twelve valid/three invalid cases in fresh V1 and V3 processes, preserving selected IDs and F32 weight bits. Independent source and actual reviews are retained. This does not establish model parity or a speedup. Exact-version checks and CI remain required before publication; HF adoption requires verified registry bytes and a locked pin.
