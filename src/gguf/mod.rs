@@ -2235,3 +2235,7 @@ mod mapped_storage_plan_tests {
         assert!(error.to_string().contains("does not fit this host"));
     }
 }
+
+#[cfg(test)]
+#[path = "k1_existing_route_shape_tests.rs"]
+mod k1_existing_route_shape_tests;
