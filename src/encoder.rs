@@ -1145,6 +1145,25 @@ impl CommandEncoder {
         }
     }
 
+    /// Explicit same-invocation opaque-auxiliary scope for CB rotation only.
+    /// The caller must independently declare it auxiliary; never pass a saved
+    /// Known tensor/row witness. CURRENT scope is separate and never inherited.
+    /// Default None stays unknown after rotation. This encodes no GPU work.
+    pub fn set_observation_rotation_scope(
+        &mut self,
+        scope: Option<crate::submission_observer::ObservationScope>,
+    ) -> Result<()> {
+        self.observation
+            .as_mut()
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "rotation fallback requires an enabled observation".into(),
+                )
+            })?
+            .set_rotation_scope(scope)
+            .map_err(|error| MlxError::InvalidArgument(error.into()))
+    }
+
     pub fn set_observation_replay_bindings(
         &mut self,
         bindings: &[(
@@ -2834,6 +2853,11 @@ impl CommandEncoder {
             .and_then(|_| crate::submission_observer::clock_ns());
         self.cmd_buf.wait_until_completed();
         let status = self.cmd_buf.status();
+        if self.observation.is_some() {
+            crate::submission_observer::inspect_retired_after_wait(
+                &*self.queue as *const metal::CommandQueueRef as u64,
+            );
+        }
         if let Some(observer) = &self.observation {
             observer.drained(begin, crate::submission_observer::clock_ns(), status as u64);
         }
@@ -3191,8 +3215,7 @@ impl CommandEncoder {
             }
         });
         CMD_BUF_COUNT.fetch_add(1, Ordering::Relaxed);
-        self.cmd_buf = PooledCommandBuffer::new(cmd_buf);
-        self.observation = self
+        let next_observation = self
             .observation
             .as_ref()
             .and_then(|old| match old.rotate() {
@@ -3202,6 +3225,9 @@ impl CommandEncoder {
                     None
                 }
             });
+        self.retire_observation();
+        self.cmd_buf = PooledCommandBuffer::new(cmd_buf);
+        self.observation = next_observation;
         self.observation_has_work = false;
         self.observation_replay_bound = false;
         // Per-CB scratch state — every field that's documented as being
@@ -3345,11 +3371,20 @@ impl CommandEncoder {
     }
 }
 
+impl CommandEncoder {
+    fn retire_observation(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            crate::submission_observer::retire_command(observation, &self.queue, &self.cmd_buf);
+        }
+    }
+}
+
 impl Drop for CommandEncoder {
     fn drop(&mut self) {
         // End the persistent compute encoder before the command buffer
         // is dropped, otherwise Metal will assert:
         // "Command encoder released without endEncoding"
         self.end_active_encoder();
+        self.retire_observation();
     }
 }

@@ -90,6 +90,10 @@ pub trait SubmissionObserver: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[non_exhaustive]
 pub struct ObservationStatus {
+    /// Actual submitted CBs retained pending individual terminal status checks.
+    /// A final diagnostic window requires zero; never infer completion from an anchor.
+    pub pending_commands: u64,
+    pub pending_command_limit: u64,
     pub installed: bool,
     pub invalid: bool,
     pub events: u64,
@@ -104,7 +108,14 @@ pub struct ObservationStatus {
     pub comparison_qualified: bool,
 }
 
+#[path = "submission_observer/pending.rs"]
+mod pending;
+pub(crate) use pending::{
+    inspect_after_wait as inspect_retired_after_wait, retire as retire_command,
+};
+
 struct Core {
+    pending: pending::Registry<pending::MetalCommand>,
     sink: Arc<dyn SubmissionObserver>,
     limit: u64,
     events: AtomicU64,
@@ -150,6 +161,8 @@ pub fn install_submission_observer(
 pub fn submission_observation_status() -> ObservationStatus {
     match CORE.get() {
         Some(c) => ObservationStatus {
+            pending_commands: c.pending.outstanding(),
+            pending_command_limit: pending::LIMIT,
             installed: matches!(INSTALL.load(Ordering::Acquire), 2 | 4),
             invalid: c.invalid.load(Ordering::Acquire),
             events: c.events.load(Ordering::Acquire),
@@ -164,6 +177,8 @@ pub fn submission_observation_status() -> ObservationStatus {
             comparison_qualified: false,
         },
         None => ObservationStatus {
+            pending_commands: 0,
+            pending_command_limit: pending::LIMIT,
             installed: false,
             invalid: false,
             events: 0,
@@ -226,6 +241,7 @@ fn mark_started(state: &AtomicU8) {
 impl Core {
     fn new(sink: Arc<dyn SubmissionObserver>, limit: u64, metadata_limit: u64) -> Self {
         Self {
+            pending: pending::Registry::new(pending::LIMIT),
             sink,
             limit,
             events: AtomicU64::new(0),
@@ -459,6 +475,7 @@ pub(crate) struct CommandObservation {
     device: u64,
     pub(crate) epoch: u64,
     pub(crate) scope: Option<ObservationScope>,
+    rotation_scope: Option<ObservationScope>,
     captured_scope: Option<ObservationScope>,
     geometry: Option<DispatchGeometry>,
     pending_replay: Option<Option<ObservationScope>>,
@@ -476,6 +493,13 @@ pub(crate) struct CommandObservation {
 }
 
 impl CommandObservation {
+    fn unchecked_work(&self) -> bool {
+        self.submitted.load(Ordering::Acquire)
+            && self.checked.load(Ordering::Acquire) == u64::MAX
+            && (self.ordinal > 0
+                || self.noncompute.load(Ordering::Acquire) > 0
+                || self.tainted.load(Ordering::Acquire))
+    }
     pub(crate) fn create(queue: u64, device: u64, epoch: u64) -> Result<Self, &'static str> {
         if !matches!(INSTALL.load(Ordering::Acquire), 2 | 4) || epoch == 0 {
             return Err("installed observer and nonzero fresh invocation epoch required");
@@ -504,6 +528,7 @@ impl CommandObservation {
             device,
             epoch,
             scope: None,
+            rotation_scope: None,
             captured_scope: None,
             geometry: None,
             pending_replay: None,
@@ -679,7 +704,23 @@ impl CommandObservation {
         self.pending_replay = Some(bound);
     }
     pub(crate) fn rotate(&self) -> Result<Self, &'static str> {
-        Self::with_core(self.core.clone(), self.queue, self.device, self.epoch)
+        let mut next = Self::with_core(self.core.clone(), self.queue, self.device, self.epoch)?;
+        // Only the separately declared opaque fallback survives. Never inherit
+        // CURRENT scope, capture tags, replay bindings or prior dispatch state.
+        next.rotation_scope = self.rotation_scope;
+        next.scope = self.rotation_scope;
+        Ok(next)
+    }
+    pub(crate) fn set_rotation_scope(
+        &mut self,
+        scope: Option<ObservationScope>,
+    ) -> Result<(), &'static str> {
+        self.rotation_scope = scope.filter(|scope| scope.epoch == self.epoch);
+        if scope.is_some() && self.rotation_scope.is_none() {
+            self.core.unknown();
+            return Err("rotation fallback must match the current invocation epoch");
+        }
+        Ok(())
     }
     pub(crate) fn set_scope(&mut self, scope: Option<ObservationScope>) {
         self.captured_scope = None;
