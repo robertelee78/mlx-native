@@ -177,6 +177,11 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
     ] {
         let e = values.len();
         let l = input(&d, &values);
+        let l = if matches!(kind, 1 | 3 | 4 | 5) {
+            l.with_shape(vec![1, 256]).unwrap()
+        } else {
+            l
+        };
         let scales = input(
             &d,
             &(0..e).map(|i| 1.0 + i as f32 / 32.0).collect::<Vec<_>>(),
@@ -251,15 +256,22 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
         println!("ROUTING_WITNESS_GEMMA case={label} variant={:?} kernel={} exact_ids=true exact_weight_bits=true",chosen.variant,chosen.kernel);
     }
     let rows = 2;
-    let l = input(&d, &vec![0.0; rows * 256]);
+    let l = input(&d, &vec![0.0; rows * 256])
+        .with_shape(vec![rows, 256])
+        .unwrap();
     let bias = input(
         &d,
         &(0..256)
             .map(|i| if i < 6 { 6.0 - i as f32 } else { 0.0 })
             .collect::<Vec<_>>(),
     );
-    let a = Outputs::new(&d, rows, 6, DType::I32);
-    let b = Outputs::new(&d, rows, 6, DType::I32);
+    let mut a = Outputs::new(&d, rows, 6, DType::I32);
+    let mut b = Outputs::new(&d, rows, 6, DType::I32);
+    // Match the actual legacy DeepSeek ABI, not only its flattened element count.
+    for outputs in [&mut a, &mut b] {
+        outputs.ids.view = outputs.ids.view.with_shape(vec![rows, 6]).unwrap();
+        outputs.weights.view = outputs.weights.view.with_shape(vec![rows, 6]).unwrap();
+    }
     let mut enc = d.command_encoder().unwrap();
     super::super::deepseek_moe_routing::dispatch_deepseek_moe_score_route(
         &mut enc,
@@ -305,6 +317,11 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
             values[1] = f32::NAN;
         }
         let l = input(&d, &values);
+        let l = if matches!(kind, 1 | 3 | 4 | 5) {
+            l.with_shape(vec![1, 256]).unwrap()
+        } else {
+            l
+        };
         let mut scale_values = vec![
             if kind == 2 {
                 f32::INFINITY
@@ -319,7 +336,7 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
             scale_values[33] = f32::NAN;
         }
         let scales = input(&d, &scale_values);
-        let o = Outputs::new(
+        let mut o = Outputs::new(
             &d,
             1,
             6,
@@ -329,6 +346,10 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
                 DType::U32
             },
         );
+        if matches!(kind, 1 | 3 | 4 | 5) {
+            o.ids.view = o.ids.view.with_shape(vec![1, 6]).unwrap();
+            o.weights.view = o.weights.view.with_shape(vec![1, 6]).unwrap();
+        }
         let mut enc = d.command_encoder().unwrap();
         match kind {
             0 => {
