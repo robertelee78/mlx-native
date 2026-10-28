@@ -1442,6 +1442,14 @@ impl KernelRegistry {
         // Replaces CPU softmax+topk round-trip and CPU weighted accumulate.
         let moe_stk_src: &'static str = include_str!("shaders/moe_softmax_topk.metal");
         sources.insert("moe_softmax_topk_f32".into(), moe_stk_src);
+        // Explicit diagnostic producers; ordinary routing names/sources remain unchanged.
+        sources.insert("moe_softmax_topk_selection_witness_f32".into(), include_str!("shaders/moe_softmax_topk_selection_witness.metal"));
+        let routing_witness = include_str!("shaders/fused_moe_selection_witness.metal");
+        for name in ["fused_moe_routing_f32_selection_witness", "fused_moe_routing_f32_v2_selection_witness", "fused_moe_routing_f32_v3_selection_witness"] {
+            sources.insert(name.into(), routing_witness);
+        }
+        sources.insert("deepseek_moe_score_selection_witness_f32".into(), include_str!("shaders/deepseek_selection_witness.metal"));
+
         let moe_wr_src: &'static str = include_str!("shaders/moe_weighted_reduce.metal");
         sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
         // DeepSeek-V4 Hyper-Connection split/reduce/expand kernels.
