@@ -149,3 +149,36 @@ observe one Unknown, never qualified metadata. Each uses64B/four roots/two
 existing add operations/eight CPU-expected values under the same4MiB declared
 allowance and20s external watchdog proposal. `HF2Q_ENCODER_SESSION=1` is required;
 these authored controls have not been run by the author.
+
+## Async ownership and rotation validation
+
+The production asynchronous submit/drop path and EncoderSession rotation were
+exercised on Apple Silicon at source `4ef880dab29fb0445f25b60adb3762b4349376fe`
+with a release-built test executable. Five pending-registry controls and three
+rotation controls passed. Three separately launched actual Metal cases each
+ran one ignored test with 64 bytes of payload and eight exact output values:
+
+- Async encoder drop retained one pending owner until an existing consumer wait;
+  both actual command buffers then reported checked Completed and owner drop,
+  with zero pending owners and zero Unknown observations.
+- Explicit rotation fallback preserved the separately supplied scope, checked
+  both command buffers and retired all owners with zero Unknown observations.
+- Missing rotation fallback preserved an Unknown observation and remained
+  unqualified despite correct arithmetic and checked command completion.
+
+These are finite primitive controls, not model, full-forward, utilization or
+performance qualification. The original failed error-event control is retained
+in the experiment record; the correction records the actual Error status before
+sticky invalidation. No new GPU wait or kernel dispatch was introduced.
+
+Reproduce the actual cases separately in fresh processes:
+
+```sh
+cargo test --release --locked --lib submission_observer::tests::async_tests::submission_observer_async_drop_then_actual_consumer_checked_wait -- --exact --ignored --nocapture --test-threads=1
+HF2Q_ENCODER_SESSION=1 cargo test --release --locked --lib submission_observer::tests::rotation_actual::submission_observer_explicit_rotation_fallback_actual -- --exact --ignored --nocapture --test-threads=1
+HF2Q_ENCODER_SESSION=1 cargo test --release --locked --lib submission_observer::tests::rotation_actual::submission_observer_missing_rotation_fallback_unknown_actual -- --exact --ignored --nocapture --test-threads=1
+```
+
+Leave profiling overrides unset so the first case exercises genuine asynchronous
+submission. Confirm exactly one test ran in each process. Crate 0.15.8 carries
+this ownership fix; observation remains absent by default.
