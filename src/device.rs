@@ -181,6 +181,7 @@ impl MlxDevice {
     /// Returns `Err(MlxError::DeviceNotFound)` if no Metal device is available
     /// (e.g. running on a non-Apple-Silicon machine or in a headless Linux VM).
     pub fn new() -> Result<Self> {
+        crate::submission_observer::native_creation();
         let device = Device::system_default().ok_or(MlxError::DeviceNotFound)?;
         let queue = device.new_command_queue();
         let log_init = std::env::var("MLX_NATIVE_LOG_INIT").as_deref() == Ok("1");
@@ -518,3 +519,7 @@ pub(crate) fn raw_shared_buffer(
     }
     Ok(unsafe { metal::Buffer::from_ptr(raw) })
 }
+
+#[cfg(test)]
+#[path = "device/nocopy_residency_tests.rs"]
+mod nocopy_residency_tests;

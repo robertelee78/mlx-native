@@ -117,6 +117,7 @@ impl OpKind {
 /// transform the graph before encoding.
 pub struct ComputeGraph {
     nodes: Vec<CapturedNode>,
+    observation_scopes: Option<crate::submission_observer::CapturedScopes>,
 }
 
 impl ComputeGraph {
@@ -124,17 +125,36 @@ impl ComputeGraph {
     pub fn new() -> Self {
         Self {
             nodes: Vec::with_capacity(128),
+            observation_scopes: None,
         }
     }
 
     /// Create a compute graph from a pre-built list of captured nodes.
     pub fn from_nodes(nodes: Vec<CapturedNode>) -> Self {
-        Self { nodes }
+        Self {
+            nodes,
+            observation_scopes: None,
+        }
+    }
+
+    /// Preserve private diagnostic attachments through immediate replay. Reusing
+    /// this graph in another invocation requires explicit current-epoch rebind.
+    pub fn from_observed_capture(capture: crate::encoder::ObservedCapture) -> Self {
+        if let Some(tags) = &capture.scopes {
+            tags.aligned(capture.nodes.len());
+        }
+        Self {
+            nodes: capture.nodes,
+            observation_scopes: capture.scopes,
+        }
     }
 
     /// Record a captured node into the graph.
     pub fn record(&mut self, node: CapturedNode) {
         self.nodes.push(node);
+        if let Some(tags) = &mut self.observation_scopes {
+            tags.push(None);
+        }
     }
 
     /// Number of nodes (dispatches + barriers) in the graph.
@@ -198,8 +218,12 @@ impl ComputeGraph {
     ///
     /// Returns the number of barriers emitted.
     pub fn encode_sequential(&self, encoder: &mut CommandEncoder) -> u32 {
+        let permit = self
+            .observation_scopes
+            .as_ref()
+            .map(|tags| tags.claim(encoder.observation_command_id(), self.nodes.len()));
         let mut barrier_count = 0u32;
-        for node in &self.nodes {
+        for (observation_index, node) in self.nodes.iter().enumerate() {
             match node {
                 CapturedNode::Barrier => {
                     encoder.memory_barrier();
@@ -221,6 +245,15 @@ impl ComputeGraph {
                     // (GraphExecutor::begin_recorded path) are tagged with
                     // the same op label as direct-dispatch encoding.
                     encoder.set_op_kind(*op_kind);
+                    if let Some(tags) = &self.observation_scopes {
+                        tags.require_observed(encoder.observation_enabled());
+                    }
+                    encoder.bind_observed_replay(
+                        self.observation_scopes
+                            .as_ref()
+                            .and_then(|tags| tags.get(observation_index)),
+                        permit,
+                    );
                     encoder.replay_dispatch(
                         pipeline,
                         bindings,
@@ -244,10 +277,14 @@ impl ComputeGraph {
     ///
     /// Returns the number of barriers emitted.
     pub fn encode_with_barriers(&self, encoder: &mut CommandEncoder) -> u32 {
+        let permit = self
+            .observation_scopes
+            .as_ref()
+            .map(|tags| tags.claim(encoder.observation_command_id(), self.nodes.len()));
         let mut tracker = ReorderConflictTracker::new();
         let mut barrier_count = 0u32;
 
-        for node in &self.nodes {
+        for (observation_index, node) in self.nodes.iter().enumerate() {
             match node {
                 CapturedNode::Dispatch {
                     pipeline,
@@ -272,6 +309,15 @@ impl ComputeGraph {
                     }
                     // ADR-015: see encode_sequential note.
                     encoder.set_op_kind(*op_kind);
+                    if let Some(tags) = &self.observation_scopes {
+                        tags.require_observed(encoder.observation_enabled());
+                    }
+                    encoder.bind_observed_replay(
+                        self.observation_scopes
+                            .as_ref()
+                            .and_then(|tags| tags.get(observation_index)),
+                        permit,
+                    );
                     encoder.replay_dispatch(
                         pipeline,
                         bindings,
@@ -319,11 +365,31 @@ impl ComputeGraph {
         let split_idx = find_dispatch_split_index(&self.nodes, n0);
 
         // Encode first chunk with barrier recomputation, then commit immediately.
-        let barriers0 = encode_chunk_with_barriers(&self.nodes[..split_idx], encoder0);
+        let permit0 = self
+            .observation_scopes
+            .as_ref()
+            .map(|tags| tags.claim(encoder0.observation_command_id(), self.nodes.len()));
+        let barriers0 = encode_chunk_with_barriers(
+            &self.nodes[..split_idx],
+            encoder0,
+            self.observation_scopes.as_ref(),
+            0,
+            permit0,
+        );
         encoder0.commit();
 
         // Encode second chunk with barrier recomputation.
-        let barriers1 = encode_chunk_with_barriers(&self.nodes[split_idx..], encoder1);
+        let permit1 = self
+            .observation_scopes
+            .as_ref()
+            .map(|tags| tags.claim(encoder1.observation_command_id(), self.nodes.len()));
+        let barriers1 = encode_chunk_with_barriers(
+            &self.nodes[split_idx..],
+            encoder1,
+            self.observation_scopes.as_ref(),
+            split_idx,
+            permit1,
+        );
 
         (barriers0, barriers1)
     }
@@ -353,6 +419,10 @@ impl ComputeGraph {
         registry: &mut KernelRegistry,
         device: &metal::DeviceRef,
     ) -> Result<u32> {
+        let old_len = self.nodes.len();
+        if let Some(tags) = &self.observation_scopes {
+            tags.aligned(old_len);
+        }
         let mut result: Vec<CapturedNode> = Vec::with_capacity(self.nodes.len());
         let mut fusions = 0u32;
         let mut i = 0;
@@ -541,6 +611,11 @@ impl ComputeGraph {
             i = j + 1;
         }
 
+        if fusions > 0 || result.len() != old_len {
+            if let Some(tags) = &mut self.observation_scopes {
+                tags.transformed(result.len());
+            }
+        }
         self.nodes = result;
         Ok(fusions)
     }
@@ -574,6 +649,17 @@ impl ComputeGraph {
     pub fn reorder(&mut self) -> u32 {
         // Step 1: Strip barrier nodes.  After fusion + reorder, barriers will
         // be recomputed by the ConflictTracker at encode time.
+        if let Some(tags) = &mut self.observation_scopes {
+            if tags.aligned(self.nodes.len()) {
+                let indices: Vec<_> = self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, n)| (!matches!(n, CapturedNode::Barrier)).then_some(i))
+                    .collect();
+                tags.permute(&indices);
+            }
+        }
         self.nodes.retain(|n| !matches!(n, CapturedNode::Barrier));
 
         let n = self.nodes.len();
@@ -678,6 +764,9 @@ impl ComputeGraph {
         }
 
         // Build the reordered nodes vec.
+        if let Some(tags) = &mut self.observation_scopes {
+            tags.permute(&result);
+        }
         let old_nodes = std::mem::take(&mut self.nodes);
         self.nodes = result.iter().map(|&idx| old_nodes[idx].clone()).collect();
 
@@ -779,11 +868,17 @@ fn find_dispatch_split_index(nodes: &[CapturedNode], n0: usize) -> usize {
 /// Factored out so both halves of a dual-buffer encode can use it.
 ///
 /// Returns the number of barriers emitted.
-fn encode_chunk_with_barriers(nodes: &[CapturedNode], encoder: &mut CommandEncoder) -> u32 {
+fn encode_chunk_with_barriers(
+    nodes: &[CapturedNode],
+    encoder: &mut CommandEncoder,
+    scopes: Option<&crate::submission_observer::CapturedScopes>,
+    scope_offset: usize,
+    permit: Option<crate::submission_observer::ReplayPermit>,
+) -> u32 {
     let mut tracker = ReorderConflictTracker::new();
     let mut barrier_count = 0u32;
 
-    for node in nodes {
+    for (scope_index, node) in nodes.iter().enumerate() {
         match node {
             CapturedNode::Dispatch {
                 pipeline,
@@ -810,6 +905,13 @@ fn encode_chunk_with_barriers(nodes: &[CapturedNode], encoder: &mut CommandEncod
                 // per-dispatch profile dump groups dual-buffer chunked replay
                 // entries by the same op_kind label as direct dispatch.
                 encoder.set_op_kind(*op_kind);
+                if let Some(tags) = scopes {
+                    tags.require_observed(encoder.observation_enabled());
+                }
+                encoder.bind_observed_replay(
+                    scopes.and_then(|tags| tags.get(scope_offset + scope_index)),
+                    permit,
+                );
                 encoder.replay_dispatch(
                     pipeline,
                     bindings,
@@ -2080,8 +2182,8 @@ impl<'a> GraphSession<'a> {
     /// Consumes the session — no further ops can be encoded.
     pub fn finish(mut self) -> Result<()> {
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let graph = ComputeGraph::from_observed_capture(nodes);
                 graph.encode_sequential(&mut self.encoder);
             }
         }
@@ -2098,8 +2200,8 @@ impl<'a> GraphSession<'a> {
         let mut reordered = 0;
         let mut barriers = 0;
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 let unannotated = graph.unannotated_dispatch_count();
                 if unannotated != 0 {
                     let pipelines = graph
@@ -2140,8 +2242,8 @@ impl<'a> GraphSession<'a> {
     /// Consumes the session.
     pub fn commit(mut self) -> CommandEncoder {
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let graph = ComputeGraph::from_observed_capture(nodes);
                 graph.encode_sequential(&mut self.encoder);
             }
         }
@@ -2178,8 +2280,8 @@ impl<'a> GraphSession<'a> {
     /// Consumes the session.
     pub fn finish_with_timing(mut self, session_begin: std::time::Instant) -> Result<(u64, u64)> {
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let graph = ComputeGraph::from_observed_capture(nodes);
                 graph.encode_sequential(&mut self.encoder);
             }
         }
@@ -2206,8 +2308,8 @@ impl<'a> GraphSession<'a> {
     /// Consumes the session.
     pub fn finish_with_gpu_time(mut self) -> Result<u64> {
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let graph = ComputeGraph::from_observed_capture(nodes);
                 graph.encode_sequential(&mut self.encoder);
             }
         }
@@ -2234,8 +2336,8 @@ impl<'a> GraphSession<'a> {
     ) -> Result<u32> {
         let mut fusions = 0;
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 fusions = graph.fuse(registry, device)?;
                 graph.encode_sequential(&mut self.encoder);
             }
@@ -2268,8 +2370,8 @@ impl<'a> GraphSession<'a> {
     ) -> Result<(CommandEncoder, u32)> {
         let mut fusions = 0;
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 fusions = graph.fuse(registry, device)?;
                 graph.encode_sequential(&mut self.encoder);
             }
@@ -2294,8 +2396,8 @@ impl<'a> GraphSession<'a> {
     ) -> Result<(u64, u64, u32)> {
         let mut fusions = 0;
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 fusions = graph.fuse(registry, device)?;
                 graph.encode_sequential(&mut self.encoder);
             }
@@ -2323,8 +2425,8 @@ impl<'a> GraphSession<'a> {
         let mut fusions = 0;
         let mut reordered = 0;
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 fusions = graph.fuse(registry, device)?;
                 reordered = graph.reorder();
                 graph.encode_with_barriers(&mut self.encoder);
@@ -2347,8 +2449,8 @@ impl<'a> GraphSession<'a> {
         let mut fusions = 0;
         let mut reordered = 0;
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
-                let mut graph = ComputeGraph::from_nodes(nodes);
+            if let Some(nodes) = self.encoder.take_observed_capture() {
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 fusions = graph.fuse(registry, device)?;
                 reordered = graph.reorder();
                 graph.encode_with_barriers(&mut self.encoder);
@@ -2385,12 +2487,12 @@ impl<'a> GraphSession<'a> {
         let mut barriers1 = 0u32;
 
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
+            if let Some(nodes) = self.encoder.take_observed_capture() {
                 // Commit the capture encoder's empty command buffer so its
                 // MTLCommandQueue pool slot is freed (same fix as timing variant).
                 self.encoder.commit();
 
-                let mut graph = ComputeGraph::from_nodes(nodes);
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 fusions = graph.fuse(registry, device)?;
                 reordered = graph.reorder();
 
@@ -2442,7 +2544,7 @@ impl<'a> GraphSession<'a> {
         let mut barriers1 = 0u32;
 
         if self.recording {
-            if let Some(nodes) = self.encoder.take_capture() {
+            if let Some(nodes) = self.encoder.take_observed_capture() {
                 // Commit the capture encoder's empty command buffer so its
                 // MTLCommandQueue pool slot is freed.  Without this, each
                 // token leaks one uncommitted buffer and the queue exhausts
@@ -2450,7 +2552,7 @@ impl<'a> GraphSession<'a> {
                 self.encoder.commit();
 
                 let opt_t0 = std::time::Instant::now();
-                let mut graph = ComputeGraph::from_nodes(nodes);
+                let mut graph = ComputeGraph::from_observed_capture(nodes);
                 let fuse_t0 = std::time::Instant::now();
                 fusions = graph.fuse(registry, device)?;
                 let fuse_us = fuse_t0.elapsed().as_micros();
