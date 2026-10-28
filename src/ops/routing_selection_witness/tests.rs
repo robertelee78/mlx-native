@@ -438,3 +438,6 @@ fn actual_selection_witness_preserves_ids_weights_and_domains() {
     assert!(actual_gemma.iter().all(|v| *v == actual_gemma[0]));
     println!("ROUTING_SELECTION_WITNESS_COMPLETE qwen_cases=4 gemma_cases=3 ds_cases=1 invalid_cases=6 views_guarded=true gemma_variant={:?} model_parity=false",actual_gemma[0]);
 }
+
+#[path="batch_tests.rs"]
+mod batch_tests;

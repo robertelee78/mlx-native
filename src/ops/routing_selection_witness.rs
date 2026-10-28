@@ -471,3 +471,6 @@ pub fn dispatch_deepseek_score_with_witness(
 #[cfg(test)]
 #[path = "routing_selection_witness/tests.rs"]
 mod tests;
+
+mod batch;
+pub use batch::dispatch_gemma_batch_with_witness;

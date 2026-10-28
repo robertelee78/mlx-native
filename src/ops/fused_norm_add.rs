@@ -695,6 +695,21 @@ pub fn dispatch_fused_moe_routing_f32(
     Ok(())
 }
 
+/// Shared actual cached batch selector; no scalar V2 fallback is implied.
+pub(crate) fn selected_fused_moe_routing_batch_f32_kernel() -> &'static str {
+    // ADR-029 iter-175 Step 1j: batched-prefill counterpart of the Step 1i
+    // V3 win.  Same parallel SG-tournament top-K replacing the serial scan
+    // (per-token within each TG).  Same HF2Q_FUSED_MOE_ROUTING_V3 env flag
+    // controls both unbatched + batched paths.
+    static CACHED_MOE_ROUTING_V3_BATCH: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let use_v3 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V3_BATCH, "HF2Q_FUSED_MOE_ROUTING_V3");
+    if use_v3 {
+        "fused_moe_routing_batch_f32_v3"
+    } else {
+        "fused_moe_routing_batch_f32"
+    }
+}
+
 /// Batched fused MoE routing for prefill.
 ///
 /// Processes `n_tokens` routings in one dispatch. Same semantics as
@@ -724,17 +739,8 @@ pub fn dispatch_fused_moe_routing_batch_f32(
         ));
     }
 
-    // ADR-029 iter-175 Step 1j: batched-prefill counterpart of the Step 1i
-    // V3 win.  Same parallel SG-tournament top-K replacing the serial scan
-    // (per-token within each TG).  Same HF2Q_FUSED_MOE_ROUTING_V3 env flag
-    // controls both unbatched + batched paths.
-    static CACHED_MOE_ROUTING_V3_BATCH: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-    let use_v3 = crate::env_flags::cached_env_default_true(&CACHED_MOE_ROUTING_V3_BATCH, "HF2Q_FUSED_MOE_ROUTING_V3");
-    let kernel_name = if use_v3 {
-        "fused_moe_routing_batch_f32_v3"
-    } else {
-        "fused_moe_routing_batch_f32"
-    };
+    let kernel_name = selected_fused_moe_routing_batch_f32_kernel();
+    let use_v3 = kernel_name == "fused_moe_routing_batch_f32_v3";
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
     let gpu_params = GpuFusedMoeRoutingParams {

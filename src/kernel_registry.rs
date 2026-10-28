@@ -1448,6 +1448,10 @@ impl KernelRegistry {
         for name in ["fused_moe_routing_f32_selection_witness", "fused_moe_routing_f32_v2_selection_witness", "fused_moe_routing_f32_v3_selection_witness"] {
             sources.insert(name.into(), routing_witness);
         }
+        let batch_routing_witness = include_str!("shaders/fused_moe_batch_selection_witness.metal");
+        for name in ["fused_moe_routing_batch_f32_selection_witness", "fused_moe_routing_batch_f32_v3_selection_witness"] {
+            sources.insert(name.into(), batch_routing_witness);
+        }
         sources.insert("deepseek_moe_score_selection_witness_f32".into(), include_str!("shaders/deepseek_selection_witness.metal"));
 
         let moe_wr_src: &'static str = include_str!("shaders/moe_weighted_reduce.metal");
