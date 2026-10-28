@@ -134,6 +134,22 @@ static INSTALL: AtomicU8 = AtomicU8::new(0);
 static CORE: OnceLock<Arc<Core>> = OnceLock::new();
 thread_local! { static IN_SINK: Cell<bool> = const { Cell::new(false) }; }
 
+// Total historical event count only; never an allocation/capacity request.
+const MAX_TOTAL_EVENTS: u64 = 16_000_000;
+
+fn validate_observer_limits(event_limit: u64, metadata_limit_bytes: u64) -> Result<(), &'static str> {
+    if event_limit == 0 || event_limit > MAX_TOTAL_EVENTS {
+        return Err("observer event bound must be 1..=16000000");
+    }
+    if metadata_limit_bytes == 0 || metadata_limit_bytes > 16 * 1024 * 1024 {
+        return Err("observer metadata quota must be 1..=16MiB");
+    }
+    Ok(())
+}
+
+/// Install an explicit total-event ceiling (1..=16,000,000) and independent
+/// live metadata quota (1..=16MiB). Neither limit preallocates event storage.
+/// Callers retain their chosen limit; no observer is installed by default.
 pub fn install_submission_observer(
     sink: Arc<dyn SubmissionObserver>,
     event_limit: u64,
@@ -142,12 +158,7 @@ pub fn install_submission_observer(
     if cfg!(panic = "abort") {
         return Err("observer panic containment requires panic=unwind");
     }
-    if event_limit == 0 || event_limit > 1_000_000 {
-        return Err("observer event bound must be 1..=1000000");
-    }
-    if metadata_limit_bytes == 0 || metadata_limit_bytes > 16 * 1024 * 1024 {
-        return Err("observer metadata quota must be 1..=16MiB");
-    }
+    validate_observer_limits(event_limit, metadata_limit_bytes)?;
     begin_install(&INSTALL)?;
     let core = Arc::new(Core::new(sink, event_limit, metadata_limit_bytes));
     if CORE.set(core).is_err() {
@@ -801,3 +812,7 @@ impl Drop for CommandObservation {
 #[cfg(test)]
 #[path = "submission_observer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "submission_observer/event_limit_tests.rs"]
+mod event_limit_tests;

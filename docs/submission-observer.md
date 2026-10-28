@@ -182,3 +182,35 @@ HF2Q_ENCODER_SESSION=1 cargo test --release --locked --lib submission_observer::
 Leave profiling overrides unset so the first case exercises genuine asynchronous
 submission. Confirm exactly one test ran in each process. Crate 0.15.8 carries
 this ownership fix; observation remains absent by default.
+
+## Prospective0.15.9 total-event ceiling
+
+The explicitly installed total historical event limit may be1..=16,000,000.
+This changes only the maximum accepted caller argument. Existing callers that
+request1,000,000 keep that exact ceiling; observation-None remains the default.
+Live native metadata stays at most16MiB, pending commands1024, capture/replay
+maps4096; consumer bookkeeping is not enlarged by this API change. Overflow
+still invalidates and counts dropped events; no sampling/reset/refund is added.
+
+The total limit is stored as one u64 in Core. Core::new initializes atomic
+counters and an empty fixed-limit pending registry; it does not reserve a vector
+or event array proportional to event_limit. Core::emit checked-increments one
+counter and invokes the external sink by reference. The sink owns its separate
+serialized/storage quota; raising a counter ceiling is not a RAM bound or an
+instruction to allocate16million entries. Live reservations remain independently
+precharged against metadata_limit, and pending entries remain bounded1024.
+
+Reason: the downstream full native0.15.8 capture040642Z reached its requested
+1,000,000 events, retained a footer with invalid=true and2,524,480 dropped events,
+pending0/unknown0. That attempt remains failed; no new ceiling rescues/rescores
+it. A future consumer profile may prospectively request a higher finite count
+and its own serialized I/O budget after independent review. Existing legacy/v2
+consumer profiles stay1million. This note does not attest future wholecase fit,
+physical memory, model quality, timing or fulltrace success.
+
+Four new model-free controls cover validation0/exact16million/onepast/overflow,
+unchanged live/pending bounds and actual command emission at both old/new total
+ceilings. They seed only the historical counter near its boundary, then execute
+real Created/Drop emission with a constant-space counting sink; no Metal work
+or16million-event allocation/loop is needed. These controls are authored only;
+compilation/execution/publication and downstream exact pin remain pending.
