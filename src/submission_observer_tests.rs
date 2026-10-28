@@ -563,3 +563,6 @@ fn submission_observer_recorded_two_operation_actual() {
         "model_admission":false,"performance_claim":false})
     );
 }
+
+#[path = "submission_observer/async_tests.rs"]
+mod async_tests;
