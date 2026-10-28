@@ -1145,6 +1145,25 @@ impl CommandEncoder {
         }
     }
 
+    /// Explicit same-invocation opaque-auxiliary scope for CB rotation only.
+    /// The caller must independently declare it auxiliary; never pass a saved
+    /// Known tensor/row witness. CURRENT scope is separate and never inherited.
+    /// Default None stays unknown after rotation. This encodes no GPU work.
+    pub fn set_observation_rotation_scope(
+        &mut self,
+        scope: Option<crate::submission_observer::ObservationScope>,
+    ) -> Result<()> {
+        self.observation
+            .as_mut()
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "rotation fallback requires an enabled observation".into(),
+                )
+            })?
+            .set_rotation_scope(scope)
+            .map_err(|error| MlxError::InvalidArgument(error.into()))
+    }
+
     pub fn set_observation_replay_bindings(
         &mut self,
         bindings: &[(

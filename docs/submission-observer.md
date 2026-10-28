@@ -122,3 +122,30 @@ zero outstanding owners. Payload is four 16-byte roots (64 B); the separately
 predeclared 4 MiB userdata/metadata allowance excludes device/driver/compiler
 bootstrap. It must run in a fresh bounded process; authored source is not an
 actual device result. The old 0.15.7 whole-model failed trace remains unchanged.
+
+### Explicit rotation fallback (source candidate)
+
+`CommandEncoder::set_observation_rotation_scope(Option<ObservationScope>) ->
+Result<()>` declares a separate same-epoch fallback for command-buffer rotation.
+It requires an enabled observer; a wrong epoch refuses, clears the saved
+fallback and records Unknown. `None` explicitly clears it. Default None remains
+Unknown after rotation. The caller must bind an independently declared opaque
+auxiliary scope, not a Known RMS/tensor-row scope. Native scope IDs do not encode
+HF membership: the HF strict source/manifest consumer must validate that this
+fallback is auxiliary.
+
+Rotation creates a fresh command ID and clears capture/replay/dispatch state;
+only this explicit fallback becomes the new current/future rotation scope.
+It never copies the previous CURRENT Known scope. HF constructor and attachment
+adapters must each bind a fresh `auxiliary(epoch)` separately from CURRENT.
+No GPU instruction, route, synchronization or scheduling changes.
+
+Three hosted controls check the actual rotation helper: stale/cleared/missing
+fallback and removal of current Known/capture/replay state. Two distinct ignored
+fresh-process actual EncoderSession controls call `commit_stage` then
+`reset_for_next_stage` and a real consumer checked wait. The positive retains
+only explicit fallback; the negative deliberately leaves it missing and must
+observe one Unknown, never qualified metadata. Each uses64B/four roots/two
+existing add operations/eight CPU-expected values under the same4MiB declared
+allowance and20s external watchdog proposal. `HF2Q_ENCODER_SESSION=1` is required;
+these authored controls have not been run by the author.

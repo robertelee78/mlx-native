@@ -475,6 +475,7 @@ pub(crate) struct CommandObservation {
     device: u64,
     pub(crate) epoch: u64,
     pub(crate) scope: Option<ObservationScope>,
+    rotation_scope: Option<ObservationScope>,
     captured_scope: Option<ObservationScope>,
     geometry: Option<DispatchGeometry>,
     pending_replay: Option<Option<ObservationScope>>,
@@ -527,6 +528,7 @@ impl CommandObservation {
             device,
             epoch,
             scope: None,
+            rotation_scope: None,
             captured_scope: None,
             geometry: None,
             pending_replay: None,
@@ -702,7 +704,23 @@ impl CommandObservation {
         self.pending_replay = Some(bound);
     }
     pub(crate) fn rotate(&self) -> Result<Self, &'static str> {
-        Self::with_core(self.core.clone(), self.queue, self.device, self.epoch)
+        let mut next = Self::with_core(self.core.clone(), self.queue, self.device, self.epoch)?;
+        // Only the separately declared opaque fallback survives. Never inherit
+        // CURRENT scope, capture tags, replay bindings or prior dispatch state.
+        next.rotation_scope = self.rotation_scope;
+        next.scope = self.rotation_scope;
+        Ok(next)
+    }
+    pub(crate) fn set_rotation_scope(
+        &mut self,
+        scope: Option<ObservationScope>,
+    ) -> Result<(), &'static str> {
+        self.rotation_scope = scope.filter(|scope| scope.epoch == self.epoch);
+        if scope.is_some() && self.rotation_scope.is_none() {
+            self.core.unknown();
+            return Err("rotation fallback must match the current invocation epoch");
+        }
+        Ok(())
     }
     pub(crate) fn set_scope(&mut self, scope: Option<ObservationScope>) {
         self.captured_scope = None;

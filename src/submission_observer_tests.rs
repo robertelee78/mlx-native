@@ -566,3 +566,8 @@ fn submission_observer_recorded_two_operation_actual() {
 
 #[path = "submission_observer/async_tests.rs"]
 mod async_tests;
+
+#[path = "submission_observer/rotation_controls.rs"]
+mod rotation_controls;
+#[path = "submission_observer/rotation_actual.rs"]
+mod rotation_actual;

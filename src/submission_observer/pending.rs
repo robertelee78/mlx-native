@@ -108,10 +108,12 @@ impl<R: TerminalResource> Registry<R> {
             let Some((entry, status, begin, end)) = terminal else {
                 return;
             };
+            // Preserve actual terminal Error evidence before sticky invalidation
+            // suppresses future sink events. Error can never become healthy.
+            entry.observation.drained(begin, end, status);
             if status != 4 {
                 core.fail();
             }
-            entry.observation.drained(begin, end, status);
             // Fully release outside lock, then count/metadata refund. Nonterminal
             // resources stay retained; no sleep, poll loop, callback or extra wait.
             drop(entry);
