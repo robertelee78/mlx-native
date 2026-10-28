@@ -574,6 +574,22 @@ fn encode_trace_enabled() -> bool {
 /// branch single-atomic-load fast.  Default OFF so any production decode
 /// run that does NOT explicitly set the var preserves retained-refs
 /// behavior verbatim.
+/// Return the process-cached reference mode used by actual command-buffer
+/// construction and rotation. `true` means bound GPU resources must be kept
+/// alive explicitly until completion; retaining the command buffer is not enough.
+///
+/// The first call initializes the SAME native decision as encoder construction
+/// from `MLX_UNRETAINED_REFS` (only the exact string `"1"` enables it). Later
+/// environment changes do not change that decision. Call before allocating or
+/// mutating GPU state when a caller needs to refuse unretained-reference mode.
+/// This performs no Metal/device/queue operation and is not a completion or
+/// allocation-lifetime proof. It does not expose a raw command buffer or taint
+/// observation. On non-Metal hosts it describes the cached configuration only;
+/// it does not claim that a Metal encoder can be constructed there.
+pub fn command_buffer_uses_unretained_references() -> bool {
+    unretained_refs_enabled()
+}
+
 fn unretained_refs_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
