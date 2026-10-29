@@ -496,3 +496,6 @@ mod mapping_retirement;
 
 #[path = "scoped_membership/joint_mapping_retirement.rs"]
 mod joint_mapping_retirement;
+
+#[path="scoped_membership/latency.rs"]
+mod latency;
