@@ -218,7 +218,7 @@ fn run()->R<()>{
   membership(&d,&cohorts,on(0,1))?;
   for(step,&index)in SEQUENCE.iter().enumerate(){
    read_all(&d,&cohorts[index],index,&out,n.reads,&mut log)?;n.reads+=1;
-   if(1..=3).contains(&step){let retired=(index+2)%3;membership(&d,&cohorts,on(index,(index+1)%3))?;let frames=cut(&cohorts[retired],arm,step-1,origin,&mut log,&mut n)?;if arm==Arm::Advice{n.advice+=2;let matched=control.get(step-1).ok_or("missing fixed control cut")?;reductions.push(compare(matched,&frames)?);}else{need(full_cross_l1(&frames.0,&frames.1)<=NUISANCE,"NoAdvice nonstationary full L1")?;control.push(frames);}}
+   if(1..=3).contains(&step){let retired=(index+2)%3;membership(&d,&cohorts,on(index,(index+1)%3))?;let frames=cut(&cohorts[retired],arm,step-1,origin,&mut log,&mut n)?;if arm==Arm::Advice{n.advice+=2;let matched=control.get(step-1).ok_or("missing fixed control cut")?;reductions.push(compare(matched,&frames)?);}else{need(full_cross_l1(&frames.0,&frames.1)<=u128::from(NUISANCE),"NoAdvice nonstationary full L1")?;control.push(frames);}}
    else if step==4{membership(&d,&cohorts,on(1,2))?;}
   }
  }
