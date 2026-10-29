@@ -112,7 +112,23 @@ fn sweep(c:&Cohort,arm:Arm,cut:usize,stage:&str,index:usize,origin:Instant,log:&
  for i in 0..CHUNKS{let r=chunk(i)?;let l=PageQueryLimits{max_elapsed_ns:QUERY_CAP};
   let a=text(c.root.observe_nocopy_root_pages(r,l))?;n.queries+=1;
   let b=text(observe_readonly_mapping_pages(&c.b,r,l))?;n.queries+=1;
-  need(actual_pair_valid(c,r,&a,&b),"actual complete same-file chunk pair/flags/authority disagreement")?;
+  let pair_valid=actual_pair_valid(c,r,&a,&b);
+  if !pair_valid{
+   // Diagnostic only AFTER the unchanged predicate has failed. No extra page
+   // query, retry, acceptance fallback or raw payload access.
+   let expected_offset=usize::try_from(r.page_offset).ok().and_then(|p|p.checked_mul(PAGE));
+   let expected_bytes=(r.page_count as usize).checked_mul(PAGE);
+   let expected_addresses=[expected_offset.and_then(|o|(c.a.as_ptr()as usize).checked_add(o)),expected_offset.and_then(|o|(c.b.as_ptr()as usize).checked_add(o))];
+   let mismatches=a.dispositions.iter().zip(&b.dispositions).filter(|(x,y)|x!=y).count()+a.dispositions.len().abs_diff(b.dispositions.len());
+   let mut first=Vec::with_capacity(8);
+   for j in 0..a.dispositions.len().max(b.dispositions.len()).min(4096){let x=a.dispositions.get(j).copied();let y=b.dispositions.get(j).copied();if x!=y&&first.len()<8{first.push((r.page_offset.checked_add(j as u64),x,y));}}
+   let fd_now=match identity(&c.file){Ok(v)=>json!({"stat":v}),Err(e)=>json!({"error":e})};
+   let root_now=match c.root.backing_snapshot(){Ok(v)=>json!({"descriptor":format!("{v:?}")}),Err(e)=>json!({"error":e.to_string()})};
+   let requested=json!({"range":[r.page_offset,r.page_count as u64],"page_bytes":PAGE,"expected_addresses":expected_addresses,"expected_queried_bytes":expected_bytes,"query_cap_ns":QUERY_CAP,"expected_root_descriptor":format!("{:?}",c.descriptor),"expected_fd":c.id,"actual_fd":fd_now,"actual_root":root_now});
+   let describe=|o:&PageObservation|json!({"source":format!("{:?}",o.source),"range":[o.range.page_offset,o.range.page_count as u64],"page_bytes":o.page_bytes,"address":o.query_address,"queried_bytes":o.queried_bytes,"status":o.raw_mach_status,"returned":o.returned_count,"flags_length":o.dispositions.len(),"elapsed_ns":o.elapsed_ns,"clock":o.clock,"start_ns":o.start_ns,"end_ns":o.end_ns,"raw_flags_sha256_le":hash_flags(&o.dispositions),"counts":counts(o)});
+   log.emit("PAIR_FAILED",json!({"arm":arm.label(),"cut":cut,"stage":stage,"index":index,"chunk":i,"requested":requested,"root_observation":describe(&a),"alias_observation":describe(&b),"flags_mismatch_count":mismatches,"first_mismatches":first,"mismatch_offset_unit":"root_page_index","first_mismatch_cap":8,"scan_page_cap":4096,"protocol":false,"physical_credit_bytes":0,"no_retry":true}))?;
+  }
+  need(pair_valid,"actual complete same-file chunk pair/flags/authority disagreement")?;
   let cs=counts(&a);for(j,v)in cs.into_iter().enumerate(){result.totals[j]=result.totals[j].checked_add(v as u64).ok_or("count overflow")?;}
   log.emit("CHUNK",json!({"arm":arm.label(),"cut":cut,"stage":stage,"index":index,"chunk":i,"fd":c.id,"root":format!("{:?}",a.source),"alias":format!("{:?}",b.source),"range":[r.page_offset,r.page_count as u64],"addresses":[a.query_address,b.query_address],"page_bytes":PAGE,"queried_bytes":a.queried_bytes,"returned":[a.returned_count,b.returned_count],"status":[a.raw_mach_status,b.raw_mach_status],"counts":[counts(&a),counts(&b)],"flags_sha256_le":[hash_flags(&a.dispositions),hash_flags(&b.dispositions)],"native_clock":a.clock,"native_brackets":[[a.start_ns,a.end_ns,a.elapsed_ns],[b.start_ns,b.end_ns,b.elapsed_ns]],"equal":true,"physical_credit_bytes":0}))?;
  }
