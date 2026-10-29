@@ -6,6 +6,9 @@ pub(super) const LIMIT: u64 = 1024;
 
 pub(super) trait TerminalResource {
     fn status(&self) -> u64;
+    fn gpu_timestamps(&self) -> crate::CompletedGpuTimestamps {
+        crate::CompletedGpuTimestamps::unknown(crate::GpuTimestampUnknown::NotHealthyCompleted, None)
+    }
 }
 struct Slot(Arc<AtomicU64>);
 impl Drop for Slot {
@@ -111,6 +114,7 @@ impl<R: TerminalResource> Registry<R> {
             // Preserve actual terminal Error evidence before sticky invalidation
             // suppresses future sink events. Error can never become healthy.
             entry.observation.drained(begin, end, status);
+            entry.observation.completed_gpu_timing(|| entry.resource.gpu_timestamps());
             if status != 4 {
                 core.fail();
             }
@@ -126,6 +130,10 @@ pub(super) struct MetalCommand {
     _queue: Option<metal::CommandQueue>,
 }
 impl TerminalResource for MetalCommand {
+    fn gpu_timestamps(&self) -> crate::CompletedGpuTimestamps {
+        crate::gpu_timestamps::read(self.command.as_ref().expect("retained actual CB"))
+    }
+
     fn status(&self) -> u64 {
         self.command.as_ref().expect("retained actual CB").status() as u64
     }

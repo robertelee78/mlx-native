@@ -2876,6 +2876,7 @@ impl CommandEncoder {
         }
         if let Some(observer) = &self.observation {
             observer.drained(begin, crate::submission_observer::clock_ns(), status as u64);
+            observer.completed_gpu_timing(|| crate::gpu_timestamps::read(&self.cmd_buf));
         }
         status
     }
@@ -3097,6 +3098,13 @@ impl CommandEncoder {
             let ns = self.completed_gpu_interval_ns();
             GPU_BUSY_NS.fetch_add(ns, Ordering::Relaxed);
         }
+    }
+
+    /// Nonblocking raw endpoints from THIS actual healthy completed CB. No
+    /// wait, recommit, rotation, observer drain, raw escape or clock conversion.
+    /// Read before rotation; Unknown is never a zero-time measurement.
+    pub fn completed_gpu_timestamps(&self) -> crate::CompletedGpuTimestamps {
+        crate::gpu_timestamps::read(&self.cmd_buf)
     }
 
     /// Return this completed command buffer's GPU interval in nanoseconds.
