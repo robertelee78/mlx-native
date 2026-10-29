@@ -16,6 +16,11 @@
 //! let norm = gguf.load_tensor_f32("blk.0.attn_norm.weight", &device)?;
 //! ```
 
+mod header;
+mod map_plan;
+pub use header::{GgufHeaderLimits,GgufHeaderUsage};
+pub use map_plan::{GgufMappedTensorPlan,GgufMappedSegmentPlan,GgufTensorViewPlan};
+
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -168,6 +173,7 @@ pub struct GgufFile {
     /// Absolute byte offset in the file where tensor data begins.
     tensor_data_offset: u64,
     reader: Mutex<BufReader<std::fs::File>>,
+    bounded_header_usage:Option<GgufHeaderUsage>,
 }
 
 /// File-backed Metal segments and typed tensor views for one GGUF/device pair.
@@ -380,62 +386,6 @@ fn read_f64<R: Read>(r: &mut R) -> Result<f64> {
 
 /// Read a GGUF-format string: u64 length followed by UTF-8 bytes (not
 /// null-terminated).
-fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
-    let len = read_u64(r)? as usize;
-    if len > 256 * 1024 * 1024 {
-        return Err(MlxError::GgufParseError(format!(
-            "string length {len} exceeds 256 MiB safety limit"
-        )));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)
-        .map_err(|e| MlxError::GgufParseError(format!("read string bytes: {e}")))?;
-    String::from_utf8(buf)
-        .map_err(|e| MlxError::GgufParseError(format!("invalid UTF-8 in string: {e}")))
-}
-
-// ---------------------------------------------------------------------------
-// Metadata value parsing
-// ---------------------------------------------------------------------------
-
-/// Read a single metadata value of the given type.
-fn read_metadata_value<R: Read>(r: &mut R, value_type: u32) -> Result<MetadataValue> {
-    match value_type {
-        GGUF_TYPE_UINT8 => Ok(MetadataValue::Uint8(read_u8(r)?)),
-        GGUF_TYPE_INT8 => Ok(MetadataValue::Int8(read_i8(r)?)),
-        GGUF_TYPE_UINT16 => Ok(MetadataValue::Uint16(read_u16(r)?)),
-        GGUF_TYPE_INT16 => Ok(MetadataValue::Int16(read_i16(r)?)),
-        GGUF_TYPE_UINT32 => Ok(MetadataValue::Uint32(read_u32(r)?)),
-        GGUF_TYPE_INT32 => Ok(MetadataValue::Int32(read_i32(r)?)),
-        GGUF_TYPE_FLOAT32 => Ok(MetadataValue::Float32(read_f32(r)?)),
-        GGUF_TYPE_BOOL => {
-            let byte = read_u8(r)?;
-            Ok(MetadataValue::Bool(byte != 0))
-        }
-        GGUF_TYPE_STRING => Ok(MetadataValue::String(read_gguf_string(r)?)),
-        GGUF_TYPE_ARRAY => {
-            let elem_type = read_u32(r)?;
-            let count = read_u64(r)? as usize;
-            if count > 64 * 1024 * 1024 {
-                return Err(MlxError::GgufParseError(format!(
-                    "array count {count} exceeds 64M element safety limit"
-                )));
-            }
-            let mut elems = Vec::with_capacity(count);
-            for _ in 0..count {
-                elems.push(read_metadata_value(r, elem_type)?);
-            }
-            Ok(MetadataValue::Array(elems))
-        }
-        GGUF_TYPE_UINT64 => Ok(MetadataValue::Uint64(read_u64(r)?)),
-        GGUF_TYPE_INT64 => Ok(MetadataValue::Int64(read_i64(r)?)),
-        GGUF_TYPE_FLOAT64 => Ok(MetadataValue::Float64(read_f64(r)?)),
-        other => Err(MlxError::GgufParseError(format!(
-            "unknown metadata value type {other}"
-        ))),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // GGML type mapping
 // ---------------------------------------------------------------------------
@@ -1382,121 +1332,26 @@ impl GgufFile {
     pub fn from_file(mut file: std::fs::File) -> Result<Self> {
         file.seek(SeekFrom::Start(0))
             .map_err(|e| MlxError::IoError(format!("seek GGUF file start: {e}")))?;
-        let mut reader = BufReader::new(file);
-
-        // --- Header ---
-        let magic = read_u32(&mut reader)?;
-        if magic != GGUF_MAGIC {
-            return Err(MlxError::GgufParseError(format!(
-                "bad magic: expected 0x{GGUF_MAGIC:08X}, got 0x{magic:08X}"
-            )));
-        }
-
-        let version = read_u32(&mut reader)?;
-        if version != GGUF_VERSION {
-            return Err(MlxError::GgufParseError(format!(
-                "unsupported GGUF version {version} (only v3 is supported)"
-            )));
-        }
-
-        let tensor_count = read_u64(&mut reader)? as usize;
-        let metadata_kv_count = read_u64(&mut reader)? as usize;
-
-        // Sanity limits to prevent OOM on corrupted files.
-        if tensor_count > 100_000 {
-            return Err(MlxError::GgufParseError(format!(
-                "tensor_count {tensor_count} exceeds 100k safety limit"
-            )));
-        }
-        if metadata_kv_count > 1_000_000 {
-            return Err(MlxError::GgufParseError(format!(
-                "metadata_kv_count {metadata_kv_count} exceeds 1M safety limit"
-            )));
-        }
-
-        // --- Metadata KV pairs ---
-        let mut metadata = HashMap::with_capacity(metadata_kv_count);
-        for _ in 0..metadata_kv_count {
-            let key = read_gguf_string(&mut reader)?;
-            let value_type = read_u32(&mut reader)?;
-            let value = read_metadata_value(&mut reader, value_type)?;
-            metadata.insert(key, value);
-        }
-
-        // --- Determine alignment ---
-        let alignment = metadata
-            .get(GGUF_ALIGNMENT_KEY)
-            .and_then(|v| v.as_u32())
-            .map(|v| v as u64)
-            .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
-
-        if alignment == 0 || (alignment & (alignment - 1)) != 0 {
-            return Err(MlxError::GgufParseError(format!(
-                "alignment {alignment} is not a power of two"
-            )));
-        }
-
-        // --- Tensor info entries ---
-        let mut tensors = HashMap::with_capacity(tensor_count);
-        for _ in 0..tensor_count {
-            let name = read_gguf_string(&mut reader)?;
-            let n_dims = read_u32(&mut reader)? as usize;
-
-            if n_dims > 8 {
-                return Err(MlxError::GgufParseError(format!(
-                    "tensor '{name}' has {n_dims} dimensions (max 8)"
-                )));
-            }
-
-            let mut shape = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                shape.push(read_u64(&mut reader)? as usize);
-            }
-            // GGUF stores dimensions innermost-first (column-major order).
-            // Reverse to match the [rows, cols] convention used by candle
-            // and by the rest of hf2q's weight loading code.
-            shape.reverse();
-
-            let ggml_type_id = read_u32(&mut reader)?;
-            let ggml_type = ggml_type_from_u32(ggml_type_id)
-                .map_err(|e| MlxError::GgufParseError(format!("tensor '{name}': {e}")))?;
-
-            let offset = read_u64(&mut reader)?;
-            let byte_len = compute_byte_len(&shape, ggml_type)
-                .map_err(|e| MlxError::GgufParseError(format!("tensor '{name}': {e}")))?;
-
-            if tensors.contains_key(&name) {
-                return Err(MlxError::GgufParseError(format!(
-                    "duplicate tensor name '{name}' in GGUF directory"
-                )));
-            }
-            tensors.insert(
-                name.clone(),
-                TensorInfo {
-                    name,
-                    shape,
-                    ggml_type,
-                    offset,
-                    byte_len,
-                },
-            );
-        }
-
-        // --- Compute tensor_data_offset ---
-        // The current file position is just past all tensor info entries.
-        // Tensor data starts at the next alignment boundary.
-        let pos = reader
-            .stream_position()
-            .map_err(|e| MlxError::GgufParseError(format!("stream_position: {e}")))?;
-        let tensor_data_offset = align_offset(pos, alignment);
-
-        Ok(GgufFile {
-            metadata,
-            tensors,
-            tensor_data_offset,
-            reader: Mutex::new(reader),
-        })
+        let parsed = header::parse(BufReader::new(file), None)?;
+        Ok(Self {metadata:parsed.metadata,tensors:parsed.tensors,
+            tensor_data_offset:parsed.tensor_data_offset,reader:Mutex::new(parsed.reader),
+            bounded_header_usage:None})
     }
+
+    /// Parse the same retained FD with explicit aggregate header budgets.
+    /// Header reads are unbuffered/exact: this entry never prefetches payload.
+    /// Declared reservations are not an allocator/physical-memory hard upper.
+    pub fn from_file_with_limits(mut file:std::fs::File, limits:GgufHeaderLimits)->Result<Self> {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e|MlxError::IoError(format!("seek GGUF file start: {e}")))?;
+        let parsed=header::parse(file,Some(limits))?;
+        Ok(Self{metadata:parsed.metadata,tensors:parsed.tensors,
+            tensor_data_offset:parsed.tensor_data_offset,
+            reader:Mutex::new(BufReader::new(parsed.reader)),bounded_header_usage:Some(parsed.usage)})
+    }
+
+    /// Actual bounded-parser counters; None for the unchanged legacy entry.
+    pub fn bounded_header_usage(&self)->Option<GgufHeaderUsage>{self.bounded_header_usage}
 
     // -----------------------------------------------------------------------
     // Metadata accessors
@@ -1707,6 +1562,18 @@ impl GgufFile {
         Ok((Arc::new(mapping), offset_in_mapping))
     }
 
+    // All three entrypoints use this exact existing production range planner.
+    fn mapped_ranges(&self,page_size:usize,max_buffer_len:usize)->Result<Vec<MappedTensorRange>> {
+        plan_mapped_tensor_ranges(self.tensor_data_offset,self.tensors.values().collect(),page_size,max_buffer_len)
+    }
+
+    /// Pure exact coalesced plan under caller-supplied geometry, no Device/mmap.
+    /// These limits are assumptions, not observed hardware capability. Returned
+    /// file ranges do not certify unchanged FD identity or physical residency.
+    pub fn mapped_tensor_storage_plan_with_limits(&self,page_size:usize,max_buffer_len:usize)->Result<GgufMappedTensorPlan<'_>> {
+        map_plan::build(self,page_size,max_buffer_len)
+    }
+
     /// Plan the exact physical storage used by [`Self::map_tensor_data`].
     ///
     /// This metadata-only operation creates no mmap or Metal resources, so a
@@ -1718,12 +1585,7 @@ impl GgufFile {
         let page_size = host_page_size()?;
         let max_buffer_len = usize::try_from(device.max_buffer_length())
             .map_err(|_| MlxError::InvalidArgument("Metal buffer limit exceeds usize".into()))?;
-        let ranges = plan_mapped_tensor_ranges(
-            self.tensor_data_offset,
-            self.tensors.values().collect(),
-            page_size,
-            max_buffer_len,
-        )?;
+        let ranges = self.mapped_ranges(page_size, max_buffer_len)?;
         GgufMappedTensorStoragePlan::from_ranges(&ranges)
     }
 
@@ -1737,12 +1599,7 @@ impl GgufFile {
         let page_size = host_page_size()?;
         let max_buffer_len = usize::try_from(device.metal_device().max_buffer_length())
             .map_err(|_| MlxError::InvalidArgument("Metal buffer limit exceeds usize".into()))?;
-        let ranges = plan_mapped_tensor_ranges(
-            self.tensor_data_offset,
-            self.tensors.values().collect(),
-            page_size,
-            max_buffer_len,
-        )?;
+        let ranges = self.mapped_ranges(page_size, max_buffer_len)?;
         let storage_plan = GgufMappedTensorStoragePlan::from_ranges(&ranges)?;
 
         let mut segments = Vec::with_capacity(ranges.len());
