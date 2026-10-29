@@ -302,3 +302,7 @@ fn nocopy_default_residency_owned_file_observation() {
 #[cfg(test)]
 #[path = "nocopy_residency_tests/scoped_membership.rs"]
 mod scoped_membership;
+
+#[cfg(test)]
+#[path = "nocopy_residency_tests/sparse_pin.rs"]
+mod sparse_pin;
