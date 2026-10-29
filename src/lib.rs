@@ -536,3 +536,6 @@ pub use buffer::{BufferBackingSnapshot, BufferProvenance, NoCopyBackingRange};
 
 mod gpu_timestamps;
 pub use gpu_timestamps::{CompletedGpuTimestamps, GpuTimestampClock, GpuTimestampUnknown};
+
+mod page_observation;
+pub use page_observation::{observe_readonly_mapping_pages,PageQueryRange,PageQueryLimits,PageObservation,PageObservationSource,PageObservationError,PageDispositionCounts,MAX_OBSERVATION_PAGES,MAX_OBSERVATION_ELAPSED_NS,KNOWN_PAGE_DISPOSITION_BITS};
