@@ -13,3 +13,25 @@ PageObservation returns actualsource/range/pagebytes/address/extent/status/count
 Three pure actual-used helpercontrols cover range/arithmetic/caps, rawstatus/count/unknownflags/time refusal and exactflagpreservation. One ignored actualfreshprocess <=1MiBnameduserdata control exercises realNoCopyroot/subview/sameFDindependentalias, rawstatus/count/timing, Ownedrefusal and root-lifetime separation from returnedmetadata. It performs no dispatch/commit or modelwork, but realMetalallocations require root supervision. All authoredUNRUN; no authorbuild/test/hardware. Release/publish/exactHFpin remains root-owned and pending.
 
 The source-only HF window design remains physicaladmissionHOLD. FullinactivePRESENT retains fullcharge; nativeownedcapacity staysfull~107GB. Tiny5slatencyresult never licenses a wholemodelcredit. This API is a missing measurement capability, not a solution by itself.
+
+## Root validation before publication
+
+Exact API source `b0ebc92870aa627d1f22a55191812e98ae52804e` compiled in the
+optimized test profile and passed three pure range/flag/status controls. The
+locked all-target/all-feature check passed. Eighteen supervisor/protocol controls
+passed before the isolated actual two-page borrowed-alias/NoCopy-root fixture.
+It completed with raw words [129,129] in each observation (PRESENT|EXTERNAL),
+zero stderr, a reaped empty process group, and independent review. This observed
+fixture used no GPU commands. The source asserted subview-root selection, Owned
+refusal and CPU metadata-lifetime separation after deferred residency/autorelease
+owners drained. None is a physical-release or file-certificate assertion.
+
+Optimized test binary SHA256:
+`3bb31b68a8f8355ee85af8f2b663eeaf84f7c058589282a9ee63f8b797c5097d`.
+Local evidence names: `native-bounded-page-release-root-build-v2`,
+`native-bounded-page-observation-actual-v1`, and
+`adr063-bounded-page-independent-actual-review-f3-v1`. The initial test build
+refused a mistaken private accessor name; the corrected source above is the
+validation authority. It was an unpublished API extension while the package
+version remained 0.15.13. Version 0.15.14 requires separate exact-source release
+checks and publication; HF consumers must pin that public package and checksum.
