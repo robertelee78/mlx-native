@@ -63,7 +63,7 @@ fn actual_borrowed_file_alias_and_nocopy_root_subview_observation(){
     let (a,_v,b)=objc::rc::autoreleasepool(|| {
     struct FlushPending<'a>(&'a MlxDevice);
     impl Drop for FlushPending<'_>{fn drop(&mut self){
-        if let Some(set)=self.0.default_residency_set(){set.flush_pending();}
+        if let Some(set)=self.0.residency_set(){set.flush_pending();}
     }}
     let d=MlxDevice::new().unwrap();authority.register_device(&d).unwrap();
     let _flush_on_unwind=FlushPending(&d);
