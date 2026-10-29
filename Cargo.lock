@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "block",
  "bytemuck",
