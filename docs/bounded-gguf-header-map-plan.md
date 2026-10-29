@@ -24,3 +24,23 @@ Mapping logical length ends at file_end; registered Metal length includes final 
 Eight meaningful pure controls authored UNRUN: announced huge strings/arrays/catalog and reservation overflow refuse before allocation; aggregate strings/nested array totals/depth are independent; shared legacy/bounded output and name-clone charge parity; actual bounded File cursor proves no payload prefetch; pure plan normalization against old production ranges; prefix/tail/root/view and explicit invalid/overflow controls; bounded header+plan without payload/Device; overlapping split-resource source-page union. Existing real mapping integration test remains the later actual Device-wrapper/resource parity gate; no hardware result is claimed here.
 
 This API supplies missing no-Device diagnostic authority, not full-resident Q5 acceptance. No physical admission, reclaim mechanism, model-load permit, parser pass on an actual selected artifact, or existing failed experiment reinterpretation follows from source completion. Root owns independent review, build/host/actual validation, version/release/public registry verification and subsequent HF exact pin.
+
+## Candidate 0.15.15 validation
+
+Source `3a52dd069b725bf74e00c096290a9ba4a4439747` passed locked
+all-target/all-feature checking and the locked release build on Apple Silicon.
+Eight focused parser/planner controls and four existing mapped-tensor integration
+controls passed. The separate fresh-process mapping control also passed: exact
+same-FD header reads stopped at byte135, its declared reservation ledger was862B,
+and the actual131268B fixture produced one147456B registered root,192B prefix,
+16188B registered tail, three tensor views and one nested view. Eight F32 values
+(32 unique CPU payload bytes) matched source bits. Dispatch, commit, sync and
+command-buffer counters remained zero; owned process-group and fixture cleanup
+were verified. These are mapping/inspection checks, not a model, physical-memory
+admission or performance result.
+
+The complete native regression suite and hosted CI are publication gates.
+The hf2q consumer must resolve and verify the published0.15.15 registry archive
+before adopting these methods; an unpublished local patch is not a delivered
+consumer. Existing buffered parsing and the production coalescer remain the
+compatibility baseline.
