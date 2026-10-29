@@ -85,6 +85,21 @@ pub struct ObserverSinkError;
 /// never changes the GPU dispatch or its returned completion status.
 pub trait SubmissionObserver: Send + Sync + 'static {
     fn record(&self, event: &SubmissionEvent) -> Result<(), ObserverSinkError>;
+    /// Separate opt-in v1 stream; existing SubmissionEvent serialization stays unchanged.
+    fn record_gpu_timing(&self, _event: &CompletedGpuTimingEvent) -> Result<(), ObserverSinkError> { Err(ObserverSinkError) }
+
+}
+
+/// Exactly one terminal timing attempt per observed CB when explicitly enabled.
+/// Loss/sink failure invalidates the capture; a missing record is never Available.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CompletedGpuTimingEvent {
+    pub schema_version: u8,
+    pub command_id: u64,
+    pub invocation_epoch: u64,
+    pub queue_identity: u64,
+    pub device_registry_id: u64,
+    pub timestamps: crate::CompletedGpuTimestamps,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -115,6 +130,7 @@ pub(crate) use pending::{
 };
 
 struct Core {
+    gpu_timestamps: bool,
     pending: pending::Registry<pending::MetalCommand>,
     sink: Arc<dyn SubmissionObserver>,
     limit: u64,
@@ -155,12 +171,27 @@ pub fn install_submission_observer(
     event_limit: u64,
     metadata_limit_bytes: u64,
 ) -> Result<(), &'static str> {
+    install_observer(sink, event_limit, metadata_limit_bytes, false)
+}
+
+/// Explicitly enable the separate v1 completed-GPU-timing stream. Additional
+/// records consume the SAME total event quota, with no new CB owners or waits.
+/// Missing/Unknown timing must remain unqualified in the consumer.
+pub fn install_submission_observer_with_gpu_timestamps(
+    sink: Arc<dyn SubmissionObserver>, event_limit: u64, metadata_limit_bytes: u64,
+) -> Result<(), &'static str> {
+    install_observer(sink, event_limit, metadata_limit_bytes, true)
+}
+fn install_observer(sink: Arc<dyn SubmissionObserver>, event_limit: u64,
+    metadata_limit_bytes: u64, gpu_timestamps: bool) -> Result<(), &'static str> {
     if cfg!(panic = "abort") {
         return Err("observer panic containment requires panic=unwind");
     }
     validate_observer_limits(event_limit, metadata_limit_bytes)?;
     begin_install(&INSTALL)?;
-    let core = Arc::new(Core::new(sink, event_limit, metadata_limit_bytes));
+    let mut core = Core::new(sink, event_limit, metadata_limit_bytes);
+    core.gpu_timestamps = gpu_timestamps;
+    let core = Arc::new(core);
     if CORE.set(core).is_err() {
         INSTALL.store(3, Ordering::Release);
         return Err("observer already installed");
@@ -252,6 +283,7 @@ fn mark_started(state: &AtomicU8) {
 impl Core {
     fn new(sink: Arc<dyn SubmissionObserver>, limit: u64, metadata_limit: u64) -> Self {
         Self {
+            gpu_timestamps: false,
             pending: pending::Registry::new(pending::LIMIT),
             sink,
             limit,
@@ -500,6 +532,7 @@ pub(crate) struct CommandObservation {
     noncompute: AtomicU64,
     submitted: AtomicBool,
     checked: AtomicU64,
+    timing_terminal: AtomicBool,
     _reservation: Reservation,
 }
 
@@ -553,6 +586,7 @@ impl CommandObservation {
             noncompute: AtomicU64::new(0),
             submitted: AtomicBool::new(false),
             checked: AtomicU64::new(u64::MAX),
+            timing_terminal: AtomicBool::new(false),
             _reservation: reservation,
         };
         this.event(ObservationKind::Created, None, None);
@@ -689,6 +723,33 @@ impl CommandObservation {
             _ => {}
         }
     }
+    pub(crate) fn completed_gpu_timing(&self, read: impl FnOnce() -> crate::CompletedGpuTimestamps) {
+        if !self.core.gpu_timestamps || self.timing_terminal.swap(true, Ordering::AcqRel) { return; }
+        use crate::{CompletedGpuTimestamps as T, GpuTimestampUnknown as U};
+        let status = self.checked.load(Ordering::Acquire);
+        let timestamps = if status != 4 { T::unknown(U::NotHealthyCompleted, (status != u64::MAX).then_some(status)) }
+            else if self.tainted.load(Ordering::Acquire) { T::unknown(U::TaintedObservation, Some(status)) }
+            else if self.ordinal == 0 && self.noncompute.load(Ordering::Acquire) == 0 { T::unknown(U::EmptyCommand, Some(status)) }
+            else { read() };
+        self.emit_gpu_timing(timestamps);
+    }
+    fn emit_gpu_timing(&self, timestamps: crate::CompletedGpuTimestamps) {
+        // An Unknown terminal is attempted even after sticky invalidation; never
+        // replace it by a healthy inferred interval. Quota remains fail-closed.
+        if std::thread::panicking() || self.core.events.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |n| n.checked_add(1).filter(|n| *n <= self.core.limit)).is_err() {
+            self.core.fail(); self.core.drop_event(); return;
+        }
+        let event = CompletedGpuTimingEvent { schema_version: 1, command_id: self.id,
+            invocation_epoch: self.epoch, queue_identity: self.queue,
+            device_registry_id: self.device, timestamps };
+        if IN_SINK.try_with(|flag| {
+            if flag.replace(true) { self.core.fail(); self.core.drop_event(); return; }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.core.sink.record_gpu_timing(&event)));
+            flag.set(false);
+            if !matches!(result, Ok(Ok(()))) { self.core.fail(); self.core.drop_event(); }
+        }).is_err() { self.core.fail(); self.core.drop_event(); }
+    }
     pub(crate) fn bind_replay(
         &mut self,
         old: Option<ObservationScope>,
@@ -792,6 +853,11 @@ impl CommandObservation {
 
 impl Drop for CommandObservation {
     fn drop(&mut self) {
+        if self.core.gpu_timestamps && !self.timing_terminal.swap(true, Ordering::AcqRel) {
+            self.emit_gpu_timing(crate::CompletedGpuTimestamps::unknown(
+                crate::GpuTimestampUnknown::DroppedWithoutCheckedTiming, None));
+        }
+
         if self.submitted.load(Ordering::Acquire)
             && self.checked.load(Ordering::Acquire) == u64::MAX
             && (self.ordinal > 0
@@ -816,3 +882,7 @@ mod tests;
 #[cfg(test)]
 #[path = "submission_observer/event_limit_tests.rs"]
 mod event_limit_tests;
+
+#[cfg(test)]
+#[path = "submission_observer/gpu_timing_tests.rs"]
+mod gpu_timing_tests;
