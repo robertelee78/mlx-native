@@ -264,3 +264,6 @@ fn quantized_logical_view_cannot_cross_packed_tensor_bytes() {
 
     std::fs::remove_file(path).expect("remove Q2_K GGUF fixture");
 }
+
+#[path = "test_gguf_mapped_tensor/bounded_plan.rs"]
+mod bounded_plan;
