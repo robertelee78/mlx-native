@@ -211,14 +211,14 @@ fn run()->R<()>{
  let out=text(d.alloc_buffer(COHORT,DType::U8,vec![COHORT]))?;need(!out.is_file_backed()&&out.is_cpu_writable()&&out.data_byte_len()==COHORT,"ordinary independent output")?;
  need(origin.elapsed()<=Duration::from_secs(30),"setup/file initialization/sync deadline")?;
  let mut log=Log{bytes:0,records:0};let mut n=Census{sweeps:0,queries:0,reads:0,gates:0,advice:0,last_parent_frame_end:None};
- log.emit("BEGIN",json!({"schema":"mlx.private-max-parent-conservation.v1","q":COHORT,"pages":PAGES,"chunks_per_alias":CHUNKS,"tail_pages":3072,"sequence":SEQUENCE,"arms":["no-advice","advice"],"requested_bytes":USERDATA,"roots":5,"sweeps":114,"queries":3192,"gates":12,"precondition_sweeps":90,"immediate_sweeps":6,"post_sweeps":18,"full_readbacks":15,"expected_records":1884,"fixture_directory":directory.path,"directory_identity":directory.id,"files":directory.files,"file_sha256":cohorts.iter().map(|c|c.hash.clone()).collect::<Vec<_>>(),"backing_descriptors":cohorts.iter().map(|c|format!("{:?}",c.descriptor)).collect::<Vec<_>>(),"policy_sha256":"5a7cd03bd035a5b19ae1f379afa69fa934c6c28bd44b855df74460c4a19bd4be","physical_conservation_qualified":false,"physical_credit_bytes":0,"model_admission":false}))?;
+ log.emit("BEGIN",json!({"schema":"mlx.private-max-parent-conservation.v2","q":COHORT,"pages":PAGES,"chunks_per_alias":CHUNKS,"tail_pages":3072,"sequence":SEQUENCE,"arms":["no-advice","advice"],"requested_bytes":USERDATA,"roots":5,"sweeps":114,"queries":3192,"gates":12,"precondition_sweeps":90,"immediate_sweeps":6,"post_sweeps":18,"full_readbacks":15,"expected_records":1884,"fixture_directory":directory.path,"directory_identity":directory.id,"files":directory.files,"file_sha256":cohorts.iter().map(|c|c.hash.clone()).collect::<Vec<_>>(),"backing_descriptors":cohorts.iter().map(|c|format!("{:?}",c.descriptor)).collect::<Vec<_>>(),"policy_sha256":"45c83c50fe9f46152bc9ece5e43c9bd3c753c14a83ec0a0d699ffe8c48a83a74","physical_conservation_qualified":false,"physical_credit_bytes":0,"model_admission":false}))?;
  let mut control:Vec<(Plateau,Plateau)>=Vec::with_capacity(3);let mut reductions=Vec::with_capacity(3);
  let counters=(crate::encoder::dispatch_count(),crate::encoder::commit_count(),crate::encoder::sync_count());
  for arm in [Arm::NoAdvice,Arm::Advice]{
   membership(&d,&cohorts,on(0,1))?;
   for(step,&index)in SEQUENCE.iter().enumerate(){
    read_all(&d,&cohorts[index],index,&out,n.reads,&mut log)?;n.reads+=1;
-   if(1..=3).contains(&step){let retired=(index+2)%3;membership(&d,&cohorts,on(index,(index+1)%3))?;let frames=cut(&cohorts[retired],arm,step-1,origin,&mut log,&mut n)?;if arm==Arm::Advice{n.advice+=2;let matched=control.get(step-1).ok_or("missing fixed control cut")?;reductions.push(compare(matched,&frames)?);}else{need(full_cross_l1(&frames.0,&frames.1)<=u128::from(NUISANCE),"NoAdvice nonstationary full L1")?;control.push(frames);}}
+   if(1..=3).contains(&step){let retired=(index+2)%3;membership(&d,&cohorts,on(index,(index+1)%3))?;let frames=cut(&cohorts[retired],arm,step-1,origin,&mut log,&mut n)?;if arm==Arm::Advice{n.advice+=2;let matched=control.get(step-1).ok_or("missing fixed control cut")?;reductions.push(compare(matched,&frames)?);}else{need(occupied_cross_l1(&frames.0,&frames.1)?<=u128::from(NUISANCE),"NoAdvice nonstationary occupied-union L1")?;control.push(frames);}}
    else if step==4{membership(&d,&cohorts,on(1,2))?;}
   }
  }
@@ -252,8 +252,18 @@ const NUISANCE:u64=128*1024*1024;
 #[derive(Clone,Copy,Debug)]struct Frame{start:u64,end:u64,p:u64,v:[u64;7]}
 type Plateau=[Frame;9];
 fn delta(a:u64,b:u64)->i128{b as i128-a as i128}
-fn l1(a:&Frame,b:&Frame)->u128{a.v.iter().zip(b.v).map(|(&x,y)|delta(x,y).unsigned_abs()).sum()}
-fn full_cross_l1(a:&Plateau,b:&Plateau)->u128{a.iter().flat_map(|x|b.iter().map(move|y|l1(x,y))).max().unwrap_or(u128::MAX)}
+// Keep the original seven categories untouched in every ACK/record. Every S
+// component is fully charged; this derived partition is NOT owner attribution.
+fn charged_partition(f:&Frame)->R<[u64;3]>{
+ let mut s=0u64;for i in [0,2,4,5,6]{s=s.checked_add(f.v[i]).ok_or("charged union overflow")?;}
+ let total=s.checked_add(f.v[1]).and_then(|n|n.checked_add(f.v[3])).ok_or("union partition overflow")?;
+ need(f.p>0&&total==f.p,"raw seven/charged union physical sum contradiction")?;Ok([s,f.v[1],f.v[3]])
+}
+fn occupied_cross_l1(a:&Plateau,b:&Plateau)->R<u128>{
+ let mut maximum=0u128;for x in a{for y in b{let x=charged_partition(x)?;let y=charged_partition(y)?;
+  let distance:u128=x.into_iter().zip(y).map(|(a,b)|delta(a,b).unsigned_abs()).sum();maximum=maximum.max(distance);
+ }}Ok(maximum)
+}
 fn plateau(v:&serde_json::Value)->R<Plateau>{
  let a=v.as_array().ok_or("global_frames not array")?;need(a.len()==9,"exact nine global frames")?;
  let mut frames=[Frame{start:0,end:0,p:0,v:[0;7]};9];
@@ -266,13 +276,16 @@ fn plateau(v:&serde_json::Value)->R<Plateau>{
   need(start>=target&&start-target<=IPC_CAP&&end-origin<=4_250_000_000,"fixed parent plateau cadence/deadline")?;
   if i>0{need(p==frames[0].p&&start>=frames[i-1].end,"stable P/nonoverlap")?;}
  }
- need(full_cross_l1(&frames,&frames)<=NUISANCE as u128,"stationary plateau ALL-frame full L1")?;Ok(frames)
+ need(occupied_cross_l1(&frames,&frames)?<=NUISANCE as u128,"stationary plateau ALL-frame occupied-union L1")?;Ok(frames)
 }
 fn compare(control:&(Plateau,Plateau),advice:&(Plateau,Plateau))->R<(u64,u64)>{
- need(full_cross_l1(&control.0,&control.1)<=NUISANCE as u128,"control ALL-crossframe full L1")?;
+ need(occupied_cross_l1(&control.0,&control.1)?<=NUISANCE as u128,"control ALL-crossframe occupied-union L1")?;
  let p=control.0[0].p;need([&control.1,&advice.0,&advice.1].iter().all(|a|a.iter().all(|f|f.p==p)),"cross-phase physical P drift")?;
- for a in &advice.0{for b in &advice.1{let mut j=0u128;for i in [0,2,4,5,6]{j+=delta(a.v[i],b.v[i]).unsigned_abs();}
-  j+=(delta(a.v[3],b.v[3])+delta(a.v[1],b.v[1])).unsigned_abs();need(j<=NUISANCE as u128,"advice ALL-crossframe nuisance beyond declared Free/Cache signal")?;
+ for a in &advice.0{for b in &advice.1{let a_s=charged_partition(a)?[0];let b_s=charged_partition(b)?[0];let occupied_delta=delta(a_s,b_s).unsigned_abs();
+  // Fixed P makes the two terms equal: J=2*abs(delta S). This is
+  // redundant conservation arithmetic, not independent corroboration.
+  let signal=(delta(a.v[3],b.v[3])+delta(a.v[1],b.v[1])).unsigned_abs();need(signal==occupied_delta,"constant-P union/signal contradiction")?;
+  let j=2*occupied_delta;need(j<=NUISANCE as u128,"advice ALL-crossframe occupied-union nuisance")?;
  }}
  let a_low=advice.1.iter().map(|x|x.v[3]).min().ok_or("post empty")? as i128-advice.0.iter().map(|x|x.v[3]).max().ok_or("pre empty")? as i128;
  let c_high=control.1.iter().map(|x|x.v[3]).max().ok_or("control post empty")? as i128-control.0.iter().map(|x|x.v[3]).min().ok_or("control pre empty")? as i128;
@@ -280,7 +293,7 @@ fn compare(control:&(Plateau,Plateau),advice:&(Plateau,Plateau))->R<(u64,u64)>{
  let residual=(COHORT as u64-reduction).checked_add(PAGE as u64-1).ok_or("residual overflow")?/PAGE as u64*PAGE as u64;Ok((reduction,residual))
 }
 fn synthetic_frames()->serde_json::Value{json!((0..9).map(|i|json!({"start_ns":i*500_000_000u64,"end_ns":i*500_000_000u64+1,"physical_bytes":16u64*1024*1024*1024,"partition":[0,8u64*1024*1024*1024,0,8u64*1024*1024*1024,0,0,0]})).collect::<Vec<_>>())}
-#[test]fn actual_all_frame_policy_no_cancellation_full_nuisance_and_page_residual(){
+#[test]fn actual_all_frame_free_signal_full_nuisance_and_page_residual(){
  let base=plateau(&synthetic_frames()).unwrap();let control=(base,base);let mut post=base;for f in &mut post{f.v[1]-=256*MIB as u64;f.v[3]+=256*MIB as u64;}
  let r=compare(&control,&(base,post)).unwrap();assert_eq!(r,(128*MIB as u64,COHORT as u64-128*MIB as u64));
  let mut control_post=base;for f in &mut control_post{f.v[1]-=32*MIB as u64;f.v[3]+=32*MIB as u64;}assert_eq!(compare(&(base,control_post),&(base,post)).unwrap().0,96*MIB as u64);
@@ -332,3 +345,31 @@ fn advance_parent_frames(last:&mut Option<u64>,frames:&Plateau)->R<()>{
  let mut overlap=next;overlap[0].start=next[8].end-1;assert!(advance_parent_frames(&mut last,&overlap).is_err());
 }
 #[test]fn actual_gate_endpoint_refuses_late_newline_parse_and_acceptance(){assert!(within_gate(GATE_CAP));assert!(!within_gate(GATE_CAP+1));assert!(!within_gate(GATE_CAP+50_000_000));}
+
+
+#[test]fn union_internal_reclassification_keeps_every_raw_byte_charged_and_no_credit(){
+ for(from,to)in[(0,4),(0,2),(6,4)]{
+  let mut raw=synthetic_frames();for frame in raw.as_array_mut().unwrap(){for i in [0,2,4,5,6]{frame["partition"][i]=json!(512*MIB as u64);}frame["partition"][1]=json!(8u64*1024*1024*1024-5*512*MIB as u64);}
+  let stable=plateau(&raw).unwrap();
+  for (i,frame)in raw.as_array_mut().unwrap().iter_mut().enumerate(){if i%2==1{frame["partition"][from]=json!(282*MIB as u64);frame["partition"][to]=json!(742*MIB as u64);}}
+  let migrated=plateau(&raw).unwrap();assert_ne!(stable[1].v,migrated[1].v);assert_eq!(charged_partition(&stable[1]).unwrap(),charged_partition(&migrated[1]).unwrap());
+  assert_eq!(occupied_cross_l1(&stable,&migrated).unwrap(),0);assert_eq!(compare(&(stable,migrated),&(stable,migrated)).unwrap(),(0,COHORT as u64));
+  assert_eq!(raw[1]["partition"][from].as_u64(),Some(282*MIB as u64));assert_eq!(raw[1]["partition"][to].as_u64(),Some(742*MIB as u64));
+ }
+}
+#[test]fn union_stationary_control_and_advice_refuse_excess_movement_all_pairs(){
+ let base=plateau(&synthetic_frames()).unwrap();
+ let mut raw=synthetic_frames();raw[8]["partition"][0]=json!(NUISANCE+1);raw[8]["partition"][3]=json!(8u64*1024*1024*1024-NUISANCE-1);assert!(plateau(&raw).is_err());
+ let mut raw=synthetic_frames();raw[8]["partition"][1]=json!(8u64*1024*1024*1024-NUISANCE-1);raw[8]["partition"][3]=json!(8u64*1024*1024*1024+NUISANCE+1);assert!(plateau(&raw).is_err());
+ let mut at=base;for f in &mut at{f.v[0]=NUISANCE/2;f.v[3]-=NUISANCE/2;}assert_eq!(occupied_cross_l1(&base,&at).unwrap(),NUISANCE as u128);assert!(compare(&(base,at),&(base,at)).is_ok());
+ let mut over=at;for f in &mut over{f.v[0]+=1;f.v[3]-=1;}assert!(compare(&(base,over),&(base,base)).is_err());assert!(compare(&(base,base),&(base,over)).is_err());
+}
+#[test]fn union_checked_raw_sum_overflow_and_full_nuisance_subtraction(){
+ let base=plateau(&synthetic_frames()).unwrap();let mut corrupt=base[0];corrupt.v[0]=u64::MAX;corrupt.v[2]=1;assert!(charged_partition(&corrupt).is_err());
+ let mut corrupt=base[0];corrupt.p-=1;assert!(charged_partition(&corrupt).is_err());
+ let mut raw=synthetic_frames();raw[0]["partition"][0]=json!(u64::MAX);assert!(plateau(&raw).is_err());
+ let mut raw=synthetic_frames();raw[0]["partition"].as_array_mut().unwrap().pop();assert!(plateau(&raw).is_err());
+ let mut raw=synthetic_frames();raw[0]["partition"][6]=json!(-1);assert!(plateau(&raw).is_err());
+ let mut post=base;for f in &mut post{f.v[1]-=NUISANCE+1;f.v[3]+=NUISANCE+1;}assert_eq!(compare(&(base,base),&(base,post)).unwrap(),(1,COHORT as u64));
+ let mut post=base;for f in &mut post{f.v[1]-=COHORT as u64+NUISANCE+1;f.v[3]+=COHORT as u64+NUISANCE+1;}assert_eq!(compare(&(base,base),&(base,post)).unwrap(),(COHORT as u64,0));
+}
