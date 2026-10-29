@@ -530,3 +530,6 @@ pub use root_authority::{
     LiveRootLimits, LiveRootSnapshot, NativeRootAuthority, RootAuthorityHandle, RootCreationLimits,
     RootCreationSnapshot, RootOriginSnapshot,
 };
+
+/// Read-only backing metadata; no physical-residency or release certificate.
+pub use buffer::{BufferBackingSnapshot, BufferProvenance, NoCopyBackingRange};

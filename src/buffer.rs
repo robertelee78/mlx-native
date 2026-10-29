@@ -4,6 +4,9 @@
 //! the same physical memory on Apple Silicon (zero-copy access via
 //! [`as_slice`](MlxBuffer::as_slice) / [`as_mut_slice`](MlxBuffer::as_mut_slice)).
 
+mod backing_descriptor;
+pub use backing_descriptor::{BufferBackingSnapshot, BufferProvenance, NoCopyBackingRange};
+
 use std::fmt;
 use std::sync::Arc;
 
