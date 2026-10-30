@@ -435,6 +435,81 @@ fn batched_mv_accepts_width_eight_and_rejects_width_nine_or_prompt_contract() {
 }
 
 #[test]
+fn q8_0_multi_row_route_is_default_width_scoped_and_opt_out() {
+    let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
+    request.ggml_type = GgmlType::Q8_0;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseMvNr2),
+        "M=1 keeps the single-row NR2 kernel"
+    );
+
+    request.workload = GgmlWorkloadClass::ContinuousWidth;
+    for m in 2..=MM_ROUTING_THRESHOLD {
+        request.invocation = GgmlInvocation::DenseAuto {
+            m,
+            n: 5_120,
+            k: 5_120,
+        };
+        let capability = ggml_capability(request);
+        assert_eq!(
+            capability.route,
+            Some(GgmlKernelRoute::DenseQ8_0MvNr2Rows),
+            "Q8_0 width {m} must read weights once for all rows"
+        );
+        assert!(capability.specialized_for_workload);
+        assert!(!capability.correctness_fallback);
+        assert_eq!(capability.dispatches, 1);
+
+        request.invocation = GgmlInvocation::DenseBatchedMv {
+            batch: 3,
+            m,
+            n: 5_120,
+            k: 5_120,
+        };
+        assert_eq!(
+            ggml_capability(request).route,
+            Some(GgmlKernelRoute::DenseBatchedQ8_0MvNr2Rows)
+        );
+    }
+
+    request.invocation = GgmlInvocation::DenseAuto {
+        m: 4,
+        n: 5_120,
+        k: 5_120,
+    };
+    request.routing.dense_q8_0_mv_r1 = false;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseMvNr2),
+        "opt-out restores per-row NR2"
+    );
+
+    request.routing.dense_q8_0_mv_r1 = true;
+    request.routing.dense_q8_0_mv_nr2 = false;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseMv),
+        "the multi-row kernel reproduces NR2 and is not used without it"
+    );
+
+    request.routing.dense_q8_0_mv_nr2 = true;
+    request.routing.dense_decode_mv_ext = true;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseWidthMvExt),
+        "explicit mul_mv_ext opt-in keeps precedence"
+    );
+
+    request.routing.dense_decode_mv_ext = false;
+    request.ggml_type = GgmlType::Q4_0;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::DenseMv)
+    );
+}
+
+#[test]
 fn q4_q5_and_q6_width_dispatch_count_matches_runtime_tiling() {
     for (m, expected) in [(2, 1), (3, 1), (4, 1), (5, 1), (6, 2), (7, 2), (8, 2)] {
         for ggml_type in [GgmlType::Q4_K, GgmlType::Q6_K] {

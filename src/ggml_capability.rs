@@ -17,7 +17,7 @@ use crate::ops::quantized_matmul_ggml::{dense_mn_dispatch_count, GgmlType, MM_RO
 use crate::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD;
 
 /// Schema version for serialized [`GgmlCapability`] receipts.
-pub const GGML_CAPABILITY_SCHEMA_VERSION: u32 = 2;
+pub const GGML_CAPABILITY_SCHEMA_VERSION: u32 = 3;
 
 /// Workload class for which the caller requires execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +150,10 @@ pub struct GgmlRoutingPolicy {
     pub dense_decode_mv_ext: bool,
     pub dense_q6k_mv_nr2: bool,
     pub dense_q8_0_mv_nr2: bool,
+    /// Q8_0 NR2 matvec at M in 2..=8 reads each weight block once for all
+    /// input rows (`kernel_mul_mv_q8_0_f32_nr2_r{M}`). Requires
+    /// `dense_q8_0_mv_nr2`; outputs are bit-identical to per-row NR2.
+    pub dense_q8_0_mv_r1: bool,
     pub dense_tensor_mm: GgmlTensorMmPreference,
     pub allow_dense_large_tile_mm: bool,
     pub expert_mm_threshold: u32,
@@ -173,6 +177,7 @@ impl Default for GgmlRoutingPolicy {
             dense_decode_mv_ext: false,
             dense_q6k_mv_nr2: true,
             dense_q8_0_mv_nr2: true,
+            dense_q8_0_mv_r1: true,
             dense_tensor_mm: GgmlTensorMmPreference::AutoProbe,
             allow_dense_large_tile_mm: true,
             expert_mm_threshold: MM_ID_ROUTING_THRESHOLD,
@@ -212,6 +217,8 @@ pub enum GgmlKernelRoute {
     DenseBF16Mm,
     DenseMv,
     DenseMvNr2,
+    /// Q8_0 NR2 matvec covering all M in 2..=8 input rows per threadgroup.
+    DenseQ8_0MvNr2Rows,
     DenseQ5kCanonicalQ4x4,
     DenseQ4kWidthMn,
     DenseQ5kWidthMn,
@@ -221,6 +228,8 @@ pub enum GgmlKernelRoute {
     DenseMmDeviceSelected,
     DenseBatchedMv,
     DenseBatchedMvNr2,
+    /// Batched form of [`GgmlKernelRoute::DenseQ8_0MvNr2Rows`].
+    DenseBatchedQ8_0MvNr2Rows,
     DenseBatchedMmSimdgroup,
     DenseBatchedMmDeviceSelected,
     DensePerm021TensorMm,
@@ -553,8 +562,32 @@ fn validate_common(request: &GgmlCapabilityRequest) -> Option<GgmlCapability> {
     None
 }
 
+/// Whether a Q8_0 matvec of `m` input rows uses the multi-row NR2 kernel.
+///
+/// The dispatcher and the capability API share this predicate so a receipt
+/// cannot describe a different kernel than production executes. The variant
+/// reproduces NR2's per-row floating-point tree, so it is only selected when
+/// NR2 itself is the selected Q8_0 matvec.
+pub(crate) fn q8_0_mv_nr2_rows_selected(
+    ggml_type: GgmlType,
+    m: u32,
+    routing: &GgmlRoutingPolicy,
+) -> bool {
+    ggml_type == GgmlType::Q8_0
+        && routing.dense_q8_0_mv_nr2
+        && routing.dense_q8_0_mv_r1
+        && (2..=MM_ROUTING_THRESHOLD).contains(&m)
+}
+
 fn dense_mv_route(request: &GgmlCapabilityRequest, batched: bool) -> GgmlKernelRoute {
-    if (request.ggml_type == GgmlType::Q6_K && request.routing.dense_q6k_mv_nr2)
+    let (m, _, _) = request.invocation.dimensions();
+    if q8_0_mv_nr2_rows_selected(request.ggml_type, m, &request.routing) {
+        if batched {
+            GgmlKernelRoute::DenseBatchedQ8_0MvNr2Rows
+        } else {
+            GgmlKernelRoute::DenseQ8_0MvNr2Rows
+        }
+    } else if (request.ggml_type == GgmlType::Q6_K && request.routing.dense_q6k_mv_nr2)
         || (request.ggml_type == GgmlType::Q8_0 && request.routing.dense_q8_0_mv_nr2)
     {
         if batched {
@@ -566,6 +599,17 @@ fn dense_mv_route(request: &GgmlCapabilityRequest, batched: bool) -> GgmlKernelR
         GgmlKernelRoute::DenseBatchedMv
     } else {
         GgmlKernelRoute::DenseMv
+    }
+}
+
+/// Workload a dense matvec route is specialized for: the multi-row Q8_0
+/// variant targets continuous width; every other matvec targets decode.
+fn dense_mv_specialized_workload(route: GgmlKernelRoute) -> GgmlWorkloadClass {
+    match route {
+        GgmlKernelRoute::DenseQ8_0MvNr2Rows | GgmlKernelRoute::DenseBatchedQ8_0MvNr2Rows => {
+            GgmlWorkloadClass::ContinuousWidth
+        }
+        _ => GgmlWorkloadClass::DecodeSingle,
     }
 }
 
@@ -791,10 +835,11 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
             )
         }
         DenseAutoPlan::Mv => {
-            let specialized = request.workload == GgmlWorkloadClass::DecodeSingle;
+            let route = dense_mv_route(request, false);
+            let specialized = request.workload == dense_mv_specialized_workload(route);
             GgmlCapability::supported(
                 request,
-                dense_mv_route(request, false),
+                route,
                 specialized,
                 !specialized,
                 false,
@@ -805,6 +850,8 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
                 0,
                 if request.ggml_type == GgmlType::IQ4_XS && m > MM_ROUTING_THRESHOLD {
                     "IQ4_XS dense prompt falls back to matvec because no dense MM kernel exists"
+                } else if route == GgmlKernelRoute::DenseQ8_0MvNr2Rows {
+                    "Q8_0 byte-identical multi-row NR2 matvec route"
                 } else {
                     "GGUF dense matvec route"
                 },
@@ -829,10 +876,11 @@ fn batched_mv(request: &GgmlCapabilityRequest, batch: u32, bytes: u64) -> GgmlCa
             "batched GGUF weight bytes overflow u64",
         );
     };
-    let specialized = request.workload == GgmlWorkloadClass::DecodeSingle;
+    let route = dense_mv_route(request, true);
+    let specialized = request.workload == dense_mv_specialized_workload(route);
     GgmlCapability::supported(
         request,
-        dense_mv_route(request, true),
+        route,
         specialized,
         !specialized,
         false,

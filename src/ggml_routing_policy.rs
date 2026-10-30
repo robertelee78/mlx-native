@@ -43,6 +43,7 @@ fn combine_routing_policies(
         dense_decode_mv_ext: dense.dense_decode_mv_ext,
         dense_q6k_mv_nr2: dense.dense_q6k_mv_nr2,
         dense_q8_0_mv_nr2: dense.dense_q8_0_mv_nr2,
+        dense_q8_0_mv_r1: dense.dense_q8_0_mv_r1,
         dense_tensor_mm: dense.dense_tensor_mm,
         allow_dense_large_tile_mm: dense.allow_dense_large_tile_mm,
         expert_mm_threshold: expert.expert_mm_threshold,
@@ -65,6 +66,7 @@ mod tests {
             dense_decode_mv_ext: true,
             dense_q6k_mv_nr2: false,
             dense_q8_0_mv_nr2: false,
+            dense_q8_0_mv_r1: false,
             dense_tensor_mm: GgmlTensorMmPreference::ForceSimd,
             allow_dense_large_tile_mm: false,
             ..GgmlRoutingPolicy::default()
@@ -82,6 +84,7 @@ mod tests {
         assert!(policy.dense_decode_mv_ext);
         assert!(!policy.dense_q6k_mv_nr2);
         assert!(!policy.dense_q8_0_mv_nr2);
+        assert!(!policy.dense_q8_0_mv_r1);
         assert_eq!(policy.dense_tensor_mm, GgmlTensorMmPreference::ForceSimd);
         assert!(!policy.allow_dense_large_tile_mm);
         assert_eq!(policy.expert_mm_threshold, 77);
@@ -103,6 +106,7 @@ mod tests {
         assert!(policy.dense_decode_mv_ext);
         assert!(!policy.dense_q6k_mv_nr2);
         assert!(!policy.dense_q8_0_mv_nr2);
+        assert!(!policy.dense_q8_0_mv_r1);
         assert_eq!(policy.dense_tensor_mm, GgmlTensorMmPreference::ForceSimd);
         assert!(!policy.allow_dense_large_tile_mm);
         assert_eq!(policy.expert_mm_threshold, 77);
@@ -126,6 +130,7 @@ mod tests {
                 .env("HF2Q_DECODE_MV_EXT", "1")
                 .env("HF2Q_Q6K_MV_NR2", "0")
                 .env("HF2Q_Q8_0_MV_NR2", "0")
+                .env("HF2Q_Q8_0_MV_R1", "0")
                 .env("HF2Q_DISABLE_TENSOR_MM", "1")
                 .env("HF2Q_LARGE_TILE_MM", "0")
                 .env("HF2Q_MM_ID_ROUTING_THRESHOLD", "77")

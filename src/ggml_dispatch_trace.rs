@@ -16,7 +16,7 @@ use crate::ggml_capability::{
 use crate::kernel_registry::{KernelPipelineIdentity, KernelRegistry};
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
-pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 3;
+pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +38,7 @@ pub struct GgmlKernelDispatchReceipt {
 pub enum GgmlResolvedKernelRoute {
     DenseMv,
     DenseMvNr2,
+    DenseQ8_0MvNr2Rows,
     DenseQ5kCanonicalQ4x4,
     DenseQ4kWidthMn,
     DenseQ5kWidthMn,
@@ -250,6 +251,24 @@ fn validate_dense_dispatches(
             } else {
                 GgmlResolvedKernelRoute::DenseMv
             })
+        }
+        GgmlKernelRoute::DenseQ8_0MvNr2Rows => {
+            let dispatch = require_one(dispatches)?;
+            if request.ggml_type != GgmlType::Q8_0 || !(2..=8).contains(&m) {
+                return Err(MlxError::InvalidArgument(
+                    "Q8_0 multi-row NR2 trace requires Q8_0 weights and M in 2..=8".into(),
+                ));
+            }
+            let kernel = format!("kernel_mul_mv_q8_0_f32_nr2_r{m}");
+            require_dispatch(
+                dispatch,
+                &kernel,
+                &single_batch_pipeline_label(&kernel),
+                [div_ceil_u64(n, 2), 1, 1],
+                [32, 4, 1],
+                &[(0, 256 * u64::from(m))],
+            )?;
+            Ok(GgmlResolvedKernelRoute::DenseQ8_0MvNr2Rows)
         }
         GgmlKernelRoute::DenseQ5kCanonicalQ4x4 => {
             let dispatch = require_one(dispatches)?;
@@ -616,6 +635,51 @@ mod tests {
         assert!(
             validate_dense_dispatches(&small_tile_request, &capability, &[wrong_geometry]).is_err()
         );
+    }
+
+    #[test]
+    fn q8_multi_row_trace_requires_width_kernel_and_shared_memory() {
+        let width_request = request(
+            GgmlInvocation::DenseAuto {
+                m: 4,
+                n: 65,
+                k: 256,
+            },
+            GgmlType::Q8_0,
+            GgmlWorkloadClass::ContinuousWidth,
+            GgmlRoutingPolicy::default(),
+        );
+        let capability = ggml_capability(width_request);
+        assert_eq!(capability.route, Some(GgmlKernelRoute::DenseQ8_0MvNr2Rows));
+        let kernel = "kernel_mul_mv_q8_0_f32_nr2_r4";
+        let label = single_batch_pipeline_label(kernel);
+        let valid = fake_dispatch(kernel, &label, [33, 1, 1], [32, 4, 1], vec![(0, 1024)]);
+        assert_eq!(
+            validate_dense_dispatches(&width_request, &capability, &[valid]).unwrap(),
+            GgmlResolvedKernelRoute::DenseQ8_0MvNr2Rows
+        );
+
+        let wrong_width = "kernel_mul_mv_q8_0_f32_nr2_r2";
+        let wrong_width = fake_dispatch(
+            wrong_width,
+            &single_batch_pipeline_label(wrong_width),
+            [33, 2, 1],
+            [32, 4, 1],
+            vec![(0, 512)],
+        );
+        assert!(validate_dense_dispatches(&width_request, &capability, &[wrong_width]).is_err());
+
+        let per_row = fake_dispatch(
+            "kernel_mul_mv_q8_0_f32_nr2",
+            &single_batch_pipeline_label("kernel_mul_mv_q8_0_f32_nr2"),
+            [33, 4, 1],
+            [32, 4, 1],
+            vec![(0, 256)],
+        );
+        assert!(validate_dense_dispatches(&width_request, &capability, &[per_row]).is_err());
+
+        let wrong_shmem = fake_dispatch(kernel, &label, [33, 1, 1], [32, 4, 1], vec![(0, 256)]);
+        assert!(validate_dense_dispatches(&width_request, &capability, &[wrong_shmem]).is_err());
     }
 
     #[test]

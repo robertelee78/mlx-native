@@ -933,6 +933,205 @@ kernel void kernel_mul_mv_q8_0_f32_nr2(
     }
 }
 
+// ---- Q8_0 NR2 mat-vec, multi-input-row variant ----
+//
+// Weight-amortizing analogue of `kernel_mul_mv_q8_0_f32_nr2` for narrow
+// continuous batches (M = 2..8 input rows, e.g. joint decode). NR2 with
+// grid.y = M re-reads every Q8_0 weight block from DRAM once per input row.
+// This kernel loads each of its two weight rows' blocks ONCE per iteration
+// into registers and applies them to up to R1 input rows.
+//
+// BIT-IDENTITY with an independent NR2 invocation per input row:
+//   * Same NR0=2 / NSG=4 / NW=32 / NQ=8 lane partition, so every
+//     (output row, input row) accumulator visits the same blocks `ib` in the
+//     same order on the same (sgitg, tiisg) lane.
+//   * Per block: `sumq` starts at 0 and accumulates `q * yl[iq]` for
+//     iq = 0..NQ-1 in order with an int8 weight operand and an F32 register
+//     operand, then `sumf += sumq * d` with the block's half scale — the same
+//     expression forms as NR2 (no `dot()`, no reassociation, no FMA operand
+//     form change). The weight value is the same int8/half pair whether read
+//     through a device pointer or a register copy.
+//   * Reduction: per-simdgroup `simd_sum`, then a 32-lane threadgroup slot
+//     whose lane `sgitg` holds simdgroup `sgitg`'s partial and whose other
+//     lanes are zero, then a final `simd_sum` over that slot — NR2's exact
+//     layout, replicated per (row, input row) slot.
+// The only input-row-dependent state is the input pointer, its `yl` cache,
+// the accumulators, and the output index.
+//
+// Dispatch: threadgroups = (ceil(N/2), ceil(M/R1), B), threads = (32, 4, 1),
+// threadgroup memory = NR0 * R1 * NW * sizeof(float) = 256 * R1 bytes.
+// Input rows past M in the final y-tile are never read or written.
+template <short R1>
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl(
+    device const  void  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    threadgroup float   * shmem  [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NR0 = N_R0_Q8_0;   // 2
+    constexpr int NSG = N_SG_Q8_0;   // 4
+    constexpr int NW  = N_SIMDWIDTH; // 32
+    constexpr int NQ  = NQ_Q8_0;     // 8
+
+    const int nb = p.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+    const int r1_base = tgpig.y * R1;
+    const int im = tgpig.z;
+
+    const uint i12 = im % QMM_NE12(p);
+    const uint i13 = im / QMM_NE12(p);
+
+    device const block_q8_0 * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        const uint offset0 = (r0 + row) * nb
+            + (i12 / QMM_R2(p)) * (nb * p.ne01)
+            + (i13 / QMM_R3(p)) * (nb * p.ne01 * p.ne02);
+        ax[row] = (device const block_q8_0 *) src0 + offset0;
+    }
+
+    // Number of live input rows in this y-tile (uniform across the TG).
+    const int live_r1 = min((int) R1, (int) (p.ne1 - r1_base));
+
+    // First input row of this y-tile; input row `c` starts `c * ne10` later.
+    device const float * y0 = (device const float *) src1
+        + r1_base * p.ne10
+        + im * p.ne00 * p.ne1;
+
+    float sumf[NR0][R1];
+    for (int row = 0; row < NR0; ++row) {
+        for (short c = 0; c < R1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    const int ix = tiisg / (NW / NQ);  // 0..3
+    const int il = tiisg % (NW / NQ);  // 0..3
+
+    const int ib0 = sgitg * NQ + ix;
+
+    // Element offset of this lane's NQ inputs inside block `ib`.
+    int yoff = ib0 * QK8_0 + il * NQ;
+
+    // Register copies of this lane's weight bytes. Rows past N are never
+    // loaded and never consumed; zero-init keeps them defined.
+    int8_t qv[NR0][NQ];
+    half   dv[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        for (int iq = 0; iq < NQ; ++iq) {
+            qv[row][iq] = 0;
+        }
+        dv[row] = 0.0h;
+    }
+    float  yl[NQ];
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Load each live weight row's NQ quants and scale once per block.
+        // The final NR0=2 tile may contain only one live output row: never
+        // dereference the one-past-end packed row.
+        for (int row = 0; row < NR0; ++row) {
+            if (r0 + row < p.ne01) {
+                device const int8_t * qs = ax[row][ib].qs + il * NQ;
+                for (int iq = 0; iq < NQ; ++iq) {
+                    qv[row][iq] = qs[iq];
+                }
+                dv[row] = ax[row][ib].d;
+            }
+        }
+
+        for (short c = 0; c < R1; ++c) {
+            if (c >= live_r1) {
+                break;
+            }
+            device const float * yb = y0 + c * p.ne10 + yoff;
+            for (int i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
+            }
+
+            for (int row = 0; row < NR0; ++row) {
+                if (r0 + row < p.ne01) {
+                    float sumq = 0.f;
+                    for (int iq = 0; iq < NQ; ++iq) {
+                        sumq += qv[row][iq] * yl[iq];
+                    }
+                    sumf[row][c] += sumq * dv[row];
+                }
+            }
+        }
+
+        yoff += NSG * NQ * QK8_0;
+    }
+
+    // Cross-simdgroup reduction: one NR2-layout 32-lane slot per
+    // (output row, input row) pair.
+    for (int row = 0; row < NR0; ++row) {
+        for (short c = 0; c < R1; ++c) {
+            threadgroup float * slot = shmem + NW * (row * R1 + c);
+            if (sgitg == 0) {
+                slot[tiisg] = 0.0f;
+            }
+            sumf[row][c] = simd_sum(sumf[row][c]);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int row = 0; row < NR0; ++row) {
+        for (short c = 0; c < R1; ++c) {
+            if (tiisg == 0) {
+                shmem[NW * (row * R1 + c) + sgitg] = sumf[row][c];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int row = 0; row < NR0 && r0 + row < p.ne01; ++row) {
+        for (short c = 0; c < R1; ++c) {
+            if (c >= live_r1) {
+                break;
+            }
+            const float tot = simd_sum(shmem[NW * (row * R1 + c) + tiisg]);
+            if (tiisg == 0 && sgitg == 0) {
+                dst[(r1_base + c) * p.ne0 + im * p.ne0 * p.ne1 + r0 + row] = tot;
+            }
+        }
+    }
+}
+
+// Explicit R1 ∈ {2..8} instantiations (one per narrow continuous width).
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r2")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<2>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r3")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<3>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r4")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<4>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r5")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<5>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r6")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<6>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r7")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<7>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+template [[host_name("kernel_mul_mv_q8_0_f32_nr2_r8")]]
+kernel void hf2q_mul_mv_q8_0_f32_nr2_rows_impl<8>(
+    device const void *, device const float *, device float *,
+    constant GgmlMatvecParams &, threadgroup float *, uint3, uint, uint);
+
 // ---- Q6_K mat-vec kernel ----
 //
 // Dispatch: threadgroups=(ceil(N/2), M, B), threads_per_tg=(2, 32, 1)

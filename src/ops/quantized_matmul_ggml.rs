@@ -17,9 +17,9 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
-    plan_dense_auto_route, tensor_mm_auto_selected, DenseAutoPlan, GgmlCapabilityRequest,
-    GgmlInvocation, GgmlRoutingPolicy, GgmlTensorMmPreference, GgmlWorkloadClass,
-    GGML_CAPABILITY_SCHEMA_VERSION,
+    plan_dense_auto_route, q8_0_mv_nr2_rows_selected, tensor_mm_auto_selected, DenseAutoPlan,
+    GgmlCapabilityRequest, GgmlInvocation, GgmlRoutingPolicy, GgmlTensorMmPreference,
+    GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
 use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
@@ -32,6 +32,8 @@ use std::sync::atomic::AtomicI8;
 // each hitting these 2 env reads.
 static CACHED_Q6K_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_MV_NR2: AtomicI8 = AtomicI8::new(-1);
+// Q8_0 NR2 multi-input-row matvec at M in 2..=8 (default on).
+static CACHED_Q8_0_MV_R1: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q5K_CANONICAL_Q4X4: AtomicI8 = AtomicI8::new(-1);
 // ADR-040 §0.21 decode mul_mv_ext lever (opt-in, default off — see routing site).
 static CACHED_DECODE_MV_EXT: AtomicI8 = AtomicI8::new(-1);
@@ -443,6 +445,7 @@ pub(crate) fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
         dense_decode_mv_ext: cached_env_eq_one(&CACHED_DECODE_MV_EXT, "HF2Q_DECODE_MV_EXT"),
         dense_q6k_mv_nr2: cached_env_default_true(&CACHED_Q6K_MV_NR2, "HF2Q_Q6K_MV_NR2"),
         dense_q8_0_mv_nr2: cached_env_default_true(&CACHED_Q8_0_MV_NR2, "HF2Q_Q8_0_MV_NR2"),
+        dense_q8_0_mv_r1: cached_env_default_true(&CACHED_Q8_0_MV_R1, "HF2Q_Q8_0_MV_R1"),
         dense_tensor_mm: if std::env::var("HF2Q_DISABLE_TENSOR_MM").as_deref() == Ok("1") {
             GgmlTensorMmPreference::ForceSimd
         } else {
@@ -1677,6 +1680,16 @@ fn dispatch_mv_batched(
     // production default; operators can retain the legacy kernel with
     // `HF2Q_Q8_0_MV_NR2=0` / `=false` / `=off` for diagnostics.
     let use_q8_0_nr2 = matches!(params.ggml_type, GgmlType::Q8_0) && routing.dense_q8_0_mv_nr2;
+    // Narrow continuous Q8_0 batches (M in 2..=8) run NR2's exact per-row
+    // tree with all M input rows in one threadgroup, so each weight block is
+    // read from DRAM once per call instead of once per input row. Outputs
+    // are bit-identical to per-row NR2. Opt out with `HF2Q_Q8_0_MV_R1=0` /
+    // `=false` / `=off`; the per-row NR2 grid below then applies.
+    if q8_0_mv_nr2_rows_selected(params.ggml_type, params.m, routing) {
+        return dispatch_mv_q8_0_nr2_rows(
+            encoder, registry, device, input, weight, output, params, batch, params.m,
+        );
+    }
     let kernel_name = if use_q6k_nr2 {
         "kernel_mul_mv_q6_K_f32_nr2"
     } else if use_q8_0_nr2 {
@@ -1788,6 +1801,149 @@ fn dispatch_mv_batched(
     }
 
     Ok(())
+}
+
+/// Q8_0 NR2 matvec with `r1` input rows per threadgroup.
+///
+/// Grid `(ceil(N/2), ceil(M/r1), batch)` × `(32, 4, 1)` threads with
+/// `2 * r1 * 32` floats of threadgroup memory. Each threadgroup reads its two
+/// weight rows' blocks once and applies them to up to `r1` input rows, using
+/// NR2's exact per-row accumulation and reduction tree; the kernel guards
+/// the final partial row tile. Callers validate buffers and dimensions.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mv_q8_0_nr2_rows(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    batch: u32,
+    r1: u32,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q8_0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q8_0_nr2_rows: expected Q8_0 weights, got {:?}",
+            params.ggml_type
+        )));
+    }
+    let kernel_name = match r1 {
+        2 => "kernel_mul_mv_q8_0_f32_nr2_r2",
+        3 => "kernel_mul_mv_q8_0_f32_nr2_r3",
+        4 => "kernel_mul_mv_q8_0_f32_nr2_r4",
+        5 => "kernel_mul_mv_q8_0_f32_nr2_r5",
+        6 => "kernel_mul_mv_q8_0_f32_nr2_r6",
+        7 => "kernel_mul_mv_q8_0_f32_nr2_r7",
+        8 => "kernel_mul_mv_q8_0_f32_nr2_r8",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_mv_q8_0_nr2_rows: rows per threadgroup must be 2..=8, got {r1}"
+            )))
+        }
+    };
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(700, batch as i32), (701, 1), (702, 1)],
+    )?;
+
+    let batch_i64 = i64::from(batch);
+    let gpu_params = GgmlMatvecGpuParams {
+        ne00: params.k as i64,
+        ne01: params.n as i64,
+        ne02: batch_i64,
+        ne10: params.k as i64,
+        ne12: batch_i64,
+        ne0: params.n as i64,
+        ne1: params.m as i64,
+        r2: 1,
+        r3: 1,
+    };
+
+    let threadgroups = metal::MTLSize::new(
+        div_ceil(params.n as usize, 2) as u64,
+        div_ceil(params.m as usize, r1 as usize) as u64,
+        u64::from(batch),
+    );
+    let threads_per_tg = metal::MTLSize::new(32, 4, 1);
+    // One NR2 reduction slot (NW floats) per (output row, input row) pair.
+    let smem_bytes = 2 * u64::from(r1) * 32 * std::mem::size_of::<f32>() as u64;
+    encoder.dispatch_tracked_threadgroups_with_args_and_shared(
+        &pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        &[(0, smem_bytes)],
+        &[weight, input],
+        &[output],
+        threadgroups,
+        threads_per_tg,
+    );
+    Ok(())
+}
+
+/// Test-only entry point for the Q8_0 NR2 multi-row kernel with an explicit
+/// rows-per-threadgroup tile `r1` (2..=8) independent of `M`, so tests can
+/// exercise the guarded partial final row tile (`M % r1 != 0`). Production
+/// routing always uses `r1 == M`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mv_q8_0_nr2_rows_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    r1: u32,
+) -> Result<()> {
+    validate_native_quantized_dtypes("dispatch_mv_q8_0_nr2_rows_for_test", input, weight, output)?;
+    validate_signed_metal_dimensions(
+        "dispatch_mv_q8_0_nr2_rows_for_test",
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
+    if params.m == 0 || params.n == 0 || params.k == 0 || params.k % QK8_0 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_mv_q8_0_nr2_rows_for_test: M, N, K must be non-zero and K a multiple of {QK8_0}"
+        )));
+    }
+    let weight_bytes = checked_byte_extent(
+        "weight",
+        &[
+            params.n as usize,
+            (params.k / QK8_0) as usize,
+            BLOCK_Q8_0_BYTES as usize,
+        ],
+    )?;
+    let input_bytes = checked_byte_extent(
+        "input",
+        &[params.m as usize, params.k as usize, DType::F32.size_of()],
+    )?;
+    let output_bytes = checked_byte_extent(
+        "output",
+        &[params.m as usize, params.n as usize, DType::F32.size_of()],
+    )?;
+    for (buffer, required, label) in [
+        (weight, weight_bytes, "weight"),
+        (input, input_bytes, "input"),
+        (output, output_bytes, "output"),
+    ] {
+        if buffer.data_byte_len() < required {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_mv_q8_0_nr2_rows_for_test: {label} needs {required} bytes, got {}",
+                buffer.data_byte_len()
+            )));
+        }
+    }
+    dispatch_mv_q8_0_nr2_rows(
+        encoder, registry, device, input, weight, output, params, 1, r1,
+    )
 }
 
 /// Resolve a column tile's explicit Metal binding offset relative to the
