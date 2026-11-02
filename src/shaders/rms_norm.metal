@@ -835,6 +835,10 @@ kernel void fused_post_attn_triple_norm_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float rms_inv_attn = rsqrt(shared[0] / float(dim) + eps);
+    // Phase 2's `shared[tid]` store overwrites shared[0] from thread 0; every
+    // simdgroup must finish this broadcast read first, or a late simdgroup
+    // normalizes its slice with thread 0's partial sum (nondeterministic).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: compute residual_new[i] = hidden[i] + normed_attn[i], write
     // it to residual_out, AND accumulate sum(residual_new^2) for the pre-FF
@@ -928,6 +932,9 @@ kernel void fused_post_attn_triple_norm_f32_v2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv_attn = rsqrt(shared[0] / float(dim) + eps);
+    // Phase 2's `shared[sgitg]` store overwrites shared[0] from simdgroup 0;
+    // every simdgroup must finish this broadcast read first.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Phase 2: residual_new = hidden + attn*rms_attn*post_attn_w; write
     //              + accumulate sum(residual_new^2) for SECOND RMS ---
@@ -1023,6 +1030,10 @@ kernel void fused_post_ff_norm2_endlayer_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float rms_inv_moe = rsqrt(shared[0] / float(dim) + eps);
+    // Phase 2's `shared[tid]` store overwrites shared[0] from thread 0; every
+    // simdgroup must finish this broadcast read first, or a late simdgroup
+    // normalizes its slice with thread 0's partial sum (nondeterministic).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: mlp_down[i] = attn_out + moe_accum * rms_inv_moe * w2[i],
     // write, accumulate sum(mlp_down^2) for SECOND RMS.
@@ -1116,6 +1127,9 @@ kernel void fused_post_ff_norm2_endlayer_f32_v2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv_moe = rsqrt(shared[0] / float(dim) + eps);
+    // Phase 2's `shared[sgitg]` store overwrites shared[0] from simdgroup 0;
+    // every simdgroup must finish this broadcast read first.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Phase 2: write mlp_down + accumulate sum(mlp_down^2) for SECOND RMS ---
     float sumf_mlp = 0.0f;
@@ -1262,6 +1276,9 @@ kernel void fused_moe_wsum_post_ff_norm2_endlayer_f32_v2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv_moe = rsqrt(sg_scratch[0] / float(dim) + eps);
+    // Phase 2's `sg_scratch[sgitg]` store overwrites sg_scratch[0] from
+    // simdgroup 0; every simdgroup must finish this broadcast read first.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Phase 2: write mlp_down + sum-of-squares for SECOND RMS ---
     float sumf_mlp = 0.0f;
