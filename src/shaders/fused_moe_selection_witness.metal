@@ -51,6 +51,9 @@ kernel void fused_moe_routing_f32_selection_witness(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float max_val = shared[0];
+    // Step 2's `shared[0] = local_sum` must not clobber the broadcast max
+    // before every simdgroup has read it (see fused_moe_routing_f32).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 2: compute exp(x - max) and sum
     float local_sum = 0.0f;
@@ -185,6 +188,8 @@ kernel void fused_moe_routing_f32_v2_selection_witness(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float max_val = shared[num_experts + 0];
+    // Step 2 overwrites this broadcast slot (see fused_moe_routing_f32_v2).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Step 2: compute exp(x - max) and sum ---
     float local_sum = 0.0f;
@@ -318,6 +323,8 @@ kernel void fused_moe_routing_f32_v3_selection_witness(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float max_val = shared[num_experts + 0];
+    // Step 2 overwrites this broadcast slot (see fused_moe_routing_f32_v2).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Step 2: compute exp(x - max) and sum — same as V2 ---
     float local_sum = 0.0f;

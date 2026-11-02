@@ -569,6 +569,12 @@ kernel void fused_moe_routing_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float max_val = shared[0];
+    // Every simdgroup must finish this broadcast read before thread 0 stores
+    // `shared[0] = local_sum` in Step 2. Without the barrier a late simdgroup
+    // reads a clobbered max, rescales all experts it owns, and top-K selects
+    // the wrong experts (nondeterministic decode routing). Same fix as
+    // `fused_moe_routing_batch_f32` (99fea55).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 2: compute exp(x - max) and sum
     float local_sum = 0.0f;
@@ -683,6 +689,11 @@ kernel void fused_moe_routing_f32_v2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float max_val = shared[num_experts + 0];
+    // Step 2 stores exp values over `shared[num_experts + i]`; thread 0's
+    // first store overwrites this broadcast slot. Every simdgroup must finish
+    // the read first, or a late simdgroup rescales all experts it owns and
+    // top-K selects the wrong experts (nondeterministic decode routing).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Step 2: compute exp(x - max) and sum ---
     float local_sum = 0.0f;
@@ -820,6 +831,8 @@ kernel void fused_moe_routing_f32_v3(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float max_val = shared[num_experts + 0];
+    // Same WAR hazard as V2: Step 2 overwrites this broadcast slot.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Step 2: compute exp(x - max) and sum — same as V2 ---
     float local_sum = 0.0f;
