@@ -79,3 +79,19 @@ served `attn_output` 263.9 vs 264.5 µs). A few 4×4 rows ran slower, up to 25%
 across paths (runtime: 547 vs 539 µs). Unique-weight bandwidth was 62–123 GB/s
 and logical bandwidth 248–493 GB/s. Per-case numbers are in
 `bandwidth-{precompiled,runtime}.txt`.
+
+### Follow-up: runtime-path capture kernels
+
+- On mlx-native 0.15.16 (`20540a5`), both capture probes fail on the runtime
+  path with `KernelNotFound("gated_delta_net_decode_capture_f32_4")`.
+- The fix is on branch `fix/gdn-capture-runtime-registry` at `4e32003`. It
+  registers `gated_delta_net_decode_capture_f32_{1,2,4}` in
+  `KernelRegistry::new()` and adds the test `gdn_decode_capture_runtime_source`,
+  which passes.
+- On the fix branch, with `MLX_PRECOMPILED_METALLIB=0`, both probes pass and
+  all 20 records are bitwise:
+  - `e6_gated_delta_net_decode_capture_four_sequence_windows_match_single_sequences`:
+    12/12 (output, `state_out` and `state_capture` for 4 sequences);
+  - `e6_gated_delta_net_decode_window_versus_sequential_tokens`: 8/8.
+- Evidence: `509-e6/records-runtime-fix-4e32003.txt` and
+  `test-runtime-fix-4e32003.log`.
