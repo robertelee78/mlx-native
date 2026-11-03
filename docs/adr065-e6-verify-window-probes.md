@@ -50,19 +50,32 @@ metallib path. It writes `records-{precompiled,runtime}.txt`,
 `bandwidth-{precompiled,runtime}.txt`, the logs, and a provenance file
 (source commit, test-binary sha256, embedded metallib sha256, crate version).
 
-## Results
+## Results (M5 Max, 2026-11-03)
 
-Not yet run. The probes are written and compiled. GPU execution on the
-M5 Max waits for the GPU lane. The result tables below are filled from the
-record files of that run.
+Run at source commit `608425d` with mlx-native 0.15.16 and rustc 1.94.0.
+Embedded metallib sha256 is `a4f35c4b…f961827`. Records, logs and
+provenance are in the hf2q v0130 evidence directory `509-e6/`. The capture
+restore test was also run with `E6_STRICT_NAN=1` on both paths.
 
 | Primitive | Precompiled | Runtime | Serves verify windows bitwise? |
 |---|---|---|---|
-| `mul_mv_ext` 8 vs 4 (Q4_K/Q5_K/Q6_K) | pending | pending | pending |
-| Served dense routes 8 vs 4 | pending | pending | pending |
-| TQ-HB batched, in-bucket / crossing | pending | pending | pending |
-| TQ-HB banked, in-bucket / crossing | pending | pending | pending |
-| F32 `flash_attn_vec` window | pending | pending | pending |
-| `gated_delta_net_decode` 4-seq vs 4×1 (± capture) | pending | pending | pending |
-| Capture restore: blit + strided copy / transpose | pending | pending | pending |
-| 16 rows 4×4 vs 2×8: passes, GB/s | pending | pending | n/a |
+| `mul_mv_ext` 8 vs 4 (Q4_K/Q5_K/Q6_K, 8 shapes) | 24/24 bitwise | 24/24 bitwise | Yes |
+| Served dense routes 8 vs 4 (Q4_K mN, Q5_K canonical, Q6_K mN) | 24/24 bitwise | 24/24 bitwise | Yes |
+| TQ-HB batched: in-bucket, `nwg` 16→32 crossings, cohort | all bitwise | all bitwise | Yes (`nwg`-invariant) |
+| TQ-HB batched: `nsg` 1→4 crossing (w4, w8) | 6/12 rows bitwise, max 7.5e-9 | same | **No**. Rows at KV length ≤1024 (single-row `nsg`=1) differ from the window's `nsg`=4. Rows above 1024 match |
+| TQ-HB banked: same matrix | identical verdicts, max 4.7e-9 | same | Same as batched |
+| F32 `flash_attn_vec` window (all 9 placements) | 60/60 bitwise | 60/60 bitwise | Yes |
+| `gated_delta_net_decode` 4-seq vs 4×1, 1 and 4 tokens | bitwise | bitwise | Yes |
+| `gated_delta_net_decode` capture 4-seq vs 4×1; window vs sequential tokens | bitwise | **KernelNotFound** | Yes on precompiled. The runtime path cannot build `gated_delta_net_decode_capture_f32_*`: `KernelRegistry::new()` does not register their source (only `ops::gated_delta_net_decode::register` does) |
+| Capture restore: blit recurrent + strided copy / transpose conv | bitwise, incl. all NaN payloads (strict) | same | Yes. The existing primitives suffice (P4a) |
+| 16 rows 4×4 vs 2×8 | 4 weight passes both ways, every route and codec | same | n/a |
+
+Bandwidth: 2×8 never reduces logical weight loads. With both `mul_mv_ext` and
+mN, an 8-column dispatch runs as two 4-column groups, so 16 rows read the
+weight 4 times either way. Median GPU times of the two groupings are within
+noise in most rows (for example Q4_K `deltanet_qkv` 313.6 vs 316.6 µs, Q6_K
+served `attn_output` 263.9 vs 264.5 µs). A few 4×4 rows ran slower, up to 25%
+(Q4_K `ffn_gate_up` 794 vs 598 µs precompiled), but that did not reproduce
+across paths (runtime: 547 vs 539 µs). Unique-weight bandwidth was 62–123 GB/s
+and logical bandwidth 248–493 GB/s. Per-case numbers are in
+`bandwidth-{precompiled,runtime}.txt`.
