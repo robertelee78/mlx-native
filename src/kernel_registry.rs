@@ -931,6 +931,14 @@ impl KernelRegistry {
         sources.insert("gated_delta_net_decode_f32_1".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_f32_2".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_f32_4".into(), gdn_decode_src);
+        // Per-position state-capture variants (speculative-decode rollback).
+        // Without these the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`)
+        // cannot build the capture pipelines.
+        let gdn_decode_capture_src: &'static str =
+            include_str!("shaders/gated_delta_net_decode_capture.metal");
+        sources.insert("gated_delta_net_decode_capture_f32_1".into(), gdn_decode_capture_src);
+        sources.insert("gated_delta_net_decode_capture_f32_2".into(), gdn_decode_capture_src);
+        sources.insert("gated_delta_net_decode_capture_f32_4".into(), gdn_decode_capture_src);
         // Wave 5b — chunk-parallel inter-chunk state-recurrence kernel
         // (the one new kernel in the chunk-parallel pipeline; spec source:
         // arXiv 2412.06464 §4 + FLA chunk_delta_h.py:43-298).
