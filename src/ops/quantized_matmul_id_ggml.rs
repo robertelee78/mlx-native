@@ -2127,6 +2127,132 @@ pub fn dispatch_id_mm_with_prepared_schedule_for_test(
     )
 }
 
+/// Test-only helper: encode only the legacy `map0` routing-schedule stage.
+///
+/// Writes the uniform-grid schedule (`htpe` `[n_experts]` counts, `hids`
+/// `[n_experts, n_tokens]` lists) for `ids` without encoding a matrix
+/// kernel. Microbenchmarks use it to time `map0` on its own; a following
+/// [`dispatch_id_mm_with_prepared_schedule_for_test`] consumes the result.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_id_mm_map0_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+) -> Result<()> {
+    validate_id_mm_scratch_dtypes("dispatch_id_mm_map0_for_test", htpe, hids)?;
+    if ids.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_id_mm_map0_for_test requires U32 expert IDs, got {:?}",
+            ids.dtype()
+        )));
+    }
+    if params.n_tokens == 0
+        || params.top_k == 0
+        || params.n_experts == 0
+        || params.top_k > params.n_experts
+        || params.n_tokens > i32::MAX as u32
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_map0_for_test: n_tokens, top_k and n_experts must be valid".into(),
+        ));
+    }
+    let total_rows = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("map0 row count overflow".into()))?;
+    let ids_bytes = checked_byte_extent("map0 ids", &[total_rows, DType::U32.size_of()])?;
+    if ids.data_byte_len() < ids_bytes
+        || htpe.data_byte_len() < params.htpe_bytes()
+        || hids.data_byte_len() < params.hids_bytes()
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_map0_for_test: ids or scratch buffer too small".into(),
+        ));
+    }
+    encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)
+}
+
+/// Encode the legacy `kernel_mul_mm_id_map0_ne20_<top_k>` stage plus the
+/// barrier that orders it before the consuming `mm_id` kernel.
+fn encode_legacy_map0(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+) -> Result<()> {
+    let map0_kernel_name = match params.top_k {
+        1 => "kernel_mul_mm_id_map0_ne20_1",
+        6 => "kernel_mul_mm_id_map0_ne20_6",
+        8 => "kernel_mul_mm_id_map0_ne20_8",
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
+                other
+            )))
+        }
+    };
+    let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
+    if u64::from(params.n_experts) > map0_pipeline.max_total_threads_per_threadgroup() {
+        return Err(MlxError::InvalidArgument(format!(
+            "n_experts ({}) exceeds map0 pipeline threadgroup limit ({})",
+            params.n_experts,
+            map0_pipeline.max_total_threads_per_threadgroup(),
+        )));
+    }
+
+    let map0_params = GgmlIdMmMap0GpuParams {
+        ne10: params
+            .n
+            .try_into()
+            .map_err(|_| MlxError::InvalidArgument("N out of i32 range".into()))?,
+        ne11: params.top_k as i32,
+        nb11: 0,
+        nb12: 0,
+        ne21: params.n_tokens as i32,
+        ne20: params.top_k as i32,
+        nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
+    };
+
+    let map0_shmem =
+        (params.n_experts as u64) * (params.top_k as u64) * DType::U32.size_of() as u64;
+    let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
+    let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
+
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start =
+                (buffer.contents_ptr() as usize).saturating_add(buffer.byte_offset() as usize);
+            (start, start.saturating_add(buffer.data_byte_len()))
+        };
+        encoder.set_pending_buffer_ranges(vec![range(ids)], vec![range(htpe), range(hids)]);
+    }
+    encoder.encode_threadgroups_with_args_and_shared(
+        map0_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&map0_params))),
+            (1, KernelArg::Buffer(ids)),
+            (2, KernelArg::Buffer(htpe)),
+            (3, KernelArg::Buffer(hids)),
+        ],
+        &[(0, map0_shmem)],
+        map0_threadgroups,
+        map0_threads,
+    );
+
+    // Memory barrier: the mm kernel reads htpe + hids, map0 wrote them.
+    // Without this, Metal's concurrent-dispatch compute encoder lets the
+    // two dispatches overlap — mm would read zeros (all-expert early-exit).
+    encoder.memory_barrier();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_id_mm_with_layout(
     encoder: &mut CommandEncoder,
@@ -2294,69 +2420,7 @@ fn dispatch_id_mm_with_layout(
     // and re-reads each expert's weights once per (seq_len*top_k) row —
     // ~50% of prefill time wasted on weight re-reads.
     if !schedule_prepared {
-        let map0_kernel_name = match params.top_k {
-            1 => "kernel_mul_mm_id_map0_ne20_1",
-            6 => "kernel_mul_mm_id_map0_ne20_6",
-            8 => "kernel_mul_mm_id_map0_ne20_8",
-            other => {
-                return Err(MlxError::InvalidArgument(format!(
-                    "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
-                    other
-                )))
-            }
-        };
-        let map0_pipeline = registry.get_pipeline(map0_kernel_name, device.metal_device())?;
-        if u64::from(params.n_experts) > map0_pipeline.max_total_threads_per_threadgroup() {
-            return Err(MlxError::InvalidArgument(format!(
-                "n_experts ({}) exceeds map0 pipeline threadgroup limit ({})",
-                params.n_experts,
-                map0_pipeline.max_total_threads_per_threadgroup(),
-            )));
-        }
-
-        let map0_params = GgmlIdMmMap0GpuParams {
-            ne10: params
-                .n
-                .try_into()
-                .map_err(|_| MlxError::InvalidArgument("N out of i32 range".into()))?,
-            ne11: params.top_k as i32,
-            nb11: 0,
-            nb12: 0,
-            ne21: params.n_tokens as i32,
-            ne20: params.top_k as i32,
-            nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
-        };
-
-        let map0_shmem =
-            (params.n_experts as u64) * (params.top_k as u64) * DType::U32.size_of() as u64;
-        let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
-        let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
-
-        if encoder.is_capturing() {
-            let range = |buffer: &MlxBuffer| {
-                let start =
-                    (buffer.contents_ptr() as usize).saturating_add(buffer.byte_offset() as usize);
-                (start, start.saturating_add(buffer.data_byte_len()))
-            };
-            encoder.set_pending_buffer_ranges(vec![range(ids)], vec![range(htpe), range(hids)]);
-        }
-        encoder.encode_threadgroups_with_args_and_shared(
-            map0_pipeline,
-            &[
-                (0, KernelArg::Bytes(as_bytes(&map0_params))),
-                (1, KernelArg::Buffer(ids)),
-                (2, KernelArg::Buffer(htpe)),
-                (3, KernelArg::Buffer(hids)),
-            ],
-            &[(0, map0_shmem)],
-            map0_threadgroups,
-            map0_threads,
-        );
-
-        // Memory barrier: the mm kernel reads htpe + hids, map0 wrote them.
-        // Without this, Metal's concurrent-dispatch compute encoder lets the
-        // two dispatches overlap — mm would read zeros (all-expert early-exit).
-        encoder.memory_barrier();
+        encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)?;
     }
 
     // ---- Stage 2: mm_id — matmul with the per-expert lists ----
