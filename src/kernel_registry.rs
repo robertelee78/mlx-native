@@ -1487,6 +1487,20 @@ impl KernelRegistry {
         // ADR-040 M4 — batched multi-seq decode flash (same source file).
         sources.insert("flash_attn_vec_hybrid_batched_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_batched_dk512".into(), hybrid_src);
+        // ADR-063 lever A — GQA-grouped, per-slot-bucket batched decode flash
+        // (same source file and compile flags as the batched reference).
+        for name in [
+            "flash_attn_vec_hybrid_batched_gqa1_dk256",
+            "flash_attn_vec_hybrid_batched_gqa2_dk256",
+            "flash_attn_vec_hybrid_batched_gqa4_dk256",
+            "flash_attn_vec_hybrid_batched_gqa8_dk256",
+            "flash_attn_vec_hybrid_batched_gqa1_dk512",
+            "flash_attn_vec_hybrid_batched_gqa2_dk512",
+            "flash_attn_vec_hybrid_batched_gqa4_dk512",
+            "flash_attn_vec_hybrid_batched_gqa8_dk512",
+        ] {
+            sources.insert(name.into(), hybrid_src);
+        }
 
         // ADR-029: verbatim peer port.
         // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.
