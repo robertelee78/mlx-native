@@ -12,12 +12,19 @@
 //! - `GEMMA_DECODE_BENCH_OUT` — receipt directory (default
 //!   `target/gemma_decode_w4`); `cells.jsonl` and `identity.json` go there.
 //! - `GEMMA_DECODE_BENCH_FAMILIES` — comma list of `roofline`, `d1`,
-//!   `lmhead`, `d2`, `e1`, `f1` (default: all).
+//!   `lmhead`, `d2`, `e1`, `f1`, `attn` (default: all).
 //! - `GEMMA_DECODE_BENCH_V2_OVERLAP` — file with the hf2q `[ROUTING_OVERLAP]`
-//!   line from the V2 run; adds the empirical E1 patterns (`v2_u*`).
+//!   line from the V2 run; adds the empirical E1 patterns (`v2_u*`) and the
+//!   V2 KV-length histogram steps of `attn` (`v2_le*`, weighted by count).
 //! - `GEMMA_DECODE_BENCH_ITERS` (default 50, minimum 50) and
 //!   `GEMMA_DECODE_BENCH_WARMUP` (default 10).
 //! - `HF2Q_HOST_LOCK_HOLDER` — recorded verbatim (the runner's HOST-LOCK name).
+//!
+//! `attn` (lever A1/A2): d256 sliding (16 q / 8 KV heads, ring 1024) and
+//! d512 global (16 q / 2 KV heads) hybrid decode flash, n_q ∈ {1,4,8,16},
+//! uniform-length steps (stock batched vs GQA at every legal G) and
+//! mixed-bucket steps (stock per-slot fallback vs GQA at every legal G);
+//! reduce dispatches included; 30 distinct KV caches cycled.
 //!
 //! Run (precompiled metallib, the production default):
 //!   cargo bench --bench bench_gemma_decode_w4
@@ -27,6 +34,12 @@
 use std::io::Write;
 use std::process::Command;
 
+use mlx_native::ops::flash_attn_vec_hybrid::{
+    flash_attn_vec_hybrid, flash_attn_vec_hybrid_batched, flash_attn_vec_hybrid_batched_gqa,
+    flash_attn_vec_hybrid_batched_gqa_group_is_legal, HybridSlotBucket,
+    FLASH_ATTN_VEC_HYBRID_GQA_GROUPS,
+};
+use mlx_native::ops::flash_attn_vec_tq_hb::{compute_nsg, FlashAttnVecTqHbParams};
 use mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode;
 use mlx_native::{
     quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_dual_gate_up_q4k,
@@ -53,7 +66,7 @@ impl Config {
             .map(Into::into)
             .unwrap_or_else(|| "target/gemma_decode_w4".into());
         let families = std::env::var("GEMMA_DECODE_BENCH_FAMILIES")
-            .unwrap_or_else(|_| "roofline,d1,lmhead,d2,e1,f1".into())
+            .unwrap_or_else(|_| "roofline,d1,lmhead,d2,e1,f1,attn".into())
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
@@ -781,6 +794,293 @@ impl Bench {
     }
 }
 
+/// One attention layer type of the `attn` family.
+struct AttnShape {
+    name: &'static str,
+    head_dim: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    sliding: bool,
+}
+
+const ATTN_SLOTS: usize = 16;
+const SLIDING_WINDOW: u32 = 1024;
+
+#[derive(Clone, Copy)]
+enum AttnArm {
+    /// Stock `flash_attn_vec_hybrid_batched` (uniform bucket).
+    StockBatched,
+    /// Stock per-slot `flash_attn_vec_hybrid` fallback (mixed buckets).
+    StockPerSlot,
+    /// `flash_attn_vec_hybrid_batched_gqa` at group G.
+    Gqa(u32),
+}
+
+impl AttnArm {
+    fn label(self) -> String {
+        match self {
+            AttnArm::StockBatched => "stock_batched".into(),
+            AttnArm::StockPerSlot => "stock_per_slot".into(),
+            AttnArm::Gqa(g) => format!("gqa_g{g}"),
+        }
+    }
+}
+
+struct KvCache {
+    k: MlxBuffer,
+    v: MlxBuffer,
+    norms: MlxBuffer,
+}
+
+fn u32_buffer(device: &MlxDevice, values: &[u32]) -> MlxBuffer {
+    let mut buffer = device
+        .alloc_buffer(values.len() * 4, DType::U32, vec![values.len()])
+        .expect("u32");
+    buffer.as_mut_slice::<u32>().expect("u32 slice").copy_from_slice(values);
+    buffer
+}
+
+fn random_bytes(buffer: &mut MlxBuffer, rng: &mut Rng, f16: bool) {
+    let bytes = buffer.as_mut_slice::<u8>().expect("byte slice");
+    for chunk in bytes.chunks_mut(8) {
+        let mut v = rng.next();
+        if f16 {
+            // Finite halves in ±[0.125, 0.25).
+            v = (v & 0x83ff_83ff_83ff_83ff) | 0x3000_3000_3000_3000;
+        }
+        chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
+    }
+}
+
+/// V2 KV-length histogram of one layer type: (representative length, weight).
+fn v2_kv_lengths(layer_type: &str) -> Vec<(u32, f64)> {
+    let Some(path) = std::env::var_os("GEMMA_DECODE_BENCH_V2_OVERLAP") else {
+        return Vec::new();
+    };
+    let text = std::fs::read_to_string(&path).expect("V2 overlap JSON");
+    let json_text = text.trim().trim_start_matches("[ROUTING_OVERLAP]").trim();
+    let report: serde_json::Value = serde_json::from_str(json_text).expect("V2 overlap JSON parse");
+    let hist: Vec<(u32, f64)> = report[layer_type]["kv_len_pow2"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(key, count)| {
+            let len = key.trim_start_matches("le").parse().expect("kv_len_pow2 key");
+            (len, count.as_f64().unwrap_or(0.0))
+        })
+        .collect();
+    let total: f64 = hist.iter().map(|(_, c)| c).sum();
+    hist.into_iter().map(|(l, c)| (l, c / total.max(1.0))).collect()
+}
+
+impl Bench {
+    fn attn_family(&mut self) {
+        let shapes = [
+            AttnShape { name: "d256_sliding", head_dim: 256, num_heads: 16, num_kv_heads: 8, sliding: true },
+            AttnShape { name: "d512_global", head_dim: 512, num_heads: 16, num_kv_heads: 2, sliding: false },
+        ];
+        let mut rng = Rng(0xa77);
+        for shape in &shapes {
+            // (step name, per-slot seq_pos+1 pattern, weight)
+            let mut steps: Vec<(String, Vec<u32>, Option<f64>)> = [512u32, 1024, 2048, 4096]
+                .iter()
+                .map(|&l| (format!("uniform_{l}"), vec![l], None))
+                .collect();
+            let layer_type = if shape.sliding { "sliding" } else { "global" };
+            for (l, w) in v2_kv_lengths(layer_type) {
+                steps.push((format!("v2_le{l}"), vec![l], Some(w)));
+            }
+            steps.push(("mixed_300_700_1100_3000".into(), vec![300, 700, 1100, 3000], None));
+            let max_len = steps.iter().flat_map(|s| s.1.iter().copied()).max().unwrap_or(1);
+            let cap = if shape.sliding { SLIDING_WINDOW } else { max_len };
+            let (hd, nkv) = (shape.head_dim as usize, shape.num_kv_heads as usize);
+            let npp = if hd == 512 { 2 } else { 1 };
+            let rows = ATTN_SLOTS * nkv * cap as usize;
+            let caches: Vec<KvCache> = (0..LAYERS)
+                .map(|_| {
+                    let mut k = self.device.alloc_buffer(rows * hd * 2, DType::F16, vec![rows * hd]).expect("k");
+                    random_bytes(&mut k, &mut rng, true);
+                    let mut v = self.device.alloc_buffer(rows * hd, DType::U8, vec![rows * hd]).expect("v");
+                    random_bytes(&mut v, &mut rng, false);
+                    KvCache { k, v, norms: f32_buffer(&self.device, rows * npp, &mut rng) }
+                })
+                .collect();
+            let q_len = ATTN_SLOTS * shape.num_heads as usize * hd;
+            let inputs = [f32_buffer(&self.device, q_len, &mut rng), f32_buffer(&self.device, q_len, &mut rng)];
+            let output = f32_buffer(&self.device, q_len, &mut rng);
+            let tmp = f32_buffer(&self.device, ATTN_SLOTS * shape.num_heads as usize * (hd + 2) * 32, &mut rng);
+            let slot_ids: Vec<u32> = (0..ATTN_SLOTS as u32).collect();
+            let slot_id_arr = u32_buffer(&self.device, &slot_ids);
+            for n_q in [1usize, 4, 8, 16] {
+                for (step, pattern, weight) in &steps {
+                    let seq_lens: Vec<u32> = (0..n_q).map(|i| pattern[i % pattern.len()]).collect();
+                    let kv_lens: Vec<u32> =
+                        seq_lens.iter().map(|&l| if shape.sliding { l.min(cap) } else { l }).collect();
+                    let buckets: Vec<HybridSlotBucket> =
+                        kv_lens.iter().map(|&l| HybridSlotBucket::for_kv_seq_len(l)).collect();
+                    let uniform = buckets.iter().all(|b| *b == buckets[0]);
+                    if pattern.len() > 1 && uniform {
+                        continue; // a "mixed" step that collapses to one bucket
+                    }
+                    let nsg_max = buckets.iter().map(|b| b.nsg).max().unwrap_or(1);
+                    let mut arms = vec![if uniform { AttnArm::StockBatched } else { AttnArm::StockPerSlot }];
+                    arms.extend(FLASH_ATTN_VEC_HYBRID_GQA_GROUPS.iter().copied().filter(|&g| {
+                        flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+                            shape.num_heads,
+                            shape.num_kv_heads,
+                            shape.head_dim,
+                            g,
+                            nsg_max,
+                        )
+                    }).map(AttnArm::Gqa));
+                    let seq_pos: Vec<u32> = seq_lens.iter().map(|l| l - 1).collect();
+                    let seq_pos_arr = u32_buffer(&self.device, &seq_pos);
+                    let bytes_per_row = (hd * 2 + hd + npp * 4) as f64;
+                    let kv_rows: f64 = kv_lens.iter().map(|&l| l as f64).sum();
+                    let logical = kv_rows * shape.num_heads as f64 * bytes_per_row;
+                    let unique = kv_rows * shape.num_kv_heads as f64 * bytes_per_row;
+                    for arm in arms {
+                        let s = self.time_attn(
+                            shape, cap, &caches, &inputs, &output, &tmp, &slot_id_arr, &seq_pos_arr, &kv_lens,
+                            &buckets, arm,
+                        );
+                        let arm_reads = match arm {
+                            AttnArm::Gqa(g) => logical / g as f64,
+                            _ => logical,
+                        };
+                        let line = serde_json::json!({
+                            "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
+                            "family": "attn",
+                            "shape": shape.name,
+                            "step": step,
+                            "n_q": n_q,
+                            "head_dim": shape.head_dim,
+                            "num_heads": shape.num_heads,
+                            "num_kv_heads": shape.num_kv_heads,
+                            "kv_capacity": cap,
+                            "kv_lens": kv_lens,
+                            "uniform_bucket": uniform,
+                            "weight": weight,
+                            "arm": arm.label(),
+                            "kv_caches_cycled": caches.len(),
+                            "dispatches_per_command_buffer": LAYERS,
+                            "iters": self.cfg.iters,
+                            "warmup": self.cfg.warmup,
+                            "median_ns": s.median_ns,
+                            "p10_ns": s.p10_ns,
+                            "p90_ns": s.p90_ns,
+                            "kv_bytes_logical_stock": logical,
+                            "kv_bytes_logical_arm": arm_reads,
+                            "kv_bytes_unique": unique,
+                            "kv_gb_per_s_unique": unique / s.median_ns,
+                        });
+                        writeln!(self.receipts, "{line}").expect("receipt");
+                        println!(
+                            "attn    {:12} {:24} n_q={n_q:2} {:14} median {:9.1} µs  p10 {:9.1}  p90 {:9.1}  {:6.1} GB/s unique",
+                            shape.name,
+                            step,
+                            arm.label(),
+                            s.median_ns / 1e3,
+                            s.p10_ns / 1e3,
+                            s.p90_ns / 1e3,
+                            unique / s.median_ns,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn time_attn(
+        &mut self,
+        shape: &AttnShape,
+        cap: u32,
+        caches: &[KvCache],
+        inputs: &[MlxBuffer; 2],
+        output: &MlxBuffer,
+        tmp: &MlxBuffer,
+        slot_id_arr: &MlxBuffer,
+        seq_pos_arr: &MlxBuffer,
+        kv_lens: &[u32],
+        buckets: &[HybridSlotBucket],
+        arm: AttnArm,
+    ) -> Stats {
+        let n_q = kv_lens.len();
+        let (hd, nh, nkv) = (shape.head_dim as usize, shape.num_heads as usize, shape.num_kv_heads as usize);
+        let npp = if hd == 512 { 2 } else { 1 };
+        let max_kv = kv_lens.iter().copied().max().unwrap_or(1);
+        let params_for = |kv_seq_len: u32, ring_start: u32, nsg: u32| FlashAttnVecTqHbParams {
+            num_heads: shape.num_heads,
+            num_kv_heads: shape.num_kv_heads,
+            head_dim: shape.head_dim,
+            kv_seq_len,
+            kv_capacity: cap,
+            scale: 1.0,
+            mask_type: if shape.sliding { 2 } else { 1 },
+            sliding_window: if shape.sliding { SLIDING_WINDOW } else { 0 },
+            softcap: 0.0,
+            ring_start,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+            fuse_fwht_pre: 0,
+            nsg,
+        };
+        let batched = params_for(max_kv, 0, buckets.iter().map(|b| b.nsg).max().unwrap_or(1));
+        let seq_pos: Vec<u32> = seq_pos_arr.as_slice::<u32>().expect("seq_pos").to_vec();
+        let mut samples = Vec::with_capacity(self.cfg.iters);
+        for iter in 0..self.cfg.warmup + self.cfg.iters {
+            let q = &inputs[iter % 2];
+            let mut encoder = self.device.command_encoder().expect("encoder");
+            for layer in 0..LAYERS {
+                let kv = &caches[(iter * LAYERS + layer) % caches.len()];
+                match arm {
+                    AttnArm::StockBatched => flash_attn_vec_hybrid_batched(
+                        &mut encoder, &mut self.registry, &self.device, n_q as u32, q, &kv.k, &kv.v,
+                        &kv.norms, output, tmp, slot_id_arr, seq_pos_arr, &batched,
+                    )
+                    .expect("batched flash"),
+                    AttnArm::Gqa(g) => flash_attn_vec_hybrid_batched_gqa(
+                        &mut encoder, &mut self.registry, &self.device, q, &kv.k, &kv.v, &kv.norms,
+                        output, tmp, slot_id_arr, seq_pos_arr, &batched, g, buckets,
+                    )
+                    .expect("gqa flash"),
+                    AttnArm::StockPerSlot => {
+                        // hf2q's mixed-bucket fallback: one solo dispatch (+ reduce) per slot.
+                        let slot_rows = nkv * cap as usize;
+                        let tmp_per_slot = nh * (hd + 2) * 32;
+                        for (i, &kv_len) in kv_lens.iter().enumerate() {
+                            let ring_start = if shape.sliding && kv_len >= cap {
+                                (seq_pos[i] + 1) % cap
+                            } else {
+                                0
+                            };
+                            let p = params_for(kv_len, ring_start, compute_nsg(kv_len));
+                            flash_attn_vec_hybrid(
+                                &mut encoder,
+                                &mut self.registry,
+                                &self.device,
+                                &q.slice_view((i * nh * hd * 4) as u64, nh * hd),
+                                &kv.k.slice_view((i * slot_rows * hd * 2) as u64, slot_rows * hd),
+                                &kv.v.slice_view((i * slot_rows * hd) as u64, slot_rows * hd),
+                                &kv.norms.slice_view((i * slot_rows * npp * 4) as u64, slot_rows * npp),
+                                &output.slice_view((i * nh * hd * 4) as u64, nh * hd),
+                                &tmp.slice_view((i * tmp_per_slot * 4) as u64, tmp_per_slot),
+                                &p,
+                            )
+                            .expect("per-slot flash");
+                        }
+                    }
+                }
+            }
+            let (start, end) = encoder.commit_wait_with_gpu_time().expect("GPU");
+            if iter >= self.cfg.warmup {
+                samples.push((end - start) * 1e9 / LAYERS as f64);
+            }
+        }
+        stats(samples)
+    }
+}
+
 fn main() {
     let cfg = Config::from_env();
     std::fs::create_dir_all(&cfg.out).expect("bench output dir");
@@ -853,6 +1153,9 @@ fn main() {
     }
     if bench.cfg.wants("f1") {
         bench.dual_gate_up_family(&widths);
+    }
+    if bench.cfg.wants("attn") {
+        bench.attn_family();
     }
 
     let identity = serde_json::json!({
