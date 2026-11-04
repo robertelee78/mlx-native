@@ -805,6 +805,7 @@ impl KernelRegistry {
             kv_cache_src,
         );
         sources.insert("kv_cache_linearize_ring_bytes".into(), kv_cache_src);
+        sources.insert("kv_cache_restore_ring_bytes".into(), kv_cache_src);
 
         // Elementwise and transpose kernels (Story 1.5)
         let elementwise_src: &'static str = include_str!("shaders/elementwise.metal");
