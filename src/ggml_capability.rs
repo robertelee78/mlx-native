@@ -304,6 +304,9 @@ pub enum GgmlKernelRoute {
     FusedGateUpSilu,
     ExpertMv,
     ExpertMvNr2,
+    /// Q4-GEMMA-DECODE E1 expert-grouped matvec (leader pairs), bitwise
+    /// equal per pair to `ExpertMv`.
+    ExpertMvGrouped,
     ExpertMmSimdgroup,
     ExpertMmDeviceSelected,
     ExpertPooledMmSimdgroup,
@@ -1103,7 +1106,19 @@ fn fused_gate_up(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability 
     )
 }
 
-fn expert_mv_route(request: &GgmlCapabilityRequest) -> GgmlKernelRoute {
+fn expert_mv_route(request: &GgmlCapabilityRequest, shape: GgmlExpertShape) -> GgmlKernelRoute {
+    if plan_expert_grouped_mv(
+        request.ggml_type,
+        shape.n_tokens,
+        shape.top_k,
+        shape.n,
+        shape.k,
+        &request.routing,
+    )
+    .is_some()
+    {
+        return GgmlKernelRoute::ExpertMvGrouped;
+    }
     if (request.ggml_type == GgmlType::Q6_K && request.routing.expert_q6k_mv_nr2)
         || (request.ggml_type == GgmlType::Q8_0 && request.routing.expert_q8_0_mv_nr2)
     {
@@ -1178,6 +1193,65 @@ pub(crate) fn plan_expert_auto_route(
     } else {
         ExpertAutoPlan::Mv
     }
+}
+
+/// Q4-GEMMA-DECODE E1 frozen per-shape geometry table: rows per SIMD group
+/// of the expert-grouped `mv_id` kernel for an admitted `(type, N, K)`.
+///
+/// Q4_K gate_up uses R0 = 2 (kernels exist for R0 in {1, 2, 4}); Q5_0 and
+/// Q8_0 down keep the stock 4 rows per SIMD group. Shapes outside the table
+/// keep the stock route. Benches override R0 through
+/// `quantized_matmul_id_ggml_mv_grouped_with_geometry`.
+pub const fn expert_grouped_mv_rows_per_simdgroup(
+    ggml_type: GgmlType,
+    n: u32,
+    k: u32,
+) -> Option<u32> {
+    match (ggml_type, n, k) {
+        (GgmlType::Q4_K, 1408, 2816) => Some(2),
+        (GgmlType::Q5_0 | GgmlType::Q8_0, 2816, 704) => Some(4),
+        _ => None,
+    }
+}
+
+/// Widths the expert-grouped `mv_id` route admits: up to 16 tokens at
+/// top-8 (gate_up) and up to 128 pairs at top-1 (down).
+pub const fn expert_grouped_mv_width_admitted(n_tokens: u32, top_k: u32) -> bool {
+    match top_k {
+        8 => n_tokens >= 1 && n_tokens <= 16,
+        1 => n_tokens >= 1 && n_tokens <= 128,
+        _ => false,
+    }
+}
+
+/// Rows per SIMD group of the expert-grouped `mv_id` route when `routing`
+/// selects it for this matvec, else `None` (the stock route).
+///
+/// The per-type field must be set, `dense_decode_mv_ext` must be off, Q8_0
+/// additionally requires `expert_q8_0_mv_nr2 = false` (its reference is the
+/// plain `kernel_mul_mv_id_q8_0_f32`), and the width and shape must be in the
+/// frozen tables.
+pub(crate) fn plan_expert_grouped_mv(
+    ggml_type: GgmlType,
+    n_tokens: u32,
+    top_k: u32,
+    n: u32,
+    k: u32,
+    routing: &GgmlRoutingPolicy,
+) -> Option<u32> {
+    if routing.dense_decode_mv_ext {
+        return None;
+    }
+    let enabled = match ggml_type {
+        GgmlType::Q4_K => routing.expert_grouped_q4k,
+        GgmlType::Q5_0 => routing.expert_grouped_q5_0,
+        GgmlType::Q8_0 => routing.expert_grouped_q8_0 && !routing.expert_q8_0_mv_nr2,
+        _ => false,
+    };
+    if !enabled || !expert_grouped_mv_width_admitted(n_tokens, top_k) {
+        return None;
+    }
+    expert_grouped_mv_rows_per_simdgroup(ggml_type, n, k)
 }
 
 fn expert_mm_route(
@@ -1329,7 +1403,7 @@ fn expert(
     let specialized = request.workload == GgmlWorkloadClass::DecodeSingle;
     GgmlCapability::supported(
         request,
-        expert_mv_route(request),
+        expert_mv_route(request, shape),
         specialized,
         !specialized,
         false,
