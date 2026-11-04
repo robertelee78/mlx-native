@@ -85,11 +85,13 @@ fn pick_axis_cpu(sector: u32, mode: RopeMultiMode, s: [u32; 4]) -> u32 {
 
 /// CPU reference — returns full output vector of length `n_rows * head_dim`.
 ///
-/// Handles all three modes. For VISION (mode 24), `sect_dims = s0 + s1`
-/// (last two sections ignored), the theta exponent is the *per-section*
-/// `local_p` rather than the global `pair_idx`, and the denominator is
-/// `n_dims = head_dim/2` rather than `rope_dim`. Mirrors the reference
-/// CUDA kernel and the `indep_sects` branch of the reference CPU op.
+/// Pairs are `(x[p], x[p + rope_dim/2])` for `p < rope_dim/2`; dims
+/// `[rope_dim, head_dim)` are copied unchanged. Handles all three modes.
+/// For VISION (mode 24), `sect_dims = s0 + s1` (last two sections
+/// ignored), the theta exponent is the *per-section* `local_p` rather
+/// than the global `pair_idx`, and the denominator is `n_dims =
+/// head_dim/2` rather than `rope_dim`. Mirrors the reference CUDA kernel
+/// and the `indep_sects` branch of the reference CPU op.
 fn cpu_rope_multi(
     input: &[f32],
     positions: &[i32],
@@ -97,7 +99,6 @@ fn cpu_rope_multi(
 ) -> Vec<f32> {
     let n_rows = (p.seq_len * p.n_heads) as usize;
     let head_dim = p.head_dim as usize;
-    let half_dim = head_dim / 2;
     let rope_dim = p.rope_dim as usize;
     let half_rope = rope_dim / 2;
     let is_vision = matches!(p.mode, RopeMultiMode::Vision);
@@ -112,40 +113,35 @@ fn cpu_rope_multi(
         let base = row * head_dim;
         let seq_idx = (row as u32) / p.n_heads;
 
-        for pair in 0..half_dim {
-            if (pair as usize) < half_rope {
-                let sector = (pair as u32) % sect_dims;
-                let axis = pick_axis_cpu(sector, p.mode, p.sections);
-                let pos = positions[(axis * p.seq_len + seq_idx) as usize];
+        // Dims [rope_dim, head_dim) stay as copied from `input`.
+        for pair in 0..half_rope {
+            let sector = (pair as u32) % sect_dims;
+            let axis = pick_axis_cpu(sector, p.mode, p.sections);
+            let pos = positions[(axis * p.seq_len + seq_idx) as usize];
 
-                let (theta_p, denom) = if is_vision {
-                    // Per-section local index; denom = n_dims = half_rope
-                    // (since for vision rope_dim == head_dim, half_rope ==
-                    // head_dim / 2 == n_dims).
-                    let local_p = if sector < p.sections[0] {
-                        sector
-                    } else {
-                        sector - p.sections[0]
-                    };
-                    (local_p, half_rope as u32)
+            let (theta_p, denom) = if is_vision {
+                // Per-section local index; denom = n_dims = half_rope
+                // (since for vision rope_dim == head_dim, half_rope ==
+                // head_dim / 2 == n_dims).
+                let local_p = if sector < p.sections[0] {
+                    sector
                 } else {
-                    (pair as u32, p.rope_dim)
+                    sector - p.sections[0]
                 };
-
-                let dim_ratio = 2.0 * (theta_p as f32) / (denom as f32);
-                let freq = 1.0 / (p.freq_base.powf(dim_ratio));
-                let theta = (pos as f32) * freq;
-                let (cos_a, sin_a) = (theta.cos(), theta.sin());
-
-                let x0 = input[base + pair];
-                let x1 = input[base + pair + half_dim];
-                out[base + pair] = x0 * cos_a - x1 * sin_a;
-                out[base + pair + half_dim] = x0 * sin_a + x1 * cos_a;
+                (local_p, half_rope as u32)
             } else {
-                // pass through (partial rotary tail)
-                out[base + pair] = input[base + pair];
-                out[base + pair + half_dim] = input[base + pair + half_dim];
-            }
+                (pair as u32, p.rope_dim)
+            };
+
+            let dim_ratio = 2.0 * (theta_p as f32) / (denom as f32);
+            let freq = 1.0 / (p.freq_base.powf(dim_ratio));
+            let theta = (pos as f32) * freq;
+            let (cos_a, sin_a) = (theta.cos(), theta.sin());
+
+            let x0 = input[base + pair];
+            let x1 = input[base + pair + half_rope];
+            out[base + pair] = x0 * cos_a - x1 * sin_a;
+            out[base + pair + half_rope] = x0 * sin_a + x1 * cos_a;
         }
     }
     out
@@ -237,18 +233,19 @@ fn test_rope_multi_imrope_spec_driven_n8_sections_2_2_1_0() {
 
     // Independently verify pair 0 manually to pin down the spec.
     // pair 0 uses axis t (pos=5), freq=1, theta=5. cos(5) ≈ 0.28366; sin(5) ≈ -0.95892.
-    // x0 = 0.1, x1 = x[0 + half_dim=8] = 0.9.
-    let pair0 = (got[0], got[8]);
+    // x0 = 0.1, x1 = x[0 + rope_dim/2 = 4] = 0.5.
+    let pair0 = (got[0], got[4]);
     let expected0 = (
-        0.1 * 5.0_f32.cos() - 0.9 * 5.0_f32.sin(),
-        0.1 * 5.0_f32.sin() + 0.9 * 5.0_f32.cos(),
+        0.1 * 5.0_f32.cos() - 0.5 * 5.0_f32.sin(),
+        0.1 * 5.0_f32.sin() + 0.5 * 5.0_f32.cos(),
     );
     assert!((pair0.0 - expected0.0).abs() < 1e-5, "pair0.x mismatch");
     assert!((pair0.1 - expected0.1).abs() < 1e-5, "pair0.y mismatch");
 
-    // Pair 4 (beyond half_rope=4): pass-through.
-    assert!((got[4] - input[4]).abs() < 1e-7, "pass-through x0 broken");
-    assert!((got[12] - input[12]).abs() < 1e-7, "pass-through x1 broken");
+    // Dims [rope_dim=8, head_dim=16): pass-through, bit-exact.
+    for d in 8..16 {
+        assert_eq!(got[d].to_bits(), input[d].to_bits(), "pass-through dim {d} broken");
+    }
 }
 
 // =================================================================
@@ -280,9 +277,9 @@ fn test_rope_multi_mrope_vs_imrope_differ_for_distinct_positions() {
     // Pair 1 picks a different axis between modes:
     //   IMROPE pair 1 sector=1 -> axis h (pos 7)
     //   MROPE  pair 1 sector=1 -> axis t (sections[0]=2 so sector<2 is axis 0 = t)
-    // So outputs should differ at indices 1 and 9.
+    // So outputs should differ at indices 1 and 5 (= 1 + rope_dim/2).
     let d1 = (got_imrope[1] - got_mrope[1]).abs();
-    let d9 = (got_imrope[9] - got_mrope[9]).abs();
+    let d9 = (got_imrope[5] - got_mrope[5]).abs();
     assert!(
         d1 > 1e-3 || d9 > 1e-3,
         "MROPE and IMROPE produced identical pair 1 — axis-mapping may be wrong"
@@ -398,21 +395,15 @@ fn test_rope_multi_qwen35_shape_determinism() {
         );
     }
 
-    // Partial-rotary tail (pairs 32..127): must pass through unchanged.
+    // Partial-rotary tail (dims 64..256): must pass through bit-exact.
     for row in 0..n_rows {
         let base = row * (p.head_dim as usize);
-        for pair in 32..128 {
-            let ix0 = base + pair;
-            let ix1 = base + pair + (p.head_dim as usize / 2);
-            assert!(
-                (got1[ix0] - input[ix0]).abs() < 1e-7,
-                "partial-rotary tail modified at row={}, pair={}",
-                row, pair
-            );
-            assert!(
-                (got1[ix1] - input[ix1]).abs() < 1e-7,
-                "partial-rotary tail modified at row={}, pair+half",
-                row
+        for d in (p.rope_dim as usize)..(p.head_dim as usize) {
+            assert_eq!(
+                got1[base + d].to_bits(),
+                input[base + d].to_bits(),
+                "partial-rotary tail modified at row={}, dim={}",
+                row, d
             );
         }
     }
@@ -453,7 +444,6 @@ fn test_rope_multi_imrope_text_equals_neox_rope() {
 
     // Reference: plain NeoX RoPE with the same per-pair frequency.
     let mut want = input.clone();
-    let half_dim = (p.head_dim / 2) as usize;
     let half_rope = (p.rope_dim / 2) as usize;
     for row in 0..n_rows {
         let base = row * p.head_dim as usize;
@@ -465,9 +455,9 @@ fn test_rope_multi_imrope_text_equals_neox_rope() {
             let theta = pos * freq;
             let (ca, sa) = (theta.cos(), theta.sin());
             let x0 = input[base + pair];
-            let x1 = input[base + pair + half_dim];
+            let x1 = input[base + pair + half_rope];
             want[base + pair] = x0 * ca - x1 * sa;
-            want[base + pair + half_dim] = x0 * sa + x1 * ca;
+            want[base + pair + half_rope] = x0 * sa + x1 * ca;
         }
     }
 

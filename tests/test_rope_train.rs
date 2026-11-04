@@ -144,7 +144,6 @@ pub fn rope_reference_f32(input: &[f32], positions: &[i32], p: &RopeTrainParams)
     let n_heads = p.n_heads as usize;
     let seq = p.seq_len as usize;
     let hd = p.head_dim as usize;
-    let half_dim = hd / 2;
     let rope_dim = p.rope_dim as usize;
     let half_rope = rope_dim / 2;
     let sections = p.sections;
@@ -168,27 +167,23 @@ pub fn rope_reference_f32(input: &[f32], positions: &[i32], p: &RopeTrainParams)
         // flat token index in [0, batch * seq_len)
         let flat_tok = b * seq + tok_in_batch;
 
-        for pair in 0..half_dim {
-            if pair < half_rope {
-                let sector = (pair % sect_dims) as u32;
-                let axis = pick_axis_imrope(sector, sections);
-                // positions[axis * batch * seq + flat_tok]
-                let pos = positions[axis * batch * seq + flat_tok] as f32;
+        // Pairs (p, p + rope_dim/2) for p < rope_dim/2; dims
+        // [rope_dim, head_dim) stay as copied from `input`.
+        for pair in 0..half_rope {
+            let sector = (pair % sect_dims) as u32;
+            let axis = pick_axis_imrope(sector, sections);
+            // positions[axis * batch * seq + flat_tok]
+            let pos = positions[axis * batch * seq + flat_tok] as f32;
 
-                let dim_ratio = 2.0 * pair as f32 / rope_dim as f32;
-                let freq = 1.0 / theta_base.powf(dim_ratio);
-                let theta = pos * freq;
-                let (cos_a, sin_a) = (theta.cos(), theta.sin());
+            let dim_ratio = 2.0 * pair as f32 / rope_dim as f32;
+            let freq = 1.0 / theta_base.powf(dim_ratio);
+            let theta = pos * freq;
+            let (cos_a, sin_a) = (theta.cos(), theta.sin());
 
-                let x0 = input[base + pair];
-                let x1 = input[base + pair + half_dim];
-                out[base + pair] = x0 * cos_a - x1 * sin_a;
-                out[base + pair + half_dim] = x0 * sin_a + x1 * cos_a;
-            } else {
-                // pass-through
-                out[base + pair] = input[base + pair];
-                out[base + pair + half_dim] = input[base + pair + half_dim];
-            }
+            let x0 = input[base + pair];
+            let x1 = input[base + pair + half_rope];
+            out[base + pair] = x0 * cos_a - x1 * sin_a;
+            out[base + pair + half_rope] = x0 * sin_a + x1 * cos_a;
         }
     }
     out
@@ -384,35 +379,29 @@ fn test_forward_parity_b2_h2_s128_d128() {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
         (seed as i32 as f32) / (i32::MAX as f32)
     };
-    let input: Vec<f32> = (0..n).map(|_| rand_f32()).collect();
+    // Round the input to bf16 first so the oracle sees the kernel's exact
+    // input; the tolerance then bounds the kernel's output rounding only.
+    let input: Vec<f32> = (0..n).map(|_| bf16::from_f32(rand_f32()).to_f32()).collect();
     let positions = text_positions(p.batch, p.seq_len);
 
     let got = run_forward_bf16(&device, &mut registry, &input, &positions, &p);
     let want = rope_reference_f32(&input, &positions, &p);
 
-    // bf16 atol=6e-3 (within 1 ULP for values up to magnitude ~1.3).
+    // bf16 atol=6e-3 (> half a ULP, 3.9e-3, for outputs below 2.0).
     assert_close_atol("fwd B2 H2 S128 D128 partial", &got, &want, 6e-3);
 
-    // Verify partial-rotary tail passes through unchanged within bf16 round-trip error.
+    // Verify the partial-rotary tail [rope_dim, head_dim) passes through
+    // unchanged within bf16 round-trip error.
     let hd = p.head_dim as usize;
-    let half_dim = hd / 2;
-    let half_rope = p.rope_dim as usize / 2;
     let n_rows = (p.batch * p.n_heads * p.seq_len) as usize;
     for row in 0..n_rows {
         let base = row * hd;
-        for pair in half_rope..half_dim {
-            // These indices should be pass-through, so got ≈ input (roundtripped through bf16).
-            let d0 = (got[base + pair] - input[base + pair]).abs();
-            let d1 = (got[base + pair + half_dim] - input[base + pair + half_dim]).abs();
+        for d in p.rope_dim as usize..hd {
+            let diff = (got[base + d] - input[base + d]).abs();
             assert!(
-                d0 < 5e-3,
-                "partial-rotary tail[pair={pair}] x0 modified: got={}, input={}",
-                got[base + pair], input[base + pair]
-            );
-            assert!(
-                d1 < 5e-3,
-                "partial-rotary tail[pair={pair}] x1 modified: got={}, input={}",
-                got[base + pair + half_dim], input[base + pair + half_dim]
+                diff < 5e-3,
+                "partial-rotary tail[dim={d}] modified: got={}, input={}",
+                got[base + d], input[base + d]
             );
         }
     }
@@ -739,28 +728,19 @@ fn test_qwen35_production_shape_forward_parity() {
     // bf16 atol=6e-3 (within 1 ULP for values up to magnitude ~1.3).
     assert_close_atol("qwen35 production shape", &got, &want, 6e-3);
 
-    // Partial-rotary tail (pairs 32..127) must pass through unchanged.
+    // Partial-rotary tail (dims 64..256) must pass through unchanged.
     let hd = p.head_dim as usize;
-    let half_dim = hd / 2;
-    let half_rope = p.rope_dim as usize / 2; // 32
     let n_rows = (p.batch * p.n_heads * p.seq_len) as usize;
     for row in 0..n_rows {
         let base = row * hd;
-        for pair in half_rope..half_dim {
-            let d0 = (got[base + pair] - input[base + pair]).abs();
-            let d1 = (got[base + pair + half_dim] - input[base + pair + half_dim]).abs();
+        for d in p.rope_dim as usize..hd {
+            let diff = (got[base + d] - input[base + d]).abs();
             // bf16 round-trip tolerance
             assert!(
-                d0 < 5e-3,
-                "qwen35 partial-rotary tail pair={pair} x0: got={}, input={}",
-                got[base + pair],
-                input[base + pair]
-            );
-            assert!(
-                d1 < 5e-3,
-                "qwen35 partial-rotary tail pair={pair} x1: got={}, input={}",
-                got[base + pair + half_dim],
-                input[base + pair + half_dim]
+                diff < 5e-3,
+                "qwen35 partial-rotary tail dim={d}: got={}, input={}",
+                got[base + d],
+                input[base + d]
             );
         }
     }
