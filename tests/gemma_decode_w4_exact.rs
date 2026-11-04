@@ -26,7 +26,8 @@ use std::io::Write;
 
 use mlx_native::{
     ggml_capability, ggml_routing_policy_from_environment,
-    quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_row_tiled_with_geometry,
+    quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_dual_gate_up_q4k,
+    quantized_matmul_ggml_row_tiled_with_geometry,
     quantized_matmul_ggml_with_policy, row_tiled_geometry, DType, GgmlCapabilityRequest,
     GgmlInvocation, GgmlKernelRoute, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
     GgmlWorkloadClass, KernelRegistry, MlxBuffer, MlxDevice, RowTiledGeometry,
@@ -388,6 +389,69 @@ fn gemma_dense_row_tiled_lm_head_bitwise() {
         &[row_tiled_geometry(GgmlType::Q6_K, 262_144, 2816).expect("lm head in table")],
         &WIDTHS,
     );
+}
+
+/// F1: dual-weight gate+up. Each output equals the reference on its own
+/// weight, at every NSG and width, including a row tail.
+#[test]
+fn gemma_dense_dual_gate_up_q4k_bitwise() {
+    for (n, k) in [(2112, 2816), (1027, 2816)] {
+        let mut fx = Fixture::new(GgmlType::Q4_K, n, k, 0xf1);
+        let mut rng = Rng(0xf1f1 ^ n as u64);
+        let up = upload_bytes(&fx.device, &weight_bytes(GgmlType::Q4_K, n, k, &mut rng));
+        let x = fx.input.as_slice::<f32>().expect("input").to_vec();
+        let up_reference: Vec<Vec<u32>> = (0..MAX_M)
+            .map(|c| {
+                stock_single_column(
+                    &fx.device,
+                    &mut fx.registry,
+                    &up,
+                    &x[c * k..(c + 1) * k],
+                    GgmlType::Q4_K,
+                    n,
+                    k,
+                )
+            })
+            .collect();
+        for nsg in RowTiledGeometry::NSG_CELLS {
+            for m in 1..=MAX_M {
+                let (gate_buf, gate_view) = sentinel_output(&fx.device, m, n, 11);
+                let (up_buf, up_view) = sentinel_output(&fx.device, m, n, 11);
+                let input = fx.input.slice_view(0, m * k);
+                let params = fx.params(m);
+                let mut encoder = fx.device.command_encoder().expect("encoder");
+                quantized_matmul_ggml_dual_gate_up_q4k(
+                    &mut encoder,
+                    &mut fx.registry,
+                    &fx.device,
+                    &input,
+                    &fx.weight,
+                    &up,
+                    &gate_view,
+                    &up_view,
+                    &params,
+                    nsg,
+                )
+                .expect("dual dispatch");
+                encoder.commit_and_wait().expect("dual GPU");
+                for (buf, reference, name) in [
+                    (&gate_buf, &fx.reference, "gate"),
+                    (&up_buf, &up_reference, "up"),
+                ] {
+                    let got = buf.as_slice::<u32>().expect("read");
+                    assert!(got[..11].iter().chain(&got[11 + m * n..]).all(|&v| v == SENTINEL));
+                    for c in 0..m {
+                        assert_eq!(
+                            &got[11 + c * n..11 + (c + 1) * n],
+                            reference[c].as_slice(),
+                            "F1 {name} n={n} nsg={nsg} m={m} column {c}"
+                        );
+                    }
+                    record(&format!("F1 {name} nsg={nsg}"), GgmlType::Q4_K, n, k, m, &got[11..11 + m * n]);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

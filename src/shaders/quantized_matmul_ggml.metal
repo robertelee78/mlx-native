@@ -1963,7 +1963,8 @@ kernel void hf2q_mul_mv_q4_K_f32_rt_impl(
     }
 
     for (int i = ix; i < nb; i += 4) {
-        // (per-row scale decode moved into the row loop; see below)
+        // Each row's scale decode stays inside the row loop in the reference
+        // statement order: hoisting it into per-row arrays drifted 1 ULP (S0).
 
         for (short c = 0; c < R1; ++c) {
             device const float * y1 = y1_c[c];
@@ -2023,6 +2024,137 @@ kernel void hf2q_mul_mv_q4_K_f32_rt_impl(
         }
     }
 }
+
+// F1 (optional lever): dual-weight dense gate+up. One SIMD group owns gate
+// row r (`src0`, written to `dst`) and up row r (`src0_up`, written to
+// `dst_up`) as its two rows; the body is a literal clone of the R0 = 2
+// row-tiled kernel above, so each output equals the reference
+// `kernel_mul_mv_q4_K_f32` on its own tensor and column.
+//
+// Dispatch: threadgroups=(ceil(N/NSG), ceil(M/R1), 1), threads=(32, NSG, 1).
+template <short R1, short NSG>
+kernel void hf2q_mul_mv_q4_K_f32_rt_dual_impl(
+    device const  void  * src0    [[buffer(0)]],
+    device const float  * src1    [[buffer(1)]],
+    device       float  * dst     [[buffer(2)]],
+    constant GgmlMatvecParams & p [[buffer(3)]],
+    device const  void  * src0_up [[buffer(4)]],
+    device       float  * dst_up  [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short R0 = 2;
+    const int nb = p.ne00 / QK_K;
+
+    const int64_t r1_base = (int64_t)R1 * tgpig.y;
+    const int row = (int)tgpig.x * NSG + (int)sgitg;
+
+    if (row >= (int)p.ne01) {
+        return;
+    }
+
+    device const block_q4_K * xr[R0];
+    xr[0] = (device const block_q4_K *)src0 + row * nb;
+    xr[1] = (device const block_q4_K *)src0_up + row * nb;
+
+    float sumf[R0][R1];
+    for (short j = 0; j < R0; ++j) {
+        for (short c = 0; c < R1; ++c) {
+            sumf[j][c] = 0.f;
+        }
+    }
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
+
+    const short l0       = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
+
+    device const float * y1_c[R1];
+    for (short c = 0; c < R1; ++c) {
+        y1_c[c] = src1 + (r1_base + c)*p.ne10 + ix * QK_K + y_offset;
+    }
+
+    for (int i = ix; i < nb; i += 4) {
+        for (short c = 0; c < R1; ++c) {
+            device const float * y1 = y1_c[c];
+            device const float * y2 = y1 + 128;
+            float yl[16], yh[16];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < 8; ++l) {
+                yl[l+0] = y1[l +  0]; sumy[0] += yl[l+0];
+                yl[l+8] = y1[l + 32]; sumy[1] += yl[l+8];
+                yh[l+0] = y2[l +  0]; sumy[2] += yh[l+0];
+                yh[l+8] = y2[l + 32]; sumy[3] += yh[l+8];
+            }
+
+            for (short j = 0; j < R0; ++j) {
+                device const uint8_t  * q1 = xr[j][i].qs + q_offset;
+                device const uint8_t  * q2 = q1 + 64;
+                device const half     * dh = &xr[j][i].d;
+                device const uint16_t * a  = (device const uint16_t *)xr[j][i].scales + iq;
+
+                uint16_t sc16[4];
+                thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+                sc16[0] = a[0] & kmask1;
+                sc16[1] = a[2] & kmask1;
+                sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+                sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+                const float dall = (float)dh[0];
+                const float dmin = (float)dh[1];
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                for (int l = 0; l < 8; ++l) {
+                    acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
+                    acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
+                    acc1[2] += yh[l+0] * (float)(q2[l] & 0x0F);
+                    acc1[3] += yh[l+8] * (float)(q2[l] & 0xF0);
+                }
+
+                sumf[j][c] += dall * ((float)sc8[0] * (acc1[0]        ) +
+                                         (float)sc8[1] * (acc1[1] / 16.f ) +
+                                         (float)sc8[4] * (acc1[2]        ) +
+                                         (float)sc8[5] * (acc1[3] / 16.f )) -
+                              dmin * (sumy[0] * (float)sc8[2] + sumy[1] * (float)sc8[3] +
+                                         sumy[2] * (float)sc8[6] + sumy[3] * (float)sc8[7]);
+            }
+
+            y1_c[c] += 4 * QK_K;
+        }
+    }
+
+    for (short c = 0; c < R1; ++c) {
+        const float tot_gate = simd_sum(sumf[0][c]);
+        const float tot_up   = simd_sum(sumf[1][c]);
+        if (tiisg == 0 && (r1_base + c) < p.ne1) {
+            dst[(r1_base + c)*p.ne0 + row] = tot_gate;
+            dst_up[(r1_base + c)*p.ne0 + row] = tot_up;
+        }
+    }
+}
+
+#define HF2Q_RT_DUAL_INSTANTIATE(R1, NSG)                                                  \
+    template [[host_name("kernel_mul_mv_q4_K_f32_rt_dual_r1_" #R1 "_nsg" #NSG)]]          \
+    kernel void hf2q_mul_mv_q4_K_f32_rt_dual_impl<R1, NSG>(                               \
+        device const void *, device const float *, device float *,                        \
+        constant GgmlMatvecParams &, device const void *, device float *, uint3, uint, uint);
+#define HF2Q_RT_DUAL_INSTANTIATE_R1(NSG) \
+    HF2Q_RT_DUAL_INSTANTIATE(1, NSG)     \
+    HF2Q_RT_DUAL_INSTANTIATE(2, NSG)     \
+    HF2Q_RT_DUAL_INSTANTIATE(3, NSG)     \
+    HF2Q_RT_DUAL_INSTANTIATE(4, NSG)
+HF2Q_RT_DUAL_INSTANTIATE_R1(2)
+HF2Q_RT_DUAL_INSTANTIATE_R1(4)
+HF2Q_RT_DUAL_INSTANTIATE_R1(8)
 
 // Q6_K: each SIMD group owns R0 rows (the reference `nr2` owns 2). Each
 // column's `yl[16]` is loaded once per block in the reference operand form

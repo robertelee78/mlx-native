@@ -802,6 +802,37 @@ pub fn quantized_matmul_ggml_dense_mn_explicit(
     )
 }
 
+/// Q4-GEMMA-DECODE F1 (optional lever): dense gate and up projections of the
+/// same Q4_K shape in one launch per column tile, `nsg ∈ {2, 4, 8}` SIMD
+/// groups per threadgroup. `gate_out` and `up_out` each equal the reference
+/// `kernel_mul_mv_q4_K_f32` run per column on its own weight (bitwise), at
+/// `m ∈ 1..=8`. Both weights share `params` (n, k); outputs must not alias.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_dual_gate_up_q4k(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gate: &MlxBuffer,
+    up: &MlxBuffer,
+    gate_out: &MlxBuffer,
+    up_out: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    nsg: u32,
+) -> Result<()> {
+    validate_dense_matmul(input, gate, gate_out, params)?;
+    validate_dense_matmul(input, up, up_out, params)?;
+    if params.ggml_type != GgmlType::Q4_K || params.m > MM_ROUTING_THRESHOLD {
+        return Err(MlxError::InvalidArgument(format!(
+            "dual gate+up requires Q4_K at m <= {MM_ROUTING_THRESHOLD}, got {:?} m={}",
+            params.ggml_type, params.m
+        )));
+    }
+    crate::ops::gemma_decode_dense::dispatch_dual_gate_up(
+        encoder, registry, device, input, gate, up, gate_out, up_out, params, nsg,
+    )
+}
+
 /// Execute the canonical dense GGUF operation under an explicit routing
 /// policy. This is the receipt-bindable entry point used by allocators and
 /// benchmark harnesses; unlike [`quantized_matmul_ggml`], it does not consult

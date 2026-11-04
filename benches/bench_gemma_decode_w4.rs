@@ -12,7 +12,7 @@
 //! - `GEMMA_DECODE_BENCH_OUT` — receipt directory (default
 //!   `target/gemma_decode_w4`); `cells.jsonl` and `identity.json` go there.
 //! - `GEMMA_DECODE_BENCH_FAMILIES` — comma list of `roofline`, `d1`,
-//!   `lmhead`, `d2`, `e1` (default: all).
+//!   `lmhead`, `d2`, `e1`, `f1` (default: all).
 //! - `GEMMA_DECODE_BENCH_V2_OVERLAP` — file with the hf2q `[ROUTING_OVERLAP]`
 //!   line from the V2 run; adds the empirical E1 patterns (`v2_u*`).
 //! - `GEMMA_DECODE_BENCH_ITERS` (default 50, minimum 50) and
@@ -28,7 +28,8 @@ use std::io::Write;
 use std::process::Command;
 
 use mlx_native::{
-    quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_row_tiled_with_geometry,
+    quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_dual_gate_up_q4k,
+    quantized_matmul_ggml_row_tiled_with_geometry,
     quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml_mv_grouped_with_geometry,
     quantized_matmul_id_ggml_mv_with_policy, row_tiled_geometry, DType,
     GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
@@ -50,7 +51,7 @@ impl Config {
             .map(Into::into)
             .unwrap_or_else(|| "target/gemma_decode_w4".into());
         let families = std::env::var("GEMMA_DECODE_BENCH_FAMILIES")
-            .unwrap_or_else(|_| "roofline,d1,lmhead,d2,e1".into())
+            .unwrap_or_else(|_| "roofline,d1,lmhead,d2,e1,f1".into())
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
@@ -379,6 +380,93 @@ fn row_tiled_arms(ty: GgmlType, n: usize, k: usize) -> Vec<Arm> {
     arms
 }
 
+#[derive(Clone, Copy)]
+enum PairArm {
+    /// Two stock launches (gate, up).
+    Stock,
+    /// Two D1 launches at the table geometry.
+    RowTiled,
+    /// One F1 launch.
+    Dual(u32),
+}
+
+impl Bench {
+    /// F1: dense gate+up (Q4_K 2816→2112) as one launch against the two
+    /// launches it would replace.
+    fn dual_gate_up_family(&mut self, widths: &[usize]) {
+        let (n, k, ty) = (2112usize, 2816usize, GgmlType::Q4_K);
+        let mut rng = Rng(0xf1);
+        let gates: Vec<MlxBuffer> = (0..LAYERS).map(|_| weight_buffer(&self.device, ty, n, k, &mut rng)).collect();
+        let ups: Vec<MlxBuffer> = (0..LAYERS).map(|_| weight_buffer(&self.device, ty, n, k, &mut rng)).collect();
+        let inputs = [f32_buffer(&self.device, 8 * k, &mut rng), f32_buffer(&self.device, 8 * k, &mut rng)];
+        let gate_out = f32_buffer(&self.device, 8 * n, &mut rng);
+        let up_out = f32_buffer(&self.device, 8 * n, &mut rng);
+        let geometry = row_tiled_geometry(ty, n as u32, k as u32).expect("gate/up in table");
+        let stock = GgmlRoutingPolicy::default();
+        for &m in widths {
+            let params = GgmlQuantizedMatmulParams { m: m as u32, n: n as u32, k: k as u32, ggml_type: ty };
+            let arms = [PairArm::Stock, PairArm::RowTiled, PairArm::Dual(2), PairArm::Dual(4), PairArm::Dual(8)];
+            for arm in arms {
+                let mut samples = Vec::with_capacity(self.cfg.iters);
+                for iter in 0..self.cfg.warmup + self.cfg.iters {
+                    let input = &inputs[iter % 2];
+                    let mut encoder = self.device.command_encoder().expect("encoder");
+                    for layer in 0..LAYERS {
+                        let (g, u) = (&gates[layer], &ups[layer]);
+                        match arm {
+                            PairArm::Stock => {
+                                for (w, o) in [(g, &gate_out), (u, &up_out)] {
+                                    quantized_matmul_ggml_with_policy(
+                                        &mut encoder, &mut self.registry, &self.device, input, w, o, &params, &stock,
+                                    )
+                                    .expect("stock");
+                                }
+                            }
+                            PairArm::RowTiled => {
+                                for (w, o) in [(g, &gate_out), (u, &up_out)] {
+                                    quantized_matmul_ggml_row_tiled_with_geometry(
+                                        &mut encoder, &mut self.registry, &self.device, input, w, o, &params, geometry,
+                                    )
+                                    .expect("d1");
+                                }
+                            }
+                            PairArm::Dual(nsg) => quantized_matmul_ggml_dual_gate_up_q4k(
+                                &mut encoder, &mut self.registry, &self.device, input, g, u, &gate_out, &up_out,
+                                &params, nsg,
+                            )
+                            .expect("f1"),
+                        }
+                    }
+                    let (start, end) = encoder.commit_wait_with_gpu_time().expect("GPU");
+                    if iter >= self.cfg.warmup {
+                        samples.push((end - start) * 1e9 / LAYERS as f64);
+                    }
+                }
+                let s = stats(samples);
+                let label = match arm {
+                    PairArm::Stock => "stock_pair".to_string(),
+                    PairArm::RowTiled => format!("d1_pair_rt{}_nsg{}", geometry.r0, geometry.nsg),
+                    PairArm::Dual(nsg) => format!("f1_dual_nsg{nsg}"),
+                };
+                let unique = 2.0 * gates[0].byte_len() as f64;
+                let line = serde_json::json!({
+                    "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
+                    "family": "f1", "shape": "gate_up_pair", "type": "Q4_K",
+                    "n": n, "k": k, "m": m, "arm": label,
+                    "weight_buffers_cycled": LAYERS, "dispatches_per_command_buffer": LAYERS,
+                    "iters": self.cfg.iters, "warmup": self.cfg.warmup,
+                    "median_ns": s.median_ns, "p10_ns": s.p10_ns, "p90_ns": s.p90_ns,
+                    "unique_weight_bytes": unique,
+                    "weight_gb_per_s_unique": unique / s.median_ns,
+                    "element_columns_per_s": (2 * n * k * m) as f64 / (s.median_ns * 1e-9),
+                });
+                writeln!(self.receipts, "{line}").expect("receipt");
+                println!("f1      gate_up_pair m={m} {label:18} median {:9.1} µs", s.median_ns / 1e3);
+            }
+        }
+    }
+}
+
 /// One routing pattern: `[n_tokens][8]` expert ids, distinct within a token.
 struct Pattern {
     name: String,
@@ -696,6 +784,9 @@ fn main() {
     }
     if bench.cfg.wants("e1") {
         bench.expert_family();
+    }
+    if bench.cfg.wants("f1") {
+        bench.dual_gate_up_family(&widths);
     }
 
     let identity = serde_json::json!({
