@@ -47,6 +47,7 @@ pub mod flash_attn_prefill;
 pub mod flash_attn_prefill_blk;
 pub mod flash_attn_prefill_d512;
 pub mod flash_attn_prefill_mask;
+pub mod flash_attn_prefill_precise;
 pub mod flash_attn_train;
 pub mod flash_attn_vec;
 pub mod flash_attn_vec_tq;

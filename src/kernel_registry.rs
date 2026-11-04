@@ -829,6 +829,16 @@ impl KernelRegistry {
             "steel_attention_float16_bq8_bk8_bd512_wm1_wn1_maskbool_".into(),
             flash_attn_prefill_src,
         );
+        // Precise tiled warm attention (hf2q ADR-063 Q4-GEMMA-KERNEL): the
+        // F32-V / F32-O entry points, under the shader file defining them.
+        for &name in crate::ops::flash_attn_prefill_precise::PRECISE_D256_KERNEL_NAMES {
+            sources.insert(name.into(), flash_attn_prefill_src);
+        }
+        let flash_attn_prefill_d512_src: &'static str =
+            include_str!("shaders/flash_attn_prefill_d512.metal");
+        for &name in crate::ops::flash_attn_prefill_precise::PRECISE_D512_KERNEL_NAMES {
+            sources.insert(name.into(), flash_attn_prefill_d512_src);
+        }
 
         // Flash attention vector kernels — SIMD-vectorized decode-path SDPA
         // (peer port of flash_attn_ext_vec)

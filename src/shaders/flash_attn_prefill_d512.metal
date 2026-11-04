@@ -202,6 +202,17 @@ struct AttnMaskParams {
   int64_t M_strides[3];
 };
 
+// Extra ABI of the precise (F32 V / F32 O) entry points, bound at buffer(9).
+// Byte-identical to `AttnPreciseParams` in flash_attn_prefill.metal; Rust
+// mirror `AttnPreciseParamsGpu` (src/ops/flash_attn_prefill_precise.rs).
+struct AttnPreciseParams {
+  int window;
+  int codebook_bits;
+  float scale_factor_d512;
+  int norms_per_pos;
+  int64_t N_strides[3];
+};
+
 // ──────────────────────────────────────────────────────────────────────────
 // Function constants
 // ──────────────────────────────────────────────────────────────────────────
@@ -246,6 +257,152 @@ constant bool sinks_per_query_row_def =
 constant int  nsg_def      = is_function_constant_defined(fc_nsg)   ? fc_nsg   : 8;
 
 // ──────────────────────────────────────────────────────────────────────────
+// Precise entry points (ADR-063 Q4-GEMMA-KERNEL)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// V input forms (`VForm` template parameter of the impl):
+//   D512_V_LEGACY: V in T, multiplied as `simdgroup_matrix<T>` (every
+//                  pre-existing entry point).
+//   D512_V_F16:    F16 V widened exactly into an F32 operand (`_v16`).
+//   D512_V_F32:    dense F32 V (`_v32`, parity only).
+//   D512_V_CODES:  TQ-HB codes + per-block norms dequantized to F32 at
+//                  operand load (`_vcodes`).
+#define D512_V_LEGACY 0
+#define D512_V_F16 1
+#define D512_V_F32 2
+#define D512_V_CODES 3
+
+// Precise entry points: the blocked Q·K^T reduction over the head
+// dimension: fragments per block and blocks per super-block.
+#define D512_QK_BLOCK 4
+#define D512_QK_SUPER 4
+
+template <typename T, int VForm>
+struct D512VSource {
+  typedef T type;
+};
+template <typename T>
+struct D512VSource<T, D512_V_F32> {
+  typedef float type;
+};
+template <typename T>
+struct D512VSource<T, D512_V_CODES> {
+  typedef uchar type;
+};
+
+// Bytes the precise `_vcodes` entry point adds after the 28,672 B legacy
+// layout: the 256-entry centroid table and one chunk's C × 2 scale_norms.
+#define D512_PRECISE_CODES_EXTRA_BYTES (256 * 4 + 64 * 2 * 4)
+
+// TQ-HB V codebooks: verbatim copies of CODEBOOK_{5,6,8}BIT_DQ in
+// tq_dequantize_kv.metal (a unit test asserts the copies are identical).
+constant float D512_CODEBOOK_5BIT[32] = {
+    -3.2606790f, -2.6910589f, -2.3176743f, -2.0286608f,
+    -1.7871646f, -1.5761599f, -1.3862739f, -1.2117410f,
+    -1.0487242f, -0.8945114f, -0.7470884f, -0.6048936f,
+    -0.4666676f, -0.3313550f, -0.1980377f, -0.0658849f,
+     0.0658849f,  0.1980377f,  0.3313550f,  0.4666676f,
+     0.6048936f,  0.7470884f,  0.8945114f,  1.0487242f,
+     1.2117410f,  1.3862739f,  1.5761599f,  1.7871646f,
+     2.0286608f,  2.3176743f,  2.6910589f,  3.2606790f,
+};
+
+constant float D512_CODEBOOK_6BIT[64] = {
+    -3.6996161f, -3.1907215f, -2.8640626f, -2.6161277f,
+    -2.4129324f, -2.2388464f, -2.0853192f, -1.9471373f,
+    -1.8208742f, -1.7041502f, -1.5952401f, -1.4928497f,
+    -1.3959804f, -1.3038428f, -1.2157998f, -1.1313277f,
+    -1.0499889f, -0.9714118f, -0.8952766f, -0.8213046f,
+    -0.7492492f, -0.6788902f, -0.6100285f, -0.5424819f,
+    -0.4760822f, -0.4106724f, -0.3461048f, -0.2822386f,
+    -0.2189392f, -0.1560761f, -0.0935225f, -0.0311537f,
+     0.0311537f,  0.0935225f,  0.1560761f,  0.2189392f,
+     0.2822386f,  0.3461048f,  0.4106724f,  0.4760822f,
+     0.5424819f,  0.6100285f,  0.6788902f,  0.7492492f,
+     0.8213046f,  0.8952766f,  0.9714118f,  1.0499889f,
+     1.1313277f,  1.2157998f,  1.3038428f,  1.3959804f,
+     1.4928497f,  1.5952401f,  1.7041502f,  1.8208742f,
+     1.9471373f,  2.0853192f,  2.2388464f,  2.4129324f,
+     2.6161277f,  2.8640626f,  3.1907215f,  3.6996161f,
+};
+
+constant float D512_CODEBOOK_8BIT[256] = {
+    -5.0652659f, -4.6836997f, -4.4467193f, -4.2715508f,
+    -4.1311907f, -4.0132856f, -3.9111092f, -3.8205780f,
+    -3.7390194f, -3.6645851f, -3.5959415f, -3.5320936f,
+    -3.4722785f, -3.4158977f, -3.3624729f, -3.3116156f,
+    -3.2630056f, -3.2163758f, -3.1715011f, -3.1281899f,
+    -3.0862780f, -3.0456229f, -3.0061011f, -2.9676040f,
+    -2.9300362f, -2.8933131f, -2.8573596f, -2.8221086f,
+    -2.7874999f, -2.7534795f, -2.7199985f, -2.6870129f,
+    -2.6544825f, -2.6223710f, -2.5906452f, -2.5592748f,
+    -2.5282321f, -2.4974918f, -2.4670306f, -2.4368270f,
+    -2.4068614f, -2.3771157f, -2.3475732f, -2.3182184f,
+    -2.2890372f, -2.2600165f, -2.2311440f, -2.2024086f,
+    -2.1737998f, -2.1453081f, -2.1169245f, -2.0886408f,
+    -2.0604493f, -2.0323430f, -2.0043154f, -1.9763603f,
+    -1.9484722f, -1.9206458f, -1.8928763f, -1.8651592f,
+    -1.8374904f, -1.8098662f, -1.7822828f, -1.7547372f,
+    -1.7272261f, -1.6997469f, -1.6722970f, -1.6448739f,
+    -1.6174755f, -1.5900996f, -1.5627445f, -1.5354084f,
+    -1.5080897f, -1.4807869f, -1.4534986f, -1.4262237f,
+    -1.3989610f, -1.3717093f, -1.3444678f, -1.3172356f,
+    -1.2900118f, -1.2627956f, -1.2355865f, -1.2083838f,
+    -1.1811868f, -1.1539951f, -1.1268081f, -1.0996255f,
+    -1.0724469f, -1.0452718f, -1.0180999f, -0.9909310f,
+    -0.9637647f, -0.9366008f, -0.9094390f, -0.8822793f,
+    -0.8551212f, -0.8279648f, -0.8008098f, -0.7736561f,
+    -0.7465035f, -0.7193520f, -0.6922014f, -0.6650517f,
+    -0.6379027f, -0.6107544f, -0.5836067f, -0.5564596f,
+    -0.5293129f, -0.5021667f, -0.4750208f, -0.4478753f,
+    -0.4207301f, -0.3935852f, -0.3664405f, -0.3392960f,
+    -0.3121517f, -0.2850076f, -0.2578636f, -0.2307198f,
+    -0.2035761f, -0.1764324f, -0.1492888f, -0.1221453f,
+    -0.0950019f, -0.0678584f, -0.0407151f, -0.0135717f,
+     0.0135717f,  0.0407151f,  0.0678584f,  0.0950019f,
+     0.1221453f,  0.1492888f,  0.1764324f,  0.2035761f,
+     0.2307198f,  0.2578636f,  0.2850076f,  0.3121517f,
+     0.3392960f,  0.3664405f,  0.3935852f,  0.4207301f,
+     0.4478753f,  0.4750208f,  0.5021667f,  0.5293129f,
+     0.5564596f,  0.5836067f,  0.6107544f,  0.6379027f,
+     0.6650517f,  0.6922014f,  0.7193520f,  0.7465035f,
+     0.7736561f,  0.8008098f,  0.8279648f,  0.8551212f,
+     0.8822793f,  0.9094390f,  0.9366008f,  0.9637647f,
+     0.9909310f,  1.0180999f,  1.0452718f,  1.0724469f,
+     1.0996255f,  1.1268081f,  1.1539951f,  1.1811868f,
+     1.2083838f,  1.2355865f,  1.2627956f,  1.2900118f,
+     1.3172356f,  1.3444678f,  1.3717093f,  1.3989610f,
+     1.4262237f,  1.4534986f,  1.4807869f,  1.5080897f,
+     1.5354084f,  1.5627445f,  1.5900996f,  1.6174755f,
+     1.6448739f,  1.6722970f,  1.6997469f,  1.7272261f,
+     1.7547372f,  1.7822828f,  1.8098662f,  1.8374904f,
+     1.8651592f,  1.8928763f,  1.9206458f,  1.9484722f,
+     1.9763603f,  2.0043154f,  2.0323430f,  2.0604493f,
+     2.0886408f,  2.1169245f,  2.1453081f,  2.1737998f,
+     2.2024086f,  2.2311440f,  2.2600165f,  2.2890372f,
+     2.3182184f,  2.3475732f,  2.3771157f,  2.4068614f,
+     2.4368270f,  2.4670306f,  2.4974918f,  2.5282321f,
+     2.5592748f,  2.5906452f,  2.6223710f,  2.6544825f,
+     2.6870129f,  2.7199985f,  2.7534795f,  2.7874999f,
+     2.8221086f,  2.8573596f,  2.8933131f,  2.9300362f,
+     2.9676040f,  3.0061011f,  3.0456229f,  3.0862780f,
+     3.1281899f,  3.1715011f,  3.2163758f,  3.2630056f,
+     3.3116156f,  3.3624729f,  3.4158977f,  3.4722785f,
+     3.5320936f,  3.5959415f,  3.6645851f,  3.7390194f,
+     3.8205780f,  3.9111092f,  4.0132856f,  4.1311907f,
+     4.2715508f,  4.4467193f,  4.6836997f,  5.0652659f,
+};
+
+METAL_FUNC float d512_tq_hb_centroid(uint idx, int codebook_bits) {
+  if (codebook_bits == 5) {
+    return D512_CODEBOOK_5BIT[idx & 0x1Fu];
+  } else if (codebook_bits == 6) {
+    return D512_CODEBOOK_6BIT[idx & 0x3Fu];
+  }
+  return D512_CODEBOOK_8BIT[idx];
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Kernel template
 // ──────────────────────────────────────────────────────────────────────────
 //
@@ -266,7 +423,12 @@ constant int  nsg_def      = is_function_constant_defined(fc_nsg)   ? fc_nsg   :
 // kernel.  It does not carry `[[kernel]]` — a kernel cannot be called from
 // another function in MSL, but a plain function with threadgroup/grid/
 // lane-id arguments forwarded from the caller is legal.
-template <typename T, typename MaskT, short NSG>
+//
+// OutT  — O element type: T (pre-existing entry points) or float (precise:
+//         O stored without the final T rounding).
+// VForm — V input form (D512_V_*).  Every form other than D512_V_LEGACY
+//         multiplies P by an F32 V operand and is precise-only.
+template <typename T, typename MaskT, short NSG, typename OutT, int VForm>
 void flash_attn_prefill_d512_impl(
     const device char* q_base,
     const device char* k_base,
@@ -277,10 +439,16 @@ void flash_attn_prefill_d512_impl(
     const device MaskT* mask_base,
     const device char*  blk_base,
     const device float* sinks,
+    const constant AttnPreciseParams* pparams,
+    const device float* v_norms,
     threadgroup  half* shmem_f16,
     uint3  tgpig,
     ushort tiisg,
     ushort sgitg) {
+  static_assert(
+      VForm == D512_V_LEGACY || is_same_v<OutT, float>,
+      "F32 V operands exist only on the F32-output precise entry points");
+  using VT = typename D512VSource<T, VForm>::type;
 
   // ── Tile/workload shape constants ──────────────────────────────────────
   //
@@ -384,8 +552,8 @@ void flash_attn_prefill_d512_impl(
 
   const device T* q_typed = (const device T*)(q_base);
   const device T* k_typed = (const device T*)(k_base);
-  const device T* v_typed = (const device T*)(v_base);
-  device       T* o_typed = (device       T*)(o_base);
+  const device VT* v_typed = (const device VT*)(v_base);
+  device    OutT* o_typed = (device    OutT*)(o_base);
 
   // Q / O are per-query-head (H heads).  K / V are per-KV-head (H / gqa).
   const ulong kv_head = iq2 / args.gqa_factor;
@@ -394,10 +562,25 @@ void flash_attn_prefill_d512_impl(
                                     + (ulong)iq2 * (ulong)args.Q_strides[1];
   const device T* k_head = k_typed + (ulong)iq3 * (ulong)args.K_strides[0]
                                     +       kv_head * (ulong)args.K_strides[1];
-  const device T* v_head = v_typed + (ulong)iq3 * (ulong)args.V_strides[0]
-                                    +       kv_head * (ulong)args.V_strides[1];
-  device       T* o_head = o_typed + (ulong)iq3 * (ulong)args.O_strides[0]
+  const device VT* v_head = v_typed + (ulong)iq3 * (ulong)args.V_strides[0]
+                                     +       kv_head * (ulong)args.V_strides[1];
+  device    OutT* o_head = o_typed + (ulong)iq3 * (ulong)args.O_strides[0]
                                     + (ulong)iq2 * (ulong)args.O_strides[1];
+
+  // `_vcodes`: this KV head's per-position TQ-HB norms (in place, with the
+  // caller's kv_capacity stride), the centroid table and one chunk's
+  // scale_norms in the threadgroup bytes after the legacy 28,672 B layout.
+  const device float* norms_head = v_norms;
+  threadgroup float* cb_s = (threadgroup float*)(shmem_f16 + 28672 / 2);
+  threadgroup float* sn_s = cb_s + 256;
+  if constexpr (VForm == D512_V_CODES) {
+    norms_head = v_norms + (ulong)iq3 * (ulong)pparams->N_strides[0]
+                         + kv_head * (ulong)pparams->N_strides[1];
+    const short thread_idx = (short)sgitg * NW + (short)tiisg;
+    for (short i = thread_idx; i < 256; i += NSG * NW) {
+      cb_s[i] = d512_tq_hb_centroid(uint(i), pparams->codebook_bits);
+    }
+  }
 
   // K / V element-stride between consecutive KV items.  Layout is contiguous
   // in D, stride-D between items, stride-(kL*D) between heads — NS10 is
@@ -518,6 +701,13 @@ void flash_attn_prefill_d512_impl(
   if (kL_chunks * C > args.kL + C) {
     kL_chunks = (args.kL + C - 1) / C;
   }
+  // Precise entry points read K and V in place from a cache whose rows
+  // past kL hold other data (or NaN): never visit a chunk that starts at
+  // or beyond kL.  The legacy clamp above admits one such chunk when
+  // kL % C == 0 and the causal limit overshoots kL.
+  if constexpr (VForm != D512_V_LEGACY) {
+    kL_chunks = min(kL_chunks, (args.kL + C - 1) / C);
+  }
 
   // ── Wave 2E tile-skip pre-pass row base (D=512) ────────────────────────
   //
@@ -567,6 +757,24 @@ void flash_attn_prefill_d512_impl(
       blk_cur = blk_row[ic0];
       if (blk_cur == 0) {
         continue;
+      }
+    }
+
+    // `_vcodes`: this chunk's per-(row, 256-block) scale_norm = norm / sf,
+    // as `tq_dequantize_hb_kv_seq` forms it; 0 for rows at or past kL.
+    // Read by the P·V step after the post-Q·K^T barrier; the previous
+    // chunk's readers finished at the end-of-chunk barrier.
+    if constexpr (VForm == D512_V_CODES) {
+      const short thread_idx = (short)sgitg * NW + (short)tiisg;
+      for (short i = thread_idx; i < 2 * C; i += NSG * NW) {
+        const int row = ic + i / 2;
+        float scale_norm = 0.0f;
+        if (row < args.kL) {
+          const float norm =
+              norms_head[(ulong)row * (ulong)pparams->N_strides[2] + (ulong)(i % 2)];
+          scale_norm = norm / pparams->scale_factor_d512;
+        }
+        sn_s[i] = scale_norm;
       }
     }
 
@@ -667,6 +875,7 @@ void flash_attn_prefill_d512_impl(
         // mqk accumulator — initialised to 0, unique per simdgroup.
         simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
+        if constexpr (VForm == D512_V_LEGACY) {
         // DK=512 → DK8=64, DK8/2=32 matmul iterations (DK%16==0 path).
         //
         // ADR-029 iter-44 (H41) FALSIFIED + iter-47 (H43) sweep falsified:
@@ -739,6 +948,58 @@ void flash_attn_prefill_d512_impl(
 
           simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
           simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+        }
+        } else {
+          // Precise Q·K^T: a three-level blocked reduction over the head
+          // dimension.  Each block of D512_QK_BLOCK fragments accumulates
+          // from zero, D512_QK_SUPER blocks are summed into a super-block,
+          // and the super-blocks into the score.  One running F32
+          // accumulator over all 64 fragments (512 dependent FMAs per score;
+          // D512_QK_BLOCK = 64, D512_QK_SUPER = 1) fails the §5.1 P2 bound.
+          const int kv_row_base = ic + (int)sgitg * 8 + (int)cc * 8 * NSG;
+          const bool k_in_bounds = align_K_def || kv_row_base + 8 <= args.kL;
+          constexpr short kBlock = D512_QK_BLOCK;
+          constexpr short kSuper = D512_QK_SUPER;
+          static_assert(DK8 % (kBlock * kSuper) == 0, "QK blocks");
+          for (short s0 = 0; s0 < DK8; s0 += kBlock * kSuper) {
+            simdgroup_float8x8 msup = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            for (short f0 = s0; f0 < s0 + kBlock * kSuper; f0 += kBlock) {
+              simdgroup_float8x8 mblk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+              FOR_UNROLL (short a = 0; a < kBlock; ++a) {
+                const short f = f0 + a;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_matrix<T, 8, 8> mq1;
+                simdgroup_matrix<T, 8, 8> mk1;
+                simdgroup_load(mq1, sq + 8 * f, DK);
+                if (k_in_bounds) {
+                  simdgroup_load(mk1, pk + 8 * f, NS10, 0, true);
+                } else {
+                  // Same zero-substituting tail load as the legacy path.
+                  const short qid = tiisg / 4;
+                  const short sm = (qid & 4) + (tiisg / 2) % 4;
+                  const short sn = (qid & 2) * 2 + (tiisg % 2) * 2;
+                  const int row0 = kv_row_base + sn;
+                  const int dim = 8 * f + sm;
+                  T value0 = T(0);
+                  T value1 = T(0);
+                  if (row0 < args.kL) {
+                    value0 = k_head[(ulong)row0 * (ulong)NS10 + (ulong)dim];
+                  }
+                  if (row0 + 1 < args.kL) {
+                    value1 = k_head[(ulong)(row0 + 1) * (ulong)NS10 + (ulong)dim];
+                  }
+                  mk1.thread_elements()[0] = value0;
+                  mk1.thread_elements()[1] = value1;
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(mblk, mq1, mk1, mblk);
+              }
+              msup.thread_elements()[0] += mblk.thread_elements()[0];
+              msup.thread_elements()[1] += mblk.thread_elements()[1];
+            }
+            mqk.thread_elements()[0] += msup.thread_elements()[0];
+            mqk.thread_elements()[1] += msup.thread_elements()[1];
+          }
         }
 
         // Store the 8×8 score frag into ss at this simdgroup's column
@@ -919,8 +1180,8 @@ void flash_attn_prefill_d512_impl(
       // (vs[2]), run 4 8×8 matmuls per ii (2 V-frag loads × 2 score-frag
       // multiplies).
       {
-        const device T* pv = v_head + (ulong)ic * (ulong)NS20
-                                    + (ulong)sgitg * 8;  // per-simdgroup DV offset
+        const device VT* pv = v_head + (ulong)ic * (ulong)NS20
+                                     + (ulong)sgitg * 8;  // per-simdgroup DV offset
 
         constexpr short NC = (C / 8) / 2;  // 4
 
@@ -942,13 +1203,16 @@ void flash_attn_prefill_d512_impl(
           simdgroup_load(vs[1], ss + 16 * cc + 8, SH, 0, false);
 
           FOR_UNROLL (short ii = 0; ii < NO / 2; ++ii) {
-            simdgroup_matrix<T, 8, 8> mv[4];
-
             const int kv_row_base0 = ic + (int)cc * 16;
             const int kv_row_base1 = kv_row_base0 + 8;
             const int dim_base0 = (int)sgitg * 8 + 16 * (int)ii * NSG;
             const int dim_base1 = dim_base0 + 8 * NSG;
-            if (align_K_def || kv_row_base1 + 8 <= args.kL) {
+            const bool v_in_bounds = align_K_def || kv_row_base1 + 8 <= args.kL;
+
+            if constexpr (VForm == D512_V_LEGACY) {
+            simdgroup_matrix<T, 8, 8> mv[4];
+
+            if (v_in_bounds) {
               simdgroup_load(mv[0], pv + 0 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
               simdgroup_load(mv[1], pv + 8 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
               simdgroup_load(mv[2], pv + 0 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
@@ -983,6 +1247,68 @@ void flash_attn_prefill_d512_impl(
             simdgroup_multiply_accumulate(lo[2 * ii + 1], vs[0], mv[1], lo[2 * ii + 1]);
             simdgroup_multiply_accumulate(lo[2 * ii + 0], vs[1], mv[2], lo[2 * ii + 0]);
             simdgroup_multiply_accumulate(lo[2 * ii + 1], vs[1], mv[3], lo[2 * ii + 1]);
+            } else {
+              // Precise: the V operand is F32.  `_v32` in-bounds blocks
+              // load the F32 fragments directly and `_v16` widens the F16
+              // fragments element-wise (exact); `_vcodes` and every tail
+              // block fill the lane-owned elements (row sm, dims sn, sn+1)
+              // with the same lane mapping `simdgroup_load` uses, so all
+              // forms feed identical F32 operands for identical V values.
+              simdgroup_matrix<float, 8, 8> mv[4];
+              const short qid = tiisg / 4;
+              const short sm = (qid & 4) + (tiisg / 2) % 4;
+              const short sn = (qid & 2) * 2 + (tiisg % 2) * 2;
+              const int row_bases[2] = {kv_row_base0, kv_row_base1};
+              const int dim_bases[2] = {dim_base0, dim_base1};
+              if (VForm == D512_V_F32 && v_in_bounds) {
+                const device float* pvf = (const device float*)pv;
+                simdgroup_load(mv[0], pvf + 0 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
+                simdgroup_load(mv[1], pvf + 8 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
+                simdgroup_load(mv[2], pvf + 0 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+                simdgroup_load(mv[3], pvf + 8 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+              } else if (VForm == D512_V_F16 && v_in_bounds) {
+                const device half* pvh = (const device half*)pv;
+                simdgroup_matrix<half, 8, 8> mh[4];
+                simdgroup_load(mh[0], pvh + 0 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
+                simdgroup_load(mh[1], pvh + 8 * NSG + 16 * ii * NSG + 0 * 8 * NS20, NS20, 0, false);
+                simdgroup_load(mh[2], pvh + 0 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+                simdgroup_load(mh[3], pvh + 8 * NSG + 16 * ii * NSG + 1 * 8 * NS20, NS20, 0, false);
+                FOR_UNROLL (short frag = 0; frag < 4; ++frag) {
+                  mv[frag].thread_elements()[0] = float(mh[frag].thread_elements()[0]);
+                  mv[frag].thread_elements()[1] = float(mh[frag].thread_elements()[1]);
+                }
+              } else {
+                FOR_UNROLL (short row_frag = 0; row_frag < 2; ++row_frag) {
+                  const int row = row_bases[row_frag] + sm;
+                  FOR_UNROLL (short dim_frag = 0; dim_frag < 2; ++dim_frag) {
+                    const int dim0 = dim_bases[dim_frag] + sn;
+                    float value0 = 0.0f;
+                    float value1 = 0.0f;
+                    if (row < args.kL) {
+                      const ulong at = (ulong)row * (ulong)NS20 + (ulong)dim0;
+                      if constexpr (VForm == D512_V_CODES) {
+                        const uchar2 code = *(const device uchar2*)(v_head + at);
+                        const float scale_norm =
+                            sn_s[(row - ic) * 2 + (dim0 >= DV / 2 ? 1 : 0)];
+                        value0 = cb_s[code.x] * scale_norm;
+                        value1 = cb_s[code.y] * scale_norm;
+                      } else {
+                        value0 = float(v_head[at]);
+                        value1 = float(v_head[at + 1]);
+                      }
+                    }
+                    const short frag = row_frag * 2 + dim_frag;
+                    mv[frag].thread_elements()[0] = value0;
+                    mv[frag].thread_elements()[1] = value1;
+                  }
+                }
+              }
+
+              simdgroup_multiply_accumulate(lo[2 * ii + 0], vs[0], mv[0], lo[2 * ii + 0]);
+              simdgroup_multiply_accumulate(lo[2 * ii + 1], vs[0], mv[1], lo[2 * ii + 1]);
+              simdgroup_multiply_accumulate(lo[2 * ii + 0], vs[1], mv[2], lo[2 * ii + 0]);
+              simdgroup_multiply_accumulate(lo[2 * ii + 1], vs[1], mv[3], lo[2 * ii + 1]);
+            }
           }
 
           pv += 2 * 8 * NS20;
@@ -1040,18 +1366,19 @@ void flash_attn_prefill_d512_impl(
       continue;  // past qL tail (align_Q=false case)
     }
 
-    device T* o_row = o_head + (ulong)(iq1 + j) * (ulong)args.O_strides[2];
+    device OutT* o_row = o_head + (ulong)(iq1 + j) * (ulong)args.O_strides[2];
 
     const float scale = (S[jj] == 0.0f) ? 0.0f : 1.0f / S[jj];
 
-    // so is f32 — no pre-promotion needed.  Cast to T at the final store
-    // is the ONLY bf16 round per element (the peer writes f32 out here
-    // but our dispatcher contract is bf16; this matches sdpa_bf16's
-    // single-bf16-round output convention).  DV = 512; 512 / NW = 16
+    // so is f32 — no pre-promotion needed.  Cast to OutT at the final store
+    // is the ONLY T round per element on the pre-existing entry points (the
+    // peer writes f32 out here but our dispatcher contract is bf16; this
+    // matches sdpa_bf16's single-bf16-round output convention) and no
+    // rounding at all on the precise ones.  DV = 512; 512 / NW = 16
     // writes per lane.
     FOR_UNROLL (short ii = 0; ii < DV / NW; ++ii) {
       const short i = ii * NW + tiisg;
-      o_row[i] = (T)(so[j * PV + i] * scale);
+      o_row[i] = (OutT)(so[j * PV + i] * scale);
     }
   }
 }
@@ -1085,19 +1412,49 @@ void flash_attn_prefill_d512(
   // pipeline.  Cases 1 and 2 are omitted (unused by our dispatcher).
   switch (nsg_def) {
     case 4:
-      flash_attn_prefill_d512_impl<T, MaskT, 4>(
+      flash_attn_prefill_d512_impl<T, MaskT, 4, T, D512_V_LEGACY>(
           q_base, k_base, v_base, o_base, args,
-          mask_args, mask_base, blk_base, sinks, shmem_f16, tgpig, tiisg, sgitg);
+          mask_args, mask_base, blk_base, sinks, nullptr, nullptr,
+          shmem_f16, tgpig, tiisg, sgitg);
       break;
     case 8:
-      flash_attn_prefill_d512_impl<T, MaskT, 8>(
+      flash_attn_prefill_d512_impl<T, MaskT, 8, T, D512_V_LEGACY>(
           q_base, k_base, v_base, o_base, args,
-          mask_args, mask_base, blk_base, sinks, shmem_f16, tgpig, tiisg, sgitg);
+          mask_args, mask_base, blk_base, sinks, nullptr, nullptr,
+          shmem_f16, tgpig, tiisg, sgitg);
       break;
     default:
       // No-op on unsupported NSG.  The dispatcher only ever sets 4 or 8.
       break;
   }
+}
+
+// Precise D=512 causal-resume entry points (ADR-063 Q4-GEMMA-KERNEL): F16 Q
+// and K, F32 scores scaled after Q·K^T with natural exp, F32 softmax / P /
+// V operand / accumulator, F32 O.  NSG fixed at 8; no mask, blk or sinks.
+// K and V are read in place from the cache (K_strides / V_strides carry
+// the kv_capacity head stride).  Threadgroup memory: 28,672 B, plus
+// D512_PRECISE_CODES_EXTRA_BYTES for `_vcodes`.
+template <int VForm>
+[[kernel, max_total_threads_per_threadgroup(32 * 8)]]
+void flash_attn_prefill_d512_precise(
+    const device char* q_base    [[buffer(0)]],
+    const device char* k_base    [[buffer(1)]],
+    const device char* v_base    [[buffer(2)]],
+    device       char* o_base    [[buffer(3)]],
+    const constant AttnParams& args [[buffer(4)]],
+    const constant AttnMaskParams& mask_args [[buffer(5), function_constant(has_mask)]],
+    const device half* mask_base [[buffer(6), function_constant(has_mask)]],
+    const constant AttnPreciseParams* pparams [[buffer(9)]],
+    const device float* v_norms  [[buffer(10)]],
+    threadgroup  half* shmem_f16 [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  flash_attn_prefill_d512_impl<half, half, 8, float, VForm>(
+      q_base, k_base, v_base, o_base, args,
+      mask_args, mask_base, nullptr, nullptr, pparams, v_norms,
+      shmem_f16, tgpig, tiisg, sgitg);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1118,3 +1475,14 @@ instantiate_d512("flash_attn_prefill_d512_bf16",          bfloat, bfloat)
 instantiate_d512("flash_attn_prefill_d512_bf16_boolmask", bfloat, bool)
 instantiate_d512("flash_attn_prefill_d512_f16",           half,   half)
 instantiate_d512("flash_attn_prefill_d512_f16_boolmask",  half,   bool)
+
+// Precise D=512 (ADR-063 Q4-GEMMA-KERNEL).  `_v32` is parity-only: it is
+// the P9 reference for `_vcodes` and is never a serving route.
+#define instantiate_d512_precise(name, VForm) \
+  template [[host_name(name)]] [[kernel]] \
+  decltype(flash_attn_prefill_d512_precise<VForm>) \
+  flash_attn_prefill_d512_precise<VForm>;
+
+instantiate_d512_precise("flash_attn_prefill_precise_d512_vcodes", D512_V_CODES)
+instantiate_d512_precise("flash_attn_prefill_precise_d512_v16",    D512_V_F16)
+instantiate_d512_precise("flash_attn_prefill_precise_d512_v32",    D512_V_F32)
