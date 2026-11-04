@@ -1,7 +1,9 @@
-//! Every kernel that an op's `register` function adds beyond the constructor
-//! must build from runtime source when the precompiled metallib is disabled,
-//! from `KernelRegistry::new()` alone (no `register` call), using exactly the
-//! source text that op's `register` installs.
+//! Every kernel in the embedded metallib that production dispatches must
+//! build from runtime source when the precompiled metallib is disabled, from
+//! `KernelRegistry::new()` alone. This covers the kernels an op's `register`
+//! function adds (constructor registration fallbacks), checked against the
+//! source text that `register` installs, and the IQ4_XS matmul kernels the
+//! constructor carries directly.
 //!
 //! One test per binary: `MLX_PRECOMPILED_METALLIB` is latched on first use.
 
@@ -44,6 +46,8 @@ const D512_INTS: &[(usize, i32)] = &[(322, 8)];
 const BLK_INTS: &[(usize, i32)] = &[(400, 32), (401, 16)];
 /// `flash_attn_train_{fwd,bwd}.metal`: align_Q, align_K, has_mask, do_causal.
 const TRAIN_BOOLS: &[(usize, bool)] = &[(200, false), (201, false), (300, false), (301, false)];
+/// `quantized_matmul_ggml.metal`: ne12, r2, r3 as `dispatch_mv` sets them.
+const QMATMUL_MV_INTS: &[(usize, i32)] = &[(700, 1), (701, 1), (702, 1)];
 
 type Case = (
     String,
@@ -58,7 +62,7 @@ fn cases() -> Vec<Case> {
         &'static str,
         &'static [(usize, bool)],
         &'static [(usize, i32)],
-    ); 28] = [
+    ); 32] = [
         (
             "add_bias_row_2d_f32",
             add_bias_row_2d::ADD_BIAS_ROW_2D_SHADER_SOURCE,
@@ -227,6 +231,30 @@ fn cases() -> Vec<Case> {
             NO_BOOLS,
             NO_INTS,
         ),
+        (
+            "kernel_mul_mv_iq4_xs_f32",
+            include_str!("../src/shaders/quantized_matmul_ggml.metal"),
+            NO_BOOLS,
+            QMATMUL_MV_INTS,
+        ),
+        (
+            "kernel_mul_mv_id_iq4_xs_f32",
+            include_str!("../src/shaders/quantized_matmul_id_ggml.metal"),
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "kernel_mul_mm_id_iq4_xs_f32",
+            include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "kernel_mul_mm_id_iq4_xs_tensor_f32",
+            include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
+            NO_BOOLS,
+            NO_INTS,
+        ),
     ];
     let mut cases: Vec<Case> = fixed
         .into_iter()
@@ -302,9 +330,9 @@ fn registration_fallbacks_build_from_runtime_source() {
     let cases = cases();
     let unique: std::collections::BTreeSet<&str> =
         cases.iter().map(|case| case.0.as_str()).collect();
-    // Matches the constructor's fallback count (unit test in kernel_registry.rs).
-    assert_eq!(unique.len(), 54);
-    assert_eq!(cases.len(), 54);
+    // 54 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
+    assert_eq!(unique.len(), 58);
+    assert_eq!(cases.len(), 58);
     for (name, source, bools, ints) in cases {
         let pipeline = if bools.is_empty() && ints.is_empty() {
             registry.get_pipeline(&name, device.metal_device())

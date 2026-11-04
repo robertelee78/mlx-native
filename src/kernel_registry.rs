@@ -282,6 +282,8 @@ impl KernelRegistry {
         // ADR-028 iter-368: peer-style NSG=4 NR=2 variant (128 threads/TG).
         sources.insert("kernel_mul_mv_q8_0_f32_nr2".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+        // IQ4_XS ships in the metallib; this source serves the runtime path.
+        sources.insert("kernel_mul_mv_iq4_xs_f32".into(), ggml_src);
         // ADR-028 iter-309 — q6_K mat-vec with nr0=2 + cached yl[16]
         // (peer-pattern kernel with N_R0_Q6_K=2;
         // 4 rows/TG vs baseline's 2).  Env-gated via
@@ -594,6 +596,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_iq4_xs_f32".into(), ggml_id_src);
         // ADR-028 iter-321 — q6_K _id with nr0=2 + cached yl[16]
         // (peer-pattern port mirroring iter-309's non-_id variant).
         // Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
@@ -629,6 +632,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q2_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q3_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_iq4_xs_f32".into(), ggml_id_mm_src);
         // ADR-013 P16 — Q4_K mm_id (peer-pattern kernel).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
         // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id template instantiations.
@@ -680,6 +684,10 @@ impl KernelRegistry {
         );
         sources.insert(
             "kernel_mul_mm_id_q6_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_iq4_xs_tensor_f32".into(),
             ggml_id_mm_tensor_src,
         );
         // ADR-013 P16 — Q4_K tensor-API mm_id.
