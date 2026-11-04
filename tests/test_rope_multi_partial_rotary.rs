@@ -160,10 +160,14 @@ fn ref_rope_multi_f64(
 }
 
 /// F32 kernel tolerance. The kernel evaluates `pow`/`cos`/`sin` in f32, so
-/// the angle error grows with the position (pair 0 has frequency 1, so
-/// `|theta| <= pos`).
+/// the angle error grows with the position: pair 0 has frequency 1, so
+/// `|theta| <= pos`, and an angle error of `k` f32 ulps of `theta` moves an
+/// output by up to `(|x0| + |x1|) * k * eps * pos`. Inputs are in [-2, 2], so
+/// `|x0| + |x1| <= 4`; `k = 2` covers the Metal transcendental error observed
+/// across Apple GPUs (M5 Max measured 1.34e-2 at pos 262143, a hosted CI
+/// runner 3.2e-2; the bound there is 0.25, the pre-fix pairing error 3.95).
 fn f32_tol(max_pos: i32) -> f64 {
-    2e-5 + 1e-7 * f64::from(max_pos)
+    2e-5 + 4.0 * 2.0 * f64::from(f32::EPSILON) * f64::from(max_pos)
 }
 
 // -----------------------------------------------------------------
