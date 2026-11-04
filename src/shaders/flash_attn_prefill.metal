@@ -1221,9 +1221,11 @@ METAL_FUNC float pfa_tq_hb_centroid(uint idx, int codebook_bits) {
 #define PFA_V_F32 2
 #define PFA_V_CODES 3
 
-// Precise entry points: number of independent F32 partial sums of the
-// Q·K^T reduction over the head dimension (see attention_impl).
-#define PFA_QK_PARTIALS 16
+// Precise entry points: the blocked Q·K^T reduction over the head
+// dimension (see attention_impl): fragments per block and blocks per
+// super-block.
+#define PFA_QK_BLOCK 2
+#define PFA_QK_SUPER 4
 
 template <typename T, int VForm>
 struct PfaVSource {
@@ -1683,44 +1685,46 @@ METAL_FUNC void attention_impl(
         tile_matmad(Stile, Qtile, Ktile, Stile);
       }
     } else {
-      // Precise: PFA_QK_PARTIALS independent F32 partial sums over the
-      // head dimension (head-dim fragment dd feeds partial dd % N), added
-      // pairwise at the end.  One running sum over all TD fragments rounds
-      // against an ever larger partial; the split keeps the Q·K^T rounding
-      // at the level of the vec route's lane-split dot product.
-      constexpr short kParts = PFA_QK_PARTIALS;
-      static_assert(TD % kParts == 0 && (kParts & (kParts - 1)) == 0, "QK partials");
-      MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Spart[kParts];
-      STEEL_PRAGMA_UNROLL
-      for (short a = 0; a < kParts; a++) {
-        Spart[a].clear();
-      }
-      STEEL_PRAGMA_UNROLL
-      for (short dd = 0; dd < TD; dd++) {
-        simdgroup_barrier(mem_flags::mem_none);
+      // Precise: a three-level blocked Q·K^T reduction over the head
+      // dimension.  Each block of PFA_QK_BLOCK fragments accumulates from
+      // zero, PFA_QK_SUPER blocks are summed into a super-block, and the
+      // super-blocks into the scores.  One running sum over all TD
+      // fragments (PFA_QK_BLOCK = TD, PFA_QK_SUPER = 1) rounds against an
+      // ever larger partial and fails the §5.1 P2 bound; the blocked order
+      // keeps the rounding at the level of the vec route's lane-split dot
+      // product with three live accumulators.
+      constexpr short kBlock = PFA_QK_BLOCK;
+      constexpr short kSuper = PFA_QK_SUPER;
+      static_assert(TD % (kBlock * kSuper) == 0, "QK blocks");
+      MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Ssup;
+      MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Sblk;
+      for (short s0 = 0; s0 < TD; s0 += kBlock * kSuper) {
+        Ssup.clear();
+        for (short f0 = s0; f0 < s0 + kBlock * kSuper; f0 += kBlock) {
+          Sblk.clear();
+          STEEL_PRAGMA_UNROLL
+          for (short a = 0; a < kBlock; a++) {
+            const short dd = f0 + a;
+            simdgroup_barrier(mem_flags::mem_none);
 
-        Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
-            &Qs[Qs_offset + dd * Qs_tile_stride]);
-        Ktile.template load<T, 1, 1, LDK_tgp, 1>(
-            &Ks[Ks_offset + dd * Ks_tile_stride]);
+            Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
+                &Qs[Qs_offset + dd * Qs_tile_stride]);
+            Ktile.template load<T, 1, 1, LDK_tgp, 1>(
+                &Ks[Ks_offset + dd * Ks_tile_stride]);
 
-        simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_barrier(mem_flags::mem_none);
 
-        tile_matmad(Spart[dd % kParts], Qtile, Ktile, Spart[dd % kParts]);
-      }
-      STEEL_PRAGMA_UNROLL
-      for (short stride = kParts / 2; stride > 0; stride /= 2) {
-        STEEL_PRAGMA_UNROLL
-        for (short a = 0; a < stride; a++) {
+            tile_matmad(Sblk, Qtile, Ktile, Sblk);
+          }
           STEEL_PRAGMA_UNROLL
           for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
-            Spart[a].val_frags[i] += Spart[a + stride].val_frags[i];
+            Ssup.val_frags[i] += Sblk.val_frags[i];
           }
         }
-      }
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
-        Stile.val_frags[i] = Spart[0].val_frags[i];
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
+          Stile.val_frags[i] += Ssup.val_frags[i];
+        }
       }
     }
 

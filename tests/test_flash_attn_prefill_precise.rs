@@ -75,19 +75,30 @@ fn runtime_path() -> bool {
         })
 }
 
-/// P1, P1′, P2, P3, C+, C−, N1, N2, N3 at one shape.
+/// Seed offset of the served-shape tests.  `PRECISE_PARITY_SEED=<u64>`
+/// selects fresh inputs (the default seeds are the ones the kernel was
+/// developed against); the receipts record it.
+fn seed_offset() -> u64 {
+    std::env::var("PRECISE_PARITY_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// P1, P1′, P2, P3, C+, C−, N1, N2, N3 (and P6 on d256) at one shape.
 fn full_parity(c: &mut Ctx, s: Shape, seed: u64) {
+    let seed = seed ^ seed_offset();
+    eprintln!(
+        "RECEIPT {{\"check\":\"seed\",\"d\":{},\"seed\":{seed}}}",
+        s.d
+    );
     let p = problem(c, s, seed);
     let reference32 = reference(&s, &p.q16, &p.k16, &p.v32, 1.0);
     let v16_values = read_f16(&p.v16_buf, s.h_kv * s.kl * s.d);
     let reference16 = reference(&s, &p.q16, &p.k16, &v16_values, 1.0);
-    let vis = if s.d == 256 {
-        Vis::Window
-    } else {
-        Vis::MaskBlk
-    };
+    let vis = if s.d == 256 { Vis::Window } else { Vis::Causal };
 
-    // P1 (F32 V forms) and P1′ (F16 V cache input).
+    // P1 (F32 V forms; `_vcodes` in place) and P1′ (F16 V cache, in place).
     let mut forms = vec![("v32", VIn::F32), ("vcodes", VIn::Codes)];
     if s.d == 512 {
         forms.retain(|(name, _)| *name == "vcodes"); // d512 `_v32` is parity-only (P9)
@@ -98,11 +109,20 @@ fn full_parity(c: &mut Ctx, s: Shape, seed: u64) {
         let m = metrics(&out, &reference32);
         receipt("P1", &s, name, m, p1_pass(m));
         assert!(p1_pass(m), "P1 {name} {m:?}");
+        if s.d == 256 {
+            // P6 at served shapes: mask + blk and mask alone equal the
+            // in-kernel window bitwise.
+            for vis in [Vis::MaskBlk, Vis::MaskOnly] {
+                let masked = run_precise(c, &p, &p.q16_buf, vin, vis, 1.0);
+                assert!(bits_equal(&masked, &out), "P6 {name} {vis:?} != window");
+            }
+            eprintln!("RECEIPT {{\"check\":\"P6\",\"d\":256,\"ql\":{},\"what\":\"{name}\",\"pass\":true}}", s.ql);
+        }
         precise_out.push(out);
     }
-    let out16 = run_precise(c, &p, &p.q16_buf, VIn::F16Dequant, vis, 1.0);
+    let out16 = run_precise(c, &p, &p.q16_buf, VIn::F16Cache, vis, 1.0);
     let m = metrics(&out16, &reference16);
-    receipt("P1'", &s, "v16", m, p1_pass(m));
+    receipt("P1'", &s, "v16-cache-in-place", m, p1_pass(m));
     assert!(p1_pass(m), "P1' {m:?}");
 
     // C+, P2, P3 against vec-hybrid on the same codes and K.
@@ -149,7 +169,8 @@ fn full_parity(c: &mut Ctx, s: Shape, seed: u64) {
     assert!(!p3_pass(m), "N1 unexpectedly passed P3 {m:?}");
 
     // N2: V mismatch only — `_v16` on the F16 dequant against the F32-V reference.
-    let m = metrics(&out16, &reference32);
+    let n2 = run_precise(c, &p, &p.q16_buf, VIn::F16Dequant, vis, 1.0);
+    let m = metrics(&n2, &reference32);
     receipt("N2", &s, "v16-dequant-vs-ref32", m, !p1_pass(m));
     assert!(!p1_pass(m), "N2 unexpectedly passed P1 {m:?}");
 
@@ -186,18 +207,21 @@ fn served_global_lanes_meet_primitive_bounds_and_controls() {
     }
 }
 
-/// Small d256 shapes: unaligned qL/kL, window edges mid-tile, fully masked
-/// leading tiles, q_offset > 0, GQA 2.  P1/P1′ and P6 (mask + blk, mask
+/// Small d256 shapes read in place with poisoned rows past kL: unaligned
+/// qL/kL, window edges mid-tile, fully masked leading tiles, q_offset > 0,
+/// GQA 2, and causal-only visibility.  P1/P1′ and P6 (mask + blk, mask
 /// alone and the in-kernel window are bitwise equal).
 #[test]
 fn edge_sliding_shapes_meet_p1_and_masks_agree_bitwise() {
     let mut c = ctx();
     for (seed, (ql, q_offset, window)) in [
-        (1, 140, 40),
-        (31, 119, 37),
-        (32, 96, 24),
-        (33, 211, 50),
-        (33, 0, 1024),
+        (1, 140, Some(40)),
+        (31, 119, Some(37)),
+        (32, 96, Some(24)),
+        (33, 211, Some(50)),
+        (33, 0, Some(1024)),
+        (31, 119, None),
+        (32, 64, None),
     ]
     .into_iter()
     .enumerate()
@@ -209,28 +233,33 @@ fn edge_sliding_shapes_meet_p1_and_masks_agree_bitwise() {
             h_kv: SLIDING_KV_HEADS,
             ql,
             kl,
-            cap: kl,
+            cap: kl + 37,
             q_offset,
-            window: Some(window),
+            window,
         };
         let p = problem(&mut c, s, 0xED6E + seed as u64);
         let reference32 = reference(&s, &p.q16, &p.k16, &p.v32, 1.0);
+        let in_kernel = if window.is_some() {
+            Vis::Window
+        } else {
+            Vis::Causal
+        };
         for vin in [VIn::F32, VIn::Codes] {
-            let window_out = run_precise(&mut c, &p, &p.q16_buf, vin, Vis::Window, 1.0);
-            let m = metrics(&window_out, &reference32);
-            receipt("P1", &s, &format!("{vin:?}"), m, p1_pass(m));
+            let out = run_precise(&mut c, &p, &p.q16_buf, vin, in_kernel, 1.0);
+            let m = metrics(&out, &reference32);
+            receipt("P1", &s, &format!("{vin:?}-{in_kernel:?}"), m, p1_pass(m));
             assert!(p1_pass(m), "P1 {vin:?} {s:?} {m:?}");
             for vis in [Vis::MaskBlk, Vis::MaskOnly] {
-                let out = run_precise(&mut c, &p, &p.q16_buf, vin, vis, 1.0);
+                let masked = run_precise(&mut c, &p, &p.q16_buf, vin, vis, 1.0);
                 assert!(
-                    bits_equal(&out, &window_out),
-                    "P6 {vis:?} != window {vin:?} {s:?}"
+                    bits_equal(&masked, &out),
+                    "P6 {vis:?} != {in_kernel:?} {vin:?} {s:?}"
                 );
             }
         }
         let v16_values = read_f16(&p.v16_buf, s.h_kv * s.kl * s.d);
         let reference16 = reference(&s, &p.q16, &p.k16, &v16_values, 1.0);
-        let out16 = run_precise(&mut c, &p, &p.q16_buf, VIn::F16Dequant, Vis::Window, 1.0);
+        let out16 = run_precise(&mut c, &p, &p.q16_buf, VIn::F16Cache, in_kernel, 1.0);
         let m = metrics(&out16, &reference16);
         assert!(p1_pass(m), "P1' {s:?} {m:?}");
     }
@@ -248,13 +277,13 @@ fn edge_global_shapes_meet_p1() {
         let s = Shape::global(history, ql, history + ql + 13);
         let p = problem(&mut c, s, 0xD512 + seed as u64);
         let reference32 = reference(&s, &p.q16, &p.k16, &p.v32, 1.0);
-        let out = run_precise(&mut c, &p, &p.q16_buf, VIn::Codes, Vis::MaskBlk, 1.0);
+        let out = run_precise(&mut c, &p, &p.q16_buf, VIn::Codes, Vis::Causal, 1.0);
         let m = metrics(&out, &reference32);
         receipt("P1", &s, "vcodes", m, p1_pass(m));
         assert!(p1_pass(m), "P1 {s:?} {m:?}");
         let v16_values = read_f16(&p.v16_buf, s.h_kv * s.kl * s.d);
         let reference16 = reference(&s, &p.q16, &p.k16, &v16_values, 1.0);
-        let out16 = run_precise(&mut c, &p, &p.q16_buf, VIn::F16Dequant, Vis::MaskBlk, 1.0);
+        let out16 = run_precise(&mut c, &p, &p.q16_buf, VIn::F16Cache, Vis::Causal, 1.0);
         let m = metrics(&out16, &reference16);
         assert!(p1_pass(m), "P1' {s:?} {m:?}");
     }
@@ -303,7 +332,7 @@ fn repeats_are_bitwise_deterministic() {
         (&sliding, VIn::Codes, Vis::MaskBlk),
         (&sliding, VIn::F32, Vis::MaskOnly),
         (&global, VIn::Codes, Vis::MaskBlk),
-        (&global, VIn::F16Dequant, Vis::MaskBlk),
+        (&global, VIn::F16Cache, Vis::Causal),
         (&global, VIn::F32, Vis::MaskBlk),
     ];
     for (p, vin, vis) in cases {
@@ -326,155 +355,57 @@ fn with_tail<T: Copy>(values: &[T], extra: usize, poison: T) -> Vec<T> {
     out
 }
 
-/// P5 (d256): NaN K/V/Q rows past kL / qL, 0xFF codes and NaN norms, give
-/// bitwise the clean O.  One KV head, so the last head's tail tile reads
-/// run into the poison.
+/// P5 and P10: reading K and an in-cache V (`_vcodes`, `_v16`) in place
+/// with `kv_capacity > kL`, where rows `[kL, capacity)` are poisoned (K and
+/// F16 V NaN, codes 0xFF, norms NaN), Q rows past qL are NaN and a dense
+/// F32 V (`_v32`) is followed by NaN, gives bitwise the O of the clean,
+/// compacted problem (`capacity = kL`, identical values).  d256 runs with
+/// one KV head so the tail tile reads run into the end of the buffers.
+/// The d512 cases include kL = 128 (a multiple of the 64-key chunk with a
+/// partial last Q tile), the case of the precise chunk clamp.
 #[test]
-fn d256_tail_poison_does_not_reach_o() {
+fn in_place_reads_with_poisoned_tails_match_compacted_bitwise() {
     let mut c = ctx();
-    let s = Shape {
+    let sliding = |history, suffix| Shape {
         h: 2,
         h_kv: 1,
-        ..Shape::sliding(203, 33)
+        ..Shape::sliding(history, suffix)
     };
-    let p = problem(&mut c, s, 0x7A11);
-    let pad = 64 * s.d;
-    let dev = &c.device;
-    let q = upload_f16(dev, &with_tail(&p.q16, pad, f32::NAN));
-    let k = upload_f16(dev, &with_tail(&p.k16, pad, f32::NAN));
-    let v32 = upload_f32(dev, &with_tail(&p.v32, pad, f32::NAN));
-    let v16_clean = read_f16(&p.v16_buf, s.kl * s.d);
-    let v16 = upload_f16(dev, &with_tail(&v16_clean, pad, f32::NAN));
-    let codes_clean = p.codes.as_slice::<u8>().unwrap().to_vec();
-    let codes = upload_u8(dev, &with_tail(&codes_clean, pad, 0xFF));
-    let norms_clean = read_f32(&p.norms, s.kl);
-    let norms = upload_f32(dev, &with_tail(&norms_clean, 64, f32::NAN));
-    let params = FlashAttnPrecisePrefillParams {
-        n_heads: s.h as u32,
-        n_kv_heads: 1,
-        head_dim: 256,
-        seq_len_q: s.ql as u32,
-        seq_len_k: s.kl as u32,
-        batch: 1,
-        scale: 1.0,
-        q_offset: s.q_offset as u32,
-    };
-    let codes_v = PreciseV::Codes {
-        codes: &codes,
-        norms: &norms,
-        codebook_bits: 8,
-        scale_factor_d512: 1.0,
-    };
-    let forms = [
-        (VIn::F32, PreciseV::F32(&v32)),
-        (VIn::F16Dequant, PreciseV::F16(&v16)),
-        (VIn::Codes, codes_v),
+    let cases = [
+        (sliding(203, 33), Vis::Window),
+        (sliding(64, 64), Vis::Window),
+        (Shape::global(140, 33, 0), Vis::Causal),
+        (Shape::global(64, 64, 0), Vis::Causal),
+        (Shape::global(300, 1, 0), Vis::Causal),
+        (Shape::global(95, 33, 0), Vis::Causal),
     ];
-    for (vin, v) in forms {
-        let clean = run_precise(&mut c, &p, &p.q16_buf, vin, Vis::Window, 1.0);
-        let out = zeros_f32(&c.device, s.o_len());
-        let mut enc = c.device.command_encoder().unwrap();
-        let mask = PreciseD256Mask::Window {
-            window: SLIDING_WINDOW as u32,
+    for (i, (shape, vis)) in cases.into_iter().enumerate() {
+        let compact = Shape {
+            cap: shape.kl,
+            ..shape
         };
-        precise::dispatch_flash_attn_prefill_precise_d256(
-            &mut enc,
-            &c.device,
-            &mut c.registry,
-            &q,
-            &k,
-            v,
-            mask,
-            &out,
-            &params,
-        )
-        .unwrap();
-        enc.commit_and_wait().unwrap();
-        assert!(
-            bits_equal(&read_f32(&out, s.o_len()), &clean),
-            "P5 d256 {vin:?}"
-        );
-    }
-}
-
-/// P10 (and P5 for d512): `_vcodes` in place with kv_capacity > kL gives
-/// bitwise the O of a compacted copy (capacity = kL).  Rows
-/// `[kL, capacity)` are poisoned (K NaN, norms NaN, codes 0xFF) and Q rows
-/// past qL are NaN.
-#[test]
-fn d512_in_place_read_matches_compacted_copy_under_poison() {
-    let mut c = ctx();
-    // (95, 33): kL = 128 is a multiple of the 64-key chunk and the last
-    // partial Q tile's causal limit overshoots kL, the case the precise
-    // chunk clamp exists for.
-    for (history, suffix) in [(140, 33), (64, 64), (300, 1), (95, 33)] {
-        let compact = Shape::global(history, suffix, 0);
-        let p = problem(&mut c, compact, 0x1010 + history as u64);
-        let clean_codes = run_precise(&mut c, &p, &p.q16_buf, VIn::Codes, Vis::MaskBlk, 1.0);
-        let clean_v16 = run_precise(&mut c, &p, &p.q16_buf, VIn::F16Dequant, Vis::MaskBlk, 1.0);
-
-        let (s, cap, d) = (compact, compact.kl + 70, 512);
-        let mut k = vec![f32::NAN; s.h_kv * cap * d];
-        let mut v16 = vec![f32::NAN; s.h_kv * cap * d];
-        let mut codes = vec![0xFFu8; s.h_kv * cap * d];
-        let mut norms = vec![f32::NAN; s.h_kv * cap * 2];
-        let codes_clean = p.codes.as_slice::<u8>().unwrap().to_vec();
-        let norms_clean = read_f32(&p.norms, s.h_kv * s.kl * 2);
-        let v16_clean = read_f16(&p.v16_buf, s.h_kv * s.kl * d);
-        for hk in 0..s.h_kv {
-            let (src, dst) = (hk * s.kl * d, hk * cap * d);
-            k[dst..dst + s.kl * d].copy_from_slice(&p.k16[src..src + s.kl * d]);
-            v16[dst..dst + s.kl * d].copy_from_slice(&v16_clean[src..src + s.kl * d]);
-            codes[dst..dst + s.kl * d].copy_from_slice(&codes_clean[src..src + s.kl * d]);
-            let (src, dst) = (hk * s.kl * 2, hk * cap * 2);
-            norms[dst..dst + s.kl * 2].copy_from_slice(&norms_clean[src..src + s.kl * 2]);
+        let roomy = Shape {
+            cap: shape.kl + 70,
+            ..shape
+        };
+        let seed = 0x1010 + i as u64;
+        let clean = problem(&mut c, compact, seed);
+        let mut poisoned = problem(&mut c, roomy, seed);
+        let pad = 70 * shape.d;
+        poisoned.v32_buf = upload_f32(&c.device, &with_tail(&clean.v32, pad, f32::NAN));
+        let q = upload_f16(&c.device, &with_tail(&clean.q16, 8 * shape.d, f32::NAN));
+        let mut forms = vec![VIn::Codes, VIn::F16Cache];
+        if shape.d == 256 {
+            forms.push(VIn::F32);
         }
-        let dev = &c.device;
-        let (k, codes, norms) = (
-            upload_f16(dev, &k),
-            upload_u8(dev, &codes),
-            upload_f32(dev, &norms),
-        );
-        let v16 = upload_f16(dev, &v16);
-        let q = upload_f16(dev, &with_tail(&p.q16, 8 * d, f32::NAN));
-        let params = FlashAttnPrefillResumeParams {
-            n_heads: s.h as u32,
-            n_kv_heads: s.h_kv as u32,
-            head_dim: 512,
-            seq_len_q: s.ql as u32,
-            seq_len_k: s.kl as u32,
-            batch: 1,
-            scale: 1.0,
-            do_causal: true,
-            q_offset_in_k: s.q_offset as u32,
-            kv_capacity: cap as u32,
-        };
-        let codes_v = PreciseV::Codes {
-            codes: &codes,
-            norms: &norms,
-            codebook_bits: 8,
-            scale_factor_d512: 1.0,
-        };
-        for (v, clean, what) in [
-            (codes_v, &clean_codes, "vcodes"),
-            (PreciseV::F16(&v16), &clean_v16, "v16"),
-        ] {
-            let out = zeros_f32(&c.device, s.o_len());
-            let mut enc = c.device.command_encoder().unwrap();
-            precise::dispatch_flash_attn_prefill_precise_d512_resume(
-                &mut enc,
-                &c.device,
-                &mut c.registry,
-                &q,
-                &k,
-                v,
-                &out,
-                &params,
-            )
-            .unwrap();
-            enc.commit_and_wait().unwrap();
-            let got = read_f32(&out, s.o_len());
-            assert!(bits_equal(&got, clean), "P10 {what} history {history}");
+        for vin in forms {
+            let want = run_precise(&mut c, &clean, &clean.q16_buf, vin, vis, 1.0);
+            let got = run_precise(&mut c, &poisoned, &q, vin, vis, 1.0);
+            assert!(
+                bits_equal(&got, &want),
+                "P5/P10 d{} {vin:?} {shape:?}",
+                shape.d
+            );
         }
     }
 }
@@ -515,6 +446,7 @@ fn row_without_visible_key_is_zero() {
             head_dim: 256,
             seq_len_q: s.ql as u32,
             seq_len_k: s.kl as u32,
+            kv_capacity: s.cap as u32,
             batch: 1,
             scale: 1.0,
             q_offset: 0,
@@ -545,7 +477,9 @@ fn batch_two_matches_each_sequence_reference() {
     let cat = |x: &[f32], y: &[f32]| [x, y].concat();
     let dev = &c.device;
     let q = upload_f16(dev, &cat(&a.q16, &b.q16));
-    let k = upload_f16(dev, &cat(&a.k16, &b.k16));
+    // Both sequences' K, codes and norms in their cache layout, batch-major.
+    let k_of = |p: &Problem| read_f16(&p.k_cache, s.h_kv * s.cap * s.d);
+    let k = upload_f16(dev, &cat(&k_of(&a), &k_of(&b)));
     let codes = upload_u8(
         dev,
         &[
@@ -554,7 +488,7 @@ fn batch_two_matches_each_sequence_reference() {
         ]
         .concat(),
     );
-    let n = s.h_kv * s.kl;
+    let n = s.h_kv * s.cap;
     let norms = upload_f32(dev, &cat(&read_f32(&a.norms, n), &read_f32(&b.norms, n)));
     let out = zeros_f32(dev, 2 * s.o_len());
     let mut enc = c.device.command_encoder().unwrap();
@@ -580,6 +514,7 @@ fn batch_two_matches_each_sequence_reference() {
             head_dim: 256,
             seq_len_q: s.ql as u32,
             seq_len_k: s.kl as u32,
+            kv_capacity: s.cap as u32,
             batch: 2,
             scale: 1.0,
             q_offset: s.q_offset as u32,
@@ -631,11 +566,7 @@ fn pipelines_resolve_from_the_expected_metallib_path() {
     }
     for s in [Shape::sliding(714, 200), Shape::global(714, 200, 1000)] {
         let p = problem(&mut c, s, 0xD16);
-        let vis = if s.d == 256 {
-            Vis::Window
-        } else {
-            Vis::MaskBlk
-        };
+        let vis = if s.d == 256 { Vis::Window } else { Vis::Causal };
         let out = run_precise(&mut c, &p, &p.q16_buf, VIn::Codes, vis, 1.0);
         eprintln!(
             "RECEIPT {{\"check\":\"P8\",\"origin\":\"{expected:?}\",\"d\":{},\"o_sha256\":\"{}\"}}",
@@ -662,6 +593,7 @@ fn contract_violations_are_rejected() {
         head_dim: 256,
         seq_len_q: s.ql as u32,
         seq_len_k: s.kl as u32,
+        kv_capacity: s.cap as u32,
         batch: 1,
         scale: 1.0,
         q_offset: s.q_offset as u32,
@@ -715,6 +647,14 @@ fn contract_violations_are_rejected() {
     assert!(is_invalid(d256(
         base,
         PreciseD256Mask::Window { window: 0 },
+        &out
+    )));
+    assert!(is_invalid(d256(
+        FlashAttnPrecisePrefillParams {
+            kv_capacity: s.kl as u32 - 1,
+            ..base
+        },
+        window,
         &out
     )));
     let out16 = upload_f16(&c.device, &vec![0.0; s.o_len()]);

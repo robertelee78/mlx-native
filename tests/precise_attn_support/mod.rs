@@ -149,7 +149,9 @@ pub struct Shape {
 
 impl Shape {
     /// Sliding layer of a warm resume with `history` cached tokens and
-    /// `suffix` new rows: the ring stage holds `min(history, 1023)` rows.
+    /// `suffix` new rows, read in place from hf2q's ring stage: it holds
+    /// `min(history, 1023)` history rows and the chunk, with capacity
+    /// `1023 + min(suffix, 1024)`.
     pub fn sliding(history: usize, suffix: usize) -> Self {
         let q_offset = history.min(SLIDING_WINDOW - 1);
         let kl = q_offset + suffix;
@@ -159,7 +161,7 @@ impl Shape {
             h_kv: SLIDING_KV_HEADS,
             ql: suffix,
             kl,
-            cap: kl,
+            cap: (SLIDING_WINDOW - 1 + suffix.min(SLIDING_WINDOW)).max(kl),
             q_offset,
             window: Some(SLIDING_WINDOW),
         }
@@ -203,14 +205,20 @@ pub struct Problem {
     pub v32: Vec<f32>,
     pub q32_tokens_buf: MlxBuffer,
     pub q16_buf: MlxBuffer,
-    /// F16 K cache `[h_kv, cap, d]`.
+    /// F16 K cache `[h_kv, cap, d]`; rows `[kl, cap)` are NaN.
     pub k_cache: MlxBuffer,
-    /// TQ-HB codes `[h_kv, cap, d]` and norms `[h_kv, cap, d/256]`.
+    /// Compacted F16 K `[h_kv, kl, d]`.
+    pub k_dense: MlxBuffer,
+    /// TQ-HB codes `[h_kv, cap, d]` and norms `[h_kv, cap, d/256]`; rows
+    /// `[kl, cap)` are poisoned (codes 0xFF, norms NaN).
     pub codes: MlxBuffer,
     pub norms: MlxBuffer,
     /// `tq_dequantize_hb_kv_seq` output `[h_kv, kl, d]`, F32 and F16.
     pub v32_buf: MlxBuffer,
     pub v16_buf: MlxBuffer,
+    /// The F16 dequant values as an F16 V cache `[h_kv, cap, d]`; rows
+    /// `[kl, cap)` are NaN.
+    pub v16_cache: MlxBuffer,
     /// TQ-HB codebook width and D=512 norm divisor of the codes.
     pub bits: u32,
     pub sf: f32,
@@ -240,13 +248,19 @@ pub fn problem_tq(c: &mut Ctx, shape: Shape, seed: u64, bits: u32, sf: f32) -> P
     let q16 = f16_round(&transpose_01(&q32_tokens, ql, h, d));
     let k16 = f16_round(&k_rows);
 
-    let mut k_cache_vals = vec![0.0f32; h_kv * cap * d];
-    for hk in 0..h_kv {
-        let src = &k16[hk * kl * d..(hk + 1) * kl * d];
-        k_cache_vals[hk * cap * d..hk * cap * d + kl * d].copy_from_slice(src);
-    }
+    // Lay `[h_kv, kl, d]` rows out as a `[h_kv, cap, d]` cache, poisoning
+    // rows `[kl, cap)`.
+    let cache = |rows: &[f32]| {
+        let mut out = vec![f32::NAN; h_kv * cap * d];
+        for hk in 0..h_kv {
+            let src = &rows[hk * kl * d..(hk + 1) * kl * d];
+            out[hk * cap * d..hk * cap * d + kl * d].copy_from_slice(src);
+        }
+        out
+    };
     let dev = &c.device;
-    let k_cache = upload_f16(dev, &k_cache_vals);
+    let k_cache = upload_f16(dev, &cache(&k16));
+    let k_dense = upload_f16(dev, &k16);
     let codes = upload_u8(dev, &vec![0u8; h_kv * cap * d]);
     let norms = zeros_f32(dev, h_kv * cap * (d / 256));
     let v_src = upload_f32(dev, &v_tokens);
@@ -285,6 +299,19 @@ pub fn problem_tq(c: &mut Ctx, shape: Shape, seed: u64, bits: u32, sf: f32) -> P
     );
     enc.commit_and_wait().unwrap();
     let v32 = read_f32(&v32_buf, h_kv * kl * d);
+    let v16_cache = upload_f16(&c.device, &cache(&read_f16(&v16_buf, h_kv * kl * d)));
+    // Poison the cache rows past kl after encoding and dequantizing.
+    let mut codes = codes;
+    let mut norms = norms;
+    let npp = d / 256;
+    let (codes_mut, norms_mut) = (
+        codes.as_mut_slice::<u8>().unwrap(),
+        norms.as_mut_slice::<f32>().unwrap(),
+    );
+    for hk in 0..h_kv {
+        codes_mut[(hk * cap + kl) * d..(hk + 1) * cap * d].fill(0xFF);
+        norms_mut[(hk * cap + kl) * npp..(hk + 1) * cap * npp].fill(f32::NAN);
+    }
     Problem {
         shape,
         q32_tokens_buf,
@@ -294,10 +321,12 @@ pub fn problem_tq(c: &mut Ctx, shape: Shape, seed: u64, bits: u32, sf: f32) -> P
         k16,
         v32,
         k_cache,
+        k_dense,
         codes,
         norms,
         v32_buf,
         v16_buf,
+        v16_cache,
         bits,
         sf,
     }
@@ -421,20 +450,24 @@ pub fn metrics<A: Copy + Into<f64>, B: Copy + Into<f64>>(got: &[A], want: &[B]) 
 /// Which precise V input a dispatch uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VIn {
-    /// `_v32` on the F32 dequant output (d512: parity only, compacted).
+    /// `_v32` on the dense F32 dequant output; K read in place.
     F32,
-    /// `_v16` on the F16 dequant output (the N2 input).
+    /// `_v16` on the dense F16 dequant output with the compacted K (the
+    /// N2 input).
     F16Dequant,
-    /// `_vcodes` on the codes and norms.
+    /// `_v16` on the F16 V cache, read in place like K.
+    F16Cache,
+    /// `_vcodes` on the codes and norms, read in place like K.
     Codes,
 }
 
-/// d256 visibility of a precise dispatch.
+/// d256 visibility of a precise dispatch (d512 is always causal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vis {
     Window,
     MaskBlk,
     MaskOnly,
+    Causal,
 }
 
 /// Encode the external SWA mask (and, with `blk`, the fence + classifier
@@ -511,6 +544,7 @@ pub fn encode_precise(
     let v = match vin {
         VIn::F32 => PreciseV::F32(&p.v32_buf),
         VIn::F16Dequant => PreciseV::F16(&p.v16_buf),
+        VIn::F16Cache => PreciseV::F16(&p.v16_cache),
         VIn::Codes => PreciseV::Codes {
             codes: &p.codes,
             norms: &p.norms,
@@ -518,18 +552,13 @@ pub fn encode_precise(
             scale_factor_d512: p.sf,
         },
     };
+    // Only the N2 input (dense F16 dequant) attends the compacted K.
+    let (k, cap) = if vin == VIn::F16Dequant {
+        (&p.k_dense, s.kl)
+    } else {
+        (&p.k_cache, s.cap)
+    };
     if s.d == 512 {
-        // `_v32` / `_v16` read the dense `[h_kv, kl, d]` dequant output, so
-        // they attend a compacted K (capacity kl); `_vcodes` reads the
-        // cache in place with the cache capacity.
-        let dense = vin != VIn::Codes;
-        let compact_k;
-        let k = if dense && s.cap != s.kl {
-            compact_k = upload_f16(&c.device, &p.k16);
-            &compact_k
-        } else {
-            &p.k_cache
-        };
         let params = FlashAttnPrefillResumeParams {
             n_heads: s.h as u32,
             n_kv_heads: s.h_kv as u32,
@@ -540,7 +569,7 @@ pub fn encode_precise(
             scale,
             do_causal: true,
             q_offset_in_k: s.q_offset as u32,
-            kv_capacity: if dense { s.kl as u32 } else { s.cap as u32 },
+            kv_capacity: cap as u32,
         };
         precise::dispatch_flash_attn_prefill_precise_d512_resume(
             enc,
@@ -555,13 +584,13 @@ pub fn encode_precise(
         .unwrap();
         return;
     }
-    assert_eq!(s.cap, s.kl, "d256 attends a compacted stage");
     let params = FlashAttnPrecisePrefillParams {
         n_heads: s.h as u32,
         n_kv_heads: s.h_kv as u32,
         head_dim: 256,
         seq_len_q: s.ql as u32,
         seq_len_k: s.kl as u32,
+        kv_capacity: cap as u32,
         batch: 1,
         scale,
         q_offset: s.q_offset as u32,
@@ -571,6 +600,10 @@ pub fn encode_precise(
         Vis::Window => PreciseD256Mask::Window {
             window: s.window.unwrap() as u32,
         },
+        Vis::Causal => {
+            assert!(s.window.is_none(), "causal-only visibility needs no window");
+            PreciseD256Mask::Causal
+        }
         Vis::MaskBlk | Vis::MaskOnly => {
             built = encode_mask(c, enc, &s, vis == Vis::MaskBlk);
             PreciseD256Mask::External {
@@ -584,7 +617,7 @@ pub fn encode_precise(
         &c.device,
         &mut c.registry,
         q,
-        &p.k_cache,
+        k,
         v,
         mask,
         out,
@@ -682,7 +715,7 @@ pub fn run_tiled_f16(c: &mut Ctx, p: &Problem) -> Vec<f32> {
             &c.device,
             &mut c.registry,
             &p.q16_buf,
-            &p.k_cache,
+            &p.k_dense,
             &p.v16_buf,
             Some(&mask),
             blk.as_ref(),
@@ -700,13 +733,12 @@ pub fn run_tiled_f16(c: &mut Ctx, p: &Problem) -> Vec<f32> {
         )
         .unwrap();
     } else {
-        let k = upload_f16(&c.device, &p.k16);
         mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_f16_d512_resume(
             &mut enc,
             &c.device,
             &mut c.registry,
             &p.q16_buf,
-            &k,
+            &p.k_dense,
             &p.v16_buf,
             &out,
             &FlashAttnPrefillResumeParams {

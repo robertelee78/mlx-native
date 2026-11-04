@@ -272,9 +272,10 @@ constant int  nsg_def      = is_function_constant_defined(fc_nsg)   ? fc_nsg   :
 #define D512_V_F32 2
 #define D512_V_CODES 3
 
-// Precise entry points: number of independent F32 partial sums of the
-// Q·K^T reduction over the head dimension.
-#define D512_QK_PARTIALS 16
+// Precise entry points: the blocked Q·K^T reduction over the head
+// dimension: fragments per block and blocks per super-block.
+#define D512_QK_BLOCK 4
+#define D512_QK_SUPER 4
 
 template <typename T, int VForm>
 struct D512VSource {
@@ -949,57 +950,56 @@ void flash_attn_prefill_d512_impl(
           simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
         }
         } else {
-          // Precise: D512_QK_PARTIALS independent F32 partial sums over the
-          // head dimension (head-dim fragment f feeds partial
-          // f % D512_QK_PARTIALS), added pairwise at the end, instead of one
-          // running sum over all 64 fragments.  Same rationale as the d256
-          // precise entry points (flash_attn_prefill.metal).
-          constexpr short kParts = D512_QK_PARTIALS;
-          static_assert(DK8 % kParts == 0 && (kParts & (kParts - 1)) == 0, "QK partials");
-          simdgroup_float8x8 mpart[kParts];
-          FOR_UNROLL (short a = 0; a < kParts; ++a) {
-            mpart[a] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-          }
+          // Precise Q·K^T: a three-level blocked reduction over the head
+          // dimension.  Each block of D512_QK_BLOCK fragments accumulates
+          // from zero, D512_QK_SUPER blocks are summed into a super-block,
+          // and the super-blocks into the score.  One running F32
+          // accumulator over all 64 fragments (512 dependent FMAs per score;
+          // D512_QK_BLOCK = 64, D512_QK_SUPER = 1) fails the §5.1 P2 bound.
           const int kv_row_base = ic + (int)sgitg * 8 + (int)cc * 8 * NSG;
           const bool k_in_bounds = align_K_def || kv_row_base + 8 <= args.kL;
-          for (short f0 = 0; f0 < DK8; f0 += kParts) {
-            FOR_UNROLL (short a = 0; a < kParts; ++a) {
-              const short f = f0 + a;
-              simdgroup_barrier(mem_flags::mem_none);
-              simdgroup_matrix<T, 8, 8> mq1;
-              simdgroup_matrix<T, 8, 8> mk1;
-              simdgroup_load(mq1, sq + 8 * f, DK);
-              if (k_in_bounds) {
-                simdgroup_load(mk1, pk + 8 * f, NS10, 0, true);
-              } else {
-                // Same zero-substituting tail load as the legacy path.
-                const short qid = tiisg / 4;
-                const short sm = (qid & 4) + (tiisg / 2) % 4;
-                const short sn = (qid & 2) * 2 + (tiisg % 2) * 2;
-                const int row0 = kv_row_base + sn;
-                const int dim = 8 * f + sm;
-                T value0 = T(0);
-                T value1 = T(0);
-                if (row0 < args.kL) {
-                  value0 = k_head[(ulong)row0 * (ulong)NS10 + (ulong)dim];
+          constexpr short kBlock = D512_QK_BLOCK;
+          constexpr short kSuper = D512_QK_SUPER;
+          static_assert(DK8 % (kBlock * kSuper) == 0, "QK blocks");
+          for (short s0 = 0; s0 < DK8; s0 += kBlock * kSuper) {
+            simdgroup_float8x8 msup = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            for (short f0 = s0; f0 < s0 + kBlock * kSuper; f0 += kBlock) {
+              simdgroup_float8x8 mblk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+              FOR_UNROLL (short a = 0; a < kBlock; ++a) {
+                const short f = f0 + a;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_matrix<T, 8, 8> mq1;
+                simdgroup_matrix<T, 8, 8> mk1;
+                simdgroup_load(mq1, sq + 8 * f, DK);
+                if (k_in_bounds) {
+                  simdgroup_load(mk1, pk + 8 * f, NS10, 0, true);
+                } else {
+                  // Same zero-substituting tail load as the legacy path.
+                  const short qid = tiisg / 4;
+                  const short sm = (qid & 4) + (tiisg / 2) % 4;
+                  const short sn = (qid & 2) * 2 + (tiisg % 2) * 2;
+                  const int row0 = kv_row_base + sn;
+                  const int dim = 8 * f + sm;
+                  T value0 = T(0);
+                  T value1 = T(0);
+                  if (row0 < args.kL) {
+                    value0 = k_head[(ulong)row0 * (ulong)NS10 + (ulong)dim];
+                  }
+                  if (row0 + 1 < args.kL) {
+                    value1 = k_head[(ulong)(row0 + 1) * (ulong)NS10 + (ulong)dim];
+                  }
+                  mk1.thread_elements()[0] = value0;
+                  mk1.thread_elements()[1] = value1;
                 }
-                if (row0 + 1 < args.kL) {
-                  value1 = k_head[(ulong)(row0 + 1) * (ulong)NS10 + (ulong)dim];
-                }
-                mk1.thread_elements()[0] = value0;
-                mk1.thread_elements()[1] = value1;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(mblk, mq1, mk1, mblk);
               }
-              simdgroup_barrier(mem_flags::mem_none);
-              simdgroup_multiply_accumulate(mpart[a], mq1, mk1, mpart[a]);
+              msup.thread_elements()[0] += mblk.thread_elements()[0];
+              msup.thread_elements()[1] += mblk.thread_elements()[1];
             }
+            mqk.thread_elements()[0] += msup.thread_elements()[0];
+            mqk.thread_elements()[1] += msup.thread_elements()[1];
           }
-          FOR_UNROLL (short stride = kParts / 2; stride > 0; stride /= 2) {
-            FOR_UNROLL (short a = 0; a < stride; ++a) {
-              mpart[a].thread_elements()[0] += mpart[a + stride].thread_elements()[0];
-              mpart[a].thread_elements()[1] += mpart[a + stride].thread_elements()[1];
-            }
-          }
-          mqk = mpart[0];
         }
 
         // Store the 8×8 score frag into ss at this simdgroup's column

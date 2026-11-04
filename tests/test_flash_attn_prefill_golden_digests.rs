@@ -5,8 +5,9 @@
 //! The goldens in `tests/fixtures/flash_attn_prefill_golden_digests.json`
 //! are SHA-256 digests of the full O buffers (pre-filled with a sentinel, so
 //! stray or missing writes change the digest), recorded by this same file
-//! on mlx-native 0.15.16 (`20540a5`, before the change) on both metallib
-//! paths:
+//! on mlx-native 0.15.17 main (`3030aa8`, before the change) on both
+//! metallib paths.  136 cases: every entry point with unaligned and aligned
+//! (align_Q / align_K true) shapes:
 //!
 //! ```text
 //! MLX_FLASH_ATTN_GOLDEN_RECORD=1 cargo test --release \
@@ -155,13 +156,22 @@ fn run_case(
     tile: (usize, usize, u64),
     nsg: Option<i32>,
     feature: Feature,
+    aligned: bool,
     seed: u64,
 ) -> (String, String) {
     let (h, h_kv, batch) = (4usize, 2usize, 1usize);
-    let (ql, kl, cap, off) = match feature {
-        Feature::Causal => (33usize, 101usize, 128usize, 68usize),
-        Feature::MaskBlk => (40, 72, 72, 32),
-        _ => (37, 53, 53, 0),
+    // Unaligned shapes exercise the partial-tile paths; aligned ones
+    // (qL % 32 == 0, kL % 64 == 0, so every tile family's align_Q /
+    // align_K constants are true) the full-tile paths.  The aligned causal
+    // case keeps q_off + qL = kL with no partial Q tile, so the legacy d512
+    // causal chunk limit stays inside kL.
+    let (ql, kl, cap, off) = match (feature, aligned) {
+        (Feature::Causal, false) => (33usize, 101usize, 128usize, 68usize),
+        (Feature::MaskBlk, false) => (40, 72, 72, 32),
+        (_, false) => (37, 53, 53, 0),
+        (Feature::Causal, true) => (32, 128, 192, 96),
+        (Feature::MaskBlk, true) => (64, 128, 128, 64),
+        (_, true) => (64, 128, 128, 0),
     };
     let (bq, bk, threads_y) = tile;
     let mut rng = Rng(seed);
@@ -264,55 +274,63 @@ fn run_case(
     }
     encoder.commit_and_wait().expect("commit");
     let digest = hex::encode(Sha256::digest(o.as_slice::<u8>().expect("read")));
-    (label, digest)
+    // The pipeline label plus the shape: two cases may share a
+    // specialization.
+    (format!("{label}|shape:q{ql}k{kl}c{cap}o{off}"), digest)
 }
 
 fn all_cases(device: &MlxDevice, registry: &mut KernelRegistry) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-    // flash_attn_prefill.metal: (D, BQ, BK, WM) families × dtype × mask kind.
-    for (d, tile) in [(64usize, (32, 16, 4)), (256, (32, 16, 4)), (512, (8, 8, 1))] {
-        for (tag, dtype) in [("bf16", DType::BF16), ("f16", DType::F16)] {
-            for bool_mask in [false, true] {
-                let suffix = if bool_mask { "_boolmask" } else { "" };
-                let name = format!("flash_attn_prefill_{tag}_d{d}{suffix}");
-                for feature in [Feature::Plain, Feature::Causal, Feature::MaskBlk] {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    let (label, digest) = run_case(
-                        device, registry, &name, dtype, bool_mask, d, tile, None, feature, seed,
-                    );
-                    out.insert(label, digest);
+    // The unaligned pass first, so its seeds (and digests) are those of the
+    // original 68-case set; the aligned pass continues the seed stream.
+    for aligned in [false, true] {
+        // flash_attn_prefill.metal: (D, BQ, BK, WM) families × dtype × mask kind.
+        for (d, tile) in [(64usize, (32, 16, 4)), (256, (32, 16, 4)), (512, (8, 8, 1))] {
+            for (tag, dtype) in [("bf16", DType::BF16), ("f16", DType::F16)] {
+                for bool_mask in [false, true] {
+                    let suffix = if bool_mask { "_boolmask" } else { "" };
+                    let name = format!("flash_attn_prefill_{tag}_d{d}{suffix}");
+                    for feature in [Feature::Plain, Feature::Causal, Feature::MaskBlk] {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let (label, digest) = run_case(
+                            device, registry, &name, dtype, bool_mask, d, tile, None, feature,
+                            aligned, seed,
+                        );
+                        out.insert(label, digest);
+                    }
                 }
             }
         }
-    }
-    // flash_attn_prefill_d512.metal: NSG 4 and 8.
-    for (tag, dtype) in [("bf16", DType::BF16), ("f16", DType::F16)] {
-        for bool_mask in [false, true] {
-            let suffix = if bool_mask { "_boolmask" } else { "" };
-            let name = format!("flash_attn_prefill_d512_{tag}{suffix}");
-            for nsg in [4, 8] {
-                for feature in [
-                    Feature::Plain,
-                    Feature::Causal,
-                    Feature::MaskBlk,
-                    Feature::Sinks,
-                ] {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    let tile = (8, 64, nsg as u64);
-                    let (label, digest) = run_case(
-                        device,
-                        registry,
-                        &name,
-                        dtype,
-                        bool_mask,
-                        512,
-                        tile,
-                        Some(nsg),
-                        feature,
-                        seed,
-                    );
-                    out.insert(label, digest);
+        // flash_attn_prefill_d512.metal: NSG 4 and 8.
+        for (tag, dtype) in [("bf16", DType::BF16), ("f16", DType::F16)] {
+            for bool_mask in [false, true] {
+                let suffix = if bool_mask { "_boolmask" } else { "" };
+                let name = format!("flash_attn_prefill_d512_{tag}{suffix}");
+                for nsg in [4, 8] {
+                    for feature in [
+                        Feature::Plain,
+                        Feature::Causal,
+                        Feature::MaskBlk,
+                        Feature::Sinks,
+                    ] {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let tile = (8, 64, nsg as u64);
+                        let (label, digest) = run_case(
+                            device,
+                            registry,
+                            &name,
+                            dtype,
+                            bool_mask,
+                            512,
+                            tile,
+                            Some(nsg),
+                            feature,
+                            aligned,
+                            seed,
+                        );
+                        out.insert(label, digest);
+                    }
                 }
             }
         }
@@ -342,7 +360,12 @@ fn existing_flash_attn_prefill_entry_points_match_their_pre_change_digests() {
     let origins: std::collections::BTreeSet<String> = digests
         .keys()
         .map(|label| {
-            match registry.pipeline_identity(label).expect("identity").origin {
+            let pipeline_label = label.rsplit_once("|shape:").expect("case key").0;
+            match registry
+                .pipeline_identity(pipeline_label)
+                .expect("identity")
+                .origin
+            {
                 KernelPipelineOrigin::PrecompiledMetallib => "precompiled_metallib",
                 KernelPipelineOrigin::RuntimeSource => "runtime_source",
             }

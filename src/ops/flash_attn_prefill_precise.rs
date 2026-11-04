@@ -35,12 +35,18 @@
 //! `[ceil(qL/32), ceil(kL/16)]` or whose length is below
 //! [`blk_buffer_byte_len`].  d512 uses Q 8 × C 64 with NSG 8.
 //!
+//! # Registration
+//!
+//! The six entry points are in `KernelRegistry::new()`'s source map under
+//! the shader file that defines them, so they resolve from the precompiled
+//! metallib by default; no `register` call is needed.
+//!
 //! # Ordering
 //!
 //! The dispatchers encode one compute dispatch and declare nothing to a
-//! `GraphSession`.  In particular the d512 resume reads the caller's K
-//! cache, V codes and norms (or F16 V cache) in place, so the caller must
-//! order it after the writes of those rows (e.g.
+//! `GraphSession`.  Both read K and an in-cache V (codes and norms, or F16)
+//! in place with a `kv_capacity` head stride, so the caller must order the
+//! dispatch after the writes of those rows (e.g.
 //! `barrier_between(&[k, v_codes, v_norms, q], &[out])`).
 
 use metal::MTLSize;
@@ -100,22 +106,6 @@ const PRECISE_D512_CODES_EXTRA_TGMEM: u64 = 256 * 4 + 64 * 2 * 4;
 
 /// Function-constant index of the in-kernel window predicate.
 const FC_HAS_WINDOW: usize = 310;
-
-/// Register the precise entry points against their shader sources.
-pub fn register(registry: &mut KernelRegistry) {
-    for &name in PRECISE_D256_KERNEL_NAMES {
-        registry.register_source(
-            name,
-            crate::ops::flash_attn_prefill::FLASH_ATTN_PREFILL_SHADER_SOURCE,
-        );
-    }
-    for &name in PRECISE_D512_KERNEL_NAMES {
-        registry.register_source(
-            name,
-            crate::ops::flash_attn_prefill_d512::FLASH_ATTN_PREFILL_D512_SHADER_SOURCE,
-        );
-    }
-}
 
 /// Rust mirror of the MSL `AttnPreciseParams` struct (buffer 9).
 #[repr(C)]
@@ -214,6 +204,11 @@ pub struct FlashAttnPrecisePrefillParams {
     pub head_dim: u32,
     pub seq_len_q: u32,
     pub seq_len_k: u32,
+    /// Rows per KV head of K and of an in-cache V (`F16`, `Codes`): the
+    /// head stride, `>= seq_len_k`.  Keys `[0, seq_len_k)` are read in
+    /// place; rows past `seq_len_k` are never read.  A dense F32 V always
+    /// has `seq_len_k` rows per head.
+    pub kv_capacity: u32,
     pub batch: u32,
     /// Finite and > 0; applied to the F32 scores.
     pub scale: f32,
@@ -299,16 +294,23 @@ fn check_common(
     Ok(())
 }
 
-/// Validate the V input against `[B, H_kv, rows, D]` and build the precise
-/// parameter block (norm strides) for it.
+/// Validate the V input and build the precise parameter block (norm
+/// strides) for it.  K and an in-cache V (`F16`, `Codes`) have `cap` rows
+/// per KV head; a dense F32 V has `kl`.  Returns the block and the V row
+/// count per head.
 fn check_v(
     what: &str,
     v: &PreciseV<'_>,
     batch: usize,
     h_kv: usize,
-    rows: usize,
+    (cap, kl): (usize, usize),
     d: usize,
-) -> Result<AttnPreciseParamsGpu> {
+) -> Result<(AttnPreciseParamsGpu, usize)> {
+    let rows = if matches!(v, PreciseV::F32(_)) {
+        kl
+    } else {
+        cap
+    };
     let elements = batch * h_kv * rows * d;
     let npp = d / 256;
     let mut pp = AttnPreciseParamsGpu {
@@ -353,7 +355,7 @@ fn check_v(
             pp.scale_factor_d512 = scale_factor_d512;
         }
     }
-    Ok(pp)
+    Ok((pp, rows))
 }
 
 fn v_bindings<'a>(v: &PreciseV<'a>) -> (KernelArg<'a>, Option<KernelArg<'a>>) {
@@ -422,17 +424,19 @@ fn pipeline_label(name: &str, constants: &[(usize, bool)]) -> String {
 /// Dispatch precise tiled attention for D=256.
 ///
 /// Layouts (contiguous, head-major): Q F16 `[B, H, qL, 256]`; K F16
-/// `[B, H_kv, kL, 256]`; V per [`PreciseV`] with `kL` rows (`Codes` norms
-/// `[B, H_kv, kL]`); O F32 `[B, H, qL, 256]`.  Every O element of rows
-/// `< qL` is written and nothing beyond.
+/// `[B, H_kv, kv_capacity, 256]` with keys `[0, kL)` linear, read in place;
+/// V per [`PreciseV`]: an in-cache V (`F16`, `Codes` with norms
+/// `[B, H_kv, kv_capacity]`) like K, a dense F32 V `[B, H_kv, kL, 256]`;
+/// O F32 `[B, H, qL, 256]`.  Rows `[kL, kv_capacity)` are never read.
+/// Every O element of rows `< qL` is written and nothing beyond.
 ///
 /// # Errors
 ///
 /// `InvalidArgument` for a head_dim other than 256, empty shapes, a GQA
 /// mismatch, a non-finite or non-positive scale, wrong dtypes, undersized
-/// buffers, `q_offset + qL > kL` with an in-kernel mask, a zero window,
-/// codebook bits outside {5, 6, 8}, or a `blk` that does not match the
-/// (32, 16) tile.
+/// buffers, `kL > kv_capacity`, `q_offset + qL > kL` with an in-kernel
+/// mask, a zero window, codebook bits outside {5, 6, 8}, or a `blk` that
+/// does not match the (32, 16) tile.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_flash_attn_prefill_precise_d256(
     encoder: &mut CommandEncoder,
@@ -460,13 +464,20 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
     )?;
     let (b, h, h_kv) = (p.batch as usize, p.n_heads as usize, p.n_kv_heads as usize);
     let (ql, kl, d) = (p.seq_len_q as usize, p.seq_len_k as usize, 256_usize);
+    let cap = p.kv_capacity as usize;
+    if cap < kl {
+        return Err(invalid(
+            WHAT,
+            format!("seq_len_k ({kl}) > kv_capacity ({cap})"),
+        ));
+    }
     check_dtype(WHAT, q, "Q", DType::F16)?;
     check_dtype(WHAT, k, "K", DType::F16)?;
     check_dtype(WHAT, out, "out", DType::F32)?;
     check_len(WHAT, q, "Q", b * h * ql * d)?;
-    check_len(WHAT, k, "K", b * h_kv * kl * d)?;
+    check_len(WHAT, k, "K", b * h_kv * cap * d)?;
     check_len(WHAT, out, "out", b * h * ql * d)?;
-    let mut pp = check_v(WHAT, &v, b, h_kv, kl, d)?;
+    let (mut pp, v_rows) = check_v(WHAT, &v, b, h_kv, (cap, kl), d)?;
 
     let mut mask_strides = None;
     match mask {
@@ -535,7 +546,8 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
     )?;
 
     let q_strides = [(h * ql * d) as i64, (ql * d) as i64, d as i64];
-    let kv_strides = [(h_kv * kl * d) as i64, (kl * d) as i64, d as i64];
+    let k_strides = [(h_kv * cap * d) as i64, (cap * d) as i64, d as i64];
+    let v_strides = [(h_kv * v_rows * d) as i64, (v_rows * d) as i64, d as i64];
     let attn = AttnParamsGpu {
         b: p.batch as i32,
         h: p.n_heads as i32,
@@ -558,8 +570,8 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
         },
         _pad: 0,
         q_strides,
-        k_strides: kv_strides,
-        v_strides: kv_strides,
+        k_strides,
+        v_strides,
         o_strides: q_strides,
     };
     let mask_params = mask_strides.map(|m_strides| AttnMaskParamsGpu { m_strides });
@@ -598,10 +610,10 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
 /// place from the cache.
 ///
 /// Layouts: Q F16 `[B, H, qL, 512]`; K F16 `[B, H_kv, kv_capacity, 512]`
-/// with keys `[0, kL)` linear; V per [`PreciseV`] with `kv_capacity` rows
-/// (`Codes` norms `[B, H_kv, kv_capacity, 2]`); O F32 `[B, H, qL, 512]`.
-/// Rows `[kL, kv_capacity)` are never read.  No K or V scratch is
-/// allocated.  `PreciseV::F32` is parity-only.
+/// with keys `[0, kL)` linear; an in-cache V (`F16`, `Codes` with norms
+/// `[B, H_kv, kv_capacity, 2]`) like K; a dense F32 V `[B, H_kv, kL, 512]`
+/// (parity-only); O F32 `[B, H, qL, 512]`.  Rows `[kL, kv_capacity)` are
+/// never read.  No K or V scratch is allocated.
 ///
 /// # Errors
 ///
@@ -652,14 +664,19 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
         ));
     }
     let (b, h, h_kv) = (p.batch as usize, p.n_heads as usize, p.n_kv_heads as usize);
-    let (ql, cap, d) = (p.seq_len_q as usize, p.kv_capacity as usize, 512_usize);
+    let (ql, kl, cap, d) = (
+        p.seq_len_q as usize,
+        p.seq_len_k as usize,
+        p.kv_capacity as usize,
+        512_usize,
+    );
     check_dtype(WHAT, q, "Q", DType::F16)?;
     check_dtype(WHAT, k, "K", DType::F16)?;
     check_dtype(WHAT, out, "out", DType::F32)?;
     check_len(WHAT, q, "Q", b * h * ql * d)?;
     check_len(WHAT, k, "K", b * h_kv * cap * d)?;
     check_len(WHAT, out, "out", b * h * ql * d)?;
-    let pp = check_v(WHAT, &v, b, h_kv, cap, d)?;
+    let (pp, v_rows) = check_v(WHAT, &v, b, h_kv, (cap, kl), d)?;
 
     let (nq, nc) = (PRECISE_D512_Q, PRECISE_D512_C);
     let constants = d512_constants(p.seq_len_q % nq == 0, p.seq_len_k % nc == 0, p.do_causal);
@@ -670,7 +687,8 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
     )?;
 
     let q_strides = [(h * ql * d) as i64, (ql * d) as i64, d as i64];
-    let kv_strides = [(h_kv * cap * d) as i64, (cap * d) as i64, d as i64];
+    let k_strides = [(h_kv * cap * d) as i64, (cap * d) as i64, d as i64];
+    let v_strides = [(h_kv * v_rows * d) as i64, (v_rows * d) as i64, d as i64];
     let attn = AttnParamsGpu {
         b: p.batch as i32,
         h: p.n_heads as i32,
@@ -689,8 +707,8 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
         ql_off: p.q_offset_in_k as i32,
         _pad: 0,
         q_strides,
-        k_strides: kv_strides,
-        v_strides: kv_strides,
+        k_strides,
+        v_strides,
         o_strides: q_strides,
     };
     let (v_arg, norms_arg) = v_bindings(&v);
