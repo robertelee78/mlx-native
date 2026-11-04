@@ -27,10 +27,12 @@
 use std::io::Write;
 use std::process::Command;
 
+use mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode;
 use mlx_native::{
     quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_dual_gate_up_q4k,
     quantized_matmul_ggml_row_tiled_with_geometry,
-    quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml_mv_grouped_with_geometry,
+    quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry,
+    quantized_matmul_id_ggml_mv_grouped_with_geometry,
     quantized_matmul_id_ggml_mv_with_policy, row_tiled_geometry, DType,
     GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
     KernelRegistry, MlxBuffer, MlxDevice, RowTiledGeometry,
@@ -568,6 +570,12 @@ fn v2_patterns(n_tokens: usize, rng: &mut Rng) -> Vec<Pattern> {
 enum ExpertArm {
     Stock,
     Grouped(u32),
+    /// Stock gate_up then stock `moe_swiglu_batch` (F2 baseline).
+    StockSwiglu,
+    /// E1 gate_up then stock `moe_swiglu_batch`.
+    GroupedSwiglu(u32),
+    /// F2 fused gate_up + GELU·mul.
+    Geglu(u32),
 }
 
 impl Bench {
@@ -620,14 +628,32 @@ impl Bench {
                     let mut arms = vec![ExpertArm::Stock];
                     let cells: &[u32] = if ty == GgmlType::Q4_K { &[1, 2, 4] } else { &[4] };
                     arms.extend(cells.iter().map(|&r0| ExpertArm::Grouped(r0)));
+                    // F2: gate_up + GELU·mul, fused against its two-launch arms.
+                    if ty == GgmlType::Q4_K {
+                        arms.push(ExpertArm::StockSwiglu);
+                        arms.extend(cells.iter().map(|&r0| ExpertArm::GroupedSwiglu(r0)));
+                        arms.extend(cells.iter().map(|&r0| ExpertArm::Geglu(r0)));
+                    }
+                    let swiglu_out = f32_buffer(&self.device, pairs * n / 2, &mut rng);
                     for arm in arms {
-                        let s = self.time_expert(&stacks, &inputs, &ids, &output, &params, arm);
+                        let s = self.time_expert(
+                            &stacks,
+                            &inputs,
+                            &ids,
+                            &output,
+                            &params,
+                            arm,
+                            Some(&swiglu_out),
+                        );
                         let expert_bytes = stride as f64;
                         let logical = expert_bytes * pairs as f64;
                         let unique = expert_bytes * unique_experts as f64;
                         let label = match arm {
                             ExpertArm::Stock => "stock".to_string(),
                             ExpertArm::Grouped(r0) => format!("e1_grouped_rt{r0}"),
+                            ExpertArm::StockSwiglu => "stock+swiglu".to_string(),
+                            ExpertArm::GroupedSwiglu(r0) => format!("e1_grouped_rt{r0}+swiglu"),
+                            ExpertArm::Geglu(r0) => format!("f2_geglu_rt{r0}"),
                         };
                         let line = serde_json::json!({
                             "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
@@ -672,6 +698,7 @@ impl Bench {
         output: &MlxBuffer,
         params: &GgmlQuantizedMatmulIdParams,
         arm: ExpertArm,
+        swiglu_out: Option<&MlxBuffer>,
     ) -> Stats {
         let stock = GgmlRoutingPolicy::default();
         let mut samples = Vec::with_capacity(self.cfg.iters);
@@ -700,6 +727,45 @@ impl Bench {
                         weight,
                         ids,
                         output,
+                        params,
+                        r0,
+                    ),
+                    ExpertArm::StockSwiglu | ExpertArm::GroupedSwiglu(_) => {
+                        let swiglu = swiglu_out.expect("swiglu output");
+                        let product = match arm {
+                            ExpertArm::StockSwiglu => quantized_matmul_id_ggml_mv_with_policy(
+                                &mut encoder, &mut self.registry, &self.device, input, weight, ids,
+                                output, params, &stock,
+                            ),
+                            ExpertArm::GroupedSwiglu(r0) => {
+                                quantized_matmul_id_ggml_mv_grouped_with_geometry(
+                                    &mut encoder, &mut self.registry, &self.device, input, weight,
+                                    ids, output, params, r0,
+                                )
+                            }
+                            _ => unreachable!(),
+                        };
+                        product.and_then(|()| {
+                            encoder.memory_barrier();
+                            moe_swiglu_batch_encode(
+                                &mut encoder,
+                                &mut self.registry,
+                                self.device.metal_device(),
+                                output,
+                                swiglu,
+                                params.n as usize / 2,
+                                (params.n_tokens * params.top_k) as usize,
+                            )
+                        })
+                    }
+                    ExpertArm::Geglu(r0) => quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry(
+                        &mut encoder,
+                        &mut self.registry,
+                        &self.device,
+                        input,
+                        weight,
+                        ids,
+                        swiglu_out.expect("swiglu output"),
                         params,
                         r0,
                     ),
