@@ -16,14 +16,21 @@ fn codebook(source: &str, name: &str) -> Vec<f32> {
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.trim_end_matches('f').parse::<f32>().expect("float literal"))
+        .map(|s| {
+            s.trim_end_matches('f')
+                .parse::<f32>()
+                .expect("float literal")
+        })
         .collect()
 }
 
 #[test]
 fn precise_params_match_the_msl_layout() {
     assert_eq!(std::mem::size_of::<AttnPreciseParamsGpu>(), 40);
-    assert_eq!(std::mem::offset_of!(AttnPreciseParamsGpu, scale_factor_d512), 8);
+    assert_eq!(
+        std::mem::offset_of!(AttnPreciseParamsGpu, scale_factor_d512),
+        8
+    );
     assert_eq!(std::mem::offset_of!(AttnPreciseParamsGpu, n_strides), 16);
     for source in [D256_SOURCE, D512_SOURCE] {
         let start = source.find("struct AttnPreciseParams {").expect("struct");
@@ -66,11 +73,17 @@ fn attention_codebooks_are_the_dequant_codebooks() {
 #[test]
 fn every_precise_name_is_instantiated_in_its_registered_source() {
     for &name in PRECISE_D256_KERNEL_NAMES {
-        assert!(D256_SOURCE.contains(&format!("instantiate_kernel(\"{name}\"")), "{name}");
+        assert!(
+            D256_SOURCE.contains(&format!("instantiate_kernel(\"{name}\"")),
+            "{name}"
+        );
         assert!(!D512_SOURCE.contains(&format!("\"{name}\"")), "{name}");
     }
     for &name in PRECISE_D512_KERNEL_NAMES {
-        assert!(D512_SOURCE.contains(&format!("instantiate_d512_precise(\"{name}\"")), "{name}");
+        assert!(
+            D512_SOURCE.contains(&format!("instantiate_d512_precise(\"{name}\"")),
+            "{name}"
+        );
         assert!(!D256_SOURCE.contains(&format!("\"{name}\"")), "{name}");
     }
 }
@@ -79,7 +92,12 @@ fn every_precise_name_is_instantiated_in_its_registered_source() {
 fn d256_visibility_selects_exactly_one_mask_mechanism() {
     let get = |kind| {
         let c = d256_constants(true, false, kind);
-        let v = |i: usize| c.iter().find(|(idx, _)| *idx == i).map(|(_, b)| *b).unwrap();
+        let v = |i: usize| {
+            c.iter()
+                .find(|(idx, _)| *idx == i)
+                .map(|(_, b)| *b)
+                .unwrap()
+        };
         (v(200), v(201), v(300), v(301), v(303), v(310))
     };
     assert_eq!(
@@ -90,8 +108,14 @@ fn d256_visibility_selects_exactly_one_mask_mechanism() {
         get(PreciseD256MaskKind::External { blk: false }),
         (true, false, true, false, false, false)
     );
-    assert_eq!(get(PreciseD256MaskKind::Window), (true, false, false, true, false, true));
-    assert_eq!(get(PreciseD256MaskKind::Causal), (true, false, false, true, false, false));
+    assert_eq!(
+        get(PreciseD256MaskKind::Window),
+        (true, false, false, true, false, true)
+    );
+    assert_eq!(
+        get(PreciseD256MaskKind::Causal),
+        (true, false, false, true, false, false)
+    );
 }
 
 #[test]

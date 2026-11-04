@@ -1221,6 +1221,10 @@ METAL_FUNC float pfa_tq_hb_centroid(uint idx, int codebook_bits) {
 #define PFA_V_F32 2
 #define PFA_V_CODES 3
 
+// Precise entry points: number of independent F32 partial sums of the
+// Q·K^T reduction over the head dimension (see attention_impl).
+#define PFA_QK_PARTIALS 16
+
 template <typename T, int VForm>
 struct PfaVSource {
   typedef T type;
@@ -1664,18 +1668,60 @@ METAL_FUNC void attention_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    STEEL_PRAGMA_UNROLL
-    for (short dd = 0; dd < TD; dd++) {
-      simdgroup_barrier(mem_flags::mem_none);
+    if constexpr (!ScaleScores) {
+      STEEL_PRAGMA_UNROLL
+      for (short dd = 0; dd < TD; dd++) {
+        simdgroup_barrier(mem_flags::mem_none);
 
-      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
-          &Qs[Qs_offset + dd * Qs_tile_stride]);
-      Ktile.template load<T, 1, 1, LDK_tgp, 1>(
-          &Ks[Ks_offset + dd * Ks_tile_stride]);
+        Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
+            &Qs[Qs_offset + dd * Qs_tile_stride]);
+        Ktile.template load<T, 1, 1, LDK_tgp, 1>(
+            &Ks[Ks_offset + dd * Ks_tile_stride]);
 
-      simdgroup_barrier(mem_flags::mem_none);
+        simdgroup_barrier(mem_flags::mem_none);
 
-      tile_matmad(Stile, Qtile, Ktile, Stile);
+        tile_matmad(Stile, Qtile, Ktile, Stile);
+      }
+    } else {
+      // Precise: PFA_QK_PARTIALS independent F32 partial sums over the
+      // head dimension (head-dim fragment dd feeds partial dd % N), added
+      // pairwise at the end.  One running sum over all TD fragments rounds
+      // against an ever larger partial; the split keeps the Q·K^T rounding
+      // at the level of the vec route's lane-split dot product.
+      constexpr short kParts = PFA_QK_PARTIALS;
+      static_assert(TD % kParts == 0 && (kParts & (kParts - 1)) == 0, "QK partials");
+      MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Spart[kParts];
+      STEEL_PRAGMA_UNROLL
+      for (short a = 0; a < kParts; a++) {
+        Spart[a].clear();
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short dd = 0; dd < TD; dd++) {
+        simdgroup_barrier(mem_flags::mem_none);
+
+        Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
+            &Qs[Qs_offset + dd * Qs_tile_stride]);
+        Ktile.template load<T, 1, 1, LDK_tgp, 1>(
+            &Ks[Ks_offset + dd * Ks_tile_stride]);
+
+        simdgroup_barrier(mem_flags::mem_none);
+
+        tile_matmad(Spart[dd % kParts], Qtile, Ktile, Spart[dd % kParts]);
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short stride = kParts / 2; stride > 0; stride /= 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short a = 0; a < stride; a++) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
+            Spart[a].val_frags[i] += Spart[a + stride].val_frags[i];
+          }
+        }
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
+        Stile.val_frags[i] = Spart[0].val_frags[i];
+      }
     }
 
     if constexpr (ScaleScores) {

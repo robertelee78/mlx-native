@@ -159,3 +159,7 @@ harness = false
 [[bench]]
 name = "bench_moe_id_token_parity"
 harness = false
+
+[[bench]]
+name = "bench_flash_attn_warm_precise"
+harness = false

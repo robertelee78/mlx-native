@@ -70,11 +70,17 @@ pub const K_PRECISE_D512_V16: &str = "flash_attn_prefill_precise_d512_v16";
 pub const K_PRECISE_D512_V32: &str = "flash_attn_prefill_precise_d512_v32";
 
 /// D=256 entry points (defined in `flash_attn_prefill.metal`).
-pub const PRECISE_D256_KERNEL_NAMES: &[&str] =
-    &[K_PRECISE_D256_V32, K_PRECISE_D256_V16, K_PRECISE_D256_VCODES];
+pub const PRECISE_D256_KERNEL_NAMES: &[&str] = &[
+    K_PRECISE_D256_V32,
+    K_PRECISE_D256_V16,
+    K_PRECISE_D256_VCODES,
+];
 /// D=512 entry points (defined in `flash_attn_prefill_d512.metal`).
-pub const PRECISE_D512_KERNEL_NAMES: &[&str] =
-    &[K_PRECISE_D512_VCODES, K_PRECISE_D512_V16, K_PRECISE_D512_V32];
+pub const PRECISE_D512_KERNEL_NAMES: &[&str] = &[
+    K_PRECISE_D512_VCODES,
+    K_PRECISE_D512_V16,
+    K_PRECISE_D512_V32,
+];
 
 /// D=256 query tile (rows per threadgroup) of every precise entry point.
 pub const PRECISE_D256_BQ: u32 = 32;
@@ -98,7 +104,10 @@ const FC_HAS_WINDOW: usize = 310;
 /// Register the precise entry points against their shader sources.
 pub fn register(registry: &mut KernelRegistry) {
     for &name in PRECISE_D256_KERNEL_NAMES {
-        registry.register_source(name, crate::ops::flash_attn_prefill::FLASH_ATTN_PREFILL_SHADER_SOURCE);
+        registry.register_source(
+            name,
+            crate::ops::flash_attn_prefill::FLASH_ATTN_PREFILL_SHADER_SOURCE,
+        );
     }
     for &name in PRECISE_D512_KERNEL_NAMES {
         registry.register_source(
@@ -229,7 +238,10 @@ fn invalid(what: &str, detail: String) -> MlxError {
 
 fn check_dtype(what: &str, buf: &MlxBuffer, name: &str, dtype: DType) -> Result<()> {
     if buf.dtype() != dtype {
-        return Err(invalid(what, format!("{name} must be {dtype}, got {}", buf.dtype())));
+        return Err(invalid(
+            what,
+            format!("{name} must be {dtype}, got {}", buf.dtype()),
+        ));
     }
     Ok(())
 }
@@ -239,7 +251,10 @@ fn check_len(what: &str, buf: &MlxBuffer, name: &str, elements: usize) -> Result
     if buf.byte_len() < bytes {
         return Err(invalid(
             what,
-            format!("{name} needs at least {bytes} bytes, got {}", buf.byte_len()),
+            format!(
+                "{name} needs at least {bytes} bytes, got {}",
+                buf.byte_len()
+            ),
         ));
     }
     Ok(())
@@ -258,7 +273,10 @@ fn check_common(
     scale: f32,
 ) -> Result<()> {
     if head_dim != expected_head_dim {
-        return Err(invalid(what, format!("head_dim must be {expected_head_dim}, got {head_dim}")));
+        return Err(invalid(
+            what,
+            format!("head_dim must be {expected_head_dim}, got {head_dim}"),
+        ));
     }
     if n_heads == 0 || n_kv_heads == 0 || seq_len_q == 0 || seq_len_k == 0 || batch == 0 {
         return Err(invalid(
@@ -273,7 +291,10 @@ fn check_common(
         ));
     }
     if !(scale.is_finite() && scale > 0.0) {
-        return Err(invalid(what, format!("scale must be finite and > 0, got {scale}")));
+        return Err(invalid(
+            what,
+            format!("scale must be finite and > 0, got {scale}"),
+        ));
     }
     Ok(())
 }
@@ -306,7 +327,12 @@ fn check_v(
             check_dtype(what, buf, "V", DType::F16)?;
             check_len(what, buf, "V", elements)?;
         }
-        PreciseV::Codes { codes, norms, codebook_bits, scale_factor_d512 } => {
+        PreciseV::Codes {
+            codes,
+            norms,
+            codebook_bits,
+            scale_factor_d512,
+        } => {
             check_dtype(what, codes, "V codes", DType::U8)?;
             check_dtype(what, norms, "V norms", DType::F32)?;
             check_len(what, codes, "V codes", elements)?;
@@ -375,7 +401,13 @@ fn d256_constants(align_q: bool, align_k: bool, kind: PreciseD256MaskKind) -> [(
 
 /// Function constants of a d512 precise specialization.
 fn d512_constants(align_q: bool, align_k: bool, do_causal: bool) -> [(usize, bool); 5] {
-    [(200, align_q), (201, align_k), (300, false), (301, do_causal), (303, false)]
+    [
+        (200, align_q),
+        (201, align_k),
+        (300, false),
+        (301, do_causal),
+        (303, false),
+    ]
 }
 
 /// Pipeline label (`KernelRegistry` cache key) of a specialization.
@@ -416,7 +448,14 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
     const WHAT: &str = "dispatch_flash_attn_prefill_precise_d256";
     let p = params;
     check_common(
-        WHAT, p.n_heads, p.n_kv_heads, p.head_dim, 256, p.seq_len_q, p.seq_len_k, p.batch,
+        WHAT,
+        p.n_heads,
+        p.n_kv_heads,
+        p.head_dim,
+        256,
+        p.seq_len_q,
+        p.seq_len_k,
+        p.batch,
         p.scale,
     )?;
     let (b, h, h_kv) = (p.batch as usize, p.n_heads as usize, p.n_kv_heads as usize);
@@ -434,7 +473,12 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
         PreciseD256Mask::External { mask, blk } => {
             check_dtype(WHAT, mask, "mask", DType::F16)?;
             let rank2 = mask.shape().len() == 2;
-            check_len(WHAT, mask, "mask", if rank2 { ql * kl } else { b * h * ql * kl })?;
+            check_len(
+                WHAT,
+                mask,
+                "mask",
+                if rank2 { ql * kl } else { b * h * ql * kl },
+            )?;
             mask_strides = Some(if rank2 {
                 [0, 0, kl as i64]
             } else {
@@ -475,14 +519,20 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
     {
         return Err(invalid(
             WHAT,
-            format!("q_offset ({}) + seq_len_q ({ql}) > seq_len_k ({kl})", p.q_offset),
+            format!(
+                "q_offset ({}) + seq_len_q ({ql}) > seq_len_k ({kl})",
+                p.q_offset
+            ),
         ));
     }
 
     let (bq, bk) = (PRECISE_D256_BQ, PRECISE_D256_BK);
     let constants = d256_constants(p.seq_len_q % bq == 0, p.seq_len_k % bk == 0, mask.kind());
-    let pipeline =
-        registry.get_pipeline_with_bool_constants(d256_kernel(v.form()), device.metal_device(), &constants)?;
+    let pipeline = registry.get_pipeline_with_bool_constants(
+        d256_kernel(v.form()),
+        device.metal_device(),
+        &constants,
+    )?;
 
     let q_strides = [(h * ql * d) as i64, (ql * d) as i64, d as i64];
     let kv_strides = [(h_kv * kl * d) as i64, (kl * d) as i64, d as i64];
@@ -501,7 +551,11 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
         nk_aligned: (p.seq_len_k / bk) as i32,
         ql_rem: (p.seq_len_q % bq) as i32,
         kl_rem: (p.seq_len_k % bk) as i32,
-        ql_off: if mask_strides.is_some() { 0 } else { p.q_offset as i32 },
+        ql_off: if mask_strides.is_some() {
+            0
+        } else {
+            p.q_offset as i32
+        },
         _pad: 0,
         q_strides,
         k_strides: kv_strides,
@@ -530,7 +584,11 @@ pub fn dispatch_flash_attn_prefill_precise_d256(
         args.push((10, norms));
     }
 
-    let grid = MTLSize::new(p.seq_len_q.div_ceil(bq) as u64, p.n_heads as u64, p.batch as u64);
+    let grid = MTLSize::new(
+        p.seq_len_q.div_ceil(bq) as u64,
+        p.n_heads as u64,
+        p.batch as u64,
+    );
     encoder.set_op_kind(CapturedOpKind::Sdpa);
     encoder.encode_threadgroups_with_args(pipeline, &args, grid, MTLSize::new(32, 4, 1));
     Ok(())
@@ -565,7 +623,14 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
     const WHAT: &str = "dispatch_flash_attn_prefill_precise_d512_resume";
     let p = params;
     check_common(
-        WHAT, p.n_heads, p.n_kv_heads, p.head_dim, 512, p.seq_len_q, p.seq_len_k, p.batch,
+        WHAT,
+        p.n_heads,
+        p.n_kv_heads,
+        p.head_dim,
+        512,
+        p.seq_len_q,
+        p.seq_len_k,
+        p.batch,
         p.scale,
     )?;
     if p.q_offset_in_k as u64 + p.seq_len_q as u64 > p.seq_len_k as u64 {
@@ -580,7 +645,10 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
     if p.seq_len_k > p.kv_capacity {
         return Err(invalid(
             WHAT,
-            format!("seq_len_k ({}) > kv_capacity ({})", p.seq_len_k, p.kv_capacity),
+            format!(
+                "seq_len_k ({}) > kv_capacity ({})",
+                p.seq_len_k, p.kv_capacity
+            ),
         ));
     }
     let (b, h, h_kv) = (p.batch as usize, p.n_heads as usize, p.n_kv_heads as usize);
@@ -595,8 +663,11 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
 
     let (nq, nc) = (PRECISE_D512_Q, PRECISE_D512_C);
     let constants = d512_constants(p.seq_len_q % nq == 0, p.seq_len_k % nc == 0, p.do_causal);
-    let pipeline =
-        registry.get_pipeline_with_bool_constants(d512_kernel(v.form()), device.metal_device(), &constants)?;
+    let pipeline = registry.get_pipeline_with_bool_constants(
+        d512_kernel(v.form()),
+        device.metal_device(),
+        &constants,
+    )?;
 
     let q_strides = [(h * ql * d) as i64, (ql * d) as i64, d as i64];
     let kv_strides = [(h_kv * cap * d) as i64, (cap * d) as i64, d as i64];
@@ -637,7 +708,11 @@ pub fn dispatch_flash_attn_prefill_precise_d512_resume(
         tgmem += PRECISE_D512_CODES_EXTRA_TGMEM;
     }
 
-    let grid = MTLSize::new(p.seq_len_q.div_ceil(nq) as u64, p.n_heads as u64, p.batch as u64);
+    let grid = MTLSize::new(
+        p.seq_len_q.div_ceil(nq) as u64,
+        p.n_heads as u64,
+        p.batch as u64,
+    );
     encoder.set_op_kind(CapturedOpKind::Sdpa);
     encoder.encode_threadgroups_with_args_and_shared(
         pipeline,

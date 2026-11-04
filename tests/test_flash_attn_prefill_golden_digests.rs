@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use half::{bf16, f16};
-use mlx_native::KernelPipelineOrigin;
 use mlx_native::ops::flash_attn_prefill::{AttnMaskParamsGpu, AttnParamsGpu};
+use mlx_native::KernelPipelineOrigin;
 use mlx_native::{DType, KernelArg, KernelRegistry, MlxBuffer, MlxDevice};
 use sha2::{Digest, Sha256};
 
@@ -46,16 +46,26 @@ impl Rng {
 
 fn bytes_of(dtype: DType, values: &[f32]) -> Vec<u8> {
     match dtype {
-        DType::F16 => values.iter().flat_map(|&v| f16::from_f32(v).to_le_bytes()).collect(),
-        DType::BF16 => values.iter().flat_map(|&v| bf16::from_f32(v).to_le_bytes()).collect(),
+        DType::F16 => values
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+            .collect(),
+        DType::BF16 => values
+            .iter()
+            .flat_map(|&v| bf16::from_f32(v).to_le_bytes())
+            .collect(),
         DType::F32 => values.iter().flat_map(|&v| v.to_le_bytes()).collect(),
         other => panic!("unsupported dtype {other}"),
     }
 }
 
 fn upload(device: &MlxDevice, dtype: DType, bytes: &[u8], shape: Vec<usize>) -> MlxBuffer {
-    let mut buf = device.alloc_buffer(bytes.len(), dtype, shape).expect("alloc");
-    buf.as_mut_slice::<u8>().expect("map").copy_from_slice(bytes);
+    let mut buf = device
+        .alloc_buffer(bytes.len(), dtype, shape)
+        .expect("alloc");
+    buf.as_mut_slice::<u8>()
+        .expect("map")
+        .copy_from_slice(bytes);
     buf
 }
 
@@ -84,13 +94,20 @@ fn mask_and_blk(
     let mask = match dtype {
         Some(dtype) => {
             let values: Vec<f32> = (0..ql * kl)
-                .map(|e| if visible(e / kl, e % kl, off) { 0.0 } else { f32::NEG_INFINITY })
+                .map(|e| {
+                    if visible(e / kl, e % kl, off) {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
                 .collect();
             upload(device, dtype, &bytes_of(dtype, &values), vec![ql, kl])
         }
         None => {
-            let values: Vec<u8> =
-                (0..ql * kl).map(|e| u8::from(visible(e / kl, e % kl, off))).collect();
+            let values: Vec<u8> = (0..ql * kl)
+                .map(|e| u8::from(visible(e / kl, e % kl, off)))
+                .collect();
             upload(device, DType::U8, &values, vec![ql, kl])
         }
     };
@@ -106,7 +123,13 @@ fn mask_and_blk(
                     all &= v;
                 }
             }
-            blk[t * nk + c] = if !any { 0 } else if all { 2 } else { 1 };
+            blk[t * nk + c] = if !any {
+                0
+            } else if all {
+                2
+            } else {
+                1
+            };
         }
     }
     let blk = upload(device, DType::U8, &blk, vec![nq, nk]);
@@ -199,7 +222,9 @@ fn run_case(
         v_strides: kv_strides,
         o_strides: q_strides,
     };
-    let mask_params = AttnMaskParamsGpu { m_strides: [0, 0, kl as i64] };
+    let mask_params = AttnMaskParamsGpu {
+        m_strides: [0, 0, kl as i64],
+    };
 
     let pipeline = registry
         .get_pipeline_with_constants(name, device.metal_device(), &bools, &ints)
@@ -267,11 +292,24 @@ fn all_cases(device: &MlxDevice, registry: &mut KernelRegistry) -> BTreeMap<Stri
             let suffix = if bool_mask { "_boolmask" } else { "" };
             let name = format!("flash_attn_prefill_d512_{tag}{suffix}");
             for nsg in [4, 8] {
-                for feature in [Feature::Plain, Feature::Causal, Feature::MaskBlk, Feature::Sinks] {
+                for feature in [
+                    Feature::Plain,
+                    Feature::Causal,
+                    Feature::MaskBlk,
+                    Feature::Sinks,
+                ] {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let tile = (8, 64, nsg as u64);
                     let (label, digest) = run_case(
-                        device, registry, &name, dtype, bool_mask, 512, tile, Some(nsg), feature,
+                        device,
+                        registry,
+                        &name,
+                        dtype,
+                        bool_mask,
+                        512,
+                        tile,
+                        Some(nsg),
+                        feature,
                         seed,
                     );
                     out.insert(label, digest);
@@ -320,11 +358,23 @@ fn existing_flash_attn_prefill_entry_points_match_their_pre_change_digests() {
         .map(|s| serde_json::from_str(&s).expect("fixture json"))
         .unwrap_or_else(|| serde_json::json!({ "device": device.name(), "paths": {} }));
     if std::env::var("MLX_FLASH_ATTN_GOLDEN_RECORD").as_deref() == Ok("1") {
-        assert_eq!(fixture["device"], serde_json::json!(device.name()), "recording device");
+        assert_eq!(
+            fixture["device"],
+            serde_json::json!(device.name()),
+            "recording device"
+        );
         fixture["paths"][&origin] = serde_json::to_value(&digests).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_string_pretty(&fixture).unwrap() + "\n").unwrap();
-        eprintln!("recorded {} {origin} digests on {}", digests.len(), device.name());
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&fixture).unwrap() + "\n",
+        )
+        .unwrap();
+        eprintln!(
+            "recorded {} {origin} digests on {}",
+            digests.len(),
+            device.name()
+        );
         return;
     }
     assert_eq!(
@@ -332,11 +382,22 @@ fn existing_flash_attn_prefill_entry_points_match_their_pre_change_digests() {
         serde_json::json!(device.name()),
         "goldens were recorded on another GPU"
     );
-    let golden: BTreeMap<String, String> = serde_json::from_value(fixture["paths"][&origin].clone())
-        .unwrap_or_else(|_| panic!("no {origin} goldens in {FIXTURE}"));
+    let golden: BTreeMap<String, String> =
+        serde_json::from_value(fixture["paths"][&origin].clone())
+            .unwrap_or_else(|_| panic!("no {origin} goldens in {FIXTURE}"));
     assert_eq!(golden.len(), digests.len(), "case set changed");
-    let mismatches: Vec<&String> =
-        digests.iter().filter(|(label, d)| golden.get(*label) != Some(*d)).map(|(l, _)| l).collect();
-    assert!(mismatches.is_empty(), "{} {origin} entry points changed: {mismatches:?}", mismatches.len());
-    eprintln!("{} {origin} digests bitwise equal to the pre-change goldens", digests.len());
+    let mismatches: Vec<&String> = digests
+        .iter()
+        .filter(|(label, d)| golden.get(*label) != Some(*d))
+        .map(|(l, _)| l)
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "{} {origin} entry points changed: {mismatches:?}",
+        mismatches.len()
+    );
+    eprintln!(
+        "{} {origin} digests bitwise equal to the pre-change goldens",
+        digests.len()
+    );
 }
