@@ -20,9 +20,9 @@
 //! time-axis positions, next `seq_len` the height-axis, then width, then extra.
 //! For text-only inputs all four axes equal the token's 1-D position.
 //!
-//! Pair indexing is NeoX-style: each thread rotates
-//! `(x[p], x[p + head_dim/2])` for pair `p ∈ [0, rope_dim/2)`.
-//! Pairs `p ≥ rope_dim/2` pass through unchanged (partial-rotary tail).
+//! Pair indexing is NeoX-style within the rotated block: each thread rotates
+//! `(x[p], x[p + rope_dim/2])` for pair `p ∈ [0, rope_dim/2)`.
+//! Dims `[rope_dim, head_dim)` pass through unchanged (partial-rotary tail).
 //!
 //! # References
 //!
@@ -61,7 +61,7 @@ pub struct RopeTrainParams {
     /// Full head dimension (must be even).
     pub head_dim: u32,
     /// Number of dimensions that participate in rotation (≤ head_dim, even).
-    /// Pairs `[rope_dim/2, head_dim/2)` pass through unchanged.
+    /// Dims `[rope_dim, head_dim)` pass through unchanged.
     pub rope_dim: u32,
     /// Base frequency (theta).  Qwen3.5/3.6: `1_000_000.0 = 1e6`.
     ///

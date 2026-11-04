@@ -14,9 +14,13 @@
 //!      → axis 0; `== 1 && sector < 3*s1` → axis 1; `== 2 && sector < 3*s2`
 //!      → axis 2; else axis 3.
 //! 3. `theta = position[axis] * freq_base^(-2p/rope_dim)`
-//! 4. Rotate pair `(x[p], x[p + head_dim/2])` by that angle (NeoX indexing).
+//! 4. Rotate pair `(x[p], x[p + rope_dim/2])` by that angle (NeoX indexing
+//!    within the rotated block `[0, rope_dim)`).
 //!
-//! Pairs `p ≥ rope_dim/2` pass through unchanged (partial-rotary-factor).
+//! Dims `[rope_dim, head_dim)` pass through unchanged (partial-rotary-factor).
+//! The partner offset is `rope_dim/2`, not `head_dim/2`: for Qwen3.5 /
+//! Qwen3.6 (`head_dim = 256`, `rope_dim = 64`) pairs are `(p, p + 32)` and
+//! dims 64..255 are the tail. With `rope_dim == head_dim` both offsets agree.
 //!
 //! # Positions layout
 //!
@@ -104,8 +108,12 @@ pub enum RopeMultiMode {
 /// Shape + config for a rope_multi dispatch.
 #[derive(Debug, Clone, Copy)]
 pub struct RopeMultiParams {
+    /// Row length and row stride of `input` / `output`, in elements.
     pub head_dim: u32,
-    pub rope_dim: u32, // must be <= head_dim; must be even
+    /// Length of the rotated block `[0, rope_dim)` (even, `<= head_dim`).
+    /// Pairs are `(p, p + rope_dim/2)` for `p < rope_dim/2`; dims
+    /// `[rope_dim, head_dim)` are copied through unchanged.
+    pub rope_dim: u32,
     pub n_heads: u32,
     pub seq_len: u32,
     pub freq_base: f32,
@@ -254,7 +262,8 @@ pub fn dispatch_rope_multi(
     let half_dim = p.head_dim / 2;
     let n_rows = p.seq_len * p.n_heads;
 
-    // Grid: (half_dim, n_rows). Every thread writes a NeoX pair.
+    // Grid: (half_dim, n_rows). Thread p < rope_dim/2 rotates the pair
+    // (p, p + rope_dim/2); thread p >= rope_dim/2 copies two tail dims.
     let grid = MTLSize::new(half_dim as u64, n_rows as u64, 1);
 
     let tg_x = std::cmp::min(half_dim, 256).max(1);

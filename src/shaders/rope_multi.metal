@@ -28,11 +28,17 @@ using namespace metal;
 // theta-exponent restart at the s0 boundary is the structural difference
 // versus MROPE/IMROPE.
 //
-// # Pair indexing (NeoX-style)
+// # Pair indexing (NeoX-style, within the rotated block)
 //
-// For each pair p in [0, head_dim / 2), the rotation acts on
-// `(x[p], x[p + head_dim/2])`. Only the first `rope_dim / 2` pairs are
-// rotated; the remaining pairs pass through unchanged.
+// The first `rope_dim` dims of each row form the rotated block; dims
+// `[rope_dim, head_dim)` are the unrotated tail. For each pair
+// p in [0, rope_dim / 2), the rotation acts on `(x[p], x[p + rope_dim/2])`.
+// Tail dims are copied through unchanged. This matches the reference
+// NeoX/MROPE/IMROPE rotation, whose partner offset is `n_dims / 2` with
+// `n_dims = rope_dim` (NOT `head_dim / 2`). Qwen3.5 / Qwen3.6 text has
+// head_dim = 256, rope_dim = 64: pairs are (p, p + 32), dims 64..255 pass
+// through. For rope_dim == head_dim the partner is p + head_dim/2, so the
+// full-rotary case (and VISION, which requires it) is unchanged.
 //
 // # Per-pair frequency
 //
@@ -77,6 +83,8 @@ using namespace metal;
 //   buffer(0): input       - shape [n_rows, head_dim]  (n_rows = seq_len*n_heads)
 //   buffer(1): output      - same shape + dtype as input
 //   buffer(2): params      - float4: (freq_base, head_dim_f, rope_dim_f, 0)
+//                            head_dim = row stride / row length;
+//                            rope_dim = rotated block length (even, <= head_dim)
 //   buffer(3): positions   - int32 array, length 4 * seq_len
 //   buffer(4): rope_params - uint4: (n_heads, mode, seq_len, 0)
 //   buffer(5): sections    - uint4: (s0, s1, s2, s3)
@@ -84,8 +92,10 @@ using namespace metal;
 // # Grid
 //
 //   Grid: (head_dim / 2, n_rows, 1). Every thread writes exactly 2 output
-//   elements (one pair). Threads with pair_idx >= rope_dim/2 copy input
-//   unchanged — partial-rotary pass-through.
+//   elements. Threads with pair_idx < rope_dim/2 rotate the pair
+//   (pair_idx, pair_idx + rope_dim/2). Threads with pair_idx >= rope_dim/2
+//   copy two tail dims: tail index t = pair_idx - rope_dim/2 copies dims
+//   rope_dim + 2t and rope_dim + 2t + 1 (partial-rotary pass-through).
 
 // ----- constants -----
 
@@ -175,7 +185,7 @@ kernel void rope_multi_f32(
     const float freq_base = params[0];
     const uint head_dim   = uint(params[1]);
     const uint rope_dim   = uint(params[2]);
-    const uint half_dim   = head_dim / 2u;
+    const uint half_dim   = head_dim / 2u;   // grid width (threads per row)
     const uint half_rope  = rope_dim / 2u;
 
     const uint n_heads = rope_params[0];
@@ -186,10 +196,11 @@ kernel void rope_multi_f32(
 
     const uint base = row_idx * head_dim;
 
-    // Pass-through for pairs outside the rotary range.
+    // Pass-through for the unrotated tail [rope_dim, head_dim).
     if (pair_idx >= half_rope) {
-        output[base + pair_idx]            = input[base + pair_idx];
-        output[base + pair_idx + half_dim] = input[base + pair_idx + half_dim];
+        const uint d = rope_dim + 2u * (pair_idx - half_rope);
+        output[base + d]      = input[base + d];
+        output[base + d + 1u] = input[base + d + 1u];
         return;
     }
 
@@ -223,10 +234,10 @@ kernel void rope_multi_f32(
     const float sin_a = cs.y;
 
     const float x0 = input[base + pair_idx];
-    const float x1 = input[base + pair_idx + half_dim];
+    const float x1 = input[base + pair_idx + half_rope];
 
-    output[base + pair_idx]            = x0 * cos_a - x1 * sin_a;
-    output[base + pair_idx + half_dim] = x0 * sin_a + x1 * cos_a;
+    output[base + pair_idx]             = x0 * cos_a - x1 * sin_a;
+    output[base + pair_idx + half_rope] = x0 * sin_a + x1 * cos_a;
     // s3 is read-referenced above solely to avoid unused-variable noise on
     // some shader compilers; its behavior only matters when sector falls
     // into the axis-3 branch inside pick_axis.
@@ -250,7 +261,7 @@ kernel void rope_multi_bf16(
     const float freq_base = params[0];
     const uint head_dim   = uint(params[1]);
     const uint rope_dim   = uint(params[2]);
-    const uint half_dim   = head_dim / 2u;
+    const uint half_dim   = head_dim / 2u;   // grid width (threads per row)
     const uint half_rope  = rope_dim / 2u;
 
     const uint n_heads = rope_params[0];
@@ -262,8 +273,9 @@ kernel void rope_multi_bf16(
     const uint base = row_idx * head_dim;
 
     if (pair_idx >= half_rope) {
-        output[base + pair_idx]            = input[base + pair_idx];
-        output[base + pair_idx + half_dim] = input[base + pair_idx + half_dim];
+        const uint d = rope_dim + 2u * (pair_idx - half_rope);
+        output[base + d]      = input[base + d];
+        output[base + d + 1u] = input[base + d + 1u];
         return;
     }
 
@@ -291,9 +303,9 @@ kernel void rope_multi_bf16(
     const float sin_a = cs.y;
 
     const float x0 = float(input[base + pair_idx]);
-    const float x1 = float(input[base + pair_idx + half_dim]);
+    const float x1 = float(input[base + pair_idx + half_rope]);
 
-    output[base + pair_idx]            = bfloat(x0 * cos_a - x1 * sin_a);
-    output[base + pair_idx + half_dim] = bfloat(x0 * sin_a + x1 * cos_a);
+    output[base + pair_idx]             = bfloat(x0 * cos_a - x1 * sin_a);
+    output[base + pair_idx + half_rope] = bfloat(x0 * sin_a + x1 * cos_a);
     (void)s3;
 }
