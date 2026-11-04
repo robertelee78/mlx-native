@@ -346,7 +346,7 @@ fn registration_fallbacks_build_from_runtime_source() {
             // API (same exception as test_all_shaders_compile.rs).
             Err(MlxError::ShaderCompilationError { message, .. })
                 if source.contains("#include <metal_tensor>")
-                    && message.contains("'metal_tensor' file not found") =>
+                    && message.contains("fatal error: 'metal_tensor' file not found") =>
             {
                 tensor_unavailable.push(name);
                 continue;
