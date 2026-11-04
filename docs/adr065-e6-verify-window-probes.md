@@ -83,11 +83,13 @@ and logical bandwidth 248–493 GB/s. Per-case numbers are in
 
 The `KernelNotFound` row above was a registry gap at 0.15.16:
 `KernelRegistry::new()` did not register the
-`gated_delta_net_decode_capture_f32_{1,2,4}` sources. The fix (`4e32003`,
-released in 0.15.17 with its test `gdn_decode_capture_runtime_source`)
-registers them, and the E6 rerun on this branch covers both capture probes on
-the runtime path (see "P4a results"). The fix is not a P4a dependency: the
-restore primitives never used those kernels.
+`gated_delta_net_decode_capture_f32_{1,2,4}` sources. 0.15.17 (`4e32003`)
+registered them. 0.15.18 replaces that with registration fallbacks for every
+register-only kernel, including `ssm_conv_capture_forward_f32`; its test
+`registration_fallback_runtime_sources` covers all of them. The E6 rerun on
+this branch covers both capture probes on the runtime path (see "P4a
+results"). The fix is not a P4a dependency: the restore primitives never used
+those kernels.
 
 ## P4a: DeltaNet capture restore with existing primitives (path A)
 

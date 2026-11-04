@@ -2403,7 +2403,8 @@ impl KernelRegistry {
         self.cache.len()
     }
 
-    /// Number of registered shader sources.
+    /// Number of shader sources this registry holds, including registration
+    /// fallbacks the constructor carries for op `register` functions.
     pub fn source_count(&self) -> usize {
         self.sources.len()
     }
