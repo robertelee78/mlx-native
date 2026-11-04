@@ -478,7 +478,7 @@ pub fn quantized_matmul_id_ggml_mv_grouped_with_geometry(
     params: &GgmlQuantizedMatmulIdParams,
     rows_per_simdgroup: u32,
 ) -> Result<()> {
-    validate_id_call(input, weight, ids, output, params)?;
+    validate_id_call(input, weight, ids, output, params, params.n)?;
     dispatch_id_mv_grouped(
         encoder,
         registry,
@@ -490,6 +490,73 @@ pub fn quantized_matmul_id_ggml_mv_grouped_with_geometry(
         params,
         rows_per_simdgroup,
     )
+}
+
+/// Q4-GEMMA-DECODE F2 bench/test entry: expert-grouped Q4_K gate_up with the
+/// `moe_swiglu_batch` GELU-tanh(gate) * up epilogue.
+///
+/// The weight is the stacked `[n_experts, n, K]` gate_up tensor whose rows
+/// `0..n/2` are gate and `n/2..n` are up; `output` is `[n_tokens * top_k,
+/// n/2]` f32. The result is bitwise equal to `kernel_mul_mv_id_q4_K_f32`
+/// into `[pairs, n]` followed by `moe_swiglu_batch_encode(.., n/2, pairs)`,
+/// including out-of-range ids (NaN poison mapped through the epilogue).
+/// `rows_per_simdgroup` is the number of gate/up row pairs per SIMD group,
+/// in {1, 2, 4}.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    rows_per_simdgroup: u32,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_K || params.n % 2 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped GEGLU mv_id requires Q4_K and an even gate_up width; got {:?} at N = {}",
+            params.ggml_type, params.n
+        )));
+    }
+    let kernel_name = match rows_per_simdgroup {
+        1 => "kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt1",
+        2 => "kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt2",
+        4 => "kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped GEGLU mv_id supports R0 in {{1, 2, 4}}; got {rows_per_simdgroup}"
+            )))
+        }
+    };
+    let n_ff = params.n / 2;
+    validate_id_call(input, weight, ids, output, params, n_ff)?;
+
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    let gpu_params = GgmlMatvecIdGpuParams {
+        ne0: i64::from(n_ff),
+        ..mv_id_gpu_params(params)
+    };
+    let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
+    let columns_per_threadgroup = 2 * rows_per_simdgroup as usize;
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        metal::MTLSize::new(
+            div_ceil(n_ff as usize, columns_per_threadgroup) as u64,
+            total_rows,
+            1,
+        ),
+        metal::MTLSize::new(2, 32, 1),
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -505,7 +572,7 @@ fn quantized_matmul_id_ggml_impl(
     force_mv: bool,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
-    validate_id_call(input, weight, ids, output, params)?;
+    validate_id_call(input, weight, ids, output, params, params.n)?;
 
     // ADR-011 Phase 3 — route on n_tokens threshold.
     //
@@ -553,12 +620,15 @@ fn quantized_matmul_id_ggml_impl(
     )
 }
 
+/// `output_cols` is the row width of the `[n_tokens * top_k, output_cols]`
+/// output (`params.n`, or `params.n / 2` for the GEGLU epilogue).
 fn validate_id_call(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
+    output_cols: u32,
 ) -> Result<()> {
     validate_native_expert_dtypes("quantized_matmul_id_ggml", input, weight, ids, output)?;
     let qk = params.ggml_type.block_values();
@@ -634,12 +704,12 @@ fn validate_id_call(
 
     let expected_output_bytes = checked_byte_extent(
         "output",
-        &[total_rows, params.n as usize, DType::F32.size_of()],
+        &[total_rows, output_cols as usize, DType::F32.size_of()],
     )?;
     if output.data_byte_len() < expected_output_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml: output buffer too small: expected {} bytes for [{} x {}] f32, got {}",
-            expected_output_bytes, total_rows, params.n, output.data_byte_len()
+            expected_output_bytes, total_rows, output_cols, output.data_byte_len()
         )));
     }
     Ok(())
