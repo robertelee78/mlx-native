@@ -315,6 +315,86 @@ fn iq4_xs_prompt_exposes_matvec_fallback() {
 }
 
 #[test]
+fn iq2_xxs_is_expert_only() {
+    // Dense mv, dense mm, batched and fused dense routes have no kernel.
+    for (m, workload) in [
+        (1, GgmlWorkloadClass::DecodeSingle),
+        (4, GgmlWorkloadClass::ContinuousWidth),
+        (2_048, GgmlWorkloadClass::Prompt),
+    ] {
+        let mut request = dense_request(m, workload);
+        request.ggml_type = GgmlType::IQ2_XXS;
+        let capability = ggml_capability(request);
+        assert!(!capability.executable, "dense m={m}");
+        assert_eq!(
+            capability.rejection_code,
+            Some(GgmlRejectionCode::UnsupportedType)
+        );
+    }
+    let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
+    request.ggml_type = GgmlType::IQ2_XXS;
+    request.invocation = GgmlInvocation::DenseBatchedMv {
+        batch: 2,
+        m: 1,
+        n: 2_048,
+        k: 4_096,
+    };
+    assert!(!ggml_capability(request).executable);
+    request.invocation = GgmlInvocation::DenseGateUpSiluPair {
+        m: 1,
+        n: 2_048,
+        k: 4_096,
+    };
+    assert!(!ggml_capability(request).executable);
+    request.workload = GgmlWorkloadClass::Prompt;
+    request.invocation = GgmlInvocation::DenseBatchedMm {
+        batch: 2,
+        m: 64,
+        n: 2_048,
+        k: 4_096,
+        input_layout: GgmlBatchedInputLayout::Contiguous,
+    };
+    assert!(!ggml_capability(request).executable);
+
+    // DeepSeek-V4-Flash gate/up experts: mv_id, mm_id and the paired entry.
+    let matrix_bytes = ggml_matrix_bytes(GgmlType::IQ2_XXS, 2_048, 4_096).unwrap();
+    assert_eq!(matrix_bytes, 2_048 * 16 * 66);
+    let shape = |n_tokens| GgmlExpertShape {
+        n_tokens,
+        n: 2_048,
+        k: 4_096,
+        top_k: 6,
+        n_experts: 256,
+        expert_stride_bytes: matrix_bytes,
+        ids_are_distinct_per_token: true,
+        ids_within_expert_range: true,
+    };
+    let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
+    request.ggml_type = GgmlType::IQ2_XXS;
+    request.invocation = GgmlInvocation::ExpertForceMv { shape: shape(1) };
+    let capability = ggml_capability(request);
+    assert_eq!(capability.route, Some(GgmlKernelRoute::ExpertMv));
+    assert_eq!(capability.minimum_total_weight_bytes, 256 * matrix_bytes);
+
+    request.workload = GgmlWorkloadClass::Prompt;
+    request.invocation = GgmlInvocation::ExpertAutoAllocated { shape: shape(512) };
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::ExpertMmDeviceSelected)
+    );
+    request.routing.expert_tensor_mm = GgmlTensorMmPreference::ForceSimd;
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::ExpertMmSimdgroup)
+    );
+    request.invocation = GgmlInvocation::ExpertPooledPair { shape: shape(512) };
+    assert_eq!(
+        ggml_capability(request).route,
+        Some(GgmlKernelRoute::ExpertPooledPairMmSimdgroup)
+    );
+}
+
+#[test]
 fn fused_gate_up_is_a_two_weight_atomic_operation() {
     let mut request = dense_request(1, GgmlWorkloadClass::DecodeSingle);
     request.invocation = GgmlInvocation::DenseGateUpSiluPair {

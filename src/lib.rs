@@ -69,6 +69,7 @@ pub mod submission_observer;
 pub mod graph;
 pub mod metal_capture;
 pub mod ops;
+pub mod quant;
 pub mod turboquant;
 pub mod tq_oracle;
 pub mod weight;

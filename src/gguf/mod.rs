@@ -81,6 +81,7 @@ const GGML_TYPE_Q3_K: u32 = 11;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
+const GGML_TYPE_IQ2_XXS: u32 = 16;
 const GGML_TYPE_I16: u32 = 17;
 const GGML_TYPE_IQ4_NL: u32 = 20;
 const GGML_TYPE_IQ4_XS: u32 = 23;
@@ -404,6 +405,7 @@ fn ggml_type_from_u32(id: u32) -> Result<GgmlType> {
         GGML_TYPE_Q4_K => Ok(GgmlType::Q4_K),
         GGML_TYPE_Q5_K => Ok(GgmlType::Q5_K),
         GGML_TYPE_Q6_K => Ok(GgmlType::Q6_K),
+        GGML_TYPE_IQ2_XXS => Ok(GgmlType::IQ2_XXS),
         GGML_TYPE_I16 => Ok(GgmlType::I16),
         GGML_TYPE_IQ4_NL => Ok(GgmlType::IQ4_NL),
         GGML_TYPE_IQ4_XS => Ok(GgmlType::IQ4_XS),
@@ -1229,6 +1231,64 @@ fn dequantize_iq4_xs(data: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Dequantize GGML IQ2_XXS super-blocks to f32.
+///
+/// Block layout (66 bytes, 256 values): `f16 d` then `u16 qs[32]`. Each
+/// 32-value sub-block `ib32` reads two little-endian `u32` from
+/// `qs[4*ib32 .. 4*ib32 + 4]`: the low word holds four 8-bit grid indices,
+/// the high word four 7-bit sign indices (bits `7l..7l+7`) and a 4-bit
+/// scale (bits 28..32). The expressions follow ggml's
+/// `dequantize_row_iq2_xxs` in evaluation order, with no additions that a
+/// compiler could contract, so the output is bit-exact.
+fn dequantize_iq2_xxs(data: &[u8], output: &mut [f32]) -> Result<()> {
+    use crate::quant::iq_tables::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+    const BLOCK_BYTES: usize = 66;
+    const BLOCK_ELEMS: usize = 256;
+
+    if data.len() % BLOCK_BYTES != 0 {
+        return Err(MlxError::GgufParseError(format!(
+            "IQ2_XXS data length {} not divisible by block size {BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+
+    let num_blocks = data.len() / BLOCK_BYTES;
+    if output.len() < num_blocks * BLOCK_ELEMS {
+        return Err(MlxError::GgufParseError(
+            "IQ2_XXS output buffer too small".into(),
+        ));
+    }
+
+    for block_index in 0..num_blocks {
+        let block = &data[block_index * BLOCK_BYTES..(block_index + 1) * BLOCK_BYTES];
+        let d = f16_from_le_bytes([block[0], block[1]]);
+        let qs = &block[2..];
+        let out = &mut output[block_index * BLOCK_ELEMS..(block_index + 1) * BLOCK_ELEMS];
+
+        for ib32 in 0..8 {
+            let words = &qs[8 * ib32..8 * ib32 + 8];
+            let grid_indices = [words[0], words[1], words[2], words[3]];
+            let aux1 = u32::from_le_bytes([words[4], words[5], words[6], words[7]]);
+            let db = d * (0.5f32 + (aux1 >> 28) as f32) * 0.25f32;
+            for l in 0..4 {
+                let grid = IQ2XXS_GRID[grid_indices[l] as usize].to_le_bytes();
+                let signs = KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
+                let y = &mut out[32 * ib32 + 8 * l..32 * ib32 + 8 * l + 8];
+                for j in 0..8 {
+                    let sign = if signs & KMASK_IQ2XS[j] != 0 {
+                        -1.0f32
+                    } else {
+                        1.0f32
+                    };
+                    y[j] = db * grid[j] as f32 * sign;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Test-only export of `dequantize_q5_1` for ADR-022 parity tests in
 /// `/opt/mlx-native/tests/adr_022_phase1_dequant_parity.rs`. Hidden
 /// behind a doc(hidden) marker so it's not part of the public API but
@@ -1296,6 +1356,7 @@ fn dequantize_to_f32(data: &[u8], ggml_type: GgmlType, output: &mut [f32]) -> Re
         GgmlType::Q5_1 => dequantize_q5_1(data, output),
         GgmlType::IQ4_NL => dequantize_iq4_nl(data, output),
         GgmlType::IQ4_XS => dequantize_iq4_xs(data, output),
+        GgmlType::IQ2_XXS => dequantize_iq2_xxs(data, output),
     }
 }
 
@@ -1704,7 +1765,9 @@ impl GgufFile {
             // Metal matmul kernel reads them directly. (Kernel port:
             // Task #16. Until then, hf2q's runtime will surface a
             // typed "unsupported" at the dispatch site.)
-            | GgmlType::IQ4_XS => {
+            | GgmlType::IQ4_XS
+            // ADR-066 N-IQ2XXS — opaque U8 blocks for the expert kernels.
+            | GgmlType::IQ2_XXS => {
                 // Store raw GGML blocks as a U8 buffer. Where a Metal
                 // quantized-matmul kernel exists for the type, it consumes
                 // these blocks directly without an explicit dequant pass on
@@ -1958,7 +2021,8 @@ fn raw_tensor_dtype(ggml_type: GgmlType) -> DType {
         | GgmlType::I16
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL
-        | GgmlType::IQ4_XS => DType::U8,
+        | GgmlType::IQ4_XS
+        | GgmlType::IQ2_XXS => DType::U8,
     }
 }
 
