@@ -106,6 +106,9 @@ impl GgmlType {
             // ADR-033 §Pi Task #16 SHIPPED 2026-05-22 — mirrors IQ4_NL
             // _id geometry (N_SIMDGROUP=2, N_DST=4, (8, 8, 8) launch).
             GgmlType::IQ4_XS => "kernel_mul_mv_id_iq4_xs_f32",
+            // ADR-066 N-IQ2XXS — port of the peer's IQ2_XXS mv layout
+            // (N_R0 = 4, N_SG = 2, grid/sign tables in threadgroup memory).
+            GgmlType::IQ2_XXS => "kernel_mul_mv_id_iq2_xxs_f32",
         }
     }
 
@@ -134,6 +137,8 @@ impl GgmlType {
             // path). Tensor-API variant is not yet ported; tests fall
             // back to the simdgroup path via TENSOR_MM_ID_AVAILABLE probe.
             GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_f32",
+            // ADR-066 N-IQ2XXS — simdgroup MMA mm_id.
+            GgmlType::IQ2_XXS => "kernel_mul_mm_id_iq2_xxs_f32",
         }
     }
 
@@ -161,6 +166,8 @@ impl GgmlType {
             // SHIPPED 2026-05-22 to close the prefill perf gap vs the
             // reference implementation.
             GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32",
+            // ADR-066 N-IQ2XXS — tensor-API mm_id.
+            GgmlType::IQ2_XXS => "kernel_mul_mm_id_iq2_xxs_tensor_f32",
         }
     }
 }
@@ -1083,6 +1090,10 @@ fn quantized_matmul_id_ggml_pooled_impl(
 // (the mm tile-reuse setup overhead doesn't amortize at small n_tokens).
 pub const MM_ID_ROUTING_THRESHOLD: u32 = 32;
 
+/// Threadgroup memory for `kernel_mul_mv_id_iq2_xxs_f32`: the 256-entry
+/// `iq2xxs_grid` (256 × 8 B) followed by the 128 `ksigns_iq2xs` bytes.
+const IQ2_XXS_MV_ID_SHARED_BYTES: u64 = 256 * 8 + 128;
+
 /// ADR-013 P19 H11 (2026-05-01) — runtime override for the mm_id routing
 /// threshold via `HF2Q_MM_ID_ROUTING_THRESHOLD` env. Setting it to a very
 /// large value (e.g. `99999`) forces every dispatch onto the `mv_id` route,
@@ -1191,6 +1202,8 @@ fn dispatch_id_mv(
         // geometry.  ADR-013 P7 — Q4_K added; mirrors Q5_K (NSG=2,
         // 1 row per simdgroup; same kmask scale-decode).
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
+        // ADR-066 N-IQ2XXS — two simdgroups of 32 lanes, four rows each.
+        GgmlType::IQ2_XXS => (32u64, 2u64, 8usize),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::BF16
@@ -1227,7 +1240,23 @@ fn dispatch_id_mv(
     let threadgroups = metal::MTLSize::new(div_ceil(n, align) as u64, m as u64, 1);
     let threads_per_tg = metal::MTLSize::new(nth0, nth1, 1);
 
-    if use_q8_0_id_nr2 {
+    if matches!(params.ggml_type, GgmlType::IQ2_XXS) {
+        // The IQ2_XXS kernel stages the 256-entry grid (2,048 B) and the
+        // 128 sign bytes in threadgroup memory once per threadgroup.
+        encoder.encode_threadgroups_with_args_and_shared(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(weight)),
+                (1, KernelArg::Buffer(input)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Buffer(ids)),
+                (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+            ],
+            &[(0, IQ2_XXS_MV_ID_SHARED_BYTES)],
+            threadgroups,
+            threads_per_tg,
+        );
+    } else if use_q8_0_id_nr2 {
         // ADR-029: cross-SG reduction needs threadgroup memory:
         // NR0 * NW * sizeof(float) = 2 * 32 * 4 = 256 bytes.
         let smem_bytes: u64 = 2 * 32 * std::mem::size_of::<f32>() as u64;
@@ -2121,6 +2150,7 @@ fn dispatch_id_mm_with_layout(
     // ---- Validate common shapes ----
     // ADR-013 P16 — Q4_K added. ADR-022 — Q5_1 / IQ4_NL added.
     // ADR-022 Phase 2 — Q5_K added. ADR-033 §Pi Task #20 — IQ4_XS added.
+    // ADR-066 N-IQ2XXS — IQ2_XXS added.
     match params.ggml_type {
         GgmlType::Q4_0
         | GgmlType::Q5_0
@@ -2132,7 +2162,8 @@ fn dispatch_id_mm_with_layout(
         | GgmlType::Q6_K
         | GgmlType::Q5_1
         | GgmlType::IQ4_NL
-        | GgmlType::IQ4_XS => {}
+        | GgmlType::IQ4_XS
+        | GgmlType::IQ2_XXS => {}
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm_for_test does not support {:?}",

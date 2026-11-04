@@ -396,7 +396,27 @@ fn quantized_matmul_type(ggml_type: GgmlType) -> bool {
             | GgmlType::Q5_1
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS
+            | GgmlType::IQ2_XXS
     )
+}
+
+/// Block types whose only native kernels are expert-routed (`mv_id`/`mm_id`).
+/// ADR-066 N-IQ2XXS ships no dense IQ2_XXS mv or mm kernel.
+fn expert_only_type(ggml_type: GgmlType) -> bool {
+    ggml_type == GgmlType::IQ2_XXS
+}
+
+fn dense_kernel_missing(request: &GgmlCapabilityRequest) -> Option<GgmlCapability> {
+    expert_only_type(request.ggml_type).then(|| {
+        GgmlCapability::unsupported(
+            request,
+            GgmlRejectionCode::UnsupportedType,
+            format!(
+                "{:?} has no dense kernel; only expert-routed mv_id/mm_id exist",
+                request.ggml_type
+            ),
+        )
+    })
 }
 
 /// Checked packed bytes for one GGUF weight row containing `K` values.
@@ -667,6 +687,9 @@ pub(crate) fn plan_dense_auto_route(
 
 fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
     let (m, _, k) = request.invocation.dimensions();
+    if let Some(rejection) = dense_kernel_missing(request) {
+        return rejection;
+    }
     if request.workload == GgmlWorkloadClass::Embedding {
         return GgmlCapability::unsupported(
             request,
@@ -815,6 +838,9 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
 
 fn batched_mv(request: &GgmlCapabilityRequest, batch: u32, bytes: u64) -> GgmlCapability {
     let (m, _, _) = request.invocation.dimensions();
+    if let Some(rejection) = dense_kernel_missing(request) {
+        return rejection;
+    }
     if batch == 0 || m > MM_ROUTING_THRESHOLD {
         return GgmlCapability::unsupported(
             request,
@@ -852,6 +878,9 @@ fn batched_mm(
     bytes: u64,
 ) -> GgmlCapability {
     let (m, _, k) = request.invocation.dimensions();
+    if let Some(rejection) = dense_kernel_missing(request) {
+        return rejection;
+    }
     if batch == 0 || m <= MM_ROUTING_THRESHOLD || request.ggml_type == GgmlType::IQ4_XS {
         return GgmlCapability::unsupported(
             request,

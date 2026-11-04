@@ -150,8 +150,8 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
 
 ### Matrix multiplication
-- **GGUF formats**: F32, F16, BF16 typed storage plus Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS blocks — mat-vec + mul_mm kernels where implemented (byte-parity with the reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented)
-- **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS (top_k>1 MoE mat-vec + tensor-mm where implemented)
+- **GGUF formats**: F32, F16, BF16 typed storage plus Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS blocks — mat-vec + mul_mm kernels where implemented (byte-parity with the reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented)
+- **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS (top_k>1 MoE mat-vec + tensor-mm where implemented). IQ2_XXS is expert-only: `mv_id`, simdgroup `mm_id` and tensor `mm_id`, with no dense kernel; its CPU dequant is bit-exact against the reference, and its codebook tables come from one Rust source (`mlx_native::quant::iq_tables`) that generates the Metal copies (`MLX_BLESS_IQ_TABLES=1 cargo test --test iq_tables` rewrites them)
 - **Native scalar expert-routed**: `dense_matmul_id` consumes F32, F16, or BF16 expert stacks in their stored bytes, F32 shared-per-token or slotted activations, and U32 expert IDs. Direct execution is one dispatch; the bit-identical grouped route uses two dispatches, a primitive-owned pre-map scratch-reuse barrier, a map-to-multiply barrier, and caller-owned scratch. `calibrate_dense_matmul_id_routes` measures balanced and maximally skewed distinct routing for every exact case declared by a model activation, freezes a pointer-free/epoch-scoped route plan bound to the compiled pipeline identities and value-independence theorem digest, and defaults every unproven or unstable case to Direct. Each exact shape empirically proves one current weight representative with adversarial F32 activations and routing under both profiles; shared source-identical expert-base/address/widen/F32-FMA/reduction helpers then authorize its other declared layer-local weight identities without retaining them. A later width may use Direct only when its complete width-independent contract was admitted; undeclared dtype, N/K, top-k, expert count/stride, layout, or multiplicity still fails. Cached Grouped timing metadata reruns the exact-shape representative proof before activation; no static M threshold or prior model pointer selects production work. Required Direct proof failure aborts without a plan. Every nonzero proof/timing attempt is followed by exactly one empty cleanup boundary before deferred cache eviction and fully validated, deadline-gated plan publication.
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
 - **MLX fused dequant+matmul**: `qmm_affine_t_f32` + `qmm_affine_t_f32_tiled` (2.29× over non-tiled), simdgroup-MMA `qmm_affine_t_f32_simd` / `qmm_affine_simd4` variants, and packed-U32 `qmm_affine_t_packed_simd4_b4`
@@ -176,7 +176,8 @@ the dense, batched, permuted-output, fused gate/up, expert schedule, and
 embedding route for an exact public entry point, shape, workload regime, and
 explicit routing policy. Correct but non-specialized fallbacks are explicit—
 for example, prompt-shaped dense IQ4_XS is executable through matvec but has no
-dense-MM route. The matching `*_with_policy` dispatch APIs consume that exact
+dense-MM route, and IQ2_XXS reports dense requests as unsupported because only
+its expert routes have kernels. The matching `*_with_policy` dispatch APIs consume that exact
 policy rather than rereading environment overrides. Use
 `ggml_routing_policy_from_environment()` once at model load when compatibility
 with the legacy environment-backed entry points is required; serialize that

@@ -560,6 +560,8 @@ impl KernelRegistry {
         // ADR-022 Phase 1 — Q5_1 / IQ4_NL MoE expert-routed mat-vec.
         sources.insert("kernel_mul_mv_id_q5_1_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_iq4_nl_f32".into(), ggml_id_src);
+        // ADR-066 N-IQ2XXS — IQ2_XXS MoE expert-routed mat-vec.
+        sources.insert("kernel_mul_mv_id_iq2_xxs_f32".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
         // in one dispatch — replaces silu_mul + expert_down sequence.
@@ -589,6 +591,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_iq4_nl_f32".into(), ggml_id_mm_src);
         // ADR-022 Phase 2 — Q5_K mm_id template instantiation.
         sources.insert("kernel_mul_mm_id_q5_K_f32".into(), ggml_id_mm_src);
+        // ADR-066 N-IQ2XXS — IQ2_XXS mm_id template instantiation.
+        sources.insert("kernel_mul_mm_id_iq2_xxs_f32".into(), ggml_id_mm_src);
 
         // ADR-033 §Pi Task #20 / ADR-034 §93 — fused MoE gate+up+silu_mul
         // mm_id kernel for Q6_K. Replaces 3 dispatches (gate_mm_id, up_mm_id,
@@ -650,6 +654,11 @@ impl KernelRegistry {
         // ADR-022 Phase 2 — Q5_K tensor-API mm_id.
         sources.insert(
             "kernel_mul_mm_id_q5_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        // ADR-066 N-IQ2XXS — IQ2_XXS tensor-API mm_id.
+        sources.insert(
+            "kernel_mul_mm_id_iq2_xxs_tensor_f32".into(),
             ggml_id_mm_tensor_src,
         );
 

@@ -199,6 +199,14 @@ const BLOCK_IQ4_NL_BYTES: u32 = 18;
 /// Reference: the ggml `block_iq4_xs` block format.
 const BLOCK_IQ4_XS_BYTES: u32 = 136;
 
+/// IQ2_XXS (2.0625 bpw grid codebook, 256-element super-block, GGML id 16).
+/// Block layout: d(fp16) + qs[32] (u16) = 66 bytes. Each 32-value
+/// sub-block reads two u32: the low word holds four 8-bit grid indices,
+/// the high word four 7-bit sign indices and a 4-bit scale.
+/// ADR-066 N-IQ2XXS: expert-routed (`mv_id`/`mm_id`) kernels only.
+/// Reference: the ggml `block_iq2_xxs` block format.
+const BLOCK_IQ2_XXS_BYTES: u32 = 66;
+
 // ---- Public types ----
 
 /// GGML quantization type.
@@ -256,6 +264,11 @@ pub enum GgmlType {
     /// Reader-side recognized for GGUF header parsing; Metal mul_mv /
     /// mul_mm kernels follow in a subsequent commit.
     IQ4_XS,
+    /// Super-block 2-bit grid codebook quant (id 16 in GGML). 256 values
+    /// per super-block, 66 bytes per block. ADR-066 N-IQ2XXS: CPU dequant
+    /// plus expert-routed `mv_id`/`mm_id` kernels; no dense kernel.
+    #[serde(rename = "iq2_xxs")]
+    IQ2_XXS,
 }
 
 impl GgmlType {
@@ -278,6 +291,7 @@ impl GgmlType {
             GgmlType::Q5_1 => QK5_1,
             GgmlType::IQ4_NL => QK4_NL,
             GgmlType::IQ4_XS => QK6_K, // super-block size = QK_K = 256
+            GgmlType::IQ2_XXS => QK6_K,
         }
     }
 
@@ -300,6 +314,7 @@ impl GgmlType {
             GgmlType::Q5_1 => BLOCK_Q5_1_BYTES,
             GgmlType::IQ4_NL => BLOCK_IQ4_NL_BYTES,
             GgmlType::IQ4_XS => BLOCK_IQ4_XS_BYTES,
+            GgmlType::IQ2_XXS => BLOCK_IQ2_XXS_BYTES,
         }
     }
 
@@ -329,6 +344,8 @@ impl GgmlType {
             // Byte-cmp parity tested against the reference Metal IQ4_XS
             // kernel via tests/iq4_xs_metal_parity.rs.
             GgmlType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
+            // ADR-066 N-IQ2XXS: expert-routed kernels only; no dense mv.
+            GgmlType::IQ2_XXS => "unsupported",
         }
     }
 
@@ -353,7 +370,7 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_f32",
             // ADR-033 §Pi 2026-05-22 — Metal mm kernel port pending (Task #16).
-            GgmlType::IQ4_XS => "unsupported",
+            GgmlType::IQ4_XS | GgmlType::IQ2_XXS => "unsupported",
         }
     }
 
@@ -379,7 +396,7 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_f32",
             // ADR-033 §Pi 2026-05-22 — Metal tensor mm port pending (Task #16).
-            GgmlType::IQ4_XS => "unsupported",
+            GgmlType::IQ4_XS | GgmlType::IQ2_XXS => "unsupported",
         }
     }
 
@@ -403,7 +420,7 @@ impl GgmlType {
             GgmlType::Q5_1 => "kernel_mul_mm_q5_1_tensor_v2_f32",
             GgmlType::IQ4_NL => "kernel_mul_mm_iq4_nl_tensor_v2_f32",
             // ADR-033 §Pi 2026-05-22 — Metal tensor-v2 mm port pending (Task #16).
-            GgmlType::IQ4_XS => "unsupported",
+            GgmlType::IQ4_XS | GgmlType::IQ2_XXS => "unsupported",
         }
     }
 }
@@ -1733,7 +1750,11 @@ fn dispatch_mv_batched(
         // Q4_K / Q5_K (ADR-022 Phase 2) mirror Q6_K's 2-row-per-tg geometry.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (2u64, 32u64, 2usize),
         GgmlType::Q3_K => (2u64, 32u64, 4usize),
-        _ => unreachable!(),
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dense quantized matvec has no kernel for {other:?}"
+            )));
+        }
     };
     // ADR-028 —nr0=2 variant doubles rows-per-TG to 4.  Same
     // 2 SGs × 32 threads layout, but each SG handles 2 rows so align=4.
