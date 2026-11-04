@@ -47,7 +47,9 @@
 //! `GraphSession`.  Both read K and an in-cache V (codes and norms, or F16)
 //! in place with a `kv_capacity` head stride, so the caller must order the
 //! dispatch after the writes of those rows (e.g.
-//! `barrier_between(&[k, v_codes, v_norms, q], &[out])`).
+//! `barrier_between(&[k, v_codes, v_norms, q], &[out])`).  With an external
+//! mask, the caller must also fence after the mask fill before any mask
+//! reader: the `blk` classifier and the attention dispatch.
 
 use metal::MTLSize;
 
