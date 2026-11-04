@@ -41,12 +41,11 @@ Expectations derived from the kernel source. These are not results.
 ## Run (requires the GPU lane)
 
 ```sh
-cd /opt/mlx-native-worktrees/adr065-e6-probes
-scripts/adr065_e6_run_probes.sh /Users/robert/.local/state/hf2q/v0130/509-e6
+scripts/adr065_e6_run_probes.sh /Users/robert/.local/state/hf2q/v0130/p4a-526
 ```
 
-The script runs the correctness probes, then the bandwidth probe, once per
-metallib path. It writes `records-{precompiled,runtime}.txt`,
+The script runs the correctness probes (E6 and P4a), then the bandwidth
+probe, once per metallib path. It writes `records-{precompiled,runtime}.txt`,
 `bandwidth-{precompiled,runtime}.txt`, the logs, and a provenance file
 (source commit, test-binary sha256, embedded metallib sha256, crate version).
 
@@ -80,18 +79,95 @@ across paths (runtime: 547 vs 539 µs). Unique-weight bandwidth was 62–123 GB/
 and logical bandwidth 248–493 GB/s. Per-case numbers are in
 `bandwidth-{precompiled,runtime}.txt`.
 
-### Follow-up: runtime-path capture kernels
+### Runtime-path capture kernels (superseded)
 
-- On mlx-native 0.15.16 (`20540a5`), both capture probes fail on the runtime
-  path with `KernelNotFound("gated_delta_net_decode_capture_f32_4")`.
-- The fix is on branch `fix/gdn-capture-runtime-registry` at `4e32003`. It
-  registers `gated_delta_net_decode_capture_f32_{1,2,4}` in
-  `KernelRegistry::new()` and adds the test `gdn_decode_capture_runtime_source`,
-  which passes.
-- On the fix branch, with `MLX_PRECOMPILED_METALLIB=0`, both probes pass and
-  all 20 records are bitwise:
-  - `e6_gated_delta_net_decode_capture_four_sequence_windows_match_single_sequences`:
-    12/12 (output, `state_out` and `state_capture` for 4 sequences);
-  - `e6_gated_delta_net_decode_window_versus_sequential_tokens`: 8/8.
-- Evidence: `509-e6/records-runtime-fix-4e32003.txt` and
-  `test-runtime-fix-4e32003.log`.
+The `KernelNotFound` row above was a registry gap at 0.15.16:
+`KernelRegistry::new()` did not register the
+`gated_delta_net_decode_capture_f32_{1,2,4}` sources. The fix (`4e32003`,
+released in 0.15.17 with its test `gdn_decode_capture_runtime_source`)
+registers them, and the E6 rerun on this branch covers both capture probes on
+the runtime path (see "P4a results"). The fix is not a P4a dependency: the
+restore primitives never used those kernels.
+
+## P4a: DeltaNet capture restore with existing primitives (path A)
+
+Story: hf2q ADR-065 P4a (hf2q issue #526). E6 probe 4 showed that existing
+copy primitives restore captured DeltaNet state bitwise, so **P4a is
+satisfied by this record without a native kernel or release**. hf2q composes
+the primitives itself (ADR-065 assigns encode-only helpers to hf2q).
+
+### Contract (`DeltaNetCaptureRestore`)
+
+Per DeltaNet layer: `rec_cap` is an f32 view of logical shape `[E, T, S]`
+(E fastest) and `conv_cap` of `[S, T, Km1, C]` (C fastest). Each item `j` is
+`(s_j < S, t_j < T, rec_dst[j], conv_dst[j])`, with destination views of
+exactly `E` and `C·Km1` elements. For every `e < E`, `c < C`, `k < Km1`:
+
+```text
+bits(rec_dst[j][e])          := bits(rec_cap[(s_j·T + t_j)·E + e])
+bits(conv_dst[j][c·Km1 + k]) := bits(conv_cap[((s_j·T + t_j)·Km1 + k)·C + c])
+```
+
+- Equality is on raw 32-bit patterns for every value, including signaling and
+  quiet NaN payloads, ±0, subnormals and ±∞. No arithmetic or flush-to-zero.
+- Preconditions, validated by the caller: destination views pairwise
+  disjoint and disjoint from every source; all views inside their buffers'
+  logical extents; `E`, `C`, `Km1 > 0`; no u32 index overflow inside a view.
+- Cohort invariance: the bytes written for item `j` depend only on
+  `(rec_cap, conv_cap, s_j, t_j)`, not on the other items, their order, their
+  number (1–4) or their slots. Bytes outside the destination views are
+  unchanged, including peer slots and the non-current parity buffer.
+- Ordering: everything is encoded into a caller-provided `CommandEncoder`;
+  the caller commits and waits. Sources written by earlier work in command
+  buffer order are complete before the restore reads them. A GPU fault
+  surfaces as `MlxError::CommandBufferError` from the wait.
+- Anchor images: a capture-layout pair with `T = S = 1`, restored with
+  `(s, t) = (0, 0)`, is inside the contract. The contract covers capture →
+  state only.
+
+### Composition
+
+| Component | Primitive | Arguments |
+|---|---|---|
+| Recurrent | `CommandEncoder::blit_copy_bytes` | source `rec_cap` at byte offset `(s·T+t)·E·4`, destination `rec_dst`, length `E·4` |
+| Conv re-index | `ops::copy::dispatch_strided_copy_f32` | `src = conv_cap.slice_view((s·T+t)·Km1·C·4, Km1·C)`, `dst = conv_dst`, `rows = C`, `cols = Km1`, `stride_row = 1`, `stride_col = C`, so `dst[c·Km1+k] = src[k·C+c]` |
+
+`offset_copy_f32` and `transpose_2d` are not part of the composition.
+
+**Encoding order.** hf2q encodes every conv strided copy for all layers and
+items first (one compute pass), then every recurrent blit. Each
+`blit_copy_bytes` ends the active compute pass and opens its own blit
+encoder. The two families have disjoint destinations and read-only sources,
+so no barrier is needed between them. E6 probe 4 interleaved the families;
+T-P4a-3 covers the shipped order.
+
+**Bounds-check caveat.** `blit_copy_bytes` validates against view extents
+(`data_byte_len()`) and refuses overlapping same-allocation ranges.
+`dispatch_strided_copy_f32` validates against `MlxBuffer::byte_len()`, the
+whole Metal allocation, so it accepts a view too small for the copy as long
+as the allocation is large enough, and writes past the view (T-P4a-6 pins
+this). View-exact range checking is therefore the caller's preflight.
+
+**C2 snapshot direction.** ADR-063 C2 snapshots state into an anchor image
+with the same primitives in reverse: a blit out of the parity-current
+recurrent region of slot `s`, and the inverse strided copy `rows = Km1`,
+`cols = C`, `stride_row = 1`, `stride_col = Km1`, giving
+`img[k·C + c] = state[c·Km1 + k]`. These are tests of existing primitives,
+not a contract extension.
+
+### Tests
+
+All run on both metallib paths and assert the pipeline origin of
+`strided_copy_f32` for the selected path. Every comparison is bitwise for
+every u32 class, NaN payloads included.
+
+| ID | Test | What is checked |
+|---|---|---|
+| T-P4a-1 | `adr065_e6_capture_restore_copy` (E6 probe 4) | Port of hf2q `rollback_la_to`: four slots, mixed parity, `t ∈ {0..3}`, one command buffer. NaN payloads asserted with `E6_STRICT_NAN=1` |
+| T-P4a-2 | `adr065_p4a_capture_restore::p4a_acceptance_classes_match_host_rollback` | Full (no item: every byte unchanged), partial (`t ∈ {1, 2}`) and zero (`t = 0`) acceptance for every slot at the Qwen3.8 shape |
+| T-P4a-3 | `p4a_compute_first_order_matches_host_for_every_ordered_slot_subset` | Compute-first order, one command buffer, all 64 ordered subsets of four slots (1–4 items) at `E = 786,432, C = 10,240`, `E = 524,288, C = 8,192` (`Km1 = 3`, `T = 4`) and a 2-layer small shape. Item regions equal the host restore (the single-item runs are in the sweep); peer regions and the non-current parity buffer equal their sentinel fill |
+| T-P4a-4 | `p4a_anchor_image_restore_matches_host` | `T = S = 1` image, `(0, 0)`, into every slot under both parities; all other bytes unchanged |
+| T-P4a-5 | `p4a_snapshot_direction_and_round_trip_are_bitwise` | State → image for slots 1–3 under both parities (inverse strided copy, then blit out of the parity-current region), then image → sentinel state; the round trip is byte-identical and touches no other bytes |
+| T-P4a-6 | `p4a_native_refusals_and_strided_bounds_caveat` | `blit_copy_bytes` refuses overlapping same-allocation ranges and source/destination ranges past `data_byte_len()`; `dispatch_strided_copy_f32` refuses zero rows or cols, and accepts (and writes) an allocation-sized copy into a smaller view |
+
+Records use `probe=p4a_capture_restore`.

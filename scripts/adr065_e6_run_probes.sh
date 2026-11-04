@@ -28,6 +28,7 @@ correctness=(
     --test adr065_e6_served_kv_attention_windows
     --test adr065_e6_gated_delta_net_decode_seqs
     --test adr065_e6_capture_restore_copy
+    --test adr065_p4a_capture_restore
 )
 bandwidth=(--test adr065_e6_weight_load_bandwidth)
 
@@ -42,7 +43,7 @@ cargo test --release "${correctness[@]}" "${bandwidth[@]}" --no-run 2>&1 |
     target=${CARGO_TARGET_DIR:-$root/target}
     find "$target/release/build" -path '*mlx-native-*/out/default.metallib' \
         -exec shasum -a 256 {} + | sed 's/^/metallib_sha256=/'
-    grep -o 'Executable tests/adr065_e6[^ ]* ([^)]*)' "$evidence/build.log" |
+    grep -oE 'Executable tests/adr065_(e6|p4a)[^ ]* \([^)]*\)' "$evidence/build.log" |
         sed -E 's/.*\((.*)\)/\1/' | while read -r binary; do
             echo "test_binary_sha256=$(shasum -a 256 "$binary")"
         done
@@ -57,6 +58,14 @@ for path in precompiled runtime; do
         cargo test --release "${correctness[@]}" --no-fail-fast -- --test-threads=1 2>&1 |
         tee "$evidence/test-$path.log" || status=$?
     echo "correctness_$path=$status" >>"$evidence/status.txt"
+    status=0
+    MLX_PRECOMPILED_METALLIB=$flag E6_STRICT_NAN=1 \
+        E6_RECORD_PATH="$evidence/strict-nan-$path.txt" \
+        cargo test --release --test adr065_e6_capture_restore_copy -- --test-threads=1 2>&1 |
+        tee "$evidence/strict-nan-$path.log" || status=$?
+    echo "strict_nan_$path=$status" >>"$evidence/status.txt"
+    # Set E6_SKIP_BANDWIDTH=1 to skip the timing probe (no quiet host).
+    if [ "${E6_SKIP_BANDWIDTH:-0}" = 1 ]; then continue; fi
     status=0
     MLX_PRECOMPILED_METALLIB=$flag E6_RECORD_PATH="$evidence/bandwidth-$path.txt" \
         cargo test --release "${bandwidth[@]}" -- --ignored --test-threads=1 2>&1 |

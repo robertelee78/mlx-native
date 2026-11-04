@@ -34,6 +34,7 @@
 #![allow(clippy::expect_used, clippy::panic, dead_code)]
 
 include!("support/adr065_e6_common.rs");
+include!("support/adr065_restore_common.rs");
 
 use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
 use mlx_native::ops::transpose::transpose_2d;
@@ -51,50 +52,6 @@ const CONV: usize = CHANNELS * KM1;
 const ITEMS: [(usize, usize); SLOTS] = [(2, 1), (0, 3), (3, 0), (1, 2)];
 /// Per-slot ping-pong parity (`true` = CURRENT is the scratch buffer).
 const FLIPPED: [bool; SLOTS] = [false, true, true, false];
-
-const SPECIALS: [u32; 10] = [
-    0x0000_0000, // +0
-    0x8000_0000, // -0
-    0x0000_0001, // smallest subnormal
-    0x807f_ffff, // largest negative subnormal
-    0x7f80_0000, // +inf
-    0xff80_0000, // -inf
-    0x7fc0_0000, // canonical quiet NaN
-    0x7fc1_2345, // quiet NaN payload
-    0x7f80_0001, // signaling NaN payload
-    0xffa5_a5a5, // negative signaling NaN payload
-];
-
-fn payload(rng: &mut E6Rng, len: usize) -> Vec<u32> {
-    (0..len)
-        .map(|index| {
-            if index % 7 == 3 {
-                SPECIALS[(rng.next_u64() % SPECIALS.len() as u64) as usize]
-            } else {
-                rng.next_u64() as u32
-            }
-        })
-        .collect()
-}
-
-fn is_nan_bits(bits: u32) -> bool {
-    (bits & 0x7f80_0000) == 0x7f80_0000 && (bits & 0x007f_ffff) != 0
-}
-
-fn bits_buffer(device: &MlxDevice, bits: &[u32]) -> MlxBuffer {
-    let mut buffer = device
-        .alloc_buffer(bits.len() * 4, DType::F32, vec![bits.len()])
-        .expect("alloc");
-    buffer
-        .as_mut_slice::<u32>()
-        .expect("bits slice")
-        .copy_from_slice(bits);
-    buffer
-}
-
-fn read_bits(buffer: &MlxBuffer) -> Vec<u32> {
-    buffer.as_slice::<u32>().expect("read bits").to_vec()
-}
 
 /// Host authority: port of `rollback_la_to` for one `(slot, t)`.
 fn host_restore(
