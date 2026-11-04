@@ -117,6 +117,41 @@ fn requires_precise_fp32_math(name: &str) -> bool {
     name.starts_with("deepseek_tail_rope_")
 }
 
+/// Op `register` functions whose sources the constructor installs as
+/// [`KernelRegistry`] registration fallbacks.
+///
+/// Each lists kernels the constructor did not otherwise carry. All of them
+/// are in the embedded metallib, so the default path never needed a source;
+/// on the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`) a registry that
+/// skipped the op's `register` call failed with `KernelNotFound`. Kernels a
+/// function registers that the constructor already carries are unaffected.
+const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 24] = [
+    crate::ops::add_bias_row_2d::register,
+    crate::ops::bilinear_resize_2d::register,
+    crate::ops::block_merge_2x2::register,
+    crate::ops::deepseek_moe_routing::register,
+    crate::ops::deepseek_tail_rope::register,
+    crate::ops::embedding_kquant::register,
+    crate::ops::embedding_q2_k::register,
+    crate::ops::embedding_q8_0::register,
+    crate::ops::feature_concat::register,
+    crate::ops::flash_attn_prefill::register,
+    crate::ops::flash_attn_prefill_blk::register,
+    crate::ops::flash_attn_prefill_d512::register,
+    crate::ops::flash_attn_prefill_mask::register,
+    crate::ops::flash_attn_train::register,
+    crate::ops::flash_attn_train::register_bwd,
+    crate::ops::flash_attn_vec_tq::register,
+    crate::ops::fused_residual_norm::register,
+    crate::ops::gated_delta_net_decode::register,
+    crate::ops::gather_bench::register,
+    crate::ops::hadamard::register,
+    crate::ops::hadamard_quantize_kv::register,
+    crate::ops::im2col_2d_3ch::register,
+    crate::ops::ssm_conv::register,
+    crate::ops::vision_2d_rope::register,
+];
+
 // MTLDataType numeric values (from metal-rs argument.rs, confirmed in Apple Metal spec):
 //   Int  = 29
 //   Bool = 53
@@ -175,6 +210,16 @@ pub struct KernelRegistry {
     /// caller's replacement as active. Overrides therefore remain on the
     /// runtime-source path for this registry's lifetime.
     runtime_source_overrides: HashSet<String>,
+    /// Functions whose source comes only from [`REGISTRATION_FALLBACKS`]
+    /// and has not been registered explicitly on this registry.
+    ///
+    /// The fallback lets `get_pipeline*` resolve these functions on the
+    /// runtime-source path (`MLX_PRECOMPILED_METALLIB=0`) without the op's
+    /// `register` call. Otherwise the registry behaves as if the source were
+    /// absent: prewarming skips it, and an explicit registration (even of
+    /// identical text) becomes a runtime source override, as it was before
+    /// the fallback existed.
+    registration_fallbacks: HashSet<String>,
     /// Precompiled `default.metallib` (lazy).
     ///
     /// `None` initially.  On first `get_pipeline*` call under
@@ -237,6 +282,8 @@ impl KernelRegistry {
         // ADR-028 iter-368: peer-style NSG=4 NR=2 variant (128 threads/TG).
         sources.insert("kernel_mul_mv_q8_0_f32_nr2".into(), ggml_src);
         sources.insert("kernel_mul_mv_q6_K_f32".into(), ggml_src);
+        // IQ4_XS ships in the metallib; this source serves the runtime path.
+        sources.insert("kernel_mul_mv_iq4_xs_f32".into(), ggml_src);
         // ADR-028 iter-309 — q6_K mat-vec with nr0=2 + cached yl[16]
         // (peer-pattern kernel with N_R0_Q6_K=2;
         // 4 rows/TG vs baseline's 2).  Env-gated via
@@ -549,6 +596,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_K_f32".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q6_K_f32".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_iq4_xs_f32".into(), ggml_id_src);
         // ADR-028 iter-321 — q6_K _id with nr0=2 + cached yl[16]
         // (peer-pattern port mirroring iter-309's non-_id variant).
         // Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
@@ -584,6 +632,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q2_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q3_K_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q6_K_f32".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_iq4_xs_f32".into(), ggml_id_mm_src);
         // ADR-013 P16 — Q4_K mm_id (peer-pattern kernel).
         sources.insert("kernel_mul_mm_id_q4_K_f32".into(), ggml_id_mm_src);
         // ADR-022 Phase 1 P1.6 — Q5_1 / IQ4_NL mm_id template instantiations.
@@ -635,6 +684,10 @@ impl KernelRegistry {
         );
         sources.insert(
             "kernel_mul_mm_id_q6_K_tensor_f32".into(),
+            ggml_id_mm_tensor_src,
+        );
+        sources.insert(
+            "kernel_mul_mm_id_iq4_xs_tensor_f32".into(),
             ggml_id_mm_tensor_src,
         );
         // ADR-013 P16 — Q4_K tensor-API mm_id.
@@ -950,14 +1003,6 @@ impl KernelRegistry {
         sources.insert("gated_delta_net_decode_f32_1".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_f32_2".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_f32_4".into(), gdn_decode_src);
-        // Per-position state-capture variants (speculative-decode rollback).
-        // Without these the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`)
-        // cannot build the capture pipelines.
-        let gdn_decode_capture_src: &'static str =
-            include_str!("shaders/gated_delta_net_decode_capture.metal");
-        sources.insert("gated_delta_net_decode_capture_f32_1".into(), gdn_decode_capture_src);
-        sources.insert("gated_delta_net_decode_capture_f32_2".into(), gdn_decode_capture_src);
-        sources.insert("gated_delta_net_decode_capture_f32_4".into(), gdn_decode_capture_src);
         // Wave 5b — chunk-parallel inter-chunk state-recurrence kernel
         // (the one new kernel in the chunk-parallel pipeline; spec source:
         // arXiv 2412.06464 §4 + FLA chunk_delta_h.py:43-298).
@@ -1586,7 +1631,7 @@ impl KernelRegistry {
         let sdpa_decode_src: &'static str = include_str!("shaders/sdpa_decode.metal");
         sources.insert("sdpa_decode".into(), sdpa_decode_src);
 
-        Self {
+        let mut registry = Self {
             ggml_routing_policy: None,
             dense_bf16_auto: crate::ops::dense_bf16_auto::DenseBf16AutoState::default(),
             dense_matmul_id_auto: crate::ops::dense_matmul_id_auto::DenseMatmulIdAutoState::default(
@@ -1598,11 +1643,19 @@ impl KernelRegistry {
             pipeline_identities: HashMap::new(),
             sources,
             runtime_source_overrides: HashSet::new(),
+            registration_fallbacks: HashSet::new(),
             precompiled_lib: None,
             precompiled_load_attempted: false,
             #[cfg(test)]
             test_next_pipeline_failure: None,
+        };
+        // Every source these calls add is new to the registry, so each one
+        // lands in `runtime_source_overrides`; those names become fallbacks.
+        for register in REGISTRATION_FALLBACKS {
+            register(&mut registry);
         }
+        registry.registration_fallbacks = std::mem::take(&mut registry.runtime_source_overrides);
+        registry
     }
 
     /// Bind one immutable routing policy to this model registry.
@@ -1721,7 +1774,10 @@ impl KernelRegistry {
                 "cannot mutate dense Q4 shader {name} after its route plan is frozen"
             )));
         }
-        if self.sources.get(&name).copied() == Some(source) {
+        // Explicitly registering a fallback keeps its pre-fallback meaning:
+        // the function leaves the embedded metallib for runtime source.
+        let was_fallback = self.registration_fallbacks.remove(&name);
+        if !was_fallback && self.sources.get(&name).copied() == Some(source) {
             return Ok(());
         }
         // Invalidate every specialization for this function since the source
@@ -1894,7 +1950,7 @@ impl KernelRegistry {
                 continue;
             }
             // Skip if no source registered for this name.
-            if !self.sources.contains_key(*name) {
+            if !self.sources.contains_key(*name) || self.registration_fallbacks.contains(*name) {
                 continue;
             }
             // Best-effort: ignore errors so one broken kernel doesn't
@@ -1932,7 +1988,7 @@ impl KernelRegistry {
         }
         let mut warmed = 0_usize;
         for (name, bool_constants) in entries {
-            if !self.sources.contains_key(*name) {
+            if !self.sources.contains_key(*name) || self.registration_fallbacks.contains(*name) {
                 continue;
             }
             if self
@@ -1954,7 +2010,12 @@ impl KernelRegistry {
     /// Returns (warmed, skipped) counts. A registry already bound to another
     /// physical device reports every requested source as skipped.
     pub fn prewarm_all(&mut self, device: &metal::DeviceRef) -> (usize, usize) {
-        let names: Vec<String> = self.sources.keys().cloned().collect();
+        let names: Vec<String> = self
+            .sources
+            .keys()
+            .filter(|name| !self.registration_fallbacks.contains(*name))
+            .cloned()
+            .collect();
         if self.bind_device(device).is_err() {
             return (0, names.len());
         }
@@ -2350,7 +2411,8 @@ impl KernelRegistry {
         self.cache.len()
     }
 
-    /// Number of registered shader sources.
+    /// Number of shader sources this registry holds, including registration
+    /// fallbacks the constructor carries for op `register` functions.
     pub fn source_count(&self) -> usize {
         self.sources.len()
     }
@@ -2574,5 +2636,52 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
             label_v7, label_v13,
             "distinct constant values must yield distinct pipeline labels"
         );
+    }
+
+    /// A registration fallback resolves without the op's `register` call,
+    /// but an explicit registration still moves the function to runtime
+    /// source, as it did before the constructor carried the fallback.
+    #[test]
+    fn registration_fallbacks_keep_explicit_registration_on_runtime_source() {
+        let device = metal::Device::system_default().expect("Metal device");
+        let fallback = "ssm_conv_capture_forward_f32";
+        let constructor = "ssm_conv_forward_f32";
+        let mut registry = KernelRegistry::new();
+        // Same count as tests/registration_fallback_runtime_sources.rs.
+        assert_eq!(registry.registration_fallbacks.len(), 54);
+        assert!(registry.registration_fallbacks.contains(fallback));
+        assert!(!registry.registration_fallbacks.contains(constructor));
+        assert!(registry.runtime_source_overrides.is_empty());
+        // Prewarming skips a fallback, as it skipped the absent source.
+        assert_eq!(registry.prewarm_pipelines(&device, &[fallback]), 0);
+
+        fn origin(
+            registry: &mut KernelRegistry,
+            device: &metal::DeviceRef,
+            name: &str,
+        ) -> KernelPipelineOrigin {
+            let label = registry
+                .get_pipeline(name, device)
+                .expect("pipeline")
+                .label()
+                .to_owned();
+            registry.pipeline_identity(&label).expect("identity").origin
+        }
+        let default_origin = if precompiled_enabled() {
+            KernelPipelineOrigin::PrecompiledMetallib
+        } else {
+            KernelPipelineOrigin::RuntimeSource
+        };
+        assert_eq!(origin(&mut registry, &device, fallback), default_origin);
+
+        crate::ops::ssm_conv::register(&mut registry);
+        assert!(!registry.registration_fallbacks.contains(fallback));
+        assert!(registry.runtime_source_overrides.contains(fallback));
+        assert!(!registry.runtime_source_overrides.contains(constructor));
+        assert_eq!(
+            origin(&mut registry, &device, fallback),
+            KernelPipelineOrigin::RuntimeSource
+        );
+        assert_eq!(origin(&mut registry, &device, constructor), default_origin);
     }
 }
