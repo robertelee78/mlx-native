@@ -188,6 +188,11 @@ pub(crate) fn all_kernel_names() -> Vec<String> {
             }
         }
     }
+    for nsg in RowTiledGeometry::NSG_CELLS {
+        for width in 1..=4 {
+            names.push(dual_gate_up_kernel_name(nsg, width));
+        }
+    }
     names
 }
 
@@ -195,10 +200,82 @@ fn div_ceil(a: u32, b: u32) -> u64 {
     u64::from(a).div_ceil(u64::from(b))
 }
 
+/// F1 kernel name (dual-weight Q4_K gate+up).
+pub(crate) fn dual_gate_up_kernel_name(nsg: u32, width: u32) -> String {
+    format!("kernel_mul_mv_q4_K_f32_rt_dual_r1_{width}_nsg{nsg}")
+}
+
+/// Encode F1: dense gate and up (same Q4_K shape) in one launch per column
+/// tile. Each output equals the reference single-column kernel on its own
+/// tensor. Validation is the caller's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_dual_gate_up(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gate: &MlxBuffer,
+    up: &MlxBuffer,
+    gate_out: &MlxBuffer,
+    up_out: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    nsg: u32,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_K || !RowTiledGeometry::NSG_CELLS.contains(&nsg) {
+        return Err(MlxError::InvalidArgument(format!(
+            "dual gate+up requires Q4_K and nsg in {{2,4,8}}, got {:?} nsg={nsg}",
+            params.ggml_type
+        )));
+    }
+    for (col0, width) in gemma_column_tiling(params.m) {
+        let kernel = dual_gate_up_kernel_name(nsg, width);
+        let input_off =
+            checked_mn_tile_byte_offset(input.byte_offset(), col0 as usize, params.k, "dual input")?;
+        let gate_off =
+            checked_mn_tile_byte_offset(gate_out.byte_offset(), col0 as usize, params.n, "gate out")?;
+        let up_off =
+            checked_mn_tile_byte_offset(up_out.byte_offset(), col0 as usize, params.n, "up out")?;
+        let pipeline = registry.get_pipeline_with_constants(
+            &kernel,
+            device.metal_device(),
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )?;
+        let gpu_params = GgmlMatvecGpuParams {
+            ne00: i64::from(params.k),
+            ne01: i64::from(params.n),
+            ne02: 1,
+            ne10: i64::from(params.k),
+            ne12: 1,
+            ne0: i64::from(params.n),
+            ne1: i64::from(width),
+            r2: 1,
+            r3: 1,
+        };
+        encoder.dispatch_tracked_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(gate)),
+                (1, KernelArg::BufferWithOffset(input, input_off)),
+                (2, KernelArg::BufferWithOffset(gate_out, gate_off)),
+                (3, KernelArg::Bytes(as_bytes(&gpu_params))),
+                (4, KernelArg::Buffer(up)),
+                (5, KernelArg::BufferWithOffset(up_out, up_off)),
+            ],
+            &[gate, up, input],
+            &[gate_out, up_out],
+            metal::MTLSize::new(div_ceil(params.n, nsg), 1, 1),
+            metal::MTLSize::new(32, u64::from(nsg), 1),
+        );
+    }
+    Ok(())
+}
+
 /// Encode the D1 route at an explicit geometry. Columns `0..m` are tiled in
 /// chunks of at most four; every column's output equals the reference
 /// single-column kernel. Validation (dtypes, buffer extents) is the caller's;
-/// public callers use [`quantized_matmul_ggml_row_tiled`].
+/// public callers use
+/// [`crate::ops::quantized_matmul_ggml::quantized_matmul_ggml_row_tiled_with_geometry`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_row_tiled(
     encoder: &mut CommandEncoder,
