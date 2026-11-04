@@ -164,6 +164,36 @@ pub struct GgmlRoutingPolicy {
     /// Absent in schema-2 receipts, which executed the uniform grid.
     #[serde(default = "ExpertMmSchedule::schema2_default")]
     pub expert_mm_schedule: ExpertMmSchedule,
+    /// Q4-GEMMA-DECODE D1: exact row-tiled Q4_K multi-column route at
+    /// widths 2..=8, bitwise equal per column to `kernel_mul_mv_q4_K_f32`.
+    /// Per-lever fields are never resolved from the environment.
+    #[serde(default)]
+    pub dense_row_tiled_q4k: bool,
+    /// D1: exact row-tiled Q6_K multi-column route at widths 2..=8, bitwise
+    /// equal per column to `kernel_mul_mv_q6_K_f32_nr2`. Honoured only while
+    /// `dense_q6k_mv_nr2` holds.
+    #[serde(default)]
+    pub dense_row_tiled_q6k: bool,
+    /// D1: also route width 1 through the row-tiled kernels.
+    #[serde(default)]
+    pub dense_row_tiled_m1: bool,
+    /// D2: exact multi-column Q5_0 route at widths 2..=8.
+    #[serde(default)]
+    pub dense_mn_q5_0: bool,
+    /// D2: exact multi-column Q8_0 `nr2` route at widths 2..=8. Honoured only
+    /// while `dense_q8_0_mv_nr2` holds.
+    #[serde(default)]
+    pub dense_mn_q8_0: bool,
+    /// E1: expert-grouped Q4_K `mv_id` (leader pairs).
+    #[serde(default)]
+    pub expert_grouped_q4k: bool,
+    /// E1: expert-grouped Q5_0 `mv_id`.
+    #[serde(default)]
+    pub expert_grouped_q5_0: bool,
+    /// E1: expert-grouped Q8_0 `mv_id`. Honoured only while
+    /// `expert_q8_0_mv_nr2` is false.
+    #[serde(default)]
+    pub expert_grouped_q8_0: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +243,14 @@ impl Default for GgmlRoutingPolicy {
             expert_q8_0_mv_nr2: false,
             expert_tensor_mm: GgmlTensorMmPreference::AutoProbe,
             expert_mm_schedule: ExpertMmSchedule::CompactTiles,
+            dense_row_tiled_q4k: false,
+            dense_row_tiled_q6k: false,
+            dense_row_tiled_m1: false,
+            dense_mn_q5_0: false,
+            dense_mn_q8_0: false,
+            expert_grouped_q4k: false,
+            expert_grouped_q5_0: false,
+            expert_grouped_q8_0: false,
         }
     }
 }
