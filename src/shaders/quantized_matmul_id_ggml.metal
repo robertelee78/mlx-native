@@ -1957,15 +1957,16 @@ inline int grouped_mv_id_next_members(
 // Metal's default-math contraction and drifts 1 ULP from the stock kernel,
 // so rows are never interleaved; members (columns) are.
 
+// One weight row against up to 4 members: tot[c] is the stock per-pair
+// `simd_sum(sumf)` for member c.
 template <int NC>
-inline void q4_K_grouped_row(
+inline void q4_K_grouped_row_sums(
     device const block_q4_K * x,
     device const float      * src1,
-    device       float      * dst,
     constant GgmlMatvecIdParams & p,
     thread const int * members,
-    int row,
-    uint tiisg
+    uint tiisg,
+    thread float * tot
 ) {
     const int nb = p.ne00 / QK_K;
 
@@ -2041,9 +2042,25 @@ inline void q4_K_grouped_row(
     }
 
     for (int c = 0; c < NC; ++c) {
-        const float tot = simd_sum(sumf[c]);
+        tot[c] = simd_sum(sumf[c]);
+    }
+}
+
+template <int NC>
+inline void q4_K_grouped_row(
+    device const block_q4_K * x,
+    device const float      * src1,
+    device       float      * dst,
+    constant GgmlMatvecIdParams & p,
+    thread const int * members,
+    int row,
+    uint tiisg
+) {
+    float tot[NC];
+    q4_K_grouped_row_sums<NC>(x, src1, p, members, tiisg, tot);
+    for (int c = 0; c < NC; ++c) {
         if (tiisg == 0 && row < (int)p.ne01) {
-            dst[members[c] * p.ne0 + row] = tot;
+            dst[members[c] * p.ne0 + row] = tot[c];
         }
     }
 }
@@ -2124,6 +2141,125 @@ kernel void kernel_mul_mv_id_q4_K_f32_grouped_impl<2>(
 
 template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_rt4")]]
 kernel void kernel_mul_mv_id_q4_K_f32_grouped_impl<4>(
+    device const char *, device const float *, device float *, device const uint *,
+    constant GgmlMatvecIdParams &, uint3, uint, uint);
+
+// ---- Q4_K gate_up with the moe_swiglu_batch epilogue (ADR-063 F2) ----
+//
+// The weight holds [gate (n_ff rows); up (n_ff rows)] per expert (ne01 =
+// 2 * n_ff). A SIMD group owns R0 gate rows r and their up rows r + n_ff,
+// computes each row with the E1 per-row loop (rows sequential, members
+// interleaved), and lane 0 applies the `moe_swiglu_batch` expression to the
+// two stock row sums, writing dst[pair * ne0 + r] with ne0 = n_ff: exactly
+// what `kernel_mul_mv_id_q4_K_f32` followed by `moe_swiglu_batch` produces.
+// An invalid id feeds the stock NaN poison through the same epilogue.
+
+// Literal clone of the `moe_swiglu_batch` expression (moe_dispatch.metal).
+inline float grouped_geglu_epilogue(float gate, float up) {
+    float gelu = gate * 0.5f * (1.0f + precise::tanh(
+        0.7978845608f * (gate + 0.044715f * gate * gate * gate)));
+    return gelu * up;
+}
+
+template <int R0, int NC>
+inline void q4_K_geglu_chunk(
+    device const block_q4_K * xe,
+    device const float      * src1,
+    device       float      * dst,
+    constant GgmlMatvecIdParams & p,
+    thread const int * members,
+    int first_row,
+    uint tiisg
+) {
+    const int nb = p.ne00 / QK_K;
+    const int n_ff = (int)p.ne01 / 2;
+    for (int r = 0; r < R0; ++r) {
+        const int row = first_row + r;
+        // Uniform per SIMD group; rows past the tail do no work.
+        if (row >= n_ff) {
+            break;
+        }
+        float gate[NC];
+        float up[NC];
+        q4_K_grouped_row_sums<NC>(xe + row * nb, src1, p, members, tiisg, gate);
+        q4_K_grouped_row_sums<NC>(xe + (row + n_ff) * nb, src1, p, members, tiisg, up);
+        if (tiisg == 0) {
+            for (int c = 0; c < NC; ++c) {
+                dst[members[c] * p.ne0 + row] = grouped_geglu_epilogue(gate[c], up[c]);
+            }
+        }
+    }
+}
+
+// Geometry: threads (2, 32, 1) = 2 SIMD groups of R0 gate/up row pairs, so a
+// threadgroup covers 2 * R0 output columns. tgpig.y = flat pair.
+template <int R0>
+kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int pair = tgpig.y;
+    if (pair >= (int)p.ne1) return;
+
+    const uint expert_id = ids[pair];
+    const int n_ff = (int)p.ne01 / 2;
+    const int first_row = (2 * (int)tgpig.x + (int)sgitg) * R0;
+
+    if ((uint64_t)expert_id >= (uint64_t)p.ne02) {
+        // Stock: the gate and up rows hold the NAN poison and
+        // moe_swiglu_batch maps them at run time. Default Metal math assumes
+        // no NaNs, so a compile-time NAN operand would be folded away; the
+        // poison is rebuilt from p.r2 (always 1 in this ABI) so the epilogue
+        // runs on the same bits at run time, exactly as stock does.
+        const float poison = as_type<float>(as_type<uint>(NAN) + (p.r2 - 1u));
+        if (tiisg == 0) {
+            for (int r = 0; r < R0; ++r) {
+                if (first_row + r < n_ff) {
+                    dst[pair * p.ne0 + first_row + r] = grouped_geglu_epilogue(poison, poison);
+                }
+            }
+        }
+        return;
+    }
+    if (grouped_mv_id_has_earlier_member(ids, pair, expert_id)) return;
+
+    device const block_q4_K * xe = (device const block_q4_K *)((device const char *)src0 + expert_id * p.expert_stride);
+
+    int cursor = pair;
+    int members[4];
+    for (;;) {
+        const int count = grouped_mv_id_next_members(ids, p, expert_id, &cursor, members);
+        if (count == 4) {
+            q4_K_geglu_chunk<R0, 4>(xe, src1, dst, p, members, first_row, tiisg);
+        } else if (count == 3) {
+            q4_K_geglu_chunk<R0, 3>(xe, src1, dst, p, members, first_row, tiisg);
+        } else if (count == 2) {
+            q4_K_geglu_chunk<R0, 2>(xe, src1, dst, p, members, first_row, tiisg);
+        } else if (count == 1) {
+            q4_K_geglu_chunk<R0, 1>(xe, src1, dst, p, members, first_row, tiisg);
+        }
+        if (count < 4) break;
+    }
+}
+
+template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt1")]]
+kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<1>(
+    device const char *, device const float *, device float *, device const uint *,
+    constant GgmlMatvecIdParams &, uint3, uint, uint);
+
+template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt2")]]
+kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<2>(
+    device const char *, device const float *, device float *, device const uint *,
+    constant GgmlMatvecIdParams &, uint3, uint, uint);
+
+template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4")]]
+kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<4>(
     device const char *, device const float *, device float *, device const uint *,
     constant GgmlMatvecIdParams &, uint3, uint, uint);
 

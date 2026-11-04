@@ -623,6 +623,11 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_rt4".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q5_0_f32_grouped".into(), ggml_id_src);
         sources.insert("kernel_mul_mv_id_q8_0_f32_grouped".into(), ggml_id_src);
+        // ADR-063 Q4-GEMMA-DECODE F2 — grouped Q4_K gate_up with the
+        // moe_swiglu_batch GELU*mul epilogue.
+        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt1".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt2".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
         // in one dispatch — replaces silu_mul + expert_down sequence.
