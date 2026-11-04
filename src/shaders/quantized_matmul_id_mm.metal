@@ -84,7 +84,8 @@ struct GgmlMatmulIdMm_MmParams {
     int32_t  ne1;    // batch (always == ne21 * ne20 in our layout)
     int16_t  r2;     // 1
     int16_t  r3;     // 1
-    int16_t  _pad0;
+    int16_t  sched_flags; // compact kernels only: bit 0 = N tile fastest,
+                          // bit 1 = half-tile skip (P2c)
     int16_t  _pad1;
 };
 
@@ -701,6 +702,178 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
     threadgroup char *, ushort, ushort);
 
 // ====================================================================
+// map0c — compact per-expert tile schedule builder (ADR-063 P2)
+// ====================================================================
+//
+// Same launch as map0: one threadgroup of `ntg == n_experts` threads, one
+// thread per expert id. Output layout:
+//
+//   htpe word 0           — tile_count, or POISON (bit 31) when any token has
+//                            an out-of-range or duplicate expert id, or the
+//                            tile list would exceed `max_tiles`.
+//   htpe[1 + 3*t + 0..3]  — descriptor of tile t: (expert, first list entry,
+//                            valid rows <= 32). Tiles are emitted per expert
+//                            in ascending expert order, each expert's tiles
+//                            in ascending entry order.
+//   hids                  — compact routed-row list. Expert e's entries
+//                            start at the exclusive prefix sum of
+//                            (count + 1) over experts < e, and hold
+//                            `token * ne20 + slot` in ascending token order,
+//                            so each expert's 32-row tiles have exactly the
+//                            membership of the uniform-grid schedule.
+//
+// The staging thread validates its own token (every id < n_experts, the
+// ne20 ids pairwise distinct) — the map0 predicate, evaluated once per
+// token. Threadgroup memory: ntg*ne20 staged ids followed by 3*ntg + 2
+// bookkeeping words.
+
+struct GgmlMatmulIdMm_Map0cParams {
+    int32_t  ne21;      // n_tokens
+    int32_t  ne20;      // n_expert_used (== top_k)
+    uint64_t nb21;      // bytes per token in the source ids table
+    uint32_t max_tiles; // descriptor capacity bound
+    uint32_t _pad;
+};
+
+template<short ne20>
+kernel void hf2q_mul_mm_id_map0c_impl(
+        constant GgmlMatmulIdMm_Map0cParams & args [[buffer(0)]],
+        device const char * src2 [[buffer(1)]],
+        device       char * htpe [[buffer(2)]],
+        device       char * hids [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const uint32_t ide = tpitg;
+
+    threadgroup uint32_t * sids  = (threadgroup uint32_t *) shmem;
+    threadgroup uint32_t * soff  = sids + ntg * ne20;
+    threadgroup uint32_t * stile = soff + ntg;
+    threadgroup uint32_t * sflag = stile + ntg;
+    threadgroup uint32_t * stot  = sflag + ntg;
+
+    // ---- Pass 1: validate staged tokens and count this expert's rows ----
+    bool staged_invalid = false;
+    uint32_t n_all = 0;
+    for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
+        if (i21 + tpitg < args.ne21) {
+            device const uint32_t * src2_u32 =
+                (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
+            threadgroup uint32_t * mine = sids + tpitg * ne20;
+            bool token_invalid = false;
+            for (short i20 = 0; i20 < ne20; i20++) {
+                const uint32_t id = src2_u32[i20];
+                mine[i20] = id;
+                token_invalid |= id >= ntg;
+                for (short other = 0; other < i20; other++) {
+                    token_invalid |= id == mine[other];
+                }
+            }
+            staged_invalid |= token_invalid;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short t = 0; t < ntg; t++) {
+            if (i21 + t >= args.ne21) break;
+            threadgroup const uint32_t * sids_t = sids + t * ne20;
+            for (short i20 = 0; i20 < ne20; i20++) {
+                if (sids_t[i20] == ide) {
+                    n_all++;
+                    break;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    soff[ide]  = n_all;
+    stile[ide] = (n_all + 31) / 32;
+    sflag[ide] = staged_invalid ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Exclusive prefix sums of list slices and tile counts ----
+    if (tpitg == 0) {
+        uint32_t entry = 0;
+        uint32_t tile = 0;
+        uint32_t invalid = 0;
+        for (ushort e = 0; e < ntg; e++) {
+            const uint32_t count = soff[e];
+            const uint32_t tiles = stile[e];
+            soff[e]  = entry;
+            stile[e] = tile;
+            entry += count + 1;
+            tile  += tiles;
+            invalid |= sflag[e];
+        }
+        const bool poison = invalid != 0u || tile > args.max_tiles;
+        stot[0] = tile;
+        stot[1] = poison ? 1u : 0u;
+        device uint32_t * word0 = (device uint32_t *) htpe;
+        word0[0] = poison ? 0x80000000u : tile;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (stot[1] != 0u) {
+        return;
+    }
+
+    // ---- Tile descriptors for this expert ----
+    const uint32_t first_entry = soff[ide];
+    const uint32_t first_tile  = stile[ide];
+    device uint32_t * desc = (device uint32_t *) htpe + 1 + 3 * first_tile;
+    for (uint32_t r = 0; r < n_all; r += 32) {
+        desc[0] = ide;
+        desc[1] = first_entry + r;
+        desc[2] = (n_all - r < 32u) ? (n_all - r) : 32u;
+        desc += 3;
+    }
+
+    // ---- Pass 2: this expert's entries in ascending token order ----
+    device int32_t * list = (device int32_t *) hids + first_entry;
+    uint32_t written = 0;
+    for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
+        if (i21 + tpitg < args.ne21) {
+            device const uint32_t * src2_u32 =
+                (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
+            threadgroup uint32_t * mine = sids + tpitg * ne20;
+            for (short i20 = 0; i20 < ne20; i20++) {
+                mine[i20] = src2_u32[i20];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short t = 0; t < ntg; t++) {
+            if (i21 + t >= args.ne21) break;
+            threadgroup const uint32_t * sids_t = sids + t * ne20;
+            for (short i20 = 0; i20 < ne20; i20++) {
+                if (sids_t[i20] == ide) {
+                    list[written++] = (i21 + t) * ne20 + i20;
+                    break;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template [[host_name("kernel_mul_mm_id_map0c_ne20_1")]]
+kernel void hf2q_mul_mm_id_map0c_impl<1>(
+    constant GgmlMatmulIdMm_Map0cParams &,
+    device const char *, device char *, device char *,
+    threadgroup char *, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_map0c_ne20_6")]]
+kernel void hf2q_mul_mm_id_map0c_impl<6>(
+    constant GgmlMatmulIdMm_Map0cParams &,
+    device const char *, device char *, device char *,
+    threadgroup char *, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_map0c_ne20_8")]]
+kernel void hf2q_mul_mm_id_map0c_impl<8>(
+    constant GgmlMatmulIdMm_Map0cParams &,
+    device const char *, device char *, device char *,
+    threadgroup char *, ushort, ushort);
+
+// ====================================================================
 // mul_mm_id — MoE matmul using the map0-produced expert token lists
 // ====================================================================
 //
@@ -727,8 +900,18 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
 // Write-back staging ALWAYS goes through shmem because consecutive M-rows
 // in this tile belong to the same expert but may correspond to different
 // (token, slot) output rows (determined by hids[im * ne21 + r1 + j]).
+//
+// COMPACT (ADR-063 P2, `_c` host names): the grid is `max_tiles` tile
+// slots × ⌈N/64⌉ N tiles (bit 0 of `sched_flags` puts the N tile on grid x)
+// over the map0c schedule. Word 0 of htpe holds tile_count or POISON; each
+// live tile loads its (expert, first entry, valid rows) descriptor and runs
+// the tile body below unchanged, with `hids[im*ne21 + r1 + j]` replaced by
+// `hids[first_entry + j]`. Bit 1 enables the half-tile skip (P2c): when a
+// tile holds at most 16 rows, simdgroups 2-3 — which own rows 16-31 — skip
+// their MMA and shared-memory store; all four simdgroups still stage the
+// tiles and copy rows out.
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
 kernel void hf2q_mul_mm_id_impl(
         constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
         device const char * src0 [[buffer(1)]],
@@ -751,38 +934,74 @@ kernel void hf2q_mul_mm_id_impl(
     constexpr int NL0 = NK/16;  // 2
     constexpr int NL1 = NK/8;   // 4
 
-    const int im = tgpig.z;
-    const int r0 = tgpig.y * NR0;
-    const int r1 = tgpig.x * NR1;
-
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const uint32_t route_state = tpe_u32[im];
-    if ((route_state & 0x80000000u) != 0u) {
-        // Invalid IDs poison the whole operation. Exactly one threadgroup
-        // fills the complete logical output with NaN; every threadgroup exits
-        // before constructing an expert weight or activation address. The
-        // consuming graph is responsible for rejecting this sentinel at an
-        // existing host-visible result readback.
-        if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
-            device float * out = (device float *) dst;
-            const uint64_t total =
-                (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
-            for (uint64_t index = tiitg; index < total; index += 128) {
-                out[index] = NAN;
+    int   im;
+    int   r0;
+    int   list_base;  // hids index of this tile's first routed row
+    short nr1;
+    if (COMPACT) {
+        const uint32_t schedule_state = tpe_u32[0];
+        const bool n_fastest = (args.sched_flags & 1) != 0;
+        const uint32_t tile  = n_fastest ? tgpig.y : tgpig.x;
+        const uint32_t ntile = n_fastest ? tgpig.x : tgpig.y;
+        if ((schedule_state & 0x80000000u) != 0u) {
+            // Same poison contract as the uniform grid: one threadgroup
+            // fills the logical output with NaN and nobody forms a weight
+            // or activation address.
+            if (tgpig.x == 0 && tgpig.y == 0) {
+                device float * out = (device float *) dst;
+                const uint64_t total =
+                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+                for (uint64_t index = tiitg; index < total; index += 128) {
+                    out[index] = NAN;
+                }
             }
+            return;
         }
-        return;
-    }
-    const int32_t neh1 = (int32_t)route_state;
+        if (tile >= schedule_state) return;
+        device const uint32_t * desc = tpe_u32 + 1 + 3*tile;
+        im        = (int)desc[0];
+        list_base = (int)desc[1];
+        nr1       = (short)desc[2];
+        r0        = ntile * NR0;
+    } else {
+        im = tgpig.z;
+        r0 = tgpig.y * NR0;
+        const int r1 = tgpig.x * NR1;
 
-    // Early exit: this expert has fewer routed tokens than our tile's
-    // M-base.  Whole threadgroup returns.
-    if (r1 >= neh1) return;
+        const uint32_t route_state = tpe_u32[im];
+        if ((route_state & 0x80000000u) != 0u) {
+            // Invalid IDs poison the whole operation. Exactly one threadgroup
+            // fills the complete logical output with NaN; every threadgroup exits
+            // before constructing an expert weight or activation address. The
+            // consuming graph is responsible for rejecting this sentinel at an
+            // existing host-visible result readback.
+            if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
+                device float * out = (device float *) dst;
+                const uint64_t total =
+                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+                for (uint64_t index = tiitg; index < total; index += 128) {
+                    out[index] = NAN;
+                }
+            }
+            return;
+        }
+        const int32_t neh1 = (int32_t)route_state;
+
+        // Early exit: this expert has fewer routed tokens than our tile's
+        // M-base.  Whole threadgroup returns.
+        if (r1 >= neh1) return;
+
+        nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;
+        list_base = im * args.ne21 + r1;
+    }
+    // P2c: simdgroups 2-3 own tile rows 16-31, which hold no routed row.
+    const bool upper_half_idle =
+        COMPACT && (args.sched_flags & 2) != 0 && nr1 <= 16 && sgitg >= 2;
 
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
-    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
 
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
@@ -791,7 +1010,7 @@ kernel void hf2q_mul_mm_id_impl(
     short il = il0;
 
     // (token_idx, slot_idx) of the row this thread owns.
-    const int id = ids_i32[im * args.ne21 + r1 + lr1];
+    const int id = ids_i32[list_base + lr1];
     const short i11 = (id % args.ne20) % args.ne11;   // slot index
     // §0.19 FIX (2026-06-30): token/row index must be `int`, not `short`.
     // The flat [n_tokens, K] input layout makes i12 = id/ne20 range up to
@@ -890,21 +1109,23 @@ kernel void hf2q_mul_mm_id_impl(
         threadgroup const half  * lsma = (sa + 4*64*(sgitg%2));
         threadgroup const float * lsmb = (sb + 2*64*(sgitg/2));
 
-        for (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+        if (!upper_half_idle) {
+            for (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+                for (short i = 0; i < 4; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                for (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                for (short i = 0; i < 8; i++) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+                }
+                lsma += 8*64;
+                lsmb += 4*64;
             }
-            simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-            }
-            simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
-            }
-            lsma += 8*64;
-            lsmb += 4*64;
         }
     }
 
@@ -914,8 +1135,10 @@ kernel void hf2q_mul_mm_id_impl(
     threadgroup float * temp_str = ((threadgroup float *) shmem)
         + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
-    for (short i = 0; i < 8; i++) {
-        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    if (!upper_half_idle) {
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -924,7 +1147,7 @@ kernel void hf2q_mul_mm_id_impl(
     // For each owned row j (within the tile), look up its (token, slot)
     // via hids, compute the destination address in dst, and copy.
     for (short j = sgitg; j < nr1; j += 4) {
-        const int id = ids_i32[im*args.ne21 + r1 + j];
+        const int id = ids_i32[list_base + j];
 
         const short ide = id % args.ne20;  // slot index (output row-major)
         // §0.19 FIX (2026-06-30): output token/batch index must be `int` —
@@ -1051,6 +1274,80 @@ kernel void hf2q_mul_mm_id_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>(
     constant GgmlMatmulIdMm_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-063 P2 — compact-schedule (`_c`) instantiations of every mm_id type.
+template [[host_name("kernel_mul_mm_id_q4_0_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q4_0, 2, dequantize_q4_0, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_0_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q5_0, 2, dequantize_q5_0, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q8_0_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q8_0, 2, dequantize_q8_0, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q2_K_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q2_K, QK_NL, dequantize_q2_K, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q3_K_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q3_K, QK_NL, dequantize_q3_K, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q4_K_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q4_K, QK_NL, dequantize_q4_K, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_K_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q5_K, QK_NL, dequantize_q5_K, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q6_K_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q6_K, QK_NL, dequantize_q6_K, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_1_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_q5_1, 2, dequantize_q5_1, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq4_nl_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_iq4_nl, 2, dequantize_iq4_nl, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq4_xs_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_iq4_xs, QK_NL, dequantize_iq4_xs, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_c")]]
+kernel void hf2q_mul_mm_id_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, true>(
+    constant GgmlMatmulIdMm_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
 
 // ============================================================================
 // ADR-033 §Pi Task #20 debug kernel — dequantize_iq4_xs dump

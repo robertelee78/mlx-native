@@ -40,7 +40,8 @@ struct GgmlMatmulIdMmTensor_MmParams {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
-    int16_t  _pad0;
+    int16_t  sched_flags; // compact kernels only: bit 0 = N tile fastest,
+                          // bit 1 = half-tile skip (P2c)
     int16_t  _pad1;
 };
 
@@ -495,92 +496,40 @@ void dq_q5_K_id(device const block_q5_K * xb, short il, thread type4x4 & reg) {
     }
 }
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
-kernel void hf2q_mul_mm_id_tensor_impl(
-        constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
-        device const char * src0 [[buffer(1)]],
-        device const char * src1 [[buffer(2)]],
-        device const char * htpe [[buffer(3)]],
-        device const char * hids [[buffer(4)]],
-        device       char * dst  [[buffer(5)]],
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-
-    threadgroup half  * sa = (threadgroup half  *)(shmem);
-    threadgroup half  * sb = (threadgroup half  *)(shmem + 4096);
-    threadgroup float * sc = (threadgroup float *)(shmem);
-
+// K loop, `matmul2d` accumulate and shared-memory store of one tile.
+//
+// `TM` is the row count of the B operand and of the destination. The
+// uniform grid and full compact tiles use TM = 32 (`matmul2d_descriptor(32,
+// 64, 32)`, today's body). The half-tile skip (P2c) runs partial compact
+// tiles with at most 16 rows at TM = 16 over the lower half of the staged
+// B tile; staging is unchanged, so rows 16-31 are loaded but not multiplied
+// and the destination rows 16-31 of `sc` are not written.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), short TM>
+inline void hf2q_mul_mm_id_tensor_tile(
+        constant GgmlMatmulIdMmTensor_MmParams & args,
+        device const block_q * x,
+        device const float * y,
+        short il0,
+        threadgroup half  * sa,
+        threadgroup half  * sb,
+        threadgroup float * sc,
+        ushort tiitg) {
     constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z;
-    const int r0 = tgpig.y * NR0;
-    const int r1 = tgpig.x * NR1;
-
-    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
-    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
-
-    const uint32_t route_state = tpe_u32[im];
-    if ((route_state & 0x80000000u) != 0u) {
-        if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
-            device float * out = (device float *) dst;
-            const uint64_t total =
-                (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
-            for (uint64_t index = tiitg; index < total; index += 128) {
-                out[index] = NAN;
-            }
-        }
-        return;
-    }
-    const int32_t neh1 = (int32_t)route_state;
-    if (r1 >= neh1) return;
-
-    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
-    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
-
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
-    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
-
-    const short il0 = (tiitg % NL0);
     short il = il0;
 
-    const int id = ids_i32[im * args.ne21 + r1 + lr1];
-    const short i11 = (id % args.ne20) % args.ne11;
-    // §0.19 FIX (2026-06-30): token/row index must be `int` — flat
-    // [n_tokens, K] layout makes i12 reach n_tokens-1 (65535 at 8k); `short`
-    // overflows at 32768 → OOB gather. See quantized_matmul_id_mm.metal.
-    const int   i12 = (id / args.ne20);
-    const short i13 = 0;
-
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
-    const short    offset1 = il0/nl;
-
-    device const block_q * x =
-        (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
-
-    const short iy = 8*(tiitg % NL1);
-
-    device const float * y = (device const float *)(src1
-        + args.nb13*i13
-        + args.nb12*(uint64_t)i12
-        + args.nb11*i11
-        + args.nb10*iy);
-
-    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
-    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
+    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
+    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NK, TM));
 
     matmul2d<
-        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+        matmul2d_descriptor(TM, NR0, NK, false, true, false,
             matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         // Stage A.
@@ -656,14 +605,133 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     {
-        auto tC_sm = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(NR0, NR1));
+        auto tC_sm = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(NR0, TM));
         cT.store(tC_sm);
+    }
+}
+
+// COMPACT (ADR-063 P2, `_c` host names): grid of `max_tiles` tile slots ×
+// ⌈N/64⌉ N tiles (bit 0 of `sched_flags` puts the N tile on grid x) over the
+// map0c schedule; see quantized_matmul_id_mm.metal for the descriptor
+// layout. Bit 1 enables the half-tile skip (P2c) for tiles of <= 16 rows.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
+kernel void hf2q_mul_mm_id_tensor_impl(
+        constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const char * htpe [[buffer(3)]],
+        device const char * hids [[buffer(4)]],
+        device       char * dst  [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half  * sa = (threadgroup half  *)(shmem);
+    threadgroup half  * sb = (threadgroup half  *)(shmem + 4096);
+    threadgroup float * sc = (threadgroup float *)(shmem);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    int   im;
+    int   r0;
+    int   list_base;  // hids index of this tile's first routed row
+    short nr1;
+    if (COMPACT) {
+        const uint32_t schedule_state = tpe_u32[0];
+        const bool n_fastest = (args.sched_flags & 1) != 0;
+        const uint32_t tile  = n_fastest ? tgpig.y : tgpig.x;
+        const uint32_t ntile = n_fastest ? tgpig.x : tgpig.y;
+        if ((schedule_state & 0x80000000u) != 0u) {
+            if (tgpig.x == 0 && tgpig.y == 0) {
+                device float * out = (device float *) dst;
+                const uint64_t total =
+                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+                for (uint64_t index = tiitg; index < total; index += 128) {
+                    out[index] = NAN;
+                }
+            }
+            return;
+        }
+        if (tile >= schedule_state) return;
+        device const uint32_t * desc = tpe_u32 + 1 + 3*tile;
+        im        = (int)desc[0];
+        list_base = (int)desc[1];
+        nr1       = (short)desc[2];
+        r0        = ntile * NR0;
+    } else {
+        im = tgpig.z;
+        r0 = tgpig.y * NR0;
+        const int r1 = tgpig.x * NR1;
+
+        const uint32_t route_state = tpe_u32[im];
+        if ((route_state & 0x80000000u) != 0u) {
+            if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
+                device float * out = (device float *) dst;
+                const uint64_t total =
+                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+                for (uint64_t index = tiitg; index < total; index += 128) {
+                    out[index] = NAN;
+                }
+            }
+            return;
+        }
+        const int32_t neh1 = (int32_t)route_state;
+        if (r1 >= neh1) return;
+
+        nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;
+        list_base = im * args.ne21 + r1;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    const int id = ids_i32[list_base + lr1];
+    const short i11 = (id % args.ne20) % args.ne11;
+    // §0.19 FIX (2026-06-30): token/row index must be `int` — flat
+    // [n_tokens, K] layout makes i12 reach n_tokens-1 (65535 at 8k); `short`
+    // overflows at 32768 → OOB gather. See quantized_matmul_id_mm.metal.
+    const int   i12 = (id / args.ne20);
+    const short i13 = 0;
+
+    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q * x =
+        (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*(uint64_t)i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    if (COMPACT && (args.sched_flags & 2) != 0 && nr1 <= 16) {
+        hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, 16>(
+            args, x, y, il0, sa, sb, sc, tiitg);
+    } else {
+        hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, NR1>(
+            args, x, y, il0, sa, sb, sc, tiitg);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = sgitg; j < nr1; j += 4) {
-        const int id = ids_i32[im*args.ne21 + r1 + j];
+        const int id = ids_i32[list_base + j];
         const short ide = id % args.ne20;
         // §0.19 FIX (2026-06-30): output token/batch index must be `int` —
         // `short` overflows at n_tokens>32768 → OOB write-back. See
@@ -772,6 +840,79 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_q5_K, QK_NL, dq_q5_K_id>(
 
 template [[host_name("kernel_mul_mm_id_q4_K_tensor_f32")]]
 kernel void hf2q_mul_mm_id_tensor_impl<block_q4_K, QK_NL, dq_q4_K_id>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// ADR-063 P2 — compact-schedule (`_c`) instantiations of every mm_id type.
+template [[host_name("kernel_mul_mm_id_q4_0_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q4_0, 2, dq_q4_0_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_0_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q5_0, 2, dq_q5_0_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q8_0_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q8_0, 2, dq_q8_0_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q2_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q2_K, QK_NL, dq_q2_K_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q3_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q3_K, QK_NL, dq_q3_K_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q4_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q4_K, QK_NL, dq_q4_K_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q5_K, QK_NL, dq_q5_K_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q6_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q6_K, QK_NL, dq_q6_K_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_q5_1_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_q5_1, 2, dq_q5_1_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq4_nl_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_nl, 2, dq_iq4_nl_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq4_xs_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_iq4_xs, QK_NL, dq_iq4_xs_id, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_tensor_impl<block_iq2_xxs, QK_NL, dq_iq2_xxs_id, true>(
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);

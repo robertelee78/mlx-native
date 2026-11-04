@@ -16,8 +16,9 @@ use crate::dtypes::DType;
 use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, DispatchRecord, KernelArg};
 use crate::env_flags::{cached_env_default_true, cached_env_eq_one};
 use crate::ggml_capability::{
-    ggml_expert_bytes, plan_expert_auto_route, tensor_mm_auto_selected, ExpertAutoPlan,
-    GgmlRoutingPolicy, GgmlTensorMmPreference,
+    compact_max_tiles, expert_mm_schedule_scratch_bytes, ggml_expert_bytes, plan_expert_auto_route,
+    tensor_mm_auto_selected, ExpertAutoPlan, ExpertMmSchedule, GgmlRoutingPolicy,
+    GgmlTensorMmPreference,
 };
 use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
 use std::sync::atomic::AtomicI8;
@@ -170,6 +171,48 @@ impl GgmlType {
             GgmlType::IQ2_XXS => "kernel_mul_mm_id_iq2_xxs_tensor_f32",
         }
     }
+
+    /// Compact-schedule (`_c`) simdgroup mm_id kernel (ADR-063 P2).
+    fn id_mm_compact_kernel_name(self) -> &'static str {
+        match self {
+            GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_f32_c",
+            GgmlType::Q5_0 => "kernel_mul_mm_id_q5_0_f32_c",
+            GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_f32_c",
+            GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_f32_c",
+            GgmlType::Q3_K => "kernel_mul_mm_id_q3_K_f32_c",
+            GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_f32_c",
+            GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_f32_c",
+            GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_f32_c",
+            GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_f32_c",
+            GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_f32_c",
+            GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_f32_c",
+            GgmlType::IQ2_XXS => "kernel_mul_mm_id_iq2_xxs_f32_c",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
+        }
+    }
+
+    /// Compact-schedule (`_c`) tensor-API mm_id kernel (ADR-063 P2).
+    fn id_mm_tensor_compact_kernel_name(self) -> &'static str {
+        match self {
+            GgmlType::Q4_0 => "kernel_mul_mm_id_q4_0_tensor_f32_c",
+            GgmlType::Q5_0 => "kernel_mul_mm_id_q5_0_tensor_f32_c",
+            GgmlType::Q8_0 => "kernel_mul_mm_id_q8_0_tensor_f32_c",
+            GgmlType::Q2_K => "kernel_mul_mm_id_q2_K_tensor_f32_c",
+            GgmlType::Q3_K => "kernel_mul_mm_id_q3_K_tensor_f32_c",
+            GgmlType::Q4_K => "kernel_mul_mm_id_q4_K_tensor_f32_c",
+            GgmlType::Q5_K => "kernel_mul_mm_id_q5_K_tensor_f32_c",
+            GgmlType::Q6_K => "kernel_mul_mm_id_q6_K_tensor_f32_c",
+            GgmlType::Q5_1 => "kernel_mul_mm_id_q5_1_tensor_f32_c",
+            GgmlType::IQ4_NL => "kernel_mul_mm_id_iq4_nl_tensor_f32_c",
+            GgmlType::IQ4_XS => "kernel_mul_mm_id_iq4_xs_tensor_f32_c",
+            GgmlType::IQ2_XXS => "kernel_mul_mm_id_iq2_xxs_tensor_f32_c",
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I16 | GgmlType::I32 => {
+                "unsupported"
+            }
+        }
+    }
 }
 
 #[inline]
@@ -264,7 +307,40 @@ pub(crate) fn expert_routing_policy_from_environment() -> GgmlRoutingPolicy {
         } else {
             GgmlTensorMmPreference::AutoProbe
         },
+        expert_mm_schedule: mm_id_schedule_from_environment(),
         ..GgmlRoutingPolicy::default()
+    }
+}
+
+/// `HF2Q_MM_ID_SCHEDULE`: `grid` selects [`ExpertMmSchedule::UniformGrid`]
+/// (diagnostic and A/B arm), `compact` selects
+/// [`ExpertMmSchedule::CompactTiles`]; unset or empty keeps the default.
+/// Any other value warns once and keeps the default. Read once per process.
+fn mm_id_schedule_from_environment() -> ExpertMmSchedule {
+    static SCHEDULE: std::sync::LazyLock<ExpertMmSchedule> = std::sync::LazyLock::new(|| {
+        let value = std::env::var("HF2Q_MM_ID_SCHEDULE").ok();
+        let (schedule, recognized) = parse_mm_id_schedule(value.as_deref());
+        if !recognized {
+            eprintln!(
+                "[mlx-native] HF2Q_MM_ID_SCHEDULE={:?} is neither `grid` nor `compact`; keeping the default {:?} schedule",
+                value.unwrap_or_default(),
+                schedule,
+            );
+        }
+        schedule
+    });
+    *SCHEDULE
+}
+
+/// Parse an `HF2Q_MM_ID_SCHEDULE` value; the flag is `false` for a
+/// non-empty value that is not a schedule name.
+fn parse_mm_id_schedule(value: Option<&str>) -> (ExpertMmSchedule, bool) {
+    let default = GgmlRoutingPolicy::default().expert_mm_schedule;
+    match value.map(str::trim) {
+        None | Some("") => (default, true),
+        Some("grid") => (ExpertMmSchedule::UniformGrid, true),
+        Some("compact") => (ExpertMmSchedule::CompactTiles, true),
+        Some(_) => (default, false),
     }
 }
 
@@ -574,6 +650,7 @@ pub fn quantized_matmul_id_ggml_pooled_with_policy(
         scratch,
         params,
         IdMmInputLayout::SharedPerToken,
+        false,
         routing,
     )
 }
@@ -742,14 +819,13 @@ pub fn quantized_matmul_id_ggml_pooled_pair_with_policy(
             ids.data_byte_len(),
         )));
     }
-    scratch.check_capacity(params.n_experts, params.n_tokens)?;
-    let expected_htpe_bytes = (params.n_experts as usize)
-        .checked_mul(DType::U32.size_of())
-        .ok_or_else(|| MlxError::InvalidArgument("pair htpe byte count overflow".into()))?;
-    let expected_hids_bytes = (params.n_experts as usize)
-        .checked_mul(params.n_tokens as usize)
-        .and_then(|elements| elements.checked_mul(DType::U32.size_of()))
-        .ok_or_else(|| MlxError::InvalidArgument("pair hids byte count overflow".into()))?;
+    scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
+    let (expected_htpe_bytes, expected_hids_bytes) = id_mm_scratch_bytes(
+        routing.expert_mm_schedule,
+        params.n_experts,
+        params.n_tokens,
+        params.top_k,
+    )?;
     for (name, buffer, expected) in [
         ("htpe", &scratch.htpe, expected_htpe_bytes),
         ("hids", &scratch.hids, expected_hids_bytes),
@@ -908,6 +984,74 @@ pub fn quantized_matmul_id_ggml_pooled_slotted_with_policy(
         scratch,
         params,
         IdMmInputLayout::Slotted,
+        false,
+        routing,
+    )
+}
+
+/// Slotted pooled `mm_id` that consumes the routing schedule already in
+/// `scratch` instead of encoding `map0` (ADR-063 P2b).
+///
+/// Intended for an MoE down projection whose gate/up call built the
+/// schedule from the same expert ids: the down input is `[n_tokens, top_k,
+/// K]`, the ids are the gate/up call's `[n_tokens, top_k]` table, and the
+/// schedule depends only on the ids, so the result is byte-identical to
+/// [`quantized_matmul_id_ggml_pooled_slotted`].
+///
+/// Every `map0` encode into `scratch` records a schedule key: the ids
+/// buffer (object, byte offset and extent), `n_tokens`, `top_k`,
+/// `n_experts`, the schedule kind, the [`CommandEncoder`] object (a
+/// `commit_wait_and_rotate` keeps it) and a per-scratch encode serial. A
+/// mutable buffer access through [`IdMmScratch::htpe_mut`],
+/// [`IdMmScratch::hids_mut`] or [`IdMmScratch::buffers_mut`] clears the key.
+/// This call returns `InvalidArgument` before encoding anything unless the
+/// recorded key equals the key of this call (same ids, shape, schedule and
+/// encoder, no `map0` or mutable access since). The `map0` barrier already
+/// in the encoder orders schedule construction before this dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    let routing = ggml_routing_policy_for_registry(registry);
+    quantized_matmul_id_ggml_pooled_slotted_reusing_schedule_with_policy(
+        encoder, registry, device, input, weight, ids, output, scratch, params, &routing,
+    )
+}
+
+/// Schedule-reusing slotted expert MM under an explicit routing policy.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_pooled_slotted_reusing_schedule_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
+    quantized_matmul_id_ggml_pooled_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        IdMmInputLayout::Slotted,
+        true,
         routing,
     )
 }
@@ -930,6 +1074,7 @@ fn quantized_matmul_id_ggml_pooled_impl(
     scratch: &mut IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
     input_layout: IdMmInputLayout,
+    reuse_schedule: bool,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
     validate_native_expert_dtypes(
@@ -1054,6 +1199,16 @@ fn quantized_matmul_id_ggml_pooled_impl(
                 params.n_experts,
             );
         }
+        if reuse_schedule {
+            scratch.validate_schedule_reuse(
+                encoder,
+                ids,
+                params.n_tokens,
+                params.top_k,
+                params.n_experts,
+                routing.expert_mm_schedule,
+            )?;
+        }
         return dispatch_id_mm_pooled_with_layout(
             encoder,
             registry,
@@ -1065,7 +1220,7 @@ fn quantized_matmul_id_ggml_pooled_impl(
             scratch,
             params,
             input_layout,
-            false,
+            reuse_schedule,
             routing,
         );
     }
@@ -1745,57 +1900,197 @@ pub fn quantized_matmul_id_swiglu_q4_0(
     Ok(())
 }
 
-/// Caller-owned scratch for the `_id` mm path's map0 stage.
+/// Grid order of the compact `mm_id` launch. Both orders give each output
+/// element a single writer, so they are bitwise-neutral; they differ only
+/// in activation and weight locality (ADR-063 M0c measures both).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactGridOrder {
+    /// `(max_tiles, ⌈N/64⌉, 1)`: every tile of one N block before the next.
+    TileFastest,
+    /// `(⌈N/64⌉, max_tiles, 1)`: every N block of one tile before the next,
+    /// keeping a tile's routed rows resident as the uniform grid does.
+    NTileFastest,
+}
+
+/// Half-tile skip (P2c) selection for a compact `mm_id` launch.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalfTileSkip {
+    /// Enabled exactly on the kernel paths where it shipped (bitwise).
+    Production,
+    Disabled,
+    /// Enabled on whichever path runs; parity and benchmark use only.
+    Forced,
+}
+
+/// Complete `mm_id` schedule configuration. Production derives it from
+/// [`GgmlRoutingPolicy::expert_mm_schedule`] via [`Self::production`];
+/// parity tests and microbenchmarks pass explicit values.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdMmScheduleOptions {
+    pub schedule: ExpertMmSchedule,
+    pub grid_order: CompactGridOrder,
+    pub half_tile_skip: HalfTileSkip,
+}
+
+impl IdMmScheduleOptions {
+    /// The configuration production dispatch uses for `schedule`.
+    pub const fn production(schedule: ExpertMmSchedule) -> Self {
+        Self {
+            schedule,
+            grid_order: COMPACT_GRID_ORDER,
+            half_tile_skip: HalfTileSkip::Production,
+        }
+    }
+}
+
+/// Compact grid order shipped under `CompactTiles` until M0c selects the
+/// faster order at the served shapes.
+const COMPACT_GRID_ORDER: CompactGridOrder = CompactGridOrder::NTileFastest;
+/// P2c on the simdgroup path: simdgroups 2-3 own rows 16-31 and skip their
+/// MMA and shared-memory store, which is bitwise by construction (§5.1 N5).
+const HALF_TILE_SKIP_SIMDGROUP: bool = true;
+/// P2c on the tensor-API path: a 16-row `matmul2d` on partial tiles.
+const HALF_TILE_SKIP_TENSOR: bool = true;
+
+const SCHED_FLAG_N_TILE_FASTEST: u16 = 1;
+const SCHED_FLAG_HALF_TILE_SKIP: u16 = 2;
+
+/// `(htpe, hids)` bytes one schedule needs for `(n_experts, n_tokens, top_k)`.
+fn id_mm_scratch_bytes(
+    schedule: ExpertMmSchedule,
+    n_experts: u32,
+    n_tokens: u32,
+    top_k: u32,
+) -> Result<(usize, usize)> {
+    let (htpe, hids) = expert_mm_schedule_scratch_bytes(schedule, n_experts, n_tokens, top_k)
+        .ok_or_else(|| MlxError::InvalidArgument("mm_id schedule scratch size overflow".into()))?;
+    let to_usize = |bytes: u64| {
+        usize::try_from(bytes)
+            .map_err(|_| MlxError::InvalidArgument("mm_id schedule scratch exceeds usize".into()))
+    };
+    Ok((to_usize(htpe)?, to_usize(hids)?))
+}
+
+/// Identity of the routing schedule a `map0` encode left in an
+/// [`IdMmScratch`] (ADR-063 P2b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdMmScheduleKey {
+    ids_buffer: usize,
+    ids_byte_offset: u64,
+    ids_byte_extent: usize,
+    n_tokens: u32,
+    top_k: u32,
+    n_experts: u32,
+    schedule: ExpertMmSchedule,
+    encoder: u64,
+    encode_serial: u64,
+}
+
+/// Caller-owned scratch for the `_id` mm path's routing schedule.
 ///
-/// Holds the two small buffers map0 writes and mm_id reads
-/// (`htpe`: `[n_experts]` per-expert routed-token count, `hids`:
-/// `[n_experts, n_tokens]` per-expert routed-token list).  Passing one
-/// instance through every mm_id call in a prefill amortises what would
-/// otherwise be two Metal allocations per MoE layer — ~60 allocations
-/// per Gemma 4 prefill.
+/// Holds the two buffers `map0` writes and `mm_id` reads. Under
+/// [`ExpertMmSchedule::UniformGrid`] they are `htpe` `[n_experts]`
+/// per-expert counts and `hids` `[n_experts, n_tokens]` per-expert lists;
+/// under [`ExpertMmSchedule::CompactTiles`] they are the tile descriptor
+/// words (tile count plus three words per tile) and the compact
+/// `rows + n_experts` list. Passing one instance through every mm_id call in
+/// a prefill amortises what would otherwise be two Metal allocations per MoE
+/// layer.
 ///
-/// Size the scratch for the largest `(n_experts, n_tokens)` pair the
-/// session will dispatch; callers use `IdMmScratch::alloc(dev, n_experts,
-/// max_n_tokens)` once at prefill start.  Smaller subsequent dispatches
-/// reuse the same buffers (kernel only touches the first
-/// `n_experts * n_tokens` u32s).
+/// Size the scratch once for the largest call: [`Self::alloc`] bounds
+/// `n_experts` and `n_tokens` per call and assumes `top_k <= 8` (the largest
+/// `map0` instantiation); [`Self::alloc_with_top_k`] takes the top-k bound
+/// explicitly. Either constructor serves both schedules, and `htpe` always
+/// holds at least `n_experts` words for consumers of the legacy `map0`.
+///
+/// The buffers are private. Read them through [`Self::htpe`] and
+/// [`Self::hids`]; every kernel that writes them must take them through
+/// [`Self::htpe_mut`], [`Self::hids_mut`] or [`Self::buffers_mut`], which
+/// invalidate the recorded schedule key that
+/// [`quantized_matmul_id_ggml_pooled_slotted_reusing_schedule`] checks.
 pub struct IdMmScratch {
-    pub htpe: MlxBuffer,
-    pub hids: MlxBuffer,
+    htpe: MlxBuffer,
+    hids: MlxBuffer,
     n_experts_cap: u32,
     n_tokens_cap: u32,
+    rows_cap: u32,
+    encode_serial: u64,
+    schedule_key: Option<IdMmScheduleKey>,
 }
 
 impl IdMmScratch {
-    /// Allocate scratch sized to `n_experts * max_n_tokens` u32s.
+    /// Allocate scratch for calls with at most `n_experts` experts and
+    /// `max_n_tokens` tokens, assuming `top_k <= 8`.
     pub fn alloc(device: &MlxDevice, n_experts: u32, max_n_tokens: u32) -> Result<Self> {
-        if n_experts == 0 || max_n_tokens == 0 {
+        Self::alloc_with_top_k(device, n_experts, max_n_tokens, 8)
+    }
+
+    /// Allocate scratch for calls with at most `n_experts` experts,
+    /// `max_n_tokens` tokens and `max_n_tokens * max_top_k` routed rows.
+    pub fn alloc_with_top_k(
+        device: &MlxDevice,
+        n_experts: u32,
+        max_n_tokens: u32,
+        max_top_k: u32,
+    ) -> Result<Self> {
+        if n_experts == 0 || max_n_tokens == 0 || max_top_k == 0 {
             return Err(MlxError::InvalidArgument(
                 "IdMmScratch::alloc dimensions must be nonzero".into(),
             ));
         }
-        let htpe_bytes = (n_experts as usize)
-            .checked_mul(DType::U32.size_of())
-            .ok_or_else(|| MlxError::InvalidArgument("IdMmScratch htpe size overflow".into()))?;
-        let hids_bytes = (n_experts as usize)
-            .checked_mul(max_n_tokens as usize)
-            .and_then(|elements| elements.checked_mul(DType::U32.size_of()))
-            .ok_or_else(|| MlxError::InvalidArgument("IdMmScratch hids size overflow".into()))?;
-        let htpe = device.alloc_buffer(htpe_bytes, DType::U32, vec![n_experts as usize])?;
-        let hids = device.alloc_buffer(
-            hids_bytes,
-            DType::U32,
-            vec![n_experts as usize, max_n_tokens as usize],
+        let rows_cap = max_n_tokens
+            .checked_mul(max_top_k)
+            .filter(|rows| *rows <= i32::MAX as u32)
+            .ok_or_else(|| {
+                MlxError::InvalidArgument(
+                    "IdMmScratch: max_n_tokens * max_top_k exceeds signed Metal row indexing"
+                        .into(),
+                )
+            })?;
+        let (grid_htpe, grid_hids) =
+            id_mm_scratch_bytes(ExpertMmSchedule::UniformGrid, n_experts, max_n_tokens, 1)?;
+        let (compact_htpe, compact_hids) = id_mm_scratch_bytes(
+            ExpertMmSchedule::CompactTiles,
+            n_experts,
+            max_n_tokens,
+            max_top_k,
         )?;
+        let htpe_bytes = grid_htpe.max(compact_htpe);
+        let hids_bytes = grid_hids.max(compact_hids);
+        let word = DType::U32.size_of();
+        let htpe = device.alloc_buffer(htpe_bytes, DType::U32, vec![htpe_bytes / word])?;
+        let hids = device.alloc_buffer(hids_bytes, DType::U32, vec![hids_bytes / word])?;
         Ok(Self {
             htpe,
             hids,
             n_experts_cap: n_experts,
             n_tokens_cap: max_n_tokens,
+            rows_cap,
+            encode_serial: 0,
+            schedule_key: None,
         })
     }
 
-    fn check_capacity(&self, n_experts: u32, n_tokens: u32) -> Result<()> {
+    /// Largest `n_experts` a call may use.
+    pub fn capacity_n_experts(&self) -> u32 {
+        self.n_experts_cap
+    }
+
+    /// Largest `n_tokens` a call may use.
+    pub fn capacity_n_tokens(&self) -> u32 {
+        self.n_tokens_cap
+    }
+
+    /// Largest `n_tokens * top_k` a call may use.
+    pub fn capacity_rows(&self) -> u32 {
+        self.rows_cap
+    }
+
+    /// Check that a call fits the constructor's bounds.
+    pub fn check_capacity(&self, n_experts: u32, n_tokens: u32, top_k: u32) -> Result<()> {
         if n_experts > self.n_experts_cap {
             return Err(MlxError::InvalidArgument(format!(
                 "IdMmScratch: n_experts ({}) > cap ({})",
@@ -1808,7 +2103,93 @@ impl IdMmScratch {
                 n_tokens, self.n_tokens_cap,
             )));
         }
+        let rows = u64::from(n_tokens) * u64::from(top_k);
+        if rows > u64::from(self.rows_cap) {
+            return Err(MlxError::InvalidArgument(format!(
+                "IdMmScratch: n_tokens * top_k ({rows}) > row cap ({})",
+                self.rows_cap,
+            )));
+        }
         Ok(())
+    }
+
+    /// Schedule-word buffer, for host inspection or read-only binding.
+    pub fn htpe(&self) -> &MlxBuffer {
+        &self.htpe
+    }
+
+    /// Routed-row list buffer, for host inspection or read-only binding.
+    pub fn hids(&self) -> &MlxBuffer {
+        &self.hids
+    }
+
+    /// Mutable schedule-word buffer; invalidates the recorded schedule.
+    pub fn htpe_mut(&mut self) -> &mut MlxBuffer {
+        self.invalidate_schedule();
+        &mut self.htpe
+    }
+
+    /// Mutable routed-row list buffer; invalidates the recorded schedule.
+    pub fn hids_mut(&mut self) -> &mut MlxBuffer {
+        self.invalidate_schedule();
+        &mut self.hids
+    }
+
+    /// Both buffers for a kernel that writes the scratch (for example a
+    /// legacy `map0` consumer); invalidates the recorded schedule.
+    pub fn buffers_mut(&mut self) -> (&mut MlxBuffer, &mut MlxBuffer) {
+        self.invalidate_schedule();
+        (&mut self.htpe, &mut self.hids)
+    }
+
+    fn invalidate_schedule(&mut self) {
+        self.encode_serial = self.encode_serial.wrapping_add(1);
+        self.schedule_key = None;
+    }
+
+    fn schedule_key_for(
+        &self,
+        encoder: &CommandEncoder,
+        ids: &MlxBuffer,
+        n_tokens: u32,
+        top_k: u32,
+        n_experts: u32,
+        schedule: ExpertMmSchedule,
+    ) -> IdMmScheduleKey {
+        IdMmScheduleKey {
+            ids_buffer: &**ids.metal_buffer() as *const metal::BufferRef as usize,
+            ids_byte_offset: ids.byte_offset(),
+            ids_byte_extent: (n_tokens as usize)
+                .saturating_mul(top_k as usize)
+                .saturating_mul(DType::U32.size_of()),
+            n_tokens,
+            top_k,
+            n_experts,
+            schedule,
+            encoder: encoder.instance_id(),
+            encode_serial: self.encode_serial,
+        }
+    }
+
+    fn validate_schedule_reuse(
+        &self,
+        encoder: &CommandEncoder,
+        ids: &MlxBuffer,
+        n_tokens: u32,
+        top_k: u32,
+        n_experts: u32,
+        schedule: ExpertMmSchedule,
+    ) -> Result<()> {
+        let requested = self.schedule_key_for(encoder, ids, n_tokens, top_k, n_experts, schedule);
+        match self.schedule_key {
+            Some(recorded) if recorded == requested => Ok(()),
+            Some(recorded) => Err(MlxError::InvalidArgument(format!(
+                "IdMmScratch schedule reuse mismatch: recorded {recorded:?}, requested {requested:?}"
+            ))),
+            None => Err(MlxError::InvalidArgument(
+                "IdMmScratch schedule reuse without a valid map0 schedule (none encoded, or invalidated by a mutable buffer access)".into(),
+            )),
+        }
     }
 }
 
@@ -1858,7 +2239,40 @@ fn dispatch_id_mm_pooled_with_layout(
     schedule_prepared: bool,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
-    scratch.check_capacity(params.n_experts, params.n_tokens)?;
+    dispatch_id_mm_pooled_with_options(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        input_layout,
+        schedule_prepared,
+        routing,
+        IdMmScheduleOptions::production(routing.expert_mm_schedule),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_id_mm_pooled_with_options(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    input_layout: IdMmInputLayout,
+    schedule_prepared: bool,
+    routing: &GgmlRoutingPolicy,
+    options: IdMmScheduleOptions,
+) -> Result<()> {
+    scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
 
     // Translate the dispatcher-facing params to the mm_id internal dispatch
     // shape.  Same fields; different type keeps the public mv params from
@@ -1873,20 +2287,109 @@ fn dispatch_id_mm_pooled_with_layout(
         ggml_type: params.ggml_type,
     };
 
-    dispatch_id_mm_with_layout(
+    let result = dispatch_id_mm_with_layout(
         encoder,
         registry,
         device,
         input,
         weight,
         ids,
-        &mut scratch.htpe,
-        &mut scratch.hids,
+        &scratch.htpe,
+        &scratch.hids,
         output,
         &dispatch,
         input_layout,
         schedule_prepared,
         routing,
+        options,
+    );
+    match (&result, schedule_prepared) {
+        // A fresh schedule is now the scratch's schedule.
+        (Ok(()), false) => {
+            scratch.encode_serial = scratch.encode_serial.wrapping_add(1);
+            scratch.schedule_key = Some(scratch.schedule_key_for(
+                encoder,
+                ids,
+                params.n_tokens,
+                params.top_k,
+                params.n_experts,
+                options.schedule,
+            ));
+        }
+        (Ok(()), true) => {}
+        // Fail closed: a failed call may have encoded part of a schedule.
+        (Err(_), _) => scratch.invalidate_schedule(),
+    }
+    result
+}
+
+/// Test-only helper: pooled `mm_id` under an explicit schedule
+/// configuration (grid order, half-tile skip), for parity tests and the
+/// schedule microbenchmark.
+///
+/// `slotted` selects the `[n_tokens, top_k, K]` input layout. With
+/// `reuse_schedule` the call validates the scratch's recorded schedule key
+/// exactly like [`quantized_matmul_id_ggml_pooled_slotted_reusing_schedule`]
+/// and encodes no `map0`. The call must be on the `mm_id` route.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_id_mm_pooled_with_options_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted: bool,
+    reuse_schedule: bool,
+    routing: &GgmlRoutingPolicy,
+    options: IdMmScheduleOptions,
+) -> Result<()> {
+    validate_native_expert_dtypes(
+        "dispatch_id_mm_pooled_with_options_for_test",
+        input,
+        weight,
+        ids,
+        output,
+    )?;
+    if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, false, routing)
+        != ExpertAutoPlan::Mm
+    {
+        return Err(MlxError::InvalidArgument(
+            "dispatch_id_mm_pooled_with_options_for_test requires the mm_id route".into(),
+        ));
+    }
+    if reuse_schedule {
+        scratch.validate_schedule_reuse(
+            encoder,
+            ids,
+            params.n_tokens,
+            params.top_k,
+            params.n_experts,
+            options.schedule,
+        )?;
+    }
+    dispatch_id_mm_pooled_with_options(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        if slotted {
+            IdMmInputLayout::Slotted
+        } else {
+            IdMmInputLayout::SharedPerToken
+        },
+        reuse_schedule,
+        routing,
+        options,
     )
 }
 
@@ -1907,7 +2410,8 @@ fn dispatch_id_mm(
     params: &GgmlQuantizedMatmulIdParams,
     routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
-    let mut scratch = IdMmScratch::alloc(device, params.n_experts, params.n_tokens)?;
+    let mut scratch =
+        IdMmScratch::alloc_with_top_k(device, params.n_experts, params.n_tokens, params.top_k)?;
     dispatch_id_mm_pooled(
         encoder,
         registry,
@@ -1987,7 +2491,9 @@ struct GgmlIdMmMmGpuParams {
     ne1: i32,  // batch stride (== ne20 for our packed layout)
     r2: i16,
     r3: i16,
-    _pad1: u32,
+    /// Compact kernels only: bit 0 N tile fastest, bit 1 half-tile skip.
+    sched_flags: u16,
+    _pad1: u16,
 }
 
 /// Parameters for the `_id` mm dispatch (scratch-buffer sized view).
@@ -2077,6 +2583,7 @@ pub fn dispatch_id_mm_for_test(
         IdMmInputLayout::SharedPerToken,
         false,
         &routing,
+        IdMmScheduleOptions::production(ExpertMmSchedule::UniformGrid),
     )
 }
 
@@ -2124,15 +2631,17 @@ pub fn dispatch_id_mm_with_prepared_schedule_for_test(
         IdMmInputLayout::SharedPerToken,
         true,
         &routing,
+        IdMmScheduleOptions::production(ExpertMmSchedule::UniformGrid),
     )
 }
 
-/// Test-only helper: encode only the legacy `map0` routing-schedule stage.
+/// Test-only helper: encode only the routing-schedule stage of `schedule`.
 ///
-/// Writes the uniform-grid schedule (`htpe` `[n_experts]` counts, `hids`
-/// `[n_experts, n_tokens]` lists) for `ids` without encoding a matrix
-/// kernel. Microbenchmarks use it to time `map0` on its own; a following
-/// [`dispatch_id_mm_with_prepared_schedule_for_test`] consumes the result.
+/// `UniformGrid` runs the legacy `map0` (`htpe` `[n_experts]` counts, `hids`
+/// `[n_experts, n_tokens]` lists); `CompactTiles` runs `map0c` (tile count,
+/// descriptors and the compact list). No matrix kernel is encoded.
+/// Microbenchmarks use it to time the schedule stage on its own, and
+/// parity tests read the schedule back on the host.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_id_mm_map0_for_test(
@@ -2143,6 +2652,7 @@ pub fn dispatch_id_mm_map0_for_test(
     htpe: &MlxBuffer,
     hids: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
+    schedule: ExpertMmSchedule,
 ) -> Result<()> {
     validate_id_mm_scratch_dtypes("dispatch_id_mm_map0_for_test", htpe, hids)?;
     if ids.dtype() != DType::U32 {
@@ -2165,15 +2675,31 @@ pub fn dispatch_id_mm_map0_for_test(
         .checked_mul(params.top_k as usize)
         .ok_or_else(|| MlxError::InvalidArgument("map0 row count overflow".into()))?;
     let ids_bytes = checked_byte_extent("map0 ids", &[total_rows, DType::U32.size_of()])?;
+    let (htpe_bytes, hids_bytes) =
+        id_mm_scratch_bytes(schedule, params.n_experts, params.n_tokens, params.top_k)?;
     if ids.data_byte_len() < ids_bytes
-        || htpe.data_byte_len() < params.htpe_bytes()
-        || hids.data_byte_len() < params.hids_bytes()
+        || htpe.data_byte_len() < htpe_bytes
+        || hids.data_byte_len() < hids_bytes
     {
         return Err(MlxError::InvalidArgument(
             "dispatch_id_mm_map0_for_test: ids or scratch buffer too small".into(),
         ));
     }
-    encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)
+    match schedule {
+        ExpertMmSchedule::UniformGrid => {
+            encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)
+        }
+        ExpertMmSchedule::CompactTiles => encode_compact_map0(
+            encoder,
+            registry,
+            device,
+            ids,
+            htpe,
+            hids,
+            params,
+            compact_max_tiles(total_rows as u64, u64::from(params.n_experts)),
+        ),
+    }
 }
 
 /// Encode the legacy `kernel_mul_mm_id_map0_ne20_<top_k>` stage plus the
@@ -2253,6 +2779,88 @@ fn encode_legacy_map0(
     Ok(())
 }
 
+/// Host-side params for `kernel_mul_mm_id_map0c_ne20_<N>`; matches
+/// `GgmlMatmulIdMm_Map0cParams` in `quantized_matmul_id_mm.metal`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GgmlIdMmMap0cGpuParams {
+    ne21: i32,      // n_tokens
+    ne20: i32,      // top_k
+    nb21: u64,      // bytes per token in the ids table
+    max_tiles: u32, // descriptor capacity; more tiles poison the schedule
+    _pad: u32,
+}
+
+/// Encode the compact `kernel_mul_mm_id_map0c_ne20_<top_k>` stage (ADR-063
+/// P2) plus the barrier that orders it before the consuming `mm_id` kernel.
+#[allow(clippy::too_many_arguments)]
+fn encode_compact_map0(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+    max_tiles: u64,
+) -> Result<()> {
+    let kernel_name = match params.top_k {
+        1 => "kernel_mul_mm_id_map0c_ne20_1",
+        6 => "kernel_mul_mm_id_map0c_ne20_6",
+        8 => "kernel_mul_mm_id_map0c_ne20_8",
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "dispatch_id_mm: no map0c instantiation for top_k={other}"
+            )))
+        }
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    if u64::from(params.n_experts) > pipeline.max_total_threads_per_threadgroup() {
+        return Err(MlxError::InvalidArgument(format!(
+            "n_experts ({}) exceeds map0c pipeline threadgroup limit ({})",
+            params.n_experts,
+            pipeline.max_total_threads_per_threadgroup(),
+        )));
+    }
+    let map0_params = GgmlIdMmMap0cGpuParams {
+        ne21: params.n_tokens as i32,
+        ne20: params.top_k as i32,
+        nb21: u64::from(params.top_k) * DType::U32.size_of() as u64,
+        max_tiles: u32::try_from(max_tiles)
+            .map_err(|_| MlxError::InvalidArgument("compact tile bound exceeds u32".into()))?,
+        _pad: 0,
+    };
+    // Staged ids (n_experts × top_k) plus per-expert offset, tile and
+    // invalid-flag words and two totals; Metal wants a 16-byte multiple.
+    let words =
+        u64::from(params.n_experts) * u64::from(params.top_k) + 3 * u64::from(params.n_experts) + 2;
+    let shmem = (words * DType::U32.size_of() as u64).div_ceil(16) * 16;
+
+    if encoder.is_capturing() {
+        let range = |buffer: &MlxBuffer| {
+            let start =
+                (buffer.contents_ptr() as usize).saturating_add(buffer.byte_offset() as usize);
+            (start, start.saturating_add(buffer.data_byte_len()))
+        };
+        encoder.set_pending_buffer_ranges(vec![range(ids)], vec![range(htpe), range(hids)]);
+    }
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&map0_params))),
+            (1, KernelArg::Buffer(ids)),
+            (2, KernelArg::Buffer(htpe)),
+            (3, KernelArg::Buffer(hids)),
+        ],
+        &[(0, shmem)],
+        metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(u64::from(params.n_experts), 1, 1),
+    );
+    // The compact mm_id kernel reads the descriptors and list map0c wrote.
+    encoder.memory_barrier();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_id_mm_with_layout(
     encoder: &mut CommandEncoder,
@@ -2268,6 +2876,7 @@ fn dispatch_id_mm_with_layout(
     input_layout: IdMmInputLayout,
     schedule_prepared: bool,
     routing: &GgmlRoutingPolicy,
+    options: IdMmScheduleOptions,
 ) -> Result<()> {
     validate_native_expert_dtypes("dispatch_id_mm", input, weight, ids, output)?;
     validate_id_mm_scratch_dtypes("dispatch_id_mm", htpe, hids)?;
@@ -2395,16 +3004,30 @@ fn dispatch_id_mm_with_layout(
             "dispatch_id_mm_for_test: output buffer too small".into(),
         ));
     }
-    if htpe.data_byte_len() < params.htpe_bytes() {
-        return Err(MlxError::InvalidArgument(
-            "dispatch_id_mm_for_test: htpe buffer too small".into(),
-        ));
+    let (htpe_bytes, hids_bytes) = id_mm_scratch_bytes(
+        options.schedule,
+        params.n_experts,
+        params.n_tokens,
+        params.top_k,
+    )?;
+    if htpe.data_byte_len() < htpe_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_id_mm_for_test: htpe buffer too small for the {:?} schedule: expected {} bytes, got {}",
+            options.schedule,
+            htpe_bytes,
+            htpe.data_byte_len(),
+        )));
     }
-    if hids.data_byte_len() < params.hids_bytes() {
-        return Err(MlxError::InvalidArgument(
-            "dispatch_id_mm_for_test: hids buffer too small".into(),
-        ));
+    if hids.data_byte_len() < hids_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "dispatch_id_mm_for_test: hids buffer too small for the {:?} schedule: expected {} bytes, got {}",
+            options.schedule,
+            hids_bytes,
+            hids.data_byte_len(),
+        )));
     }
+    let compact = options.schedule == ExpertMmSchedule::CompactTiles;
+    let max_tiles = compact_max_tiles(total_rows as u64, u64::from(params.n_experts));
 
     // ---- Stage 1: map0 — build per-expert routed-token lists ----
     //
@@ -2420,7 +3043,13 @@ fn dispatch_id_mm_with_layout(
     // and re-reads each expert's weights once per (seq_len*top_k) row —
     // ~50% of prefill time wasted on weight re-reads.
     if !schedule_prepared {
-        encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)?;
+        if compact {
+            encode_compact_map0(
+                encoder, registry, device, ids, htpe, hids, params, max_tiles,
+            )?;
+        } else {
+            encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)?;
+        }
     }
 
     // ---- Stage 2: mm_id — matmul with the per-expert lists ----
@@ -2434,11 +3063,40 @@ fn dispatch_id_mm_with_layout(
     // kernel isn't shipped — e.g. IQ4_XS (ADR-033 §Pi Task #20 shipped
     // the simdgroup variant only; tensor-API variant deferred as a
     // perf optimization).
-    let tensor_name = params.ggml_type.id_mm_tensor_kernel_name();
-    let mm_kernel_name = if use_tensor && tensor_name != "unsupported" {
+    let tensor_name = if compact {
+        params.ggml_type.id_mm_tensor_compact_kernel_name()
+    } else {
+        params.ggml_type.id_mm_tensor_kernel_name()
+    };
+    let tensor_path = use_tensor && tensor_name != "unsupported";
+    let mm_kernel_name = if tensor_path {
         tensor_name
+    } else if compact {
+        params.ggml_type.id_mm_compact_kernel_name()
     } else {
         params.ggml_type.id_mm_kernel_name()
+    };
+    let half_tile_skip = compact
+        && match options.half_tile_skip {
+            HalfTileSkip::Production => {
+                if tensor_path {
+                    HALF_TILE_SKIP_TENSOR
+                } else {
+                    HALF_TILE_SKIP_SIMDGROUP
+                }
+            }
+            HalfTileSkip::Disabled => false,
+            HalfTileSkip::Forced => true,
+        };
+    let n_tile_fastest = compact && options.grid_order == CompactGridOrder::NTileFastest;
+    let sched_flags = if n_tile_fastest {
+        SCHED_FLAG_N_TILE_FASTEST
+    } else {
+        0
+    } | if half_tile_skip {
+        SCHED_FLAG_HALF_TILE_SKIP
+    } else {
+        0
     };
     let mm_pipeline = registry.get_pipeline(mm_kernel_name, device.metal_device())?;
 
@@ -2478,6 +3136,7 @@ fn dispatch_id_mm_with_layout(
         ne1: params.top_k as i32,
         r2: 1,
         r3: 1,
+        sched_flags,
         _pad1: 0,
     };
 
@@ -2500,11 +3159,21 @@ fn dispatch_id_mm_with_layout(
     // This stays on-device because production routers can create IDs earlier
     // in this same command stream; a host scan would observe stale data or
     // introduce a forbidden synchronization point.
-    let mm_threadgroups = metal::MTLSize::new(
-        (params.n_tokens as u64 + NR1 - 1) / NR1,
-        (params.n as u64 + NR0 - 1) / NR0,
-        params.n_experts as u64,
-    );
+    //
+    // Compact schedule: map0c emitted at most `max_tiles` descriptors and
+    // stored the live count in word 0; tile slots at or past it return.
+    let n_tiles = (params.n as u64 + NR0 - 1) / NR0;
+    let mm_threadgroups = if !compact {
+        metal::MTLSize::new(
+            (params.n_tokens as u64 + NR1 - 1) / NR1,
+            n_tiles,
+            params.n_experts as u64,
+        )
+    } else if n_tile_fastest {
+        metal::MTLSize::new(n_tiles, max_tiles, 1)
+    } else {
+        metal::MTLSize::new(max_tiles, n_tiles, 1)
+    };
     let mm_threads = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
 
     const MM_SHMEM_BYTES: u64 = 8192;
@@ -2806,6 +3475,7 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
         ne1: params.top_k as i32,
         r2: 1,
         r3: 1,
+        sched_flags: 0,
         _pad1: 0,
     };
 
@@ -2860,5 +3530,28 @@ mod validation_tests {
         let error = required_expert_weight_bytes(GgmlType::Q4_0, 3, 64, 256, 9_215)
             .expect_err("undersized stride must fail");
         assert!(error.to_string().contains("smaller than one matrix"));
+    }
+
+    #[test]
+    fn mm_id_schedule_environment_values() {
+        let default = GgmlRoutingPolicy::default().expert_mm_schedule;
+        assert_eq!(default, ExpertMmSchedule::CompactTiles);
+        for (value, expected, recognized) in [
+            (None, default, true),
+            (Some(""), default, true),
+            (Some("  "), default, true),
+            (Some("grid"), ExpertMmSchedule::UniformGrid, true),
+            (Some("compact"), ExpertMmSchedule::CompactTiles, true),
+            (Some(" grid "), ExpertMmSchedule::UniformGrid, true),
+            (Some("GRID"), default, false),
+            (Some("uniform"), default, false),
+            (Some("1"), default, false),
+        ] {
+            assert_eq!(
+                parse_mm_id_schedule(value),
+                (expected, recognized),
+                "HF2Q_MM_ID_SCHEDULE={value:?}"
+            );
+        }
     }
 }

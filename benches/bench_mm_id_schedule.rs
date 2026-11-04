@@ -13,15 +13,21 @@
 //!   (device-selected route) and Q5_0 (simdgroup route), on the Gemma 4
 //!   down shape (704 → 2816, 128 experts), `top_k = 1`, `n_tokens` ∈ {33,
 //!   256, 1024, 4096, 11360}.
-//! * `m0b` — served shapes on today's kernels, `n` ∈ {232, 528, 764, 880,
-//!   1172, 1412, 1420}: gate/up (Q4_K 2816 → 1408, top_k 8), down (Q8_0 and
-//!   Q5_0 704 → 2816) flattened (`8n` rows, top_k 1) and slotted (`n`
-//!   tokens, top_k 8), `map0_ne20_8` and `map0_ne20_1` alone, the
-//!   activation pass and the fused weighted-sum pass. Routing tables:
+//! * `m0b` — served shapes on today's route (`UniformGrid`), `n` ∈ {232,
+//!   528, 764, 880, 1172, 1412, 1420}: gate/up (Q4_K 2816 → 1408, top_k 8),
+//!   down (Q8_0 and Q5_0 704 → 2816) flattened (`8n` rows, top_k 1) and
+//!   slotted (`n` tokens, top_k 8), `map0_ne20_8` and `map0_ne20_1` alone,
+//!   the activation pass and the fused weighted-sum pass. Routing tables:
 //!   uniform random, a bootstrap of a routing-witness JSONL
 //!   (`--witness PATH`, rows drawn per layer with replacement), and a
 //!   recorded agent table (`--recorded PATH`, same JSONL format, rows
 //!   grouped by invocation and layer and used as recorded).
+//! * `m0c` — the same shapes and tables, `UniformGrid` against
+//!   `CompactTiles` in both grid orders (tile fastest, N tile fastest), each
+//!   with the half-tile skip off and on (`Forced`: on regardless of whether
+//!   it shipped on that path), for gate/up and slotted down; `map0` against
+//!   `map0c` alone; and ± schedule reuse, timed as one command buffer of
+//!   gate/up followed by down with its own `map0` or with the reusing call.
 //!
 //! Clock: `MTLCommandBuffer` `GPUStartTime`/`GPUEndTime`, one command
 //! buffer per measured op, `--warmup` (default 20) warm-up iterations and
@@ -42,6 +48,9 @@
 //! cargo bench --locked --bench bench_mm_id_schedule -- m0b \
 //!     --witness $E/q1-gemma-routing1511-t0-on-actual-v1/output/routing-witness.jsonl \
 //!     --json m0b.json
+//! cargo bench --locked --bench bench_mm_id_schedule -- m0c \
+//!     --witness $E/q1-gemma-routing1511-t0-on-actual-v1/output/routing-witness.jsonl \
+//!     --json m0c.json
 //! ```
 
 use std::collections::BTreeMap;
@@ -50,13 +59,15 @@ use std::io::{BufRead, Write};
 use mlx_native::ops::fused_norm_add::dispatch_fused_moe_wsum_dnorm_add_f32;
 use mlx_native::ops::moe_dispatch::moe_swiglu_seq_encode;
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_map0_for_test, dispatch_id_mm_with_prepared_schedule_for_test,
-    GgmlIdMmDispatchParams,
+    dispatch_id_mm_map0_for_test, dispatch_id_mm_pooled_with_options_for_test,
+    dispatch_id_mm_with_prepared_schedule_for_test, CompactGridOrder, GgmlIdMmDispatchParams,
+    HalfTileSkip, IdMmScheduleOptions,
 };
 use mlx_native::{
-    quantized_matmul_id_ggml_pooled, quantized_matmul_id_ggml_pooled_slotted, CommandEncoder,
-    DType, GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch, KernelRegistry, MlxBuffer,
-    MlxDevice,
+    ggml_routing_policy_from_environment, quantized_matmul_id_ggml_pooled_slotted_with_policy,
+    quantized_matmul_id_ggml_pooled_with_policy, CommandEncoder, DType, ExpertMmSchedule,
+    GgmlQuantizedMatmulIdParams, GgmlRoutingPolicy, GgmlType, IdMmScratch, KernelRegistry,
+    MlxBuffer, MlxDevice,
 };
 use objc::runtime::{Class, Object, BOOL, NO};
 use objc::{msg_send, sel, sel_impl};
@@ -126,10 +137,10 @@ fn parse_options() -> Options {
                     .and_then(|value| value.parse().ok())
                     .expect("--iters takes a count")
             }
-            "m0a" | "m0b" => options.suites.push(arg),
+            "m0a" | "m0b" | "m0c" => options.suites.push(arg),
             // cargo bench appends `--bench`; libtest-style flags are ignored.
             other if other.starts_with("--") => {}
-            other => panic!("unknown argument {other:?}; suites are m0a, m0b"),
+            other => panic!("unknown argument {other:?}; suites are m0a, m0b, m0c"),
         }
     }
     if options.suites.is_empty() {
@@ -144,7 +155,10 @@ fn parse_options() -> Options {
 // ---------------------------------------------------------------------------
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program).args(args).output().ok()?;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     output
         .status
         .success()
@@ -337,7 +351,11 @@ fn f32_buffer(device: &MlxDevice, elements: usize, seed: u64) -> MlxBuffer {
 
 fn u32_buffer(device: &MlxDevice, values: &[u32]) -> MlxBuffer {
     let mut buffer = device
-        .alloc_buffer(values.len().max(1) * 4, DType::U32, vec![values.len().max(1)])
+        .alloc_buffer(
+            values.len().max(1) * 4,
+            DType::U32,
+            vec![values.len().max(1)],
+        )
         .expect("u32 buffer");
     buffer.as_mut_slice::<u32>().expect("u32 values")[..values.len()].copy_from_slice(values);
     buffer
@@ -654,6 +672,7 @@ fn run_m0b_table(
     let mut scratch =
         IdMmScratch::alloc(device, GEMMA_EXPERTS, routed).expect("flattened-capacity scratch");
     let mut cases = Vec::new();
+    let grid = routing_policy(ExpertMmSchedule::UniformGrid);
 
     let gate_up = expert_params(
         GgmlType::Q4_K,
@@ -663,7 +682,7 @@ fn run_m0b_table(
         GEMMA_HIDDEN,
     );
     let stats = time_gpu(device, options, |encoder| {
-        quantized_matmul_id_ggml_pooled(
+        quantized_matmul_id_ggml_pooled_with_policy(
             encoder,
             registry,
             device,
@@ -673,6 +692,7 @@ fn run_m0b_table(
             &gate_up_out,
             &mut scratch,
             &gate_up,
+            &grid,
         )
         .expect("gate/up mm_id");
     });
@@ -694,7 +714,7 @@ fn run_m0b_table(
         let n_tiles = u64::from(GEMMA_HIDDEN).div_ceil(NR0);
         let flat = expert_params(ggml_type, routed, 1, GEMMA_HIDDEN, GEMMA_EXPERT_FF);
         let stats = time_gpu(device, options, |encoder| {
-            quantized_matmul_id_ggml_pooled(
+            quantized_matmul_id_ggml_pooled_with_policy(
                 encoder,
                 registry,
                 device,
@@ -704,6 +724,7 @@ fn run_m0b_table(
                 &down_out,
                 &mut scratch,
                 &flat,
+                &grid,
             )
             .expect("flattened down mm_id");
         });
@@ -718,7 +739,7 @@ fn run_m0b_table(
         ));
         let slotted = expert_params(ggml_type, rows, GEMMA_TOP_K, GEMMA_HIDDEN, GEMMA_EXPERT_FF);
         let stats = time_gpu(device, options, |encoder| {
-            quantized_matmul_id_ggml_pooled_slotted(
+            quantized_matmul_id_ggml_pooled_slotted_with_policy(
                 encoder,
                 registry,
                 device,
@@ -728,6 +749,7 @@ fn run_m0b_table(
                 &down_out,
                 &mut scratch,
                 &slotted,
+                &grid,
             )
             .expect("slotted down mm_id");
         });
@@ -758,10 +780,27 @@ fn run_m0b_table(
         let htpe = u32_buffer(device, &vec![0; params.htpe_bytes() / 4]);
         let hids = u32_buffer(device, &vec![0; params.hids_bytes() / 4]);
         let stats = time_gpu(device, options, |encoder| {
-            dispatch_id_mm_map0_for_test(encoder, registry, device, &ids, &htpe, &hids, &params)
-                .expect("map0 alone");
+            dispatch_id_mm_map0_for_test(
+                encoder,
+                registry,
+                device,
+                &ids,
+                &htpe,
+                &hids,
+                &params,
+                ExpertMmSchedule::UniformGrid,
+            )
+            .expect("map0 alone");
         });
-        cases.push(case_json(table, op, None, None, None, stats, Some(op.into())));
+        cases.push(case_json(
+            table,
+            op,
+            None,
+            None,
+            None,
+            stats,
+            Some(op.into()),
+        ));
     }
 
     let stats = time_gpu(device, options, |encoder| {
@@ -777,7 +816,15 @@ fn run_m0b_table(
         )
         .expect("activation pass");
     });
-    cases.push(case_json(table, "activation_moe_swiglu_seq", None, None, None, stats, None));
+    cases.push(case_json(
+        table,
+        "activation_moe_swiglu_seq",
+        None,
+        None,
+        None,
+        stats,
+        None,
+    ));
 
     let routing_weights = f32_buffer(device, routed as usize, 25);
     let residual = f32_buffer(device, (rows * GEMMA_HIDDEN) as usize, 26);
@@ -802,7 +849,15 @@ fn run_m0b_table(
         )
         .expect("fused weighted sum");
     });
-    cases.push(case_json(table, "fused_moe_wsum_dnorm_add", None, None, None, stats, None));
+    cases.push(case_json(
+        table,
+        "fused_moe_wsum_dnorm_add",
+        None,
+        None,
+        None,
+        stats,
+        None,
+    ));
 
     for case in &cases {
         eprintln!(
@@ -820,12 +875,15 @@ fn run_m0b_table(
     cases
 }
 
-fn run_m0b(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options) -> Value {
-    let weights = ServedWeights {
+fn served_weights(device: &MlxDevice) -> ServedWeights {
+    ServedWeights {
         gate_up_q4k: weight_buffer(device, GgmlType::Q4_K, GEMMA_GATE_UP_N, GEMMA_HIDDEN, 31),
         down_q8_0: weight_buffer(device, GgmlType::Q8_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF, 32),
         down_q5_0: weight_buffer(device, GgmlType::Q5_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF, 33),
-    };
+    }
+}
+
+fn served_tables(options: &Options) -> Vec<RoutingTable> {
     let mut tables = Vec::new();
     for (index, &n) in M0B_ROWS.iter().enumerate() {
         tables.push(uniform_table(n, 1000 + index as u64));
@@ -841,6 +899,20 @@ fn run_m0b(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options)
     if let Some(path) = &options.recorded {
         tables.extend(recorded_tables(path, options.layers.as_deref()));
     }
+    tables
+}
+
+/// The process routing policy with an explicit expert `mm_id` schedule.
+fn routing_policy(schedule: ExpertMmSchedule) -> GgmlRoutingPolicy {
+    GgmlRoutingPolicy {
+        expert_mm_schedule: schedule,
+        ..ggml_routing_policy_from_environment()
+    }
+}
+
+fn run_m0b(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options) -> Value {
+    let weights = served_weights(device);
+    let tables = served_tables(options);
     let cases: Vec<Value> = tables
         .iter()
         .flat_map(|table| run_m0b_table(device, registry, options, &weights, table))
@@ -871,6 +943,299 @@ fn run_m0b(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options)
     })
 }
 
+// ---------------------------------------------------------------------------
+// M0c — uniform grid against the compact schedule
+// ---------------------------------------------------------------------------
+
+fn compact_launch(rows: u32, n: u32) -> u64 {
+    let rows = u64::from(rows);
+    let max_tiles = rows.min(rows.div_ceil(NR1) + u64::from(GEMMA_EXPERTS).min(rows) - 1);
+    max_tiles * u64::from(n).div_ceil(NR0)
+}
+
+/// Schedule variants M0c times: label, options.
+fn m0c_variants() -> Vec<(String, IdMmScheduleOptions)> {
+    let mut variants = vec![(
+        "uniform_grid".to_string(),
+        IdMmScheduleOptions::production(ExpertMmSchedule::UniformGrid),
+    )];
+    for grid_order in [
+        CompactGridOrder::TileFastest,
+        CompactGridOrder::NTileFastest,
+    ] {
+        for half_tile_skip in [HalfTileSkip::Disabled, HalfTileSkip::Forced] {
+            variants.push((
+                format!("compact_{grid_order:?}_skip_{half_tile_skip:?}"),
+                IdMmScheduleOptions {
+                    schedule: ExpertMmSchedule::CompactTiles,
+                    grid_order,
+                    half_tile_skip,
+                },
+            ));
+        }
+    }
+    variants
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_expert(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted: bool,
+    reuse: bool,
+    options: IdMmScheduleOptions,
+) {
+    dispatch_id_mm_pooled_with_options_for_test(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        slotted,
+        reuse,
+        &routing_policy(options.schedule),
+        options,
+    )
+    .expect("expert mm_id");
+}
+
+fn run_m0c_table(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    options: &Options,
+    weights: &ServedWeights,
+    table: &RoutingTable,
+) -> Vec<Value> {
+    let rows = table.n_tokens();
+    let routed = rows * GEMMA_TOP_K;
+    let busy_tiles = table.busy_row_tiles();
+    let ids = u32_buffer(device, &table.ids);
+    let hidden_in = f32_buffer(device, (rows * GEMMA_HIDDEN) as usize, 41);
+    let gate_up_out = f32_buffer(device, (routed * GEMMA_GATE_UP_N) as usize, 42);
+    let down_in = f32_buffer(device, (routed * GEMMA_EXPERT_FF) as usize, 43);
+    let down_out = f32_buffer(device, (routed * GEMMA_HIDDEN) as usize, 44);
+    let mut scratch = IdMmScratch::alloc(device, GEMMA_EXPERTS, rows).expect("scratch");
+    let gate_up = expert_params(
+        GgmlType::Q4_K,
+        rows,
+        GEMMA_TOP_K,
+        GEMMA_GATE_UP_N,
+        GEMMA_HIDDEN,
+    );
+    let mut cases = Vec::new();
+    let mut push = |op: &str,
+                    variant: &str,
+                    ggml_type: Option<GgmlType>,
+                    launched,
+                    busy,
+                    stats: Stats| {
+        let mut case = case_json(table, op, ggml_type, launched, busy, stats, None);
+        case["variant"] = json!(variant);
+        eprintln!(
+            "m0c {op:<22} {variant:<40} n={rows:>5} {:<5} layer={:>4} median={:>10.2}us p90={:>10.2}us",
+            ggml_type.map(type_tag).unwrap_or("-"),
+            table.layer.map_or("-".to_string(), |layer| layer.to_string()),
+            stats.median_us,
+            stats.p90_us,
+        );
+        cases.push(case);
+    };
+
+    for (variant, schedule) in m0c_variants() {
+        let compact = schedule.schedule == ExpertMmSchedule::CompactTiles;
+        let launched = |n: u32| {
+            if compact {
+                compact_launch(routed, n)
+            } else {
+                launched_grid(rows, n)
+            }
+        };
+        let stats = time_gpu(device, options, |encoder| {
+            encode_expert(
+                encoder,
+                registry,
+                device,
+                &hidden_in,
+                &weights.gate_up_q4k,
+                &ids,
+                &gate_up_out,
+                &mut scratch,
+                &gate_up,
+                false,
+                false,
+                schedule,
+            );
+        });
+        push(
+            "gate_up",
+            &variant,
+            Some(GgmlType::Q4_K),
+            Some(launched(GEMMA_GATE_UP_N)),
+            Some(busy_tiles * u64::from(GEMMA_GATE_UP_N).div_ceil(NR0)),
+            stats,
+        );
+        for (ggml_type, weight) in [
+            (GgmlType::Q8_0, &weights.down_q8_0),
+            (GgmlType::Q5_0, &weights.down_q5_0),
+        ] {
+            let down = expert_params(ggml_type, rows, GEMMA_TOP_K, GEMMA_HIDDEN, GEMMA_EXPERT_FF);
+            let busy = Some(busy_tiles * u64::from(GEMMA_HIDDEN).div_ceil(NR0));
+            let stats = time_gpu(device, options, |encoder| {
+                encode_expert(
+                    encoder,
+                    registry,
+                    device,
+                    &down_in,
+                    weight,
+                    &ids,
+                    &down_out,
+                    &mut scratch,
+                    &down,
+                    true,
+                    false,
+                    schedule,
+                );
+            });
+            push(
+                "down_slotted",
+                &variant,
+                Some(ggml_type),
+                Some(launched(GEMMA_HIDDEN)),
+                busy,
+                stats,
+            );
+            // ± P2b: gate/up then down in one command buffer; down builds its
+            // own schedule or reuses the gate/up schedule.
+            for reuse in [false, true] {
+                let stats = time_gpu(device, options, |encoder| {
+                    encode_expert(
+                        encoder,
+                        registry,
+                        device,
+                        &hidden_in,
+                        &weights.gate_up_q4k,
+                        &ids,
+                        &gate_up_out,
+                        &mut scratch,
+                        &gate_up,
+                        false,
+                        false,
+                        schedule,
+                    );
+                    encode_expert(
+                        encoder,
+                        registry,
+                        device,
+                        &down_in,
+                        weight,
+                        &ids,
+                        &down_out,
+                        &mut scratch,
+                        &down,
+                        true,
+                        reuse,
+                        schedule,
+                    );
+                });
+                push(
+                    if reuse {
+                        "gate_up+down_reuse"
+                    } else {
+                        "gate_up+down_fresh"
+                    },
+                    &variant,
+                    Some(ggml_type),
+                    None,
+                    None,
+                    stats,
+                );
+            }
+        }
+    }
+
+    for schedule in [
+        ExpertMmSchedule::UniformGrid,
+        ExpertMmSchedule::CompactTiles,
+    ] {
+        for (n_tokens, top_k) in [(rows, GEMMA_TOP_K), (routed, 1)] {
+            let params = GgmlIdMmDispatchParams {
+                n_tokens,
+                top_k,
+                n: GEMMA_HIDDEN,
+                k: GEMMA_EXPERT_FF,
+                n_experts: GEMMA_EXPERTS,
+                expert_stride: expert_matrix_bytes(GgmlType::Q8_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF),
+                ggml_type: GgmlType::Q8_0,
+            };
+            let mut map_scratch =
+                IdMmScratch::alloc(device, GEMMA_EXPERTS, n_tokens).expect("map0 scratch");
+            let (htpe, hids) = map_scratch.buffers_mut();
+            let (htpe, hids) = (&*htpe, &*hids);
+            let stats = time_gpu(device, options, |encoder| {
+                dispatch_id_mm_map0_for_test(
+                    encoder, registry, device, &ids, htpe, hids, &params, schedule,
+                )
+                .expect("schedule stage alone");
+            });
+            let op = match schedule {
+                ExpertMmSchedule::UniformGrid => format!("map0_ne20_{top_k}"),
+                ExpertMmSchedule::CompactTiles => format!("map0c_ne20_{top_k}"),
+            };
+            push(&op, &format!("{schedule:?}"), None, None, None, stats);
+        }
+    }
+    cases
+}
+
+fn run_m0c(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options) -> Value {
+    let weights = served_weights(device);
+    let tables = served_tables(options);
+    let cases: Vec<Value> = tables
+        .iter()
+        .flat_map(|table| run_m0c_table(device, registry, options, &weights, table))
+        .collect();
+    let mut kernels: Vec<String> = [GgmlType::Q4_K, GgmlType::Q8_0, GgmlType::Q5_0]
+        .into_iter()
+        .flat_map(|ggml_type| {
+            mm_kernel_candidates(ggml_type)
+                .into_iter()
+                .flat_map(|name| [format!("{name}_c"), name])
+        })
+        .collect();
+    kernels.extend(
+        [
+            "kernel_mul_mm_id_map0_ne20_1",
+            "kernel_mul_mm_id_map0_ne20_8",
+            "kernel_mul_mm_id_map0c_ne20_1",
+            "kernel_mul_mm_id_map0c_ne20_8",
+        ]
+        .map(String::from),
+    );
+    let kernel_refs: Vec<&str> = kernels.iter().map(String::as_str).collect();
+    json!({
+        "routing_sources": {
+            "uniform": true,
+            "witness": options.witness,
+            "recorded": options.recorded,
+            "layers": options.layers,
+        },
+        "variants": m0c_variants().into_iter().map(|(label, _)| label).collect::<Vec<_>>(),
+        "cases": cases,
+        "pipelines": pipeline_receipts(registry, &kernel_refs),
+    })
+}
+
 fn main() {
     let options = parse_options();
     let device = MlxDevice::new().expect("Metal device");
@@ -887,6 +1252,7 @@ fn main() {
         let result = match suite.as_str() {
             "m0a" => run_m0a(&device, &mut registry, &options),
             "m0b" => run_m0b(&device, &mut registry, &options),
+            "m0c" => run_m0c(&device, &mut registry, &options),
             _ => unreachable!("validated suite"),
         };
         suites.insert(suite.clone(), result);

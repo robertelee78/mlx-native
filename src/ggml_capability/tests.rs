@@ -572,6 +572,52 @@ fn expert_entrypoint_stride_and_scratch_define_capability() {
 }
 
 #[test]
+fn expert_mm_scratch_reports_the_selected_schedule() {
+    let mut request = dense_request(1, GgmlWorkloadClass::Prompt);
+    request.invocation = GgmlInvocation::ExpertPooled {
+        shape: expert_shape(2_048),
+        input_layout: GgmlExpertInputLayout::Slotted,
+    };
+    assert_eq!(
+        GgmlRoutingPolicy::default().expert_mm_schedule,
+        ExpertMmSchedule::CompactTiles
+    );
+    // 2048 tokens × top-6 = 12288 rows over 256 experts:
+    // max_tiles = min(12288, 384 + 256 - 1) = 639.
+    let compact = ggml_capability(request).scratch;
+    assert_eq!(
+        compact,
+        GgmlScratchRequirement::ExpertMm {
+            htpe_bytes: (1 + 3 * 639) * 4,
+            hids_bytes: (12_288 + 256) * 4,
+            caller_owned: true,
+            schedule_reused: false,
+        }
+    );
+    request.routing.expert_mm_schedule = ExpertMmSchedule::UniformGrid;
+    assert_eq!(
+        ggml_capability(request).scratch,
+        GgmlScratchRequirement::ExpertMm {
+            htpe_bytes: 256 * 4,
+            hids_bytes: 256 * 2_048 * 4,
+            caller_owned: true,
+            schedule_reused: false,
+        }
+    );
+}
+
+#[test]
+fn compact_tile_bound_matches_its_cases() {
+    // `rows` term: one row per expert.
+    assert_eq!(compact_max_tiles(33, 128), 33);
+    // `⌈rows/32⌉ + experts − 1` term.
+    assert_eq!(compact_max_tiles(11_360, 128), 355 + 127);
+    assert_eq!(compact_max_tiles(64, 2), 3);
+    assert_eq!(compact_max_tiles(1, 128), 1);
+    assert_eq!(compact_max_tiles(0, 128), 0);
+}
+
+#[test]
 fn expert_mm_requires_distinct_ids() {
     let mut request = dense_request(2_048, GgmlWorkloadClass::Prompt);
     let mut shape = expert_shape(2_048);
