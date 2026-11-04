@@ -13,6 +13,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MlxError, Result};
+use crate::ops::gemma_decode_dense::{
+    gemma_dense_dispatch_count, plan_gemma_dense_route, GemmaDenseRoute, RowTiledGeometry,
+};
 use crate::ops::quantized_matmul_ggml::{dense_mn_dispatch_count, GgmlType, MM_ROUTING_THRESHOLD};
 use crate::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD;
 
@@ -289,6 +292,8 @@ pub enum GgmlKernelRoute {
     DenseQ5kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
+    DenseGemmaRowTiled,
+    DenseGemmaMn,
     DenseMmSimdgroup,
     DenseMmDeviceSelected,
     DenseBatchedMv,
@@ -706,6 +711,10 @@ pub(crate) enum DenseAutoPlan {
     Q4kWidthMn,
     Q5kWidthMn,
     Q6kWidthMn,
+    /// Q4-GEMMA-DECODE D1 (Q4_K / Q6_K) at the frozen per-shape geometry.
+    GemmaRowTiled(RowTiledGeometry),
+    /// Q4-GEMMA-DECODE D2 (Q5_0 / Q8_0).
+    GemmaDenseMn,
     WidthMvExt,
     Mm,
 }
@@ -713,9 +722,17 @@ pub(crate) enum DenseAutoPlan {
 pub(crate) fn plan_dense_auto_route(
     ggml_type: GgmlType,
     m: u32,
+    n: u32,
     k: u32,
     routing: &GgmlRoutingPolicy,
 ) -> DenseAutoPlan {
+    match plan_gemma_dense_route(ggml_type, m, n, k, routing) {
+        Some(GemmaDenseRoute::RowTiled(geometry)) => return DenseAutoPlan::GemmaRowTiled(geometry),
+        Some(GemmaDenseRoute::MnQ5_0 | GemmaDenseRoute::MnQ8_0) => {
+            return DenseAutoPlan::GemmaDenseMn
+        }
+        None => {}
+    }
     if routing.dense_q5k_canonical_q4x4
         && ggml_type == GgmlType::Q5_K
         && (1..=MM_ROUTING_THRESHOLD).contains(&m)
@@ -758,7 +775,7 @@ pub(crate) fn plan_dense_auto_route(
 }
 
 fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
-    let (m, _, k) = request.invocation.dimensions();
+    let (m, n, k) = request.invocation.dimensions();
     if let Some(rejection) = dense_kernel_missing(request) {
         return rejection;
     }
@@ -793,7 +810,33 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
             "native scalar GGUF dense projection route",
         );
     }
-    match plan_dense_auto_route(request.ggml_type, m, k, &request.routing) {
+    match plan_dense_auto_route(request.ggml_type, m, n, k, &request.routing) {
+        DenseAutoPlan::GemmaRowTiled(_) => GgmlCapability::supported(
+            request,
+            GgmlKernelRoute::DenseGemmaRowTiled,
+            request.workload == GgmlWorkloadClass::ContinuousWidth,
+            request.workload != GgmlWorkloadClass::ContinuousWidth,
+            false,
+            1,
+            bytes,
+            GgmlScratchRequirement::None,
+            gemma_dense_dispatch_count(m),
+            0,
+            "Q4-GEMMA-DECODE D1 row-tiled Q4_K/Q6_K matvec route (bitwise per column)",
+        ),
+        DenseAutoPlan::GemmaDenseMn => GgmlCapability::supported(
+            request,
+            GgmlKernelRoute::DenseGemmaMn,
+            request.workload == GgmlWorkloadClass::ContinuousWidth,
+            request.workload != GgmlWorkloadClass::ContinuousWidth,
+            false,
+            1,
+            bytes,
+            GgmlScratchRequirement::None,
+            gemma_dense_dispatch_count(m),
+            0,
+            "Q4-GEMMA-DECODE D2 multi-column Q5_0/Q8_0 matvec route (bitwise per column)",
+        ),
         DenseAutoPlan::Q5kCanonicalQ4x4 => GgmlCapability::supported(
             request,
             GgmlKernelRoute::DenseQ5kCanonicalQ4x4,

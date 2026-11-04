@@ -122,8 +122,8 @@ fn case(codec: GgmlType, n: usize, k: usize) {
         ..baseline
     };
     for m in [1usize, 2, 4, 8] {
-        let base_route = plan_dense_auto_route(codec, m as u32, k as u32, &baseline);
-        let alt_route = plan_dense_auto_route(codec, m as u32, k as u32, &candidate);
+        let base_route = plan_dense_auto_route(codec, m as u32, n as u32, k as u32, &baseline);
+        let alt_route = plan_dense_auto_route(codec, m as u32, n as u32, k as u32, &candidate);
         if m == 1 {
             assert_eq!(base_route, alt_route);
         } else if codec == GgmlType::Q4_K && m == 2 {
@@ -284,7 +284,7 @@ fn existing_route_shape_budget_and_route_controls() {
         ..GgmlRoutingPolicy::default()
     };
     assert_eq!(
-        plan_dense_auto_route(GgmlType::Q4_K, 4, 5120, &p),
+        plan_dense_auto_route(GgmlType::Q4_K, 4, 17408, 5120, &p),
         DenseAutoPlan::Q4kWidthMn
     );
     let alt = GgmlRoutingPolicy {
@@ -292,15 +292,15 @@ fn existing_route_shape_budget_and_route_controls() {
         ..p
     };
     assert_eq!(
-        plan_dense_auto_route(GgmlType::Q4_K, 2, 5120, &alt),
+        plan_dense_auto_route(GgmlType::Q4_K, 2, 17408, 5120, &alt),
         DenseAutoPlan::Mv
     );
     assert_eq!(
-        plan_dense_auto_route(GgmlType::Q4_K, 4, 5120, &alt),
+        plan_dense_auto_route(GgmlType::Q4_K, 4, 17408, 5120, &alt),
         DenseAutoPlan::WidthMvExt
     );
     assert_eq!(
-        plan_dense_auto_route(GgmlType::Q8_0, 2, 8192, &alt),
+        plan_dense_auto_route(GgmlType::Q8_0, 2, 4096, 8192, &alt),
         DenseAutoPlan::WidthMvExt
     );
     assert!(!close(f64::NAN, 1.0));
