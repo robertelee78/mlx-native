@@ -192,6 +192,9 @@ pub use ops::embedding_kquant::{
 pub use ops::embedding_q8_0::{embedding_gather_q8_0, EmbeddingQ8_0Params};
 pub use ops::q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinterleaveParams};
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
+pub use ops::gemma_decode_dense::{
+    dense_mn_shape_admitted, row_tiled_geometry, RowTiledGeometry,
+};
 pub use ops::quantized_matmul_ggml::{
     dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
@@ -199,6 +202,7 @@ pub use ops::quantized_matmul_ggml::{
     quantized_matmul_ggml_batched_mm_strided_input_with_policy,
     quantized_matmul_ggml_batched_mm_with_policy, quantized_matmul_ggml_batched_mv,
     quantized_matmul_ggml_batched_mv_with_policy, quantized_matmul_ggml_broadcast_batched_mm,
+    quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_row_tiled_with_geometry,
     quantized_matmul_ggml_with_policy,
     quantized_matmul_ggml_with_policy_and_trace,
     quantized_matmul_mm_tensor_perm021,

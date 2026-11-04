@@ -43,6 +43,8 @@ pub enum GgmlResolvedKernelRoute {
     DenseQ5kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
+    DenseGemmaRowTiled,
+    DenseGemmaMn,
     DenseMmSimdgroup,
     DenseMmTensorV1,
     DenseMmTensorV2,
@@ -327,6 +329,58 @@ fn validate_dense_dispatches(
                 )?;
             }
             Ok(resolved)
+        }
+        GgmlKernelRoute::DenseGemmaRowTiled | GgmlKernelRoute::DenseGemmaMn => {
+            use crate::ops::gemma_decode_dense::{
+                dense_mn_kernel_name, gemma_column_tiling, row_tiled_geometry,
+                row_tiled_kernel_name,
+            };
+            let tiles = gemma_column_tiling(m);
+            if dispatches.len() != tiles.len() {
+                return Err(MlxError::InvalidArgument(format!(
+                    "Gemma dense trace requires {} tiles, got {}",
+                    tiles.len(),
+                    dispatches.len()
+                )));
+            }
+            let row_tiled = structural_route == GgmlKernelRoute::DenseGemmaRowTiled;
+            for (dispatch, (_, width)) in dispatches.iter().zip(tiles) {
+                let (kernel, grid_x, threads, shmem) = if row_tiled {
+                    let geometry = row_tiled_geometry(request.ggml_type, n, k).ok_or_else(|| {
+                        MlxError::InvalidArgument(
+                            "row-tiled route selected for a shape outside the frozen table".into(),
+                        )
+                    })?;
+                    (
+                        row_tiled_kernel_name(request.ggml_type, geometry, width)?,
+                        div_ceil_u64(n, u64::from(geometry.r0 * geometry.nsg)),
+                        [32, u64::from(geometry.nsg), 1],
+                        Vec::new(),
+                    )
+                } else if request.ggml_type == GgmlType::Q5_0 {
+                    (dense_mn_kernel_name(request.ggml_type, width)?, div_ceil_u64(n, 8), [8, 8, 1], Vec::new())
+                } else {
+                    (
+                        dense_mn_kernel_name(request.ggml_type, width)?,
+                        div_ceil_u64(n, 2),
+                        [32, 4, 1],
+                        vec![(0, u64::from(width) * 256)],
+                    )
+                };
+                require_dispatch(
+                    dispatch,
+                    &kernel,
+                    &single_batch_pipeline_label(&kernel),
+                    [grid_x, 1, 1],
+                    threads,
+                    &shmem,
+                )?;
+            }
+            Ok(if row_tiled {
+                GgmlResolvedKernelRoute::DenseGemmaRowTiled
+            } else {
+                GgmlResolvedKernelRoute::DenseGemmaMn
+            })
         }
         GgmlKernelRoute::DenseWidthMvExt => {
             let dispatch = require_one(dispatches)?;

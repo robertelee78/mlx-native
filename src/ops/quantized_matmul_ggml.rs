@@ -523,16 +523,16 @@ pub struct GgmlBatchedQuantizedMatmulInputStrides {
 /// GPU-side params struct — must match the Metal shader's `GgmlMatvecParams`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GgmlMatvecGpuParams {
-    ne00: i64, // K
-    ne01: i64, // N
-    ne02: i64, // batch (weights)
-    ne10: i64, // K
-    ne12: i64, // batch (input)
-    ne0: i64,  // N (output stride)
-    ne1: i64,  // M
-    r2: u32,   // ne12/ne02
-    r3: u32,   // always 1
+pub(crate) struct GgmlMatvecGpuParams {
+    pub(crate) ne00: i64, // K
+    pub(crate) ne01: i64, // N
+    pub(crate) ne02: i64, // batch (weights)
+    pub(crate) ne10: i64, // K
+    pub(crate) ne12: i64, // batch (input)
+    pub(crate) ne0: i64,  // N (output stride)
+    pub(crate) ne1: i64,  // M
+    pub(crate) r2: u32,   // ne12/ne02
+    pub(crate) r3: u32,   // always 1
 }
 
 /// GPU-side params struct for the mat-mat (mm) kernel.
@@ -636,25 +636,13 @@ pub fn quantized_matmul_ggml(
     )
 }
 
-/// Execute the canonical dense GGUF operation under an explicit routing
-/// policy. This is the receipt-bindable entry point used by allocators and
-/// benchmark harnesses; unlike [`quantized_matmul_ggml`], it does not consult
-/// process-global routing overrides.
-#[allow(clippy::too_many_arguments)]
-pub fn quantized_matmul_ggml_with_policy(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
+/// Canonical validation shared by every dense GGUF matmul entry point.
+fn validate_dense_matmul(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
-    routing: &GgmlRoutingPolicy,
 ) -> Result<()> {
-    // ADR-028: output: &MlxBuffer (was &mut).  Encoders never mutate
-    // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
-    // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
-    // for the multi-thread encoding port (peer's n_cb=2 pattern).
     validate_native_quantized_dtypes("quantized_matmul_ggml", input, weight, output)?;
     validate_signed_metal_dimensions(
         "quantized_matmul_ggml",
@@ -753,6 +741,87 @@ pub fn quantized_matmul_ggml_with_policy(
             output.data_byte_len()
         )));
     }
+    Ok(())
+}
+
+/// Q4-GEMMA-DECODE D1 at an explicit geometry, for parity tests and the M0
+/// geometry search. Accepts Q4_K and Q6_K at `m ∈ 1..=8` and any shape the
+/// canonical validation admits; every column's output is bitwise equal to
+/// the reference single-column kernel (`kernel_mul_mv_q4_K_f32`,
+/// `kernel_mul_mv_q6_K_f32_nr2`). Production callers route through
+/// [`quantized_matmul_ggml_with_policy`] and the frozen geometry table.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_row_tiled_with_geometry(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    geometry: crate::ops::gemma_decode_dense::RowTiledGeometry,
+) -> Result<()> {
+    validate_dense_matmul(input, weight, output, params)?;
+    if !matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+        || params.m > MM_ROUTING_THRESHOLD
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "row-tiled matvec requires Q4_K/Q6_K at m <= {MM_ROUTING_THRESHOLD}, got {:?} m={}",
+            params.ggml_type, params.m
+        )));
+    }
+    crate::ops::gemma_decode_dense::dispatch_row_tiled(
+        encoder, registry, device, input, weight, output, params, geometry,
+    )
+}
+
+/// Q4-GEMMA-DECODE D2 for any admitted shape, for parity tests and M0.
+/// Accepts Q5_0 and Q8_0 at `m ∈ 2..=8`; each column is bitwise equal to
+/// `kernel_mul_mv_q5_0_f32` / `kernel_mul_mv_q8_0_f32_nr2`.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_dense_mn_explicit(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    validate_dense_matmul(input, weight, output, params)?;
+    if !matches!(params.ggml_type, GgmlType::Q5_0 | GgmlType::Q8_0)
+        || !(2..=MM_ROUTING_THRESHOLD).contains(&params.m)
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "dense mN requires Q5_0/Q8_0 at m in 2..={MM_ROUTING_THRESHOLD}, got {:?} m={}",
+            params.ggml_type, params.m
+        )));
+    }
+    crate::ops::gemma_decode_dense::dispatch_dense_mn(
+        encoder, registry, device, input, weight, output, params,
+    )
+}
+
+/// Execute the canonical dense GGUF operation under an explicit routing
+/// policy. This is the receipt-bindable entry point used by allocators and
+/// benchmark harnesses; unlike [`quantized_matmul_ggml`], it does not consult
+/// process-global routing overrides.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_ggml_with_policy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    routing: &GgmlRoutingPolicy,
+) -> Result<()> {
+    // ADR-028: output: &MlxBuffer (was &mut).  Encoders never mutate
+    // through Rust refs — only via metal_buffer() / contents_ptr() (&self).
+    // Relaxing to &MlxBuffer enables Arc<MlxBuffer> sharing across threads
+    // for the multi-thread encoding port (peer's n_cb=2 pattern).
+    validate_dense_matmul(input, weight, output, params)?;
 
     // ADR-011 Phase 3 Wave P3a — route on m threshold.
     //
@@ -787,7 +856,15 @@ pub fn quantized_matmul_ggml_with_policy(
     // bit-identical and therefore remains diagnostic/default-off. Q4_K and
     // Q6_K retain their default-on exact multi-column routes. Every route is
     // selected only after the canonical validation above.
-    match plan_dense_auto_route(params.ggml_type, params.m, params.k, routing) {
+    match plan_dense_auto_route(params.ggml_type, params.m, params.n, params.k, routing) {
+        DenseAutoPlan::GemmaRowTiled(geometry) => {
+            crate::ops::gemma_decode_dense::dispatch_row_tiled(
+                encoder, registry, device, input, weight, output, params, geometry,
+            )
+        }
+        DenseAutoPlan::GemmaDenseMn => crate::ops::gemma_decode_dense::dispatch_dense_mn(
+            encoder, registry, device, input, weight, output, params,
+        ),
         DenseAutoPlan::Q5kCanonicalQ4x4 => {
             debug_assert_eq!(params.ggml_type, GgmlType::Q5_K);
             debug_assert!(params.k % QK5_K == 0);
@@ -995,7 +1072,9 @@ pub(crate) fn quantized_matmul_ggml_broadcast_batched_mm_with_policy(
         k: params.k,
         ggml_type: params.ggml_type,
     };
-    if plan_dense_auto_route(params.ggml_type, params.m, params.k, routing) != DenseAutoPlan::Mm {
+    if plan_dense_auto_route(params.ggml_type, params.m, params.n, params.k, routing)
+        != DenseAutoPlan::Mm
+    {
         return Err(MlxError::InvalidArgument(format!(
             "{OPERATION} requires the canonical scalar route to select MM"
         )));
@@ -1814,7 +1893,7 @@ fn dispatch_mv_batched(
 /// Resolve a column tile's explicit Metal binding offset relative to the
 /// underlying allocation. `KernelArg::BufferWithOffset` is intentionally
 /// absolute, so callers must compose the logical view's base offset here.
-fn checked_mn_tile_byte_offset(
+pub(crate) fn checked_mn_tile_byte_offset(
     logical_base: u64,
     col0: usize,
     row_elements: u32,
@@ -3008,7 +3087,7 @@ mod shared_weight_batch_route_tests {
         let mut registry = KernelRegistry::new();
         let policy = GgmlRoutingPolicy::default();
         assert_eq!(
-            plan_dense_auto_route(ggml_type, m as u32, k as u32, &policy),
+            plan_dense_auto_route(ggml_type, m as u32, n as u32, k as u32, &policy),
             DenseAutoPlan::Mm
         );
         let weight_bytes = n * (k / ggml_type.block_values() as usize)
