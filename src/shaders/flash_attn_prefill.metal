@@ -1052,6 +1052,23 @@ struct AttnMaskParams {
   int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
 };
 
+// ──────────────────────────────────────────────────────────────────────────
+// AttnPreciseParams — extra ABI of the precise (F32 V / F32 O) entry points.
+//
+// Bound at buffer(9) by the `flash_attn_prefill_precise_*` dispatchers only.
+// Rust mirror: `AttnPreciseParamsGpu` in src/ops/flash_attn_prefill_precise.rs.
+// The identical struct is declared in flash_attn_prefill_d512.metal.
+// Total size: 40 bytes.
+// ──────────────────────────────────────────────────────────────────────────
+
+struct AttnPreciseParams {
+  int window; ///< In-kernel sliding window W (has_window only)
+  int codebook_bits; ///< TQ-HB V codebook width: 5, 6 or 8 (`_vcodes` only)
+  float scale_factor_d512; ///< D=512 TQ-HB norm divisor (`_vcodes` d512 only)
+  int norms_per_pos; ///< TQ-HB norms per position: 1 (D=256) or 2 (D=512)
+  int64_t N_strides[3]; ///< V norm strides in floats (B, H_kv, position)
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // GEMM kernels
 ///////////////////////////////////////////////////////////////////////////////
@@ -1071,6 +1088,151 @@ constant bool do_causal [[function_constant(301)]];
 // the Metal compiler dead-codes every blk reference below — so enabling the
 // pre-pass is a strict zero-cost add for callers that don't need it.
 constant bool has_blk [[function_constant(303)]];
+
+// Precise d256 entry points only: replaces the external mask with the exact
+// predicate `q_abs - k < W` (W = AttnPreciseParams::window) on top of the
+// in-kernel causal mask, and skips K tiles that are wholly outside every
+// row's window.  Undefined (false) for every pre-existing entry point.
+constant bool has_window [[function_constant(310)]];
+constant bool has_window_def =
+    is_function_constant_defined(has_window) ? has_window : false;
+
+// TQ-HB V codebooks.  Verbatim copies of CODEBOOK_{5,6,8}BIT_DQ in
+// tq_dequantize_kv.metal (a unit test asserts the copies are identical), so
+// the `_vcodes` entry points dequantize to exactly the values
+// `tq_dequantize_hb_kv_seq` writes.
+constant float PFA_CODEBOOK_5BIT[32] = {
+    -3.2606790f, -2.6910589f, -2.3176743f, -2.0286608f,
+    -1.7871646f, -1.5761599f, -1.3862739f, -1.2117410f,
+    -1.0487242f, -0.8945114f, -0.7470884f, -0.6048936f,
+    -0.4666676f, -0.3313550f, -0.1980377f, -0.0658849f,
+     0.0658849f,  0.1980377f,  0.3313550f,  0.4666676f,
+     0.6048936f,  0.7470884f,  0.8945114f,  1.0487242f,
+     1.2117410f,  1.3862739f,  1.5761599f,  1.7871646f,
+     2.0286608f,  2.3176743f,  2.6910589f,  3.2606790f,
+};
+
+constant float PFA_CODEBOOK_6BIT[64] = {
+    -3.6996161f, -3.1907215f, -2.8640626f, -2.6161277f,
+    -2.4129324f, -2.2388464f, -2.0853192f, -1.9471373f,
+    -1.8208742f, -1.7041502f, -1.5952401f, -1.4928497f,
+    -1.3959804f, -1.3038428f, -1.2157998f, -1.1313277f,
+    -1.0499889f, -0.9714118f, -0.8952766f, -0.8213046f,
+    -0.7492492f, -0.6788902f, -0.6100285f, -0.5424819f,
+    -0.4760822f, -0.4106724f, -0.3461048f, -0.2822386f,
+    -0.2189392f, -0.1560761f, -0.0935225f, -0.0311537f,
+     0.0311537f,  0.0935225f,  0.1560761f,  0.2189392f,
+     0.2822386f,  0.3461048f,  0.4106724f,  0.4760822f,
+     0.5424819f,  0.6100285f,  0.6788902f,  0.7492492f,
+     0.8213046f,  0.8952766f,  0.9714118f,  1.0499889f,
+     1.1313277f,  1.2157998f,  1.3038428f,  1.3959804f,
+     1.4928497f,  1.5952401f,  1.7041502f,  1.8208742f,
+     1.9471373f,  2.0853192f,  2.2388464f,  2.4129324f,
+     2.6161277f,  2.8640626f,  3.1907215f,  3.6996161f,
+};
+
+constant float PFA_CODEBOOK_8BIT[256] = {
+    -5.0652659f, -4.6836997f, -4.4467193f, -4.2715508f,
+    -4.1311907f, -4.0132856f, -3.9111092f, -3.8205780f,
+    -3.7390194f, -3.6645851f, -3.5959415f, -3.5320936f,
+    -3.4722785f, -3.4158977f, -3.3624729f, -3.3116156f,
+    -3.2630056f, -3.2163758f, -3.1715011f, -3.1281899f,
+    -3.0862780f, -3.0456229f, -3.0061011f, -2.9676040f,
+    -2.9300362f, -2.8933131f, -2.8573596f, -2.8221086f,
+    -2.7874999f, -2.7534795f, -2.7199985f, -2.6870129f,
+    -2.6544825f, -2.6223710f, -2.5906452f, -2.5592748f,
+    -2.5282321f, -2.4974918f, -2.4670306f, -2.4368270f,
+    -2.4068614f, -2.3771157f, -2.3475732f, -2.3182184f,
+    -2.2890372f, -2.2600165f, -2.2311440f, -2.2024086f,
+    -2.1737998f, -2.1453081f, -2.1169245f, -2.0886408f,
+    -2.0604493f, -2.0323430f, -2.0043154f, -1.9763603f,
+    -1.9484722f, -1.9206458f, -1.8928763f, -1.8651592f,
+    -1.8374904f, -1.8098662f, -1.7822828f, -1.7547372f,
+    -1.7272261f, -1.6997469f, -1.6722970f, -1.6448739f,
+    -1.6174755f, -1.5900996f, -1.5627445f, -1.5354084f,
+    -1.5080897f, -1.4807869f, -1.4534986f, -1.4262237f,
+    -1.3989610f, -1.3717093f, -1.3444678f, -1.3172356f,
+    -1.2900118f, -1.2627956f, -1.2355865f, -1.2083838f,
+    -1.1811868f, -1.1539951f, -1.1268081f, -1.0996255f,
+    -1.0724469f, -1.0452718f, -1.0180999f, -0.9909310f,
+    -0.9637647f, -0.9366008f, -0.9094390f, -0.8822793f,
+    -0.8551212f, -0.8279648f, -0.8008098f, -0.7736561f,
+    -0.7465035f, -0.7193520f, -0.6922014f, -0.6650517f,
+    -0.6379027f, -0.6107544f, -0.5836067f, -0.5564596f,
+    -0.5293129f, -0.5021667f, -0.4750208f, -0.4478753f,
+    -0.4207301f, -0.3935852f, -0.3664405f, -0.3392960f,
+    -0.3121517f, -0.2850076f, -0.2578636f, -0.2307198f,
+    -0.2035761f, -0.1764324f, -0.1492888f, -0.1221453f,
+    -0.0950019f, -0.0678584f, -0.0407151f, -0.0135717f,
+     0.0135717f,  0.0407151f,  0.0678584f,  0.0950019f,
+     0.1221453f,  0.1492888f,  0.1764324f,  0.2035761f,
+     0.2307198f,  0.2578636f,  0.2850076f,  0.3121517f,
+     0.3392960f,  0.3664405f,  0.3935852f,  0.4207301f,
+     0.4478753f,  0.4750208f,  0.5021667f,  0.5293129f,
+     0.5564596f,  0.5836067f,  0.6107544f,  0.6379027f,
+     0.6650517f,  0.6922014f,  0.7193520f,  0.7465035f,
+     0.7736561f,  0.8008098f,  0.8279648f,  0.8551212f,
+     0.8822793f,  0.9094390f,  0.9366008f,  0.9637647f,
+     0.9909310f,  1.0180999f,  1.0452718f,  1.0724469f,
+     1.0996255f,  1.1268081f,  1.1539951f,  1.1811868f,
+     1.2083838f,  1.2355865f,  1.2627956f,  1.2900118f,
+     1.3172356f,  1.3444678f,  1.3717093f,  1.3989610f,
+     1.4262237f,  1.4534986f,  1.4807869f,  1.5080897f,
+     1.5354084f,  1.5627445f,  1.5900996f,  1.6174755f,
+     1.6448739f,  1.6722970f,  1.6997469f,  1.7272261f,
+     1.7547372f,  1.7822828f,  1.8098662f,  1.8374904f,
+     1.8651592f,  1.8928763f,  1.9206458f,  1.9484722f,
+     1.9763603f,  2.0043154f,  2.0323430f,  2.0604493f,
+     2.0886408f,  2.1169245f,  2.1453081f,  2.1737998f,
+     2.2024086f,  2.2311440f,  2.2600165f,  2.2890372f,
+     2.3182184f,  2.3475732f,  2.3771157f,  2.4068614f,
+     2.4368270f,  2.4670306f,  2.4974918f,  2.5282321f,
+     2.5592748f,  2.5906452f,  2.6223710f,  2.6544825f,
+     2.6870129f,  2.7199985f,  2.7534795f,  2.7874999f,
+     2.8221086f,  2.8573596f,  2.8933131f,  2.9300362f,
+     2.9676040f,  3.0061011f,  3.0456229f,  3.0862780f,
+     3.1281899f,  3.1715011f,  3.2163758f,  3.2630056f,
+     3.3116156f,  3.3624729f,  3.4158977f,  3.4722785f,
+     3.5320936f,  3.5959415f,  3.6645851f,  3.7390194f,
+     3.8205780f,  3.9111092f,  4.0132856f,  4.1311907f,
+     4.2715508f,  4.4467193f,  4.6836997f,  5.0652659f,
+};
+
+// The centroid `tq_dequantize_hb_kv_seq` reads for code byte `idx`.
+METAL_FUNC float pfa_tq_hb_centroid(uint idx, int codebook_bits) {
+  if (codebook_bits == 5) {
+    return PFA_CODEBOOK_5BIT[idx & 0x1Fu];
+  } else if (codebook_bits == 6) {
+    return PFA_CODEBOOK_6BIT[idx & 0x3Fu];
+  }
+  return PFA_CODEBOOK_8BIT[idx];
+}
+
+// V input forms of the attention template (`VForm`).
+//   PFA_V_STAGED: V in the I/O dtype T, staged through threadgroup memory
+//                 and widened exactly to F32 at fragment load (every
+//                 pre-existing entry point, and precise `_v16`).
+//   PFA_V_F32:    dense F32 V read straight from device memory into the F32
+//                 MMA fragments (precise `_v32`, §3.7 option a).
+//   PFA_V_CODES:  TQ-HB V codes staged in threadgroup memory and
+//                 dequantized to F32 at fragment load (precise `_vcodes`,
+//                 §3.7 option c).
+#define PFA_V_STAGED 0
+#define PFA_V_F32 2
+#define PFA_V_CODES 3
+
+template <typename T, int VForm>
+struct PfaVSource {
+  typedef T type;
+};
+template <typename T>
+struct PfaVSource<T, PFA_V_F32> {
+  typedef float type;
+};
+template <typename T>
+struct PfaVSource<T, PFA_V_CODES> {
+  typedef uchar type;
+};
 
 template <typename T>
 struct TransformScale {
@@ -1141,6 +1303,31 @@ struct DivOp {
   }
 };
 
+// Threadgroup-memory geometry of the attention template, shared by the
+// kernel wrappers (which own the threadgroup arrays) and the body.
+template <typename T, int BQ, int BK, int BD>
+struct AttnTgpGeometry {
+  STEEL_CONST short padQ = 16 / sizeof(T);
+  STEEL_CONST short padK = 16 / sizeof(T);
+  STEEL_CONST short padV = 16 / sizeof(T);
+  STEEL_CONST short tgp_mem_0 = (BK + padK) * (BD);
+  STEEL_CONST short tgp_mem_1 = BK * (BD + padV);
+  STEEL_CONST short tgp_mem_q = BQ * (BD + padQ);
+  STEEL_CONST short tgp_mem_s = tgp_mem_0 > tgp_mem_1 ? tgp_mem_0 : tgp_mem_1;
+};
+
+// Body of every flash-attention prefill entry point.
+//
+// The pre-existing entry points instantiate it with OutT = T,
+// ScaleScores = false and VForm = PFA_V_STAGED, which is exactly the
+// historical kernel.  The precise entry points (ADR-063 Q4-GEMMA-KERNEL)
+// set:
+//   OutT = float      — O stored without the final T rounding;
+//   ScaleScores=true  — Q stays exactly as loaded and the F32 scores are
+//                       multiplied by `scale * log2(e)` (factor formed in
+//                       F32) after Q·K^T, instead of scaling the T Q tile by
+//                       the T-rounded factor;
+//   VForm             — the V input form (see PFA_V_*).
 // clang-format off
 template <
     typename T,
@@ -1149,24 +1336,34 @@ template <
     int BD,
     int WM,
     int WN,
-    typename MaskType = float,
-    typename AccumType = float>
-[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention(
-    const device T* Q [[buffer(0)]],
-    const device T* K [[buffer(1)]],
-    const device T* V [[buffer(2)]],
-    device T* O [[buffer(3)]],
-    const constant AttnParams* params [[buffer(4)]],
-    const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
-    const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
-    const device char* blk [[buffer(7), function_constant(has_blk)]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint3 lid [[thread_position_in_threadgroup]]) { // clang-format on
-
-  // Pacifying compiler
-  (void)lid;
+    typename MaskType,
+    typename AccumType,
+    typename OutT,
+    bool ScaleScores,
+    int VForm>
+METAL_FUNC void attention_impl(
+    const device T* Q,
+    const device T* K,
+    const device typename PfaVSource<T, VForm>::type* V,
+    device OutT* O,
+    const constant AttnParams* params,
+    const constant AttnMaskParams* mask_params,
+    const device MaskType* mask,
+    const device char* blk,
+    const constant AttnPreciseParams* pparams,
+    const device float* v_norms,
+    threadgroup T* Q_smem,
+    threadgroup T* KV_smem,
+    threadgroup float* cb_smem,
+    uint simd_lane_id,
+    uint simd_group_id,
+    uint3 tid) { // clang-format on
+  static_assert(
+      VForm == PFA_V_STAGED || ScaleScores,
+      "F32 / code V forms exist only on the precise entry points");
+  static_assert(
+      VForm != PFA_V_CODES || BD == 256,
+      "the d256 `_vcodes` form assumes one TQ-HB norm per position");
 
   // Move to correct block
   ulong3 tidl{tid.x, tid.y, tid.z};
@@ -1182,6 +1379,11 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
+  if constexpr (VForm == PFA_V_CODES) {
+    v_norms += tidl.z * pparams->N_strides[0] + // Batch
+        kv_head_idx * pparams->N_strides[1]; // Head
+  }
+
   O += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Seqeunce
@@ -1192,20 +1394,14 @@ template <
   }
 
   // Prepare threadgroup memory
-  constexpr short padQ = 16 / sizeof(T);
-  constexpr short padK = 16 / sizeof(T);
-  constexpr short padV = 16 / sizeof(T);
+  using tgp_geometry = AttnTgpGeometry<T, BQ, BK, BD>;
+  constexpr short padQ = tgp_geometry::padQ;
+  constexpr short padK = tgp_geometry::padK;
+  constexpr short padV = tgp_geometry::padV;
 
   constexpr short LDQ_tgp = BD + padQ;
   constexpr short LDK_tgp = BK + padK;
   constexpr short LDV_tgp = BD + padV;
-
-  constexpr short tgp_mem_0 = (BK + padK) * (BD);
-  constexpr short tgp_mem_1 = BK * (BD + padV);
-  constexpr short tgp_mem_s = tgp_mem_0 > tgp_mem_1 ? tgp_mem_0 : tgp_mem_1;
-
-  threadgroup T Q_smem[BQ * (BD + padQ)];
-  threadgroup T KV_smem[tgp_mem_s];
 
   threadgroup T* Qs = Q_smem;
   threadgroup T* Ks = KV_smem;
@@ -1244,10 +1440,29 @@ template <
       Q, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
   KBlockLoader loader_k(
       K, params->K_strides[2], Ks, simd_group_id, simd_lane_id);
+  // `_v32` / `_vcodes` never stage V through this loader; it is built on a
+  // reinterpreted pointer so the template stays uniform and is dead code.
   VBlockLoader loader_v(
-      V, params->V_strides[2], Vs, simd_group_id, simd_lane_id);
+      reinterpret_cast<const device T*>(V),
+      params->V_strides[2],
+      Vs,
+      simd_group_id,
+      simd_lane_id);
 
   TransformScale<T> ts(static_cast<T>(params->scale * 1.44269504089));
+  const AccumType score_scale =
+      AccumType(params->scale) * AccumType(1.44269504089f);
+
+  // `_vcodes`: TQ-HB codes for one K tile in the first BK * BD bytes of
+  // KV_smem (free once the K tile has been consumed) and the per-position
+  // scale_norm = norm * rsqrt(D) right after them.
+  threadgroup uchar* Cs = reinterpret_cast<threadgroup uchar*>(KV_smem);
+  threadgroup float* SNs =
+      reinterpret_cast<threadgroup float*>(KV_smem + (BK * BD) / sizeof(T));
+  static_assert(
+      VForm != PFA_V_CODES ||
+          (BK * BD + BK * sizeof(float)) <= tgp_geometry::tgp_mem_s * sizeof(T),
+      "`_vcodes` staging must fit in KV_smem");
 
   // Prepare MMA tiles
   constexpr short kFragSize = 8; // MMAFrag size
@@ -1288,6 +1503,18 @@ template <
   constexpr short Qs_tile_stride = kFragSize;
   constexpr short Ks_tile_stride = kFragSize * LDK_tgp;
 
+  // `_vcodes`: the 256-entry centroid table this dispatch's code bytes
+  // index, in threadgroup memory (constant-memory lookups with divergent
+  // indices serialise).  Ordered before use by the barriers below.
+  if constexpr (VForm == PFA_V_CODES) {
+    const short thread_idx = simd_group_id * 32 + simd_lane_id;
+    for (short i = thread_idx; i < 256; i += WM * WN * 32) {
+      cb_smem[i] = pfa_tq_hb_centroid(uint(i), pparams->codebook_bits);
+    }
+  }
+  // rsqrt(D) at run time, as `tq_dequantize_hb_kv_seq` forms it.
+  const float v_inv_sqrt_d = rsqrt(float(params->D));
+
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Load Q blocks apply scale
@@ -1296,7 +1523,9 @@ template <
   } else {
     loader_q.load_unsafe();
   }
-  loader_q.apply_inplace_op(ts);
+  if constexpr (!ScaleScores) {
+    loader_q.apply_inplace_op(ts);
+  }
 
   // Init row reduction variables
   constexpr short kRowsPT = decltype(Stile)::kRowsPerThread;
@@ -1345,6 +1574,22 @@ template <
     kb_lim = min(kb_lim, causal_kb_lim);
   }
 
+  // In-kernel sliding window (precise d256 only).  Key k is visible to the
+  // absolute query row q iff k <= q (the causal mask above, do_causal is
+  // required) and q - k < W.  K tiles below `kb_start` hold no key any row
+  // of this Q tile can see; skipping them is bitwise neutral because a
+  // fully masked tile leaves the running max, sum and O unchanged.
+  int kb_start = 0;
+  if (has_window_def) {
+    const int first_visible =
+        int(tid.x) * BQ + params->qL_off - pparams->window + 1;
+    kb_start = first_visible > 0 ? min(first_visible / BK, kb_lim) : 0;
+    loader_k.src += kb_start * loader_k.tile_stride;
+    if constexpr (VForm == PFA_V_STAGED) {
+      loader_v.src += kb_start * loader_v.tile_stride;
+    }
+  }
+
   // ── Wave 2E tile-skip pre-pass row base ─────────────────────────────────
   //
   // When has_blk is true the dispatcher has bound the per-(qtile, ktile)
@@ -1363,7 +1608,7 @@ template <
   }
 
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     // ── Wave 2E tile-skip branch ─────────────────────────────────────────
     //
     // blk_cur:
@@ -1399,7 +1644,9 @@ template <
         // (there the K/V stream is per-chunk
         // and the advance happens implicitly via ic0++ in the for-head).
         loader_k.next();
-        loader_v.next();
+        if constexpr (VForm == PFA_V_STAGED) {
+          loader_v.next();
+        }
         continue;
       }
     }
@@ -1429,6 +1676,13 @@ template <
       simdgroup_barrier(mem_flags::mem_none);
 
       tile_matmad(Stile, Qtile, Ktile, Stile);
+    }
+
+    if constexpr (ScaleScores) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
+        Stile.val_frags[i] *= score_scale;
+      }
     }
 
     // Mask out length sequence
@@ -1468,6 +1722,32 @@ template <
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
             if (row_pos < (col_pos + jj)) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
+            }
+          }
+        }
+      }
+    }
+
+    // Lower window edge (precise d256, has_window): q - k >= W is masked.
+    // Only tiles whose first key can fall outside some row's window pay
+    // the per-element test.
+    if (has_window_def &&
+        kb * BK <= int(tid.x) * BQ + BQ - 1 + params->qL_off - pparams->window) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = -metal::numeric_limits<selem_t>::infinity();
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        const int row_pos =
+            tid.x * BQ + params->qL_off + tm + sm + (i * stile_t::kFragRows);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            if (row_pos - (col_pos + jj) >= pparams->window) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }
@@ -1540,10 +1820,45 @@ template <
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Load V blocks
-    if (!align_K && kb == (params->NK_aligned)) {
-      loader_v.load_safe(short2(BD, params->kL_rem));
-    } else {
-      loader_v.load_unsafe();
+    if constexpr (VForm == PFA_V_STAGED) {
+      if (!align_K && kb == (params->NK_aligned)) {
+        loader_v.load_safe(short2(BD, params->kL_rem));
+      } else {
+        loader_v.load_unsafe();
+      }
+    } else if constexpr (VForm == PFA_V_CODES) {
+      // Stage this K tile's TQ-HB codes (BK rows × BD bytes) and per-row
+      // scale_norm.  Rows at or past kL are written as code 0 with
+      // scale_norm 0, so poisoned cache rows never reach the MMA.
+      constexpr short kTgpSize = WM * WN * 32;
+      constexpr short kVecsPerRow = BD / 4;
+      constexpr short kVecs = BK * kVecsPerRow;
+      static_assert(kVecs % kTgpSize == 0, "uniform code staging");
+      const short thread_idx = simd_group_id * 32 + simd_lane_id;
+      const int rows_valid =
+          (!align_K && kb == (params->NK_aligned)) ? params->kL_rem : BK;
+      const device uchar* v_tile = V + (long)kb * BK * params->V_strides[2];
+      STEEL_PRAGMA_UNROLL
+      for (short n = 0; n < kVecs / kTgpSize; n++) {
+        const short idx = n * kTgpSize + thread_idx;
+        const short r = idx / kVecsPerRow;
+        const short c = (idx % kVecsPerRow) * 4;
+        uchar4 code = uchar4(0);
+        if (r < rows_valid) {
+          code = *reinterpret_cast<const device uchar4*>(
+              v_tile + (long)r * params->V_strides[2] + c);
+        }
+        *reinterpret_cast<threadgroup uchar4*>(Cs + r * BD + c) = code;
+      }
+      if (thread_idx < BK) {
+        const int r = thread_idx;
+        float scale_norm = 0.0f;
+        if (r < rows_valid) {
+          const float norm = v_norms[(long)(kb * BK + r) * pparams->N_strides[2]];
+          scale_norm = norm * v_inv_sqrt_d;
+        }
+        SNs[r] = scale_norm;
+      }
     }
 
     // Do softmax
@@ -1597,6 +1912,10 @@ template <
     // Load V into registers
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // `_v32`: rows of this K tile that exist (the tail tile stops at kL).
+    const int v_rows_valid =
+        (!align_K && kb == (params->NK_aligned)) ? params->kL_rem : BK;
+
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
@@ -1610,8 +1929,31 @@ template <
           const short kk = ik * kFragSize;
           const short dd = id * kFragSize;
 
-          Vtile.template load<T, 1, 1, LDV_tgp, 1>(
-              &Vs[Vs_offset + kk * LDV_tgp + dd]);
+          if constexpr (VForm == PFA_V_STAGED) {
+            Vtile.template load<T, 1, 1, LDV_tgp, 1>(
+                &Vs[Vs_offset + kk * LDV_tgp + dd]);
+          } else if constexpr (VForm == PFA_V_F32) {
+            // §3.7 option a: the F32 fragment straight from device memory
+            // (lane owns row kk + sm, columns dd + sn + {0, 1}).
+            const short r = kk + sm;
+            float2 v2 = float2(0.0f);
+            if (r < v_rows_valid) {
+              const device float* v_src =
+                  V + (long)(kb * BK + r) * params->V_strides[2] + dd + sn;
+              v2 = float2(v_src[0], v_src[1]);
+            }
+            Vtile.frag_at(0, 0)[0] = v2.x;
+            Vtile.frag_at(0, 0)[1] = v2.y;
+          } else {
+            // §3.7 option c: centroid · scale_norm, the exact F32 value
+            // `tq_dequantize_hb_kv_seq` stores for this code.
+            const short r = kk + sm;
+            const uchar2 code =
+                *reinterpret_cast<threadgroup const uchar2*>(Cs + r * BD + dd + sn);
+            const float scale_norm = SNs[r];
+            Vtile.frag_at(0, 0)[0] = cb_smem[code.x] * scale_norm;
+            Vtile.frag_at(0, 0)[1] = cb_smem[code.y] * scale_norm;
+          }
 
           if constexpr (BD == 128) {
             simdgroup_barrier(mem_flags::mem_none);
@@ -1628,7 +1970,9 @@ template <
 
     // Prepare for next iteration
     loader_k.next();
-    loader_v.next();
+    if constexpr (VForm == PFA_V_STAGED) {
+      loader_v.next();
+    }
   }
 
   // Normalize output
@@ -1644,10 +1988,78 @@ template <
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
       return;
 
-    Otile.template store_safe<T, 1, 1>(O, params->O_strides[2], dst_tile_dims);
+    Otile.template store_safe<OutT, 1, 1>(O, params->O_strides[2], dst_tile_dims);
   } else {
-    Otile.template store<T, 1, 1>(O, params->O_strides[2]);
+    Otile.template store<OutT, 1, 1>(O, params->O_strides[2]);
   }
+}
+
+// Pre-existing entry points: T I/O, T-scaled Q, staged V, T output.
+// clang-format off
+template <
+    typename T,
+    int BQ,
+    int BK,
+    int BD,
+    int WM,
+    int WN,
+    typename MaskType = float,
+    typename AccumType = float>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention(
+    const device T* Q [[buffer(0)]],
+    const device T* K [[buffer(1)]],
+    const device T* V [[buffer(2)]],
+    device T* O [[buffer(3)]],
+    const constant AttnParams* params [[buffer(4)]],
+    const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
+    const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
+    const device char* blk [[buffer(7), function_constant(has_blk)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]]) { // clang-format on
+
+  // Pacifying compiler
+  (void)lid;
+
+  using tgp_geometry = AttnTgpGeometry<T, BQ, BK, BD>;
+  threadgroup T Q_smem[tgp_geometry::tgp_mem_q];
+  threadgroup T KV_smem[tgp_geometry::tgp_mem_s];
+
+  attention_impl<T, BQ, BK, BD, WM, WN, MaskType, AccumType, T, false, PFA_V_STAGED>(
+      Q, K, V, O, params, mask_params, mask, blk, nullptr, nullptr,
+      Q_smem, KV_smem, nullptr, simd_lane_id, simd_group_id, tid);
+}
+
+// Precise D=256 entry points (ADR-063 Q4-GEMMA-KERNEL): F16 Q and K, F32
+// scores scaled after Q·K^T, F32 softmax / P / V operand / accumulator, F32
+// O.  Tile geometry BQ=32, BK=16, WM=4, WN=1 for every V form, so `blk`
+// keeps the (32, 16) classification of the F16 entry points.  Threadgroup
+// memory: Q 16,896 B + K/V 12,288 B (+ 1,024 B codebook for `_vcodes`).
+// clang-format off
+template <int VForm>
+[[kernel, max_total_threads_per_threadgroup(128)]] void attention_precise_d256(
+    const device half* Q [[buffer(0)]],
+    const device half* K [[buffer(1)]],
+    const device typename PfaVSource<half, VForm>::type* V [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    const constant AttnParams* params [[buffer(4)]],
+    const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
+    const device half* mask [[buffer(6), function_constant(has_mask)]],
+    const device char* blk [[buffer(7), function_constant(has_blk)]],
+    const constant AttnPreciseParams* pparams [[buffer(9)]],
+    const device float* v_norms [[buffer(10)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]]) { // clang-format on
+  using tgp_geometry = AttnTgpGeometry<half, 32, 16, 256>;
+  threadgroup half Q_smem[tgp_geometry::tgp_mem_q];
+  threadgroup half KV_smem[tgp_geometry::tgp_mem_s];
+  threadgroup float cb_smem[VForm == PFA_V_CODES ? 256 : 1];
+
+  attention_impl<half, 32, 16, 256, 4, 1, half, float, float, true, VForm>(
+      Q, K, V, O, params, mask_params, mask, blk, pparams, v_norms,
+      Q_smem, KV_smem, cb_smem, simd_lane_id, simd_group_id, tid);
 }
 
 // clang-format off
@@ -1683,6 +2095,12 @@ instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d256",          bfloat16
 instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d256_boolmask", bfloat16_t, 32, 16, 256, 4, 1, bool)
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d256",           half,       32, 16, 256, 4, 1, half)
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d256_boolmask",  half,       32, 16, 256, 4, 1, bool)
+
+// Precise D=256 (ADR-063 Q4-GEMMA-KERNEL; F16 additive mask): `_v32` dense
+// F32 V, `_v16` F16 V widened exactly, `_vcodes` TQ-HB codes + norms.
+instantiate_kernel("flash_attn_prefill_precise_d256_v32",    attention_precise_d256, PFA_V_F32)
+instantiate_kernel("flash_attn_prefill_precise_d256_v16",    attention_precise_d256, PFA_V_STAGED)
+instantiate_kernel("flash_attn_prefill_precise_d256_vcodes", attention_precise_d256, PFA_V_CODES)
 
 // D=512 — global-attention layers (Gemma 4 family).
 // BQ=8, BK=8, WM=1, WN=1 → 32 threads / threadgroup, 1 simdgroup.
