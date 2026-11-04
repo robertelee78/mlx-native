@@ -171,3 +171,21 @@ every u32 class, NaN payloads included.
 | T-P4a-6 | `p4a_native_refusals_and_strided_bounds_caveat` | `blit_copy_bytes` refuses overlapping same-allocation ranges and source/destination ranges past `data_byte_len()`; `dispatch_strided_copy_f32` refuses zero rows or cols, and accepts (and writes) an allocation-sized copy into a smaller view |
 
 Records use `probe=p4a_capture_restore`.
+
+### P4a results (M5 Max, 2026-11-03)
+
+Run with `E6_SKIP_BANDWIDTH=1 scripts/adr065_e6_run_probes.sh …/p4a-526` at
+source commit `1117708` (mlx-native 0.15.17, rustc 1.94.0, embedded
+metallib sha256 `a4f35c4b…f961827`). Records, logs and provenance are in the
+hf2q v0130 evidence directory `p4a-526/`. Every test binary passed on both
+paths (`status.txt`: all zero).
+
+| Records | Precompiled | Runtime |
+|---|---|---|
+| P4a T-P4a-2..6 (`probe=p4a_capture_restore`) | 30/30 bitwise; refusals as specified | same |
+| T-P4a-3 compute-first sweeps (64 ordered slot subsets each; small 2-layer, Qwen3.6, Qwen3.8 shapes) | 3/3 sweeps, 0 failed runs | same |
+| T-P4a-1 capture restore (E6 probe 4), `E6_STRICT_NAN=1` | 8/8 bitwise, NaN payloads 4/4 preserved | same |
+| `gated_delta_net_decode` capture: 4-seq vs 4×1; window vs sequential tokens | 12/12 bitwise; 8/8 bitwise | same (registry fix) |
+| Other E6 probes | verdicts unchanged from the E6 results above, including the recorded-only TQ-HB `nsg` 1→4 crossing rows | same |
+
+The bandwidth (timing) probe was not rerun; its E6 numbers stand.
