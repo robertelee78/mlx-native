@@ -41,7 +41,7 @@ Expectations derived from the kernel source. These are not results.
 ## Run (requires the GPU lane)
 
 ```sh
-scripts/adr065_e6_run_probes.sh /Users/robert/.local/state/hf2q/v0130/p4a-526
+scripts/adr065_e6_run_probes.sh EVIDENCE_DIR
 ```
 
 The script runs the correctness probes (E6 and P4a), then the bandwidth
@@ -118,9 +118,11 @@ bits(conv_dst[j][c·Km1 + k]) := bits(conv_cap[((s_j·T + t_j)·Km1 + k)·C + c]
   number (1–4) or their slots. Bytes outside the destination views are
   unchanged, including peer slots and the non-current parity buffer.
 - Ordering: everything is encoded into a caller-provided `CommandEncoder`;
-  the caller commits and waits. Sources written by earlier work in command
-  buffer order are complete before the restore reads them. A GPU fault
-  surfaces as `MlxError::CommandBufferError` from the wait.
+  the caller commits and waits. Sources written by earlier command buffers,
+  or by earlier work in the same command buffer separated by an explicit
+  `memory_barrier()`, are complete before the restore reads them; work in the
+  same open compute pass can run concurrently with the first strided copies.
+  A GPU fault surfaces as `MlxError::CommandBufferError` from the wait.
 - Anchor images: a capture-layout pair with `T = S = 1`, restored with
   `(s, t) = (0, 0)`, is inside the contract. The contract covers capture →
   state only.
@@ -143,10 +145,13 @@ T-P4a-3 covers the shipped order.
 
 **Bounds-check caveat.** `blit_copy_bytes` validates against view extents
 (`data_byte_len()`) and refuses overlapping same-allocation ranges.
-`dispatch_strided_copy_f32` validates against `MlxBuffer::byte_len()`, the
-whole Metal allocation, so it accepts a view too small for the copy as long
-as the allocation is large enough, and writes past the view (T-P4a-6 pins
-this). View-exact range checking is therefore the caller's preflight.
+`dispatch_strided_copy_f32` compares `rows·cols·4` with
+`MlxBuffer::byte_len()`, the whole Metal allocation, and ignores the view's
+start offset, while the kernel binds at the view's byte offset. A view that
+starts partway into a buffer can therefore pass the check and write past the
+end of the view and of the allocation; the source side has the same gap
+(T-P4a-6 pins the allocation-wide check). View-exact range checking is
+therefore the caller's preflight.
 
 **C2 snapshot direction.** ADR-063 C2 snapshots state into an anchor image
 with the same primitives in reverse: a blit out of the parity-current

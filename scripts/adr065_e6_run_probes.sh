@@ -52,7 +52,7 @@ rm -f "$evidence/status.txt"
 
 for path in precompiled runtime; do
     if [ "$path" = runtime ]; then flag=0; else flag=1; fi
-    rm -f "$evidence/records-$path.txt" "$evidence/bandwidth-$path.txt"
+    rm -f "$evidence/records-$path.txt" "$evidence/strict-nan-$path.txt"
     status=0
     MLX_PRECOMPILED_METALLIB=$flag E6_RECORD_PATH="$evidence/records-$path.txt" \
         cargo test --release "${correctness[@]}" --no-fail-fast -- --test-threads=1 2>&1 |
@@ -66,6 +66,7 @@ for path in precompiled runtime; do
     echo "strict_nan_$path=$status" >>"$evidence/status.txt"
     # Set E6_SKIP_BANDWIDTH=1 to skip the timing probe (no quiet host).
     if [ "${E6_SKIP_BANDWIDTH:-0}" = 1 ]; then continue; fi
+    rm -f "$evidence/bandwidth-$path.txt"
     status=0
     MLX_PRECOMPILED_METALLIB=$flag E6_RECORD_PATH="$evidence/bandwidth-$path.txt" \
         cargo test --release "${bandwidth[@]}" -- --ignored --test-threads=1 2>&1 |
