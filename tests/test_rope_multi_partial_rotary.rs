@@ -584,7 +584,12 @@ fn library_path_matches_env() {
         Ok("0") | Ok("false") | Ok("off")
     );
     println!("MLX_PRECOMPILED_METALLIB runtime={runtime}; rope_multi_f32 origin {origin:?}");
-    if runtime {
-        assert_eq!(origin, mlx_native::KernelPipelineOrigin::RuntimeSource);
-    }
+    // Guard against an empty embedded metallib silently turning the
+    // "precompiled" run into a second runtime-source run.
+    let want = if runtime {
+        mlx_native::KernelPipelineOrigin::RuntimeSource
+    } else {
+        mlx_native::KernelPipelineOrigin::PrecompiledMetallib
+    };
+    assert_eq!(origin, want);
 }
