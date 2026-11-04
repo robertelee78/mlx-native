@@ -491,11 +491,12 @@ pub fn encode_mask(
         },
     )
     .unwrap();
+    // The encoder is concurrent and the mask fill is not a declared write:
+    // fence before anything (blk classifier or attention) reads the mask.
+    enc.memory_barrier();
     if !with_blk {
         return (mask, None);
     }
-    // The mask fill is not a declared write: fence before classifying.
-    enc.memory_barrier();
     let params = precise::precise_d256_blk_params(s.ql as u32, s.kl as u32);
     let blk = alloc_blk_buffer(&c.device, &params).unwrap();
     flash_attn_prefill_blk::dispatch_flash_attn_prefill_blk_f16(
