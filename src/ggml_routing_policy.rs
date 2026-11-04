@@ -49,6 +49,14 @@ fn combine_routing_policies(
         expert_q6k_mv_nr2: expert.expert_q6k_mv_nr2,
         expert_q8_0_mv_nr2: expert.expert_q8_0_mv_nr2,
         expert_tensor_mm: expert.expert_tensor_mm,
+        dense_row_tiled_q4k: dense.dense_row_tiled_q4k,
+        dense_row_tiled_q6k: dense.dense_row_tiled_q6k,
+        dense_row_tiled_m1: dense.dense_row_tiled_m1,
+        dense_mn_q5_0: dense.dense_mn_q5_0,
+        dense_mn_q8_0: dense.dense_mn_q8_0,
+        expert_grouped_q4k: expert.expert_grouped_q4k,
+        expert_grouped_q5_0: expert.expert_grouped_q5_0,
+        expert_grouped_q8_0: expert.expert_grouped_q8_0,
     }
 }
 
