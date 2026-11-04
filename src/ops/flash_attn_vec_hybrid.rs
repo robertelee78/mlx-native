@@ -442,6 +442,404 @@ pub fn flash_attn_vec_hybrid_batched(
     Ok(())
 }
 
+/// ADR-063 lever A: the (nwg, nsg) bucket one slot runs at, i.e. the split
+/// count and SIMD-group count its solo `flash_attn_vec_hybrid_batched`
+/// dispatch would use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridSlotBucket {
+    /// Split-K workgroups (1..=32; the stock reduce handles at most 32).
+    pub nwg: u32,
+    /// SIMD groups per workgroup (1, 2 or 4).
+    pub nsg: u32,
+}
+
+impl HybridSlotBucket {
+    /// The stock bucket for a slot whose effective KV length is
+    /// `kv_seq_len` (`compute_nwg` and `compute_nsg`, unchanged heuristics).
+    pub fn for_kv_seq_len(kv_seq_len: u32) -> Self {
+        Self {
+            nwg: compute_nwg(kv_seq_len),
+            nsg: compute_nsg(kv_seq_len),
+        }
+    }
+}
+
+/// Query-head group sizes the grouped kernel is instantiated for.
+pub const FLASH_ATTN_VEC_HYBRID_GQA_GROUPS: [u32; 4] = [1, 2, 4, 8];
+
+/// Threadgroup-memory cap a grouped dispatch must fit (Apple GPUs: 32 KiB).
+pub const FLASH_ATTN_VEC_HYBRID_GQA_MAX_SHMEM_BYTES: usize = 32 * 1024;
+
+/// Threadgroup memory (bytes) of one grouped threadgroup: per head the stock
+/// `pk + nsg·(sh + 2·pv)` halves, times `group`.
+pub fn flash_attn_vec_hybrid_batched_gqa_shmem_bytes(
+    head_dim: u32,
+    group: u32,
+    nsg_max: u32,
+) -> usize {
+    let pk = pad2(head_dim as usize, 128);
+    let pv = pad2(head_dim as usize, 128);
+    let sh = 4 * 32;
+    group as usize * (pk + nsg_max as usize * (sh + 2 * pv)) * 2
+}
+
+/// Whether `group` query heads per threadgroup is legal: an instantiated
+/// size, dividing `num_heads / num_kv_heads`, and fitting 32 KiB of
+/// threadgroup memory at `nsg_max`.
+pub fn flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    group: u32,
+    nsg_max: u32,
+) -> bool {
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return false;
+    }
+    let heads_per_kv = num_heads / num_kv_heads;
+    FLASH_ATTN_VEC_HYBRID_GQA_GROUPS.contains(&group)
+        && heads_per_kv % group == 0
+        && flash_attn_vec_hybrid_batched_gqa_shmem_bytes(head_dim, group, nsg_max)
+            <= FLASH_ATTN_VEC_HYBRID_GQA_MAX_SHMEM_BYTES
+}
+
+/// The largest legal group size (see
+/// [`flash_attn_vec_hybrid_batched_gqa_group_is_legal`]); 1 when no larger
+/// size is legal.
+pub fn flash_attn_vec_hybrid_batched_gqa_pick_group(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    nsg_max: u32,
+) -> u32 {
+    FLASH_ATTN_VEC_HYBRID_GQA_GROUPS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&g| {
+            flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                g,
+                nsg_max,
+            )
+        })
+        .unwrap_or(1)
+}
+
+/// GPU-side per-slot bucket (`FlashAttnHybridSlotBucket` in the shader).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HybridSlotBucketGpu {
+    nwg: u32,
+    nsg: u32,
+    part_off: u32,
+    sm_off: u32,
+}
+
+/// One stock reduce dispatch: a maximal run of consecutive slots sharing an
+/// NWG > 1, laid out exactly as a stock dispatch over those rows.
+struct HybridReduceRun {
+    slot0: usize,
+    slots: usize,
+    nwg: u32,
+    tmp_off_floats: usize,
+    tmp_floats: usize,
+}
+
+/// Slots per grouped dispatch: the bucket array travels as inline bytes
+/// (Metal caps `setBytes` at 4 KiB).
+const GQA_MAX_SLOTS: usize = 4096 / std::mem::size_of::<HybridSlotBucketGpu>();
+
+fn plan_gqa_layout(
+    num_heads: u32,
+    head_dim: u32,
+    buckets: &[HybridSlotBucket],
+) -> Result<(Vec<HybridSlotBucketGpu>, Vec<HybridReduceRun>, usize)> {
+    let rows = num_heads as usize;
+    let dv = head_dim as usize;
+    let mut gpu = Vec::with_capacity(buckets.len());
+    let mut runs = Vec::new();
+    let mut off = 0usize;
+    let to_u32 = |v: usize| {
+        u32::try_from(v).map_err(|_| {
+            MlxError::InvalidArgument(format!(
+                "flash_attn_vec_hybrid_batched_gqa: tmp offset {v} exceeds u32"
+            ))
+        })
+    };
+    let mut s = 0usize;
+    while s < buckets.len() {
+        let nwg = buckets[s].nwg;
+        let mut e = s + 1;
+        while e < buckets.len() && buckets[e].nwg == nwg {
+            e += 1;
+        }
+        if nwg == 1 {
+            // Written straight to the output, as the stock NWG == 1 dispatch.
+            for b in &buckets[s..e] {
+                gpu.push(HybridSlotBucketGpu { nwg: 1, nsg: b.nsg, part_off: 0, sm_off: 0 });
+            }
+        } else {
+            // float4 partials: keep every run base 16-byte aligned.
+            off = pad2(off, 4);
+            let w = nwg as usize;
+            let slots = e - s;
+            let part_floats = slots * rows * dv * w;
+            let sm_floats = slots * rows * 2 * w;
+            for (k, b) in buckets[s..e].iter().enumerate() {
+                gpu.push(HybridSlotBucketGpu {
+                    nwg,
+                    nsg: b.nsg,
+                    part_off: to_u32(off + k * rows * dv * w)?,
+                    sm_off: to_u32(off + part_floats + k * rows * 2 * w)?,
+                });
+            }
+            runs.push(HybridReduceRun {
+                slot0: s,
+                slots,
+                nwg,
+                tmp_off_floats: off,
+                tmp_floats: part_floats + sm_floats,
+            });
+            off += part_floats + sm_floats;
+            to_u32(off)?;
+        }
+        s = e;
+    }
+    Ok((gpu, runs, off))
+}
+
+/// Bytes of `tmp` [`flash_attn_vec_hybrid_batched_gqa`] writes for these
+/// per-slot buckets. With one shared bucket this equals the stock batched
+/// layout (`n_q · heads · nwg · (head_dim + 2)` floats); it never exceeds
+/// `n_q · tmp_buffer_bytes(heads, head_dim)` for NWG values that are
+/// multiples of 2.
+pub fn flash_attn_vec_hybrid_batched_gqa_tmp_bytes(
+    num_heads: u32,
+    head_dim: u32,
+    buckets: &[HybridSlotBucket],
+) -> Result<usize> {
+    let (_, _, floats) = plan_gqa_layout(num_heads, head_dim, buckets)?;
+    Ok(floats * std::mem::size_of::<f32>())
+}
+
+/// ADR-063 lever A (A1 + A2) — batched multi-sequence decode flash with
+/// GQA-grouped query heads and per-slot (nwg, nsg) buckets. Class A against
+/// [`flash_attn_vec_hybrid_batched`] run per slot at that slot's bucket:
+/// every output row (and every partial/S/M value) is bitwise that solo
+/// dispatch's.
+///
+/// * `group` query heads sharing one KV head run in one threadgroup; each
+///   K row and packed V row + norm is loaded and decoded once for them.
+///   Must satisfy [`flash_attn_vec_hybrid_batched_gqa_group_is_legal`] at the
+///   largest bucket NSG ([`flash_attn_vec_hybrid_batched_gqa_pick_group`]
+///   returns the largest legal one). `group == 1` is the ungrouped A2 path.
+/// * `buckets[i]` is slot row i's bucket (normally
+///   [`HybridSlotBucket::for_kv_seq_len`] of its own effective KV length);
+///   `n_q = buckets.len()`. Slots may straddle buckets: no per-slot fallback
+///   is needed.
+/// * `q`, `k_f16`, `v_packed`, `v_norms`, `output`, `slot_id_arr`,
+///   `seq_pos_arr` and `params` are exactly as for
+///   [`flash_attn_vec_hybrid_batched`]. The kernel derives every slot's KV
+///   length and ring start from `seq_pos_arr` and `params.mask_type`; it
+///   does not read `params.kv_seq_len`, `params.ring_start` or `params.nsg`
+///   (they are still validated as for the stock call).
+/// * `tmp` must hold [`flash_attn_vec_hybrid_batched_gqa_tmp_bytes`]. Each
+///   maximal run of consecutive slots sharing an NWG > 1 occupies the stock
+///   batched layout for its rows, and is reduced by one stock
+///   `flash_attn_vec_reduce_dk{256,512}` dispatch at `32·nwg` width. With
+///   one shared bucket the main dispatch writes the stock batched `tmp`
+///   layout byte for byte and issues the stock single reduce.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_hybrid_batched_gqa(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    group: u32,
+    buckets: &[HybridSlotBucket],
+) -> Result<()> {
+    validate_params(params)?;
+    if k_f16.dtype() != crate::DType::F16 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: k_f16 must be DType::F16, got {:?}",
+            k_f16.dtype()
+        )));
+    }
+    if buckets.is_empty() || buckets.len() > GQA_MAX_SLOTS {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: need 1..={GQA_MAX_SLOTS} slot buckets, got {}",
+            buckets.len()
+        )));
+    }
+    for (i, b) in buckets.iter().enumerate() {
+        if !(1..=32).contains(&b.nwg) || !matches!(b.nsg, 1 | 2 | 4) {
+            return Err(MlxError::InvalidArgument(format!(
+                "flash_attn_vec_hybrid_batched_gqa: slot {i} bucket {b:?} outside nwg 1..=32, nsg {{1,2,4}}"
+            )));
+        }
+    }
+    let n_q = buckets.len() as u32;
+    let nwg_max = buckets.iter().map(|b| b.nwg).max().unwrap_or(1);
+    let nsg_max = buckets.iter().map(|b| b.nsg).max().unwrap_or(1);
+    let head_dim = params.head_dim;
+    if !flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+        params.num_heads,
+        params.num_kv_heads,
+        head_dim,
+        group,
+        nsg_max,
+    ) {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: group {group} illegal for heads {}/{} head_dim {head_dim} nsg_max {nsg_max}",
+            params.num_heads, params.num_kv_heads
+        )));
+    }
+    if output.dtype() != crate::DType::F32 || tmp.dtype() != crate::DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: output/tmp must be F32, got {:?}/{:?}",
+            output.dtype(),
+            tmp.dtype()
+        )));
+    }
+    let out_bytes = n_q as usize * params.num_heads as usize * head_dim as usize * 4;
+    if output.data_byte_len() < out_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: output holds {} bytes, need {out_bytes}",
+            output.data_byte_len()
+        )));
+    }
+    let (gpu_buckets, runs, tmp_floats) = plan_gqa_layout(params.num_heads, head_dim, buckets)?;
+    if tmp.data_byte_len() < tmp_floats * 4 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: tmp holds {} bytes, need {}",
+            tmp.data_byte_len(),
+            tmp_floats * 4
+        )));
+    }
+
+    let gpu_params = FlashAttnVecHybridParamsGpu {
+        n_heads: params.num_heads,
+        n_kv_heads: params.num_kv_heads,
+        head_dim: params.head_dim,
+        kv_seq_len: params.kv_seq_len,
+        kv_capacity: params.kv_capacity,
+        scale: params.scale,
+        mask_type: params.mask_type,
+        sliding_window: params.sliding_window,
+        softcap: params.softcap,
+        nwg: nwg_max,
+        ring_start: params.ring_start,
+        scale_factor_d512: params.scale_factor_d512,
+        codebook_bits: params.codebook_bits,
+        fuse_fwht_pre: params.fuse_fwht_pre,
+        nsg: nsg_max,
+        n_queries: n_q,
+    };
+
+    let kernel_name = match (group, head_dim) {
+        (1, 256) => "flash_attn_vec_hybrid_batched_gqa1_dk256",
+        (2, 256) => "flash_attn_vec_hybrid_batched_gqa2_dk256",
+        (4, 256) => "flash_attn_vec_hybrid_batched_gqa4_dk256",
+        (8, 256) => "flash_attn_vec_hybrid_batched_gqa8_dk256",
+        (1, 512) => "flash_attn_vec_hybrid_batched_gqa1_dk512",
+        (2, 512) => "flash_attn_vec_hybrid_batched_gqa2_dk512",
+        (4, 512) => "flash_attn_vec_hybrid_batched_gqa4_dk512",
+        (8, 512) => "flash_attn_vec_hybrid_batched_gqa8_dk512",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "flash_attn_vec_hybrid_batched_gqa: unsupported group {group} / head_dim {head_dim}"
+            )))
+        }
+    };
+    let cbits_const = (params.codebook_bits as i32, 50usize);
+    let v_is_f16: i32 = match v_packed.dtype() {
+        crate::DType::F16 => 1,
+        _ => 0,
+    };
+    let pipeline = registry.get_pipeline_with_constants(
+        kernel_name,
+        device.metal_device(),
+        &[],
+        &[(cbits_const.1, cbits_const.0), (51usize, v_is_f16)],
+    )?;
+
+    let shmem_bytes = flash_attn_vec_hybrid_batched_gqa_shmem_bytes(head_dim, group, nsg_max);
+
+    encoder.set_op_kind(CapturedOpKind::Sdpa);
+
+    let threadgroups = MTLSize::new(
+        n_q as u64,
+        (params.num_heads / group) as u64,
+        nwg_max as u64,
+    );
+    let threadgroup_size = MTLSize::new(32, nsg_max as u64, 1);
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(q)),
+            (2, KernelArg::Buffer(k_f16)),
+            (3, KernelArg::Buffer(v_packed)),
+            (4, KernelArg::Buffer(v_norms)),
+            (5, KernelArg::Buffer(tmp)),
+            (6, KernelArg::Buffer(slot_id_arr)),
+            (7, KernelArg::Buffer(seq_pos_arr)),
+            (8, KernelArg::Bytes(bytemuck::cast_slice(&gpu_buckets))),
+            (9, KernelArg::Buffer(output)),
+        ],
+        &[(0, shmem_bytes as u64)],
+        threadgroups,
+        threadgroup_size,
+    );
+
+    if runs.is_empty() {
+        return Ok(());
+    }
+    encoder.memory_barrier();
+    let reduce_kernel = match head_dim {
+        256 => "flash_attn_vec_reduce_dk256",
+        512 => "flash_attn_vec_reduce_dk512",
+        _ => unreachable!(),
+    };
+    let row_floats = params.num_heads as usize * head_dim as usize;
+    for run in &runs {
+        let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
+        let nrows = run.slots as u32 * params.num_heads;
+        let reduce_params = FlashAttnVecReduceParamsGpu { nrows };
+        let tmp_view = tmp.slice_view((run.tmp_off_floats * 4) as u64, run.tmp_floats);
+        let out_view = output.slice_view(
+            (run.slot0 * row_floats * 4) as u64,
+            run.slots * row_floats,
+        );
+        let nwg = run.nwg;
+        encoder.encode_threadgroups_with_args(
+            reduce_pipeline,
+            &[
+                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+                (1, KernelArg::Buffer(&tmp_view)),
+                (2, KernelArg::Buffer(&out_view)),
+                (3, KernelArg::Bytes(as_bytes(&nwg))),
+            ],
+            MTLSize::new(nrows as u64, 1, 1),
+            MTLSize::new(32 * nwg as u64, 1, 1),
+        );
+    }
+
+    Ok(())
+}
+
 fn pad2(x: usize, n: usize) -> usize {
     (x + n - 1) & !(n - 1)
 }
