@@ -65,9 +65,14 @@ fn digest(values: &[f32]) -> String {
 /// The precise pipelines are function-constant specializations, so either
 /// switch selects the runtime-source path.
 fn runtime_path() -> bool {
-    ["MLX_PRECOMPILED_METALLIB", "MLX_PRECOMPILED_METALLIB_FCV"].iter().any(|name| {
-        matches!(std::env::var(name).as_deref(), Ok("0") | Ok("false") | Ok("off"))
-    })
+    ["MLX_PRECOMPILED_METALLIB", "MLX_PRECOMPILED_METALLIB_FCV"]
+        .iter()
+        .any(|name| {
+            matches!(
+                std::env::var(name).as_deref(),
+                Ok("0") | Ok("false") | Ok("off")
+            )
+        })
 }
 
 /// P1, P1′, P2, P3, C+, C−, N1, N2, N3 at one shape.
