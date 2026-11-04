@@ -17,7 +17,7 @@ use mlx_native::ops::{
     flash_attn_vec_tq, fused_residual_norm, gated_delta_net_decode, gather_bench, hadamard,
     hadamard_quantize_kv, im2col_2d_3ch, ssm_conv, vision_2d_rope,
 };
-use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice};
+use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice, MlxError};
 use sha2::{Digest, Sha256};
 
 const NO_BOOLS: &[(usize, bool)] = &[];
@@ -333,16 +333,26 @@ fn registration_fallbacks_build_from_runtime_source() {
     // 54 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
     assert_eq!(unique.len(), 58);
     assert_eq!(cases.len(), 58);
+    let mut tensor_unavailable = Vec::new();
     for (name, source, bools, ints) in cases {
         let pipeline = if bools.is_empty() && ints.is_empty() {
             registry.get_pipeline(&name, device.metal_device())
         } else {
             registry.get_pipeline_with_constants(&name, device.metal_device(), bools, ints)
         };
-        let label = pipeline
-            .unwrap_or_else(|error| panic!("{name}: {error}"))
-            .label()
-            .to_owned();
+        let label = match pipeline {
+            Ok(pipeline) => pipeline.label().to_owned(),
+            // The source resolved, but this SDK lacks the optional tensor
+            // API (same exception as test_all_shaders_compile.rs).
+            Err(MlxError::ShaderCompilationError { message, .. })
+                if source.contains("#include <metal_tensor>")
+                    && message.contains("'metal_tensor' file not found") =>
+            {
+                tensor_unavailable.push(name);
+                continue;
+            }
+            Err(error) => panic!("{name}: {error}"),
+        };
         let identity = registry.pipeline_identity(&label).expect("identity");
         assert_eq!(
             identity.origin,
@@ -356,5 +366,17 @@ fn registration_fallbacks_build_from_runtime_source() {
             "{name}"
         );
         assert!(identity.embedded_metallib_sha256.is_none(), "{name}");
+    }
+    // A toolchain that linked the tensor artifact must compile every case.
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    assert!(
+        tensor_unavailable.is_empty(),
+        "tensor artifact present but runtime compile refused: {tensor_unavailable:?}"
+    );
+    if !tensor_unavailable.is_empty() {
+        eprintln!(
+            "optional <metal_tensor> capability unavailable; source resolved but not compiled for: {}",
+            tensor_unavailable.join(", ")
+        );
     }
 }
