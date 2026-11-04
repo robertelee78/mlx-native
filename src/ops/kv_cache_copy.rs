@@ -27,6 +27,7 @@ pub fn register(registry: &mut KernelRegistry) {
         "kv_cache_linearize_ring_bytes",
         KV_CACHE_COPY_SHADER_SOURCE,
     );
+    registry.register_source("kv_cache_restore_ring_bytes", KV_CACHE_COPY_SHADER_SOURCE);
 }
 
 /// Dispatch a GPU copy from a source bf16 buffer into a KV cache buffer.
@@ -1018,6 +1019,89 @@ pub fn dispatch_kv_cache_linearize_ring_bytes(
             (5, KernelArg::Bytes(&history_len_bytes)),
             (6, KernelArg::Bytes(&logical_end_bytes)),
             (7, KernelArg::Bytes(&row_bytes_bytes)),
+        ],
+        MTLSize::new(row_bytes as u64, n_heads as u64, history_len as u64),
+        MTLSize::new(std::cmp::min(256, row_bytes as u64), 1, 1),
+    );
+    Ok(())
+}
+
+/// Write staging rows back into a head-major ring: the inverse of
+/// [`dispatch_kv_cache_linearize_ring_bytes`] over a tail of the staging rows.
+///
+/// For `i < history_len` and every head `h` it writes
+/// `dst[h, (logical_end - history_len + i) mod dst_capacity] =
+/// src[h, src_row_offset + i]`; every other `dst` byte is untouched. `src` is
+/// the staging (pre-image) buffer with `src_capacity` rows per head, `dst` the
+/// ring with `dst_capacity` slots per head. Both are checked against the
+/// view's `data_byte_len`, so a per-slot view never writes past its slot.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_cache_restore_ring_bytes(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    src: &MlxBuffer,
+    dst: &MlxBuffer,
+    n_heads: u32,
+    src_capacity: u32,
+    dst_capacity: u32,
+    src_row_offset: u32,
+    history_len: u32,
+    logical_end: u32,
+    row_bytes: u32,
+) -> Result<()> {
+    if n_heads == 0 || history_len == 0 || row_bytes == 0 {
+        return Ok(());
+    }
+    if src_capacity == 0 || dst_capacity == 0 {
+        return Err(MlxError::InvalidArgument(
+            "kv_cache_restore_ring_bytes: capacities must be > 0".into(),
+        ));
+    }
+    if src_row_offset as u64 + history_len as u64 > src_capacity as u64
+        || history_len > dst_capacity
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_restore_ring_bytes: src_row_offset ({src_row_offset}) + history_len ({history_len}) exceeds source capacity ({src_capacity}), or history_len exceeds destination capacity ({dst_capacity})"
+        )));
+    }
+    if logical_end < history_len {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_restore_ring_bytes: logical_end ({logical_end}) < history_len ({history_len})"
+        )));
+    }
+    let src_required = n_heads as u64 * src_capacity as u64 * row_bytes as u64;
+    let dst_required = n_heads as u64 * dst_capacity as u64 * row_bytes as u64;
+    if (src.data_byte_len() as u64) < src_required || (dst.data_byte_len() as u64) < dst_required
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "kv_cache_restore_ring_bytes: views too small (src {} < {src_required} or dst {} < {dst_required})",
+            src.data_byte_len(),
+            dst.data_byte_len()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_restore_ring_bytes", device)?;
+    let n_heads_bytes = n_heads.to_ne_bytes();
+    let src_capacity_bytes = src_capacity.to_ne_bytes();
+    let dst_capacity_bytes = dst_capacity.to_ne_bytes();
+    let src_row_offset_bytes = src_row_offset.to_ne_bytes();
+    let history_len_bytes = history_len.to_ne_bytes();
+    let logical_end_bytes = logical_end.to_ne_bytes();
+    let row_bytes_bytes = row_bytes.to_ne_bytes();
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(src)),
+            (1, KernelArg::Buffer(dst)),
+            (2, KernelArg::Bytes(&n_heads_bytes)),
+            (3, KernelArg::Bytes(&src_capacity_bytes)),
+            (4, KernelArg::Bytes(&dst_capacity_bytes)),
+            (5, KernelArg::Bytes(&src_row_offset_bytes)),
+            (6, KernelArg::Bytes(&history_len_bytes)),
+            (7, KernelArg::Bytes(&logical_end_bytes)),
+            (8, KernelArg::Bytes(&row_bytes_bytes)),
         ],
         MTLSize::new(row_bytes as u64, n_heads as u64, history_len as u64),
         MTLSize::new(std::cmp::min(256, row_bytes as u64), 1, 1),

@@ -454,3 +454,32 @@ kernel void kv_cache_linearize_ring_bytes(
     const uint dst_idx = (head * dst_capacity + history_idx) * row_bytes + byte_idx;
     dst[dst_idx] = src[src_idx];
 }
+
+/// Inverse of `kv_cache_linearize_ring_bytes` over a tail of the staging
+/// buffer: writes staging rows `[src_row_offset, src_row_offset + history_len)`
+/// back into the ring slots of logical positions
+/// `[logical_end - history_len, logical_end)`. Every other ring byte is left
+/// untouched.
+kernel void kv_cache_restore_ring_bytes(
+    device const uint8_t* src             [[buffer(0)]],
+    device       uint8_t* dst             [[buffer(1)]],
+    constant uint&        n_heads         [[buffer(2)]],
+    constant uint&        src_capacity    [[buffer(3)]],
+    constant uint&        dst_capacity    [[buffer(4)]],
+    constant uint&        src_row_offset  [[buffer(5)]],
+    constant uint&        history_len     [[buffer(6)]],
+    constant uint&        logical_end     [[buffer(7)]],
+    constant uint&        row_bytes       [[buffer(8)]],
+    uint3 tid [[thread_position_in_grid]])
+{
+    const uint byte_idx = tid.x;
+    const uint head = tid.y;
+    const uint history_idx = tid.z;
+    if (byte_idx >= row_bytes || head >= n_heads || history_idx >= history_len) return;
+
+    const uint logical_pos = logical_end - history_len + history_idx;
+    const uint dst_slot = logical_pos % dst_capacity;
+    const uint src_idx = (head * src_capacity + src_row_offset + history_idx) * row_bytes + byte_idx;
+    const uint dst_idx = (head * dst_capacity + dst_slot) * row_bytes + byte_idx;
+    dst[dst_idx] = src[src_idx];
+}
