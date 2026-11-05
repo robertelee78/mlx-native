@@ -84,8 +84,7 @@ struct GgmlMatmulIdMm_MmParams {
     int32_t  ne1;    // batch (always == ne21 * ne20 in our layout)
     int16_t  r2;     // 1
     int16_t  r3;     // 1
-    int16_t  sched_flags; // compact kernels only: bit 0 = N tile fastest,
-                          // bit 1 = half-tile skip (P2c)
+    int16_t  sched_flags; // compact kernels only: bit 0 = half-tile skip (P2c)
     int16_t  _pad1;
 };
 
@@ -902,11 +901,12 @@ kernel void hf2q_mul_mm_id_map0c_impl<8>(
 // (token, slot) output rows (determined by hids[im * ne21 + r1 + j]).
 //
 // COMPACT (ADR-063 P2, `_c` host names): the grid is `max_tiles` tile
-// slots × ⌈N/64⌉ N tiles (bit 0 of `sched_flags` puts the N tile on grid x)
-// over the map0c schedule. Word 0 of htpe holds tile_count or POISON; each
+// slots (grid x, fastest) × ⌈N/64⌉ N tiles (grid y) over the map0c
+// schedule; ADR-063 M0c measured this order faster than N tile fastest at
+// the served shapes. Word 0 of htpe holds tile_count or POISON; each
 // live tile loads its (expert, first entry, valid rows) descriptor and runs
 // the tile body below unchanged, with `hids[im*ne21 + r1 + j]` replaced by
-// `hids[first_entry + j]`. Bit 1 enables the half-tile skip (P2c): when a
+// `hids[first_entry + j]`. Bit 0 enables the half-tile skip (P2c): when a
 // tile holds at most 16 rows, simdgroups 2-3 — which own rows 16-31 — skip
 // their MMA and shared-memory store; all four simdgroups still stage the
 // tiles and copy rows out.
@@ -943,9 +943,8 @@ kernel void hf2q_mul_mm_id_impl(
     short nr1;
     if (COMPACT) {
         const uint32_t schedule_state = tpe_u32[0];
-        const bool n_fastest = (args.sched_flags & 1) != 0;
-        const uint32_t tile  = n_fastest ? tgpig.y : tgpig.x;
-        const uint32_t ntile = n_fastest ? tgpig.x : tgpig.y;
+        const uint32_t tile  = tgpig.x;
+        const uint32_t ntile = tgpig.y;
         if ((schedule_state & 0x80000000u) != 0u) {
             // Same poison contract as the uniform grid: one threadgroup
             // fills the logical output with NaN and nobody forms a weight
@@ -999,7 +998,7 @@ kernel void hf2q_mul_mm_id_impl(
     }
     // P2c: simdgroups 2-3 own tile rows 16-31, which hold no routed row.
     const bool upper_half_idle =
-        COMPACT && (args.sched_flags & 2) != 0 && nr1 <= 16 && sgitg >= 2;
+        COMPACT && (args.sched_flags & 1) != 0 && nr1 <= 16 && sgitg >= 2;
 
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
 

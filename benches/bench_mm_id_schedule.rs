@@ -23,9 +23,10 @@
 //!   recorded agent table (`--recorded PATH`, same JSONL format, rows
 //!   grouped by invocation and layer and used as recorded).
 //! * `m0c` — the same shapes and tables, `UniformGrid` against
-//!   `CompactTiles` in both grid orders (tile fastest, N tile fastest), each
-//!   with the half-tile skip off and on (`Forced`: on regardless of whether
-//!   it shipped on that path), for gate/up and slotted down; `map0` against
+//!   `CompactTiles` (tile-fastest grid, the only order shipped since M0c
+//!   measured it faster than N tile fastest) with the half-tile skip off
+//!   and on (`Forced`: on regardless of whether it shipped on that path),
+//!   for gate/up and slotted down; `map0` against
 //!   `map0c` alone; and ± schedule reuse, timed as one command buffer of
 //!   gate/up followed by down with its own `map0` or with the reusing call.
 //!
@@ -61,7 +62,7 @@ use mlx_native::ops::moe_dispatch::moe_swiglu_seq_encode;
 use mlx_native::ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_map0_for_test, dispatch_id_mm_pooled_with_options_for_test,
     dispatch_id_mm_with_prepared_schedule_for_test, tensor_half_tile_skip_validated,
-    CompactGridOrder, GgmlIdMmDispatchParams, HalfTileSkip, IdMmScheduleOptions,
+    GgmlIdMmDispatchParams, HalfTileSkip, IdMmScheduleOptions,
 };
 use mlx_native::{
     ggml_routing_policy_from_environment, quantized_matmul_id_ggml_pooled_slotted_with_policy,
@@ -960,20 +961,14 @@ fn m0c_variants() -> Vec<(String, IdMmScheduleOptions)> {
         "uniform_grid".to_string(),
         IdMmScheduleOptions::production(ExpertMmSchedule::UniformGrid),
     )];
-    for grid_order in [
-        CompactGridOrder::TileFastest,
-        CompactGridOrder::NTileFastest,
-    ] {
-        for half_tile_skip in [HalfTileSkip::Disabled, HalfTileSkip::Forced] {
-            variants.push((
-                format!("compact_{grid_order:?}_skip_{half_tile_skip:?}"),
-                IdMmScheduleOptions {
-                    schedule: ExpertMmSchedule::CompactTiles,
-                    grid_order,
-                    half_tile_skip,
-                },
-            ));
-        }
+    for half_tile_skip in [HalfTileSkip::Disabled, HalfTileSkip::Forced] {
+        variants.push((
+            format!("compact_skip_{half_tile_skip:?}"),
+            IdMmScheduleOptions {
+                schedule: ExpertMmSchedule::CompactTiles,
+                half_tile_skip,
+            },
+        ));
     }
     variants
 }

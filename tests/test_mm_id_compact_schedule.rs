@@ -47,8 +47,7 @@
 
 use mlx_native::ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_map0_for_test, dispatch_id_mm_pooled_with_options_for_test,
-    tensor_half_tile_skip_validated, CompactGridOrder, GgmlIdMmDispatchParams, HalfTileSkip,
-    IdMmScheduleOptions,
+    tensor_half_tile_skip_validated, GgmlIdMmDispatchParams, HalfTileSkip, IdMmScheduleOptions,
 };
 use mlx_native::{
     ggml_expert_bytes, quantized_matmul_id_ggml_pooled_pair_with_policy,
@@ -1327,81 +1326,75 @@ fn n5_half_tile_skip_against_the_32_row_body() {
         let weight = weights(&gpu.device, shape, ggml_type, scales);
         for path in gpu.paths(ggml_type) {
             let routing_policy = policy(path, ExpertMmSchedule::CompactTiles);
-            for grid_order in [
-                CompactGridOrder::TileFastest,
-                CompactGridOrder::NTileFastest,
-            ] {
-                for (slot, half_tile_skip) in [
-                    HalfTileSkip::Disabled,
-                    HalfTileSkip::Forced,
-                    HalfTileSkip::Production,
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    poison(&mut outputs[slot], 50 + slot as u32);
-                    let options = IdMmScheduleOptions {
-                        schedule: ExpertMmSchedule::CompactTiles,
-                        grid_order,
-                        half_tile_skip,
-                    };
-                    let mut scratch = IdMmScratch::alloc(&gpu.device, shape.n_experts, n_tokens)
-                        .expect("scratch");
-                    let out = &outputs[slot];
-                    gpu.run(|encoder, registry, device| {
-                        dispatch_id_mm_pooled_with_options_for_test(
-                            encoder,
-                            registry,
-                            device,
-                            &input,
-                            &weight,
-                            &ids,
-                            out,
-                            &mut scratch,
-                            &params(ggml_type, shape, n_tokens, 1),
-                            false,
-                            false,
-                            &routing_policy,
-                            options,
-                        )
-                        .expect("N5 dispatch");
-                    });
+            for (slot, half_tile_skip) in [
+                HalfTileSkip::Disabled,
+                HalfTileSkip::Forced,
+                HalfTileSkip::Production,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                poison(&mut outputs[slot], 50 + slot as u32);
+                let options = IdMmScheduleOptions {
+                    schedule: ExpertMmSchedule::CompactTiles,
+                    half_tile_skip,
+                };
+                let mut scratch =
+                    IdMmScratch::alloc(&gpu.device, shape.n_experts, n_tokens).expect("scratch");
+                let out = &outputs[slot];
+                gpu.run(|encoder, registry, device| {
+                    dispatch_id_mm_pooled_with_options_for_test(
+                        encoder,
+                        registry,
+                        device,
+                        &input,
+                        &weight,
+                        &ids,
+                        out,
+                        &mut scratch,
+                        &params(ggml_type, shape, n_tokens, 1),
+                        false,
+                        false,
+                        &routing_policy,
+                        options,
+                    )
+                    .expect("N5 dispatch");
+                });
+            }
+            let label = format!("N5 {ggml_type:?} {path:?}");
+            // Production ships only bitwise variants.
+            assert_bitwise(
+                &format!("{label} production vs 32-row body"),
+                &outputs[0],
+                &outputs[2],
+                elements,
+            );
+            let row = shape.n as usize * 4;
+            let disabled = bytes(&outputs[0], elements);
+            let forced = bytes(&outputs[1], elements);
+            let mut partial_ok = true;
+            for (token, &nr1) in token_tile_rows.iter().enumerate() {
+                let same = disabled[token * row..(token + 1) * row]
+                    == forced[token * row..(token + 1) * row];
+                if nr1 > 16 {
+                    assert!(same, "{label}: full-tile row {token} (nr1={nr1}) changed under the half-tile skip");
+                } else if !same {
+                    partial_ok = false;
                 }
-                let label = format!("N5 {ggml_type:?} {path:?} {grid_order:?}");
-                // Production ships only bitwise variants.
-                assert_bitwise(
-                    &format!("{label} production vs 32-row body"),
-                    &outputs[0],
-                    &outputs[2],
-                    elements,
+            }
+            record.push(format!(
+                "{label}: partial tiles {}",
+                if partial_ok {
+                    "bitwise"
+                } else {
+                    "DIFFER (falsified)"
+                }
+            ));
+            if path == Path::Simdgroup {
+                assert!(
+                    partial_ok,
+                    "{label}: simdgroup half-tile skip must be bitwise by construction"
                 );
-                let row = shape.n as usize * 4;
-                let disabled = bytes(&outputs[0], elements);
-                let forced = bytes(&outputs[1], elements);
-                let mut partial_ok = true;
-                for (token, &nr1) in token_tile_rows.iter().enumerate() {
-                    let same = disabled[token * row..(token + 1) * row]
-                        == forced[token * row..(token + 1) * row];
-                    if nr1 > 16 {
-                        assert!(same, "{label}: full-tile row {token} (nr1={nr1}) changed under the half-tile skip");
-                    } else if !same {
-                        partial_ok = false;
-                    }
-                }
-                record.push(format!(
-                    "{label}: partial tiles {}",
-                    if partial_ok {
-                        "bitwise"
-                    } else {
-                        "DIFFER (falsified)"
-                    }
-                ));
-                if path == Path::Simdgroup {
-                    assert!(
-                        partial_ok,
-                        "{label}: simdgroup half-tile skip must be bitwise by construction"
-                    );
-                }
             }
         }
     }
@@ -1826,13 +1819,14 @@ fn n9_scratch_constructors_serve_every_entry_point() {
 }
 
 // ---------------------------------------------------------------------------
-// P2c / grid-order coverage of the production default
+// P2c coverage of the production default
 // ---------------------------------------------------------------------------
 
-/// Both grid orders and every half-tile setting agree with the uniform
-/// grid on served-like routing (complements N5's constructed tiles).
+/// Every half-tile setting of the compact (tile-fastest) launch agrees with
+/// the uniform grid on served-like routing (complements N5's constructed
+/// tiles).
 #[test]
-fn compact_grid_orders_equal_uniform_grid() {
+fn compact_half_tile_settings_equal_uniform_grid() {
     let mut gpu = Gpu::new();
     let shape = GEMMA_DOWN;
     for (ggml_type, scales) in [TYPES[1], TYPES[2]] {
@@ -1867,43 +1861,37 @@ fn compact_grid_orders_equal_uniform_grid() {
                         .expect("grid");
                     });
                 }
-                for grid_order in [
-                    CompactGridOrder::TileFastest,
-                    CompactGridOrder::NTileFastest,
-                ] {
-                    for half_tile_skip in [HalfTileSkip::Disabled, HalfTileSkip::Production] {
-                        poison(&mut compact, 71);
-                        let out = &compact;
-                        let options = IdMmScheduleOptions {
-                            schedule: ExpertMmSchedule::CompactTiles,
-                            grid_order,
-                            half_tile_skip,
-                        };
-                        gpu.run(|encoder, registry, device| {
-                            dispatch_id_mm_pooled_with_options_for_test(
-                                encoder,
-                                registry,
-                                device,
-                                &input,
-                                &weight,
-                                &ids,
-                                out,
-                                &mut scratch,
-                                &params(ggml_type, shape, n_tokens, 8),
-                                true,
-                                false,
-                                &grid_policy,
-                                options,
-                            )
-                            .expect("compact");
-                        });
-                        assert_bitwise(
-                            &format!("{ggml_type:?} {path:?} n={n_tokens} {grid_order:?} {half_tile_skip:?}"),
-                            &grid,
-                            &compact,
-                            elements,
-                        );
-                    }
+                for half_tile_skip in [HalfTileSkip::Disabled, HalfTileSkip::Production] {
+                    poison(&mut compact, 71);
+                    let out = &compact;
+                    let options = IdMmScheduleOptions {
+                        schedule: ExpertMmSchedule::CompactTiles,
+                        half_tile_skip,
+                    };
+                    gpu.run(|encoder, registry, device| {
+                        dispatch_id_mm_pooled_with_options_for_test(
+                            encoder,
+                            registry,
+                            device,
+                            &input,
+                            &weight,
+                            &ids,
+                            out,
+                            &mut scratch,
+                            &params(ggml_type, shape, n_tokens, 8),
+                            true,
+                            false,
+                            &grid_policy,
+                            options,
+                        )
+                        .expect("compact");
+                    });
+                    assert_bitwise(
+                        &format!("{ggml_type:?} {path:?} n={n_tokens} {half_tile_skip:?}"),
+                        &grid,
+                        &compact,
+                        elements,
+                    );
                 }
             }
         }
