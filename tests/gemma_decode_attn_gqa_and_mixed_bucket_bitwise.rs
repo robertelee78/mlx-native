@@ -74,6 +74,18 @@ const SLIDING_LINEAR: Shape = Shape {
     window: 512,
 };
 
+/// d256 with 8 query heads per KV head (16 q / 2 KV), ring of 1024: makes
+/// the d256 G = 4 and G = 8 kernels compare instead of only being refused.
+const SLIDING_GQA8: Shape = Shape {
+    name: "d256-gqa8-ring",
+    dk: 256,
+    nh: 16,
+    nkv: 2,
+    cap: 1024,
+    mask_type: 2,
+    window: 1024,
+};
+
 struct Xor(u64);
 
 impl Xor {
@@ -806,6 +818,16 @@ fn check_all_groups(ctx: &mut Ctx, base: &Cell, kv: &Kv) {
     }
 }
 
+/// `check_all_groups`, asserting every group in `required` is legal (and so
+/// compared bitwise) for `base`.
+fn check_all_groups_requiring(ctx: &mut Ctx, base: &Cell, kv: &Kv, required: &[u32]) {
+    let legal = legal_groups(&base.shape, nsg_max_of(base));
+    for g in required {
+        assert!(legal.contains(g), "{}: G={g} not legal ({legal:?})", base.label());
+    }
+    check_all_groups(ctx, base, kv);
+}
+
 fn assert_illegal(ctx: &mut Ctx, cell: &Cell, kv: &Kv) {
     let inputs = Inputs::new(&ctx.device, cell);
     let shape = &cell.shape;
@@ -1019,6 +1041,73 @@ fn sliding_linear_mask_type3_bitwise() {
         0xF003,
     );
     check_all_groups(&mut ctx, &cell, &kv);
+}
+
+#[test]
+fn d256_eight_heads_per_kv_head_groups_4_and_8_bitwise() {
+    let mut ctx = Ctx::new();
+    let kv = make_kv(&ctx.device, &SLIDING_GQA8, false, 0x5117_6A08);
+    for (k, &sp) in [0u32, 31, 511, 512, 1023, 1024, 2047, 4096].iter().enumerate() {
+        let base = Cell::new(SLIDING_GQA8, uniform_slots(sp, 4), 1, 0x6A00 + k as u64);
+        check_all_groups_requiring(&mut ctx, &base, &kv, &[1, 2, 4, 8]);
+    }
+    let base = Cell::new(
+        SLIDING_GQA8,
+        vec![(4, 99), (0, 700), (9, 5000), (15, 19), (2, 511), (11, 512)],
+        1,
+        0x6A10,
+    );
+    check_all_groups_requiring(&mut ctx, &base, &kv, &[1, 2, 4, 8]);
+}
+
+#[test]
+fn d512_variants_with_nsg_max_1_groups_4_and_8_bitwise() {
+    let mut ctx = Ctx::new();
+    let kv = make_kv(&ctx.device, &GLOBAL, false, 0xCB51_2001);
+    let kv16 = make_kv(&ctx.device, &GLOBAL, true, 0xF165_1201);
+    // Every slot at KV <= 1024: nsg 1 everywhere.
+    let slots = vec![(1, 40), (8, 777), (3, 1023), (10, 300)];
+    let req = [1, 2, 4, 8];
+    let check = |ctx: &mut Ctx, cell: &Cell, kv: &Kv| {
+        assert_eq!(nsg_max_of(cell), 1, "{}", cell.label());
+        check_all_groups_requiring(ctx, cell, kv, &req);
+    };
+    for cbits in [5, 6] {
+        let mut cell = Cell::new(GLOBAL, slots.clone(), 1, 0xE500 + cbits as u64);
+        cell.cbits = cbits;
+        check(&mut ctx, &cell, &kv);
+    }
+    let cell = Cell::new(GLOBAL, slots.clone(), 1, 0xE600);
+    check(&mut ctx, &cell, &kv16);
+    let mut cell = Cell::new(GLOBAL, slots.clone(), 1, 0xE700);
+    cell.fuse_fwht = true;
+    check(&mut ctx, &cell, &kv);
+    let mut cell = Cell::new(GLOBAL, slots.clone(), 1, 0xE800);
+    cell.scale = 0.0625;
+    check(&mut ctx, &cell, &kv);
+    for (k, sf) in [3.0f32, 16.0, 0.7071068].into_iter().enumerate() {
+        let mut cell = Cell::new(GLOBAL, slots.clone(), 1, 0xE900 + k as u64);
+        cell.sf_d512 = sf;
+        check(&mut ctx, &cell, &kv);
+    }
+}
+
+#[test]
+fn d512_explicit_nsg_2_group_4_cross_simd_merge_bitwise() {
+    let mut ctx = Ctx::new();
+    let kv = make_kv(&ctx.device, &GLOBAL, false, 0x610B_0E02);
+    let b = |nwg, nsg| HybridSlotBucket { nwg, nsg };
+    let mut cell = Cell::new(
+        GLOBAL,
+        vec![(5, 99), (1, 600), (12, 1500), (3, 3000), (7, 40)],
+        1,
+        0xC104,
+    );
+    cell.buckets = Some(vec![b(1, 2), b(8, 2), b(32, 2), b(3, 2), b(16, 2)]);
+    check_all_groups_requiring(&mut ctx, &cell, &kv, &[1, 2, 4]);
+    let mut cell = Cell::new(GLOBAL, vec![(2, 4095), (9, 1024), (6, 0)], 1, 0xC105);
+    cell.buckets = Some(vec![b(32, 2), b(16, 1), b(1, 2)]);
+    check_all_groups_requiring(&mut ctx, &cell, &kv, &[1, 2, 4]);
 }
 
 #[test]
