@@ -22,7 +22,7 @@ concurrency:
 jobs:
   publish:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
@@ -65,7 +65,18 @@ jobs:
           cargo +1.96.0 audit
 
       - name: Test exact source
-        run: cargo +1.96.0 test --locked --all-features -- --test-threads=1
+        # tests/test_mm_id_compact_schedule.rs runs in release on the packed
+        # archive below, as in ci.yml's rust-metal-mm-id job.
+        run: >-
+          cargo +1.96.0 test --locked --all-features -- --test-threads=1
+          --skip compact_grid_orders_equal_uniform_grid
+          --skip n1_slotted_equals_flattened_and_n7_row_independence
+          --skip n2_compact_equals_uniform_grid_on_every_entry_point
+          --skip n3_invalid_metadata_
+          --skip n4_schedule_reuse_is_keyed_and_bitwise
+          --skip n5_half_tile_skip_against_the_32_row_body
+          --skip n6_capacity_bound_and_schedule_contents
+          --skip n9_scratch_constructors_serve_every_entry_point
 
       - name: Package exact source
         shell: bash
@@ -87,7 +98,29 @@ jobs:
           tar -xzf "$crate" -C "$unpacked"
           cargo +1.96.0 test --locked --all-features \
             --manifest-path "$unpacked/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
-            -- --test-threads=1
+            -- --test-threads=1 \
+            --skip compact_grid_orders_equal_uniform_grid \
+            --skip n1_slotted_equals_flattened_and_n7_row_independence \
+            --skip n2_compact_equals_uniform_grid_on_every_entry_point \
+            --skip n3_invalid_metadata_ \
+            --skip n4_schedule_reuse_is_keyed_and_bitwise \
+            --skip n5_half_tile_skip_against_the_32_row_body \
+            --skip n6_capacity_bound_and_schedule_contents \
+            --skip n9_scratch_constructors_serve_every_entry_point
+
+      - name: Compact mm_id schedule parity on packed archive (simdgroup path)
+        # Too heavy for a debug build on the hosted paravirtual GPU, and that
+        # device lacks the tensor mm_id path: the suite runs its simdgroup
+        # matrix and prints a RECORDED SKIP for the tensor half (ci.yml
+        # rust-metal-mm-id).
+        env:
+          MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.96.0 test --release --locked \
+            --manifest-path "$RUNNER_TEMP/packed-crate/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
+            --test test_mm_id_compact_schedule -- --test-threads=1 --nocapture
 
       - name: Publish exact package
         env:
