@@ -932,6 +932,13 @@ fn n3_invalid_metadata_reads_no_weight_under_shader_validation() {
         stdout.contains("running 1 test") && stdout.contains("1 passed"),
         "shader-validation child ran no N3 test:\n{stdout}"
     );
+    // Positive control: the child really ran under GPU validation (Metal
+    // logs this banner when MTL_SHADER_VALIDATION takes effect).
+    assert!(
+        stderr.contains("Metal GPU Validation Enabled")
+            || stdout.contains("Metal GPU Validation Enabled"),
+        "shader validation did not engage in the N3 child:\n{stdout}\n{stderr}"
+    );
     let lowered = stderr.to_lowercase();
     for marker in [
         "invalid device load",
