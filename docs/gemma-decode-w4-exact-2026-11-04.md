@@ -78,9 +78,14 @@ present; otherwise the test prints `SKIPPED`. With `GEMMA_DECODE_V2_OVERLAP`
 naming a file that holds the hf2q `[ROUTING_OVERLAP]` line, it replays one
 pattern per observed (width, U).
 
-All passed on both paths at `f2d273b`. With `GEMMA_DECODE_RECEIPT_DIR` set,
-`gemma_decode_w4_exact` records an output digest per cell (T-N5); all 1,304
-recorded dense and F1 cells had identical digests on both paths.
+All passed on both paths at `46f3b44` (dense 7 + ignored T-N5 step, expert
+12, epilogue 3, attention 12; `--lib` 573). The dense fixture keeps outliers
+in two of eight columns only, so a 1-ULP lane drift is not absorbed by
+`simd_sum` in the other six. With `GEMMA_DECODE_RECEIPT_DIR` set,
+`gemma_decode_w4_exact` writes `dense-{precompiled,runtime}.jsonl` labelled
+with the pipeline origin read back from the registry (T-N5), and
+`tn5_cross_path_digest_diff` (ignored; run after both paths) diffs them:
+997 cells, no mismatch.
 
 ## M0 (pending)
 
