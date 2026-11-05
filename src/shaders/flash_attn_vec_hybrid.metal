@@ -1623,9 +1623,21 @@ kernel void flash_attn_vec_hybrid_batched_gqa_impl(
                         }
                     } else {
                         float v_norm_val = V_norms[vn_off_b + kv_head * kv_capacity + kv_pos];
+                        // Stock `v_norm * inv_sqrt_dv * w`. Here DV = 256, so
+                        // inv_sqrt_dv = 2^-4 and every association is equal in
+                        // the normal range; near FLT_MIN they are not. The
+                        // compiled stock kernel keeps `v_norm * w` normal and
+                        // scales last; written as a plain product, this kernel
+                        // was compiled to scale `w` first, flushed the
+                        // subnormal `w * 2^-4` and wrote 0 where stock wrote
+                        // ~1.4e-38 (warm S0-a, random-bit K). `ldexp` pins the
+                        // scale-last order; T-N8's underflow cells check it.
                         float v_sw[G];
                         HYB_GQA_UNROLL
-                        for (short g = 0; g < G; ++g) v_sw[g] = v_norm_val * inv_sqrt_dv * w[g];
+                        for (short g = 0; g < G; ++g) {
+                            v_sw[g] = (DV == 256) ? ldexp(v_norm_val * w[g], -4)
+                                                  : v_norm_val * inv_sqrt_dv * w[g];
+                        }
                         device const uint8_t *v_base =
                             V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV + tx * 4u;
 
