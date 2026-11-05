@@ -54,6 +54,12 @@ jobs:
           cargo +1.96.0 install cargo-audit --locked --version 0.22.2
           cargo +1.96.0 audit
       - name: Test
+        # The hosted runner's paravirtual device and SDK lack the tensor
+        # (<metal_tensor>) mm_id path: the compact-schedule suite runs its
+        # simdgroup matrix and prints a RECORDED SKIP for the tensor half.
+        # Local and self-hosted runs keep the strict default.
+        env:
+          MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
         run: cargo +1.96.0 test --locked -- --test-threads=1
       - name: Package
         shell: bash
