@@ -1060,25 +1060,42 @@ fn main() {
     .collect::<Vec<_>>();
     // Origins of the grouped pipelines the vec_gqa arm can issue.
     let mut gqa_identity = Vec::new();
+    // Grouped (A1) and batched-rows pipelines: origin plus the occupancy
+    // limits Metal reports after register allocation (a pipeline whose
+    // max threads per threadgroup drops below 32·NSG cannot launch, and a
+    // drop below 1024 signals register pressure).
+    let mut names = Vec::new();
     for dk in [256u32, 512] {
         for g in flash_attn_vec_hybrid::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
-            let name = format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}");
-            let label = reg
-                .get_pipeline_with_constants(
-                    &name,
-                    dev.metal_device(),
-                    &[],
-                    &[(50, CODEBOOK_BITS as i32), (51, 0)],
-                )
-                .unwrap()
-                .label()
-                .to_owned();
-            let id = reg.pipeline_identity(&label).unwrap();
-            gqa_identity.push(
-                serde_json::json!({"label": label, "origin": format!("{:?}", id.origin),
-                "embedded_metallib_sha256": id.embedded_metallib_sha256}),
-            );
+            names.push(format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}"));
         }
+        for (g, r) in flash_attn_vec_hybrid::FLASH_ATTN_VEC_HYBRID_ROWS_CONFIGS {
+            names.push(format!(
+                "flash_attn_vec_hybrid_batched_rows_g{g}_r{r}_dk{dk}"
+            ));
+        }
+    }
+    for name in names {
+        let pipeline = reg
+            .get_pipeline_with_constants(
+                &name,
+                dev.metal_device(),
+                &[],
+                &[(50, CODEBOOK_BITS as i32), (51, 0)],
+            )
+            .unwrap();
+        let label = pipeline.label().to_owned();
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let width = pipeline.thread_execution_width();
+        let static_tg = pipeline.static_threadgroup_memory_length();
+        let id = reg.pipeline_identity(&label).unwrap();
+        gqa_identity.push(
+            serde_json::json!({"label": label, "origin": format!("{:?}", id.origin),
+            "embedded_metallib_sha256": id.embedded_metallib_sha256,
+            "max_total_threads_per_threadgroup": max_threads,
+            "thread_execution_width": width,
+            "static_threadgroup_memory_length": static_tg}),
+        );
     }
     let exe = std::env::current_exe().unwrap();
     let os = std::process::Command::new("sw_vers")

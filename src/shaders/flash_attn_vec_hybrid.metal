@@ -1902,6 +1902,11 @@ kernel void flash_attn_vec_hybrid_batched_rows_impl(
                     }
                 }
             }
+        } else {
+            // Absent row (past n_q): a defined, never-used Q bank.
+            for (ushort i = tiisg; i < PK4; i += NW) {
+                sq4[i] = half4(0.0h);
+            }
         }
         threadgroup float4 *so4 = (threadgroup float4 *)(shmem + so_base + ((uint)m * NSG + (uint)sgitg) * 2 * PV) + tiisg;
         for (short i = 0; i < DV4 / NL; ++i) {

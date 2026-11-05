@@ -187,6 +187,7 @@ struct Cell {
     positions: Vec<u32>,
     kv_seq_len: u32,
     cbits: u32,
+    sf_d512: f32,
     q: Vec<f32>,
 }
 
@@ -212,7 +213,7 @@ impl Cell {
             },
             softcap: 0.0,
             ring_start: 0,
-            scale_factor_d512: 22.627417,
+            scale_factor_d512: self.sf_d512,
             codebook_bits: self.cbits,
             fuse_fwht_pre: 0,
             nsg: b.nsg,
@@ -230,6 +231,7 @@ fn sliding_cell(start: u32, rows: u32, cbits: u32, seed: u64) -> Cell {
         positions: (0..rows).map(|i| history + i).collect(),
         kv_seq_len: history + rows,
         cbits,
+        sf_d512: 22.627417,
         q: make_q(rows as usize, Layer::Sliding, seed),
     }
 }
@@ -243,6 +245,7 @@ fn global_cell(graft: u32, start: u32, rows: u32, cbits: u32, seed: u64) -> Cell
         positions: (0..rows).map(|i| base + i).collect(),
         kv_seq_len: base + rows,
         cbits,
+        sf_d512: 22.627417,
         q: make_q(rows as usize, Layer::Global, seed),
     }
 }
@@ -812,4 +815,44 @@ fn rows_kernel_refuses_mixed_slots_unordered_rows_and_ring_masks() {
         words(&out_base).iter().all(|&w| w == SENTINEL),
         "refused calls wrote O"
     );
+}
+
+/// T-N8's d512 underflow cell (`check_s0_underflow_cell`, S0_GLOBAL) in the
+/// warm form: global cache of 4096 + 512 rows built with S0-a's seeds, rows
+/// at positions 714..=904 (bucket (32, 1)), every legal (G, R) including
+/// R in {2, 4, 8}, at a non-power-of-two norm divisor (22.6) and at 3. The
+/// compiler re-associates per kernel, so the d512 `wr` pin is proven here.
+#[test]
+fn global_d512_underflow_cell_all_rows_configs_bitwise() {
+    let mut ctx = ctx();
+    let kv = make_kv(&ctx.device, Layer::Global, 4096 + 512, false, 0x506B);
+    for sf in [22.627417f32, 3.0] {
+        let mut cell = global_cell(0, 714, 191, 8, 0x606B);
+        cell.sf_d512 = sf;
+        cell.label += &format!(" sf={sf}");
+        assert_eq!(cell.bucket(), HybridSlotBucket { nwg: 32, nsg: 1 });
+        let rows_r: Vec<u32> = legal_variants(Layer::Global, 1)
+            .into_iter()
+            .filter_map(|v| match v {
+                Variant::Rows(_, r) if r > 1 => Some(r),
+                _ => None,
+            })
+            .collect();
+        for r in [2u32, 4, 8] {
+            assert!(rows_r.contains(&r), "{}: R={r} not legal", cell.label);
+        }
+        check(&mut ctx, &cell, &kv);
+        let stock = run(&mut ctx, &cell, &kv, Variant::Stock);
+        let tiny = stock.tmp[GUARD..stock.tmp.len() - GUARD]
+            .iter()
+            .map(|&w| f32::from_bits(w).abs())
+            .filter(|&x| x > 0.0 && x < 1e-37)
+            .count();
+        assert!(
+            tiny > 0,
+            "{}: underflow cell vacuous (no stock partial in (0, 1e-37))",
+            cell.label
+        );
+        eprintln!("GEMMA_WARM_ATTN_EXACT_UNDERFLOW_D512 sf={sf} tiny_stock_words={tiny}");
+    }
 }

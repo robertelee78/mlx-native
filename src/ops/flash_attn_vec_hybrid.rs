@@ -982,6 +982,12 @@ pub fn flash_attn_vec_hybrid_batched_rows(
         if slots[start..end].iter().any(|&s| s != slots[start]) {
             return Err(invalid(format!("row block {b} spans more than one slot")));
         }
+        if pos[start..end].iter().any(|&p| p >= params.kv_capacity) {
+            return Err(invalid(format!(
+                "row block {b}: seq_pos + 1 exceeds kv_capacity {} (linear storage)",
+                params.kv_capacity
+            )));
+        }
         if pos[start..end].windows(2).any(|w| w[1] <= w[0]) {
             return Err(invalid(format!(
                 "row block {b}: seq_pos not strictly increasing"
