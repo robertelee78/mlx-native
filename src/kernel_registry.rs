@@ -642,6 +642,27 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_q5_K_f32".into(), ggml_id_mm_src);
         // ADR-066 N-IQ2XXS — IQ2_XXS mm_id template instantiation.
         sources.insert("kernel_mul_mm_id_iq2_xxs_f32".into(), ggml_id_mm_src);
+        // ADR-063 P2 — compact tile schedule: map0c builder and the `_c`
+        // (compact-grid) instantiation of every mm_id type.
+        for name in [
+            "kernel_mul_mm_id_map0c_ne20_1",
+            "kernel_mul_mm_id_map0c_ne20_6",
+            "kernel_mul_mm_id_map0c_ne20_8",
+            "kernel_mul_mm_id_q4_0_f32_c",
+            "kernel_mul_mm_id_q5_0_f32_c",
+            "kernel_mul_mm_id_q8_0_f32_c",
+            "kernel_mul_mm_id_q2_K_f32_c",
+            "kernel_mul_mm_id_q3_K_f32_c",
+            "kernel_mul_mm_id_q4_K_f32_c",
+            "kernel_mul_mm_id_q5_K_f32_c",
+            "kernel_mul_mm_id_q6_K_f32_c",
+            "kernel_mul_mm_id_q5_1_f32_c",
+            "kernel_mul_mm_id_iq4_nl_f32_c",
+            "kernel_mul_mm_id_iq4_xs_f32_c",
+            "kernel_mul_mm_id_iq2_xxs_f32_c",
+        ] {
+            sources.insert(name.into(), ggml_id_mm_src);
+        }
 
         // ADR-033 §Pi Task #20 / ADR-034 §93 — fused MoE gate+up+silu_mul
         // mm_id kernel for Q6_K. Replaces 3 dispatches (gate_mm_id, up_mm_id,
@@ -714,6 +735,22 @@ impl KernelRegistry {
             "kernel_mul_mm_id_iq2_xxs_tensor_f32".into(),
             ggml_id_mm_tensor_src,
         );
+        for name in [
+            "kernel_mul_mm_id_q4_0_tensor_f32_c",
+            "kernel_mul_mm_id_q5_0_tensor_f32_c",
+            "kernel_mul_mm_id_q8_0_tensor_f32_c",
+            "kernel_mul_mm_id_q2_K_tensor_f32_c",
+            "kernel_mul_mm_id_q3_K_tensor_f32_c",
+            "kernel_mul_mm_id_q4_K_tensor_f32_c",
+            "kernel_mul_mm_id_q5_K_tensor_f32_c",
+            "kernel_mul_mm_id_q6_K_tensor_f32_c",
+            "kernel_mul_mm_id_q5_1_tensor_f32_c",
+            "kernel_mul_mm_id_iq4_nl_tensor_f32_c",
+            "kernel_mul_mm_id_iq4_xs_tensor_f32_c",
+            "kernel_mul_mm_id_iq2_xxs_tensor_f32_c",
+        ] {
+            sources.insert(name.into(), ggml_id_mm_tensor_src);
+        }
 
         // Embedding kernels (Story 1.5)
         let embedding_src: &'static str = include_str!("shaders/embedding.metal");

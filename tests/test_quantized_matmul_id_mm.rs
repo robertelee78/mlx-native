@@ -30,8 +30,8 @@ fn mm_id_capture_annotates_both_dispatches() {
         .alloc_buffer(32 * 34, DType::U8, vec![32 * 34])
         .unwrap();
     let ids = device.alloc_buffer(4, DType::U32, vec![1, 1]).unwrap();
-    let htpe = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
-    let hids = device.alloc_buffer(4, DType::U32, vec![1, 1]).unwrap();
+    let mut htpe = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+    let mut hids = device.alloc_buffer(4, DType::U32, vec![1, 1]).unwrap();
     let output = device
         .alloc_buffer(32 * 4, DType::F32, vec![1, 1, 32])
         .unwrap();
@@ -53,8 +53,8 @@ fn mm_id_capture_annotates_both_dispatches() {
         &input,
         &weight,
         &ids,
-        &htpe,
-        &hids,
+        &mut htpe,
+        &mut hids,
         &output,
         &params,
     )

@@ -83,7 +83,7 @@ pub use affine_capability::{
     PACKED_AFFINE_CAPABILITY_SCHEMA_VERSION,
 };
 pub use ggml_capability::{
-    ggml_batched_matrix_bytes, ggml_capability, ggml_expert_bytes,
+    ggml_batched_matrix_bytes, ggml_capability, ggml_expert_bytes, ExpertMmSchedule,
     ggml_matrix_bytes, ggml_packed_row_bytes, GgmlBatchedInputLayout,
     GgmlCapability, GgmlCapabilityRequest, GgmlExpertInputLayout,
     GgmlExpertShape, GgmlInvocation, GgmlKernelRoute, GgmlRejectionCode,
@@ -215,6 +215,8 @@ pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
     quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,
     quantized_matmul_id_ggml_pooled_slotted,
+    quantized_matmul_id_ggml_pooled_slotted_reusing_schedule,
+    quantized_matmul_id_ggml_pooled_slotted_reusing_schedule_with_policy,
     quantized_matmul_id_ggml_pooled_slotted_with_policy,
     quantized_matmul_id_ggml_pooled_with_policy, quantized_matmul_id_ggml_with_policy,
     quantized_matmul_id_ggml_mv_with_policy,

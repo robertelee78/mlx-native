@@ -184,6 +184,9 @@ fn bench_one(case: &ShapeCase, device: &MlxDevice, registry: &mut KernelRegistry
         ggml_type:     case.qtype,
     };
     let mut scratch = alloc_id_mm_scratch(device, &params);
+    // dispatch_id_mm_for_test writes the uniform-grid schedule into both
+    // buffers, so it takes them through the invalidating accessor.
+    let (htpe, hids) = scratch.buffers_mut();
 
     // Warmup: triggers kernel pipeline compile on first call.
     for _ in 0..WARMUP_ITERS {
@@ -191,7 +194,7 @@ fn bench_one(case: &ShapeCase, device: &MlxDevice, registry: &mut KernelRegistry
         dispatch_id_mm_for_test(
             &mut enc, registry, device,
             &input, &weight, &ids,
-            &mut scratch.htpe, &mut scratch.hids,
+            htpe, hids,
             &mut output, &params,
         ).expect("dispatch warmup");
         enc.commit_and_wait().expect("warmup commit");
@@ -205,7 +208,7 @@ fn bench_one(case: &ShapeCase, device: &MlxDevice, registry: &mut KernelRegistry
         dispatch_id_mm_for_test(
             &mut enc, registry, device,
             &input, &weight, &ids,
-            &mut scratch.htpe, &mut scratch.hids,
+            htpe, hids,
             &mut output, &params,
         ).expect("dispatch measure");
         enc.commit_and_wait().expect("measure commit");

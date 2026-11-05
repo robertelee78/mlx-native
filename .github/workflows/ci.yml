@@ -36,6 +36,24 @@ jobs:
       - name: Training shader compatibility
         run: cargo +1.96.0 test --locked --test test_flash_attn_train -- --test-threads=1
 
+  rust-metal-mm-id:
+    # The compact mm_id schedule parity matrix (tests/test_mm_id_compact_schedule.rs)
+    # is too heavy for a debug build on the hosted paravirtual GPU, so it runs
+    # here in release. That device and SDK lack the tensor (<metal_tensor>)
+    # mm_id path: the suite runs its simdgroup matrix and prints a RECORDED
+    # SKIP for the tensor half. Local and self-hosted runs keep the strict default.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Compact mm_id schedule parity (simdgroup path)
+        env:
+          MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
+        run: cargo +1.96.0 test --release --locked --test test_mm_id_compact_schedule -- --test-threads=1 --nocapture
   rust-metal:
     runs-on: macos-15
     timeout-minutes: 40
@@ -54,7 +72,17 @@ jobs:
           cargo +1.96.0 install cargo-audit --locked --version 0.22.2
           cargo +1.96.0 audit
       - name: Test
-        run: cargo +1.96.0 test --locked -- --test-threads=1
+        # tests/test_mm_id_compact_schedule.rs runs in rust-metal-mm-id.
+        run: >-
+          cargo +1.96.0 test --locked -- --test-threads=1
+          --skip compact_grid_orders_equal_uniform_grid
+          --skip n1_slotted_equals_flattened_and_n7_row_independence
+          --skip n2_compact_equals_uniform_grid_on_every_entry_point
+          --skip n3_invalid_metadata_
+          --skip n4_schedule_reuse_is_keyed_and_bitwise
+          --skip n5_half_tile_skip_against_the_32_row_body
+          --skip n6_capacity_bound_and_schedule_contents
+          --skip n9_scratch_constructors_serve_every_entry_point
       - name: Package
         shell: bash
         run: |

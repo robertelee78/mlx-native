@@ -1752,6 +1752,34 @@ impl<'a> GraphSession<'a> {
         )
     }
 
+    /// Slotted pooled `mm_id` that reuses the routing schedule a previous
+    /// `map0` in this session's encoder left in `scratch`. See
+    /// [`ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled_slotted_reusing_schedule`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+        &mut self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        ids: &MlxBuffer,
+        output: &MlxBuffer,
+        scratch: &mut ops::quantized_matmul_id_ggml::IdMmScratch,
+        params: &ops::quantized_matmul_id_ggml::GgmlQuantizedMatmulIdParams,
+    ) -> Result<()> {
+        ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+            &mut self.encoder,
+            registry,
+            device,
+            input,
+            weight,
+            ids,
+            output,
+            scratch,
+            params,
+        )
+    }
+
     /// Encode scaled dot-product attention into this session's encoder.
     ///
     /// Delegates to [`ops::sdpa::sdpa`].

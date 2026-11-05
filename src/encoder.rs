@@ -829,6 +829,9 @@ impl Drop for PooledCommandBuffer {
     }
 }
 
+/// Source of [`CommandEncoder::instance_id`] values.
+static NEXT_ENCODER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A batched compute command encoder.
 ///
 /// Keeps a single Metal `ComputeCommandEncoder` alive across multiple
@@ -937,6 +940,12 @@ pub struct CommandEncoder {
     /// as the per-dispatch `cb_label` field.  `String::new()` until
     /// `commit_and_wait_labeled` / `commit_labeled` is called.
     last_label: String,
+    /// Process-unique identity of this encoder object. Stable across
+    /// `commit*` and [`Self::commit_wait_and_rotate`] (which keep the
+    /// object and swap only its command buffer); a new encoder gets a new
+    /// value. Keys caller-owned state recorded against this encoder, such
+    /// as an `IdMmScratch` routing schedule.
+    instance_id: u64,
 }
 
 /// SAFETY: CommandEncoder is safe to Send across threads provided that:
@@ -1081,7 +1090,13 @@ impl CommandEncoder {
             pending_dispatch_meta: Vec::new(),
             dispatch_in_cb: 0,
             last_label: String::new(),
+            instance_id: NEXT_ENCODER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Process-unique identity of this encoder object; see the field docs.
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     /// Enable capture mode.

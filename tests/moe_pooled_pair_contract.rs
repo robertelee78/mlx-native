@@ -105,7 +105,7 @@ fn pooled_pair_rejects_overlapping_outputs_and_decode_sized_work() {
 
     let mut aliased_scratch =
         IdMmScratch::alloc(&device, N_EXPERTS, N_TOKENS).expect("aliased routing scratch");
-    aliased_scratch.htpe = ids.clone();
+    *aliased_scratch.htpe_mut() = ids.clone();
     let mut encoder = device
         .command_encoder()
         .expect("scratch/read-alias encoder");
@@ -130,7 +130,8 @@ fn pooled_pair_rejects_overlapping_outputs_and_decode_sized_work() {
 
     let mut overlapping_scratch =
         IdMmScratch::alloc(&device, N_EXPERTS, N_TOKENS).expect("overlapping routing scratch");
-    overlapping_scratch.htpe = overlapping_scratch.hids.clone();
+    let hids_alias = overlapping_scratch.hids().clone();
+    *overlapping_scratch.htpe_mut() = hids_alias;
     let mut encoder = device.command_encoder().expect("scratch-overlap encoder");
     match quantized_matmul_id_ggml_pooled_pair(
         &mut encoder,

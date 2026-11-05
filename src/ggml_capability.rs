@@ -17,7 +17,7 @@ use crate::ops::quantized_matmul_ggml::{dense_mn_dispatch_count, GgmlType, MM_RO
 use crate::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD;
 
 /// Schema version for serialized [`GgmlCapability`] receipts.
-pub const GGML_CAPABILITY_SCHEMA_VERSION: u32 = 2;
+pub const GGML_CAPABILITY_SCHEMA_VERSION: u32 = 3;
 
 /// Workload class for which the caller requires execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +105,9 @@ pub enum GgmlInvocation {
     },
     /// Two projections sharing one prepared expert routing schedule.
     ExpertPooledPair { shape: GgmlExpertShape },
+    /// Slotted pooled expert MM that consumes the routing schedule a
+    /// previous `map0` left in the caller's scratch (no `map0`, no barrier).
+    ExpertPooledSlottedReusingSchedule { shape: GgmlExpertShape },
     /// Q4_0-only fused SwiGLU plus expert-down matvec.
     ExpertSwiGluDownQ4 { shape: GgmlExpertShape },
     /// Direct block-quantized embedding gather.
@@ -127,6 +130,7 @@ impl GgmlInvocation {
             | Self::ExpertForceMv { shape }
             | Self::ExpertPooled { shape, .. }
             | Self::ExpertPooledPair { shape }
+            | Self::ExpertPooledSlottedReusingSchedule { shape }
             | Self::ExpertSwiGluDownQ4 { shape } => (shape.n_tokens, shape.n, shape.k),
             Self::EmbeddingGather {
                 n_tokens,
@@ -156,6 +160,10 @@ pub struct GgmlRoutingPolicy {
     pub expert_q6k_mv_nr2: bool,
     pub expert_q8_0_mv_nr2: bool,
     pub expert_tensor_mm: GgmlTensorMmPreference,
+    /// Tile schedule of the expert matrix-matrix (`mm_id`) route.
+    /// Absent in schema-2 receipts, which executed the uniform grid.
+    #[serde(default = "ExpertMmSchedule::schema2_default")]
+    pub expert_mm_schedule: ExpertMmSchedule,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +171,31 @@ pub struct GgmlRoutingPolicy {
 pub enum GgmlTensorMmPreference {
     AutoProbe,
     ForceSimd,
+}
+
+/// Launch schedule of the expert `mm_id` kernels.
+///
+/// Both schedules compute every output element with the same tile body,
+/// expert slab, N tile, K loop and staging precision, and give each expert
+/// the same 32-row tile membership, so their outputs are byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertMmSchedule {
+    /// `map0` writes per-expert counts and `[n_experts, n_tokens]` lists;
+    /// `mm_id` launches `n_experts × ⌈n_tokens/32⌉ × ⌈N/64⌉` threadgroups and
+    /// empty tiles exit. Diagnostic and A/B arm (`HF2Q_MM_ID_SCHEDULE=grid`).
+    UniformGrid,
+    /// `map0c` writes a compact list of routed-row tiles; `mm_id` launches
+    /// only `max_tiles(rows) × ⌈N/64⌉` threadgroups, where
+    /// `max_tiles(rows) = min(rows, ⌈rows/32⌉ + min(n_experts, rows) − 1)`.
+    CompactTiles,
+}
+
+impl ExpertMmSchedule {
+    /// The schedule every schema-2 receipt executed.
+    fn schema2_default() -> Self {
+        Self::UniformGrid
+    }
 }
 
 impl Default for GgmlRoutingPolicy {
@@ -179,6 +212,7 @@ impl Default for GgmlRoutingPolicy {
             expert_q6k_mv_nr2: true,
             expert_q8_0_mv_nr2: false,
             expert_tensor_mm: GgmlTensorMmPreference::AutoProbe,
+            expert_mm_schedule: ExpertMmSchedule::CompactTiles,
         }
     }
 }
@@ -1005,12 +1039,49 @@ enum ExpertEntrypoint {
     PooledShared,
     PooledPair,
     PooledSlotted,
+    PooledSlottedReusing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpertAutoPlan {
     Mv,
     Mm,
+}
+
+/// Upper bound on the compact schedule's tile count for `rows` routed rows
+/// over `n_experts` experts: every non-empty expert adds at most one partial
+/// tile beyond `⌈rows/32⌉`, and there are at most `min(n_experts, rows)`
+/// of them; no tile is empty, so the count never exceeds `rows`.
+pub(crate) fn compact_max_tiles(rows: u64, n_experts: u64) -> u64 {
+    if rows == 0 || n_experts == 0 {
+        return 0;
+    }
+    rows.min(rows.div_ceil(32) + n_experts.min(rows) - 1)
+}
+
+/// Exact `(htpe, hids)` byte requirement of one `mm_id` schedule.
+///
+/// Uniform grid: `n_experts` counts and `n_experts × n_tokens` list entries.
+/// Compact tiles: one tile-count word plus three words per tile, and a list
+/// of `rows + n_experts` entries (each expert's slice is padded by one).
+pub(crate) fn expert_mm_schedule_scratch_bytes(
+    schedule: ExpertMmSchedule,
+    n_experts: u32,
+    n_tokens: u32,
+    top_k: u32,
+) -> Option<(u64, u64)> {
+    let experts = u64::from(n_experts);
+    match schedule {
+        ExpertMmSchedule::UniformGrid => Some((
+            experts.checked_mul(4)?,
+            experts.checked_mul(u64::from(n_tokens))?.checked_mul(4)?,
+        )),
+        ExpertMmSchedule::CompactTiles => {
+            let rows = u64::from(n_tokens).checked_mul(u64::from(top_k))?;
+            let words = compact_max_tiles(rows, experts).checked_mul(3)?.checked_add(1)?;
+            Some((words.checked_mul(4)?, rows.checked_add(experts)?.checked_mul(4)?))
+        }
+    }
 }
 
 pub(crate) fn plan_expert_auto_route(
@@ -1040,10 +1111,12 @@ fn expert_mm_route(
         (ExpertEntrypoint::PooledShared, false) => GgmlKernelRoute::ExpertPooledMmSimdgroup,
         (ExpertEntrypoint::PooledPair, true) => GgmlKernelRoute::ExpertPooledPairMmDeviceSelected,
         (ExpertEntrypoint::PooledPair, false) => GgmlKernelRoute::ExpertPooledPairMmSimdgroup,
-        (ExpertEntrypoint::PooledSlotted, true) => {
+        (ExpertEntrypoint::PooledSlotted | ExpertEntrypoint::PooledSlottedReusing, true) => {
             GgmlKernelRoute::ExpertPooledSlottedMmDeviceSelected
         }
-        (ExpertEntrypoint::PooledSlotted, false) => GgmlKernelRoute::ExpertPooledSlottedMmSimdgroup,
+        (ExpertEntrypoint::PooledSlotted | ExpertEntrypoint::PooledSlottedReusing, false) => {
+            GgmlKernelRoute::ExpertPooledSlottedMmSimdgroup
+        }
         (ExpertEntrypoint::ForcedMv, _) => unreachable!("forced MV has no MM route"),
     };
     (route, tensor)
@@ -1098,7 +1171,9 @@ fn expert(
     ) == ExpertAutoPlan::Mm;
     let requires_mm = matches!(
         entrypoint,
-        ExpertEntrypoint::PooledPair | ExpertEntrypoint::PooledSlotted
+        ExpertEntrypoint::PooledPair
+            | ExpertEntrypoint::PooledSlotted
+            | ExpertEntrypoint::PooledSlottedReusing
     );
     if requires_mm && !mm_eligible {
         return GgmlCapability::unsupported(
@@ -1116,28 +1191,26 @@ fn expert(
     }
     if entrypoint != ExpertEntrypoint::ForcedMv && mm_eligible {
         let (route, tensor_probe) = expert_mm_route(request, entrypoint);
-        let Some(htpe_bytes) = u64::from(shape.n_experts).checked_mul(4) else {
+        let Some((htpe_bytes, hids_bytes)) = expert_mm_schedule_scratch_bytes(
+            request.routing.expert_mm_schedule,
+            shape.n_experts,
+            shape.n_tokens,
+            shape.top_k,
+        ) else {
             return GgmlCapability::unsupported(
                 request,
                 GgmlRejectionCode::ArithmeticOverflow,
-                "expert htpe scratch bytes overflow u64",
-            );
-        };
-        let Some(hids_bytes) = u64::from(shape.n_experts)
-            .checked_mul(u64::from(shape.n_tokens))
-            .and_then(|elements| elements.checked_mul(4))
-        else {
-            return GgmlCapability::unsupported(
-                request,
-                GgmlRejectionCode::ArithmeticOverflow,
-                "expert hids scratch bytes overflow u64",
+                "expert mm_id schedule scratch bytes overflow u64",
             );
         };
         let scratch = GgmlScratchRequirement::ExpertMm {
             htpe_bytes,
             hids_bytes,
             caller_owned: entrypoint != ExpertEntrypoint::AutoAllocated,
-            schedule_reused: entrypoint == ExpertEntrypoint::PooledPair,
+            schedule_reused: matches!(
+                entrypoint,
+                ExpertEntrypoint::PooledPair | ExpertEntrypoint::PooledSlottedReusing
+            ),
         };
         return GgmlCapability::supported(
             request,
@@ -1152,12 +1225,16 @@ fn expert(
             },
             buffer_bytes,
             scratch,
-            if entrypoint == ExpertEntrypoint::PooledPair {
-                3
-            } else {
-                2
+            match entrypoint {
+                ExpertEntrypoint::PooledPair => 3,
+                ExpertEntrypoint::PooledSlottedReusing => 1,
+                _ => 2,
             },
-            1,
+            if entrypoint == ExpertEntrypoint::PooledSlottedReusing {
+                0
+            } else {
+                1
+            },
             "expert mm_id route with explicit schedule/layout entry point",
         );
     }
@@ -1339,6 +1416,12 @@ pub fn ggml_capability(request: GgmlCapabilityRequest) -> GgmlCapability {
         GgmlInvocation::ExpertPooledPair { shape } => {
             expert(&request, ExpertEntrypoint::PooledPair, shape, matrix_bytes)
         }
+        GgmlInvocation::ExpertPooledSlottedReusingSchedule { shape } => expert(
+            &request,
+            ExpertEntrypoint::PooledSlottedReusing,
+            shape,
+            matrix_bytes,
+        ),
         GgmlInvocation::ExpertSwiGluDownQ4 { shape } => {
             expert_swiglu_down_q4(&request, shape, matrix_bytes)
         }
