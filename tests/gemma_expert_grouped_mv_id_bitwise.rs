@@ -11,6 +11,14 @@
 //! non-zero-offset views for every buffer and sentinel bytes outside the
 //! output view. The default routing policy must plan the stock routes.
 //!
+//! Design §2.4 witness rows: real Q1 routing selections (4 lanes per
+//! position) replayed as n_tokens = 4, 8 and 16, from the checked-in sample
+//! `tests/fixtures/gemma_routing_witness_sample.json` (always) and from the
+//! full witness when present (`GEMMA_DECODE_ROUTING_WITNESS` overrides its
+//! path; absent → an explicit SKIPPED line). V2 replay: set
+//! `GEMMA_DECODE_V2_OVERLAP` to a file holding the hf2q `[ROUTING_OVERLAP]`
+//! line to replay one pattern per observed (width, U).
+//!
 //! Run on both metallib paths:
 //! `MLX_PRECOMPILED_METALLIB=1 cargo test --release --test gemma_expert_grouped_mv_id_bitwise -- --test-threads=1`
 //! and the same with `MLX_PRECOMPILED_METALLIB=0`.
@@ -204,21 +212,38 @@ fn check_cell(
     digest: &mut u64,
 ) {
     let ids = make_ids(pattern, n_tokens, top_k, w.n_experts, seed);
-    let mut input = make_input(n_tokens, w.k, seed ^ 0x5eed);
-    if nan_row {
-        poison_row(&mut input, n_tokens / 2, w.k);
-    }
     let label = format!(
         "{:?} N={} K={} E={} tokens={n_tokens} top_k={top_k} {pattern:?} nan_row={nan_row}",
         w.ty, w.n, w.k, w.n_experts
     );
+    check_ids(h, w, n_tokens, top_k, &ids, routes, nan_row, seed, &label, digest);
+}
+
+/// Compares the stock route with each grouped route for explicit ids.
+fn check_ids(
+    h: &mut Harness,
+    w: &Weights,
+    n_tokens: usize,
+    top_k: usize,
+    ids: &[u32],
+    routes: &[Route],
+    nan_row: bool,
+    seed: u64,
+    label: &str,
+    digest: &mut u64,
+) {
     let pairs = n_tokens * top_k;
-    let stock = h.run(w, n_tokens, top_k, &ids, &input, Route::Stock);
-    assert_stock_frame(&stock, pairs, w.n, &label);
+    assert_eq!(ids.len(), pairs, "{label}: ids length");
+    let mut input = make_input(n_tokens, w.k, seed ^ 0x5eed);
+    if nan_row {
+        poison_row(&mut input, n_tokens / 2, w.k);
+    }
+    let stock = h.run(w, n_tokens, top_k, ids, &input, Route::Stock);
+    assert_stock_frame(&stock, pairs, w.n, label);
     fnv(digest, &stock);
     for &route in routes {
-        let got = h.run(w, n_tokens, top_k, &ids, &input, route);
-        assert_bitwise(&stock, &got, w.n, &ids, &format!("{label} {route:?}"));
+        let got = h.run(w, n_tokens, top_k, ids, &input, route);
+        assert_bitwise(&stock, &got, w.n, ids, &format!("{label} {route:?}"));
     }
 }
 
@@ -294,6 +319,338 @@ fn q5_0_down_grouped_is_bitwise_stock_up_to_128_pairs() {
 #[test]
 fn q8_0_down_grouped_is_bitwise_stock_up_to_128_pairs() {
     check_down_shape(GgmlType::Q8_0, 0xfedc_ba98_7654_3210);
+}
+
+// ---- T-N3: design §2.4 witness rows and the V2 replay ----
+//
+// A witness row is one (layer, position) of the Q1 routing witness: the four
+// lanes' top-8 selections become one n_tokens = 4 pattern (token = lane).
+// Two consecutive positions give n_tokens = 8 and four give 16. Gate_up
+// replays the token rows at top-8; down replays the same ids flattened to
+// 32/64/128 pairs at top-1, as the Gemma down call does.
+
+/// The Q1 routing witness (`GEMMA_DECODE_ROUTING_WITNESS` overrides).
+fn witness_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("GEMMA_DECODE_ROUTING_WITNESS") {
+        return path.into();
+    }
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join(
+        ".local/state/hf2q/campaigns/adr063-preflight-20261023/\
+         q1-gemma-routing1511-t0-on-actual-v1/output/routing-witness.jsonl",
+    )
+}
+
+const WITNESS_LANES: usize = 4;
+const WITNESS_LAYERS: u32 = 30;
+const WITNESS_POSITIONS: u32 = 144;
+
+/// Four consecutive positions of one layer; `rows[i]` is the 32 ids of
+/// position `start + i`, lane-major.
+struct WitnessGroup {
+    kind: String,
+    layer: u32,
+    start: u32,
+    rows: Vec<Vec<u32>>,
+}
+
+/// Every (layer, position) of the full witness, lanes concatenated in lane
+/// order. Panics on a malformed or incomplete file.
+fn load_witness(path: &std::path::Path) -> std::collections::HashMap<(u32, u32), Vec<u32>> {
+    let text = std::fs::read_to_string(path).expect("read routing witness");
+    let mut lanes = std::collections::HashMap::<(u32, u32), Vec<Option<Vec<u32>>>>::new();
+    for line in text.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("witness JSON line");
+        if record["kind"] != "routing_row" {
+            continue;
+        }
+        let at = &record["at"];
+        let key = (
+            at["layer"].as_u64().expect("layer") as u32,
+            at["row"]["position"].as_u64().expect("position") as u32,
+        );
+        let lane = at["row"]["lane"].as_u64().expect("lane") as usize;
+        let ids: Vec<u32> = record["selected_ids"]
+            .as_array()
+            .expect("selected_ids")
+            .iter()
+            .map(|id| id.as_u64().expect("id") as u32)
+            .collect();
+        let slot = &mut lanes.entry(key).or_insert_with(|| vec![None; WITNESS_LANES])[lane];
+        assert!(slot.is_none(), "duplicate witness row {key:?} lane {lane}");
+        *slot = Some(ids);
+    }
+    assert_eq!(
+        lanes.len(),
+        (WITNESS_LAYERS * WITNESS_POSITIONS) as usize,
+        "witness must hold 30 layers x 144 positions"
+    );
+    lanes
+        .into_iter()
+        .map(|(key, lanes)| {
+            let rows: Vec<u32> = lanes
+                .into_iter()
+                .enumerate()
+                .flat_map(|(lane, ids)| {
+                    ids.unwrap_or_else(|| panic!("witness row {key:?} lacks lane {lane}"))
+                })
+                .collect();
+            (key, rows)
+        })
+        .collect()
+}
+
+/// The checked-in sample (`tests/fixtures/gemma_routing_witness_extract.py`).
+fn load_fixture() -> Vec<WitnessGroup> {
+    let doc: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/gemma_routing_witness_sample.json"))
+            .expect("fixture JSON");
+    assert_eq!(doc["lanes"], WITNESS_LANES);
+    doc["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .map(|group| {
+            let positions = group["positions"].as_array().expect("positions");
+            WitnessGroup {
+                kind: group["kind"].as_str().expect("kind").to_string(),
+                layer: group["layer"].as_u64().expect("layer") as u32,
+                start: positions[0].as_u64().expect("position") as u32,
+                rows: group["ids"]
+                    .as_array()
+                    .expect("ids")
+                    .iter()
+                    .map(|lanes| {
+                        lanes
+                            .as_array()
+                            .expect("lanes")
+                            .iter()
+                            .flat_map(|ids| ids.as_array().expect("lane ids").iter())
+                            .map(|id| id.as_u64().expect("id") as u32)
+                            .collect()
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// Real routing: 8 distinct in-range experts per token.
+fn assert_real_routing(ids: &[u32], label: &str) {
+    for token in ids.chunks(8) {
+        let mut sorted = token.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert!(
+            token.len() == 8 && sorted.len() == 8 && sorted[7] < 128,
+            "{label}: not a top-8 selection of 128: {token:?}"
+        );
+    }
+}
+
+/// The n_tokens = 4, 8 and 16 cells of one group: (name, n_tokens, ids).
+fn witness_cells(group: &WitnessGroup) -> Vec<(String, usize, Vec<u32>)> {
+    assert_eq!(group.rows.len(), 4, "a witness group spans four positions");
+    let mut cells = Vec::new();
+    for (i, row) in group.rows.iter().enumerate() {
+        cells.push((format!("p{}", group.start + i as u32), 4, row.clone()));
+    }
+    for half in 0..2 {
+        let ids = [group.rows[2 * half].as_slice(), &group.rows[2 * half + 1]].concat();
+        cells.push((format!("p{}+1", group.start + 2 * half as u32), 8, ids));
+    }
+    cells.push((format!("p{}+3", group.start), 16, group.rows.concat()));
+    cells
+}
+
+/// Gemma expert shapes: (type, N, K, gate_up rows at top-8?, weight seed).
+const EXPERT_SHAPES: [(GgmlType, usize, usize, bool, u64); 3] = [
+    (GgmlType::Q4_K, 1408, 2816, true, 0x51f1_5eed_0000_0001),
+    (GgmlType::Q5_0, 2816, 704, false, 0x51f1_5eed_0000_0002),
+    (GgmlType::Q8_0, 2816, 704, false, 0x51f1_5eed_0000_0003),
+];
+
+/// Replays `(label, n_tokens, ids)` cells (top-8 token rows) through
+/// gate_up Q4_K and down Q5_0/Q8_0, stock against every grouped route.
+fn replay_top8_cells(source: &str, cells: &[(String, usize, Vec<u32>)]) {
+    let mut h = Harness::new();
+    for (ty, n, k, gate_up, seed) in EXPERT_SHAPES {
+        let w = make_weights(&h.device, ty, n, k, 128, seed);
+        let mut routes = if gate_up { q4k_routes() } else { vec![Route::Geometry(4)] };
+        routes.push(Route::Policy);
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for (index, (label, n_tokens, ids)) in cells.iter().enumerate() {
+            assert_real_routing(ids, label);
+            let (tokens, top_k) = if gate_up { (*n_tokens, 8) } else { (n_tokens * 8, 1) };
+            let label = format!("{source} {label} {ty:?} N={n} K={k} tokens={tokens} top_k={top_k}");
+            check_ids(
+                &mut h,
+                &w,
+                tokens,
+                top_k,
+                ids,
+                &routes,
+                false,
+                index as u64 * 7919 + 11,
+                &label,
+                &mut digest,
+            );
+        }
+        eprintln!("{source} {ty:?}: {} cells bitwise stock, digest {digest:#018x}", cells.len());
+    }
+}
+
+fn group_cells(groups: &[WitnessGroup]) -> Vec<(String, usize, Vec<u32>)> {
+    groups
+        .iter()
+        .flat_map(|group| {
+            witness_cells(group).into_iter().map(move |(name, n_tokens, ids)| {
+                (format!("{} L{} {name}", group.kind, group.layer), n_tokens, ids)
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn witness_fixture_rows_replay_bitwise_stock() {
+    let groups = load_fixture();
+    assert!(
+        groups.iter().any(|g| g.start >= 128) && groups.iter().any(|g| g.start < 128),
+        "the fixture samples rows 128-143 and 29-127"
+    );
+    let path = witness_path();
+    if path.exists() {
+        let witness = load_witness(&path);
+        for group in &groups {
+            for (i, row) in group.rows.iter().enumerate() {
+                let key = (group.layer, group.start + i as u32);
+                assert_eq!(&witness[&key], row, "fixture row {key:?} differs from {path:?}");
+            }
+        }
+        eprintln!("fixture rows match the source witness at {}", path.display());
+    } else {
+        eprintln!(
+            "NOTE: source witness absent at {}; fixture provenance not re-checked",
+            path.display()
+        );
+    }
+    replay_top8_cells("witness-fixture", &group_cells(&groups));
+}
+
+#[test]
+fn witness_file_rows_replay_bitwise_stock() {
+    let path = witness_path();
+    if !path.exists() {
+        eprintln!(
+            "SKIPPED witness_file_rows_replay_bitwise_stock: routing witness not found at {} \
+             (set GEMMA_DECODE_ROUTING_WITNESS); only the checked-in fixture replay ran",
+            path.display()
+        );
+        return;
+    }
+    let witness = load_witness(&path);
+    let group = |kind: &str, layer: u32, start: u32| WitnessGroup {
+        kind: kind.to_string(),
+        layer,
+        start,
+        rows: (start..start + 4).map(|p| witness[&(layer, p)].clone()).collect(),
+    };
+    let mut groups = Vec::new();
+    // Rows 128-143 (greedy continuation): every layer, every position.
+    for layer in 0..WITNESS_LAYERS {
+        for start in [128, 132, 136, 140] {
+            groups.push(group("decode", layer, start));
+        }
+    }
+    // Rows 29-127: every third layer, four spread groups.
+    for layer in (0..WITNESS_LAYERS).step_by(3) {
+        for start in [29, 61, 93, 124] {
+            groups.push(group("prefill", layer, start));
+        }
+    }
+    replay_top8_cells("witness-file", &group_cells(&groups));
+}
+
+/// Every top-8 `(width, U)` in hf2q `[ROUTING_OVERLAP]` lines (design §7.4),
+/// over all layers, from text that holds them (e.g. the worker's stderr).
+fn v2_width_u(text: &str) -> std::collections::BTreeSet<(usize, usize)> {
+    let reports: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once("[ROUTING_OVERLAP]").map(|(_, json)| json.trim()))
+        .collect();
+    assert!(!reports.is_empty(), "no [ROUTING_OVERLAP] line");
+    let mut cells = std::collections::BTreeSet::new();
+    for json in reports {
+        let report: serde_json::Value = serde_json::from_str(json).expect("[ROUTING_OVERLAP] JSON");
+        for entry in report["distinct_experts"].as_array().expect("distinct_experts") {
+            assert_eq!(entry["top_k"], 8, "Gemma routes top-8: {entry}");
+            let width = entry["width"].as_u64().expect("width") as usize;
+            for (u, count) in entry["u_hist"].as_object().expect("u_hist") {
+                if count.as_u64().expect("count") > 0 {
+                    cells.insert((width, u.parse().expect("U key")));
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// The V2 replay cells: one top-8 pattern with exactly U distinct experts per
+/// observed `(width, U)`. Widths beyond the E1 table (16) are reported and
+/// skipped because no grouped route exists there.
+fn v2_cells(text: &str) -> Vec<(String, usize, Vec<u32>)> {
+    let mut rng = Rng(0x0000_0000_5eed_00f2);
+    let mut cells = Vec::new();
+    for (width, u) in v2_width_u(text) {
+        if width > 16 {
+            eprintln!("V2 width {width} (U {u}) is outside the E1 table; not replayed");
+            continue;
+        }
+        let ids = pattern_with_u(width, u, &mut rng);
+        let mut distinct = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), u, "V2 pattern width {width} must hold exactly U = {u}");
+        cells.push((format!("v2 width={width} u={u}"), width, ids));
+    }
+    cells
+}
+
+#[test]
+fn v2_overlap_report_builds_patterns_with_each_observed_u() {
+    let log = concat!(
+        "hf2q worker exit\n",
+        "[ROUTING_OVERLAP] {\"steps\":9,\"mixed_bucket_share\":0.0,\"distinct_experts\":[",
+        "{\"layer\":0,\"width\":4,\"top_k\":8,\"u_hist\":{\"8\":3,\"21\":5,\"32\":1}},",
+        "{\"layer\":1,\"width\":4,\"top_k\":8,\"u_hist\":{\"21\":2,\"26\":0}},",
+        "{\"layer\":0,\"width\":1,\"top_k\":8,\"u_hist\":{\"8\":4}},",
+        "{\"layer\":0,\"width\":16,\"top_k\":8,\"u_hist\":{\"40\":2,\"128\":1}}],",
+        "\"sliding\":{},\"global\":{}}\n",
+    );
+    let expected: std::collections::BTreeSet<(usize, usize)> =
+        [(1, 8), (4, 8), (4, 21), (4, 32), (16, 40), (16, 128)].into();
+    assert_eq!(v2_width_u(log), expected);
+    let cells = v2_cells(log);
+    assert_eq!(cells.len(), expected.len());
+    for (label, n_tokens, ids) in &cells {
+        assert_eq!(ids.len(), n_tokens * 8, "{label}");
+        assert_real_routing(ids, label);
+    }
+}
+
+#[test]
+fn v2_overlap_patterns_replay_bitwise_stock() {
+    let Some(path) = std::env::var_os("GEMMA_DECODE_V2_OVERLAP") else {
+        eprintln!(
+            "SKIPPED v2_overlap_patterns_replay_bitwise_stock: GEMMA_DECODE_V2_OVERLAP is unset \
+             (name a file holding the hf2q [ROUTING_OVERLAP] line to replay each observed U)"
+        );
+        return;
+    };
+    let text = std::fs::read_to_string(&path).expect("read GEMMA_DECODE_V2_OVERLAP");
+    let cells = v2_cells(&text);
+    assert!(!cells.is_empty(), "no replayable V2 cells in {path:?}");
+    replay_top8_cells("v2", &cells);
 }
 
 // ---- T-N3 item 5: synthetic row tails and K tails ----

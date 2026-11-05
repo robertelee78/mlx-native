@@ -262,6 +262,40 @@ pub fn make_ids(pattern: Pattern, n_tokens: usize, top_k: usize, n_experts: usiz
     ids
 }
 
+/// Exactly `u` distinct experts over `n_tokens` top-8 tokens of 128 experts,
+/// distinct within each token (the bench's `pattern_with_u`, used for the V2
+/// replay). Panics when `u` is impossible (outside `8..=min(8·n, 128)`).
+pub fn pattern_with_u(n_tokens: usize, u: usize, rng: &mut Rng) -> Vec<u32> {
+    const TOP_K: usize = 8;
+    const N_EXPERTS: usize = 128;
+    assert!(
+        (TOP_K..=(TOP_K * n_tokens).min(N_EXPERTS)).contains(&u),
+        "U = {u} is impossible for {n_tokens} top-8 tokens of {N_EXPERTS} experts"
+    );
+    let mut pool: Vec<u32> = (0..N_EXPERTS as u32).collect();
+    for i in (1..pool.len()).rev() {
+        pool.swap(i, rng.below(i as u64 + 1) as usize);
+    }
+    pool.truncate(u);
+    // Deal the pool round-robin so every member is used, then top each token
+    // up with distinct pool members.
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); n_tokens];
+    for (i, &e) in pool.iter().enumerate() {
+        rows[i % n_tokens].push(e);
+    }
+    for row in &mut rows {
+        let mut j = 0;
+        while row.len() < TOP_K {
+            let e = pool[(rng.next() as usize).wrapping_add(j) % pool.len()];
+            if !row.contains(&e) {
+                row.push(e);
+            }
+            j += 1;
+        }
+    }
+    rows.concat()
+}
+
 pub fn guarded_f32(device: &MlxDevice, data: &[f32]) -> (MlxBuffer, MlxBuffer) {
     let total = GUARD + data.len() + GUARD;
     let mut parent = device
