@@ -13,9 +13,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MlxError, Result};
-use crate::ops::gemma_decode_dense::{
-    gemma_dense_dispatch_count, plan_gemma_dense_route, GemmaDenseRoute, RowTiledGeometry,
-};
 use crate::ops::quantized_matmul_ggml::{dense_mn_dispatch_count, GgmlType, MM_ROUTING_THRESHOLD};
 use crate::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD;
 
@@ -167,36 +164,6 @@ pub struct GgmlRoutingPolicy {
     /// Absent in schema-2 receipts, which executed the uniform grid.
     #[serde(default = "ExpertMmSchedule::schema2_default")]
     pub expert_mm_schedule: ExpertMmSchedule,
-    /// Q4-GEMMA-DECODE D1: exact row-tiled Q4_K multi-column route at
-    /// widths 2..=8, bitwise equal per column to `kernel_mul_mv_q4_K_f32`.
-    /// Per-lever fields are never resolved from the environment.
-    #[serde(default)]
-    pub dense_row_tiled_q4k: bool,
-    /// D1: exact row-tiled Q6_K multi-column route at widths 2..=8, bitwise
-    /// equal per column to `kernel_mul_mv_q6_K_f32_nr2`. Honoured only while
-    /// `dense_q6k_mv_nr2` holds.
-    #[serde(default)]
-    pub dense_row_tiled_q6k: bool,
-    /// D1: also route width 1 through the row-tiled kernels.
-    #[serde(default)]
-    pub dense_row_tiled_m1: bool,
-    /// D2: exact multi-column Q5_0 route at widths 2..=8.
-    #[serde(default)]
-    pub dense_mn_q5_0: bool,
-    /// D2: exact multi-column Q8_0 `nr2` route at widths 2..=8. Honoured only
-    /// while `dense_q8_0_mv_nr2` holds.
-    #[serde(default)]
-    pub dense_mn_q8_0: bool,
-    /// E1: expert-grouped Q4_K `mv_id` (leader pairs).
-    #[serde(default)]
-    pub expert_grouped_q4k: bool,
-    /// E1: expert-grouped Q5_0 `mv_id`.
-    #[serde(default)]
-    pub expert_grouped_q5_0: bool,
-    /// E1: expert-grouped Q8_0 `mv_id`. Honoured only while
-    /// `expert_q8_0_mv_nr2` is false.
-    #[serde(default)]
-    pub expert_grouped_q8_0: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,14 +213,6 @@ impl Default for GgmlRoutingPolicy {
             expert_q8_0_mv_nr2: false,
             expert_tensor_mm: GgmlTensorMmPreference::AutoProbe,
             expert_mm_schedule: ExpertMmSchedule::CompactTiles,
-            dense_row_tiled_q4k: false,
-            dense_row_tiled_q6k: false,
-            dense_row_tiled_m1: false,
-            dense_mn_q5_0: false,
-            dense_mn_q8_0: false,
-            expert_grouped_q4k: false,
-            expert_grouped_q5_0: false,
-            expert_grouped_q8_0: false,
         }
     }
 }
@@ -292,8 +251,6 @@ pub enum GgmlKernelRoute {
     DenseQ5kWidthMn,
     DenseQ6kWidthMn,
     DenseWidthMvExt,
-    DenseGemmaRowTiled,
-    DenseGemmaMn,
     DenseMmSimdgroup,
     DenseMmDeviceSelected,
     DenseBatchedMv,
@@ -304,9 +261,6 @@ pub enum GgmlKernelRoute {
     FusedGateUpSilu,
     ExpertMv,
     ExpertMvNr2,
-    /// Q4-GEMMA-DECODE E1 expert-grouped matvec (leader pairs), bitwise
-    /// equal per pair to `ExpertMv`.
-    ExpertMvGrouped,
     ExpertMmSimdgroup,
     ExpertMmDeviceSelected,
     ExpertPooledMmSimdgroup,
@@ -714,10 +668,6 @@ pub(crate) enum DenseAutoPlan {
     Q4kWidthMn,
     Q5kWidthMn,
     Q6kWidthMn,
-    /// Q4-GEMMA-DECODE D1 (Q4_K / Q6_K) at the frozen per-shape geometry.
-    GemmaRowTiled(RowTiledGeometry),
-    /// Q4-GEMMA-DECODE D2 (Q5_0 / Q8_0).
-    GemmaDenseMn,
     WidthMvExt,
     Mm,
 }
@@ -725,17 +675,9 @@ pub(crate) enum DenseAutoPlan {
 pub(crate) fn plan_dense_auto_route(
     ggml_type: GgmlType,
     m: u32,
-    n: u32,
     k: u32,
     routing: &GgmlRoutingPolicy,
 ) -> DenseAutoPlan {
-    match plan_gemma_dense_route(ggml_type, m, n, k, routing) {
-        Some(GemmaDenseRoute::RowTiled(geometry)) => return DenseAutoPlan::GemmaRowTiled(geometry),
-        Some(GemmaDenseRoute::MnQ5_0 | GemmaDenseRoute::MnQ8_0) => {
-            return DenseAutoPlan::GemmaDenseMn
-        }
-        None => {}
-    }
     if routing.dense_q5k_canonical_q4x4
         && ggml_type == GgmlType::Q5_K
         && (1..=MM_ROUTING_THRESHOLD).contains(&m)
@@ -778,7 +720,7 @@ pub(crate) fn plan_dense_auto_route(
 }
 
 fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
-    let (m, n, k) = request.invocation.dimensions();
+    let (m, _, k) = request.invocation.dimensions();
     if let Some(rejection) = dense_kernel_missing(request) {
         return rejection;
     }
@@ -813,33 +755,7 @@ fn dense_auto(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability {
             "native scalar GGUF dense projection route",
         );
     }
-    match plan_dense_auto_route(request.ggml_type, m, n, k, &request.routing) {
-        DenseAutoPlan::GemmaRowTiled(_) => GgmlCapability::supported(
-            request,
-            GgmlKernelRoute::DenseGemmaRowTiled,
-            request.workload == GgmlWorkloadClass::ContinuousWidth,
-            request.workload != GgmlWorkloadClass::ContinuousWidth,
-            false,
-            1,
-            bytes,
-            GgmlScratchRequirement::None,
-            gemma_dense_dispatch_count(m),
-            0,
-            "Q4-GEMMA-DECODE D1 row-tiled Q4_K/Q6_K matvec route (bitwise per column)",
-        ),
-        DenseAutoPlan::GemmaDenseMn => GgmlCapability::supported(
-            request,
-            GgmlKernelRoute::DenseGemmaMn,
-            request.workload == GgmlWorkloadClass::ContinuousWidth,
-            request.workload != GgmlWorkloadClass::ContinuousWidth,
-            false,
-            1,
-            bytes,
-            GgmlScratchRequirement::None,
-            gemma_dense_dispatch_count(m),
-            0,
-            "Q4-GEMMA-DECODE D2 multi-column Q5_0/Q8_0 matvec route (bitwise per column)",
-        ),
+    match plan_dense_auto_route(request.ggml_type, m, k, &request.routing) {
         DenseAutoPlan::Q5kCanonicalQ4x4 => GgmlCapability::supported(
             request,
             GgmlKernelRoute::DenseQ5kCanonicalQ4x4,
@@ -1106,19 +1022,7 @@ fn fused_gate_up(request: &GgmlCapabilityRequest, bytes: u64) -> GgmlCapability 
     )
 }
 
-fn expert_mv_route(request: &GgmlCapabilityRequest, shape: GgmlExpertShape) -> GgmlKernelRoute {
-    if plan_expert_grouped_mv(
-        request.ggml_type,
-        shape.n_tokens,
-        shape.top_k,
-        shape.n,
-        shape.k,
-        &request.routing,
-    )
-    .is_some()
-    {
-        return GgmlKernelRoute::ExpertMvGrouped;
-    }
+fn expert_mv_route(request: &GgmlCapabilityRequest) -> GgmlKernelRoute {
     if (request.ggml_type == GgmlType::Q6_K && request.routing.expert_q6k_mv_nr2)
         || (request.ggml_type == GgmlType::Q8_0 && request.routing.expert_q8_0_mv_nr2)
     {
@@ -1193,65 +1097,6 @@ pub(crate) fn plan_expert_auto_route(
     } else {
         ExpertAutoPlan::Mv
     }
-}
-
-/// Q4-GEMMA-DECODE E1 frozen per-shape geometry table: rows per SIMD group
-/// of the expert-grouped `mv_id` kernel for an admitted `(type, N, K)`.
-///
-/// Q4_K gate_up uses R0 = 2 (kernels exist for R0 in {1, 2, 4}); Q5_0 and
-/// Q8_0 down keep the stock 4 rows per SIMD group. Shapes outside the table
-/// keep the stock route. Benches override R0 through
-/// `quantized_matmul_id_ggml_mv_grouped_with_geometry`.
-pub const fn expert_grouped_mv_rows_per_simdgroup(
-    ggml_type: GgmlType,
-    n: u32,
-    k: u32,
-) -> Option<u32> {
-    match (ggml_type, n, k) {
-        (GgmlType::Q4_K, 1408, 2816) => Some(2),
-        (GgmlType::Q5_0 | GgmlType::Q8_0, 2816, 704) => Some(4),
-        _ => None,
-    }
-}
-
-/// Widths the expert-grouped `mv_id` route admits: up to 16 tokens at
-/// top-8 (gate_up) and up to 128 pairs at top-1 (down).
-pub const fn expert_grouped_mv_width_admitted(n_tokens: u32, top_k: u32) -> bool {
-    match top_k {
-        8 => n_tokens >= 1 && n_tokens <= 16,
-        1 => n_tokens >= 1 && n_tokens <= 128,
-        _ => false,
-    }
-}
-
-/// Rows per SIMD group of the expert-grouped `mv_id` route when `routing`
-/// selects it for this matvec, else `None` (the stock route).
-///
-/// The per-type field must be set, `dense_decode_mv_ext` must be off, Q8_0
-/// additionally requires `expert_q8_0_mv_nr2 = false` (its reference is the
-/// plain `kernel_mul_mv_id_q8_0_f32`), and the width and shape must be in the
-/// frozen tables.
-pub(crate) fn plan_expert_grouped_mv(
-    ggml_type: GgmlType,
-    n_tokens: u32,
-    top_k: u32,
-    n: u32,
-    k: u32,
-    routing: &GgmlRoutingPolicy,
-) -> Option<u32> {
-    if routing.dense_decode_mv_ext {
-        return None;
-    }
-    let enabled = match ggml_type {
-        GgmlType::Q4_K => routing.expert_grouped_q4k,
-        GgmlType::Q5_0 => routing.expert_grouped_q5_0,
-        GgmlType::Q8_0 => routing.expert_grouped_q8_0 && !routing.expert_q8_0_mv_nr2,
-        _ => false,
-    };
-    if !enabled || !expert_grouped_mv_width_admitted(n_tokens, top_k) {
-        return None;
-    }
-    expert_grouped_mv_rows_per_simdgroup(ggml_type, n, k)
 }
 
 fn expert_mm_route(
@@ -1403,7 +1248,7 @@ fn expert(
     let specialized = request.workload == GgmlWorkloadClass::DecodeSingle;
     GgmlCapability::supported(
         request,
-        expert_mv_route(request, shape),
+        expert_mv_route(request),
         specialized,
         !specialized,
         false,

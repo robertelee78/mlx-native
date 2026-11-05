@@ -65,7 +65,6 @@ pub mod fused_residual_norm;
 pub mod gather;
 pub mod gather_bench;
 pub mod gelu;
-pub mod gemma_decode_dense;
 pub mod gpu_sample;
 pub mod hadamard;
 pub mod hadamard_quantize_kv;

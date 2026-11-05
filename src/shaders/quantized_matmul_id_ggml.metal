@@ -1892,12 +1892,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_f32(
 }
 
 // ====================================================================
-// Expert-grouped mat-vec kernels (ADR-063 Q4-GEMMA-DECODE E1)
+// Expert-grouped Q4_K gate_up with the moe_swiglu_batch GELU epilogue
+// (ADR-063 Q4-GEMMA-DECODE F2)
 // ====================================================================
 //
-// Exact (bitwise) siblings of `kernel_mul_mv_id_q4_K_f32`,
-// `kernel_mul_mv_id_q8_0_f32` and `kernel_mul_mv_id_q5_0_f32`. The grid is
-// the stock one along Y (one threadgroup row per flat (token, slot) pair).
+// Exact (bitwise) fusion of `kernel_mul_mv_id_q4_K_f32` into `[pairs, n]`
+// followed by `moe_swiglu_batch`. The grid is the stock one along Y (one
+// threadgroup row per flat (token, slot) pair).
 //
 // Leader rule: pair p with expert e = ids[p] is a leader when e is valid and
 // no q < p has ids[q] == e. A non-leader returns uniformly after reading
@@ -1905,15 +1906,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_f32(
 // ids[q] == e) in column chunks of at most 4: the weight rows of e are read
 // once per K block for the whole chunk, and each member runs the stock
 // per-pair arithmetic on its own input row (token_idx = q / top_k) and writes
-// exactly the output row the stock kernel writes for q. Invalid ids take the
-// stock poison path for their own pair and never join a group.
+// exactly the output row the stock pipeline writes for q. Invalid ids take
+// the stock poison path for their own pair and never join a group.
 //
-// Per (row, member) expressions are literal clones of the stock kernels:
+// Per (row, member) expressions are literal clones of the stock kernel:
 // the same yl/yh/sumy operand forms, accumulator lanes, scale decode, sumf
-// expression and simd_sum. Only the loop nest is interleaved.
-//
-// Rows past ne01 (row tails) are never written: Q4_K skips them, Q5_0/Q8_0
-// read a clamped valid row, so no weight address leaves the expert slice.
+// expression and simd_sum. Only the loop nest is interleaved. Rows past the
+// gate/up tail are never written.
 
 // True when an earlier pair already owns `expert_id`; that leader writes
 // this pair's output.
@@ -1949,13 +1948,13 @@ inline int grouped_mv_id_next_members(
     return count;
 }
 
-// ---- Q4_K (gate_up): R0 rows per SIMD group, stock lane partition ----
+// ---- Q4_K per-row sums: stock lane partition ----
 //
-// Each SIMD group owns R0 consecutive rows and runs them one after another;
-// each row's K loop serves the whole member chunk. Interleaving the R0 rows
-// inside one K loop (sharing each column's yl/yh/sumy across rows) changes
-// Metal's default-math contraction and drifts 1 ULP from the stock kernel,
-// so rows are never interleaved; members (columns) are.
+// Rows run one after another; each row's K loop serves the whole member
+// chunk. Interleaving rows inside one K loop (sharing each column's
+// yl/yh/sumy across rows) changes Metal's default-math contraction and
+// drifts 1 ULP from the stock kernel, so rows are never interleaved;
+// members (columns) are.
 
 // One weight row against up to 4 members: tot[c] is the stock per-pair
 // `simd_sum(sumf)` for member c.
@@ -2046,113 +2045,16 @@ inline void q4_K_grouped_row_sums(
     }
 }
 
-template <int NC>
-inline void q4_K_grouped_row(
-    device const block_q4_K * x,
-    device const float      * src1,
-    device       float      * dst,
-    constant GgmlMatvecIdParams & p,
-    thread const int * members,
-    int row,
-    uint tiisg
-) {
-    float tot[NC];
-    q4_K_grouped_row_sums<NC>(x, src1, p, members, tiisg, tot);
-    for (int c = 0; c < NC; ++c) {
-        if (tiisg == 0 && row < (int)p.ne01) {
-            dst[members[c] * p.ne0 + row] = tot[c];
-        }
-    }
-}
-
-template <int R0, int NC>
-inline void q4_K_grouped_chunk(
-    device const block_q4_K * xe,
-    device const float      * src1,
-    device       float      * dst,
-    constant GgmlMatvecIdParams & p,
-    thread const int * members,
-    int first_row,
-    uint tiisg
-) {
-    const int nb = p.ne00 / QK_K;
-    for (int r = 0; r < R0; ++r) {
-        const int row = first_row + r;
-        // Uniform per SIMD group; rows past the tail do no work.
-        if (row >= (int)p.ne01) {
-            break;
-        }
-        q4_K_grouped_row<NC>(xe + row * nb, src1, dst, p, members, row, tiisg);
-    }
-}
-
-// Geometry: threads (2, 32, 1) = 2 SIMD groups; each SIMD group owns R0
-// consecutive rows, so a threadgroup covers 2 * R0 rows.
-// tgpig.x = row tile, tgpig.y = flat pair (token * top_k + slot).
-template <int R0>
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_impl(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
-) {
-    const int pair = tgpig.y;
-    if (pair >= (int)p.ne1) return;
-
-    const uint expert_id = ids[pair];
-    const int first_row = (2 * (int)tgpig.x + (int)sgitg) * R0;
-
-    if (poison_invalid_expert_id(
-            dst, p, expert_id, pair, first_row, R0, tiisg == 0)) return;
-    if (grouped_mv_id_has_earlier_member(ids, pair, expert_id)) return;
-
-    device const block_q4_K * xe = (device const block_q4_K *)((device const char *)src0 + expert_id * p.expert_stride);
-
-    int cursor = pair;
-    int members[4];
-    for (;;) {
-        const int count = grouped_mv_id_next_members(ids, p, expert_id, &cursor, members);
-        if (count == 4) {
-            q4_K_grouped_chunk<R0, 4>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 3) {
-            q4_K_grouped_chunk<R0, 3>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 2) {
-            q4_K_grouped_chunk<R0, 2>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 1) {
-            q4_K_grouped_chunk<R0, 1>(xe, src1, dst, p, members, first_row, tiisg);
-        }
-        if (count < 4) break;
-    }
-}
-
-template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_rt1")]]
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_impl<1>(
-    device const char *, device const float *, device float *, device const uint *,
-    constant GgmlMatvecIdParams &, uint3, uint, uint);
-
-template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_rt2")]]
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_impl<2>(
-    device const char *, device const float *, device float *, device const uint *,
-    constant GgmlMatvecIdParams &, uint3, uint, uint);
-
-template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_rt4")]]
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_impl<4>(
-    device const char *, device const float *, device float *, device const uint *,
-    constant GgmlMatvecIdParams &, uint3, uint, uint);
-
-// ---- Q4_K gate_up with the moe_swiglu_batch epilogue (ADR-063 F2) ----
+// ---- Q4_K gate_up with the moe_swiglu_batch epilogue ----
 //
 // The weight holds [gate (n_ff rows); up (n_ff rows)] per expert (ne01 =
 // 2 * n_ff). A SIMD group owns R0 gate rows r and their up rows r + n_ff,
-// computes each row with the E1 per-row loop (rows sequential, members
+// computes each row with the per-row loop above (rows sequential, members
 // interleaved), and lane 0 applies the `moe_swiglu_batch` expression to the
 // two stock row sums, writing dst[pair * ne0 + r] with ne0 = n_ff: exactly
 // what `kernel_mul_mv_id_q4_K_f32` followed by `moe_swiglu_batch` produces.
 // An invalid id feeds the stock NaN poison through the same epilogue.
+// Instantiated at the frozen R0 = 4 only.
 
 // Literal clone of the `moe_swiglu_batch` expression (moe_dispatch.metal).
 inline float grouped_geglu_epilogue(float gate, float up) {
@@ -2248,239 +2150,7 @@ kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl(
     }
 }
 
-template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt1")]]
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<1>(
-    device const char *, device const float *, device float *, device const uint *,
-    constant GgmlMatvecIdParams &, uint3, uint, uint);
-
-template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt2")]]
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<2>(
-    device const char *, device const float *, device float *, device const uint *,
-    constant GgmlMatvecIdParams &, uint3, uint, uint);
-
 template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4")]]
 kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<4>(
     device const char *, device const float *, device float *, device const uint *,
     constant GgmlMatvecIdParams &, uint3, uint, uint);
-
-// ---- Q8_0 (down): stock 4 rows per SIMD group, 2 SIMD groups ----
-
-template <int NC>
-inline void q8_0_grouped_chunk(
-    device const block_q8_0 * xe,
-    device const float      * src1,
-    device       float      * dst,
-    constant GgmlMatvecIdParams & p,
-    thread const int * members,
-    int first_row,
-    uint tiisg
-) {
-    const int nr = N_DST;
-    const int nw = N_SIMDWIDTH;
-    const int nb = p.ne00 / QK8_0;
-
-    device const block_q8_0 * x[nr];
-    for (int row = 0; row < nr; ++row) {
-        x[row] = xe + min(first_row + row, (int)p.ne01 - 1) * nb;
-    }
-
-    float sumf[NC][nr];
-    for (int c = 0; c < NC; ++c) {
-        for (int row = 0; row < nr; ++row) {
-            sumf[c][row] = 0.f;
-        }
-    }
-
-    const int ix = tiisg / 4;
-    const int il = tiisg % 4;
-
-    device const float * yb[NC];
-    for (int c = 0; c < NC; ++c) {
-        const uint token_idx = (uint)members[c] / p.top_k;
-        yb[c] = src1 + token_idx * p.ne10 + ix * QK8_0 + NB_Q8_0 * il;
-    }
-
-    for (int ib = ix; ib < nb; ib += nw/4) {
-        for (int c = 0; c < NC; ++c) {
-            float yl[NB_Q8_0];
-            for (int i = 0; i < NB_Q8_0; ++i) {
-                yl[i] = yb[c][i];
-            }
-
-            for (int row = 0; row < nr; row++) {
-                device const int8_t * qs = x[row][ib].qs + NB_Q8_0 * il;
-                float sumq = 0.f;
-                for (int iq = 0; iq < NB_Q8_0; ++iq) {
-                    sumq += qs[iq] * yl[iq];
-                }
-                sumf[c][row] += sumq * x[row][ib].d;
-            }
-        }
-
-        for (int c = 0; c < NC; ++c) {
-            yb[c] += NB_Q8_0 * nw;
-        }
-    }
-
-    for (int c = 0; c < NC; ++c) {
-        for (int row = 0; row < nr; ++row) {
-            const float tot = simd_sum(sumf[c][row]);
-            if (tiisg == 0 && first_row + row < p.ne01) {
-                dst[members[c] * p.ne0 + first_row + row] = tot;
-            }
-        }
-    }
-}
-
-kernel void kernel_mul_mv_id_q8_0_f32_grouped(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
-) {
-    const int nr  = N_DST;
-    const int nsg = N_SIMDGROUP;
-
-    const int pair = tgpig.y;
-    if (pair >= (int)p.ne1) return;
-
-    const uint expert_id = ids[pair];
-    const int first_row = ((int)tgpig.x * nsg + (int)sgitg) * nr;
-
-    if (poison_invalid_expert_id(
-            dst, p, expert_id, pair, first_row, nr, tiisg == 0)) return;
-    if (grouped_mv_id_has_earlier_member(ids, pair, expert_id)) return;
-
-    device const block_q8_0 * xe = (device const block_q8_0 *)((device const char *)src0 + expert_id * p.expert_stride);
-
-    int cursor = pair;
-    int members[4];
-    for (;;) {
-        const int count = grouped_mv_id_next_members(ids, p, expert_id, &cursor, members);
-        if (count == 4) {
-            q8_0_grouped_chunk<4>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 3) {
-            q8_0_grouped_chunk<3>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 2) {
-            q8_0_grouped_chunk<2>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 1) {
-            q8_0_grouped_chunk<1>(xe, src1, dst, p, members, first_row, tiisg);
-        }
-        if (count < 4) break;
-    }
-}
-
-// ---- Q5_0 (down): stock 4 rows per SIMD group, 2 SIMD groups ----
-
-template <int NC>
-inline void q5_0_grouped_chunk(
-    device const block_q5_0 * xe,
-    device const float      * src1,
-    device       float      * dst,
-    constant GgmlMatvecIdParams & p,
-    thread const int * members,
-    int first_row,
-    uint tiisg
-) {
-    const int nr = N_DST;
-    const int nw = N_SIMDWIDTH;
-    const int nb = p.ne00 / QK4_0;
-
-    device const block_q5_0 * x[nr];
-    for (int row = 0; row < nr; ++row) {
-        x[row] = xe + min(first_row + row, (int)p.ne01 - 1) * nb;
-    }
-
-    float sumf[NC][nr];
-    for (int c = 0; c < NC; ++c) {
-        for (int row = 0; row < nr; ++row) {
-            sumf[c][row] = 0.f;
-        }
-    }
-
-    const int ix = tiisg / 2;
-    const int il = (tiisg % 2) * 8;
-
-    device const float * yb[NC];
-    for (int c = 0; c < NC; ++c) {
-        const uint token_idx = (uint)members[c] / p.top_k;
-        yb[c] = src1 + token_idx * p.ne10 + ix * QK4_0 + il;
-    }
-
-    for (int ib = ix; ib < nb; ib += nw/2) {
-        for (int c = 0; c < NC; ++c) {
-            float yl[16];
-            float sumy = 0.f;
-            for (int i = 0; i < 8; i += 2) {
-                sumy += yb[c][i] + yb[c][i+1];
-                yl[i+0] = yb[c][i+0];
-                yl[i+1] = yb[c][i+1] / 256.f;
-                sumy += yb[c][i+16] + yb[c][i+17];
-                yl[i+8] = yb[c][i+16] / 16.f;
-                yl[i+9] = yb[c][i+17] / 4096.f;
-            }
-            for (int row = 0; row < nr; row++) {
-                sumf[c][row] += block_q5_0_dot_y(x[row] + ib, sumy, yl, il);
-            }
-        }
-
-        for (int c = 0; c < NC; ++c) {
-            yb[c] += QK4_0 * 16;
-        }
-    }
-
-    for (int c = 0; c < NC; ++c) {
-        for (int row = 0; row < nr; ++row) {
-            const float tot = simd_sum(sumf[c][row]);
-            if (tiisg == 0 && first_row + row < p.ne01) {
-                dst[members[c] * p.ne0 + first_row + row] = tot;
-            }
-        }
-    }
-}
-
-kernel void kernel_mul_mv_id_q5_0_f32_grouped(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
-) {
-    const int nr  = N_DST;
-    const int nsg = N_SIMDGROUP;
-
-    const int pair = tgpig.y;
-    if (pair >= (int)p.ne1) return;
-
-    const uint expert_id = ids[pair];
-    const int first_row = ((int)tgpig.x * nsg + (int)sgitg) * nr;
-
-    if (poison_invalid_expert_id(
-            dst, p, expert_id, pair, first_row, nr, tiisg == 0)) return;
-    if (grouped_mv_id_has_earlier_member(ids, pair, expert_id)) return;
-
-    device const block_q5_0 * xe = (device const block_q5_0 *)((device const char *)src0 + expert_id * p.expert_stride);
-
-    int cursor = pair;
-    int members[4];
-    for (;;) {
-        const int count = grouped_mv_id_next_members(ids, p, expert_id, &cursor, members);
-        if (count == 4) {
-            q5_0_grouped_chunk<4>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 3) {
-            q5_0_grouped_chunk<3>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 2) {
-            q5_0_grouped_chunk<2>(xe, src1, dst, p, members, first_row, tiisg);
-        } else if (count == 1) {
-            q5_0_grouped_chunk<1>(xe, src1, dst, p, members, first_row, tiisg);
-        }
-        if (count < 4) break;
-    }
-}

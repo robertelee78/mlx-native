@@ -1,20 +1,24 @@
-//! Q4-GEMMA-DECODE M0 microbenchmark (ADR-063 design §7).
+//! Q4-GEMMA-DECODE microbenchmark for the adopted levers (ADR-063 design §7).
 //!
 //! Model-free. Needs the root's GPU lane and a quiet host (HOST-LOCK held by
 //! the runner). Timings come from command-buffer `GPUStartTime`/`GPUEndTime`
 //! with 30 dispatches per command buffer (one per "layer"), so the fixed
-//! command-buffer cost is amortized. Every cell cycles 30 distinct weight
-//! buffers (2 for the 605.6 MB lm head) so its working set exceeds the system
-//! cache, alternates two activation sets, runs `WARMUP` untimed and `ITERS`
-//! timed command buffers, and writes one JSON receipt line.
+//! command-buffer cost is amortized. Every cell cycles distinct weight
+//! buffers (four 128-expert stacks for `f2`, 30 KV caches for `attn`) so its
+//! working set exceeds the system cache, alternates two activation sets, runs
+//! `WARMUP` untimed and `ITERS` timed command buffers, and writes one JSON
+//! receipt line.
+//!
+//! `f2`: stock gate_up `mv_id` + `moe_swiglu_batch` against the fused F2
+//! kernel (R0 = 4) on the Gemma 4 gate_up shape at n_tokens 4, 8 and 16.
 //!
 //! Environment:
 //! - `GEMMA_DECODE_BENCH_OUT` — receipt directory (default
 //!   `target/gemma_decode_w4`); `cells.jsonl` and `identity.json` go there.
-//! - `GEMMA_DECODE_BENCH_FAMILIES` — comma list of `roofline`, `d1`,
-//!   `lmhead`, `d2`, `e1`, `f1`, `attn` (default: all).
+//! - `GEMMA_DECODE_BENCH_FAMILIES` — comma list of `roofline`, `f2`, `attn`
+//!   (default: all).
 //! - `GEMMA_DECODE_BENCH_V2_OVERLAP` — file with the hf2q `[ROUTING_OVERLAP]`
-//!   line from the V2 run; adds the empirical E1 patterns (`v2_u*`) and the
+//!   line from the V2 run; adds the empirical F2 patterns (`v2_u*`) and the
 //!   V2 KV-length histogram steps of `attn` (`v2_le*`, weighted by count).
 //! - `GEMMA_DECODE_BENCH_ITERS` (default 50, minimum 50) and
 //!   `GEMMA_DECODE_BENCH_WARMUP` (default 10).
@@ -42,13 +46,9 @@ use mlx_native::ops::flash_attn_vec_hybrid::{
 use mlx_native::ops::flash_attn_vec_tq_hb::{compute_nsg, FlashAttnVecTqHbParams};
 use mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode;
 use mlx_native::{
-    quantized_matmul_ggml_dense_mn_explicit, quantized_matmul_ggml_dual_gate_up_q4k,
-    quantized_matmul_ggml_row_tiled_with_geometry,
-    quantized_matmul_ggml_with_policy, quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry,
-    quantized_matmul_id_ggml_mv_grouped_with_geometry,
-    quantized_matmul_id_ggml_mv_with_policy, row_tiled_geometry, DType,
-    GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
-    KernelRegistry, MlxBuffer, MlxDevice, RowTiledGeometry,
+    quantized_matmul_id_ggml_mv_grouped_geglu, quantized_matmul_id_ggml_mv_with_policy, DType,
+    GgmlQuantizedMatmulIdParams, GgmlRoutingPolicy, GgmlType, KernelRegistry, MlxBuffer,
+    MlxDevice,
 };
 
 const LAYERS: usize = 30;
@@ -66,7 +66,7 @@ impl Config {
             .map(Into::into)
             .unwrap_or_else(|| "target/gemma_decode_w4".into());
         let families = std::env::var("GEMMA_DECODE_BENCH_FAMILIES")
-            .unwrap_or_else(|_| "roofline,d1,lmhead,d2,e1,f1,attn".into())
+            .unwrap_or_else(|_| "roofline,f2,attn".into())
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
@@ -138,26 +138,6 @@ fn f32_buffer(device: &MlxDevice, len: usize, rng: &mut Rng) -> MlxBuffer {
     buffer
 }
 
-#[derive(Clone, Copy)]
-enum Arm {
-    /// Stock route under the default policy.
-    Stock,
-    /// D1 at an explicit geometry.
-    RowTiled(RowTiledGeometry),
-    /// D2.
-    DenseMn,
-}
-
-impl Arm {
-    fn label(self) -> String {
-        match self {
-            Arm::Stock => "stock".into(),
-            Arm::RowTiled(g) => format!("d1_rt{}_nsg{}", g.r0, g.nsg),
-            Arm::DenseMn => "d2_mn".into(),
-        }
-    }
-}
-
 struct Stats {
     median_ns: f64,
     p10_ns: f64,
@@ -174,30 +154,6 @@ fn stats(mut per_dispatch_ns: Vec<f64>) -> Stats {
     }
 }
 
-fn tiles(m: usize) -> usize {
-    match m {
-        0..=4 => 1,
-        _ => 2,
-    }
-}
-
-/// Weight reads issued per call by one arm (logical / unique).
-fn weight_reads(arm: Arm, ty: GgmlType, m: usize) -> usize {
-    match (arm, ty) {
-        (Arm::Stock, GgmlType::Q5_0 | GgmlType::Q8_0) => m,
-        (Arm::Stock, _) if m == 1 => 1,
-        // Stock K-quant mN tiles 5 as [5] and 6..8 as two tiles.
-        (Arm::Stock, _) => {
-            if m <= 5 {
-                1
-            } else {
-                2
-            }
-        }
-        _ => tiles(m),
-    }
-}
-
 struct Bench {
     device: MlxDevice,
     registry: KernelRegistry,
@@ -206,137 +162,6 @@ struct Bench {
 }
 
 impl Bench {
-    fn time_cell(
-        &mut self,
-        family: &str,
-        shape: &str,
-        ty: GgmlType,
-        n: usize,
-        k: usize,
-        m: usize,
-        weights: &[MlxBuffer],
-        inputs: &[MlxBuffer; 2],
-        output: &MlxBuffer,
-        arm: Arm,
-    ) {
-        let params = GgmlQuantizedMatmulParams {
-            m: m as u32,
-            n: n as u32,
-            k: k as u32,
-            ggml_type: ty,
-        };
-        let stock = GgmlRoutingPolicy::default();
-        let mut samples = Vec::with_capacity(self.cfg.iters);
-        for iter in 0..self.cfg.warmup + self.cfg.iters {
-            let input = &inputs[iter % 2];
-            let mut encoder = self.device.command_encoder().expect("encoder");
-            for layer in 0..LAYERS {
-                let weight = &weights[(iter * LAYERS + layer) % weights.len()];
-                let result = match arm {
-                    Arm::Stock => quantized_matmul_ggml_with_policy(
-                        &mut encoder,
-                        &mut self.registry,
-                        &self.device,
-                        input,
-                        weight,
-                        output,
-                        &params,
-                        &stock,
-                    ),
-                    Arm::RowTiled(geometry) => quantized_matmul_ggml_row_tiled_with_geometry(
-                        &mut encoder,
-                        &mut self.registry,
-                        &self.device,
-                        input,
-                        weight,
-                        output,
-                        &params,
-                        geometry,
-                    ),
-                    Arm::DenseMn => quantized_matmul_ggml_dense_mn_explicit(
-                        &mut encoder,
-                        &mut self.registry,
-                        &self.device,
-                        input,
-                        weight,
-                        output,
-                        &params,
-                    ),
-                };
-                result.expect("dispatch");
-            }
-            let (start, end) = encoder.commit_wait_with_gpu_time().expect("GPU");
-            if iter >= self.cfg.warmup {
-                samples.push((end - start) * 1e9 / LAYERS as f64);
-            }
-        }
-        let s = stats(samples);
-        let unique = weights[0].byte_len() as f64;
-        let logical = unique * weight_reads(arm, ty, m) as f64;
-        let element_columns = (n * k * m) as f64;
-        let line = serde_json::json!({
-            "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
-            "family": family,
-            "shape": shape,
-            "type": format!("{ty:?}"),
-            "n": n, "k": k, "m": m,
-            "arm": arm.label(),
-            "geometry": match arm {
-                Arm::RowTiled(g) => serde_json::json!({"r0": g.r0, "nsg": g.nsg}),
-                _ => serde_json::Value::Null,
-            },
-            "weight_buffers_cycled": weights.len(),
-            "dispatches_per_command_buffer": LAYERS,
-            "iters": self.cfg.iters,
-            "warmup": self.cfg.warmup,
-            "median_ns": s.median_ns,
-            "p10_ns": s.p10_ns,
-            "p90_ns": s.p90_ns,
-            "unique_weight_bytes": unique,
-            "logical_weight_bytes": logical,
-            "weight_gb_per_s_logical": logical / s.median_ns,
-            "weight_gb_per_s_unique": unique / s.median_ns,
-            "element_columns_per_s": element_columns / (s.median_ns * 1e-9),
-        });
-        writeln!(self.receipts, "{line}").expect("receipt");
-        println!(
-            "{family:7} {shape:14} {ty:?} m={m} {:14} median {:9.1} µs  p10 {:9.1}  p90 {:9.1}  {:6.1} GB/s  {:5.2} T el-col/s",
-            arm.label(),
-            s.median_ns / 1e3,
-            s.p10_ns / 1e3,
-            s.p90_ns / 1e3,
-            logical / s.median_ns,
-            element_columns / s.median_ns / 1e3,
-        );
-    }
-
-    fn dense_family(
-        &mut self,
-        family: &str,
-        shapes: &[(&str, GgmlType, usize, usize)],
-        widths: &[usize],
-        buffers: usize,
-        arms_for: &dyn Fn(GgmlType, usize) -> Vec<Arm>,
-    ) {
-        let mut rng = Rng(0x6d30);
-        for &(shape, ty, n, k) in shapes {
-            let weights: Vec<MlxBuffer> = (0..buffers)
-                .map(|_| weight_buffer(&self.device, ty, n, k, &mut rng))
-                .collect();
-            let max_m = widths.iter().copied().max().unwrap_or(1);
-            let inputs = [
-                f32_buffer(&self.device, max_m * k, &mut rng),
-                f32_buffer(&self.device, max_m * k, &mut rng),
-            ];
-            let output = f32_buffer(&self.device, max_m * n, &mut rng);
-            for &m in widths {
-                for arm in arms_for(ty, m) {
-                    self.time_cell(family, shape, ty, n, k, m, &weights, &inputs, &output, arm);
-                }
-            }
-        }
-    }
-
     fn roofline(&mut self) {
         let bytes: u64 = 2 << 30;
         let src = self
@@ -382,104 +207,6 @@ fn command_output(program: &str, args: &[&str]) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
-}
-
-fn row_tiled_arms(ty: GgmlType, n: usize, k: usize) -> Vec<Arm> {
-    let mut arms = vec![Arm::Stock];
-    for r0 in RowTiledGeometry::R0_CELLS {
-        for nsg in RowTiledGeometry::NSG_CELLS {
-            arms.push(Arm::RowTiled(RowTiledGeometry { r0, nsg }));
-        }
-    }
-    debug_assert!(row_tiled_geometry(ty, n as u32, k as u32).is_some());
-    arms
-}
-
-#[derive(Clone, Copy)]
-enum PairArm {
-    /// Two stock launches (gate, up).
-    Stock,
-    /// Two D1 launches at the table geometry.
-    RowTiled,
-    /// One F1 launch.
-    Dual(u32),
-}
-
-impl Bench {
-    /// F1: dense gate+up (Q4_K 2816→2112) as one launch against the two
-    /// launches it would replace.
-    fn dual_gate_up_family(&mut self, widths: &[usize]) {
-        let (n, k, ty) = (2112usize, 2816usize, GgmlType::Q4_K);
-        let mut rng = Rng(0xf1);
-        let gates: Vec<MlxBuffer> = (0..LAYERS).map(|_| weight_buffer(&self.device, ty, n, k, &mut rng)).collect();
-        let ups: Vec<MlxBuffer> = (0..LAYERS).map(|_| weight_buffer(&self.device, ty, n, k, &mut rng)).collect();
-        let inputs = [f32_buffer(&self.device, 8 * k, &mut rng), f32_buffer(&self.device, 8 * k, &mut rng)];
-        let gate_out = f32_buffer(&self.device, 8 * n, &mut rng);
-        let up_out = f32_buffer(&self.device, 8 * n, &mut rng);
-        let geometry = row_tiled_geometry(ty, n as u32, k as u32).expect("gate/up in table");
-        let stock = GgmlRoutingPolicy::default();
-        for &m in widths {
-            let params = GgmlQuantizedMatmulParams { m: m as u32, n: n as u32, k: k as u32, ggml_type: ty };
-            let arms = [PairArm::Stock, PairArm::RowTiled, PairArm::Dual(2), PairArm::Dual(4), PairArm::Dual(8)];
-            for arm in arms {
-                let mut samples = Vec::with_capacity(self.cfg.iters);
-                for iter in 0..self.cfg.warmup + self.cfg.iters {
-                    let input = &inputs[iter % 2];
-                    let mut encoder = self.device.command_encoder().expect("encoder");
-                    for layer in 0..LAYERS {
-                        let (g, u) = (&gates[layer], &ups[layer]);
-                        match arm {
-                            PairArm::Stock => {
-                                for (w, o) in [(g, &gate_out), (u, &up_out)] {
-                                    quantized_matmul_ggml_with_policy(
-                                        &mut encoder, &mut self.registry, &self.device, input, w, o, &params, &stock,
-                                    )
-                                    .expect("stock");
-                                }
-                            }
-                            PairArm::RowTiled => {
-                                for (w, o) in [(g, &gate_out), (u, &up_out)] {
-                                    quantized_matmul_ggml_row_tiled_with_geometry(
-                                        &mut encoder, &mut self.registry, &self.device, input, w, o, &params, geometry,
-                                    )
-                                    .expect("d1");
-                                }
-                            }
-                            PairArm::Dual(nsg) => quantized_matmul_ggml_dual_gate_up_q4k(
-                                &mut encoder, &mut self.registry, &self.device, input, g, u, &gate_out, &up_out,
-                                &params, nsg,
-                            )
-                            .expect("f1"),
-                        }
-                    }
-                    let (start, end) = encoder.commit_wait_with_gpu_time().expect("GPU");
-                    if iter >= self.cfg.warmup {
-                        samples.push((end - start) * 1e9 / LAYERS as f64);
-                    }
-                }
-                let s = stats(samples);
-                let label = match arm {
-                    PairArm::Stock => "stock_pair".to_string(),
-                    PairArm::RowTiled => format!("d1_pair_rt{}_nsg{}", geometry.r0, geometry.nsg),
-                    PairArm::Dual(nsg) => format!("f1_dual_nsg{nsg}"),
-                };
-                let unique = 2.0 * gates[0].byte_len() as f64;
-                let line = serde_json::json!({
-                    "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
-                    "family": "f1", "shape": "gate_up_pair", "type": "Q4_K",
-                    "n": n, "k": k, "m": m, "arm": label,
-                    "weight_buffers_cycled": LAYERS, "dispatches_per_command_buffer": LAYERS,
-                    "iters": self.cfg.iters, "warmup": self.cfg.warmup,
-                    "median_ns": s.median_ns, "p10_ns": s.p10_ns, "p90_ns": s.p90_ns,
-                    "unique_weight_bytes": unique,
-                    "weight_gb_per_s_unique": unique / s.median_ns,
-                    "element_columns_per_s": (2 * n * k * m) as f64 / (s.median_ns * 1e-9),
-                });
-                writeln!(self.receipts, "{line}").expect("receipt");
-                println!("f1      gate_up_pair m={m} {label:18} median {:9.1} µs", s.median_ns / 1e3);
-            }
-        }
-    }
 }
 
 /// One routing pattern: `[n_tokens][8]` expert ids, distinct within a token.
@@ -581,123 +308,99 @@ fn v2_patterns(n_tokens: usize, rng: &mut Rng) -> Vec<Pattern> {
 
 #[derive(Clone, Copy)]
 enum ExpertArm {
-    Stock,
-    Grouped(u32),
-    /// Stock gate_up then stock `moe_swiglu_batch` (F2 baseline).
+    /// Stock gate_up then stock `moe_swiglu_batch` (the route F2 replaces).
     StockSwiglu,
-    /// E1 gate_up then stock `moe_swiglu_batch`.
-    GroupedSwiglu(u32),
-    /// F2 fused gate_up + GELU·mul.
-    Geglu(u32),
+    /// F2 fused gate_up + GELU·mul at its frozen geometry (R0 = 4).
+    Geglu,
+}
+
+impl ExpertArm {
+    fn label(self) -> &'static str {
+        match self {
+            ExpertArm::StockSwiglu => "stock+swiglu",
+            ExpertArm::Geglu => "f2_geglu_rt4",
+        }
+    }
 }
 
 impl Bench {
-    fn expert_family(&mut self) {
+    /// F2: Gemma 4 gate_up (Q4_K, N = 1408, K = 2816, top-8 of 128) at
+    /// n_tokens 4, 8 and 16 over the synthetic and V2 patterns.
+    fn f2_family(&mut self) {
         let mut rng = Rng(0xe1);
-        // gate_up: token rows broadcast to top-8 pairs; down: one row per pair.
-        let shapes = [
-            ("gate_up_q4k", GgmlType::Q4_K, 1408usize, 2816usize, false),
-            ("down_q5_0", GgmlType::Q5_0, 2816, 704, true),
-            ("down_q8_0", GgmlType::Q8_0, 2816, 704, true),
-        ];
-        for (shape, ty, n, k, per_pair) in shapes {
-            let row_bytes = k / ty.block_values() as usize * ty.block_bytes() as usize;
-            let stride = (n * row_bytes) as u64;
-            // Four distinct stacks (each > the system cache) cycled per layer.
-            let stacks: Vec<MlxBuffer> = (0..4)
-                .map(|_| weight_buffer(&self.device, ty, n * N_EXPERTS as usize, k, &mut rng))
-                .collect();
-            for n_tokens in [4usize, 8, 16] {
-                let pairs = n_tokens * TOP_K;
-                let rows = if per_pair { pairs } else { n_tokens };
-                let inputs = [
-                    f32_buffer(&self.device, rows * k, &mut rng),
-                    f32_buffer(&self.device, rows * k, &mut rng),
-                ];
-                let output = f32_buffer(&self.device, pairs * n, &mut rng);
-                let mut patterns = synthetic_patterns(n_tokens, &mut rng);
-                patterns.extend(v2_patterns(n_tokens, &mut rng));
-                for pattern in patterns {
-                    let mut ids = self
-                        .device
-                        .alloc_buffer(pairs * 4, DType::U32, vec![pairs])
-                        .expect("ids");
-                    ids.as_mut_slice::<u32>().expect("ids").copy_from_slice(&pattern.ids);
-                    let unique_experts = {
-                        let mut v = pattern.ids.clone();
-                        v.sort_unstable();
-                        v.dedup();
-                        v.len()
-                    };
-                    let params = GgmlQuantizedMatmulIdParams {
-                        n_tokens: if per_pair { pairs as u32 } else { n_tokens as u32 },
-                        top_k: if per_pair { 1 } else { TOP_K as u32 },
-                        n: n as u32,
-                        k: k as u32,
-                        n_experts: N_EXPERTS,
-                        expert_stride: stride,
-                        ggml_type: ty,
-                    };
-                    let mut arms = vec![ExpertArm::Stock];
-                    let cells: &[u32] = if ty == GgmlType::Q4_K { &[1, 2, 4] } else { &[4] };
-                    arms.extend(cells.iter().map(|&r0| ExpertArm::Grouped(r0)));
-                    // F2: gate_up + GELU·mul, fused against its two-launch arms.
-                    if ty == GgmlType::Q4_K {
-                        arms.push(ExpertArm::StockSwiglu);
-                        arms.extend(cells.iter().map(|&r0| ExpertArm::GroupedSwiglu(r0)));
-                        arms.extend(cells.iter().map(|&r0| ExpertArm::Geglu(r0)));
-                    }
-                    let swiglu_out = f32_buffer(&self.device, pairs * n / 2, &mut rng);
-                    for arm in arms {
-                        let s = self.time_expert(
-                            &stacks,
-                            &inputs,
-                            &ids,
-                            &output,
-                            &params,
-                            arm,
-                            Some(&swiglu_out),
-                        );
-                        let expert_bytes = stride as f64;
-                        let logical = expert_bytes * pairs as f64;
-                        let unique = expert_bytes * unique_experts as f64;
-                        let label = match arm {
-                            ExpertArm::Stock => "stock".to_string(),
-                            ExpertArm::Grouped(r0) => format!("e1_grouped_rt{r0}"),
-                            ExpertArm::StockSwiglu => "stock+swiglu".to_string(),
-                            ExpertArm::GroupedSwiglu(r0) => format!("e1_grouped_rt{r0}+swiglu"),
-                            ExpertArm::Geglu(r0) => format!("f2_geglu_rt{r0}"),
-                        };
-                        let line = serde_json::json!({
-                            "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
-                            "family": "e1",
-                            "shape": shape,
-                            "type": format!("{ty:?}"),
-                            "n": n, "k": k, "n_tokens": n_tokens, "top_k": TOP_K,
-                            "pattern": pattern.name,
-                            "pattern_weight": pattern.weight,
-                            "distinct_experts": unique_experts,
-                            "arm": label,
-                            "weight_stacks_cycled": stacks.len(),
-                            "dispatches_per_command_buffer": LAYERS,
-                            "iters": self.cfg.iters,
-                            "warmup": self.cfg.warmup,
-                            "median_ns": s.median_ns,
-                            "p10_ns": s.p10_ns,
-                            "p90_ns": s.p90_ns,
-                            "logical_weight_bytes_stock": logical,
-                            "unique_weight_bytes": unique,
-                            "weight_gb_per_s_logical": logical / s.median_ns,
-                            "weight_gb_per_s_unique": unique / s.median_ns,
-                            "element_columns_per_s": (n * k * pairs) as f64 / (s.median_ns * 1e-9),
-                        });
-                        writeln!(self.receipts, "{line}").expect("receipt");
-                        println!(
-                            "e1      {shape:14} n_tok={n_tokens:2} {:12} U={unique_experts:3} {label:16} median {:9.1} µs",
-                            pattern.name,
-                            s.median_ns / 1e3
-                        );
-                    }
+        let (shape, ty, n, k) = ("gate_up_q4k", GgmlType::Q4_K, 1408usize, 2816usize);
+        let row_bytes = k / ty.block_values() as usize * ty.block_bytes() as usize;
+        let stride = (n * row_bytes) as u64;
+        // Four distinct stacks (each > the system cache) cycled per layer.
+        let stacks: Vec<MlxBuffer> = (0..4)
+            .map(|_| weight_buffer(&self.device, ty, n * N_EXPERTS as usize, k, &mut rng))
+            .collect();
+        for n_tokens in [4usize, 8, 16] {
+            let pairs = n_tokens * TOP_K;
+            let inputs = [
+                f32_buffer(&self.device, n_tokens * k, &mut rng),
+                f32_buffer(&self.device, n_tokens * k, &mut rng),
+            ];
+            let gate_up = f32_buffer(&self.device, pairs * n, &mut rng);
+            let output = f32_buffer(&self.device, pairs * n / 2, &mut rng);
+            let mut patterns = synthetic_patterns(n_tokens, &mut rng);
+            patterns.extend(v2_patterns(n_tokens, &mut rng));
+            for pattern in patterns {
+                let mut ids = self
+                    .device
+                    .alloc_buffer(pairs * 4, DType::U32, vec![pairs])
+                    .expect("ids");
+                ids.as_mut_slice::<u32>().expect("ids").copy_from_slice(&pattern.ids);
+                let unique_experts = {
+                    let mut v = pattern.ids.clone();
+                    v.sort_unstable();
+                    v.dedup();
+                    v.len()
+                };
+                let params = GgmlQuantizedMatmulIdParams {
+                    n_tokens: n_tokens as u32,
+                    top_k: TOP_K as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    n_experts: N_EXPERTS,
+                    expert_stride: stride,
+                    ggml_type: ty,
+                };
+                for arm in [ExpertArm::StockSwiglu, ExpertArm::Geglu] {
+                    let s = self.time_expert(&stacks, &inputs, &ids, &gate_up, &output, &params, arm);
+                    let expert_bytes = stride as f64;
+                    let logical = expert_bytes * pairs as f64;
+                    let unique = expert_bytes * unique_experts as f64;
+                    let line = serde_json::json!({
+                        "schema": "hf2q.q4-gemma-decode.m0.cell.v1",
+                        "family": "f2",
+                        "shape": shape,
+                        "type": format!("{ty:?}"),
+                        "n": n, "k": k, "n_tokens": n_tokens, "top_k": TOP_K,
+                        "pattern": pattern.name,
+                        "pattern_weight": pattern.weight,
+                        "distinct_experts": unique_experts,
+                        "arm": arm.label(),
+                        "weight_stacks_cycled": stacks.len(),
+                        "dispatches_per_command_buffer": LAYERS,
+                        "iters": self.cfg.iters,
+                        "warmup": self.cfg.warmup,
+                        "median_ns": s.median_ns,
+                        "p10_ns": s.p10_ns,
+                        "p90_ns": s.p90_ns,
+                        "logical_weight_bytes_stock": logical,
+                        "unique_weight_bytes": unique,
+                        "weight_gb_per_s_logical": logical / s.median_ns,
+                        "weight_gb_per_s_unique": unique / s.median_ns,
+                        "element_columns_per_s": (n * k * pairs) as f64 / (s.median_ns * 1e-9),
+                    });
+                    writeln!(self.receipts, "{line}").expect("receipt");
+                    println!(
+                        "f2      {shape:14} n_tok={n_tokens:2} {:12} U={unique_experts:3} {:16} median {:9.1} µs",
+                        pattern.name,
+                        arm.label(),
+                        s.median_ns / 1e3
+                    );
                 }
             }
         }
@@ -708,10 +411,10 @@ impl Bench {
         stacks: &[MlxBuffer],
         inputs: &[MlxBuffer; 2],
         ids: &MlxBuffer,
+        gate_up: &MlxBuffer,
         output: &MlxBuffer,
         params: &GgmlQuantizedMatmulIdParams,
         arm: ExpertArm,
-        swiglu_out: Option<&MlxBuffer>,
     ) -> Stats {
         let stock = GgmlRoutingPolicy::default();
         let mut samples = Vec::with_capacity(self.cfg.iters);
@@ -721,18 +424,30 @@ impl Bench {
                 let weight = &stacks[(iter * LAYERS + layer) % stacks.len()];
                 let input = &inputs[iter % 2];
                 match arm {
-                    ExpertArm::Stock => quantized_matmul_id_ggml_mv_with_policy(
+                    ExpertArm::StockSwiglu => quantized_matmul_id_ggml_mv_with_policy(
                         &mut encoder,
                         &mut self.registry,
                         &self.device,
                         input,
                         weight,
                         ids,
-                        output,
+                        gate_up,
                         params,
                         &stock,
-                    ),
-                    ExpertArm::Grouped(r0) => quantized_matmul_id_ggml_mv_grouped_with_geometry(
+                    )
+                    .and_then(|()| {
+                        encoder.memory_barrier();
+                        moe_swiglu_batch_encode(
+                            &mut encoder,
+                            &mut self.registry,
+                            self.device.metal_device(),
+                            gate_up,
+                            output,
+                            params.n as usize / 2,
+                            (params.n_tokens * params.top_k) as usize,
+                        )
+                    }),
+                    ExpertArm::Geglu => quantized_matmul_id_ggml_mv_grouped_geglu(
                         &mut encoder,
                         &mut self.registry,
                         &self.device,
@@ -741,46 +456,6 @@ impl Bench {
                         ids,
                         output,
                         params,
-                        r0,
-                    ),
-                    ExpertArm::StockSwiglu | ExpertArm::GroupedSwiglu(_) => {
-                        let swiglu = swiglu_out.expect("swiglu output");
-                        let product = match arm {
-                            ExpertArm::StockSwiglu => quantized_matmul_id_ggml_mv_with_policy(
-                                &mut encoder, &mut self.registry, &self.device, input, weight, ids,
-                                output, params, &stock,
-                            ),
-                            ExpertArm::GroupedSwiglu(r0) => {
-                                quantized_matmul_id_ggml_mv_grouped_with_geometry(
-                                    &mut encoder, &mut self.registry, &self.device, input, weight,
-                                    ids, output, params, r0,
-                                )
-                            }
-                            _ => unreachable!(),
-                        };
-                        product.and_then(|()| {
-                            encoder.memory_barrier();
-                            moe_swiglu_batch_encode(
-                                &mut encoder,
-                                &mut self.registry,
-                                self.device.metal_device(),
-                                output,
-                                swiglu,
-                                params.n as usize / 2,
-                                (params.n_tokens * params.top_k) as usize,
-                            )
-                        })
-                    }
-                    ExpertArm::Geglu(r0) => quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry(
-                        &mut encoder,
-                        &mut self.registry,
-                        &self.device,
-                        input,
-                        weight,
-                        ids,
-                        swiglu_out.expect("swiglu output"),
-                        params,
-                        r0,
                     ),
                 }
                 .expect("expert dispatch");
@@ -1100,59 +775,8 @@ fn main() {
     if bench.cfg.wants("roofline") {
         bench.roofline();
     }
-    let widths = [1usize, 2, 3, 4, 5, 6, 7, 8];
-    if bench.cfg.wants("d1") {
-        let shapes = [
-            ("q_sliding", GgmlType::Q4_K, 4096, 2816),
-            ("q_global", GgmlType::Q4_K, 8192, 2816),
-            ("k_sliding", GgmlType::Q4_K, 2048, 2816),
-            ("k_global", GgmlType::Q4_K, 1024, 2816),
-            ("v_q4k", GgmlType::Q4_K, 2048, 2816),
-            ("v_q6k", GgmlType::Q6_K, 2048, 2816),
-            ("o_sliding", GgmlType::Q4_K, 2816, 4096),
-            ("o_global", GgmlType::Q4_K, 2816, 8192),
-            ("gate_up", GgmlType::Q4_K, 2112, 2816),
-        ];
-        // Each shape's own arms; stock at m = 1 is the m = 1 reference kernel.
-        let table: Vec<_> = shapes.to_vec();
-        for (shape, ty, n, k) in table {
-            bench.dense_family("d1", &[(shape, ty, n, k)], &widths, LAYERS, &|ty, _| {
-                row_tiled_arms(ty, n, k)
-            });
-        }
-    }
-    if bench.cfg.wants("lmhead") {
-        bench.dense_family(
-            "lmhead",
-            &[("lm_head", GgmlType::Q6_K, 262_144, 2816)],
-            &[1, 2, 3, 4, 8],
-            2,
-            &|ty, _| row_tiled_arms(ty, 262_144, 2816),
-        );
-    }
-    if bench.cfg.wants("d2") {
-        bench.dense_family(
-            "d2",
-            &[
-                ("down_q5_0", GgmlType::Q5_0, 2816, 2112),
-                ("down_q8_0", GgmlType::Q8_0, 2816, 2112),
-            ],
-            &widths,
-            LAYERS,
-            &|_, m| {
-                if m >= 2 {
-                    vec![Arm::Stock, Arm::DenseMn]
-                } else {
-                    vec![Arm::Stock]
-                }
-            },
-        );
-    }
-    if bench.cfg.wants("e1") {
-        bench.expert_family();
-    }
-    if bench.cfg.wants("f1") {
-        bench.dual_gate_up_family(&widths);
+    if bench.cfg.wants("f2") {
+        bench.f2_family();
     }
     if bench.cfg.wants("attn") {
         bench.attn_family();

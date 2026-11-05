@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Extract the checked-in Gemma routing-witness sample used by
-`tests/gemma_expert_grouped_mv_id_bitwise.rs` (ADR-063 Q4-GEMMA-DECODE T-N3,
+`tests/gemma_gelu_epilogue_bitwise.rs` (ADR-063 Q4-GEMMA-DECODE T-N3,
 design section 2.4 witness rows).
 
 Source: the Q1 routing witness of the accepted greedy144 dataset,

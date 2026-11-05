@@ -50,14 +50,6 @@ fn combine_routing_policies(
         expert_q8_0_mv_nr2: expert.expert_q8_0_mv_nr2,
         expert_tensor_mm: expert.expert_tensor_mm,
         expert_mm_schedule: expert.expert_mm_schedule,
-        dense_row_tiled_q4k: dense.dense_row_tiled_q4k,
-        dense_row_tiled_q6k: dense.dense_row_tiled_q6k,
-        dense_row_tiled_m1: dense.dense_row_tiled_m1,
-        dense_mn_q5_0: dense.dense_mn_q5_0,
-        dense_mn_q8_0: dense.dense_mn_q8_0,
-        expert_grouped_q4k: expert.expert_grouped_q4k,
-        expert_grouped_q5_0: expert.expert_grouped_q5_0,
-        expert_grouped_q8_0: expert.expert_grouped_q8_0,
     }
 }
 
@@ -99,40 +91,6 @@ mod tests {
         assert!(policy.expert_q8_0_mv_nr2);
         assert_eq!(policy.expert_tensor_mm, GgmlTensorMmPreference::ForceSimd);
         assert_eq!(policy.expert_mm_schedule, ExpertMmSchedule::UniformGrid);
-    }
-
-    #[test]
-    fn combine_carries_gemma_decode_levers_from_their_half() {
-        let dense = GgmlRoutingPolicy {
-            dense_row_tiled_q4k: true,
-            dense_row_tiled_q6k: true,
-            dense_row_tiled_m1: true,
-            dense_mn_q5_0: true,
-            dense_mn_q8_0: true,
-            // Expert levers on the dense half must not leak through.
-            expert_grouped_q4k: true,
-            expert_grouped_q5_0: true,
-            expert_grouped_q8_0: true,
-            ..GgmlRoutingPolicy::default()
-        };
-        let expert = GgmlRoutingPolicy {
-            expert_grouped_q4k: true,
-            expert_grouped_q5_0: true,
-            expert_grouped_q8_0: true,
-            ..GgmlRoutingPolicy::default()
-        };
-        let policy = combine_routing_policies(dense, expert);
-        assert!(policy.dense_row_tiled_q4k && policy.dense_row_tiled_q6k);
-        assert!(policy.dense_row_tiled_m1 && policy.dense_mn_q5_0 && policy.dense_mn_q8_0);
-        assert!(policy.expert_grouped_q4k && policy.expert_grouped_q5_0);
-        assert!(policy.expert_grouped_q8_0);
-        let none = combine_routing_policies(dense, GgmlRoutingPolicy::default());
-        assert!(!none.expert_grouped_q4k && !none.expert_grouped_q5_0);
-        assert!(!none.expert_grouped_q8_0);
-        let env = ggml_routing_policy_from_environment();
-        assert!(!env.dense_row_tiled_q4k && !env.dense_row_tiled_q6k && !env.dense_row_tiled_m1);
-        assert!(!env.dense_mn_q5_0 && !env.dense_mn_q8_0);
-        assert!(!env.expert_grouped_q4k && !env.expert_grouped_q5_0 && !env.expert_grouped_q8_0);
     }
 
     #[test]

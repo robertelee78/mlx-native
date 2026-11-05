@@ -1,5 +1,5 @@
-//! Shared seeded data for the ADR-063 Q4-GEMMA-DECODE expert parity tests
-//! (`gemma_expert_grouped_mv_id_bitwise`, `gemma_gelu_epilogue_bitwise`):
+//! Shared seeded data for the ADR-063 Q4-GEMMA-DECODE F2 expert parity test
+//! (`gemma_gelu_epilogue_bitwise`) and the M0 bench:
 //! GGUF blocks with zero and subnormal half scales, activations with ±0,
 //! subnormals and large values, routing patterns, and guarded views.
 

@@ -313,12 +313,6 @@ impl KernelRegistry {
         for r1 in 2..=5 {
             sources.insert(format!("kernel_mul_mv_q5_K_f32_mN_r1_{r1}"), ggml_src);
         }
-        // Q4-GEMMA-DECODE D1 (row-tiled Q4_K/Q6_K) and D2 (Q5_0/Q8_0 mN):
-        // compiled from the reference kernels' source, so both metallib
-        // paths share the reference compile flags.
-        for name in crate::ops::gemma_decode_dense::all_kernel_names() {
-            sources.insert(name, ggml_src);
-        }
 
         // GGML block-format quantized matrix-matrix kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of kernel_mul_mm_<q>_f32).
@@ -616,17 +610,8 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mv_id_iq4_nl_f32".into(), ggml_id_src);
         // ADR-066 N-IQ2XXS — IQ2_XXS MoE expert-routed mat-vec.
         sources.insert("kernel_mul_mv_id_iq2_xxs_f32".into(), ggml_id_src);
-        // ADR-063 Q4-GEMMA-DECODE E1 — expert-grouped mv_id (leader pairs),
-        // bitwise siblings of the stock Q4_K / Q5_0 / Q8_0 mv_id kernels.
-        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_rt1".into(), ggml_id_src);
-        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_rt2".into(), ggml_id_src);
-        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_rt4".into(), ggml_id_src);
-        sources.insert("kernel_mul_mv_id_q5_0_f32_grouped".into(), ggml_id_src);
-        sources.insert("kernel_mul_mv_id_q8_0_f32_grouped".into(), ggml_id_src);
-        // ADR-063 Q4-GEMMA-DECODE F2 — grouped Q4_K gate_up with the
-        // moe_swiglu_batch GELU*mul epilogue.
-        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt1".into(), ggml_id_src);
-        sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt2".into(), ggml_id_src);
+        // ADR-063 Q4-GEMMA-DECODE F2 — expert-grouped Q4_K gate_up with the
+        // moe_swiglu_batch GELU*mul epilogue (frozen R0 = 4).
         sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
