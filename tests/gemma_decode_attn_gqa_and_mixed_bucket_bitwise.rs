@@ -299,6 +299,9 @@ impl Cell {
 struct Ctx {
     device: MlxDevice,
     registry: KernelRegistry,
+    /// Stock split-K partial words seen with 0 < |x| < 1e-37 (underflow
+    /// reach of the cells run so far).
+    tiny_stock_partials: usize,
 }
 
 impl Ctx {
@@ -306,6 +309,7 @@ impl Ctx {
         Self {
             device: MlxDevice::new().expect("Metal device"),
             registry: KernelRegistry::new(),
+            tiny_stock_partials: 0,
         }
     }
 }
@@ -655,6 +659,18 @@ fn check_cell(ctx: &mut Ctx, cell: &Cell, kv: &Kv) -> Vec<u32> {
             tmp: words(t),
         })
         .collect();
+    for (i, b) in buckets.iter().enumerate() {
+        if layout[i].is_some() {
+            let part = row * b.nwg as usize;
+            ctx.tiny_stock_partials += solos[i].tmp[..part]
+                .iter()
+                .filter(|&&w| {
+                    let x = f32::from_bits(w);
+                    x != 0.0 && x.abs() < 1.0e-37
+                })
+                .count();
+        }
+    }
 
     // Partials and S/M against each slot's solo tmp (S/M first: they carry
     // only the QK/softmax path); untouched words stay sentinel.
@@ -1041,6 +1057,122 @@ fn sliding_linear_mask_type3_bitwise() {
         0xF003,
     );
     check_all_groups(&mut ctx, &cell, &kv);
+}
+
+/// Underflow KV: K is random finite f16 bit patterns (extreme scores, very
+/// peaked softmax, weights down to FLT_MIN); V norms are 0 one in 251 and
+/// otherwise log-uniform in [1e-30, 1e5].
+fn make_kv_underflow(device: &MlxDevice, shape: &Shape, v_f16: bool, seed: u64) -> Kv {
+    let mut rng = Xor::new(seed);
+    let elems = (PHYS_SLOTS * shape.nkv * shape.cap * shape.dk) as usize;
+    let mut k = device
+        .alloc_buffer(elems * 2, DType::F16, vec![elems])
+        .expect("k");
+    for h in k.as_mut_slice::<u16>().unwrap() {
+        *h = loop {
+            let bits = rng.next_u32() as u16;
+            if (bits >> 10) & 0x1F != 0x1F {
+                break bits;
+            }
+        };
+    }
+    let v = if v_f16 {
+        let mut v = device
+            .alloc_buffer(elems * 2, DType::F16, vec![elems])
+            .expect("v");
+        for h in v.as_mut_slice::<u16>().unwrap() {
+            *h = rand_half_bits(&mut rng);
+        }
+        v
+    } else {
+        let mut v = device
+            .alloc_buffer(elems, DType::U8, vec![elems])
+            .expect("v");
+        for b in v.as_mut_slice::<u8>().unwrap() {
+            *b = rng.next_u32() as u8;
+        }
+        v
+    };
+    let n_norms = (PHYS_SLOTS * shape.nkv * shape.cap * npp(shape)) as usize;
+    let mut vn = device
+        .alloc_buffer(n_norms * 4, DType::F32, vec![n_norms])
+        .expect("vn");
+    for (i, x) in vn.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+        *x = if i % 251 == 0 {
+            0.0
+        } else {
+            10f64.powf(-30.0 + 35.0 * rng.signed().abs() as f64) as f32
+        };
+    }
+    Kv { k, v, vn, v_f16 }
+}
+
+/// KV lengths of the underflow cells (seq position = length - 1).
+const UNDERFLOW_KV_LENS: [u32; 4] = [783, 905, 1024, 2048];
+
+/// Every legal G at KV lengths 783/905/1024/2048, n_q 1/4/16, uniform and
+/// mixed buckets; then require the cells to have reached underflow.
+fn check_underflow_sweep(ctx: &mut Ctx, shape: Shape, kv: &Kv, tweak: &dyn Fn(&mut Cell), seed: u64) {
+    let before = ctx.tiny_stock_partials;
+    let mut k = 0u64;
+    for &len in &UNDERFLOW_KV_LENS {
+        for n in [1usize, 4, 16] {
+            let mut cell = Cell::new(shape, uniform_slots(len - 1, n), 1, seed + k);
+            k += 1;
+            tweak(&mut cell);
+            check_all_groups(ctx, &cell, kv);
+        }
+    }
+    for n in [4usize, 16] {
+        let slots: Vec<(u32, u32)> = uniform_slots(0, n)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (p, _))| (p, UNDERFLOW_KV_LENS[(i * 3 + 1) % 4] - 1))
+            .collect();
+        // Heuristic buckets (mixed at d512, where 2048 crosses the nsg edge;
+        // the d256 ring caps every length at 1024), then explicit mixed
+        // buckets: nwg 1 (direct O), odd nwg, nsg 1/2/4.
+        let b = |nwg, nsg| HybridSlotBucket { nwg, nsg };
+        let explicit = [b(32, 1), b(16, 2), b(1, 1), b(8, 4), b(3, 2), b(32, 4)];
+        let mut cell = Cell::new(shape, slots, 1, seed + k);
+        k += 1;
+        tweak(&mut cell);
+        check_all_groups(ctx, &cell, kv);
+        cell.buckets = Some((0..n).map(|i| explicit[i % explicit.len()]).collect());
+        check_all_groups(ctx, &cell, kv);
+    }
+    assert!(
+        ctx.tiny_stock_partials > before,
+        "{} seed {seed:#x}: underflow cells vacuous (no stock partial word with 0 < |x| < 1e-37)",
+        shape.name
+    );
+}
+
+#[test]
+fn underflow_d256_sliding_bitwise() {
+    let mut ctx = Ctx::new();
+    for (shape, seed) in [(SLIDING, 0x0F10_0256u64), (SLIDING_GQA8, 0x0F10_8256)] {
+        let kv = make_kv_underflow(&ctx.device, &shape, false, seed);
+        check_underflow_sweep(&mut ctx, shape, &kv, &|_| {}, seed);
+    }
+}
+
+#[test]
+fn underflow_d512_global_sf_and_f16_v_bitwise() {
+    let mut ctx = Ctx::new();
+    let kv = make_kv_underflow(&ctx.device, &GLOBAL, false, 0x0F10_0512);
+    // Non-power-of-two norm divisors (the default 22.627417 is one too).
+    for (k, sf) in [22.627417f32, 3.0, 0.7071068].into_iter().enumerate() {
+        check_underflow_sweep(
+            &mut ctx,
+            GLOBAL,
+            &kv,
+            &move |c: &mut Cell| c.sf_d512 = sf,
+            0x0F20_0000 + ((k as u64) << 8),
+        );
+    }
+    let kv16 = make_kv_underflow(&ctx.device, &GLOBAL, true, 0x0F16_0512);
+    check_underflow_sweep(&mut ctx, GLOBAL, &kv16, &|_| {}, 0x0F30_0000);
 }
 
 #[test]
