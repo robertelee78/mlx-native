@@ -13,6 +13,7 @@
 //! | `precise_vcodes_{window,mask}` | Q permute, [mask, fence, blk], precise d256 `_vcodes` reading the stage in place, O permute | Q permute, precise d512 `_vcodes` in place, O permute |
 //! | `precise_v32_window` | F32 V dequant, Q permute, precise d256 `_v32` (K in place), O permute | as `precise_vcodes` (d512 `_v32` is parity-only) |
 //! | `precise_v16cache_window` | as `precise_vcodes_window` on an F16 V cache | precise d512 `_v16` on an F16 V cache in place |
+//! | `vec_gqa` | as `vec`, through the GQA-grouped `flash_attn_vec_hybrid_batched_gqa` (Q4-GEMMA-DECODE lever A1; hf2q Q4-GEMMA-ATTN-EXACT R = 1, bitwise equal to `vec`), largest legal group at the chunk's bucket | same |
 //!
 //! Sliding lanes read hf2q's ring stage (`min(history, 1023)` history rows
 //! plus the chunk, capacity `1023 + min(suffix, 1024)`); global lanes read
@@ -32,7 +33,9 @@
 //!
 //! Method: per cell 10 warmup and 50 measured command buffers per arm,
 //! arms interleaved forward then reverse, GPU timestamps; median and p90.
-//! `BENCH_CELLS=four_lane,single,long` selects cell groups and
+//! `BENCH_CELLS=four_lane,single,long` selects cell groups,
+//! `BENCH_ARMS=vec,vec_gqa,...` selects arms (default: all; `vec` is always
+//! measured, the ratios' denominator), and
 //! `BENCH_OUT=<path>` writes the JSON receipt.  The receipt's commit is
 //! `GIT_COMMIT_SHA` from the run environment, else `git rev-parse HEAD` of
 //! the crate checkout.  Run once per metallib path
@@ -73,14 +76,20 @@ enum PreciseVIn {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     Vec,
+    /// Q4-GEMMA-ATTN-EXACT S0-b, R = 1: lever A1's grouped kernel.
+    VecGqa,
     TiledF16,
-    Precise { v: PreciseVIn, window: bool },
+    Precise {
+        v: PreciseVIn,
+        window: bool,
+    },
 }
 
 impl Arm {
     fn name(self) -> String {
         match self {
             Arm::Vec => "vec".into(),
+            Arm::VecGqa => "vec_gqa".into(),
             Arm::TiledF16 => "tiled_f16".into(),
             Arm::Precise { v, window } => format!(
                 "precise_{}_{}",
@@ -95,8 +104,9 @@ impl Arm {
     }
 }
 
-const ARMS: [Arm; 6] = [
+const ALL_ARMS: [Arm; 7] = [
     Arm::Vec,
+    Arm::VecGqa,
     Arm::TiledF16,
     Arm::Precise {
         v: PreciseVIn::Codes,
@@ -115,6 +125,28 @@ const ARMS: [Arm; 6] = [
         window: true,
     },
 ];
+
+/// The arms this run measures (`BENCH_ARMS`, default all; `vec` always).
+fn arms() -> &'static [Arm] {
+    static ARMS: std::sync::OnceLock<Vec<Arm>> = std::sync::OnceLock::new();
+    ARMS.get_or_init(|| match std::env::var("BENCH_ARMS") {
+        Ok(list) => {
+            let names: Vec<&str> = list.split(',').map(str::trim).collect();
+            let picked: Vec<Arm> = ALL_ARMS
+                .into_iter()
+                .filter(|a| *a == Arm::Vec || names.contains(&a.name().as_str()))
+                .collect();
+            for name in &names {
+                assert!(
+                    ALL_ARMS.iter().any(|a| a.name() == *name),
+                    "BENCH_ARMS: unknown arm {name:?}"
+                );
+            }
+            picked
+        }
+        Err(_) => ALL_ARMS.to_vec(),
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -157,7 +189,7 @@ fn chunks(lane: &Lane, arm: Arm) -> Vec<(usize, usize, usize, usize)> {
         let start = lane.history + local;
         let remaining = lane.suffix - local;
         let len = match (arm, lane.kind) {
-            (Arm::Vec, _) => {
+            (Arm::Vec | Arm::VecGqa, _) => {
                 let mut len = remaining.min(VEC_CHUNK);
                 for boundary in [512usize, 1024] {
                     if start < boundary && start + len > boundary {
@@ -349,7 +381,7 @@ fn encode_attention(
     let (d, h, h_kv) = (lane.d, N_HEADS, lane.h_kv);
     let row = h * d;
     match (arm, lane.kind) {
-        (Arm::Vec, _) => {
+        (Arm::Vec | Arm::VecGqa, _) => {
             let q = lane.q.slice_view((local * row * 4) as u64, len * row);
             let out = lane.out.slice_view((local * row * 4) as u64, len * row);
             let params = FlashAttnVecTqHbParams {
@@ -374,6 +406,33 @@ fn encode_attention(
             };
             let slots = lane.vec_slots.slice_view(0, len);
             let pos = lane.vec_pos.slice_view((local * 4) as u64, len);
+            if arm == Arm::VecGqa {
+                let bucket = flash_attn_vec_hybrid::HybridSlotBucket::for_kv_seq_len(kl as u32);
+                let group = flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_gqa_pick_group(
+                    h as u32,
+                    h_kv as u32,
+                    d as u32,
+                    bucket.nsg,
+                );
+                flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_gqa(
+                    enc,
+                    reg,
+                    dev,
+                    &q,
+                    &lane.k,
+                    &lane.codes,
+                    &lane.norms,
+                    &out,
+                    s.vec_tmp.as_ref().unwrap(),
+                    &slots,
+                    &pos,
+                    &params,
+                    group,
+                    &vec![bucket; len],
+                )
+                .unwrap();
+                return;
+            }
             flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
                 enc,
                 reg,
@@ -507,12 +566,19 @@ fn encode_chain(
     for chunk in chunks(lane, arm) {
         let (local, len, q_offset, kl) = chunk;
         let mut s = ChunkScratch::default();
-        if arm == Arm::Vec {
-            s.vec_tmp = Some(alloc(
-                dev,
-                DType::F32,
-                len * flash_attn_vec_hybrid::tmp_buffer_bytes(h as u32, d as u32) / 4,
-            ));
+        if matches!(arm, Arm::Vec | Arm::VecGqa) {
+            let tmp_bytes = if arm == Arm::VecGqa {
+                let bucket = flash_attn_vec_hybrid::HybridSlotBucket::for_kv_seq_len(kl as u32);
+                flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_gqa_tmp_bytes(
+                    h as u32,
+                    d as u32,
+                    &vec![bucket; len],
+                )
+                .unwrap()
+            } else {
+                len * flash_attn_vec_hybrid::tmp_buffer_bytes(h as u32, d as u32)
+            };
+            s.vec_tmp = Some(alloc(dev, DType::F32, tmp_bytes / 4));
             encode_attention(dev, reg, enc, lane, arm, chunk, &s);
             enc.memory_barrier();
             all.push(s);
@@ -686,7 +752,7 @@ fn measure(
 ) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
     // Prepare each arm's attention inputs with one full chain.
     let mut prepared: Vec<Vec<Vec<ChunkScratch>>> = Vec::new();
-    for arm in ARMS {
+    for &arm in arms() {
         let mut enc = dev.command_encoder().unwrap();
         let p: Vec<_> = lanes
             .iter()
@@ -696,7 +762,7 @@ fn measure(
         prepared.push(p);
     }
     let mut scratch = serde_json::Map::new();
-    for (a, arm) in ARMS.into_iter().enumerate() {
+    for (a, &arm) in arms().iter().enumerate() {
         let per_lane: Vec<_> = lanes
             .iter()
             .zip(&prepared[a])
@@ -716,27 +782,27 @@ fn measure(
     }
     let mut out = Vec::new();
     for attn_only in [false, true] {
-        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); ARMS.len()];
-        let order: Vec<usize> = (0..ARMS.len()).chain((0..ARMS.len()).rev()).collect();
+        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms().len()];
+        let order: Vec<usize> = (0..arms().len()).chain((0..arms().len()).rev()).collect();
         for round in 0..(WARMUP + MEASURED).div_ceil(2) {
             for &a in &order {
                 let p = attn_only.then(|| prepared[a].as_slice());
-                let ms = time_cb(dev, reg, lanes, ARMS[a], p);
+                let ms = time_cb(dev, reg, lanes, arms()[a], p);
                 if round * 2 >= WARMUP {
                     samples[a].push(ms);
                 }
             }
         }
-        let mut arms = serde_json::Map::new();
+        let mut medians = serde_json::Map::new();
         for (a, mut s) in samples.into_iter().enumerate() {
             s.sort_by(f64::total_cmp);
             s.truncate(MEASURED);
-            arms.insert(
-                ARMS[a].name(),
+            medians.insert(
+                arms()[a].name(),
                 serde_json::json!({"median_ms": quantile(&s, 0.5), "p90_ms": quantile(&s, 0.9), "n": s.len()}),
             );
         }
-        out.push(serde_json::Value::Object(arms));
+        out.push(serde_json::Value::Object(medians));
     }
     let attn = out.pop().unwrap();
     let chain = out.pop().unwrap();
@@ -856,19 +922,51 @@ fn main() {
     // Model-level projection and the frozen M1/M2 ratios on the four-lane
     // cells: 25 sliding + 5 global layers per transaction, chain medians.
     let mut totals = std::collections::BTreeMap::<String, f64>::new();
+    // Per layer kind as well, for the S0-b report (r per layer type).
+    let mut by_kind = std::collections::BTreeMap::<String, f64>::new();
     for cell in cells.iter().filter(|c| c["group"] == "four_lane") {
         let layers = if cell["kind"] == "sliding" { 25.0 } else { 5.0 };
-        for arm in ARMS {
-            *totals.entry(arm.name()).or_default() +=
-                layers * cell["chain"][arm.name()]["median_ms"].as_f64().unwrap();
+        for &arm in arms() {
+            let ms = layers * cell["chain"][arm.name()]["median_ms"].as_f64().unwrap();
+            *totals.entry(arm.name()).or_default() += ms;
+            *by_kind
+                .entry(format!("{}/{}", arm.name(), cell["kind"].as_str().unwrap()))
+                .or_default() += ms;
         }
     }
+    // Q4-GEMMA-ATTN-EXACT S0-b: weighted chain ratio of the grouped arm
+    // against the vec chain (go if <= 0.70), overall and per layer kind, and
+    // the per-cell rule (no cell more than 2% slower than vec).
+    let s0b = totals.get("vec_gqa").map(|gqa| {
+        let kind_ratio = |k: &str| {
+            by_kind
+                .get(&format!("vec_gqa/{k}"))
+                .zip(by_kind.get(&format!("vec/{k}")))
+                .map(|(a, b)| a / b)
+        };
+        let slow_cells: Vec<String> = cells
+            .iter()
+            .filter(|c| {
+                let r = c["chain"]["vec_gqa"]["median_ms"].as_f64().unwrap()
+                    / c["chain"]["vec"]["median_ms"].as_f64().unwrap();
+                r > 1.02
+            })
+            .map(|c| format!("{} {} {}", c["group"], c["label"], c["kind"]))
+            .collect();
+        serde_json::json!({
+            "chain_ratio_vec_gqa_over_vec": gqa / totals["vec"],
+            "sliding_ratio": kind_ratio("sliding"),
+            "global_ratio": kind_ratio("global"),
+            "go_threshold": 0.70,
+            "cells_more_than_2pct_slower": slow_cells,
+        })
+    });
     let ratios: serde_json::Map<String, serde_json::Value> = if totals.is_empty() {
         serde_json::Map::new()
     } else {
         totals
             .iter()
-            .filter(|(name, _)| name.starts_with("precise"))
+            .filter(|(name, _)| name.starts_with("precise") && totals.contains_key("tiled_f16"))
             .map(|(name, ms)| {
                 (
                     name.clone(),
@@ -898,6 +996,28 @@ fn main() {
             "embedded_metallib_sha256": id.embedded_metallib_sha256})
     })
     .collect::<Vec<_>>();
+    // Origins of the grouped pipelines the vec_gqa arm can issue.
+    let mut gqa_identity = Vec::new();
+    for dk in [256u32, 512] {
+        for g in flash_attn_vec_hybrid::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
+            let name = format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}");
+            let label = reg
+                .get_pipeline_with_constants(
+                    &name,
+                    dev.metal_device(),
+                    &[],
+                    &[(50, CODEBOOK_BITS as i32), (51, 0)],
+                )
+                .unwrap()
+                .label()
+                .to_owned();
+            let id = reg.pipeline_identity(&label).unwrap();
+            gqa_identity.push(
+                serde_json::json!({"label": label, "origin": format!("{:?}", id.origin),
+                "embedded_metallib_sha256": id.embedded_metallib_sha256}),
+            );
+        }
+    }
     let exe = std::env::current_exe().unwrap();
     let os = std::process::Command::new("sw_vers")
         .arg("-buildVersion")
@@ -915,6 +1035,9 @@ fn main() {
         "warmup": WARMUP, "measured": MEASURED,
         "four_lane_projection_ms": totals,
         "four_lane_ratios": ratios,
+        "four_lane_projection_by_kind_ms": by_kind,
+        "s0b": s0b,
+        "gqa_pipelines": gqa_identity,
         "cells": cells,
     });
     let text = serde_json::to_string_pretty(&receipt).unwrap();
