@@ -13,6 +13,7 @@
 //! | `precise_vcodes_{window,mask}` | Q permute, [mask, fence, blk], precise d256 `_vcodes` reading the stage in place, O permute | Q permute, precise d512 `_vcodes` in place, O permute |
 //! | `precise_v32_window` | F32 V dequant, Q permute, precise d256 `_v32` (K in place), O permute | as `precise_vcodes` (d512 `_v32` is parity-only) |
 //! | `precise_v16cache_window` | as `precise_vcodes_window` on an F16 V cache | precise d512 `_v16` on an F16 V cache in place |
+//! | `vec_rows` | as `vec`, through `flash_attn_vec_hybrid_batched_rows` (hf2q Q4-GEMMA-ATTN-EXACT, bitwise equal to `vec`) at `(G, R)` from `ROWS_SLIDING=G,R` / `ROWS_GLOBAL=G,R` (default 2,4 / 2,2); R halves until legal at the chunk's NSG | same |
 //! | `vec_gqa` | as `vec`, through the GQA-grouped `flash_attn_vec_hybrid_batched_gqa` (Q4-GEMMA-DECODE lever A1; hf2q Q4-GEMMA-ATTN-EXACT R = 1, bitwise equal to `vec`), largest legal group at the chunk's bucket | same |
 //!
 //! Sliding lanes read hf2q's ring stage (`min(history, 1023)` history rows
@@ -78,6 +79,8 @@ enum Arm {
     Vec,
     /// Q4-GEMMA-ATTN-EXACT S0-b, R = 1: lever A1's grouped kernel.
     VecGqa,
+    /// Q4-GEMMA-ATTN-EXACT S0-b, R > 1: the batched-rows kernel.
+    VecRows,
     TiledF16,
     Precise {
         v: PreciseVIn,
@@ -90,6 +93,7 @@ impl Arm {
         match self {
             Arm::Vec => "vec".into(),
             Arm::VecGqa => "vec_gqa".into(),
+            Arm::VecRows => "vec_rows".into(),
             Arm::TiledF16 => "tiled_f16".into(),
             Arm::Precise { v, window } => format!(
                 "precise_{}_{}",
@@ -104,9 +108,10 @@ impl Arm {
     }
 }
 
-const ALL_ARMS: [Arm; 7] = [
+const ALL_ARMS: [Arm; 8] = [
     Arm::Vec,
     Arm::VecGqa,
+    Arm::VecRows,
     Arm::TiledF16,
     Arm::Precise {
         v: PreciseVIn::Codes,
@@ -125,6 +130,37 @@ const ALL_ARMS: [Arm; 7] = [
         window: true,
     },
 ];
+
+/// `(G, R)` of the `vec_rows` arm for a layer kind at a chunk's NSG:
+/// `ROWS_SLIDING` / `ROWS_GLOBAL` (`G,R`), R halved until legal.
+fn rows_config(kind: Kind, h_kv: usize, d: usize, nsg: u32) -> (u32, u32) {
+    let (var, default) = match kind {
+        Kind::Sliding => ("ROWS_SLIDING", (2, 4)),
+        Kind::Global => ("ROWS_GLOBAL", (2, 2)),
+    };
+    let (g, mut r) = std::env::var(var)
+        .ok()
+        .map(|v| {
+            let mut it = v.split(',').map(|x| x.trim().parse::<u32>().expect(var));
+            (it.next().expect(var), it.next().expect(var))
+        })
+        .unwrap_or(default);
+    let legal = |g: u32, r: u32| {
+        flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_rows_is_legal(
+            N_HEADS as u32,
+            h_kv as u32,
+            d as u32,
+            g,
+            r,
+            nsg,
+        )
+    };
+    while r > 1 && !legal(g, r) {
+        r /= 2;
+    }
+    assert!(legal(g, r), "{var}: (G {g}, R {r}) illegal at nsg {nsg}");
+    (g, r)
+}
 
 /// The arms this run measures (`BENCH_ARMS`, default all; `vec` always).
 fn arms() -> &'static [Arm] {
@@ -189,7 +225,7 @@ fn chunks(lane: &Lane, arm: Arm) -> Vec<(usize, usize, usize, usize)> {
         let start = lane.history + local;
         let remaining = lane.suffix - local;
         let len = match (arm, lane.kind) {
-            (Arm::Vec | Arm::VecGqa, _) => {
+            (Arm::Vec | Arm::VecGqa | Arm::VecRows, _) => {
                 let mut len = remaining.min(VEC_CHUNK);
                 for boundary in [512usize, 1024] {
                     if start < boundary && start + len > boundary {
@@ -381,7 +417,7 @@ fn encode_attention(
     let (d, h, h_kv) = (lane.d, N_HEADS, lane.h_kv);
     let row = h * d;
     match (arm, lane.kind) {
-        (Arm::Vec | Arm::VecGqa, _) => {
+        (Arm::Vec | Arm::VecGqa | Arm::VecRows, _) => {
             let q = lane.q.slice_view((local * row * 4) as u64, len * row);
             let out = lane.out.slice_view((local * row * 4) as u64, len * row);
             let params = FlashAttnVecTqHbParams {
@@ -406,6 +442,30 @@ fn encode_attention(
             };
             let slots = lane.vec_slots.slice_view(0, len);
             let pos = lane.vec_pos.slice_view((local * 4) as u64, len);
+            if arm == Arm::VecRows {
+                let bucket = flash_attn_vec_hybrid::HybridSlotBucket::for_kv_seq_len(kl as u32);
+                let (g, r) = rows_config(lane.kind, h_kv, d, bucket.nsg);
+                flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_rows(
+                    enc,
+                    reg,
+                    dev,
+                    len as u32,
+                    &q,
+                    &lane.k,
+                    &lane.codes,
+                    &lane.norms,
+                    &out,
+                    s.vec_tmp.as_ref().unwrap(),
+                    &slots,
+                    &pos,
+                    &params,
+                    g,
+                    r,
+                    bucket,
+                )
+                .unwrap();
+                return;
+            }
             if arm == Arm::VecGqa {
                 let bucket = flash_attn_vec_hybrid::HybridSlotBucket::for_kv_seq_len(kl as u32);
                 let group = flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_gqa_pick_group(
@@ -566,7 +626,7 @@ fn encode_chain(
     for chunk in chunks(lane, arm) {
         let (local, len, q_offset, kl) = chunk;
         let mut s = ChunkScratch::default();
-        if matches!(arm, Arm::Vec | Arm::VecGqa) {
+        if matches!(arm, Arm::Vec | Arm::VecGqa | Arm::VecRows) {
             let tmp_bytes = if arm == Arm::VecGqa {
                 let bucket = flash_attn_vec_hybrid::HybridSlotBucket::for_kv_seq_len(kl as u32);
                 flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_gqa_tmp_bytes(
@@ -937,30 +997,32 @@ fn main() {
     // Q4-GEMMA-ATTN-EXACT S0-b: weighted chain ratio of the grouped arm
     // against the vec chain (go if <= 0.70), overall and per layer kind, and
     // the per-cell rule (no cell more than 2% slower than vec).
-    let s0b = totals.get("vec_gqa").map(|gqa| {
-        let kind_ratio = |k: &str| {
-            by_kind
-                .get(&format!("vec_gqa/{k}"))
-                .zip(by_kind.get(&format!("vec/{k}")))
-                .map(|(a, b)| a / b)
-        };
-        let slow_cells: Vec<String> = cells
-            .iter()
-            .filter(|c| {
-                let r = c["chain"]["vec_gqa"]["median_ms"].as_f64().unwrap()
-                    / c["chain"]["vec"]["median_ms"].as_f64().unwrap();
-                r > 1.02
+    let s0b_of = |arm: &str| {
+        totals.get(arm).map(|gqa| {
+            let kind_ratio = |k: &str| {
+                by_kind
+                    .get(&format!("{arm}/{k}"))
+                    .zip(by_kind.get(&format!("vec/{k}")))
+                    .map(|(a, b)| a / b)
+            };
+            let slow_cells: Vec<String> = cells
+                .iter()
+                .filter(|c| {
+                    let r = c["chain"][arm]["median_ms"].as_f64().unwrap()
+                        / c["chain"]["vec"]["median_ms"].as_f64().unwrap();
+                    r > 1.02
+                })
+                .map(|c| format!("{} {} {}", c["group"], c["label"], c["kind"]))
+                .collect();
+            serde_json::json!({
+                "chain_ratio_over_vec": gqa / totals["vec"],
+                "sliding_ratio": kind_ratio("sliding"),
+                "global_ratio": kind_ratio("global"),
+                "go_threshold": 0.70,
+                "cells_more_than_2pct_slower": slow_cells,
             })
-            .map(|c| format!("{} {} {}", c["group"], c["label"], c["kind"]))
-            .collect();
-        serde_json::json!({
-            "chain_ratio_vec_gqa_over_vec": gqa / totals["vec"],
-            "sliding_ratio": kind_ratio("sliding"),
-            "global_ratio": kind_ratio("global"),
-            "go_threshold": 0.70,
-            "cells_more_than_2pct_slower": slow_cells,
         })
-    });
+    };
     let ratios: serde_json::Map<String, serde_json::Value> = if totals.is_empty() {
         serde_json::Map::new()
     } else {
@@ -1036,7 +1098,8 @@ fn main() {
         "four_lane_projection_ms": totals,
         "four_lane_ratios": ratios,
         "four_lane_projection_by_kind_ms": by_kind,
-        "s0b": s0b,
+        "s0b": {"vec_gqa": s0b_of("vec_gqa"), "vec_rows": s0b_of("vec_rows")},
+        "rows_config": {"sliding": std::env::var("ROWS_SLIDING").ok(), "global": std::env::var("ROWS_GLOBAL").ok()},
         "gqa_pipelines": gqa_identity,
         "cells": cells,
     });

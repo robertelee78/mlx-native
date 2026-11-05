@@ -263,8 +263,18 @@ fn view(device: &MlxDevice, floats: usize) -> (MlxBuffer, MlxBuffer) {
     (base, v)
 }
 
-/// `group = None`: the stock batched dispatch + reduce; `Some(g)`: A1.
-fn run(ctx: &mut Ctx, cell: &Cell, kv: &Kv, group: Option<u32>) -> Run {
+/// The kernel under test.
+#[derive(Clone, Copy, Debug)]
+enum Variant {
+    /// Stock `flash_attn_vec_hybrid_batched` + reduce (the reference).
+    Stock,
+    /// Lever A1 `flash_attn_vec_hybrid_batched_gqa` (R = 1) at group G.
+    Gqa(u32),
+    /// `flash_attn_vec_hybrid_batched_rows` at (group G, rows R).
+    Rows(u32, u32),
+}
+
+fn run(ctx: &mut Ctx, cell: &Cell, kv: &Kv, variant: Variant) -> Run {
     let n = cell.positions.len();
     let row = (NH * cell.layer.dk()) as usize;
     let mut q_words = vec![SENTINEL; GUARD];
@@ -290,8 +300,8 @@ fn run(ctx: &mut Ctx, cell: &Cell, kv: &Kv, group: Option<u32>) -> Run {
     let (out_base, out) = view(&ctx.device, n * row);
     let (tmp_base, tmp) = view(&ctx.device, tmp_floats);
     let mut enc = ctx.device.command_encoder().unwrap();
-    match group {
-        None => fa::flash_attn_vec_hybrid_batched(
+    match variant {
+        Variant::Stock => fa::flash_attn_vec_hybrid_batched(
             &mut enc,
             &mut ctx.registry,
             &ctx.device,
@@ -306,7 +316,7 @@ fn run(ctx: &mut Ctx, cell: &Cell, kv: &Kv, group: Option<u32>) -> Run {
             &seq_pos,
             &params,
         ),
-        Some(g) => fa::flash_attn_vec_hybrid_batched_gqa(
+        Variant::Gqa(g) => fa::flash_attn_vec_hybrid_batched_gqa(
             &mut enc,
             &mut ctx.registry,
             &ctx.device,
@@ -322,8 +332,26 @@ fn run(ctx: &mut Ctx, cell: &Cell, kv: &Kv, group: Option<u32>) -> Run {
             g,
             &buckets,
         ),
+        Variant::Rows(g, r) => fa::flash_attn_vec_hybrid_batched_rows(
+            &mut enc,
+            &mut ctx.registry,
+            &ctx.device,
+            n as u32,
+            &q,
+            &kv.k,
+            &kv.v,
+            &kv.vn,
+            &out,
+            &tmp,
+            &slot_ids,
+            &seq_pos,
+            &params,
+            g,
+            r,
+            b,
+        ),
     }
-    .unwrap_or_else(|e| panic!("{} group={group:?}: dispatch: {e}", cell.label));
+    .unwrap_or_else(|e| panic!("{} {variant:?}: dispatch: {e}", cell.label));
     enc.commit_and_wait().unwrap();
     let (out, tmp) = (words(&out_base), words(&tmp_base));
     for (name, w) in [("O", &out), ("tmp", &tmp)] {
@@ -332,7 +360,7 @@ fn run(ctx: &mut Ctx, cell: &Cell, kv: &Kv, group: Option<u32>) -> Run {
                 .iter()
                 .chain(&w[w.len() - GUARD..])
                 .all(|&x| x == SENTINEL),
-            "{} group={group:?}: wrote outside the {name} view",
+            "{} {variant:?}: wrote outside the {name} view",
             cell.label
         );
     }
@@ -355,17 +383,48 @@ fn legal_groups(layer: Layer, nsg: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Every legal group against the stock dispatch: O and tmp, u32-equal.
+/// Every legal (G, R) pair at the cell's NSG: (G, 1) through A1 and the rows
+/// kernel; R > 1 through the rows kernel.
+fn legal_variants(layer: Layer, nsg: u32) -> Vec<Variant> {
+    let mut v: Vec<Variant> = legal_groups(layer, nsg)
+        .into_iter()
+        .map(Variant::Gqa)
+        .collect();
+    v.extend(
+        fa::FLASH_ATTN_VEC_HYBRID_ROWS_CONFIGS
+            .iter()
+            .filter(|&&(g, r)| {
+                fa::flash_attn_vec_hybrid_batched_rows_is_legal(
+                    NH,
+                    layer.nkv(),
+                    layer.dk(),
+                    g,
+                    r,
+                    nsg,
+                )
+            })
+            .map(|&(g, r)| Variant::Rows(g, r)),
+    );
+    v
+}
+
+/// Every legal variant against the stock dispatch: O and tmp, u32-equal.
 /// Returns the stock O rows (without guards).
 fn check(ctx: &mut Ctx, cell: &Cell, kv: &Kv) -> Vec<u32> {
-    let stock = run(ctx, cell, kv, None);
-    let groups = legal_groups(cell.layer, cell.bucket().nsg);
-    assert!(groups.contains(&1), "{}: G=1 must be legal", cell.label);
-    for g in groups {
-        let cand = run(ctx, cell, kv, Some(g));
+    let stock = run(ctx, cell, kv, Variant::Stock);
+    let variants = legal_variants(cell.layer, cell.bucket().nsg);
+    assert!(
+        variants
+            .iter()
+            .any(|v| matches!(v, Variant::Rows(_, r) if *r > 1)),
+        "{}: some R > 1 must be legal",
+        cell.label
+    );
+    for variant in variants {
+        let cand = run(ctx, cell, kv, variant);
         if let Some(i) = cand.out.iter().zip(&stock.out).position(|(a, b)| a != b) {
             panic!(
-                "{} G={g}: O word {} differs ({:#x} vs stock {:#x})",
+                "{} {variant:?}: O word {} differs ({:#x} vs stock {:#x})",
                 cell.label,
                 i - GUARD,
                 cand.out[i],
@@ -375,11 +434,23 @@ fn check(ctx: &mut Ctx, cell: &Cell, kv: &Kv) -> Vec<u32> {
         assert_eq!(
             cand.tmp.len(),
             stock.tmp.len(),
-            "{} G={g}: tmp layout size",
+            "{} {variant:?}: tmp layout size",
             cell.label
         );
+        let diffs = cand
+            .tmp
+            .iter()
+            .zip(&stock.tmp)
+            .filter(|(a, b)| a != b)
+            .count();
         if let Some(i) = cand.tmp.iter().zip(&stock.tmp).position(|(a, b)| a != b) {
-            panic!("{} G={g}: tmp word {} differs", cell.label, i - GUARD);
+            panic!(
+                "{} {variant:?}: {diffs} tmp words differ; first word {} ({:#x} vs stock {:#x})",
+                cell.label,
+                i - GUARD,
+                cand.tmp[i],
+                stock.tmp[i]
+            );
         }
     }
     stock.out[GUARD..stock.out.len() - GUARD].to_vec()
@@ -635,9 +706,19 @@ fn pipelines_resolve_on_the_selected_metallib_path() {
         KernelPipelineOrigin::RuntimeSource
     };
     let mut ctx = ctx();
+    let mut names = Vec::new();
     for dk in [256u32, 512] {
         for g in fa::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
-            let name = format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}");
+            names.push(format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}"));
+        }
+        for (g, r) in fa::FLASH_ATTN_VEC_HYBRID_ROWS_CONFIGS {
+            names.push(format!(
+                "flash_attn_vec_hybrid_batched_rows_g{g}_r{r}_dk{dk}"
+            ));
+        }
+    }
+    {
+        for name in names {
             for (cbits, v16) in [(8, 0), (6, 0), (5, 0), (8, 1)] {
                 let label = ctx
                     .registry
@@ -659,4 +740,76 @@ fn pipelines_resolve_on_the_selected_metallib_path() {
         }
     }
     eprintln!("GEMMA_WARM_ATTN_EXACT_S0A_ORIGIN {expected:?}");
+}
+
+#[test]
+fn rows_kernel_refuses_mixed_slots_unordered_rows_and_ring_masks() {
+    let mut ctx = ctx();
+    let rows = 8u32;
+    let kv = make_kv(
+        &ctx.device,
+        Layer::Sliding,
+        SLIDING_CAP - 1 + rows,
+        false,
+        0xBAD1,
+    );
+    let cell = sliding_cell(100, rows, 8, 0xBAD2);
+    let n = rows as usize;
+    let row = (NH * Layer::Sliding.dk()) as usize;
+    let q = words_buffer(
+        &ctx.device,
+        &cell.q.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        DType::F32,
+    );
+    let (out_base, out) = view(&ctx.device, n * row);
+    let (_tmp_base, tmp) = view(&ctx.device, n * (NH * 32 * (256 + 2)) as usize);
+    let b = cell.bucket();
+    let attempt = |ctx: &mut Ctx, slots: Vec<u32>, pos: Vec<u32>, mask_type: u32| {
+        let slot_ids = words_buffer(&ctx.device, &slots, DType::U32);
+        let seq_pos = words_buffer(&ctx.device, &pos, DType::U32);
+        let mut params = cell.params(&kv);
+        params.mask_type = mask_type;
+        let mut enc = ctx.device.command_encoder().unwrap();
+        let r = fa::flash_attn_vec_hybrid_batched_rows(
+            &mut enc,
+            &mut ctx.registry,
+            &ctx.device,
+            rows,
+            &q,
+            &kv.k,
+            &kv.v,
+            &kv.vn,
+            &out,
+            &tmp,
+            &slot_ids,
+            &seq_pos,
+            &params,
+            2,
+            4,
+            b,
+        );
+        enc.commit_and_wait().unwrap();
+        r
+    };
+    let good: Vec<u32> = cell.positions.clone();
+    let mut mixed = vec![0u32; n];
+    mixed[2] = 1;
+    assert!(
+        attempt(&mut ctx, mixed, good.clone(), 3).is_err(),
+        "mixed slots in a row block"
+    );
+    let mut unordered = good.clone();
+    unordered.swap(1, 2);
+    assert!(
+        attempt(&mut ctx, vec![0; n], unordered, 3).is_err(),
+        "unordered rows in a block"
+    );
+    assert!(
+        attempt(&mut ctx, vec![0; n], good.clone(), 2).is_err(),
+        "ring mask refused"
+    );
+    assert!(
+        words(&out_base).iter().all(|&w| w == SENTINEL),
+        "refused calls wrote O"
+    );
 }

@@ -1501,6 +1501,16 @@ impl KernelRegistry {
         ] {
             sources.insert(name.into(), hybrid_src);
         }
+        // hf2q ADR-063 Q4-GEMMA-ATTN-EXACT — batched-rows warm-prefill flash
+        // (same source file and compile flags as the batched reference).
+        for dk in [256u32, 512] {
+            for (g, r) in crate::ops::flash_attn_vec_hybrid::FLASH_ATTN_VEC_HYBRID_ROWS_CONFIGS {
+                sources.insert(
+                    format!("flash_attn_vec_hybrid_batched_rows_g{g}_r{r}_dk{dk}"),
+                    hybrid_src,
+                );
+            }
+        }
 
         // ADR-029: verbatim peer port.
         // F16-K + F16-V, DK=DV=256, NWG=1, NSG=1, NE=1. No function constants — baked.

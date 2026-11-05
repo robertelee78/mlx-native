@@ -1761,3 +1761,544 @@ template [[host_name("flash_attn_vec_hybrid_batched_gqa4_dk512")]]
 kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_impl<512, 512, 4>;
 template [[host_name("flash_attn_vec_hybrid_batched_gqa8_dk512")]]
 kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_impl<512, 512, 8>;
+
+
+// --------------------------------------------------------------------------
+// hf2q ADR-063 Q4-GEMMA-ATTN-EXACT — batched-rows warm-prefill flash.
+//
+// `flash_attn_vec_hybrid_batched_gqa_impl` generalised from G query heads to
+// P = R·G members: R consecutive query rows of ONE slot × the G heads that
+// share one KV head. Member m = r·G + g. Every per-member expression is the
+// A1 (and so the stock batched) expression; members share only the K half4
+// load and the centroid decode. Contract (host-validated):
+//   * every row of a threadgroup's block belongs to one slot, and the rows'
+//     seq_pos are strictly increasing;
+//   * one (nwg, nsg) bucket for the whole dispatch (params.nwg/params.nsg),
+//     so `dst` is the stock batched layout (rid = head + row·n_heads) and the
+//     stock reduce applies;
+//   * mask_type 1 (causal over linear storage) or 3 (sliding over linear
+//     storage). The ring form (2) is refused.
+// Rows differ in their key count, so a member is "live" for a chunk iff
+// ic < its ksl (stock breaks otherwise) and "active" iff it is live and its
+// mask is not all <= -65504 (stock continues otherwise). Inactive members
+// write nothing for the chunk; barriers and simd_* stay uniform.
+// --------------------------------------------------------------------------
+
+#define HYB_ROWS_UNROLL _Pragma("clang loop unroll(full)")
+
+template<short DK, short DV, short G, short R>
+kernel void flash_attn_vec_hybrid_batched_rows_impl(
+    constant FlashAttnVecTqHbParams     &params      [[buffer(0)]],
+    device const float                  *Q           [[buffer(1)]],
+    device const half                   *K_f16       [[buffer(2)]],
+    device const uint8_t                *V_packed    [[buffer(3)]],
+    device const float                  *V_norms     [[buffer(4)]],
+    device       float                  *dst         [[buffer(5)]],
+    device const uint                   *slot_id_arr [[buffer(6)]],
+    device const uint                   *seq_pos_arr [[buffer(7)]],
+    device       float                  *out         [[buffer(9)]],
+    threadgroup  half                   *shmem       [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr short DK4 = DK / 4;
+    constexpr short DV4 = DV / 4;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NL  = NW;
+    constexpr short PK  = PAD2(DK, 128);
+    constexpr short PK4 = PK / 4;
+    constexpr short PV  = PAD2(DV, 128);
+    constexpr short SH  = 4 * C;
+    constexpr short P   = R * G;
+
+    static_assert(DK % 32 == 0, "DK must be divisible by 32");
+    static_assert(DV % 32 == 0, "DV must be divisible by 32");
+    static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
+    static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
+    static_assert(G == 1 || G == 2 || G == 4 || G == 8, "G must be 1, 2, 4 or 8");
+    static_assert(R == 1 || R == 2 || R == 4 || R == 8, "R must be 1, 2, 4 or 8");
+
+    const uint NWG = params.nwg;
+    const uint NSG = params.nsg;
+    const ushort iwg = tgpig[2] % NWG;
+    const uint   row0 = (uint)tgpig[0] * (uint)R;   // first query row of the block
+    const uint   h0   = (uint)tgpig[1] * (uint)G;   // first query head of the group
+    const uint   n_q  = params.n_queries;
+
+    const bool   is_sliding_b = (params.mask_type == 3u);
+    constexpr ushort npp_b = (DK == 512) ? 2 : 1;
+    const uint   slot_b    = slot_id_arr[row0];      // one slot per block (host-validated)
+    const uint   k_off_b   = slot_b * params.n_kv_heads * params.kv_capacity * DK;
+    const uint   v_off_b   = slot_b * params.n_kv_heads * params.kv_capacity * DV;
+    const uint   vn_off_b  = slot_b * params.n_kv_heads * params.kv_capacity * npp_b;
+
+    const uint heads_per_kv = params.n_heads / params.n_kv_heads;
+    const uint kv_head = h0 / heads_per_kv;
+
+    // Per-row key count and sliding-window start (stock form, per row).
+    uint ksl_r[R];
+    uint wsl_r[R];
+    uint ksl_max = 0;
+    HYB_ROWS_UNROLL
+    for (short r = 0; r < R; ++r) {
+        const uint iq1 = row0 + (uint)r;
+        const uint ksl = (iq1 < n_q) ? (seq_pos_arr[iq1] + 1u) : 0u;  // absent rows: no keys
+        ksl_r[r] = ksl;
+        uint wsl = 0;
+        if (is_sliding_b && params.sliding_window > 0 && ksl > params.sliding_window) {
+            wsl = ksl - params.sliding_window;
+        }
+        wsl_r[r] = wsl;
+        ksl_max = max(ksl_max, ksl);
+    }
+
+    const uint ss_base = (uint)P * PK;
+    const uint so_base = (uint)P * PK + (uint)P * NSG * SH;
+
+    HYB_ROWS_UNROLL
+    for (short m = 0; m < P; ++m) {
+        const short r = m / G;
+        const short g = m % G;
+        const uint iq1 = row0 + (uint)r;
+        const uint iq2 = h0 + (uint)g;
+        threadgroup half4 *sq4 = (threadgroup half4 *)(shmem + (uint)m * PK);
+        if (iq1 < n_q) {
+            const uint q_off_b = iq1 * params.n_heads * DK;
+            if (params.fuse_fwht_pre != 0u) {
+                constexpr ushort EPT = DK / 32;
+                const uint base = q_off_b + iq2 * DK + tiisg * EPT;
+                float elems[EPT];
+                for (ushort i = 0; i < EPT; i++) {
+                    elems[i] = Q[base + i];
+                }
+                for (ushort i = 0; i < EPT; i++) {
+                    ushort j = tiisg * EPT + i;
+                    uint8_t sign_byte = (DK == 256) ? TBQ_SIGNS_256_FA[j >> 3] : TBQ_SIGNS_512_FA[j >> 3];
+                    float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+                    elems[i] *= sign_val;
+                }
+                fwht_simd_fa<EPT>(elems, (uint)tiisg);
+                const float inv_sqrt_d = rsqrt(float(DK));
+                for (ushort i = 0; i < EPT; i++) {
+                    elems[i] *= inv_sqrt_d;
+                }
+                constexpr ushort SQ4_PER_THREAD = EPT / 4;
+                for (ushort q = 0; q < SQ4_PER_THREAD; q++) {
+                    ushort sq_idx = tiisg * SQ4_PER_THREAD + q;
+                    sq4[sq_idx] = half4(elems[q*4 + 0], elems[q*4 + 1],
+                                        elems[q*4 + 2], elems[q*4 + 3]);
+                }
+                for (ushort i = tiisg + DK4; i < PK4; i += NW) {
+                    sq4[i] = half4(0.0h);
+                }
+            } else {
+                for (ushort i = tiisg; i < PK4; i += NW) {
+                    if (i < DK4) {
+                        float4 qval = *((device const float4 *)(Q + q_off_b + iq2 * DK + i * 4));
+                        sq4[i] = half4(qval);
+                    } else {
+                        sq4[i] = half4(0.0h);
+                    }
+                }
+            }
+        }
+        threadgroup float4 *so4 = (threadgroup float4 *)(shmem + so_base + ((uint)m * NSG + (uint)sgitg) * 2 * PV) + tiisg;
+        for (short i = 0; i < DV4 / NL; ++i) {
+            so4[i * NL] = float4(0.0f);
+        }
+        threadgroup float *ss = (threadgroup float *)(shmem + ss_base + ((uint)m * NSG + (uint)sgitg) * SH);
+        for (ushort i = tiisg; i < SH / 4; i += NW) {
+            ss[i] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[P];
+    float M[P];
+    HYB_ROWS_UNROLL
+    for (short m = 0; m < P; ++m) {
+        S[m] = 0.0f;
+        M[m] = -FLT_MAX / 2;
+    }
+
+    const ushort tx = tiisg;
+    const float sf_d512 = params.scale_factor_d512;
+    const bool is_d512 = (DK > 256);
+
+    for (uint ic0 = iwg * NSG + (uint)sgitg; ; ic0 += NWG * NSG) {
+        uint ic = ic0 * C;
+        if (ic >= ksl_max) break;
+
+        // Mask per live row (stock form with the row's ksl / window start),
+        // written into the bank of every head of that row.
+        bool act[P];
+        bool any_act = false;
+        HYB_ROWS_UNROLL
+        for (short r = 0; r < R; ++r) {
+            const uint ksl = ksl_r[r];
+            bool row_act = false;
+            if (ic < ksl) {
+                uint k_pos = ic + tx;
+                float mask_val = 0.0f;
+                if (k_pos >= ksl) {
+                    mask_val = -65504.0f;
+                } else {
+                    // Linear storage: ring_start 0, logical_idx == k_pos.
+                    uint logical_idx = k_pos;
+                    if (logical_idx >= ksl || logical_idx < wsl_r[r]) {
+                        mask_val = -65504.0f;
+                    }
+                }
+                HYB_ROWS_UNROLL
+                for (short g = 0; g < G; ++g) {
+                    threadgroup float *ss = (threadgroup float *)(shmem + ss_base + ((uint)(r * G + g) * NSG + (uint)sgitg) * SH);
+                    ss[tx] = mask_val;
+                }
+                threadgroup const float *ss0 = (threadgroup const float *)(shmem + ss_base + ((uint)(r * G) * NSG + (uint)sgitg) * SH);
+                row_act = !(simd_max(ss0[tiisg]) <= -65504.0f);
+            }
+            HYB_ROWS_UNROLL
+            for (short g = 0; g < G; ++g) act[r * G + g] = row_act;
+            any_act = any_act || row_act;
+        }
+        if (!any_act) continue;
+
+        // ---- Q * K^T: each K half4 loaded once, dotted into every member ----
+        {
+            float mqk_tx[P];
+            HYB_ROWS_UNROLL
+            for (short m = 0; m < P; ++m) mqk_tx[m] = 0.0f;
+
+            for (short cc = 0; cc < C; ++cc) {
+                uint kv_pos = ic + cc;
+                if (kv_pos >= ksl_max) {
+                    continue;
+                }
+
+                float partial[P];
+                HYB_ROWS_UNROLL
+                for (short m = 0; m < P; ++m) partial[m] = 0.0f;
+
+                if (is_d512) {
+                    device const half *k_base =
+                        K_f16 + k_off_b + (kv_head * params.kv_capacity + kv_pos) * DK;
+                    for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
+                        uint coord = (uint)(tx + ii * NL) * 4u;
+                        half4 k_val_h = *((device const half4 *)(k_base + coord));
+                        float4 k_val = float4(k_val_h);
+                        HYB_ROWS_UNROLL
+                        for (short m = 0; m < P; ++m) {
+                            threadgroup const half4 *pq4 = (threadgroup const half4 *)(shmem + (uint)m * PK) + tx;
+                            partial[m] += dot(k_val, float4(pq4[ii * NL]));
+                        }
+                    }
+                    {
+                        const uint blk1_start = DK / 2;
+                        for (short ii = 0; ii < (DK/2) / 4 / NL; ++ii) {
+                            uint coord = blk1_start + (uint)(tx + ii * NL) * 4u;
+                            half4 k_val_h = *((device const half4 *)(k_base + coord));
+                            float4 k_val = float4(k_val_h);
+                            HYB_ROWS_UNROLL
+                            for (short m = 0; m < P; ++m) {
+                                threadgroup const half4 *pq4 = (threadgroup const half4 *)(shmem + (uint)m * PK) + tx;
+                                partial[m] += dot(k_val, float4(pq4[(DK4/2/NL + ii) * NL]));
+                            }
+                        }
+                    }
+                } else {
+                    device const half *k_base =
+                        K_f16 + k_off_b + (kv_head * params.kv_capacity + kv_pos) * DK + tx * 4u;
+                    for (short ii = 0; ii < DK4 / NL; ++ii) {
+                        half4 k_val_h = *((device const half4 *)(k_base + (ii * NL) * 4));
+                        float4 k_val = float4(k_val_h);
+                        HYB_ROWS_UNROLL
+                        for (short m = 0; m < P; ++m) {
+                            threadgroup const half4 *pq4 = (threadgroup const half4 *)(shmem + (uint)m * PK) + tx;
+                            partial[m] += dot(k_val, float4(pq4[ii * NL]));
+                        }
+                    }
+                }
+
+                HYB_ROWS_UNROLL
+                for (short m = 0; m < P; ++m) {
+                    const float mqk_cc = simd_sum(partial[m]);
+                    // Stock: kv_pos >= the row's ksl leaves mqk[cc] = 0.
+                    if ((short)tx == cc && kv_pos < ksl_r[m / G]) mqk_tx[m] = mqk_cc;
+                }
+            }
+
+            HYB_ROWS_UNROLL
+            for (short m = 0; m < P; ++m) {
+                if (act[m]) {
+                    threadgroup float *ss = (threadgroup float *)(shmem + ss_base + ((uint)m * NSG + (uint)sgitg) * SH);
+                    ss[tx] = fma(mqk_tx[m], params.scale, ss[tx]);
+                }
+            }
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Online softmax (per active member) ----
+        HYB_ROWS_UNROLL
+        for (short m = 0; m < P; ++m) {
+            if (act[m]) {
+                threadgroup float *ss = (threadgroup float *)(shmem + ss_base + ((uint)m * NSG + (uint)sgitg) * SH);
+                threadgroup float4 *so4 = (threadgroup float4 *)(shmem + so_base + ((uint)m * NSG + (uint)sgitg) * 2 * PV) + tiisg;
+                const float m_old = M[m];
+                const float s_new = ss[tiisg];
+                M[m] = simd_max(max(M[m], s_new));
+                const float ms = exp(m_old - M[m]);
+                const float vs = exp(s_new - M[m]);
+                S[m] = S[m] * ms + simd_sum(vs);
+                ss[tiisg] = vs;
+                for (short ii = 0; ii < DV4 / NL; ++ii) {
+                    so4[ii * NL] *= ms;
+                }
+            }
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- O = O + softmax_weights * V: each V row loaded/decoded once ----
+        {
+            float4 lo[P][DV4 / NL];
+            HYB_ROWS_UNROLL
+            for (short m = 0; m < P; ++m) {
+                for (short ii = 0; ii < DV4 / NL; ++ii) lo[m][ii] = float4(0.0f);
+            }
+
+            const float inv_sqrt_dv = rsqrt(float(DV));
+
+            for (short cc = 0; cc < C; ++cc) {
+                uint kv_pos = ic + cc;
+                if (kv_pos >= ksl_max) continue;
+
+                // Member m accumulates this key iff the stock row would:
+                // the chunk is active for it and kv_pos < its ksl.
+                bool use[P];
+                float w[P];
+                HYB_ROWS_UNROLL
+                for (short m = 0; m < P; ++m) {
+                    use[m] = act[m] && (kv_pos < ksl_r[m / G]);
+                    threadgroup const float *ss = (threadgroup const float *)(shmem + ss_base + ((uint)m * NSG + (uint)sgitg) * SH);
+                    w[m] = ss[cc];
+                }
+
+                if (v_is_f16_effective) {
+                    device const half *v_h = (device const half *)V_packed
+                        + v_off_b + (kv_head * params.kv_capacity + kv_pos) * DV;
+                    if (is_d512) {
+                        for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                            uint coord = (uint)(tx + ii * NL) * 4u;
+                            half4 v0 = *((device const half4 *)(v_h + coord));
+                            uint coord1 = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
+                            half4 v1 = *((device const half4 *)(v_h + coord1));
+                            HYB_ROWS_UNROLL
+                            for (short m = 0; m < P; ++m) {
+                                if (use[m]) {
+                                    lo[m][ii] += float4(v0) * w[m];
+                                    lo[m][DV4/2/NL + ii] += float4(v1) * w[m];
+                                }
+                            }
+                        }
+                    } else {
+                        device const half *v_base = v_h + tx * 4u;
+                        for (short ii = 0; ii < DV4 / NL; ++ii) {
+                            half4 v4 = *((device const half4 *)(v_base + ii * NL * 4u));
+                            HYB_ROWS_UNROLL
+                            for (short m = 0; m < P; ++m) {
+                                if (use[m]) lo[m][ii] += float4(v4) * w[m];
+                            }
+                        }
+                    }
+                } else if (is_d512) {
+                    device const float *vnorm = V_norms + vn_off_b + (kv_head * params.kv_capacity + kv_pos) * 2u;
+                    device const uint8_t *v_base =
+                        V_packed + v_off_b + (kv_head * params.kv_capacity + kv_pos) * DV;
+                    // A1's pinned stock association: `(w * rcp(sf)) * vnorm[b]`.
+                    float wr[P];
+                    HYB_ROWS_UNROLL
+                    for (short m = 0; m < P; ++m) wr[m] = w[m] * (1.0f / sf_d512);
+                    float sn0[P];
+                    HYB_ROWS_UNROLL
+                    for (short m = 0; m < P; ++m) sn0[m] = wr[m] * vnorm[0];
+                    for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                        uint coord = (uint)(tx + ii * NL) * 4u;
+                        const float4 cent = hb_centroids_float4(v_base, coord);
+                        HYB_ROWS_UNROLL
+                        for (short m = 0; m < P; ++m) {
+                            if (use[m]) lo[m][ii] += cent * sn0[m];
+                        }
+                    }
+                    float sn1[P];
+                    HYB_ROWS_UNROLL
+                    for (short m = 0; m < P; ++m) sn1[m] = wr[m] * vnorm[1];
+                    for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                        uint coord = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
+                        const float4 cent = hb_centroids_float4(v_base, coord);
+                        HYB_ROWS_UNROLL
+                        for (short m = 0; m < P; ++m) {
+                            if (use[m]) lo[m][DV4/2/NL + ii] += cent * sn1[m];
+                        }
+                    }
+                } else {
+                    float v_norm_val = V_norms[vn_off_b + kv_head * params.kv_capacity + kv_pos];
+                    // A1's pinned scale-last form (stock `v_norm * inv_sqrt_dv * w`).
+                    float v_sw[P];
+                    HYB_ROWS_UNROLL
+                    for (short m = 0; m < P; ++m) {
+                        v_sw[m] = (DV == 256) ? ldexp(v_norm_val * w[m], -4)
+                                              : v_norm_val * inv_sqrt_dv * w[m];
+                    }
+                    device const uint8_t *v_base =
+                        V_packed + v_off_b + (kv_head * params.kv_capacity + kv_pos) * DV + tx * 4u;
+                    for (short ii = 0; ii < DV4 / NL; ++ii) {
+                        const float4 cent = hb_centroids_float4(v_base, (uint)(ii * NL) * 4u);
+                        HYB_ROWS_UNROLL
+                        for (short m = 0; m < P; ++m) {
+                            if (use[m]) lo[m][ii] += cent * v_sw[m];
+                        }
+                    }
+                }
+            }
+
+            HYB_ROWS_UNROLL
+            for (short m = 0; m < P; ++m) {
+                if (act[m]) {
+                    threadgroup float4 *so4 = (threadgroup float4 *)(shmem + so_base + ((uint)m * NSG + (uint)sgitg) * 2 * PV) + tiisg;
+                    for (short ii = 0; ii < DV4 / NL; ++ii) {
+                        so4[ii * NL] += lo[m][ii];
+                    }
+                }
+            }
+        }
+    }
+
+    // Store M and S for the merge (members with no chunk keep the stock
+    // initial S = 0, M = -FLT_MAX/2).
+    if (tiisg == 0) {
+        HYB_ROWS_UNROLL
+        for (short m = 0; m < P; ++m) {
+            threadgroup float *ss = (threadgroup float *)(shmem + ss_base + ((uint)m * NSG + (uint)sgitg) * SH);
+            ss[0] = S[m];
+            ss[1] = M[m];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Cross-simdgroup online-softmax merge (per member, stock j order) ----
+    if (NSG > 1u && sgitg == 0) {
+        constexpr ushort NSG_MAX = 4;
+        HYB_ROWS_UNROLL
+        for (short m = 0; m < P; ++m) {
+            float ms_arr[NSG_MAX];
+            float M_global = -FLT_MAX / 2;
+            for (ushort j = 0; j < NSG; ++j) {
+                threadgroup const float *ssj = (threadgroup const float *)(shmem + ss_base + ((uint)m * NSG + (uint)j) * SH);
+                M_global = max(M_global, ssj[1]);
+            }
+            float S_total = 0.0f;
+            for (ushort j = 0; j < NSG; ++j) {
+                threadgroup const float *ssj = (threadgroup const float *)(shmem + ss_base + ((uint)m * NSG + (uint)j) * SH);
+                const float M_j = ssj[1];
+                const float S_j = ssj[0];
+                ms_arr[j] = exp(M_j - M_global);
+                S_total += S_j * ms_arr[j];
+            }
+            threadgroup float4 *so4 = (threadgroup float4 *)(shmem + so_base + (uint)m * NSG * 2 * PV);
+            for (ushort i = tiisg; i < DV4; i += NW) {
+                float4 acc = float4(0.0f);
+                for (ushort j = 0; j < NSG; ++j) {
+                    threadgroup const float4 *so4_j = (threadgroup const float4 *)(shmem + so_base + ((uint)m * NSG + (uint)j) * 2u * PV);
+                    acc += so4_j[i] * ms_arr[j];
+                }
+                so4[i] = acc;
+            }
+            S[m] = S_total;
+            M[m] = M_global;
+        }
+    }
+
+    // ---- Write output (stock batched layout; one bucket for the dispatch) ----
+    if (sgitg == 0) {
+        const uint NWG_val = NWG;
+        HYB_ROWS_UNROLL
+        for (short m = 0; m < P; ++m) {
+            const uint iq1 = row0 + (uint)(m / G);
+            if (iq1 >= n_q) continue;
+            const uint iq2 = h0 + (uint)(m % G);
+            threadgroup const float4 *so4 = (threadgroup const float4 *)(shmem + so_base + (uint)m * NSG * 2 * PV);
+            const float inv_S = (NWG_val == 1) ? ((S[m] == 0.0f) ? 0.0f : 1.0f / S[m]) : 1.0f;
+            const int64_t rid = iq2 + (int64_t)iq1 * params.n_heads;
+            device float4 *dst4 = (device float4 *)((NWG_val == 1) ? out : dst);
+            for (ushort i = tiisg; i < DV4; i += NW) {
+                dst4[rid * DV4 * NWG_val + NWG_val * i + iwg] = so4[i] * inv_S;
+            }
+            if (NWG_val > 1 && tiisg == 0) {
+                device float *dst1 = dst + (int64_t)n_q * params.n_heads * DV * NWG_val;
+                dst1[rid * (2 * NWG_val) + 2 * iwg + 0] = S[m];
+                dst1[rid * (2 * NWG_val) + 2 * iwg + 1] = M[m];
+            }
+        }
+    }
+}
+
+#undef HYB_ROWS_UNROLL
+
+typedef decltype(flash_attn_vec_hybrid_batched_rows_impl<256, 256, 1, 1>) flash_attn_vec_hybrid_batched_rows_t;
+
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r1_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 1, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r2_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 1, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r4_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 1, 4>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r8_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 1, 8>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r1_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 2, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r2_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 2, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r4_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 2, 4>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r8_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 2, 8>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g4_r1_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 4, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g4_r2_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 4, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g4_r4_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 4, 4>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g8_r1_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 8, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g8_r2_dk256")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<256, 256, 8, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r1_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 1, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r2_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 1, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r4_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 1, 4>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g1_r8_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 1, 8>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r1_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 2, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r2_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 2, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r4_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 2, 4>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g2_r8_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 2, 8>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g4_r1_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 4, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g4_r2_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 4, 2>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g4_r4_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 4, 4>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g8_r1_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 8, 1>;
+template [[host_name("flash_attn_vec_hybrid_batched_rows_g8_r2_dk512")]]
+kernel flash_attn_vec_hybrid_batched_rows_t flash_attn_vec_hybrid_batched_rows_impl<512, 512, 8, 2>;
