@@ -1635,10 +1635,16 @@ pub fn build_q6k_id_nr2_m1_record_with_policy(
 ///   - `GgmlMatvecIdGpuParams` bytes (n_tokens=real_top_k, top_k=1, ne1=real_top_k)
 ///   - Binding slot order: weight=0, input=1, output=2, ids=3, params=4
 ///
-/// Returns `None` when `HF2Q_Q8_0_ID_MV_NR2` is on — the opt-in NR2 kernel
-/// uses different geometry (threads=(32, 4, 1), align=2, shmem=256 bytes)
-/// and a record baked for the regular layout would be wrong.  Callers MUST
-/// fall through to the unbaked `dispatch_id_mv` path in that case.
+/// Returns `None` when `dispatch_id_mv` would not encode the regular kernel
+/// for this call, and callers MUST then fall through to the unbaked
+/// `dispatch_id_mv` path:
+///   - `HF2Q_Q8_0_ID_MV_NR2` is on — the opt-in NR2 kernel uses different
+///     geometry (threads=(32, 4, 1), align=2, shmem=256 bytes) and a record
+///     baked for the regular layout would be wrong;
+///   - the policy plans the Q4-GEMMA-DECODE E1 expert-grouped route
+///     (`expert_grouped_q8_0` at an admitted shape and width) — baking the
+///     stock kernel would silently skip E1 while the capability API reports
+///     `ExpertMvGrouped`.
 ///
 /// Bake-time validation: pipeline lookup must succeed.  Geometry is
 /// hard-coded to the regular Q8_0_ID contract (N_DST=4, N_SIMDGROUP=2,
@@ -1699,9 +1705,12 @@ pub fn build_q8_0_id_decode_record_with_policy(
             "expert stride exceeds the signed Metal kernel ABI".into(),
         ));
     }
-    // Only bakeable when the regular (non-NR2) Q8_0_ID kernel is selected.
-    // Mirrors the negation of `dispatch_id_mv`'s `use_q8_0_id_nr2` branch.
-    if routing.expert_q8_0_mv_nr2 {
+    // Only bakeable when `dispatch_id_mv` selects the regular (non-NR2)
+    // Q8_0_ID kernel: not `use_q8_0_id_nr2`, and not its E1 grouped branch
+    // (planned with the down call's `n_tokens = real_top_k, top_k = 1`).
+    if routing.expert_q8_0_mv_nr2
+        || plan_expert_grouped_mv(GgmlType::Q8_0, real_top_k, 1, n, k, routing).is_some()
+    {
         return Ok(None);
     }
 
@@ -2993,5 +3002,64 @@ mod validation_tests {
         let error = required_expert_weight_bytes(GgmlType::Q4_0, 3, 64, 256, 9_215)
             .expect_err("undersized stride must fail");
         assert!(error.to_string().contains("smaller than one matrix"));
+    }
+
+    /// Review89 finding 3: the baked Q8_0 down record must not shadow the E1
+    /// grouped route that `dispatch_id_mv` takes for the same call.
+    #[test]
+    fn q8_0_id_decode_record_defers_to_planned_expert_grouped_route() {
+        let device = crate::MlxDevice::new().expect("Metal device");
+        let mut registry = KernelRegistry::new();
+        // Gemma 4 down: N = 2816, K = 704, 128 experts, top-8 folded into
+        // n_tokens (an admitted top-1 width).
+        let (n, k, real_top_k, n_experts) = (2816u32, 704u32, 8u32, 128u32);
+        // One packed Q8_0 matrix: N rows of K/32 blocks of 34 bytes.
+        let stride = u64::from(n) * u64::from(k / 32) * 34;
+        let build = |registry: &mut KernelRegistry, routing: &GgmlRoutingPolicy| {
+            build_q8_0_id_decode_record_with_policy(
+                registry,
+                device.metal_device(),
+                n,
+                k,
+                real_top_k,
+                n_experts,
+                stride,
+                routing,
+            )
+            .expect("record build")
+        };
+
+        let default_policy = GgmlRoutingPolicy::default();
+        assert!(plan_expert_grouped_mv(GgmlType::Q8_0, real_top_k, 1, n, k, &default_policy)
+            .is_none());
+        let record = build(&mut registry, &default_policy).expect("default policy bakes");
+        assert_eq!(record.kernel_name, "kernel_mul_mv_id_q8_0_f32");
+
+        let grouped = GgmlRoutingPolicy {
+            expert_grouped_q8_0: true,
+            ..GgmlRoutingPolicy::default()
+        };
+        assert_eq!(
+            plan_expert_grouped_mv(GgmlType::Q8_0, real_top_k, 1, n, k, &grouped),
+            Some(4)
+        );
+        assert!(
+            build(&mut registry, &grouped).is_none(),
+            "E1 is planned for this call, so the stock record must not be baked"
+        );
+
+        // Outside the frozen shape table E1 is not planned: the record bakes.
+        let off_table = build_q8_0_id_decode_record_with_policy(
+            &mut registry,
+            device.metal_device(),
+            n,
+            k + 32,
+            real_top_k,
+            n_experts,
+            stride,
+            &grouped,
+        )
+        .expect("record build");
+        assert!(off_table.is_some());
     }
 }

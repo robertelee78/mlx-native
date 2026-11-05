@@ -26,6 +26,12 @@ dense lever is honoured only for shapes in the frozen table
 stock route. The new kernels sit in the same `.metal` files as their
 references, so both share Metal's default math mode on both metallib paths.
 
+Baked decode records follow the same routing. `build_q8_0_id_decode_record`
+returns `None` (callers fall through to `dispatch_id_mv`, which takes E1)
+whenever the policy plans E1 for that call, so a record never runs the stock
+kernel for a step the capability API reports as `ExpertMvGrouped`. The Q6_K
+`_id` record needs no such check because E1 has no Q6_K member.
+
 ## Findings that shaped the kernels
 
 - **S0 (Q4_K R0 = 2): exact.** The first D1 draft, which hoisted each row's
@@ -62,6 +68,15 @@ cargo test --release --test gemma_expert_grouped_mv_id_bitwise -- --test-threads
 cargo test --release --test gemma_gelu_epilogue_bitwise -- --test-threads=1              # T-N6
 cargo test --release --test gemma_decode_attn_gqa_and_mixed_bucket_bitwise -- --test-threads=1  # T-N8
 ```
+
+T-N3 also replays real routing (design §2.4): the checked-in sample
+`tests/fixtures/gemma_routing_witness_sample.json` (extracted by
+`tests/fixtures/gemma_routing_witness_extract.py` from the Q1 witness
+`q1-gemma-routing1511-t0-on-actual-v1`) always runs, and the full witness
+(rows 128–143 of every layer, rows 29–127 of every third layer) runs when
+present; otherwise the test prints `SKIPPED`. With `GEMMA_DECODE_V2_OVERLAP`
+naming a file that holds the hf2q `[ROUTING_OVERLAP]` line, it replays one
+pattern per observed (width, U).
 
 All passed on both paths at `f2d273b`. With `GEMMA_DECODE_RECEIPT_DIR` set,
 `gemma_decode_w4_exact` records an output digest per cell (T-N5); all 1,304
