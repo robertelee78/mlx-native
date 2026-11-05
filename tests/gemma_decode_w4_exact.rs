@@ -15,9 +15,11 @@
 //! - `gemma_decode_kernels_permutation_and_isolation` — T-N4 (dense part);
 //! - `routing_policy_default_unchanged` — T-N7.
 //!
-//! T-N5: run the suite with `MLX_PRECOMPILED_METALLIB=1` and `=0`. When
-//! `GEMMA_DECODE_RECEIPT_DIR` is set each test appends one JSON line per cell
-//! (path, toolchain, SHA-256 of the output bytes) to `dense.jsonl` there.
+//! T-N5: run the suite with `MLX_PRECOMPILED_METALLIB=1` and `=0` and the
+//! same `GEMMA_DECODE_RECEIPT_DIR`. Each cell appends one JSON line (the
+//! pipeline origin read back from the registry, SHA-256 of the output bits)
+//! to `dense-<origin>.jsonl`; the ignored `tn5_cross_path_digest_diff` then
+//! diffs the two files and fails on any mismatch.
 
 #![cfg(target_vendor = "apple")]
 #![allow(clippy::expect_used, clippy::panic, clippy::too_many_arguments)]
@@ -31,7 +33,7 @@ use mlx_native::{
     quantized_matmul_ggml_with_policy, row_tiled_geometry, DType, GgmlCapabilityRequest,
     GgmlInvocation, GgmlKernelRoute, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
     GgmlWorkloadClass, KernelRegistry, MlxBuffer, MlxDevice, RowTiledGeometry,
-    GGML_CAPABILITY_SCHEMA_VERSION,
+    KernelPipelineOrigin, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -99,8 +101,11 @@ fn weight_bytes(ty: GgmlType, n: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
     out
 }
 
-/// Eight activation columns. Column 1 carries NaN and ±∞ so its neighbours
-/// prove isolation; every column carries ±0, subnormals and large values.
+/// Eight activation columns. Every column carries ±0 and subnormals. Only
+/// column 1 (NaN and ±∞, proving neighbour isolation) and column 6 (large
+/// magnitudes) carry outliers: in the other six columns every lane's
+/// per-block terms are of comparable size, so a 1-ULP drift in any lane
+/// survives `simd_sum` instead of being absorbed by an outlier lane.
 fn activations(k: usize, rng: &mut Rng) -> Vec<f32> {
     let mut x: Vec<f32> = (0..MAX_M * k).map(|_| rng.unit()).collect();
     for c in 0..MAX_M {
@@ -109,9 +114,9 @@ fn activations(k: usize, rng: &mut Rng) -> Vec<f32> {
         col[17] = -0.0;
         col[40] = f32::from_bits(0x0000_0013);
         col[41] = -f32::from_bits(0x0040_0000);
-        col[k / 2] = 3.0e5 * (c as f32 + 1.0);
-        col[k - 1] = -7.5e4;
     }
+    x[6 * k + k / 2] = 3.0e5;
+    x[6 * k + k - 1] = -7.5e4;
     x[k + 9] = f32::NAN;
     x[k + 100] = f32::INFINITY;
     x[k + 101] = f32::NEG_INFINITY;
@@ -132,6 +137,8 @@ struct Fixture {
     k: usize,
     /// Reference output of column c alone, `[MAX_M][n]` as u32.
     reference: Vec<Vec<u32>>,
+    /// Metallib path the reference pipeline loaded from (T-N5 label).
+    origin: String,
 }
 
 fn upload_bytes(device: &MlxDevice, bytes: &[u8]) -> MlxBuffer {
@@ -218,6 +225,7 @@ impl Fixture {
                 )
             })
             .collect();
+        let origin = pipeline_origin(&registry, ty);
         let input = upload_f32(&device, &x);
         Self {
             device,
@@ -228,6 +236,7 @@ impl Fixture {
             n,
             k,
             reference,
+            origin,
         }
     }
 
@@ -286,31 +295,101 @@ impl Fixture {
                 );
             }
         }
-        record(label, self.ty, self.n, self.k, m, &got[pad..pad + m * self.n]);
+        record(label, &self.origin, self.ty, self.n, self.k, m, &got[pad..pad + m * self.n]);
     }
 }
 
-fn record(label: &str, ty: GgmlType, n: usize, k: usize, m: usize, bits: &[u32]) {
+/// The metallib path the reference pipeline actually loaded from, read back
+/// from the registry (not inferred from the environment).
+fn pipeline_origin(registry: &KernelRegistry, ty: GgmlType) -> String {
+    let kernel = match ty {
+        GgmlType::Q4_K => "kernel_mul_mv_q4_K_f32",
+        GgmlType::Q6_K => "kernel_mul_mv_q6_K_f32_nr2",
+        GgmlType::Q5_0 => "kernel_mul_mv_q5_0_f32",
+        GgmlType::Q8_0 => "kernel_mul_mv_q8_0_f32_nr2",
+        other => panic!("no reference kernel for {other:?}"),
+    };
+    let identity = registry
+        .pipeline_identity(&format!("{kernel}|700:i1|701:i1|702:i1"))
+        .expect("reference pipeline identity");
+    match identity.origin {
+        KernelPipelineOrigin::PrecompiledMetallib => "precompiled".into(),
+        KernelPipelineOrigin::RuntimeSource => "runtime".into(),
+    }
+}
+
+/// T-N5: one JSON line per cell into `<GEMMA_DECODE_RECEIPT_DIR>/dense-<origin>.jsonl`.
+fn record(label: &str, origin: &str, ty: GgmlType, n: usize, k: usize, m: usize, bits: &[u32]) {
     let Some(dir) = std::env::var_os("GEMMA_DECODE_RECEIPT_DIR") else {
         return;
     };
     let mut hasher = Sha256::new();
     bits.iter().for_each(|v| hasher.update(v.to_le_bytes()));
-    let path = std::env::var("MLX_PRECOMPILED_METALLIB").unwrap_or_else(|_| "default".into());
     let line = serde_json::json!({
         "suite": "gemma_decode_w4_exact",
         "cell": label,
         "type": format!("{ty:?}"),
         "n": n, "k": k, "m": m,
-        "metallib_env": path,
+        "pipeline_origin": origin,
+        "metallib_env": std::env::var("MLX_PRECOMPILED_METALLIB").ok(),
         "output_sha256": format!("{:x}", hasher.finalize()),
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(std::path::Path::new(&dir).join("dense.jsonl"))
+        .open(std::path::Path::new(&dir).join(format!("dense-{origin}.jsonl")))
         .expect("receipt file");
     writeln!(file, "{line}").expect("receipt write");
+}
+
+/// T-N5 cross-path diff. Run after the suite has run once on each path with
+/// the same `GEMMA_DECODE_RECEIPT_DIR`:
+/// `GEMMA_DECODE_RECEIPT_DIR=<dir> cargo test --release --test gemma_decode_w4_exact tn5 -- --ignored`.
+/// Fails unless both files exist, cover the same cells, and every cell's
+/// digest multiset is identical; writes `tn5-diff.json` beside them.
+#[test]
+#[ignore = "cross-run step: needs receipts from both metallib paths"]
+fn tn5_cross_path_digest_diff() {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("GEMMA_DECODE_RECEIPT_DIR").expect("GEMMA_DECODE_RECEIPT_DIR"),
+    );
+    let load = |origin: &str| {
+        let text = std::fs::read_to_string(dir.join(format!("dense-{origin}.jsonl")))
+            .unwrap_or_else(|e| panic!("dense-{origin}.jsonl: {e}"));
+        let mut cells = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for line in text.lines() {
+            let r: serde_json::Value = serde_json::from_str(line).expect("receipt line");
+            assert_eq!(r["pipeline_origin"], origin, "line filed under the wrong path");
+            let key = format!("{}|{}|{}|{}|{}", r["cell"], r["type"], r["n"], r["k"], r["m"]);
+            cells
+                .entry(key)
+                .or_default()
+                .push(r["output_sha256"].as_str().expect("digest").to_string());
+        }
+        cells.values_mut().for_each(|v| v.sort());
+        cells
+    };
+    let pre = load("precompiled");
+    let run = load("runtime");
+    let mismatched: Vec<&String> = pre
+        .iter()
+        .filter(|(k, v)| run.get(*k) != Some(v))
+        .map(|(k, _)| k)
+        .chain(run.keys().filter(|k| !pre.contains_key(*k)))
+        .collect();
+    let records: usize = pre.values().map(Vec::len).sum();
+    std::fs::write(
+        dir.join("tn5-diff.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "cells": pre.len(),
+            "records_per_path": records,
+            "mismatched": mismatched,
+        }))
+        .expect("json"),
+    )
+    .expect("tn5-diff.json");
+    assert!(mismatched.is_empty(), "cross-path digest mismatch: {mismatched:?}");
+    assert!(records > 0, "no receipts recorded");
 }
 
 fn all_geometries() -> Vec<RowTiledGeometry> {
@@ -447,7 +526,15 @@ fn gemma_dense_dual_gate_up_q4k_bitwise() {
                             "F1 {name} n={n} nsg={nsg} m={m} column {c}"
                         );
                     }
-                    record(&format!("F1 {name} nsg={nsg}"), GgmlType::Q4_K, n, k, m, &got[11..11 + m * n]);
+                    record(
+                        &format!("F1 {name} nsg={nsg}"),
+                        &fx.origin,
+                        GgmlType::Q4_K,
+                        n,
+                        k,
+                        m,
+                        &got[11..11 + m * n],
+                    );
                 }
             }
         }
