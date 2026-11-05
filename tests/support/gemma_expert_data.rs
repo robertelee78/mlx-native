@@ -1,5 +1,5 @@
 //! Shared seeded data for the ADR-063 Q4-GEMMA-DECODE F2 expert parity test
-//! (`gemma_gelu_epilogue_bitwise`) and the M0 bench:
+//! (`gemma_gelu_epilogue_bitwise`):
 //! GGUF blocks with zero and subnormal half scales, activations with ±0,
 //! subnormals and large values, routing patterns, and guarded views.
 
@@ -49,11 +49,10 @@ pub fn half_scale_bits(rng: &mut Rng, block: usize) -> u16 {
     }
 }
 
+/// F2 is Q4_K-only; other types are not generated here.
 pub fn block_bytes(ty: GgmlType) -> usize {
     match ty {
         GgmlType::Q4_K => 144,
-        GgmlType::Q5_0 => 22,
-        GgmlType::Q8_0 => 34,
         other => panic!("unsupported test type {other:?}"),
     }
 }
@@ -61,22 +60,17 @@ pub fn block_bytes(ty: GgmlType) -> usize {
 pub fn block_values(ty: GgmlType) -> usize {
     match ty {
         GgmlType::Q4_K => 256,
-        GgmlType::Q5_0 | GgmlType::Q8_0 => 32,
         other => panic!("unsupported test type {other:?}"),
     }
 }
 
 pub fn fill_block(ty: GgmlType, rng: &mut Rng, index: usize, out: &mut [u8]) {
+    assert_eq!(ty, GgmlType::Q4_K, "F2 data is Q4_K only");
     let d = half_scale_bits(rng, index).to_le_bytes();
     out[0..2].copy_from_slice(&d);
-    let start = match ty {
-        GgmlType::Q4_K => {
-            let dmin = half_scale_bits(rng, index / 3 + 7).to_le_bytes();
-            out[2..4].copy_from_slice(&dmin);
-            4
-        }
-        _ => 2,
-    };
+    let dmin = half_scale_bits(rng, index / 3 + 7).to_le_bytes();
+    out[2..4].copy_from_slice(&dmin);
+    let start = 4;
     for chunk in out[start..].chunks_mut(8) {
         let bytes = rng.next().to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);

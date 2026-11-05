@@ -24,10 +24,11 @@
 //!   `GEMMA_DECODE_BENCH_WARMUP` (default 10).
 //! - `HF2Q_HOST_LOCK_HOLDER` — recorded verbatim (the runner's HOST-LOCK name).
 //!
-//! `attn` (lever A1/A2): d256 sliding (16 q / 8 KV heads, ring 1024) and
-//! d512 global (16 q / 2 KV heads) hybrid decode flash, n_q ∈ {1,4,8,16},
+//! `attn` (the GQA-grouped vec-hybrid flash; dropped for decode by M0, kept
+//! as the warm-prefill primitive): d256 sliding (16 q / 8 KV heads, ring
+//! 1024) and d512 global (16 q / 2 KV heads), n_q ∈ {1,4,8,16},
 //! uniform-length steps (stock batched vs GQA at every legal G) and
-//! mixed-bucket steps (stock per-slot fallback vs GQA at every legal G);
+//! per-slot-bucket steps (stock per-slot fallback vs GQA at every legal G);
 //! reduce dispatches included; 30 distinct KV caches cycled.
 //!
 //! Run (precompiled metallib, the production default):
