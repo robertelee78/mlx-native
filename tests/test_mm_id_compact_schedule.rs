@@ -899,9 +899,11 @@ fn n3_invalid_metadata_poisons_output_on_both_schedules() {
 
 /// Enforces the N3 "no weight read" obligation: the N3 weight stacks are
 /// exact-size buffers, so the out-of-range ids (`n_experts`, `n_experts + 3`)
-/// address slabs wholly past their end. Under Metal shader validation any
-/// such read faults the command buffer, which fails the child's
-/// `commit_and_wait` and therefore this test.
+/// address slabs wholly past their end. Shader validation alone only
+/// zero-fills an out-of-bounds access and logs it, so the child also sets
+/// `MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1` (a fault aborts the process) and
+/// `MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1`, and its stderr must carry no
+/// validation report.
 #[test]
 fn n3_invalid_metadata_reads_no_weight_under_shader_validation() {
     if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
@@ -915,18 +917,34 @@ fn n3_invalid_metadata_reads_no_weight_under_shader_validation() {
             "--test-threads=1",
         ])
         .env("MTL_SHADER_VALIDATION", "1")
+        .env("MTL_SHADER_VALIDATION_ABORT_ON_FAULT", "1")
+        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
         .output()
         .expect("run N3 under shader validation");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "N3 under MTL_SHADER_VALIDATION=1 failed:\n{stdout}\n{stderr}"
+        "N3 under shader validation failed (status {:?}):\n{stdout}\n{stderr}",
+        output.status
     );
     assert!(
         stdout.contains("running 1 test") && stdout.contains("1 passed"),
         "shader-validation child ran no N3 test:\n{stdout}"
     );
+    let lowered = stderr.to_lowercase();
+    for marker in [
+        "invalid device load",
+        "invalid device store",
+        "out of bounds",
+        "mtlgpuerror",
+        "validation error",
+    ] {
+        assert!(
+            !lowered.contains(marker),
+            "shader validation reported a fault ({marker:?}) in N3:\n{stderr}"
+        );
+    }
 }
 
 fn compact_max_tiles(rows: u64, n_experts: u64) -> u64 {

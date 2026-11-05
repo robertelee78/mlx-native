@@ -75,12 +75,15 @@ pub fn dispatch_moe_mm_id_map0(
     registry: &mut KernelRegistry,
     device: &metal::DeviceRef,
     src2: &MlxBuffer,
-    htpe: &MlxBuffer,
-    hids: &MlxBuffer,
+    htpe: &mut MlxBuffer,
+    hids: &mut MlxBuffer,
     params_buf: &MlxBuffer,
     n_experts: u32,
     ne20: u32,
 ) -> Result<()> {
+    // Written by the kernel: taken mutably so an `IdMmScratch` can lend them
+    // only through its schedule-invalidating accessors.
+    let (htpe, hids) = (&*htpe, &*hids);
     if n_experts == 0 {
         return Err(MlxError::InvalidArgument(
             "moe_mm_id_map0: n_experts must be > 0".into(),
@@ -297,10 +300,10 @@ mod tests {
         }
 
         // outputs
-        let htpe_buf = device
+        let mut htpe_buf = device
             .alloc_buffer(n_experts * 4, DType::U32, vec![n_experts])
             .expect("alloc htpe");
-        let hids_buf = device
+        let mut hids_buf = device
             .alloc_buffer(
                 n_experts * n_tokens * 4,
                 DType::I32,
@@ -314,8 +317,8 @@ mod tests {
             &mut registry,
             device.metal_device(),
             &src2_buf,
-            &htpe_buf,
-            &hids_buf,
+            &mut htpe_buf,
+            &mut hids_buf,
             &params_buf,
             n_experts as u32,
             ne20 as u32,
