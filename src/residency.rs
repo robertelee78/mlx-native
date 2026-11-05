@@ -194,10 +194,12 @@ impl ResidencySet {
     pub(crate) fn remove_allocation(&self, buffer: &MTLBufferRef) {
         self.with_active_set(|set, pending| unsafe {
             let _: () = msg_send![set, removeAllocation: buffer];
-            let _ =
-                TEST_ALLOCATION_COUNT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                });
+            let _ = crate::atomic_update::try_update_usize(
+                &TEST_ALLOCATION_COUNT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(1),
+            );
             pending.store(true, Ordering::Release);
         });
     }
@@ -320,11 +322,13 @@ fn spawn_residency_heartbeat(inner: &Arc<ResidencySetInner>) {
             else {
                 break;
             };
-            if heartbeat_ticks
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ticks| {
-                    ticks.checked_sub(1)
-                })
-                .is_err()
+            if crate::atomic_update::try_update_usize(
+                heartbeat_ticks,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |ticks| ticks.checked_sub(1),
+            )
+            .is_err()
             {
                 continue;
             }

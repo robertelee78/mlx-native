@@ -303,19 +303,25 @@ impl Core {
         self.invalid.store(true, Ordering::Release);
     }
     fn note_unobserved(&self) {
-        if self
-            .unobserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .is_err()
+        if crate::atomic_update::try_update_u64(
+            &self.unobserved,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .is_err()
         {
             self.fail();
         }
     }
     fn drop_event(&self) {
-        if self
-            .dropped
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .is_err()
+        if crate::atomic_update::try_update_u64(
+            &self.dropped,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .is_err()
         {
             self.fail();
         }
@@ -335,12 +341,13 @@ impl Core {
             self.drop_event();
             return;
         }
-        if self
-            .events
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                n.checked_add(1).filter(|n| *n <= self.limit)
-            })
-            .is_err()
+        if crate::atomic_update::try_update_u64(
+            &self.events,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1).filter(|n| *n <= self.limit),
+        )
+        .is_err()
         {
             self.fail();
             self.drop_event();
@@ -369,10 +376,13 @@ impl Core {
         }
     }
     fn unknown(&self) {
-        if self
-            .unknown
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .is_err()
+        if crate::atomic_update::try_update_u64(
+            &self.unknown,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .is_err()
         {
             self.fail();
         }
@@ -391,14 +401,16 @@ impl Drop for Reservation {
 }
 fn reserve(core: &Arc<Core>, bytes: usize) -> Result<Reservation, &'static str> {
     let bytes = u64::try_from(bytes).map_err(|_| "observer metadata overflow")?;
-    core.metadata
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            n.checked_add(bytes).filter(|n| *n <= core.metadata_limit)
-        })
-        .map_err(|_| {
-            core.fail();
-            "observer metadata quota exhausted"
-        })?;
+    crate::atomic_update::try_update_u64(
+        &core.metadata,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |n| n.checked_add(bytes).filter(|n| *n <= core.metadata_limit),
+    )
+    .map_err(|_| {
+        core.fail();
+        "observer metadata quota exhausted"
+    })?;
     Ok(Reservation {
         core: core.clone(),
         bytes,
@@ -558,13 +570,16 @@ impl CommandObservation {
         epoch: u64,
     ) -> Result<Self, &'static str> {
         let reservation = reserve(&core, std::mem::size_of::<Self>())?;
-        let id = core
-            .next_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .map_err(|_| {
-                core.fail();
-                "command ID exhausted"
-            })?;
+        let id = crate::atomic_update::try_update_u64(
+            &core.next_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .map_err(|_| {
+            core.fail();
+            "command ID exhausted"
+        })?;
         let this = Self {
             core,
             id,
@@ -684,10 +699,13 @@ impl CommandObservation {
         self.replay_binding = ReplayBinding::Direct;
     }
     pub(crate) fn noncompute(&self) {
-        if self
-            .noncompute
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .is_err()
+        if crate::atomic_update::try_update_u64(
+            &self.noncompute,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .is_err()
         {
             self.core.fail();
             return;
@@ -736,7 +754,8 @@ impl CommandObservation {
     fn emit_gpu_timing(&self, timestamps: crate::CompletedGpuTimestamps) {
         // An Unknown terminal is attempted even after sticky invalidation; never
         // replace it by a healthy inferred interval. Quota remains fail-closed.
-        if std::thread::panicking() || self.core.events.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        if std::thread::panicking() || crate::atomic_update::try_update_u64(&self.core.events,
+            Ordering::AcqRel, Ordering::Acquire,
             |n| n.checked_add(1).filter(|n| *n <= self.core.limit)).is_err() {
             self.core.fail(); self.core.drop_event(); return;
         }
@@ -810,14 +829,16 @@ impl CommandObservation {
             &self.core,
             3 * MAX_SCOPES * std::mem::size_of::<Option<ObservationScope>>(),
         )?;
-        let generation = self
-            .core
-            .next_capture
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .map_err(|_| {
-                self.core.fail();
-                "capture generation exhausted"
-            })?;
+        let generation = crate::atomic_update::try_update_u64(
+            &self.core.next_capture,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .map_err(|_| {
+            self.core.fail();
+            "capture generation exhausted"
+        })?;
         Ok(CapturedScopes {
             tags: Vec::with_capacity(MAX_SCOPES),
             owner: self.id,
