@@ -1952,8 +1952,36 @@ const COMPACT_GRID_ORDER: CompactGridOrder = CompactGridOrder::NTileFastest;
 /// P2c on the simdgroup path: simdgroups 2-3 own rows 16-31 and skip their
 /// MMA and shared-memory store, which is bitwise by construction (§5.1 N5).
 const HALF_TILE_SKIP_SIMDGROUP: bool = true;
-/// P2c on the tensor-API path: a 16-row `matmul2d` on partial tiles.
-const HALF_TILE_SKIP_TENSOR: bool = true;
+/// P2c on the tensor-API path: a 16-row `matmul2d` on partial tiles. It is
+/// not bitwise by construction (the 16-row product's reduction order is a
+/// property of the device's `matmul2d` implementation), so it ships only on
+/// the GPU family where §5.1 N2/N5 proved it bitwise: device names starting
+/// with one of these prefixes (validated on "Apple M5 Max", 2026-11-04).
+/// Other tensor-capable devices keep the 32-row body.
+const HALF_TILE_SKIP_TENSOR_VALIDATED_DEVICES: &[&str] = &["Apple M5"];
+
+/// Whether the tensor-path half-tile skip shipped on `device`. Cached per
+/// Metal device so the hot path does not query the device name. Public for
+/// parity and benchmark receipts.
+#[doc(hidden)]
+pub fn tensor_half_tile_skip_validated(device: &MlxDevice) -> bool {
+    static CACHE: std::sync::Mutex<Option<(u64, bool)>> = std::sync::Mutex::new(None);
+    let registry_id = device.registry_id();
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match *cache {
+        Some((id, validated)) if id == registry_id => validated,
+        _ => {
+            let name = device.name();
+            let validated = HALF_TILE_SKIP_TENSOR_VALIDATED_DEVICES
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+            *cache = Some((registry_id, validated));
+            validated
+        }
+    }
+}
 
 const SCHED_FLAG_N_TILE_FASTEST: u16 = 1;
 const SCHED_FLAG_HALF_TILE_SKIP: u16 = 2;
@@ -2547,7 +2575,9 @@ impl GgmlIdMmDispatchParams {
 ///                 i32 (u32 is byte-equivalent in this range).
 ///   * `output`  — f32 output `[n_tokens, top_k, N]` row-major.
 ///
-/// Scratch (caller-allocated, zero-init not required):
+/// Scratch (caller-allocated, zero-init not required; written by `map0`, so
+/// taken mutably — an [`IdMmScratch`] lends them only through its
+/// invalidating [`IdMmScratch::buffers_mut`]):
 ///   * `htpe`    — `[n_experts]` u32 (per-expert count).
 ///   * `hids`    — `[n_experts, n_tokens]` i32 (per-expert routed list).
 ///
@@ -2563,8 +2593,8 @@ pub fn dispatch_id_mm_for_test(
     input: &MlxBuffer,
     weight: &MlxBuffer,
     ids: &MlxBuffer,
-    htpe: &MlxBuffer,
-    hids: &MlxBuffer,
+    htpe: &mut MlxBuffer,
+    hids: &mut MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
 ) -> Result<()> {
@@ -2576,8 +2606,8 @@ pub fn dispatch_id_mm_for_test(
         input,
         weight,
         ids,
-        htpe,
-        hids,
+        &*htpe,
+        &*hids,
         output,
         params,
         IdMmInputLayout::SharedPerToken,
@@ -2649,11 +2679,12 @@ pub fn dispatch_id_mm_map0_for_test(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     ids: &MlxBuffer,
-    htpe: &MlxBuffer,
-    hids: &MlxBuffer,
+    htpe: &mut MlxBuffer,
+    hids: &mut MlxBuffer,
     params: &GgmlIdMmDispatchParams,
     schedule: ExpertMmSchedule,
 ) -> Result<()> {
+    let (htpe, hids) = (&*htpe, &*hids);
     validate_id_mm_scratch_dtypes("dispatch_id_mm_map0_for_test", htpe, hids)?;
     if ids.dtype() != DType::U32 {
         return Err(MlxError::InvalidArgument(format!(
@@ -3080,7 +3111,7 @@ fn dispatch_id_mm_with_layout(
         && match options.half_tile_skip {
             HalfTileSkip::Production => {
                 if tensor_path {
-                    HALF_TILE_SKIP_TENSOR
+                    tensor_half_tile_skip_validated(device)
                 } else {
                     HALF_TILE_SKIP_SIMDGROUP
                 }
@@ -3252,11 +3283,12 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
     gate_w: &MlxBuffer,
     up_w: &MlxBuffer,
     ids: &MlxBuffer,
-    htpe: &MlxBuffer,
-    hids: &MlxBuffer,
+    htpe: &mut MlxBuffer,
+    hids: &mut MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
 ) -> Result<()> {
+    let (htpe, hids) = (&*htpe, &*hids);
     if input.dtype() != DType::F32
         || gate_w.dtype() != DType::U8
         || up_w.dtype() != DType::U8

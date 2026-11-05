@@ -607,6 +607,48 @@ fn expert_mm_scratch_reports_the_selected_schedule() {
 }
 
 #[test]
+fn slotted_reusing_schedule_reports_one_dispatch_and_no_barrier() {
+    let mut request = dense_request(1, GgmlWorkloadClass::Prompt);
+    request.invocation = GgmlInvocation::ExpertPooledSlottedReusingSchedule {
+        shape: expert_shape(2_048),
+    };
+    let capability = ggml_capability(request);
+    assert_eq!(
+        capability.route,
+        Some(GgmlKernelRoute::ExpertPooledSlottedMmDeviceSelected)
+    );
+    assert_eq!(capability.dispatches, 1);
+    assert_eq!(capability.barriers, 0);
+    assert!(matches!(
+        capability.scratch,
+        GgmlScratchRequirement::ExpertMm {
+            caller_owned: true,
+            schedule_reused: true,
+            ..
+        }
+    ));
+    // Matrix-matrix only, like the self-scheduling slotted entry point.
+    request.invocation = GgmlInvocation::ExpertPooledSlottedReusingSchedule {
+        shape: expert_shape(32),
+    };
+    assert_eq!(
+        ggml_capability(request).rejection_code,
+        Some(GgmlRejectionCode::InvalidOperationContract)
+    );
+}
+
+#[test]
+fn schema2_routing_policy_json_deserializes_as_uniform_grid() {
+    let mut value = serde_json::to_value(GgmlRoutingPolicy::default()).expect("policy json");
+    value
+        .as_object_mut()
+        .expect("policy object")
+        .remove("expert_mm_schedule");
+    let policy: GgmlRoutingPolicy = serde_json::from_value(value).expect("schema-2 policy");
+    assert_eq!(policy.expert_mm_schedule, ExpertMmSchedule::UniformGrid);
+}
+
+#[test]
 fn compact_tile_bound_matches_its_cases() {
     // `rows` term: one row per expert.
     assert_eq!(compact_max_tiles(33, 128), 33);

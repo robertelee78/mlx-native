@@ -46,8 +46,9 @@
 //! buffer) into a command-buffer error.
 
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_map0_for_test, dispatch_id_mm_pooled_with_options_for_test, CompactGridOrder,
-    GgmlIdMmDispatchParams, HalfTileSkip, IdMmScheduleOptions,
+    dispatch_id_mm_map0_for_test, dispatch_id_mm_pooled_with_options_for_test,
+    tensor_half_tile_skip_validated, CompactGridOrder, GgmlIdMmDispatchParams, HalfTileSkip,
+    IdMmScheduleOptions,
 };
 use mlx_native::{
     ggml_expert_bytes, quantized_matmul_id_ggml_pooled_pair_with_policy,
@@ -293,10 +294,21 @@ impl Gpu {
             .get_pipeline("kernel_mul_mm_id_q4_0_tensor_f32", device.metal_device())
             .is_ok();
         eprintln!(
-            "device={} tensor_mm_id_available={tensor_available} MLX_PRECOMPILED_METALLIB={:?}",
+            "device={} tensor_mm_id_available={tensor_available} tensor_half_tile_skip_ships={} MLX_PRECOMPILED_METALLIB={:?}",
             device.name(),
+            tensor_half_tile_skip_validated(&device),
             std::env::var("MLX_PRECOMPILED_METALLIB").ok(),
         );
+        // The matrix covers both kernel paths; a device without the tensor
+        // path must opt out explicitly, and the skip is recorded.
+        if !tensor_available {
+            assert!(
+                std::env::var("MLX_MM_ID_TEST_ALLOW_NO_TENSOR").as_deref() == Ok("1"),
+                "tensor mm_id path unavailable on {}: set MLX_MM_ID_TEST_ALLOW_NO_TENSOR=1 to run the simdgroup path only",
+                device.name()
+            );
+            eprintln!("RECORDED SKIP: tensor mm_id path unavailable; simdgroup path only");
+        }
         Self {
             device,
             registry,
@@ -843,7 +855,9 @@ fn n3_invalid_metadata_poisons_output_on_both_schedules() {
                             .as_mut_slice::<u32>()
                             .expect("hids")
                             .fill(GUARD);
-                        poison(&mut output, 33);
+                        // A finite prefill, so only the kernel's poison
+                        // write can make every element NaN.
+                        output.as_mut_slice::<f32>().expect("output").fill(1.0);
                         let p = params(ggml_type, shape, n_tokens, top_k);
                         let out = &output;
                         gpu.run(|encoder, registry, device| {
@@ -881,6 +895,38 @@ fn n3_invalid_metadata_poisons_output_on_both_schedules() {
             }
         }
     }
+}
+
+/// Enforces the N3 "no weight read" obligation: the N3 weight stacks are
+/// exact-size buffers, so the out-of-range ids (`n_experts`, `n_experts + 3`)
+/// address slabs wholly past their end. Under Metal shader validation any
+/// such read faults the command buffer, which fails the child's
+/// `commit_and_wait` and therefore this test.
+#[test]
+fn n3_invalid_metadata_reads_no_weight_under_shader_validation() {
+    if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
+        return; // Already the child (or an outer validation run).
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+        .args([
+            "--exact",
+            "n3_invalid_metadata_poisons_output_on_both_schedules",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("MTL_SHADER_VALIDATION", "1")
+        .output()
+        .expect("run N3 under shader validation");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "N3 under MTL_SHADER_VALIDATION=1 failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("1 passed"),
+        "shader-validation child ran no N3 test:\n{stdout}"
+    );
 }
 
 fn compact_max_tiles(rows: u64, n_experts: u64) -> u64 {
@@ -1155,19 +1201,31 @@ fn n4_schedule_reuse_is_keyed_and_bitwise() {
             );
             drop(encoder);
 
-            // A mutable buffer access (N9).
-            let mut encoder = gpu.device.command_encoder().expect("encoder");
-            build(&mut gpu, &mut scratch, &mut encoder);
-            let _ = scratch.hids_mut();
-            expect_reject(
-                "mutable access",
-                &mut gpu,
-                &mut scratch,
-                &mut encoder,
-                &ids,
-                &down_params,
-                &routing_policy,
-            );
+            // Mutable buffer access through each accessor (N9).
+            for accessor in ["hids_mut", "htpe_mut", "buffers_mut"] {
+                let mut encoder = gpu.device.command_encoder().expect("encoder");
+                build(&mut gpu, &mut scratch, &mut encoder);
+                match accessor {
+                    "hids_mut" => {
+                        let _ = scratch.hids_mut();
+                    }
+                    "htpe_mut" => {
+                        let _ = scratch.htpe_mut();
+                    }
+                    _ => {
+                        let _ = scratch.buffers_mut();
+                    }
+                }
+                expect_reject(
+                    &format!("mutable access via {accessor}"),
+                    &mut gpu,
+                    &mut scratch,
+                    &mut encoder,
+                    &ids,
+                    &down_params,
+                    &routing_policy,
+                );
+            }
 
             // No schedule at all.
             let mut never =
@@ -1322,6 +1380,11 @@ fn n5_half_tile_skip_against_the_32_row_body() {
             }
         }
     }
+    eprintln!(
+        "N5 device={} tensor half-tile skip ships={}",
+        gpu.device.name(),
+        tensor_half_tile_skip_validated(&gpu.device)
+    );
     for line in &record {
         eprintln!("{line}");
     }
@@ -1416,15 +1479,14 @@ fn n6_capacity_bound_and_schedule_contents() {
             .expect("hids")
             .fill(u32::MAX);
         let (htpe, hids) = scratch.buffers_mut();
-        let (htpe, hids) = (&*htpe, &*hids);
         gpu.run(|encoder, registry, device| {
             dispatch_id_mm_map0_for_test(
                 encoder,
                 registry,
                 device,
                 &ids,
-                htpe,
-                hids,
+                &mut *htpe,
+                &mut *hids,
                 &dispatch,
                 ExpertMmSchedule::CompactTiles,
             )
@@ -1573,6 +1635,7 @@ fn n9_scratch_constructors_serve_every_entry_point() {
     let mut reference = output_buffer(&gpu.device, (n_tokens * 8 * shape.n) as usize);
     let mut candidate = output_buffer(&gpu.device, (n_tokens * 8 * shape.n) as usize);
     let second = output_buffer(&gpu.device, (n_tokens * 8 * shape.n) as usize);
+    let mut slotted_reference = output_buffer(&gpu.device, (n_tokens * 8 * shape.n) as usize);
 
     for (label, scratch) in [
         (
@@ -1637,6 +1700,29 @@ fn n9_scratch_constructors_serve_every_entry_point() {
                     .expect("auto reference");
                 });
             }
+            // Slotted reference: uniform grid on an independent scratch.
+            poison(&mut slotted_reference, 62);
+            {
+                let out = &slotted_reference;
+                let grid_policy = policy(path, ExpertMmSchedule::UniformGrid);
+                let mut grid_scratch =
+                    IdMmScratch::alloc(&gpu.device, shape.n_experts, n_tokens).expect("scratch");
+                gpu.run(|encoder, registry, device| {
+                    quantized_matmul_id_ggml_pooled_slotted_with_policy(
+                        encoder,
+                        registry,
+                        device,
+                        &input,
+                        &weight,
+                        &ids,
+                        out,
+                        &mut grid_scratch,
+                        &p,
+                        &grid_policy,
+                    )
+                    .expect("slotted reference");
+                });
+            }
             for constructor in ["alloc", "alloc_with_top_k"] {
                 for entry in [Entry::PooledShared, Entry::PooledPair, Entry::PooledSlotted] {
                     let mut scratch = match constructor {
@@ -1697,14 +1783,17 @@ fn n9_scratch_constructors_serve_every_entry_point() {
                         }
                         .expect("N9 dispatch");
                     });
-                    if !matches!(entry, Entry::PooledSlotted) {
-                        assert_bitwise(
-                            &format!("N9 {constructor} {entry:?} top_k={top_k} {path:?}"),
-                            &reference,
-                            &candidate,
-                            elements,
-                        );
-                    }
+                    let compared = if matches!(entry, Entry::PooledSlotted) {
+                        &slotted_reference
+                    } else {
+                        &reference
+                    };
+                    assert_bitwise(
+                        &format!("N9 {constructor} {entry:?} top_k={top_k} {path:?}"),
+                        compared,
+                        &candidate,
+                        elements,
+                    );
                 }
             }
         }

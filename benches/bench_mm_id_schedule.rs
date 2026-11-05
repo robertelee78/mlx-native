@@ -60,8 +60,8 @@ use mlx_native::ops::fused_norm_add::dispatch_fused_moe_wsum_dnorm_add_f32;
 use mlx_native::ops::moe_dispatch::moe_swiglu_seq_encode;
 use mlx_native::ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_map0_for_test, dispatch_id_mm_pooled_with_options_for_test,
-    dispatch_id_mm_with_prepared_schedule_for_test, CompactGridOrder, GgmlIdMmDispatchParams,
-    HalfTileSkip, IdMmScheduleOptions,
+    dispatch_id_mm_with_prepared_schedule_for_test, tensor_half_tile_skip_validated,
+    CompactGridOrder, GgmlIdMmDispatchParams, HalfTileSkip, IdMmScheduleOptions,
 };
 use mlx_native::{
     ggml_routing_policy_from_environment, quantized_matmul_id_ggml_pooled_slotted_with_policy,
@@ -206,6 +206,7 @@ fn receipt(device: &MlxDevice) -> Value {
         "working_tree_dirty": dirty,
         "mlx_precompiled_metallib": std::env::var("MLX_PRECOMPILED_METALLIB").ok(),
         "device_name": device.name(),
+        "tensor_half_tile_skip_ships": tensor_half_tile_skip_validated(device),
         "macos_product_version": command_stdout("sw_vers", &["-productVersion"]),
         "macos_build_version": command_stdout("sw_vers", &["-buildVersion"]),
         "thermal_at_start": thermal_state(),
@@ -777,16 +778,16 @@ fn run_m0b_table(
             expert_stride: expert_matrix_bytes(GgmlType::Q8_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF),
             ggml_type: GgmlType::Q8_0,
         };
-        let htpe = u32_buffer(device, &vec![0; params.htpe_bytes() / 4]);
-        let hids = u32_buffer(device, &vec![0; params.hids_bytes() / 4]);
+        let mut htpe = u32_buffer(device, &vec![0; params.htpe_bytes() / 4]);
+        let mut hids = u32_buffer(device, &vec![0; params.hids_bytes() / 4]);
         let stats = time_gpu(device, options, |encoder| {
             dispatch_id_mm_map0_for_test(
                 encoder,
                 registry,
                 device,
                 &ids,
-                &htpe,
-                &hids,
+                &mut htpe,
+                &mut hids,
                 &params,
                 ExpertMmSchedule::UniformGrid,
             )
@@ -1133,6 +1134,10 @@ fn run_m0c_table(
                         false,
                         schedule,
                     );
+                    // The production graph orders down after gate/up (and the
+                    // activation) with a barrier; without it the fresh arm's
+                    // map0 could overwrite the schedule gate/up still reads.
+                    encoder.memory_barrier();
                     encode_expert(
                         encoder,
                         registry,
@@ -1181,10 +1186,9 @@ fn run_m0c_table(
             let mut map_scratch =
                 IdMmScratch::alloc(device, GEMMA_EXPERTS, n_tokens).expect("map0 scratch");
             let (htpe, hids) = map_scratch.buffers_mut();
-            let (htpe, hids) = (&*htpe, &*hids);
             let stats = time_gpu(device, options, |encoder| {
                 dispatch_id_mm_map0_for_test(
-                    encoder, registry, device, &ids, htpe, hids, &params, schedule,
+                    encoder, registry, device, &ids, &mut *htpe, &mut *hids, &params, schedule,
                 )
                 .expect("schedule stage alone");
             });

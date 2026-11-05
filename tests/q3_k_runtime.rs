@@ -303,10 +303,10 @@ fn q3_k_moe_mv_id_and_mm_id_match_cpu() {
                 expert_stride: expert_bytes as u64,
                 ggml_type: GgmlType::Q3_K,
             };
-            let htpe = device
+            let mut htpe = device
                 .alloc_buffer(params.htpe_bytes(), DType::U32, vec![n_experts])
                 .unwrap();
-            let hids = device
+            let mut hids = device
                 .alloc_buffer(params.hids_bytes(), DType::U32, vec![n_experts, n_tokens])
                 .unwrap();
             let mut encoder = device.command_encoder().unwrap();
@@ -317,8 +317,8 @@ fn q3_k_moe_mv_id_and_mm_id_match_cpu() {
                 &input_buf,
                 &weight_buf,
                 &ids_buf,
-                &htpe,
-                &hids,
+                &mut htpe,
+                &mut hids,
                 &output,
                 &params,
             )
