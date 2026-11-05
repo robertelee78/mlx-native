@@ -26,6 +26,9 @@
 //!   written by the extraction script kept with the receipt.
 //! - `single`: the canonical and gate lanes one at a time.
 //! - `long`: the long-context stress lanes.
+//! - `bucket` (opt-in): one lane per stock (NWG, NSG) bucket at a 256-row and
+//!   a 64-row chunk; `s0b.bucket_ratios` / `bucket_stock_fallback` give the
+//!   per-(kind, bucket) stock-fallback rule of hf2q Q4-GEMMA-ATTN-EXACT-G2.
 //!
 //! Every cell records, per arm and lane, the observed transient scratch: the
 //! sum of `byte_len()` of every buffer the chain allocated (§3.8 scope), and
@@ -922,6 +925,26 @@ fn main() {
             run_cell("long", format!("{}+{}", pair.0, pair.1), &[pair], &mut reg);
         }
     }
+    // Q4-GEMMA-ATTN-EXACT-G2 stock-fallback rule: one lane per (kind,
+    // bucket) whose every chunk lies in one (NWG, NSG) bucket of the stock
+    // heuristic (kv_seq_len <= 512: (16, 1); <= 1024: (32, 1); else (32, 4)),
+    // at a full 256-row chunk and a 64-row chunk.
+    if groups.contains("bucket") {
+        for (bucket, pairs) in [
+            ("b16x1", [(200, 256), (300, 64)]),
+            ("b32x1", [(600, 256), (800, 64)]),
+            ("b32x4", [(1100, 256), (1300, 64)]),
+        ] {
+            for pair in pairs {
+                run_cell(
+                    "bucket",
+                    format!("{bucket} {}+{}", pair.0, pair.1),
+                    &[pair],
+                    &mut reg,
+                );
+            }
+        }
+    }
 
     // Model-level projection and the frozen M1/M2 ratios on the four-lane
     // cells: 25 sliding + 5 global layers per transaction, chain medians.
@@ -957,12 +980,34 @@ fn main() {
             })
             .map(|c| format!("{} {} {}", c["group"], c["label"], c["kind"]))
             .collect();
+        // Per (kind, bucket): grouped over stock chain medians summed over
+        // the bucket's cells; a ratio above 1.02 keeps stock in that bucket.
+        let mut buckets = std::collections::BTreeMap::<String, (f64, f64)>::new();
+        for c in cells.iter().filter(|c| c["group"] == "bucket") {
+            let bucket = c["label"].as_str().unwrap().split(' ').next().unwrap();
+            let entry = buckets
+                .entry(format!("{}/{bucket}", c["kind"].as_str().unwrap()))
+                .or_default();
+            entry.0 += c["chain"]["vec_gqa"]["median_ms"].as_f64().unwrap();
+            entry.1 += c["chain"]["vec"]["median_ms"].as_f64().unwrap();
+        }
+        let bucket_ratios: serde_json::Map<String, serde_json::Value> = buckets
+            .iter()
+            .map(|(k, (g, v))| (k.clone(), serde_json::json!(g / v)))
+            .collect();
+        let stock_fallback: Vec<&String> = buckets
+            .iter()
+            .filter(|(_, (g, v))| g / v > 1.02)
+            .map(|(k, _)| k)
+            .collect();
         serde_json::json!({
             "chain_ratio_vec_gqa_over_vec": gqa / totals["vec"],
             "sliding_ratio": kind_ratio("sliding"),
             "global_ratio": kind_ratio("global"),
             "go_threshold": 0.70,
             "cells_more_than_2pct_slower": slow_cells,
+            "bucket_ratios": bucket_ratios,
+            "bucket_stock_fallback": stock_fallback,
         })
     });
     let ratios: serde_json::Map<String, serde_json::Value> = if totals.is_empty() {
