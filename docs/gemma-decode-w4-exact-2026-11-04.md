@@ -95,3 +95,11 @@ The adopt/drop thresholds are the design's §7.5. The geometry table in
 `src/ops/gemma_decode_dense.rs` holds the pre-M0 default (R0 = 2, NSG = 2)
 and is replaced by the M0 freeze; levers that miss their threshold are
 removed in the promotion commit.
+
+`flash_attn_vec_hybrid_batched_gqa` is also hf2q's warm-prefill attention
+primitive (Q4-GEMMA-ATTN-EXACT-G2, G ≤ 2), covered by
+`tests/gemma_warm_attn_exact_s0.rs` and the `vec_gqa` arm of
+`benches/bench_flash_attn_warm_precise.rs`. The kernel therefore stays even
+if decode lever A misses its threshold; only hf2q's decode use is dropped.
+A multi-row generalisation (R > 1) was measured bitwise but slower than
+R = 1 at every G and is not included.
