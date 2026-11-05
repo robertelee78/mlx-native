@@ -69,7 +69,7 @@ jobs:
         # archive below, as in ci.yml's rust-metal-mm-id job.
         run: >-
           cargo +1.96.0 test --locked --all-features -- --test-threads=1
-          --skip compact_grid_orders_equal_uniform_grid
+          --skip compact_half_tile_settings_equal_uniform_grid
           --skip n1_slotted_equals_flattened_and_n7_row_independence
           --skip n2_compact_equals_uniform_grid_on_every_entry_point
           --skip n3_invalid_metadata_
@@ -99,7 +99,7 @@ jobs:
           cargo +1.96.0 test --locked --all-features \
             --manifest-path "$unpacked/mlx-native-${EXPECTED_VERSION}/Cargo.toml" \
             -- --test-threads=1 \
-            --skip compact_grid_orders_equal_uniform_grid \
+            --skip compact_half_tile_settings_equal_uniform_grid \
             --skip n1_slotted_equals_flattened_and_n7_row_independence \
             --skip n2_compact_equals_uniform_grid_on_every_entry_point \
             --skip n3_invalid_metadata_ \

@@ -1900,19 +1900,6 @@ pub fn quantized_matmul_id_swiglu_q4_0(
     Ok(())
 }
 
-/// Grid order of the compact `mm_id` launch. Both orders give each output
-/// element a single writer, so they are bitwise-neutral; they differ only
-/// in activation and weight locality (ADR-063 M0c measures both).
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactGridOrder {
-    /// `(max_tiles, ⌈N/64⌉, 1)`: every tile of one N block before the next.
-    TileFastest,
-    /// `(⌈N/64⌉, max_tiles, 1)`: every N block of one tile before the next,
-    /// keeping a tile's routed rows resident as the uniform grid does.
-    NTileFastest,
-}
-
 /// Half-tile skip (P2c) selection for a compact `mm_id` launch.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1927,11 +1914,17 @@ pub enum HalfTileSkip {
 /// Complete `mm_id` schedule configuration. Production derives it from
 /// [`GgmlRoutingPolicy::expert_mm_schedule`] via [`Self::production`];
 /// parity tests and microbenchmarks pass explicit values.
+///
+/// The compact launch has one grid order, tile fastest: `(max_tiles,
+/// ⌈N/64⌉, 1)`, every tile of one N block before the next. ADR-063 M0c
+/// (Apple M5 Max, 2026-11-05, served shapes) measured it 0.012 s per
+/// four-agent run faster than N tile fastest `(⌈N/64⌉, max_tiles, 1)`;
+/// both give each output element a single writer, so the choice is
+/// bitwise-neutral and N tile fastest was removed.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdMmScheduleOptions {
     pub schedule: ExpertMmSchedule,
-    pub grid_order: CompactGridOrder,
     pub half_tile_skip: HalfTileSkip,
 }
 
@@ -1940,15 +1933,11 @@ impl IdMmScheduleOptions {
     pub const fn production(schedule: ExpertMmSchedule) -> Self {
         Self {
             schedule,
-            grid_order: COMPACT_GRID_ORDER,
             half_tile_skip: HalfTileSkip::Production,
         }
     }
 }
 
-/// Compact grid order shipped under `CompactTiles` until M0c selects the
-/// faster order at the served shapes.
-const COMPACT_GRID_ORDER: CompactGridOrder = CompactGridOrder::NTileFastest;
 /// P2c on the simdgroup path: simdgroups 2-3 own rows 16-31 and skip their
 /// MMA and shared-memory store, which is bitwise by construction (§5.1 N5).
 const HALF_TILE_SKIP_SIMDGROUP: bool = true;
@@ -1983,8 +1972,7 @@ pub fn tensor_half_tile_skip_validated(device: &MlxDevice) -> bool {
     }
 }
 
-const SCHED_FLAG_N_TILE_FASTEST: u16 = 1;
-const SCHED_FLAG_HALF_TILE_SKIP: u16 = 2;
+const SCHED_FLAG_HALF_TILE_SKIP: u16 = 1;
 
 /// `(htpe, hids)` bytes one schedule needs for `(n_experts, n_tokens, top_k)`.
 fn id_mm_scratch_bytes(
@@ -2352,7 +2340,7 @@ fn dispatch_id_mm_pooled_with_options(
 }
 
 /// Test-only helper: pooled `mm_id` under an explicit schedule
-/// configuration (grid order, half-tile skip), for parity tests and the
+/// configuration (schedule, half-tile skip), for parity tests and the
 /// schedule microbenchmark.
 ///
 /// `slotted` selects the `[n_tokens, top_k, K]` input layout. With
@@ -2519,7 +2507,7 @@ struct GgmlIdMmMmGpuParams {
     ne1: i32,  // batch stride (== ne20 for our packed layout)
     r2: i16,
     r3: i16,
-    /// Compact kernels only: bit 0 N tile fastest, bit 1 half-tile skip.
+    /// Compact kernels only: bit 0 half-tile skip.
     sched_flags: u16,
     _pad1: u16,
 }
@@ -3119,12 +3107,7 @@ fn dispatch_id_mm_with_layout(
             HalfTileSkip::Disabled => false,
             HalfTileSkip::Forced => true,
         };
-    let n_tile_fastest = compact && options.grid_order == CompactGridOrder::NTileFastest;
-    let sched_flags = if n_tile_fastest {
-        SCHED_FLAG_N_TILE_FASTEST
-    } else {
-        0
-    } | if half_tile_skip {
+    let sched_flags = if half_tile_skip {
         SCHED_FLAG_HALF_TILE_SKIP
     } else {
         0
@@ -3200,8 +3183,6 @@ fn dispatch_id_mm_with_layout(
             n_tiles,
             params.n_experts as u64,
         )
-    } else if n_tile_fastest {
-        metal::MTLSize::new(n_tiles, max_tiles, 1)
     } else {
         metal::MTLSize::new(max_tiles, n_tiles, 1)
     };

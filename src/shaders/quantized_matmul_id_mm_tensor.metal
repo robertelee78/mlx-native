@@ -40,8 +40,7 @@ struct GgmlMatmulIdMmTensor_MmParams {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
-    int16_t  sched_flags; // compact kernels only: bit 0 = N tile fastest,
-                          // bit 1 = half-tile skip (P2c)
+    int16_t  sched_flags; // compact kernels only: bit 0 = half-tile skip (P2c)
     int16_t  _pad1;
 };
 
@@ -610,10 +609,10 @@ inline void hf2q_mul_mm_id_tensor_tile(
     }
 }
 
-// COMPACT (ADR-063 P2, `_c` host names): grid of `max_tiles` tile slots ×
-// ⌈N/64⌉ N tiles (bit 0 of `sched_flags` puts the N tile on grid x) over the
-// map0c schedule; see quantized_matmul_id_mm.metal for the descriptor
-// layout. Bit 1 enables the half-tile skip (P2c) for tiles of <= 16 rows.
+// COMPACT (ADR-063 P2, `_c` host names): grid of `max_tiles` tile slots
+// (grid x, fastest) × ⌈N/64⌉ N tiles (grid y) over the map0c schedule; see
+// quantized_matmul_id_mm.metal for the descriptor layout. Bit 0 enables the
+// half-tile skip (P2c) for tiles of <= 16 rows.
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
 kernel void hf2q_mul_mm_id_tensor_impl(
         constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
@@ -647,9 +646,8 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     short nr1;
     if (COMPACT) {
         const uint32_t schedule_state = tpe_u32[0];
-        const bool n_fastest = (args.sched_flags & 1) != 0;
-        const uint32_t tile  = n_fastest ? tgpig.y : tgpig.x;
-        const uint32_t ntile = n_fastest ? tgpig.x : tgpig.y;
+        const uint32_t tile  = tgpig.x;
+        const uint32_t ntile = tgpig.y;
         if ((schedule_state & 0x80000000u) != 0u) {
             if (tgpig.x == 0 && tgpig.y == 0) {
                 device float * out = (device float *) dst;
@@ -720,7 +718,7 @@ kernel void hf2q_mul_mm_id_tensor_impl(
         + args.nb11*i11
         + args.nb10*iy);
 
-    if (COMPACT && (args.sched_flags & 2) != 0 && nr1 <= 16) {
+    if (COMPACT && (args.sched_flags & 1) != 0 && nr1 <= 16) {
         hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, 16>(
             args, x, y, il0, sa, sb, sc, tiitg);
     } else {
