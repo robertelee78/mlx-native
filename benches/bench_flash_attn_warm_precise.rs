@@ -473,7 +473,8 @@ fn encode_attention(
                     h_kv as u32,
                     d as u32,
                     bucket.nsg,
-                );
+                )
+                .min(2); // scratch head-to-head: capped A1 (Q4-GEMMA-ATTN-EXACT-G2)
                 flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_gqa(
                     enc,
                     reg,
