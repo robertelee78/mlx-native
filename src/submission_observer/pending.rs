@@ -46,12 +46,13 @@ impl<R: TerminalResource> Registry<R> {
             core.fail();
             return;
         }
-        if self
-            .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                n.checked_add(1).filter(|n| *n <= self.limit)
-            })
-            .is_err()
+        if crate::atomic_update::try_update_u64(
+            &self.outstanding,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| n.checked_add(1).filter(|n| *n <= self.limit),
+        )
+        .is_err()
         {
             core.fail();
             // Outside any registry lock: unchecked observation Drop records Unknown.

@@ -33,11 +33,13 @@ pub const DENSE_Q4_ROUTE_SCHEMA_VERSION: u32 = 4;
 
 fn next_registry_authority_id() -> u64 {
     static NEXT_REGISTRY_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
-    NEXT_REGISTRY_AUTHORITY_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .expect("dense Q4 registry activation authority exhausted")
+    crate::atomic_update::try_update_u64(
+        &NEXT_REGISTRY_AUTHORITY_ID,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| current.checked_add(1),
+    )
+    .expect("dense Q4 registry activation authority exhausted")
 }
 
 pub(super) const Q4_MM_PIPELINE_INT_CONSTANTS: &[(usize, i32)] = &[(700, 1), (701, 1), (702, 1)];

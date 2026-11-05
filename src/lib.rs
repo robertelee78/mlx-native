@@ -46,6 +46,7 @@
 // ---- internal modules ----
 #[macro_use]
 mod error;
+mod atomic_update;
 mod buffer;
 mod buffer_pool;
 mod legacy_growth;
