@@ -1168,6 +1168,11 @@ fn check_s0_underflow_cell(shape: Shape, v_f16: bool, sf_d512: f32) {
     );
 }
 
+// F16-V has no V norms, so the dominant key cannot carry a zero norm and the
+// partials never reach the underflow range; F16-V cells built this way were
+// measured vacuous (d24f317) and are not kept. Under the old operand form,
+// the two d256 cells below failed on a tmp partial word and pass with the
+// `ldexp` order; the d512 cells pass under both forms (non-vacuous).
 #[test]
 fn underflow_s0a_d256_sliding_bitwise() {
     check_s0_underflow_cell(S0_SLIDING, false, 22.627417);
@@ -1179,11 +1184,6 @@ fn underflow_s0a_d256_gqa8_sliding_bitwise() {
 }
 
 #[test]
-fn underflow_s0a_d256_sliding_f16_v_bitwise() {
-    check_s0_underflow_cell(S0_SLIDING, true, 22.627417);
-}
-
-#[test]
 fn underflow_s0a_d512_global_bitwise() {
     // Non-power-of-two norm divisors (a power of two hides the association).
     check_s0_underflow_cell(S0_GLOBAL, false, 22.627417);
@@ -1192,11 +1192,6 @@ fn underflow_s0a_d512_global_bitwise() {
 #[test]
 fn underflow_s0a_d512_global_sf3_bitwise() {
     check_s0_underflow_cell(S0_GLOBAL, false, 3.0);
-}
-
-#[test]
-fn underflow_s0a_d512_global_f16_v_bitwise() {
-    check_s0_underflow_cell(S0_GLOBAL, true, 22.627417);
 }
 
 #[test]
