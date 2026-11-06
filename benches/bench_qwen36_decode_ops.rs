@@ -1324,7 +1324,12 @@ fn prepare(
                 sets: n_sets,
                 footprint: n_sets as u64 * w as u64 * TqSlot::bytes(kv),
                 extra: json!({"per_row_dispatches": 2, "row_barrier": true, "kv_len": kv,
-                    "kv_capacity": kv, "gqa_q2": tq_uses_gqa_q2(kv), "nsg": compute_nsg(kv)}),
+                    "kv_capacity": kv, "gqa_q2": tq_uses_gqa_q2(kv), "nsg": compute_nsg(kv),
+                    "peer_case_unified": format!(
+                        "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[8,1],kv={},nb={w},type_K=f16,type_V=f16) (peer serving layout: unified KV, kv = w*L)",
+                        w * kv
+                    ),
+                    "peer_match_note": "match peer perf lines on the named fields only; test-backend-ops prints more vars"}),
                 encode: unit(move |enc, reg, dev, i| {
                     for (row, slot) in sets[i % sets.len()].iter().enumerate() {
                         if row > 0 {
@@ -1904,6 +1909,10 @@ fn prepare_layer_attn(
         sets: n_sets,
         footprint: n_sets as u64 * (wbytes + kv_bytes),
         extra: json!({"kv_len": kv, "kv_capacity": kv, "gqa_q2": tq_uses_gqa_q2(kv),
+            "peer_attention_unified": format!(
+                "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[8,1],kv={},nb={w},type_K=f16,type_V=f16)",
+                w * kv
+            ),
             "layers_per_step": if v_t == GgmlType::Q6_K { 6 } else { 4 },
             "row_copies": joint}),
         encode: unit(move |enc, reg, dev, i| {
