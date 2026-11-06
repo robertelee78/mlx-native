@@ -171,3 +171,7 @@ harness = false
 [[bench]]
 name = "bench_flash_attn_warm_precise"
 harness = false
+
+[[bench]]
+name = "bench_gemma_cold_attention"
+harness = false
