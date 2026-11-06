@@ -616,10 +616,8 @@ kernel void rms_norm_no_scale_f32_dual(
 //
 // Replaces the V-permute_021_bf16 dispatch (~30/prefill on Gemma 4) by
 // having the V-norm itself write directly into the FA-expected head-major
-// layout.  Same compute as rms_norm_no_scale_f32_dual; only the bf16
-// output index changes.  f32 output (used by KV cache copy downstream)
-// remains at natural layout — KV cache copy expects [seq_len, n_heads,
-// head_dim] source.
+// layout.  f32 output (used by KV cache copy downstream) remains at natural
+// layout — KV cache copy expects [seq_len, n_heads, head_dim] source.
 //
 // Buffers:
 //   0: input        — float [rows * dim]   (rows = seq_len * n_heads)
@@ -628,24 +626,111 @@ kernel void rms_norm_no_scale_f32_dual(
 //   3: output_bf16  — bfloat [rows * dim]  (permuted layout — FA src)
 //   4: aux_params   — uint  [n_heads, seq_len]  (permuted-index calc)
 //
-// Threadgroup: (min(256, next_pow2(dim)), 1, 1) — one threadgroup per row
-// Grid       : (rows, 1, 1)
+// One simdgroup per row (the reference implementation's norm pattern), no
+// threadgroup memory, no barrier: row = threadgroup *
+// simdgroups_per_threadgroup + simdgroup, rows past seq_len * n_heads
+// return.  Any 1-D dispatch with at least one
+// simdgroup per row is valid; `dispatch_rms_norm_no_scale_f32_dual_perm`
+// packs DUAL_PERM_ROWS_PER_THREADGROUP rows per threadgroup, and the earlier
+// geometry (one threadgroup of min(256, next_pow2(dim)) threads per row)
+// still computes every row once.  dim % 256 == 0 uses float4 lanes (input
+// and output 16-byte aligned, output_bf16 8-byte aligned); other dims use
+// lane l = elements l, l+32, ...
+//
+// Bitwise contract: the outputs equal those of the earlier one-threadgroup-
+// per-row kernel as this toolchain compiled it (T = min(256,
+// next_pow2(dim)) slots, slot t accumulating fma(x, x, s) over x[t],
+// x[t+T], ... from s = 0, then a tree of plain adds, stride T/2 .. 1).  The
+// reduction is spelled out with contraction and reassociation off; the
+// rsqrt(sum / dim + eps) and x * rms_inv expressions keep the earlier
+// kernel's default (fast) math lowering — a pragma there changes the
+// division lowering for non-power-of-two dim.  Twin of the reduction in
+// fused_head_norm_rope_f32.metal.
 // ---------------------------------------------------------------------------
+static inline uint dual_perm_reduction_slots(const uint dim) {
+    const uint pow2 = dim <= 1u ? 1u : (1u << (32u - clz(dim - 1u)));
+    return min(256u, pow2);
+}
+
+static inline float dual_perm_sum_sq(device const float* x, const uint dim, const ushort lane) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const uint slots = dual_perm_reduction_slots(dim);
+    const uint slots_per_lane = slots >= 32u ? slots / 32u : 1u;
+    float partial[8];
+    for (uint k = 0; k < 8u; ++k) {
+        float sum_sq = 0.0f;
+        const uint slot = uint(lane) + 32u * k;
+        if (k < slots_per_lane && slot < slots) {
+            for (uint i = slot; i < dim; i += slots) {
+                const float val = x[i];
+                sum_sq = fma(val, val, sum_sq);
+            }
+        }
+        partial[k] = sum_sq;
+    }
+    if (slots_per_lane == 8u) {
+        partial[0] += partial[4];
+        partial[1] += partial[5];
+        partial[2] += partial[6];
+        partial[3] += partial[7];
+    }
+    if (slots_per_lane >= 4u) {
+        partial[0] += partial[2];
+        partial[1] += partial[3];
+    }
+    if (slots_per_lane >= 2u) {
+        partial[0] += partial[1];
+    }
+    float sum_sq = partial[0];
+    for (ushort stride = ushort(min(16u, slots / 2u)); stride > 0; stride >>= 1) {
+        sum_sq += simd_shuffle_down(sum_sq, stride);
+    }
+    return simd_broadcast(sum_sq, 0);
+}
+
+// dim % 256 == 0: lane l owns slots 4l+c (even 128-blocks) and 128+4l+c (odd).
+static inline float dual_perm_sum_sq4(device const float4* x4, const uint blocks, const ushort lane) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    float4 even = float4(0.0f);
+    float4 odd = float4(0.0f);
+    for (uint block = 0; block < blocks; block += 2u) {
+        const float4 v0 = x4[32u * block + lane];
+        const float4 v1 = x4[32u * (block + 1u) + lane];
+        even = fma(v0, v0, even);
+        odd = fma(v1, v1, odd);
+    }
+    even += odd;
+    even += simd_shuffle_down(even, ushort(16));
+    even += simd_shuffle_down(even, ushort(8));
+    even += simd_shuffle_down(even, ushort(4));
+    even += simd_shuffle_down(even, ushort(2));
+    even += simd_shuffle_down(even, ushort(1));
+    const float lo = even.x + even.z;
+    const float hi = even.y + even.w;
+    return simd_broadcast(lo + hi, 0);
+}
+
 kernel void rms_norm_no_scale_f32_dual_perm(
     device const float *input       [[buffer(0)]],
     device float       *output      [[buffer(1)]],
     device const float *params      [[buffer(2)]],
     device bfloat      *output_bf16 [[buffer(3)]],
     constant uint2&     aux_params  [[buffer(4)]],
-    uint row_idx   [[threadgroup_position_in_grid]],
-    uint tid       [[thread_index_in_threadgroup]],
-    uint tg_size   [[threads_per_threadgroup]],
-    threadgroup float *shared       [[threadgroup(0)]]
+    uint   tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort n_sg  [[simdgroups_per_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]
 ) {
     const float eps = params[0];
     const uint dim  = uint(params[1]);
     const uint n_heads = aux_params.x;
     const uint seq_len = aux_params.y;
+    const uint row_idx = tgid * uint(n_sg) + uint(sgitg);
+    if (row_idx >= n_heads * seq_len) {
+        return;
+    }
 
     const uint base = row_idx * dim;
     // Permuted bf16 base: rows are laid out [seq_len, n_heads, dim] in
@@ -656,26 +741,23 @@ kernel void rms_norm_no_scale_f32_dual_perm(
     const uint token   = row_idx / n_heads;
     const uint base_bf = head * (seq_len * dim) + token * dim;
 
-    float partial_sum_sq = 0.0f;
-    for (uint i = tid; i < dim; i += tg_size) {
-        const float val = input[base + i];
-        partial_sum_sq += val * val;
-    }
-
-    shared[tid] = partial_sum_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared[tid] += shared[tid + stride];
+    if (dim % 256u == 0u) {
+        device const float4* x4 = (device const float4*)(input + base);
+        const float rms_inv = rsqrt(dual_perm_sum_sq4(x4, dim / 128u, lane) / float(dim) + eps);
+        device float4* out4 = (device float4*)(output + base);
+        device bfloat4* bf4 = (device bfloat4*)(output_bf16 + base_bf);
+        for (uint q = lane; q < dim / 4u; q += 32u) {
+            const float4 v = x4[q] * rms_inv;
+            out4[q] = v;
+            bf4[q]  = bfloat4(v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        return;
     }
 
-    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
-
-    for (uint i = tid; i < dim; i += tg_size) {
-        const float v = input[base + i] * rms_inv;
+    device const float* x = input + base;
+    const float rms_inv = rsqrt(dual_perm_sum_sq(x, dim, lane) / float(dim) + eps);
+    for (uint i = lane; i < dim; i += 32u) {
+        const float v = x[i] * rms_inv;
         output[base + i]         = v;
         output_bf16[base_bf + i] = bfloat(v);
     }
