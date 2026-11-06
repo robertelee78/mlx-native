@@ -16,11 +16,8 @@
 //!   - threadgroups = (N/r0ptg, M/r1ptg, batch)
 //!   - threads-per-tg = (32, nsg, 1)
 //!
-//! Callers reach these kernels only through validated GGML dispatchers:
-//! the canonical dispatcher (width-adaptive geometry above), which owns
-//! routing policy, capability, and trace contracts, and the opt-in
-//! column-invariant entry, which pins `r1ptg = 4` and a K-only `nxpsg`
-//! (see [`MulMvExtGeometry::ColumnInvariant`]).
+//! Callers reach these kernels only through the validated canonical GGML
+//! dispatcher, which owns routing policy, capability, and trace contracts.
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
@@ -29,37 +26,6 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::quantized_matmul_ggml::GgmlType;
-
-/// Launch-geometry policy for one `mul_mv_ext` dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MulMvExtGeometry {
-    /// Width-adaptive `r1ptg` / `nxpsg` (the canonical route's policy).
-    WidthAdaptive,
-    /// `r1ptg = 4` at every width and `nxpsg` chosen from K alone, so each
-    /// column executes the same instruction stream (same lane partition,
-    /// same reduction tree) at every width `m ∈ 1..=8`. Columns past `m`
-    /// in the last threadgroup are guarded by the kernel (`ne11`).
-    ColumnInvariant,
-}
-
-/// Physical column width of the column-invariant geometry.
-const COLUMN_INVARIANT_R1PTG: i32 = 4;
-
-/// `nxpsg` of the column-invariant geometry: a function of K only.
-///
-/// Both kernel templates consume `16 * nxpsg` K elements per loop
-/// iteration without a tail guard, so K must be a multiple of that span.
-/// `8` matches the peer's choice at the widths where it amortizes weights
-/// (`m >= 3`, `K % 128 == 0`); `4` admits K = 64·odd (e.g. Gemma's 2112).
-pub(super) fn column_invariant_nxpsg(k: u32) -> Option<i32> {
-    if k % 128 == 0 {
-        Some(8)
-    } else if k % 64 == 0 {
-        Some(4)
-    } else {
-        None
-    }
-}
 
 /// Host-side parameters for [`mul_mv_ext_dispatch`].
 ///
@@ -82,8 +48,6 @@ pub(super) struct MulMvExtParams {
     /// GGUF weight type. Unsupported codecs return
     /// `MlxError::InvalidArgument`.
     pub(super) ggml_type: GgmlType,
-    /// Launch-geometry policy.
-    pub(super) geometry: MulMvExtGeometry,
 }
 
 /// GPU args struct — must match `hf2q_mul_mv_ext_args` in
@@ -260,34 +224,14 @@ pub(super) fn mul_mv_ext_dispatch(
         )));
     }
 
-    let (r1ptg, nxpsg) = match params.geometry {
-        MulMvExtGeometry::ColumnInvariant => {
-            if params.m > 8 {
-                return Err(MlxError::InvalidArgument(format!(
-                    "mul_mv_ext: unsupported m {} (supported range is 1..=8)",
-                    params.m
-                )));
-            }
-            let nxpsg = column_invariant_nxpsg(params.k).ok_or_else(|| {
-                MlxError::InvalidArgument(format!(
-                    "mul_mv_ext: column-invariant geometry needs K % 64 == 0, got K = {}",
-                    params.k
-                ))
-            })?;
-            (COLUMN_INVARIANT_R1PTG, nxpsg)
-        }
-        MulMvExtGeometry::WidthAdaptive => {
-            let r1ptg = pick_r1ptg(params.m)?;
-            // Q5_K uses one frozen lane partition at every decode width so an
-            // independently encoded R1=1 column can be the arithmetic authority for
-            // R1=2..8 verification. Other codecs retain their qualified policy.
-            let nxpsg = if params.ggml_type == GgmlType::Q5_K {
-                8
-            } else {
-                pick_nxpsg(params.k, params.m)
-            };
-            (r1ptg, nxpsg)
-        }
+    let r1ptg = pick_r1ptg(params.m)?;
+    // Q5_K uses one frozen lane partition at every decode width so an
+    // independently encoded R1=1 column can be the arithmetic authority for
+    // R1=2..8 verification. Other codecs retain their qualified policy.
+    let nxpsg = if params.ggml_type == GgmlType::Q5_K {
+        8
+    } else {
+        pick_nxpsg(params.k, params.m)
     };
     let nsg: i32 = 2;
     let nypsg = 32 / nxpsg;
@@ -429,20 +373,6 @@ mod tests {
         assert_eq!(pick_nxpsg(2816, 3), 8);
         // K=512, M=4 → 512%256==0 but M>=3 → fallthrough %128==0 → 8
         assert_eq!(pick_nxpsg(512, 4), 8);
-    }
-
-    #[test]
-    fn column_invariant_nxpsg_depends_on_k_only() {
-        // Each kernel loop iteration consumes 16·nxpsg values untailed.
-        for k in [2816u32, 4096, 8192, 512, 2112, 320, 64, 96, 32, 2080] {
-            match column_invariant_nxpsg(k) {
-                Some(nxpsg) => assert_eq!(k % (16 * nxpsg as u32), 0, "K={k}"),
-                None => assert_ne!(k % 64, 0, "K={k} must be admitted"),
-            }
-        }
-        assert_eq!(column_invariant_nxpsg(2816), Some(8));
-        assert_eq!(column_invariant_nxpsg(2112), Some(4));
-        assert_eq!(column_invariant_nxpsg(96), None);
     }
 
     #[test]

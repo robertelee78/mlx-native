@@ -1,13 +1,8 @@
-//! Class B gates for the column-invariant decode mat-vec entries:
+//! Class B gates for `quantized_matmul_ggml_column_invariant_mma`, the
+//! peer's few-row MMA technique (`mul_mv_mma`, 8×8 simdgroup matrices)
+//! with a pipeline chosen from (type, N, K) only.
 //!
-//! * `quantized_matmul_ggml_column_invariant_mv_ext` — the peer's
-//!   small-batch `mul_mv_ext` technique with a width-independent launch
-//!   geometry (`r1ptg = 4`, `nxpsg` from K only);
-//! * `quantized_matmul_ggml_column_invariant_mma` — the peer's few-row MMA
-//!   technique (`mul_mv_mma`, 8×8 simdgroup matrices) with a pipeline
-//!   chosen from (type, N, K) only (tests prefixed `mma_`).
-//!
-//! Neither is bitwise equal to the canonical mv routes, so correctness is
+//! It is not bitwise equal to the canonical mv routes, so correctness is
 //! proven by:
 //!
 //! (a) an f64 CPU reference over the exactly dequantized weights with the
@@ -19,8 +14,8 @@
 //! (d) an output tail canary: nothing is written past `m·n`.
 //!
 //! Gemma 4 decode shapes: lm head Q6_K 262144×2816, Q4_K dense 4096×2816,
-//! 8192×2816, 2048×2816, 2112×2816, 2816×4096, 2816×8192 (mma; mv_ext covers
-//! 4096×2816 and 2816×4096), Q6_K 2048×2816 (mma), Q5_0/Q8_0 2816×2112
+//! 8192×2816, 2048×2816, 2112×2816, 2816×4096, 2816×8192, Q6_K 2048×2816,
+//! Q5_0/Q8_0 2816×2112
 //! (K = 64·33), plus a small N that is not a multiple of the row tile for
 //! every admitted type.
 //!
@@ -28,7 +23,7 @@
 //! large allocation alive:
 //!
 //! ```text
-//! cargo test --release --locked --test test_mv_ext_column_invariant -- --test-threads=1
+//! cargo test --release --locked --test test_mma_column_invariant -- --test-threads=1
 //! ```
 
 #![cfg(target_vendor = "apple")]
@@ -36,9 +31,8 @@
 
 use mlx_native::gguf::test_only_dequantize;
 use mlx_native::{
-    quantized_matmul_ggml_column_invariant_mma, quantized_matmul_ggml_column_invariant_mv_ext,
-    CommandEncoder, DType, GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxBuffer,
-    MlxDevice,
+    quantized_matmul_ggml_column_invariant_mma, CommandEncoder, DType, GgmlQuantizedMatmulParams,
+    GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
 };
 
 /// A column-invariant entry under test.
@@ -52,7 +46,6 @@ type Entry = fn(
     &GgmlQuantizedMatmulParams,
 ) -> mlx_native::Result<()>;
 
-const MV_EXT: Entry = quantized_matmul_ggml_column_invariant_mv_ext;
 const MMA: Entry = quantized_matmul_ggml_column_invariant_mma;
 
 /// Bound constant for `|gpu − ref| ≤ C·K·ε_f32·Σ|w·x|`, fixed here and never
@@ -386,49 +379,6 @@ fn check_shape(gpu: &mut Gpu, ggml_type: GgmlType, n: usize, k: usize, seed: u64
 }
 
 #[test]
-fn lm_head_q6_k_262144x2816() {
-    let mut gpu = Gpu::new(MV_EXT);
-    check_shape(&mut gpu, GgmlType::Q6_K, 262_144, 2816, 0x1a6d_0001);
-}
-
-#[test]
-fn q4_k_gemma_dense_shapes() {
-    let mut gpu = Gpu::new(MV_EXT);
-    check_shape(&mut gpu, GgmlType::Q4_K, 4096, 2816, 0x4b00_0001);
-    check_shape(&mut gpu, GgmlType::Q4_K, 2816, 4096, 0x4b00_0002);
-}
-
-#[test]
-fn q5_0_and_q8_0_down_2816x2112() {
-    let mut gpu = Gpu::new(MV_EXT);
-    check_shape(&mut gpu, GgmlType::Q5_0, 2816, 2112, 0x5000_0001);
-    check_shape(&mut gpu, GgmlType::Q8_0, 2816, 2112, 0x8000_0001);
-}
-
-#[test]
-fn small_odd_n_every_admitted_type() {
-    let mut gpu = Gpu::new(MV_EXT);
-    // N = 37 is not a multiple of the row tile (8 rows at nxpsg 8, 16 at
-    // nxpsg 4). K = 512 exercises nxpsg 8; K = 320 (64·5) nxpsg 4.
-    for (index, ggml_type) in [
-        GgmlType::Q4_0,
-        GgmlType::Q5_0,
-        GgmlType::Q8_0,
-        GgmlType::Q4_K,
-        GgmlType::Q5_K,
-        GgmlType::Q6_K,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        check_shape(&mut gpu, ggml_type, 37, 512, 0x0dd0_0000 + index as u64);
-        if ggml_type.block_values() == 32 {
-            check_shape(&mut gpu, ggml_type, 37, 320, 0x0dd1_0000 + index as u64);
-        }
-    }
-}
-
-#[test]
 fn mma_lm_head_q6_k_262144x2816() {
     let mut gpu = Gpu::new(MMA);
     check_shape(&mut gpu, GgmlType::Q6_K, 262_144, 2816, 0x1a6d_0101);
@@ -545,34 +495,6 @@ fn alloc_f32(device: &MlxDevice, elements: usize) -> MlxBuffer {
     device
         .alloc_buffer(elements * 4, DType::F32, vec![elements])
         .expect("f32 buffer")
-}
-
-#[test]
-fn rejects_unsupported_requests() {
-    let device = MlxDevice::new().expect("Metal device");
-    let mut r = rejector(&device, MV_EXT);
-    let input = alloc_f32(&device, 9 * REJECT_K);
-    let output = alloc_f32(&device, 9 * REJECT_N);
-    let k32 = REJECT_K as u32;
-    r.reject("m=0", &input, &output, 0, k32, GgmlType::Q4_K);
-    r.reject("m=9", &input, &output, 9, k32, GgmlType::Q4_K);
-    for t in [
-        GgmlType::F32,
-        GgmlType::F16,
-        GgmlType::BF16,
-        GgmlType::Q2_K,
-        GgmlType::Q3_K,
-        GgmlType::Q5_1,
-        GgmlType::IQ4_NL,
-        GgmlType::IQ4_XS,
-    ] {
-        r.reject(&format!("type {t:?}"), &input, &output, 4, k32, t);
-    }
-    r.reject("Q4_K k=128 (not a block multiple)", &input, &output, 4, 128, GgmlType::Q4_K);
-    r.reject("Q8_0 k=96 (not a multiple of 64)", &input, &output, 4, 96, GgmlType::Q8_0);
-    r.reject("output aliases input", &input, &input, 4, k32, GgmlType::Q8_0);
-    let short_output = alloc_f32(&device, 4 * REJECT_N - 1);
-    r.reject("undersized output", &input, &short_output, 4, k32, GgmlType::Q8_0);
 }
 
 #[test]

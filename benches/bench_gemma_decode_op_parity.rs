@@ -15,8 +15,7 @@
 //!   (the served flattening: `n_tokens·8` rows, top_k 1).
 //!
 //! Arms: `stock` = `quantized_matmul_ggml` / `quantized_matmul_id_ggml`
-//! default routing (process environment applies); `mv_ext_ci` =
-//! `quantized_matmul_ggml_column_invariant_mv_ext` and `mma_ci` =
+//! default routing (process environment applies); `mma_ci` =
 //! `quantized_matmul_ggml_column_invariant_mma` (dense and lm head only).
 //!
 //! Cache modes: `warm` reuses one weight buffer (and fixed ids) for every
@@ -38,7 +37,7 @@
 //! arm, cache, median_ns, p10, p90, rotation_buffers, dispatches_per_cb,
 //! iters) and `metadata.json` (git head, dirtiness, metallib environment,
 //! `HF2Q_HOST_LOCK_HOLDER`, device, environment snapshot, cold skips,
-//! pipeline identities of the `mv_ext` and `mul_mv_mma` kernels).
+//! pipeline identities of the `mul_mv_mma` kernels).
 //!
 //! Needs the GPU lane and a quiet host:
 //!
@@ -50,10 +49,9 @@
 use std::io::Write;
 
 use mlx_native::{
-    quantized_matmul_ggml, quantized_matmul_ggml_column_invariant_mma,
-    quantized_matmul_ggml_column_invariant_mv_ext, quantized_matmul_id_ggml, CommandEncoder,
-    DType, GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlType, KernelRegistry,
-    MlxBuffer, MlxDevice,
+    quantized_matmul_ggml, quantized_matmul_ggml_column_invariant_mma, quantized_matmul_id_ggml,
+    CommandEncoder, DType, GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlType,
+    KernelRegistry, MlxBuffer, MlxDevice,
 };
 use serde_json::{json, Value};
 
@@ -202,9 +200,8 @@ fn metadata(device: &MlxDevice, options: &Options) -> Value {
     })
 }
 
-/// Identities of the pipelines the `mv_ext_ci` arm (`mv_ext` r1=4; labels
-/// carry nsg 2, nxpsg 8 or 4) and the `mma_ci` arm (`mul_mv_mma` rt1;
-/// labels carry nsg and the block kind's K) compiled.
+/// Identities of the pipelines the `mma_ci` arm (`mul_mv_mma` rt1; labels
+/// carry nsg and the block kind's K) compiled.
 fn pipeline_identities(registry: &KernelRegistry) -> Value {
     let mut map = serde_json::Map::new();
     let mut insert = |label: String| {
@@ -215,11 +212,6 @@ fn pipeline_identities(registry: &KernelRegistry) -> Value {
             );
         }
     };
-    for ty in ["q4_0", "q5_0", "q8_0", "q4_K", "q5_K", "q6_K"] {
-        for nxpsg in [8, 4] {
-            insert(format!("kernel_mul_mv_ext_{ty}_f32_r1_4|600:i2|601:i{nxpsg}"));
-        }
-    }
     let mut mma_k: Vec<u32> = DENSE.iter().chain([&LM_HEAD]).map(|s| s.k).collect();
     mma_k.sort_unstable();
     mma_k.dedup();
@@ -482,7 +474,7 @@ fn run_dense_shape(
             (Cache::Cold, Err(_)) => continue,
         };
         let weights = weight_buffers(device, &pattern, rotation);
-        for arm in ["stock", "mv_ext_ci", "mma_ci"] {
+        for arm in ["stock", "mma_ci"] {
             for width in 1..=8u32 {
                 let params = GgmlQuantizedMatmulParams {
                     m: width,
@@ -494,7 +486,6 @@ fn run_dense_shape(
                     let weight = &weights[dispatch % rotation];
                     let entry: DenseEntry = match arm {
                         "stock" => quantized_matmul_ggml,
-                        "mv_ext_ci" => quantized_matmul_ggml_column_invariant_mv_ext,
                         _ => quantized_matmul_ggml_column_invariant_mma,
                     };
                     entry(encoder, registry, device, &input, weight, &output, &params)
