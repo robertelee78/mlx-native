@@ -1566,6 +1566,7 @@ impl KernelRegistry {
         // Replaces CPU softmax+topk round-trip and CPU weighted accumulate.
         let moe_stk_src: &'static str = include_str!("shaders/moe_softmax_topk.metal");
         sources.insert("moe_softmax_topk_f32".into(), moe_stk_src);
+        sources.insert("moe_softmax_topk_simd_f32".into(), include_str!("shaders/moe_softmax_topk_simd.metal"));
         // Explicit diagnostic producers; ordinary routing names/sources remain unchanged.
         sources.insert("moe_softmax_topk_selection_witness_f32".into(), include_str!("shaders/moe_softmax_topk_selection_witness.metal"));
         let routing_witness = include_str!("shaders/fused_moe_selection_witness.metal");

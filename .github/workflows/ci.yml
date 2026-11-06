@@ -54,6 +54,8 @@ jobs:
         env:
           MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
         run: cargo +1.96.0 test --release --locked --test test_mm_id_compact_schedule -- --test-threads=1 --nocapture
+      - name: MoE routing top-k, SIMD-group kernel (F64 reference, batched == per row)
+        run: cargo +1.96.0 test --release --locked --test test_moe_softmax_topk_simd -- --test-threads=1
   rust-metal:
     runs-on: macos-15
     # The debug-profile Gemma parity suites (GQA flash T-N8 about 2 min, warm
