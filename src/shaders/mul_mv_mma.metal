@@ -534,13 +534,14 @@ kernel void kernel_mul_mv_mma_gen(
     mul_mv_mma_store<NT, RT>(acc, args, dst, shmem, tile, tiisg, sgitg);
 }
 
-#define MUL_MV_MMA_GEN(tname, bq, nl, deq) \
-template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, bq, nl, deq>; \
-template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, bq, nl, deq>; \
-template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, bq, nl, deq>;
-
-MUL_MV_MMA_GEN("q5_0", block_q5_0, 2,     mma_dequantize_q5_0)
-MUL_MV_MMA_GEN("q4_K", block_q4_K, QK_NL, mma_dequantize_q4_K)
-MUL_MV_MMA_GEN("q6_K", block_q6_K, QK_NL, mma_dequantize_q6_K)
-
-#undef MUL_MV_MMA_GEN
+// Explicit instantiations: `host_name` does not take concatenated string
+// literals (a macro-built name leaves the function out of the library).
+template [[host_name("kernel_mul_mv_mma_q5_0_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, block_q5_0, 2, mma_dequantize_q5_0>;
+template [[host_name("kernel_mul_mv_mma_q5_0_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, block_q5_0, 2, mma_dequantize_q5_0>;
+template [[host_name("kernel_mul_mv_mma_q5_0_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, block_q5_0, 2, mma_dequantize_q5_0>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, block_q4_K, QK_NL, mma_dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, block_q4_K, QK_NL, mma_dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q4_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, block_q4_K, QK_NL, mma_dequantize_q4_K>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 1, block_q6_K, QK_NL, mma_dequantize_q6_K>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 1, block_q6_K, QK_NL, mma_dequantize_q6_K>;
+template [[host_name("kernel_mul_mv_mma_q6_K_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 1, block_q6_K, QK_NL, mma_dequantize_q6_K>;
