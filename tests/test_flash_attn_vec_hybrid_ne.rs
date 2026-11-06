@@ -420,3 +420,145 @@ fn single_sequence_ne_equals_batched_ne_per_slot() {
         }
     }
 }
+
+/// Long causal context (Review100 P3): capacity 4608 and kv 4500 run NSG 4
+/// with several 32-key chunks per simdgroup, so the online-softmax rescale of
+/// a non-zero accumulator and the cross-simdgroup merge execute. One slot,
+/// F16 V for the F64 reference and TQ codes against NE 1 and the
+/// single-sequence kernel.
+#[test]
+fn long_context_runs_the_rescale_and_the_nsg_merge() {
+    const LCAP: usize = 4608;
+    const KSL: u32 = 4500;
+    let (dev, mut reg) = setup();
+    let mut rng = Rng(0x1234);
+    let n = NKV * LCAP * HD;
+    let k: Vec<f16> = (0..n).map(|_| f16::from_f32(rng.next())).collect();
+    let v16: Vec<f16> = (0..n).map(|_| f16::from_f32(rng.next())).collect();
+    let v_src: Vec<f32> = (0..n).map(|_| rng.next()).collect();
+    let q: Vec<f32> = (0..NH * HD).map(|_| rng.next() * 3.0).collect();
+    let k_buf = upload(&dev, &k, DType::F16);
+    let v16_buf = upload(&dev, &v16, DType::F16);
+    let codes = dev.alloc_buffer(n, DType::U8, vec![n]).unwrap();
+    let norms = dev
+        .alloc_buffer(NKV * LCAP * 4, DType::F32, vec![NKV * LCAP])
+        .unwrap();
+    {
+        let src = upload(&dev, &v_src, DType::F32);
+        let mut enc = dev.command_encoder().unwrap();
+        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+            &mut enc,
+            &mut reg,
+            dev.metal_device(),
+            &src,
+            &codes,
+            &norms,
+            NKV as u32,
+            HD as u32,
+            LCAP as u32,
+            0,
+            LCAP as u32,
+            0,
+            false,
+            1.0,
+            8,
+        )
+        .unwrap();
+        enc.commit_and_wait().unwrap();
+    }
+    let p = FlashAttnVecTqHbParams {
+        num_heads: NH as u32,
+        num_kv_heads: NKV as u32,
+        head_dim: HD as u32,
+        kv_seq_len: KSL,
+        kv_capacity: LCAP as u32,
+        scale: 1.0,
+        mask_type: 1,
+        sliding_window: 0,
+        softcap: 0.0,
+        ring_start: 0,
+        scale_factor_d512: 1.0,
+        codebook_bits: 8,
+        fuse_fwht_pre: 0,
+        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(KSL),
+    };
+    assert_eq!(p.nsg, 4, "the case must run the NSG merge");
+    let q_buf = upload(&dev, &q, DType::F32);
+    let slot = upload(&dev, &[0u32], DType::U32);
+    let pos = upload(&dev, &[KSL - 1], DType::U32);
+    let tmp_bytes = fa::tmp_buffer_bytes(NH as u32, HD as u32);
+    // kind: 0 batched NE1, 1 batched NE, 2 single-sequence NE
+    let run = |reg: &mut KernelRegistry, v: &MlxBuffer, kind: u32, ne: u32| -> Vec<u32> {
+        let out = dev
+            .alloc_buffer(NH * HD * 4, DType::F32, vec![NH * HD])
+            .unwrap();
+        let tmp = dev
+            .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+            .unwrap();
+        let mut enc = dev.command_encoder().unwrap();
+        match kind {
+            0 => flash_attn_vec_hybrid_batched(
+                &mut enc, reg, &dev, 1, &q_buf, &k_buf, v, &norms, &out, &tmp, &slot, &pos, &p,
+            ),
+            1 => flash_attn_vec_hybrid_batched_ne(
+                &mut enc, reg, &dev, 1, &q_buf, &k_buf, v, &norms, &out, &tmp, &slot, &pos, &p, ne,
+            ),
+            _ => flash_attn_vec_hybrid_ne(
+                &mut enc, reg, &dev, &q_buf, &k_buf, v, &norms, &out, &tmp, &p, ne,
+            ),
+        }
+        .unwrap();
+        enc.commit_and_wait().unwrap();
+        out.as_slice::<f32>().unwrap()[..NH * HD]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    };
+    let vmax = v16.iter().map(|x| x.to_f64().abs()).fold(0.0, f64::max);
+    for ne in [2u32, 4] {
+        // F64 reference on F16 V
+        let got = run(&mut reg, &v16_buf, 1, ne);
+        let mut worst = 0.0f64;
+        for h in 0..NH {
+            let kvh = h / (NH / NKV);
+            let qv: Vec<f64> = (0..HD)
+                .map(|d| f16::from_f32(q[h * HD + d]).to_f64())
+                .collect();
+            let logits: Vec<f64> = (0..KSL as usize)
+                .map(|j| {
+                    (0..HD)
+                        .map(|d| qv[d] * k[(kvh * LCAP + j) * HD + d].to_f64())
+                        .sum()
+                })
+                .collect();
+            let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let z: f64 = logits.iter().map(|l| (l - m).exp()).sum();
+            for d in 0..HD {
+                let r: f64 = (0..KSL as usize)
+                    .map(|j| (logits[j] - m).exp() / z * v16[(kvh * LCAP + j) * HD + d].to_f64())
+                    .sum();
+                worst = worst.max((f32::from_bits(got[h * HD + d]) as f64 - r).abs());
+            }
+        }
+        eprintln!("FA_VEC_NE_LONG_REF ne={ne} ksl={KSL} nsg=4 max_abs_err={worst:.3e}");
+        assert!(worst <= REF_BOUND * vmax, "ne {ne}: {worst:e}");
+        // TQ codes: tracks NE 1, single-sequence ≡ batched
+        let base = run(&mut reg, &codes, 0, 1);
+        let out = run(&mut reg, &codes, 1, ne);
+        let scale = base
+            .iter()
+            .map(|&b| f32::from_bits(b).abs() as f64)
+            .fold(0.0, f64::max);
+        let diff = out
+            .iter()
+            .zip(&base)
+            .map(|(&a, &b)| (f32::from_bits(a) as f64 - f32::from_bits(b) as f64).abs())
+            .fold(0.0, f64::max);
+        eprintln!("FA_VEC_NE_LONG_VS_NE1 ne={ne} rel={:.3e}", diff / scale);
+        assert!(diff <= NE1_BOUND * scale);
+        assert!(
+            run(&mut reg, &codes, 2, ne) == out,
+            "ne {ne}: single-sequence differs from batched at nsg 4"
+        );
+    }
+}
