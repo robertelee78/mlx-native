@@ -456,6 +456,66 @@ pub fn quantized_matmul_id_ggml_mv_with_policy(
     )
 }
 
+/// Q4-GEMMA-DECODE F2: expert-grouped Q4_K gate_up with the
+/// `moe_swiglu_batch` GELU-tanh(gate) * up epilogue, at the frozen geometry
+/// of 4 gate/up row pairs per SIMD group (8 output columns per threadgroup).
+///
+/// The weight is the stacked `[n_experts, n, K]` gate_up tensor whose rows
+/// `0..n/2` are gate and `n/2..n` are up; `output` is `[n_tokens * top_k,
+/// n/2]` f32. The result is bitwise equal to `kernel_mul_mv_id_q4_K_f32`
+/// into `[pairs, n]` followed by `moe_swiglu_batch_encode(.., n/2, pairs)`,
+/// including out-of-range ids (NaN poison mapped through the epilogue).
+/// Callers choose the decode widths that take this route.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_grouped_geglu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    /// Gate/up row pairs per SIMD group; the kernel runs two SIMD groups.
+    const ROWS_PER_SIMDGROUP: usize = 4;
+    if params.ggml_type != GgmlType::Q4_K || params.n % 2 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped GEGLU mv_id requires Q4_K and an even gate_up width; got {:?} at N = {}",
+            params.ggml_type, params.n
+        )));
+    }
+    let n_ff = params.n / 2;
+    validate_id_call(input, weight, ids, output, params, n_ff)?;
+
+    let pipeline = registry.get_pipeline(
+        "kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4",
+        device.metal_device(),
+    )?;
+    let gpu_params = GgmlMatvecIdGpuParams {
+        ne0: i64::from(n_ff),
+        ..mv_id_gpu_params(params)
+    };
+    let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        metal::MTLSize::new(
+            div_ceil(n_ff as usize, 2 * ROWS_PER_SIMDGROUP) as u64,
+            total_rows,
+            1,
+        ),
+        metal::MTLSize::new(2, 32, 1),
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quantized_matmul_id_ggml_impl(
     encoder: &mut CommandEncoder,
@@ -468,6 +528,64 @@ fn quantized_matmul_id_ggml_impl(
     params: &GgmlQuantizedMatmulIdParams,
     force_mv: bool,
     routing: &GgmlRoutingPolicy,
+) -> Result<()> {
+    validate_id_call(input, weight, ids, output, params, params.n)?;
+
+    // ADR-011 Phase 3 — route on n_tokens threshold.
+    //
+    // At prefill with n_tokens > 8, dispatch the two-stage mm_id kernels
+    // (map0 + mm).  Each expert's weight tile is staged once to
+    // threadgroup shmem per 32-row block of that expert's routed tokens
+    // — identical to the dense mm dispatcher's win but per-expert.
+    //
+    // P3b-tensor.2 — extended to top_k=1 (Gemma 4's MoE down call).
+    // Without this the down call's 19,640-row matmul falls back to mv_id
+    // and re-reads each expert's weights once per row — ~50% of prefill
+    // wall time burnt on weight re-reads.  The map0 template set is
+    // {1, 6, 8}; other top_k values still fall back to mv_id.
+    //
+    // Falls back to the mv_id path for:
+    //   * decode (n_tokens <= 8)
+    //   * top_k values without a map0 instantiation
+    //   * K < 32 (mm tile requires NK=32)
+    // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
+    // ADR-022 Phase 2 — Q5_K mm_id ported.
+    if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, force_mv, routing)
+        == ExpertAutoPlan::Mm
+    {
+        // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
+        // engages on prefill. `HF2Q_LOG_MM_ID_ROUTE=1` enables the line.
+        if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
+            eprintln!(
+                "[mlx-native adr-022 AC-4] dispatch_id_mm engaged: type={:?} \
+                 n_tokens={} top_k={} k={} n={} n_experts={}",
+                params.ggml_type,
+                params.n_tokens,
+                params.top_k,
+                params.k,
+                params.n,
+                params.n_experts,
+            );
+        }
+        return dispatch_id_mm(
+            encoder, registry, device, input, weight, ids, output, params, routing,
+        );
+    }
+
+    dispatch_id_mv(
+        encoder, registry, device, input, weight, ids, output, params, routing,
+    )
+}
+
+/// `output_cols` is the row width of the `[n_tokens * top_k, output_cols]`
+/// output (`params.n`, or `params.n / 2` for the GEGLU epilogue).
+fn validate_id_call(
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    output_cols: u32,
 ) -> Result<()> {
     validate_native_expert_dtypes("quantized_matmul_id_ggml", input, weight, ids, output)?;
     let qk = params.ggml_type.block_values();
@@ -543,59 +661,15 @@ fn quantized_matmul_id_ggml_impl(
 
     let expected_output_bytes = checked_byte_extent(
         "output",
-        &[total_rows, params.n as usize, DType::F32.size_of()],
+        &[total_rows, output_cols as usize, DType::F32.size_of()],
     )?;
     if output.data_byte_len() < expected_output_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml: output buffer too small: expected {} bytes for [{} x {}] f32, got {}",
-            expected_output_bytes, total_rows, params.n, output.data_byte_len()
+            expected_output_bytes, total_rows, output_cols, output.data_byte_len()
         )));
     }
-
-    // ADR-011 Phase 3 — route on n_tokens threshold.
-    //
-    // At prefill with n_tokens > 8, dispatch the two-stage mm_id kernels
-    // (map0 + mm).  Each expert's weight tile is staged once to
-    // threadgroup shmem per 32-row block of that expert's routed tokens
-    // — identical to the dense mm dispatcher's win but per-expert.
-    //
-    // P3b-tensor.2 — extended to top_k=1 (Gemma 4's MoE down call).
-    // Without this the down call's 19,640-row matmul falls back to mv_id
-    // and re-reads each expert's weights once per row — ~50% of prefill
-    // wall time burnt on weight re-reads.  The map0 template set is
-    // {1, 6, 8}; other top_k values still fall back to mv_id.
-    //
-    // Falls back to the mv_id path for:
-    //   * decode (n_tokens <= 8)
-    //   * top_k values without a map0 instantiation
-    //   * K < 32 (mm tile requires NK=32)
-    // ADR-013 P16 — Q4_K mm_id ported; eligible for the prefill route.
-    // ADR-022 Phase 2 — Q5_K mm_id ported.
-    if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, force_mv, routing)
-        == ExpertAutoPlan::Mm
-    {
-        // ADR-022 AC-4: env-gated trace so operators can confirm mm_id
-        // engages on prefill. `HF2Q_LOG_MM_ID_ROUTE=1` enables the line.
-        if std::env::var("HF2Q_LOG_MM_ID_ROUTE").is_ok() {
-            eprintln!(
-                "[mlx-native adr-022 AC-4] dispatch_id_mm engaged: type={:?} \
-                 n_tokens={} top_k={} k={} n={} n_experts={}",
-                params.ggml_type,
-                params.n_tokens,
-                params.top_k,
-                params.k,
-                params.n,
-                params.n_experts,
-            );
-        }
-        return dispatch_id_mm(
-            encoder, registry, device, input, weight, ids, output, params, routing,
-        );
-    }
-
-    dispatch_id_mv(
-        encoder, registry, device, input, weight, ids, output, params, routing,
-    )
+    Ok(())
 }
 
 /// Same contract as `quantized_matmul_id_ggml`, but takes caller-owned
@@ -1275,6 +1349,23 @@ fn mm_id_routing_threshold() -> u32 {
     })
 }
 
+fn mv_id_gpu_params(params: &GgmlQuantizedMatmulIdParams) -> GgmlMatvecIdGpuParams {
+    GgmlMatvecIdGpuParams {
+        ne00: params.k as i64,
+        ne01: params.n as i64,
+        ne02: params.n_experts as i64,
+        ne10: params.k as i64,
+        ne12: 1,
+        ne0: params.n as i64,
+        ne1: (params.n_tokens as i64) * (params.top_k as i64),
+        r2: 1,
+        r3: 1,
+        top_k: params.top_k,
+        n_tokens: params.n_tokens,
+        expert_stride: params.expert_stride as i64,
+    }
+}
+
 /// Matrix-vector `_id` dispatch (decode path, unchanged from pre-Phase-3).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_id_mv(
@@ -1311,20 +1402,7 @@ fn dispatch_id_mv(
     };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
-    let gpu_params = GgmlMatvecIdGpuParams {
-        ne00: params.k as i64,
-        ne01: params.n as i64,
-        ne02: params.n_experts as i64,
-        ne10: params.k as i64,
-        ne12: 1,
-        ne0: params.n as i64,
-        ne1: total_rows as i64,
-        r2: 1,
-        r3: 1,
-        top_k: params.top_k,
-        n_tokens: params.n_tokens,
-        expert_stride: params.expert_stride as i64,
-    };
+    let gpu_params = mv_id_gpu_params(params);
 
     let (nth0, nth1, align) = match params.ggml_type {
         // Q4_0/Q8_0: historical (8, 8) layout = 64 threads = 2 simdgroups

@@ -220,7 +220,7 @@ pub use ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml_pooled_slotted_reusing_schedule_with_policy,
     quantized_matmul_id_ggml_pooled_slotted_with_policy,
     quantized_matmul_id_ggml_pooled_with_policy, quantized_matmul_id_ggml_with_policy,
-    quantized_matmul_id_ggml_mv_with_policy,
+    quantized_matmul_id_ggml_mv_grouped_geglu, quantized_matmul_id_ggml_mv_with_policy,
     quantized_matmul_id_swiglu_q4_0, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams,
     IdMmScratch, MM_ID_ROUTING_THRESHOLD,
 };
