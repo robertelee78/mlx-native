@@ -1585,40 +1585,32 @@ kernel void flash_attn_vec_hybrid_batched_gqa_impl(
                         device const uint8_t *v_base =
                             V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV;
 
-                        // Stock `vnorm[b] / sf_d512 * w` per block. Under the
-                        // default (fast) math mode the compiled stock kernel
-                        // evaluates it as `(w * rcp(sf_d512)) * vnorm[b]`:
-                        // `w * rcp` is the pair its two blocks share. With G
-                        // heads the shared pair would instead be
-                        // `vnorm[b] * rcp`, so pin the stock association with
-                        // a multi-use `wr` per head. T-N8 checks this bitwise
-                        // with a non-power-of-two `sf_d512` (a power of two
-                        // hides the association).
-                        float wr[G];
+                        // Each head runs the stock statements literally:
+                        // `sn_b = vnorm[b] / sf_d512 * w` then
+                        // `lo += dequant_hb_float4(v_base, coord, sn_b, _)`.
+                        // Under the default (fast) math mode the compiler
+                        // picks the association of `vnorm / sf * w` from the
+                        // expression's use pattern, and that choice differs
+                        // between Metal toolchains. An explicit pinned form
+                        // matched one toolchain's stock code and drifted 1 ULP
+                        // on another (mlx-native CI, #89). Keeping each head's
+                        // expression and use pattern identical to stock's lets
+                        // every compiler make the stock choice. The d512 V
+                        // decode is therefore not shared across heads; the K
+                        // load still is.
                         HYB_GQA_UNROLL
-                        for (short g = 0; g < G; ++g) wr[g] = w[g] * (1.0f / sf_d512);
-                        // Block 0: coords 0..255
-                        float sn0[G];
-                        HYB_GQA_UNROLL
-                        for (short g = 0; g < G; ++g) sn0[g] = wr[g] * vnorm[0];
-                        for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
-                            uint coord = (uint)(tx + ii * NL) * 4u;
-                            const float4 cent = hb_centroids_float4(v_base, coord);
-                            HYB_GQA_UNROLL
-                            for (short g = 0; g < G; ++g) {
-                                lo[g][ii] += cent * sn0[g];
+                        for (short g = 0; g < G; ++g) {
+                            // Block 0: coords 0..255
+                            float sn0 = vnorm[0] / sf_d512 * w[g];
+                            for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                                uint coord = (uint)(tx + ii * NL) * 4u;
+                                lo[g][ii] += dequant_hb_float4(v_base, coord, sn0, (uint)cbits_effective);
                             }
-                        }
-                        // Block 1: coords 256..511
-                        float sn1[G];
-                        HYB_GQA_UNROLL
-                        for (short g = 0; g < G; ++g) sn1[g] = wr[g] * vnorm[1];
-                        for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
-                            uint coord = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
-                            const float4 cent = hb_centroids_float4(v_base, coord);
-                            HYB_GQA_UNROLL
-                            for (short g = 0; g < G; ++g) {
-                                lo[g][DV4/2/NL + ii] += cent * sn1[g];
+                            // Block 1: coords 256..511
+                            float sn1 = vnorm[1] / sf_d512 * w[g];
+                            for (short ii = 0; ii < (DV/2) / 4 / NL; ++ii) {
+                                uint coord = (uint)(DV/2) + (uint)(tx + ii * NL) * 4u;
+                                lo[g][DV4/2/NL + ii] += dequant_hb_float4(v_base, coord, sn1, (uint)cbits_effective);
                             }
                         }
                     } else {
