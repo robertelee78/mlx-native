@@ -283,6 +283,84 @@ fn q5_0_capability_covers_every_native_public_shape_family() {
 }
 
 #[test]
+fn q5_0_tensor_mm_is_an_explicit_opt_in() {
+    let opted_in = GgmlRoutingPolicy {
+        q5_0_tensor_mm: true,
+        ..GgmlRoutingPolicy::default()
+    };
+    assert!(!GgmlRoutingPolicy::default().q5_0_tensor_mm);
+    let with = |invocation, routing| {
+        ggml_capability(GgmlCapabilityRequest {
+            routing,
+            ..request(invocation, GgmlWorkloadClass::Prompt)
+        })
+    };
+    let dense = GgmlInvocation::DenseAuto {
+        m: 33,
+        n: 96,
+        k: 64,
+    };
+    let capability = with(dense, opted_in);
+    assert_eq!(
+        capability.route,
+        Some(GgmlKernelRoute::DenseMmDeviceSelected)
+    );
+    assert!(capability.requires_device_probe);
+    let batched = GgmlInvocation::DenseBatchedMm {
+        batch: 3,
+        m: 9,
+        n: 96,
+        k: 64,
+        input_layout: GgmlBatchedInputLayout::Contiguous,
+    };
+    assert_eq!(
+        with(batched, opted_in).route,
+        Some(GgmlKernelRoute::DenseBatchedMmDeviceSelected)
+    );
+    assert_eq!(
+        with(batched, GgmlRoutingPolicy::default()).route,
+        Some(GgmlKernelRoute::DenseBatchedMmSimdgroup)
+    );
+    let shape = expert_shape(33);
+    for invocation in [
+        GgmlInvocation::ExpertAutoAllocated { shape },
+        GgmlInvocation::ExpertPooled {
+            shape,
+            input_layout: GgmlExpertInputLayout::Slotted,
+        },
+        GgmlInvocation::ExpertPooledPair { shape },
+    ] {
+        assert!(with(invocation, opted_in).requires_device_probe);
+        assert!(!with(invocation, GgmlRoutingPolicy::default()).requires_device_probe);
+    }
+    assert_eq!(
+        with(GgmlInvocation::ExpertAutoAllocated { shape }, opted_in).route,
+        Some(GgmlKernelRoute::ExpertMmDeviceSelected)
+    );
+    // The opt-in never overrides an explicit simdgroup preference.
+    let forced_simd = GgmlRoutingPolicy {
+        dense_tensor_mm: mlx_native::GgmlTensorMmPreference::ForceSimd,
+        expert_tensor_mm: mlx_native::GgmlTensorMmPreference::ForceSimd,
+        ..opted_in
+    };
+    assert_eq!(
+        with(dense, forced_simd).route,
+        Some(GgmlKernelRoute::DenseMmSimdgroup)
+    );
+    assert!(
+        !with(GgmlInvocation::ExpertAutoAllocated { shape }, forced_simd).requires_device_probe
+    );
+    // A receipt written before the field existed decodes as opted out.
+    let mut value = serde_json::to_value(opted_in).expect("policy json");
+    value
+        .as_object_mut()
+        .expect("policy object")
+        .remove("q5_0_tensor_mm");
+    let decoded: GgmlRoutingPolicy = serde_json::from_value(value).expect("older policy");
+    assert!(!decoded.q5_0_tensor_mm);
+}
+
+#[test]
 fn q5_0_shader_source_contract_has_every_native_route() {
     let dense_mv = include_str!("../src/shaders/quantized_matmul_ggml.metal");
     let dense_mm = include_str!("../src/shaders/quantized_matmul_mm.metal");

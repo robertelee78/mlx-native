@@ -2379,8 +2379,11 @@ fn dispatch_mm_impl(
     // variant on M3+ (hardware tensor cores); fall back to the simdgroup
     // MMA kernel if the probe fails or the tensor kernel can't compile
     // on this device.
-    let use_tensor = tensor_mm_auto_selected(params.ggml_type, routing.dense_tensor_mm)
-        && probe_tensor_mm(registry, device)?;
+    let use_tensor = tensor_mm_auto_selected(
+        params.ggml_type,
+        routing.dense_tensor_mm,
+        routing.q5_0_tensor_mm,
+    ) && probe_tensor_mm(registry, device)?;
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
     // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
     // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).

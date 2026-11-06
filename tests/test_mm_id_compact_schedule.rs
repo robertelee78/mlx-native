@@ -6,7 +6,8 @@
 //! skip are Class A against the uniform grid.
 //!
 //! * N1 — slotted == flattened (and both schedules agree), every `mm_id`
-//!   type × {tensor, simdgroup} × `n_tokens` × four routings × the Gemma 4
+//!   type × {tensor, simdgroup} (Q5_0 tensor through the `q5_0_tensor_mm`
+//!   routing opt-in) × `n_tokens` × four routings × the Gemma 4
 //!   down shape (704 → 2816, 128 experts, top-8; 32-value-block types only,
 //!   since 704 is not a multiple of 256) and a Qwen-like shape (512 → 2048,
 //!   256 experts, top-8). N7 (row independence) runs on the same batches.
@@ -263,6 +264,8 @@ enum Path {
     Simdgroup,
 }
 
+/// The tensor path opts Q5_0 in (`q5_0_tensor_mm`), so every type runs both
+/// kernel paths; the opt-in does not change the route of any other type.
 fn policy(path: Path, schedule: ExpertMmSchedule) -> GgmlRoutingPolicy {
     GgmlRoutingPolicy {
         expert_tensor_mm: match path {
@@ -270,6 +273,7 @@ fn policy(path: Path, schedule: ExpertMmSchedule) -> GgmlRoutingPolicy {
             Path::Simdgroup => GgmlTensorMmPreference::ForceSimd,
         },
         expert_mm_schedule: schedule,
+        q5_0_tensor_mm: path == Path::Tensor,
         ..GgmlRoutingPolicy::default()
     }
 }
@@ -315,10 +319,10 @@ impl Gpu {
         }
     }
 
-    /// Distinct kernel paths for `ggml_type`: the tensor path only where
-    /// the auto route selects it on this device.
-    fn paths(&self, ggml_type: GgmlType) -> Vec<Path> {
-        if self.tensor_available && ggml_type != GgmlType::Q5_0 {
+    /// Distinct kernel paths: the tensor path wherever this device has it
+    /// (Q5_0 through the routing-policy opt-in).
+    fn paths(&self) -> Vec<Path> {
+        if self.tensor_available {
             vec![Path::Tensor, Path::Simdgroup]
         } else {
             vec![Path::Simdgroup]
@@ -440,7 +444,7 @@ fn n1_slotted_equals_flattened_and_n7_row_independence() {
                 continue;
             }
             let weight = weights(&gpu.device, shape, ggml_type, scales);
-            for path in gpu.paths(ggml_type) {
+            for path in gpu.paths() {
                 for &n_tokens in &N_TOKENS {
                     for (r, routing) in ROUTINGS.into_iter().enumerate() {
                         let table = route_table(
@@ -621,7 +625,7 @@ fn n2_compact_equals_uniform_grid_on_every_entry_point() {
                 continue;
             }
             let weight = weights(&gpu.device, shape, ggml_type, scales);
-            for path in gpu.paths(ggml_type) {
+            for path in gpu.paths() {
                 for top_k in [1u32, 6, 8] {
                     for &n_tokens in &N_TOKENS {
                         for (r, routing) in ROUTINGS.into_iter().enumerate() {
@@ -814,7 +818,7 @@ fn n3_invalid_metadata_poisons_output_on_both_schedules() {
     let mut output = output_buffer(&gpu.device, (n_tokens * 8 * shape.n) as usize);
     for (ggml_type, scales) in TYPES {
         let weight = weights(&gpu.device, shape, ggml_type, scales);
-        for path in gpu.paths(ggml_type) {
+        for path in gpu.paths() {
             for top_k in [1u32, 6, 8] {
                 let base = route_table(Routing::Uniform, n_tokens, top_k, shape.n_experts, 77);
                 let mut cases = vec![("out_of_range", {
@@ -999,7 +1003,7 @@ fn n4_schedule_reuse_is_keyed_and_bitwise() {
     let gate_params = params(ggml_type, gate, n_tokens, top_k);
     let down_params = params(ggml_type, shape, n_tokens, top_k);
 
-    for path in gpu.paths(ggml_type) {
+    for path in gpu.paths() {
         for schedule in SCHEDULES {
             let routing_policy = policy(path, schedule);
             let mut scratch =
@@ -1324,7 +1328,7 @@ fn n5_half_tile_skip_against_the_32_row_body() {
     let mut record = Vec::new();
     for (ggml_type, scales) in TYPES {
         let weight = weights(&gpu.device, shape, ggml_type, scales);
-        for path in gpu.paths(ggml_type) {
+        for path in gpu.paths() {
             let routing_policy = policy(path, ExpertMmSchedule::CompactTiles);
             for (slot, half_tile_skip) in [
                 HalfTileSkip::Disabled,
@@ -1698,7 +1702,7 @@ fn n9_scratch_constructors_serve_every_entry_point() {
         );
         let p = params(ggml_type, shape, n_tokens, top_k);
         let elements = (n_tokens * top_k * shape.n) as usize;
-        for path in gpu.paths(ggml_type) {
+        for path in gpu.paths() {
             let routing_policy = policy(path, ExpertMmSchedule::CompactTiles);
             poison(&mut reference, 60);
             {
@@ -1838,7 +1842,7 @@ fn compact_half_tile_settings_equal_uniform_grid() {
             let elements = (n_tokens * 8 * shape.n) as usize;
             let mut grid = output_buffer(&gpu.device, elements);
             let mut compact = output_buffer(&gpu.device, elements);
-            for path in gpu.paths(ggml_type) {
+            for path in gpu.paths() {
                 let grid_policy = policy(path, ExpertMmSchedule::UniformGrid);
                 poison(&mut grid, 70);
                 let mut scratch =

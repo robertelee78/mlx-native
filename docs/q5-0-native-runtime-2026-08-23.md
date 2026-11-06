@@ -94,4 +94,45 @@ capability receipt therefore select simdgroup MM for Q5_0. Tensor symbols may
 remain compiled for future qualification, but they are not advertised or
 selected by the public auto route.
 
+## Tensor-MM requalification (2026-11-06)
+
+The falsification above measured the tensor route against a fixed bound that
+no tensor codec meets on that fixture. `tests/q5_0_tensor_f64_reference.rs`
+re-encodes every Q5_0 block losslessly as a Q8_0 block (same F16 scale, int8
+payload `q - 16`), so both codecs carry bit-identical weights, and compares
+every arm with a CPU F64 reference:
+
+- On every shape, the Q5_0 tensor kernels (dense V1 and V2, compact `mm_id`)
+  produce output bitwise equal to the Q8_0 tensor kernels, and the Q5_0
+  simdgroup kernels equal the Q8_0 simdgroup kernels. The Q5_0 dequantizer
+  matches the reference implementation's line for line, so there is no Q5_0
+  dequant or staging defect.
+- On the original fixture (N = 17, K = 64, power-of-two scales, inputs
+  `(v - 48) / 23`), Q8_0 V2 breaks the old `2e-3 * max(|y|, 1)` bound on
+  exactly as many elements as Q5_0 V2: 12/153 at M = 9 and 14/561 at M = 33.
+  The simdgroup kernels pass that bound only because they keep the
+  activations in F32, and on this fixture every weight is exact in F16; their
+  maximum error is 2.6e-5.
+- The tensor kernels round the activations to F16. That costs up to one F16
+  unit roundoff per product, the same error every tensor codec already ships
+  with. Under the K-scaled bound
+  `|y - y_f64| <= (2 u_h + u_h^2 + K u_f) * sum_k |x_k w_k|` (u_h = 2^-11,
+  u_f = 2^-24), Q5_0 and Q8_0 tensor use at most 0.19 of the bound on the
+  original fixture. On the Gemma 4 shapes (dense 2112 -> 2816 and `mm_id`
+  704 -> 2816 with 128 experts, top-8, at n ∈ {232, 1180, 1832}) they use at
+  most 0.085 and 0.128. rel_rms is 4.2e-4 for dense V2, 2.7e-4 for V1 and
+  `mm_id`, and 1.9e-4 for simdgroup. The K sweep (704 … 8448) holds rel_rms
+  constant, and the bound fraction falls as K grows.
+- The bound check is Class B. The Class A gates are: repeated runs are
+  bitwise equal; dense rows do not change with batch width, batch position,
+  or serial width-9 calls; and `tests/test_mm_id_compact_schedule.rs` now
+  covers the Q5_0 tensor path (slotted ≡ flattened, compact ≡ grid, row
+  independence).
+
+Routing: `GgmlRoutingPolicy::q5_0_tensor_mm` (`HF2Q_Q5_0_TENSOR_MM=1`) lets
+the dense and expert device-selected MM routes use the tensor pipeline for
+Q5_0. It defaults to off, so default execution keeps the simdgroup bytes until
+the downstream quality envelope passes. Receipts from before the field
+existed decode as off.
+
 No performance claim is made until those gates complete.
