@@ -1432,7 +1432,7 @@ fn host_compact_schedule(
             descriptors.push([expert as u32, first + start as u32, rows]);
         }
         list.extend(entries.iter().copied());
-        list.push(u32::MAX); // padding slot (not written by the kernel)
+        list.push(u32::MAX); // padding slot: contents unspecified, never read
     }
     (descriptors.len() as u32, descriptors, list)
 }
@@ -1537,10 +1537,15 @@ fn n6_capacity_bound_and_schedule_contents() {
             "N6 {label}: descriptor words past tile_count were written"
         );
         let device_list = &hids.as_slice::<u32>().expect("hids")[..list.len()];
-        assert_eq!(
-            device_list,
-            &list[..],
-            "N6 {label}: compact list (R2 order)"
+        // Every real entry must match; the per-expert padding slot may hold
+        // map0c's dummy store (branch-free pass 2) and is never read.
+        let first_bad = list
+            .iter()
+            .zip(device_list)
+            .position(|(want, got)| *want != u32::MAX && want != got);
+        assert!(
+            first_bad.is_none(),
+            "N6 {label}: compact list (R2 order) differs at entry {first_bad:?}"
         );
     }
 
