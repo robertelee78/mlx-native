@@ -97,7 +97,9 @@ constant int FC_mul_mv_mma_ne00 [[function_constant(2304)]];
 
 // ------- 16-weight dequantizers (reference kernels/dequantize.h, float4x4) -------
 
-static inline void mma_dequantize_q5_0(device const block_q5_0 * xb, short il, thread float4x4 & reg) {
+// External linkage: a kernel specialization whose template argument has
+// internal linkage is itself internal and is left out of the library.
+inline void mma_dequantize_q5_0(device const block_q5_0 * xb, short il, thread float4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 3);
     const float d = xb->d;
     const float md = -16.h * xb->d;
@@ -133,7 +135,7 @@ static inline uchar2 mma_get_scale_min_k4_just2(int j, int k, device const uchar
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)), uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
-static inline void mma_dequantize_q4_K(device const block_q4_K * xb, short il, thread float4x4 & reg) {
+inline void mma_dequantize_q4_K(device const block_q4_K * xb, short il, thread float4x4 & reg) {
     device const uchar * q = xb->qs;
 
     short is = (il/4) * 2;
@@ -151,7 +153,7 @@ static inline void mma_dequantize_q4_K(device const block_q4_K * xb, short il, t
     }
 }
 
-static inline void mma_dequantize_q6_K(device const block_q6_K * xb, short il, thread float4x4 & reg) {
+inline void mma_dequantize_q6_K(device const block_q6_K * xb, short il, thread float4x4 & reg) {
     const half d_all = xb->d;
     device const uint16_t * ql = (device const uint16_t *)xb->ql;
     device const uint16_t * qh = (device const uint16_t *)xb->qh;
