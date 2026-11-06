@@ -191,3 +191,7 @@ harness = false
 [[bench]]
 name = "bench_gdn_decode_addressing"
 harness = false
+
+[[bench]]
+name = "bench_qwen36_decode_ops"
+harness = false
