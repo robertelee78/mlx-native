@@ -7,11 +7,20 @@
 //!
 //! (a) an f64 CPU reference over the exactly dequantized weights with the
 //!     K-scaled bound `|gpu − ref| ≤ C·K·ε_f32·Σ|w·x|` per output element;
+//!     each shape prints one `MMA_BOUND type=… n=… k=… worst_ratio=…` line;
 //! (b) column invariance (Class A): for widths 1..=8, column `j` of the
 //!     width-`w` result is bitwise equal to the width-1 result for that
 //!     column's input row, also under a permuted column order;
 //! (c) determinism (Class A): three repeats are bitwise identical;
-//! (d) an output tail canary: nothing is written past `m·n`.
+//! (d) an output tail canary: nothing is written past `m·n`;
+//! (e) non-finite neighbours: a NaN column and a +Inf column leave every
+//!     other column of the batch bitwise equal to its width-1 result;
+//! (f) an f32-activation guard: on a fixed cell the GPU error is well
+//!     below the error of an f64 reference over f16-rounded activations
+//!     (the K-scaled bound in (a) is too loose to see f16 rounding);
+//! (g) non-zero-offset views: input, weight and output as 16-byte-aligned
+//!     views inside larger buffers are bitwise equal to the offset-0 run,
+//!     with sentinels intact around the output view.
 //!
 //! Gemma 4 decode shapes: lm head Q6_K 262144×2816, Q4_K dense 4096×2816,
 //! 8192×2816, 2048×2816, 2112×2816, 2816×4096, 2816×8192, Q6_K 2048×2816,
@@ -23,7 +32,7 @@
 //! large allocation alive:
 //!
 //! ```text
-//! cargo test --release --locked --test test_mma_column_invariant -- --test-threads=1
+//! cargo test --release --locked --test test_mma_column_invariant -- --test-threads=1 --nocapture
 //! ```
 
 #![cfg(target_vendor = "apple")]
@@ -229,6 +238,38 @@ impl Gpu {
         buffer
     }
 
+    /// Encode one dispatch over caller-owned buffers and wait for it.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
+        &mut self,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        ggml_type: GgmlType,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let params = GgmlQuantizedMatmulParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ggml_type,
+        };
+        let mut encoder = self.device.command_encoder().expect("encoder");
+        (self.entry)(
+            &mut encoder,
+            &mut self.registry,
+            &self.device,
+            input,
+            weight,
+            output,
+            &params,
+        )
+        .expect("column-invariant dispatch");
+        encoder.commit_and_wait().expect("command buffer");
+    }
+
     /// Run the entry on `columns` (each a K-length row) and return the
     /// `[columns.len(), n]` output as raw f32 bits.
     fn run(
@@ -259,24 +300,7 @@ impl Gpu {
             .as_mut_slice::<u32>()
             .expect("output bits")
             .fill(TAIL_CANARY);
-        let params = GgmlQuantizedMatmulParams {
-            m: m as u32,
-            n: n as u32,
-            k: k as u32,
-            ggml_type,
-        };
-        let mut encoder = self.device.command_encoder().expect("encoder");
-        (self.entry)(
-            &mut encoder,
-            &mut self.registry,
-            &self.device,
-            &input,
-            weight,
-            &output,
-            &params,
-        )
-        .expect("column-invariant dispatch");
-        encoder.commit_and_wait().expect("command buffer");
+        self.dispatch(&input, weight, &output, ggml_type, m, n, k);
         let bits = output.as_slice::<u32>().expect("output bits");
         assert!(
             bits[m * n..].iter().all(|&b| b == TAIL_CANARY),
@@ -284,10 +308,91 @@ impl Gpu {
         );
         bits[..m * n].to_vec()
     }
+
+    /// Same as [`Gpu::run`], with input, weight and output bound as views at
+    /// the given byte offsets inside larger buffers. Sentinels fill the
+    /// output allocation before and after the view and must survive.
+    #[allow(clippy::too_many_arguments)]
+    fn run_views(
+        &mut self,
+        weight_bytes: &[u8],
+        ggml_type: GgmlType,
+        columns: &[&[f32]],
+        n: usize,
+        k: usize,
+        offsets: ViewOffsets,
+    ) -> Vec<u32> {
+        let m = columns.len();
+        for offset in [offsets.input, offsets.weight, offsets.output] {
+            assert!(offset > 0 && offset % 16 == 0, "view offset {offset}");
+        }
+        let in_first = offsets.input / 4;
+        let in_elements = in_first + m * k + TAIL_LEN;
+        let mut input_base = self
+            .device
+            .alloc_buffer(in_elements * 4, DType::F32, vec![in_elements])
+            .expect("input base buffer");
+        {
+            let values = input_base.as_mut_slice::<f32>().expect("input values");
+            values.fill(f32::NAN);
+            for (j, column) in columns.iter().enumerate() {
+                values[in_first + j * k..in_first + (j + 1) * k].copy_from_slice(column);
+            }
+        }
+        let input = input_base.slice_view(offsets.input as u64, m * k);
+
+        let w_len = offsets.weight + weight_bytes.len() + TAIL_LEN;
+        let mut weight_base = self
+            .device
+            .alloc_buffer(w_len, DType::U8, vec![w_len])
+            .expect("weight base buffer");
+        {
+            let bytes = weight_base.as_mut_slice::<u8>().expect("weight bytes");
+            bytes.fill(0xff);
+            bytes[offsets.weight..offsets.weight + weight_bytes.len()]
+                .copy_from_slice(weight_bytes);
+        }
+        let weight = weight_base.slice_view(offsets.weight as u64, weight_bytes.len());
+
+        let out_first = offsets.output / 4;
+        let out_elements = out_first + m * n + TAIL_LEN;
+        let mut output_base = self
+            .device
+            .alloc_buffer(out_elements * 4, DType::F32, vec![out_elements])
+            .expect("output base buffer");
+        output_base
+            .as_mut_slice::<u32>()
+            .expect("output bits")
+            .fill(TAIL_CANARY);
+        let output = output_base.slice_view(offsets.output as u64, m * n);
+
+        self.dispatch(&input, &weight, &output, ggml_type, m, n, k);
+        let bits = output_base.as_slice::<u32>().expect("output bits");
+        let label = format!("{ggml_type:?} n={n} k={k} m={m} {offsets:?}");
+        assert!(
+            bits[..out_first].iter().all(|&b| b == TAIL_CANARY),
+            "{label}: kernel wrote before the output view"
+        );
+        assert!(
+            bits[out_first + m * n..].iter().all(|&b| b == TAIL_CANARY),
+            "{label}: kernel wrote past the output view"
+        );
+        bits[out_first..out_first + m * n].to_vec()
+    }
 }
 
+/// Byte offsets of the input, weight and output views for [`Gpu::run_views`].
+#[derive(Debug, Clone, Copy)]
+struct ViewOffsets {
+    input: usize,
+    weight: usize,
+    output: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn assert_reference_bound(
     label: &str,
+    ggml_type: GgmlType,
     gpu_bits: &[u32],
     reference: &[f64],
     abs_sum: &[f64],
@@ -315,7 +420,12 @@ fn assert_reference_bound(
             }
         }
     }
-    eprintln!("[{label}] reference bound OK, worst error/bound = {worst_ratio:.3e}");
+    // One parseable line per shape: the margin left under the fixed bound.
+    println!("MMA_BOUND type={ggml_type:?} n={n} k={k} C={BOUND_C} worst_ratio={worst_ratio:.6e}");
+    assert!(
+        worst_ratio <= 1.0,
+        "{label}: worst error/bound {worst_ratio:e} exceeds 1"
+    );
 }
 
 /// Reversed column order: at widths ≥ 5 inputs also cross threadgroup
@@ -375,7 +485,7 @@ fn check_shape(gpu: &mut Gpu, ggml_type: GgmlType, n: usize, k: usize, seed: u64
     // invariant (checked above), so the width-1 results cover every width.
     let (reference, abs_sum) = cpu_reference(ggml_type, &weights, &inputs, n, k);
     let gpu_bits: Vec<u32> = singles.concat();
-    assert_reference_bound(&label, &gpu_bits, &reference, &abs_sum, n, k);
+    assert_reference_bound(&label, ggml_type, &gpu_bits, &reference, &abs_sum, n, k);
 }
 
 #[test]
@@ -432,6 +542,179 @@ fn mma_small_odd_n_every_admitted_type() {
         }
     }
     check_shape(&mut gpu, GgmlType::Q8_0, 37, 96, 0x0dd4_0000);
+}
+
+/// (e) A NaN column and a +Inf column in the same batch must not change any
+/// other column's bits. One poisoned element per poisoned column is enough
+/// to make that column's outputs non-finite; the poisoned columns' outputs
+/// are reported, not compared.
+#[test]
+fn mma_non_finite_neighbour_columns() {
+    let mut gpu = Gpu::new(MMA);
+    // Generic kind (Q4_K) and block kind (Q8_0) at Gemma row widths.
+    for (ggml_type, n, k, seed) in [
+        (GgmlType::Q4_K, 2048, 2816, 0x0bad_0001u64),
+        (GgmlType::Q8_0, 2816, 2112, 0x0bad_0002),
+    ] {
+        let weights = random_weight_bytes(ggml_type, n, k, seed);
+        let inputs = random_inputs(k, seed ^ 0x9e37_79b9_7f4a_7c15);
+        let column = |j: usize| &inputs[j * k..(j + 1) * k];
+        let weight = gpu.weight(&weights);
+        let singles: Vec<Vec<u32>> = (0..MAX_WIDTH)
+            .map(|j| gpu.run(&weight, ggml_type, &[column(j)], n, k))
+            .collect();
+        for w in 2..=MAX_WIDTH {
+            // NaN in the middle slot, +Inf in the last slot.
+            let nan_slot = (w - 1) / 2;
+            let inf_slot = w - 1;
+            let mut nan_column = column(nan_slot).to_vec();
+            nan_column[k / 2 + 3] = f32::NAN;
+            let mut inf_column = column(inf_slot).to_vec();
+            inf_column[k - 1] = f32::INFINITY;
+            let columns: Vec<&[f32]> = (0..w)
+                .map(|j| match j {
+                    j if j == nan_slot => nan_column.as_slice(),
+                    j if j == inf_slot => inf_column.as_slice(),
+                    j => column(j),
+                })
+                .collect();
+            let out = gpu.run(&weight, ggml_type, &columns, n, k);
+            for j in (0..w).filter(|&j| j != nan_slot && j != inf_slot) {
+                assert!(
+                    out[j * n..(j + 1) * n] == singles[j][..],
+                    "{ggml_type:?} n={n} k={k}: width {w} clean column {j} differs bitwise \
+                     from width 1 next to NaN slot {nan_slot} / +Inf slot {inf_slot}"
+                );
+            }
+            let non_finite = |slot: usize| {
+                out[slot * n..(slot + 1) * n]
+                    .iter()
+                    .filter(|&&b| !f32::from_bits(b).is_finite())
+                    .count()
+            };
+            eprintln!(
+                "[{ggml_type:?} n={n} k={k} w={w}] non-finite outputs: NaN slot {}/{n}, +Inf slot {}/{n}",
+                non_finite(nan_slot),
+                non_finite(inf_slot)
+            );
+        }
+    }
+}
+
+/// Most a correct f32-activation kernel's summed error may be, as a fraction
+/// of the summed error of the f16-rounded-activation reference.
+///
+/// Soundness: activations are ±[0.5, 1) with random signs, so each f16
+/// rounding is a normal rounding of relative size ≤ 2^-11 and the f16
+/// reference is off by a random walk of about √K·rms(w)·2^-12/√3 per
+/// output. Random signs keep the dot's partial sums at about √K·rms(w)
+/// even when a codec's weights have a non-zero mean (Q4_K's `−dmin·m`), so
+/// the f32 kernel's accumulated rounding is about √K·u·√K·rms(w)/√3 with
+/// u = 2^-24 (less with the simdgroup K split): ≈ 1/100 of the f16 error at
+/// K = 2816 and ≈ 1/85 at K = 2112. Summed over every output of the cell,
+/// per-element chance cancellations average out, so 1/4 leaves a wide
+/// margin, while a kernel that rounded activations to f16 would land near
+/// the f16 reference (ratio ≈ 1) and fail. The comparison is on sums, not
+/// per element: one output's f16 error can cancel to ~0 by chance, so a
+/// per-element "strictly smaller" would not be sound. The K-scaled bound of
+/// (a) cannot see this: f16 rounding moves an output by ~√K·2^-12·rms(w),
+/// far inside 2·K·ε_f32·Σ|w·x|.
+const F16_GUARD_MAX_RATIO: f64 = 0.25;
+
+/// (f) The GPU consumes activations in f32, not f16.
+#[test]
+fn mma_activations_are_not_rounded_to_f16() {
+    let mut gpu = Gpu::new(MMA);
+    for (ggml_type, n, k, seed) in [
+        (GgmlType::Q4_K, 2048, 2816, 0xf16_0001u64),
+        (GgmlType::Q8_0, 2816, 2112, 0xf16_0002),
+    ] {
+        let weights = random_weight_bytes(ggml_type, n, k, seed);
+        // Activations ±[0.5, 1): every f16 rounding is a normal rounding of
+        // relative size ≤ 2^-11, none flush to zero; random signs keep the
+        // partial sums small.
+        let mut rng = Xorshift(seed ^ 0x5eed);
+        let inputs: Vec<f32> = (0..MAX_WIDTH * k)
+            .map(|_| {
+                let magnitude = 0.5 + 0.5 * rng.unit();
+                let value = if rng.next() & 1 == 0 { magnitude } else { -magnitude };
+                value as f32
+            })
+            .collect();
+        let rounded: Vec<f32> = inputs
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_f32())
+            .collect();
+        let weight = gpu.weight(&weights);
+        let columns: Vec<&[f32]> = inputs.chunks_exact(k).collect();
+        let gpu_bits = gpu.run(&weight, ggml_type, &columns, n, k);
+        drop(weight);
+        let (reference, _) = cpu_reference(ggml_type, &weights, &inputs, n, k);
+        let (reference_f16, _) = cpu_reference(ggml_type, &weights, &rounded, n, k);
+        let mut gpu_error = 0.0f64;
+        let mut f16_error = 0.0f64;
+        for (index, &bits) in gpu_bits.iter().enumerate() {
+            gpu_error += (f64::from(f32::from_bits(bits)) - reference[index]).abs();
+            f16_error += (reference_f16[index] - reference[index]).abs();
+        }
+        let ratio = gpu_error / f16_error;
+        println!(
+            "MMA_F16_GUARD type={ggml_type:?} n={n} k={k} gpu_err_sum={gpu_error:.6e} \
+             f16_err_sum={f16_error:.6e} ratio={ratio:.6e}"
+        );
+        assert!(f16_error > 0.0, "{ggml_type:?}: f16 rounding changed nothing");
+        assert!(
+            ratio <= F16_GUARD_MAX_RATIO,
+            "{ggml_type:?} n={n} k={k}: GPU error sum {gpu_error:e} is {ratio:.3} of the \
+             f16-activation reference error {f16_error:e} (max {F16_GUARD_MAX_RATIO})"
+        );
+    }
+}
+
+/// (g) Views at non-zero 16-byte-aligned offsets give the offset-0 bits.
+#[test]
+fn mma_non_zero_offset_views() {
+    let mut gpu = Gpu::new(MMA);
+    let offsets = [
+        ViewOffsets {
+            input: 16,
+            weight: 16,
+            output: 16,
+        },
+        ViewOffsets {
+            input: 4096 + 48,
+            weight: 4096 + 80,
+            output: 4096 + 32,
+        },
+    ];
+    for (index, (ggml_type, n, k)) in [
+        (GgmlType::Q4_K, 37, 512),
+        (GgmlType::Q6_K, 37, 512),
+        (GgmlType::Q5_0, 37, 320),
+        (GgmlType::Q8_0, 37, 320),
+        (GgmlType::Q4_K, 2048, 2816),
+        (GgmlType::Q8_0, 2816, 2112),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0x0ff5_0000 + index as u64;
+        let weights = random_weight_bytes(ggml_type, n, k, seed);
+        let inputs = random_inputs(k, seed ^ 0x9e37_79b9_7f4a_7c15);
+        let weight = gpu.weight(&weights);
+        for w in [1, 3, MAX_WIDTH] {
+            let columns: Vec<&[f32]> = inputs.chunks_exact(k).take(w).collect();
+            let base = gpu.run(&weight, ggml_type, &columns, n, k);
+            for view in offsets {
+                let viewed = gpu.run_views(&weights, ggml_type, &columns, n, k, view);
+                assert!(
+                    viewed == base,
+                    "{ggml_type:?} n={n} k={k} w={w} {view:?}: view result differs bitwise \
+                     from the offset-0 run"
+                );
+            }
+        }
+    }
 }
 
 /// Calls `entry` on a request that must be rejected.
