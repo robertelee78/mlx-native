@@ -41,6 +41,7 @@ use std::process::Command;
 
 use mlx_native::ops::flash_attn_vec_hybrid::{
     flash_attn_vec_hybrid, flash_attn_vec_hybrid_batched, flash_attn_vec_hybrid_batched_gqa,
+    flash_attn_vec_hybrid_batched_ne,
     flash_attn_vec_hybrid_batched_gqa_group_is_legal, HybridSlotBucket,
     FLASH_ATTN_VEC_HYBRID_GQA_GROUPS,
 };
@@ -490,6 +491,8 @@ enum AttnArm {
     StockPerSlot,
     /// `flash_attn_vec_hybrid_batched_gqa` at group G.
     Gqa(u32),
+    /// `flash_attn_vec_hybrid_batched_ne` at NE (hf2q gap program; d256).
+    StockNe(u32),
 }
 
 impl AttnArm {
@@ -498,6 +501,7 @@ impl AttnArm {
             AttnArm::StockBatched => "stock_batched".into(),
             AttnArm::StockPerSlot => "stock_per_slot".into(),
             AttnArm::Gqa(g) => format!("gqa_g{g}"),
+            AttnArm::StockNe(ne) => format!("stock_batched_ne{ne}"),
         }
     }
 }
@@ -572,7 +576,15 @@ impl Bench {
             let (hd, nkv) = (shape.head_dim as usize, shape.num_kv_heads as usize);
             let npp = if hd == 512 { 2 } else { 1 };
             let rows = ATTN_SLOTS * nkv * cap as usize;
-            let caches: Vec<KvCache> = (0..LAYERS)
+            // `GEMMA_W4_KV_CACHES=N` (default LAYERS = 30): distinct KV caches
+            // cycled; 1 keeps one cache hot (the peer's perf mode reuses its
+            // tensors), for the cache-temperature comparison.
+            let n_caches = std::env::var("GEMMA_W4_KV_CACHES")
+                .ok()
+                .map(|v| v.parse::<usize>().expect("GEMMA_W4_KV_CACHES=<positive integer>"))
+                .unwrap_or(LAYERS)
+                .max(1);
+            let caches: Vec<KvCache> = (0..n_caches)
                 .map(|_| {
                     let mut k = self.device.alloc_buffer(rows * hd * 2, DType::F16, vec![rows * hd]).expect("k");
                     random_bytes(&mut k, &mut rng, true);
@@ -609,6 +621,9 @@ impl Bench {
                             nsg_max,
                         )
                     }).map(AttnArm::Gqa));
+                    if uniform && shape.head_dim == 256 {
+                        arms.extend([2u32, 4].map(AttnArm::StockNe));
+                    }
                     let seq_pos: Vec<u32> = seq_lens.iter().map(|l| l - 1).collect();
                     let seq_pos_arr = u32_buffer(&self.device, &seq_pos);
                     let bytes_per_row = (hd * 2 + hd + npp * 4) as f64;
@@ -715,6 +730,11 @@ impl Bench {
                         &kv.norms, output, tmp, slot_id_arr, seq_pos_arr, &batched,
                     )
                     .expect("batched flash"),
+                    AttnArm::StockNe(ne) => flash_attn_vec_hybrid_batched_ne(
+                        &mut encoder, &mut self.registry, &self.device, n_q as u32, q, &kv.k, &kv.v,
+                        &kv.norms, output, tmp, slot_id_arr, seq_pos_arr, &batched, ne,
+                    )
+                    .expect("batched ne flash"),
                     AttnArm::Gqa(g) => flash_attn_vec_hybrid_batched_gqa(
                         &mut encoder, &mut self.registry, &self.device, q, &kv.k, &kv.v, &kv.norms,
                         output, tmp, slot_id_arr, seq_pos_arr, &batched, g, buckets,

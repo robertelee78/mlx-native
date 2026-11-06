@@ -332,6 +332,63 @@ pub fn flash_attn_vec_hybrid_batched(
     seq_pos_arr: &MlxBuffer,
     params: &FlashAttnVecTqHbParams,
 ) -> Result<()> {
+    flash_attn_vec_hybrid_batched_with_ne(
+        encoder, registry, device, n_q, q, k_f16, v_packed, v_norms, output, tmp, slot_id_arr,
+        seq_pos_arr, params, 1,
+    )
+}
+
+/// Head-split variants of [`flash_attn_vec_hybrid_batched`] (hf2q gap
+/// program, decode sliding attention): the peer's NE argument, `NL = 32 / NE`
+/// lanes per key, `ne` keys scored per simdgroup pass. Head dim 256 only;
+/// `ne` is 2 or 4 (1 is [`flash_attn_vec_hybrid_batched`]). Same grid,
+/// buffers, split-K tmp layout and reduce. Class B against `ne = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_hybrid_batched_ne(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    ne: u32,
+) -> Result<()> {
+    if !matches!(ne, 2 | 4) || params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_ne: ne {ne} / head_dim {} unsupported (ne 2 or 4 at head_dim 256)",
+            params.head_dim
+        )));
+    }
+    flash_attn_vec_hybrid_batched_with_ne(
+        encoder, registry, device, n_q, q, k_f16, v_packed, v_norms, output, tmp, slot_id_arr,
+        seq_pos_arr, params, ne,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_vec_hybrid_batched_with_ne(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    ne: u32,
+) -> Result<()> {
     validate_params(params)?;
     if k_f16.dtype() != crate::DType::F16 {
         return Err(MlxError::InvalidArgument(format!(
@@ -362,11 +419,13 @@ pub fn flash_attn_vec_hybrid_batched(
         n_queries: n_q,
     };
 
-    let kernel_name = match head_dim {
-        256 => "flash_attn_vec_hybrid_batched_dk256",
-        512 => "flash_attn_vec_hybrid_batched_dk512",
+    let kernel_name = match (head_dim, ne) {
+        (256, 1) => "flash_attn_vec_hybrid_batched_dk256",
+        (512, 1) => "flash_attn_vec_hybrid_batched_dk512",
+        (256, 2) => "flash_attn_vec_hybrid_batched_ne2_dk256",
+        (256, 4) => "flash_attn_vec_hybrid_batched_ne4_dk256",
         _ => return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_hybrid_batched: unsupported head_dim {head_dim}"
+            "flash_attn_vec_hybrid_batched: unsupported head_dim {head_dim} / ne {ne}"
         ))),
     };
     let cbits_const = (params.codebook_bits as i32, 50usize);
