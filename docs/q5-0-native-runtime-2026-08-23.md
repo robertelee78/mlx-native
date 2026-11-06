@@ -135,4 +135,21 @@ Q5_0. It defaults to off, so default execution keeps the simdgroup bytes until
 the downstream quality envelope passes. Receipts from before the field
 existed decode as off.
 
+Microbenchmark (`bench_mm_id_schedule -- q5t`, Apple M5 Max, precompiled
+metallib, GPU medians of 200 command buffers). Both columns are on the same
+bytes:
+
+| op | n | simdgroup (default) µs | tensor (opt-in) µs | speed-up |
+|---|---:|---:|---:|---:|
+| MoE down `mm_id` (full call − `map0c`) | 232 | 927.5 | 515.3 | 1.80× |
+| | 1180 | 3322.0 | 1428.4 | 2.33× |
+| | 1832 | 4914.4 | 2001.2 | 2.46× |
+| dense MLP down 2112 → 2816 | 232 | 255.8 | 126.3 | 2.03× |
+| | 1180 | 1085.5 | 405.5 | 2.68× |
+| | 1832 | 1678.8 | 583.6 | 2.88× |
+
+On the tensor route Q5_0 runs at the rate Q8_0 already ships at: dense
+120.6 / 370.9 / 551.2 µs, and the `mm_id` full call 824.5 / 2044.7 /
+2940.0 µs.
+
 No performance claim is made until those gates complete.
