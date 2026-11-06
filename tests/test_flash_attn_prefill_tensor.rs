@@ -10,14 +10,15 @@
 //! - determinism (Class A): a repeat is bitwise equal;
 //! - width invariance (Class A): a row's output is bitwise equal whether it
 //!   is computed in the full dispatch or in a dispatch of 1, 7, 31, 32, 58
-//!   rows at any offset (any position in a query tile);
+//!   or 311 rows at any offset (any position in a query tile);
 //! - chunking invariance (Class A): a suffix split into chunks, each
 //!   attending only `pad64(hist + chunk_end)` keys, equals the full dispatch
 //!   bitwise.
 //!
-//! Skipped when the device lacks the Metal tensor API, unless
-//! `MLX_REQUIRE_TENSOR=1` (set it on Apple10 hosts). Run once per metallib
-//! path (`MLX_PRECOMPILED_METALLIB=0` for runtime source).
+//! A device without the Metal tensor API fails the suite unless
+//! `MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR=1` opts out (hosted CI runners), in
+//! which case each test prints a RECORDED SKIP. Run once per metallib path
+//! (`MLX_PRECOMPILED_METALLIB=0` for runtime source).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use half::f16;
@@ -174,12 +175,20 @@ fn gpu(head_dim: u32) -> Option<Gpu> {
     let mut reg = KernelRegistry::new();
     let available =
         tensor::flash_attn_prefill_tensor_available(&mut reg, &device, head_dim).expect("probe");
+    eprintln!(
+        "device={} flash_attn_prefill_tensor_d{head_dim}_available={available} MLX_PRECOMPILED_METALLIB={:?}",
+        device.name(),
+        std::env::var("MLX_PRECOMPILED_METALLIB").ok()
+    );
     if !available {
+        // A device or SDK without the Metal tensor API must opt out
+        // explicitly (hosted CI runners), and the skip is recorded.
         assert!(
-            std::env::var("MLX_REQUIRE_TENSOR").as_deref() != Ok("1"),
-            "MLX_REQUIRE_TENSOR=1 but the tensor pipeline is unavailable"
+            std::env::var("MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR").as_deref() == Ok("1"),
+            "tensor flash attention unavailable on {}: set MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR=1 to skip",
+            device.name()
         );
-        eprintln!("flash_attn_prefill_tensor: Metal tensor API unavailable; skipped");
+        eprintln!("RECORDED SKIP: flash_attn_prefill_tensor d{head_dim} unavailable (no Metal tensor API)");
         return None;
     }
     Some(Gpu { device, reg })
@@ -320,6 +329,7 @@ fn full_checks(shape: Shape, hist: usize, rows: usize, q_amp: f32, seed: u64) {
         (3, 31),
         (17, 32),
         (rows / 2, 58),
+        (rows.saturating_sub(311) / 2, 311),
     ] {
         if r0 + n > rows {
             continue;
@@ -377,6 +387,8 @@ fn cold_prefill_rows() {
     full_checks(SLIDING, 0, 458, 1.0, 0x7101);
     full_checks(GLOBAL, 0, 458, 1.0, 0x7102);
     full_checks(SLIDING, 0, 256, 1.0, 0x7103);
+    full_checks(SLIDING, 0, 1024, 1.0, 0x7104);
+    full_checks(GLOBAL, 0, 1024, 1.0, 0x7105);
 }
 
 /// Large logits: the running max moves by more than 8 inside a tile row, so

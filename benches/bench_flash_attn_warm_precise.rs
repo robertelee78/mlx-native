@@ -637,8 +637,13 @@ fn encode_chain(
             // F32 layout.
             let kv_pad = tensor::kv_pad(kl as u32) as usize;
             let tail = (kv_pad - kl) * d;
-            let dense_k = alloc(dev, DType::F16, h_kv * kl * d + tail);
-            let dense_v = alloc(dev, DType::F16, h_kv * kl * d + tail);
+            let zeroed = |n: usize| {
+                let mut b = alloc(dev, DType::F16, n);
+                b.as_mut_slice::<u16>().unwrap()[n - tail..].fill(0);
+                b
+            };
+            let dense_k = zeroed(h_kv * kl * d + tail);
+            let dense_v = zeroed(h_kv * kl * d + tail);
             dispatch_kv_cache_linearize_ring_bytes(
                 enc,
                 reg,

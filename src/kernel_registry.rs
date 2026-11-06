@@ -2701,7 +2701,7 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
         let constructor = "ssm_conv_forward_f32";
         let mut registry = KernelRegistry::new();
         // Same count as tests/registration_fallback_runtime_sources.rs.
-        assert_eq!(registry.registration_fallbacks.len(), 54);
+        assert_eq!(registry.registration_fallbacks.len(), 56);
         assert!(registry.registration_fallbacks.contains(fallback));
         assert!(!registry.registration_fallbacks.contains(constructor));
         assert!(registry.runtime_source_overrides.is_empty());
