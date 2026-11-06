@@ -13,6 +13,7 @@
 //! | `precise_vcodes_{window,mask}` | Q permute, [mask, fence, blk], precise d256 `_vcodes` reading the stage in place, O permute | Q permute, precise d512 `_vcodes` in place, O permute |
 //! | `precise_v32_window` | F32 V dequant, Q permute, precise d256 `_v32` (K in place), O permute | as `precise_vcodes` (d512 `_v32` is parity-only) |
 //! | `precise_v16cache_window` | as `precise_vcodes_window` on an F16 V cache | precise d512 `_v16` on an F16 V cache in place |
+//! | `tensor_f16` | K compaction, F16 V dequant, mask (kv padded to 64), blk (32, 64), tensor-API d256 (hf2q gap program F1; Q/O stay F32 `[rows, heads, d]`) | same with d512, blk (16, 64), causal mask |
 //! | `vec_gqa` | as `vec`, through the GQA-grouped `flash_attn_vec_hybrid_batched_gqa` (Q4-GEMMA-DECODE lever A1; hf2q Q4-GEMMA-ATTN-EXACT R = 1, bitwise equal to `vec`), largest legal group at the chunk's bucket capped at G = 2 (hf2q Q4-GEMMA-ATTN-EXACT-G2) | same |
 //!
 //! Sliding lanes read hf2q's ring stage (`min(history, 1023)` history rows
@@ -55,6 +56,7 @@ use mlx_native::ops::flash_attn_prefill_mask::{self, SdpaMaskParams};
 use mlx_native::ops::flash_attn_prefill_precise::{
     self as precise, FlashAttnPrecisePrefillParams, PreciseD256Mask, PreciseV,
 };
+use mlx_native::ops::flash_attn_prefill_tensor as tensor;
 use mlx_native::ops::flash_attn_vec_hybrid::{self, FlashAttnVecTqHbParams};
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes;
 use mlx_native::ops::transpose::{permute_021_f32, permute_021_f32_to_f16};
@@ -82,6 +84,8 @@ enum Arm {
     /// Q4-GEMMA-ATTN-EXACT S0-b, R = 1: lever A1's grouped kernel.
     VecGqa,
     TiledF16,
+    /// hf2q gap program F1: the tensor-API flash attention.
+    TensorF16,
     Precise {
         v: PreciseVIn,
         window: bool,
@@ -94,6 +98,7 @@ impl Arm {
             Arm::Vec => "vec".into(),
             Arm::VecGqa => "vec_gqa".into(),
             Arm::TiledF16 => "tiled_f16".into(),
+            Arm::TensorF16 => "tensor_f16".into(),
             Arm::Precise { v, window } => format!(
                 "precise_{}_{}",
                 match v {
@@ -107,10 +112,11 @@ impl Arm {
     }
 }
 
-const ALL_ARMS: [Arm; 7] = [
+const ALL_ARMS: [Arm; 8] = [
     Arm::Vec,
     Arm::VecGqa,
     Arm::TiledF16,
+    Arm::TensorF16,
     Arm::Precise {
         v: PreciseVIn::Codes,
         window: true,
@@ -494,6 +500,38 @@ fn encode_attention(
             )
             .unwrap()
         }
+        (Arm::TensorF16, kind) => {
+            let q = lane.q.slice_view((local * row * 4) as u64, len * row);
+            let out = lane.out.slice_view((local * row * 4) as u64, len * row);
+            let kv_pad = tensor::kv_pad(kl as u32);
+            tensor::dispatch_flash_attn_prefill_tensor_f16(
+                enc,
+                reg,
+                dev,
+                &q,
+                s.dense_k.as_ref().unwrap(),
+                s.dense_v.as_ref().unwrap(),
+                s.mask.as_ref().unwrap(),
+                s.blk.as_ref().unwrap(),
+                &out,
+                &tensor::FlashAttnPrefillTensorParams {
+                    rows: len as u32,
+                    n_heads: h as u32,
+                    n_kv_heads: h_kv as u32,
+                    head_dim: d as u32,
+                    kv_pad,
+                    q_row_stride: row as u32,
+                    q_head_stride: d as u32,
+                    k_row_stride: d as u32,
+                    k_head_stride: (kl * d) as u32,
+                    v_row_stride: d as u32,
+                    v_head_stride: (kl * d) as u32,
+                    scale: 1.0,
+                },
+            )
+            .unwrap();
+            let _ = kind;
+        }
         (Arm::Precise { v, window }, kind) => {
             let codes = PreciseV::Codes {
                 codes: &lane.codes,
@@ -586,6 +624,81 @@ fn encode_chain(
                 len * flash_attn_vec_hybrid::tmp_buffer_bytes(h as u32, d as u32)
             };
             s.vec_tmp = Some(alloc(dev, DType::F32, tmp_bytes / 4));
+            encode_attention(dev, reg, enc, lane, arm, chunk, &s);
+            enc.memory_barrier();
+            all.push(s);
+            continue;
+        }
+        if arm == Arm::TensorF16 {
+            // Dense K/V `[h_kv, kl, d]` plus `kv_pad - kl` zero rows after
+            // the last head, so every row the kernel reads below kv_pad is
+            // finite (rows past kl of a head read the next head's rows,
+            // masked -inf); Q and O stay in the layer's `[rows, heads, d]`
+            // F32 layout.
+            let kv_pad = tensor::kv_pad(kl as u32) as usize;
+            let tail = (kv_pad - kl) * d;
+            let dense_k = alloc(dev, DType::F16, h_kv * kl * d + tail);
+            let dense_v = alloc(dev, DType::F16, h_kv * kl * d + tail);
+            dispatch_kv_cache_linearize_ring_bytes(
+                enc,
+                reg,
+                md,
+                &lane.k,
+                &dense_k,
+                h_kv as u32,
+                lane.cap as u32,
+                kl as u32,
+                kl as u32,
+                kl as u32,
+                (d * 2) as u32,
+            )
+            .unwrap();
+            mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq_f16(
+                enc,
+                reg,
+                md,
+                &lane.codes,
+                &lane.norms,
+                &dense_v,
+                h_kv as u32,
+                d as u32,
+                lane.cap as u32,
+                0,
+                kl as u32,
+                SCALE_FACTOR_D512,
+                CODEBOOK_BITS,
+            )
+            .unwrap();
+            let mask = flash_attn_prefill_mask::build_sdpa_mask_f16(
+                dev,
+                reg,
+                enc,
+                &SdpaMaskParams {
+                    seq_len_q: len as u32,
+                    seq_len_k: kv_pad as u32,
+                    window_size: (lane.kind == Kind::Sliding).then_some(SLIDING_CAP as u32),
+                    causal: true,
+                    q_abs_offset: q_offset as u32,
+                },
+            )
+            .unwrap();
+            enc.memory_barrier();
+            let params = flash_attn_prefill_blk::BlkParams {
+                seq_len_q: len as u32,
+                seq_len_k: kv_pad as u32,
+                bq: tensor::queries_per_threadgroup(d as u32).unwrap(),
+                bk: tensor::CACHE_ROWS_PER_STEP,
+            };
+            let blk = alloc_blk_buffer(dev, &params).unwrap();
+            flash_attn_prefill_blk::dispatch_flash_attn_prefill_blk_f16(
+                enc, dev, reg, &mask, &blk, &params,
+            )
+            .unwrap();
+            enc.memory_barrier();
+            s.dense_k = Some(dense_k);
+            s.dense_v = Some(dense_v);
+            s.mask = Some(mask);
+            s.blk = Some(blk);
             encode_attention(dev, reg, enc, lane, arm, chunk, &s);
             enc.memory_barrier();
             all.push(s);
