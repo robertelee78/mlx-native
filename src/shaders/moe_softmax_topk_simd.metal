@@ -57,7 +57,9 @@ kernel void moe_softmax_topk_simd_f32(
     for (int i = 0; i < FC_PER_LANE; ++i) {
         const uint e = lane + uint(i) * 32;
         const float x = (e < ne) ? row_logits[e] : -INFINITY;
-        v[i] = isnan(x) ? -FLT_MAX : x;
+        // NaN never wins; +/-inf are clamped to the finite range so every row keeps a
+        // finite max and every selected id is a real expert (< n_experts).
+        v[i] = isnan(x) ? -FLT_MAX : clamp(x, -FLT_MAX, FLT_MAX);
     }
 
     // Softmax: max, exp, sum.

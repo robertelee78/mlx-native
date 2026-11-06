@@ -29,7 +29,7 @@ fn reference(logits: &[f32], n_tokens: usize, n_experts: usize, top_k: usize) ->
     for t in 0..n_tokens {
         let row: Vec<f64> = logits[t * n_experts..(t + 1) * n_experts]
             .iter()
-            .map(|&x| if x.is_nan() { f32::MIN as f64 } else { x as f64 })
+            .map(|&x| if x.is_nan() { f32::MIN as f64 } else { x.clamp(f32::MIN, f32::MAX) as f64 })
             .collect();
         let m = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let e: Vec<f64> = row.iter().map(|&x| (x - m).exp()).collect();
@@ -135,14 +135,32 @@ fn ties_go_to_the_lower_expert_and_nan_never_wins() {
     for &x in &w {
         assert!((x - 0.125).abs() <= 1e-7, "tied weight {x}");
     }
-    // ties spread across lanes and per-lane slots: experts 200, 40, 72 equal and largest
+    // ties spread across lanes and per-lane slots: experts 200 (lane 8, slot 6), 41 (lane 9,
+    // slot 1) and 73 (lane 9, slot 2) equal and largest
     let mut logits = lcg(9, n_experts, 1.0);
-    for &e in &[200usize, 40, 72] {
+    for &e in &[200usize, 41, 73] {
         logits[e] = 3.0;
     }
     let (ids, _) = run(true, &logits, 1, n_experts as u32, 8);
-    assert_eq!(&ids[..3], &[40, 72, 200]);
+    assert_eq!(&ids[..3], &[41, 73, 200]);
     check_against_reference(&logits, 1, n_experts, 8);
+}
+
+#[test]
+fn infinite_rows_select_real_experts() {
+    let n_experts = 256usize;
+    // an all -inf row and a row with a +inf logit: every id is a real expert
+    let mut logits = vec![f32::NEG_INFINITY; 2 * n_experts];
+    for x in logits[n_experts..].iter_mut() {
+        *x = 0.25;
+    }
+    logits[n_experts + 77] = f32::INFINITY;
+    let (ids, w) = run(true, &logits, 2, n_experts as u32, 8);
+    assert!(ids.iter().all(|&i| (i as usize) < n_experts), "ids {ids:?}");
+    assert_eq!(&ids[..8], &[0, 1, 2, 3, 4, 5, 6, 7], "all -inf row ties to the lowest experts");
+    assert_eq!(ids[8], 77, "the +inf expert wins its row");
+    assert!(w.iter().all(|x| x.is_finite()), "weights {w:?}");
+    check_against_reference(&logits, 2, n_experts, 8);
 }
 
 #[test]
