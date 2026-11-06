@@ -13,6 +13,8 @@
 // reduces it across the SIMD group with simd_shuffle_xor, and the owning lane
 // retires that expert. No threadgroup memory, no barriers, no single-thread
 // sort. One dispatch covers every row (grid = n_tokens threadgroups of 32).
+// The per-lane count and top_k are function constants, so every register
+// index is static after unrolling.
 //
 // Numerics: the softmax sum is reduced in SIMD order (Class B against the
 // 128-thread tree of moe_softmax_topk_f32). The top-k sum accumulates the
@@ -20,13 +22,13 @@
 // as moe_softmax_topk_f32. Rows are independent, so a row's result does not
 // depend on how many rows share the dispatch.
 //
-// Limits (checked on the host): n_experts <= 32 * MOE_SIMD_MAX_PER_LANE (1024),
-// top_k <= 32.
+// Limits (checked on the host): n_experts <= 32 * 32 (1024), top_k <= 32.
 
 #include <metal_stdlib>
 using namespace metal;
 
-#define MOE_SIMD_MAX_PER_LANE 32
+constant int FC_PER_LANE [[function_constant(0)]];  // ceil(n_experts / 32), 1..32
+constant int FC_TOP_K    [[function_constant(1)]];  // 1..32
 
 struct MoeSoftmaxTopkParams {
     uint n_tokens;
@@ -46,62 +48,61 @@ kernel void moe_softmax_topk_simd_f32(
     const uint row = tgpig.x;
     if (row >= p.n_tokens) return;
 
-    const uint ne        = p.n_experts;
-    const uint top_k     = p.top_k;
-    const uint per_lane  = (ne + 31) / 32;
-
+    const uint ne = p.n_experts;
     device const float * row_logits = logits + row * ne;
 
     // Lane `lane` owns experts lane, lane + 32, lane + 64, ...
-    float v[MOE_SIMD_MAX_PER_LANE];
-    for (uint i = 0; i < MOE_SIMD_MAX_PER_LANE; ++i) {
-        v[i] = -INFINITY;
-    }
-    for (uint i = 0; i < per_lane; ++i) {
-        const uint e = lane + i * 32;
-        if (e < ne) {
-            const float x = row_logits[e];
-            v[i] = isnan(x) ? -FLT_MAX : x;
-        }
+    float v[32];  // only the first FC_PER_LANE entries are used
+#pragma unroll
+    for (int i = 0; i < FC_PER_LANE; ++i) {
+        const uint e = lane + uint(i) * 32;
+        const float x = (e < ne) ? row_logits[e] : -INFINITY;
+        v[i] = isnan(x) ? -FLT_MAX : x;
     }
 
     // Softmax: max, exp, sum.
     float local_max = -INFINITY;
-    for (uint i = 0; i < per_lane; ++i) {
+#pragma unroll
+    for (int i = 0; i < FC_PER_LANE; ++i) {
         local_max = max(local_max, v[i]);
     }
     const float row_max = simd_max(local_max);
 
     float local_sum = 0.0f;
-    for (uint i = 0; i < per_lane; ++i) {
-        const uint e = lane + i * 32;
+#pragma unroll
+    for (int i = 0; i < FC_PER_LANE; ++i) {
+        const uint e = lane + uint(i) * 32;
         const float ev = (e < ne) ? exp(v[i] - row_max) : 0.0f;
         v[i] = (e < ne) ? ev : -INFINITY;
         local_sum += ev;
     }
     const float row_sum = simd_sum(local_sum);
-    for (uint i = 0; i < per_lane; ++i) {
-        const uint e = lane + i * 32;
+#pragma unroll
+    for (int i = 0; i < FC_PER_LANE; ++i) {
+        const uint e = lane + uint(i) * 32;
         if (e < ne) {
             v[i] = v[i] / row_sum;
         }
     }
 
     // Top-k: one SIMD-wide argmax per selected expert. Every lane ends each
-    // round holding the same (best_val, best_e).
-    float sel_val[32];
-    uint  sel_id[32];
+    // round holding the same (best_val, best_e); lane k keeps round k.
+    float my_val = 0.0f;
+    uint  my_id  = 0;
     float topk_sum = 0.0f;
-    for (uint k = 0; k < top_k; ++k) {
+#pragma unroll
+    for (int k = 0; k < FC_TOP_K; ++k) {
         float best_val = -INFINITY;
         uint  best_e   = 0xFFFFFFFFu;
-        for (uint i = 0; i < per_lane; ++i) {
-            const uint e = lane + i * 32;
+#pragma unroll
+        for (int i = 0; i < FC_PER_LANE; ++i) {
+            const uint e = lane + uint(i) * 32;
             if (e < ne && (v[i] > best_val || (v[i] == best_val && e < best_e))) {
                 best_val = v[i];
                 best_e   = e;
             }
         }
+#pragma unroll
         for (ushort mask = 16; mask > 0; mask >>= 1) {
             const float ov = simd_shuffle_xor(best_val, mask);
             const uint  oe = simd_shuffle_xor(best_e, mask);
@@ -110,18 +111,23 @@ kernel void moe_softmax_topk_simd_f32(
                 best_e   = oe;
             }
         }
-        if ((best_e & 31u) == lane) {
-            v[best_e / 32] = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < FC_PER_LANE; ++i) {
+            if (lane + uint(i) * 32 == best_e) {
+                v[i] = -INFINITY;
+            }
         }
-        sel_val[k] = best_val;
-        sel_id[k]  = best_e;
-        topk_sum  += best_val;  // descending order, identical on every lane
+        if (lane == ushort(k)) {
+            my_val = best_val;
+            my_id  = best_e;
+        }
+        topk_sum += best_val;  // descending order, identical on every lane
     }
 
     const float inv_topk_sum = (topk_sum > 1e-9f) ? (1.0f / topk_sum) : 1.0f;
-    const uint base = row * top_k;
-    for (uint k = lane; k < top_k; k += 32) {
-        out_ids[base + k]     = sel_id[k];
-        out_weights[base + k] = sel_val[k] * inv_topk_sum;
+    if (lane < ushort(FC_TOP_K)) {
+        const uint base = row * uint(FC_TOP_K);
+        out_ids[base + lane]     = my_id;
+        out_weights[base + lane] = my_val * inv_topk_sum;
     }
 }

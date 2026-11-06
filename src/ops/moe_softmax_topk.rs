@@ -201,7 +201,13 @@ pub fn dispatch_moe_softmax_topk_simd(
         top_k,
         _pad: 0.0,
     };
-    let pipeline = registry.get_pipeline("moe_softmax_topk_simd_f32", device.metal_device())?;
+    let per_lane = n_experts.div_ceil(32) as i32;
+    let pipeline = registry.get_pipeline_with_constants(
+        "moe_softmax_topk_simd_f32",
+        device.metal_device(),
+        &[],
+        &[(0, per_lane), (1, top_k as i32)],
+    )?;
     encoder.encode_threadgroups_with_args(
         pipeline,
         &[
