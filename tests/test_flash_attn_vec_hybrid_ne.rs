@@ -7,15 +7,18 @@
 //!   `NE1_BOUND · max|NE1 output|` (only reduction orders differ).
 //! - Determinism (Class A): a repeat is bitwise equal.
 //! - Slot invariance (Class A): a query's output is bitwise equal alone or
-//!   in a 4-query dispatch at the same split count.
-//! Masks: linear causal (mask_type 1) and linear sliding window (mask_type 3)
-//! at kv 300 / 1000 / 1024 and a split boundary of 517.
+//!   in a 4-query dispatch at the same split count, and the single-sequence
+//!   NE kernel on the slot's own view (hf2q's per-slot decode fallback and
+//!   single-slot decode) equals the batched NE kernel bitwise.
+//! Masks: linear causal (mask_type 1), linear sliding window (mask_type 3)
+//! and ring storage (mask_type 2, the serving sliding form, wrapped) at kv
+//! 300 / 1000 / 1024, a split boundary of 517 and seq_pos up to 2099.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use half::f16;
 use mlx_native::ops::flash_attn_vec_hybrid::{
     self as fa, flash_attn_vec_hybrid_batched, flash_attn_vec_hybrid_batched_ne,
-    FlashAttnVecTqHbParams,
+    flash_attn_vec_hybrid_ne, FlashAttnVecTqHbParams,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -116,6 +119,11 @@ struct Step {
 
 fn params(step: &Step) -> FlashAttnVecTqHbParams {
     let max = *step.ksl.iter().max().unwrap();
+    let max = if step.mask_type == 2 {
+        max.min(CAP as u32)
+    } else {
+        max
+    };
     FlashAttnVecTqHbParams {
         num_heads: NH as u32,
         num_kv_heads: NKV as u32,
@@ -193,7 +201,13 @@ fn run(
 
 fn reference(kv: &Kv, q: &[f32], step: &Step, slot: usize, h: usize) -> Vec<f64> {
     let kvh = h / (NH / NKV);
-    let ksl = step.ksl[slot] as usize;
+    // ring storage (mask_type 2) holds min(seq_pos + 1, cap) rows, all in
+    // the 1024 window here; the attention is order-independent.
+    let ksl = if step.mask_type == 2 {
+        (step.ksl[slot] as usize).min(CAP)
+    } else {
+        step.ksl[slot] as usize
+    };
     let lo = if step.mask_type == 3 && step.window > 0 && ksl > step.window as usize {
         ksl - step.window as usize
     } else {
@@ -244,6 +258,12 @@ fn steps() -> Vec<Step> {
             mask_type: 1,
             window: 0,
             ksl: [517, 600, 700, 1000],
+        },
+        // the serving sliding form: ring storage, wrapped
+        Step {
+            mask_type: 2,
+            window: 1024,
+            ksl: [1024, 1500, 1030, 2100],
         },
     ]
 }
@@ -322,6 +342,80 @@ fn ne_tracks_ne1_on_tq_codes_and_is_deterministic_and_slot_invariant() {
             assert!(
                 solo[..] == out[s * NH * HD..(s + 1) * NH * HD],
                 "ne {ne} {step:?}: slot {s} alone differs"
+            );
+        }
+    }
+}
+
+/// The single-sequence NE kernel on a slot view equals the batched NE kernel
+/// for that slot (mask_type 1; the single-sequence window applies only to
+/// ring storage), so decode numerics do not depend on whether the slot ran
+/// alone, in a per-slot fallback or in a batched cohort.
+#[test]
+fn single_sequence_ne_equals_batched_ne_per_slot() {
+    let (dev, mut reg) = setup();
+    let kv = make_kv(&dev, &mut reg, 0xE55);
+    let mut rng = Rng(0xF66);
+    let q: Vec<f32> = (0..SLOTS * NH * HD).map(|_| rng.next()).collect();
+    let slot_elems = NKV * CAP * HD;
+    for ne in [2u32, 4] {
+        for (mask_type, ksl) in [
+            (1u32, 300u32),
+            (1, 517),
+            (1, 1000),
+            (1, 1024),
+            (2, 1024),
+            (2, 1500),
+            (2, 2100),
+        ] {
+            let window = if mask_type == 2 { 1024 } else { 0 };
+            let step = Step {
+                mask_type,
+                window,
+                ksl: [ksl; SLOTS],
+            };
+            let batched = run(&dev, &mut reg, &kv, &q, &step, &[0, 1, 2, 3], ne, false);
+            for s in 0..SLOTS {
+                let k = kv.k_buf.slice_view((s * slot_elems * 2) as u64, slot_elems);
+                let v = kv.codes.slice_view((s * slot_elems) as u64, slot_elems);
+                let vn = kv.norms.slice_view((s * NKV * CAP * 4) as u64, NKV * CAP);
+                let qb = upload(&dev, &q[s * NH * HD..(s + 1) * NH * HD], DType::F32);
+                let out = dev
+                    .alloc_buffer(NH * HD * 4, DType::F32, vec![NH * HD])
+                    .unwrap();
+                let tmp_bytes = fa::tmp_buffer_bytes(NH as u32, HD as u32);
+                let tmp = dev
+                    .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+                    .unwrap();
+                let mut p = params(&step);
+                // the single-sequence kernel takes the ring view explicitly
+                p.kv_seq_len = if mask_type == 2 {
+                    ksl.min(CAP as u32)
+                } else {
+                    ksl
+                };
+                p.ring_start = if mask_type == 2 && ksl >= CAP as u32 {
+                    ksl % CAP as u32
+                } else {
+                    0
+                };
+                let mut enc = dev.command_encoder().unwrap();
+                flash_attn_vec_hybrid_ne(
+                    &mut enc, &mut reg, &dev, &qb, &k, &v, &vn, &out, &tmp, &p, ne,
+                )
+                .unwrap();
+                enc.commit_and_wait().unwrap();
+                let solo: Vec<u32> = out.as_slice::<f32>().unwrap()[..NH * HD]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect();
+                assert!(
+                    solo[..] == batched[s * NH * HD..(s + 1) * NH * HD],
+                    "ne {ne} ksl {ksl} slot {s}: single-sequence differs from batched"
+                );
+            }
+            eprintln!(
+                "FA_VEC_NE_SOLO_EQ_BATCHED ne={ne} mask_type={mask_type} ksl={ksl} slots={SLOTS}"
             );
         }
     }

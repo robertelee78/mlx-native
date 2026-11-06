@@ -1511,6 +1511,8 @@ impl KernelRegistry {
         sources.insert("flash_attn_vec_hybrid_batched_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_batched_dk512".into(), hybrid_src);
         // hf2q gap program — NE head-split batched decode flash (D = 256).
+        sources.insert("flash_attn_vec_hybrid_ne2_dk256".into(), hybrid_src);
+        sources.insert("flash_attn_vec_hybrid_ne4_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_batched_ne2_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_batched_ne4_dk256".into(), hybrid_src);
         // ADR-063 lever A — GQA-grouped, per-slot-bucket batched decode flash
