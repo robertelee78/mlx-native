@@ -797,6 +797,7 @@ pub fn quantized_matmul_ggml_with_policy(
                 k: params.k,
                 batch: 1,
                 ggml_type: params.ggml_type,
+                geometry: crate::ops::mul_mv_ext::MulMvExtGeometry::WidthAdaptive,
             };
             crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
                 encoder,
@@ -854,6 +855,7 @@ pub fn quantized_matmul_ggml_with_policy(
                 k: params.k,
                 batch: 1,
                 ggml_type: params.ggml_type,
+                geometry: crate::ops::mul_mv_ext::MulMvExtGeometry::WidthAdaptive,
             };
             crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
                 encoder,
@@ -875,6 +877,130 @@ pub fn quantized_matmul_ggml_with_policy(
             encoder, registry, device, input, weight, output, params, routing,
         ),
     }
+}
+
+/// Dense GGUF mat-vec for decode widths `m ∈ 1..=8` on the peer's
+/// small-batch technique (`mul_mv_ext`): each threadgroup dequantizes a
+/// weight chunk once and dots it against four input columns.
+///
+/// Every call dispatches `kernel_mul_mv_ext_<type>_f32_r1_4` with
+/// `r1ptg = 4` at every width (grid y = ⌈m/4⌉; the kernel guards columns
+/// `≥ m`) and an `nxpsg` chosen from K alone (8 when `K % 128 == 0`, else 4).
+/// Each column therefore executes the same instruction stream, lane
+/// partition, and reduction tree at every width: the result for one
+/// column is independent of `m`, of its position in the batch, and of the
+/// other columns (column-invariant by construction).
+///
+/// Numerics class B: results are NOT bitwise equal to the canonical
+/// [`quantized_matmul_ggml`] routes (different accumulation order); they
+/// are bounded against an f64 reference by `c·K·ε_f32·Σ|w·x|` and are
+/// deterministic run to run. The canonical routes are unchanged.
+///
+/// Admitted types: Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K. `K` must be a
+/// multiple of the type's block size and of 64 (the kernels consume
+/// `16·nxpsg` values per loop iteration without a tail guard).
+///
+/// # Errors
+///
+/// `MlxError::InvalidArgument` for a non-F32 input/output or non-U8 weight
+/// buffer, `m` outside `1..=8`, zero `n`/`k`, an unadmitted type, a `K`
+/// alignment violation, undersized buffers, or an output range overlapping
+/// the input or weight range.
+pub fn quantized_matmul_ggml_column_invariant_mv_ext(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    const OPERATION: &str = "quantized_matmul_ggml_column_invariant_mv_ext";
+    validate_native_quantized_dtypes(OPERATION, input, weight, output)?;
+    validate_signed_metal_dimensions(
+        OPERATION,
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
+    if !matches!(
+        params.ggml_type,
+        GgmlType::Q4_0
+            | GgmlType::Q5_0
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+    ) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION} does not support {:?} (admitted: Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K)",
+            params.ggml_type
+        )));
+    }
+    if !(1..=MM_ROUTING_THRESHOLD).contains(&params.m) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: M ({}) must be in 1..={MM_ROUTING_THRESHOLD}",
+            params.m
+        )));
+    }
+    if params.n == 0 || params.k == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: N and K must be > 0"
+        )));
+    }
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: K ({}) must be divisible by block QK ({qk})",
+            params.k
+        )));
+    }
+    if crate::ops::mul_mv_ext::column_invariant_nxpsg(params.k).is_none() {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: K ({}) must be divisible by 64",
+            params.k
+        )));
+    }
+    let weight_bytes = checked_byte_extent(
+        "weight",
+        &[
+            params.n as usize,
+            (params.k / qk) as usize,
+            params.ggml_type.block_bytes() as usize,
+        ],
+    )?;
+    let input_bytes = checked_byte_extent(
+        "input",
+        &[params.m as usize, params.k as usize, DType::F32.size_of()],
+    )?;
+    let output_bytes = checked_byte_extent(
+        "output",
+        &[params.m as usize, params.n as usize, DType::F32.size_of()],
+    )?;
+    let input_range = validate_required_buffer_range(OPERATION, "input", input, input_bytes)?;
+    let weight_range = validate_required_buffer_range(OPERATION, "weight", weight, weight_bytes)?;
+    let output_range = validate_required_buffer_range(OPERATION, "output", output, output_bytes)?;
+    validate_output_disjoint(
+        OPERATION,
+        output_range,
+        &[("input", input_range), ("weight", weight_range)],
+    )?;
+
+    let ext_params = crate::ops::mul_mv_ext::MulMvExtParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+        batch: 1,
+        ggml_type: params.ggml_type,
+        geometry: crate::ops::mul_mv_ext::MulMvExtGeometry::ColumnInvariant,
+    };
+    crate::ops::mul_mv_ext::mul_mv_ext_dispatch(
+        encoder,
+        registry,
+        device,
+        weight,
+        input,
+        output,
+        &ext_params,
+    )
 }
 
 /// Execute the canonical dense GGUF operation under an explicit routing

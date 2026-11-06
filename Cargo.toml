@@ -175,3 +175,7 @@ harness = false
 [[bench]]
 name = "bench_flash_attn_warm_precise"
 harness = false
+
+[[bench]]
+name = "bench_gemma_decode_op_parity"
+harness = false
