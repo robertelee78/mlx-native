@@ -1045,10 +1045,14 @@ fn main() {
             "embedded_metallib_sha256": id.embedded_metallib_sha256})
     })
     .collect::<Vec<_>>();
-    // Origins of the grouped pipelines the vec_gqa arm can issue.
+    // Origins of the grouped pipelines the vec_gqa arm can issue (d512 is
+    // instantiated, and legal, at G = 1 only).
     let mut gqa_identity = Vec::new();
     for dk in [256u32, 512] {
         for g in flash_attn_vec_hybrid::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
+            if dk == 512 && g != 1 {
+                continue;
+            }
             let name = format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}");
             let label = reg
                 .get_pipeline_with_constants(

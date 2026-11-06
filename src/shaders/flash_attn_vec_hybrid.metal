@@ -1585,19 +1585,21 @@ kernel void flash_attn_vec_hybrid_batched_gqa_impl(
                         device const uint8_t *v_base =
                             V_packed + v_off_b + (kv_head * kv_capacity + kv_pos) * DV;
 
-                        // Each head runs the stock statements literally:
+                        // d512 runs at G = 1 only (gqa1_dk512 is the sole
+                        // d512 instantiation; the host rejects G > 1). The
+                        // statements are the stock ones literally:
                         // `sn_b = vnorm[b] / sf_d512 * w` then
                         // `lo += dequant_hb_float4(v_base, coord, sn_b, _)`.
                         // Under the default (fast) math mode the compiler
                         // picks the association of `vnorm / sf * w` from the
                         // expression's use pattern, and that choice differs
-                        // between Metal toolchains. An explicit pinned form
-                        // matched one toolchain's stock code and drifted 1 ULP
-                        // on another (mlx-native CI, #89). Keeping each head's
-                        // expression and use pattern identical to stock's lets
-                        // every compiler make the stock choice. The d512 V
-                        // decode is therefore not shared across heads; the K
-                        // load still is.
+                        // between Metal toolchains. A pinned
+                        // `(w * (1/sf)) * vnorm` drifted 1 ULP on the CI
+                        // toolchain even at G = 1; this literal per-head form
+                        // (and an opaque per-head divisor) match stock on CI
+                        // at every G but drift 1 ULP on the M5 toolchain at
+                        // G >= 2 (#89). Only G = 1 is bitwise-equal to stock
+                        // on every toolchain.
                         HYB_GQA_UNROLL
                         for (short g = 0; g < G; ++g) {
                             // Block 0: coords 0..255
@@ -1747,9 +1749,3 @@ kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_imp
 
 template [[host_name("flash_attn_vec_hybrid_batched_gqa1_dk512")]]
 kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_impl<512, 512, 1>;
-template [[host_name("flash_attn_vec_hybrid_batched_gqa2_dk512")]]
-kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_impl<512, 512, 2>;
-template [[host_name("flash_attn_vec_hybrid_batched_gqa4_dk512")]]
-kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_impl<512, 512, 4>;
-template [[host_name("flash_attn_vec_hybrid_batched_gqa8_dk512")]]
-kernel flash_attn_vec_hybrid_batched_gqa_t flash_attn_vec_hybrid_batched_gqa_impl<512, 512, 8>;

@@ -1518,9 +1518,6 @@ impl KernelRegistry {
             "flash_attn_vec_hybrid_batched_gqa4_dk256",
             "flash_attn_vec_hybrid_batched_gqa8_dk256",
             "flash_attn_vec_hybrid_batched_gqa1_dk512",
-            "flash_attn_vec_hybrid_batched_gqa2_dk512",
-            "flash_attn_vec_hybrid_batched_gqa4_dk512",
-            "flash_attn_vec_hybrid_batched_gqa8_dk512",
         ] {
             sources.insert(name.into(), hybrid_src);
         }

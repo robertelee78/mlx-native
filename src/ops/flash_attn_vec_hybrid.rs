@@ -486,6 +486,15 @@ pub fn flash_attn_vec_hybrid_batched_gqa_shmem_bytes(
 /// Whether `group` query heads per threadgroup is legal: an instantiated
 /// size, dividing `num_heads / num_kv_heads`, and fitting 32 KiB of
 /// threadgroup memory at `nsg_max`.
+///
+/// Head dim 512 is legal only at `group == 1`. The stock d512 V scale
+/// `vnorm / sf * w` has no source form whose floating-point association is
+/// the same on every Metal toolchain once heads are grouped: the pinned
+/// `(w * (1/sf)) * vnorm` form drifts from stock on the CI toolchain even at
+/// G = 1, and both the per-head literal form and an opaque per-head divisor
+/// match stock on CI at every G but drift 1 ULP on the M5 toolchain at
+/// G >= 2. Only the ungrouped kernel is bitwise-equal to stock everywhere.
+/// Head dim 256 keeps every group in [`FLASH_ATTN_VEC_HYBRID_GQA_GROUPS`].
 pub fn flash_attn_vec_hybrid_batched_gqa_group_is_legal(
     num_heads: u32,
     num_kv_heads: u32,
@@ -494,6 +503,9 @@ pub fn flash_attn_vec_hybrid_batched_gqa_group_is_legal(
     nsg_max: u32,
 ) -> bool {
     if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return false;
+    }
+    if head_dim == 512 && group != 1 {
         return false;
     }
     let heads_per_kv = num_heads / num_kv_heads;
@@ -693,6 +705,12 @@ pub fn flash_attn_vec_hybrid_batched_gqa(
     let nwg_max = buckets.iter().map(|b| b.nwg).max().unwrap_or(1);
     let nsg_max = buckets.iter().map(|b| b.nsg).max().unwrap_or(1);
     let head_dim = params.head_dim;
+    if head_dim == 512 && group != 1 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_gqa: head_dim 512 requires group 1, got {group} \
+             (grouped d512 V scale is not bitwise-stable across Metal toolchains)"
+        )));
+    }
     if !flash_attn_vec_hybrid_batched_gqa_group_is_legal(
         params.num_heads,
         params.num_kv_heads,
@@ -753,9 +771,6 @@ pub fn flash_attn_vec_hybrid_batched_gqa(
         (4, 256) => "flash_attn_vec_hybrid_batched_gqa4_dk256",
         (8, 256) => "flash_attn_vec_hybrid_batched_gqa8_dk256",
         (1, 512) => "flash_attn_vec_hybrid_batched_gqa1_dk512",
-        (2, 512) => "flash_attn_vec_hybrid_batched_gqa2_dk512",
-        (4, 512) => "flash_attn_vec_hybrid_batched_gqa4_dk512",
-        (8, 512) => "flash_attn_vec_hybrid_batched_gqa8_dk512",
         _ => {
             return Err(MlxError::InvalidArgument(format!(
                 "flash_attn_vec_hybrid_batched_gqa: unsupported group {group} / head_dim {head_dim}"

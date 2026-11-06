@@ -16,7 +16,7 @@ stock path it replaces, on the same metallib path:
 | Lever | Entry | Reference |
 |---|---|---|
 | F2 | `quantized_matmul_id_ggml_mv_grouped_geglu` (explicit; kernel `kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4`) | `kernel_mul_mv_id_q4_K_f32` gate_up into `[pairs, n]`, then `moe_swiglu_batch_encode(.., n/2, pairs)` |
-| GQA flash | `flash_attn_vec_hybrid_batched_gqa` (explicit group and per-slot buckets; kernels `flash_attn_vec_hybrid_batched_gqa{1,2,4,8}_dk{256,512}`) | stock batched / per-slot vec-hybrid flash and reduce at each slot's own (nwg, nsg) |
+| GQA flash | `flash_attn_vec_hybrid_batched_gqa` (explicit group and per-slot buckets; kernels `flash_attn_vec_hybrid_batched_gqa{1,2,4,8}_dk256` and `flash_attn_vec_hybrid_batched_gqa1_dk512`) | stock batched / per-slot vec-hybrid flash and reduce at each slot's own (nwg, nsg) |
 
 F2 takes the stacked `[n_experts, n, K]` Q4_K gate_up weight (rows `0..n/2`
 gate, `n/2..n` up) and writes `[n_tokens * top_k, n/2]` F32. It rejects
@@ -69,9 +69,21 @@ use is dropped.
 - **F2 poison.** A compile-time `NAN` fed into the GELU epilogue was folded
   away under default math; the poison is rebuilt at run time from `p.r2` so
   the epilogue runs on the same bits as `moe_swiglu_batch` does.
-- **GQA flash d512 packed V.** The compiled stock kernel evaluates the V
-  scale as `(w * (1/sf)) * norm`; the clone spells it that way (a literal
-  `norm / sf * w` drifted 1 ULP for non-power-of-two scale factors).
+- **GQA flash d512 packed V: G = 1 only.** Under the default (fast) math
+  mode the compiler picks the association of the stock V scale
+  `norm / sf * w`, and the pick differs between the M5 Metal toolchain and
+  the CI Metal toolchain. Forms tried against stock on both:
+  - pinned `(w * (1/sf)) * norm`: matched on the M5, drifted 1 ULP on CI at
+    G = 1 (non-power-of-two `sf`);
+  - the stock statement literally, per head: bitwise on CI at every G and on
+    the M5 at G = 1, drifted 1 ULP on the M5 at G ≥ 2;
+  - an opaque per-head divisor: same as the literal form (M5 drifts at G ≥ 2).
+
+  No form is bitwise on both toolchains at G ≥ 2, so head_dim 512 with
+  G > 1 is illegal: `flash_attn_vec_hybrid_batched_gqa_group_is_legal`
+  returns false, the dispatcher refuses it, `pick_group` returns 1, and only
+  `gqa1_dk512` is instantiated (literal per-head form). d256 keeps
+  G ∈ {1, 2, 4, 8}.
 - **GQA flash d256 V weight underflow.** Stock computes
   `v_norm * inv_sqrt_dv * w` with the 2^-4 scale applied last; a plain
   product was compiled to scale `w` first, flushed subnormals and wrote 0

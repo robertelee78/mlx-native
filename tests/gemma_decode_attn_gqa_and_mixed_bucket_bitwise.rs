@@ -823,6 +823,11 @@ fn check_all_groups(ctx: &mut Ctx, base: &Cell, kv: &Kv) {
     let nsg_max = nsg_max_of(base);
     let legal = legal_groups(&base.shape, nsg_max);
     assert!(legal.contains(&1));
+    if base.shape.dk == 512 {
+        // Grouped d512 is illegal: its V scale is not bitwise-stable across
+        // Metal toolchains at G >= 2.
+        assert_eq!(legal, [1], "{}: d512 must be legal at G = 1 only", base.label());
+    }
     for g in fa::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
         let mut cell = base.clone();
         cell.group = g;
@@ -840,6 +845,27 @@ fn check_all_groups_requiring(ctx: &mut Ctx, base: &Cell, kv: &Kv, required: &[u
     let legal = legal_groups(&base.shape, nsg_max_of(base));
     for g in required {
         assert!(legal.contains(g), "{}: G={g} not legal ({legal:?})", base.label());
+    }
+    check_all_groups(ctx, base, kv);
+}
+
+/// A d512 cell: G = 1 bitwise against stock, G = 2 / 4 / 8 refused
+/// (legality false and the dispatcher errors without writing).
+fn check_d512_g1_only(ctx: &mut Ctx, base: &Cell, kv: &Kv) {
+    assert_eq!(base.shape.dk, 512);
+    let nsg_max = nsg_max_of(base);
+    for g in [2, 4, 8] {
+        assert!(
+            !fa::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+                base.shape.nh,
+                base.shape.nkv,
+                512,
+                g,
+                nsg_max
+            ),
+            "{}: d512 G={g} must be illegal",
+            base.label()
+        );
     }
     check_all_groups(ctx, base, kv);
 }
@@ -959,7 +985,7 @@ fn mixed_buckets_match_per_slot_solo_dispatches() {
     );
     check_all_groups(&mut ctx, &cell, &kv_g);
 
-    // Global with nsg_max = 1: G = 8 fits threadgroup memory.
+    // Global with nsg_max = 1: G = 1 bitwise; grouped d512 is refused.
     let cell = Cell::new(
         GLOBAL,
         vec![(5, 99), (1, 600), (12, 0), (3, 1000)],
@@ -1211,17 +1237,18 @@ fn d256_eight_heads_per_kv_head_groups_4_and_8_bitwise() {
     check_all_groups_requiring(&mut ctx, &base, &kv, &[1, 2, 4, 8]);
 }
 
+/// d512 variants with nsg_max 1 (where G = 8 would fit threadgroup memory):
+/// G = 1 bitwise, and G = 2 / 4 / 8 refused.
 #[test]
-fn d512_variants_with_nsg_max_1_groups_4_and_8_bitwise() {
+fn d512_variants_with_nsg_max_1_g1_bitwise_and_groups_refused() {
     let mut ctx = Ctx::new();
     let kv = make_kv(&ctx.device, &GLOBAL, false, 0xCB51_2001);
     let kv16 = make_kv(&ctx.device, &GLOBAL, true, 0xF165_1201);
     // Every slot at KV <= 1024: nsg 1 everywhere.
     let slots = vec![(1, 40), (8, 777), (3, 1023), (10, 300)];
-    let req = [1, 2, 4, 8];
     let check = |ctx: &mut Ctx, cell: &Cell, kv: &Kv| {
         assert_eq!(nsg_max_of(cell), 1, "{}", cell.label());
-        check_all_groups_requiring(ctx, cell, kv, &req);
+        check_d512_g1_only(ctx, cell, kv);
     };
     for cbits in [5, 6] {
         let mut cell = Cell::new(GLOBAL, slots.clone(), 1, 0xE500 + cbits as u64);
@@ -1243,8 +1270,10 @@ fn d512_variants_with_nsg_max_1_groups_4_and_8_bitwise() {
     }
 }
 
+/// Explicit nsg-2 buckets (cross-SIMD merge) at d512: G = 1 bitwise, and
+/// G = 2 / 4 / 8 refused (d512 is legal at G = 1 only).
 #[test]
-fn d512_explicit_nsg_2_group_4_cross_simd_merge_bitwise() {
+fn d512_explicit_nsg_2_g1_bitwise_and_groups_refused() {
     let mut ctx = Ctx::new();
     let kv = make_kv(&ctx.device, &GLOBAL, false, 0x610B_0E02);
     let b = |nwg, nsg| HybridSlotBucket { nwg, nsg };
@@ -1255,10 +1284,10 @@ fn d512_explicit_nsg_2_group_4_cross_simd_merge_bitwise() {
         0xC104,
     );
     cell.buckets = Some(vec![b(1, 2), b(8, 2), b(32, 2), b(3, 2), b(16, 2)]);
-    check_all_groups_requiring(&mut ctx, &cell, &kv, &[1, 2, 4]);
+    check_d512_g1_only(&mut ctx, &cell, &kv);
     let mut cell = Cell::new(GLOBAL, vec![(2, 4095), (9, 1024), (6, 0)], 1, 0xC105);
     cell.buckets = Some(vec![b(32, 2), b(16, 1), b(1, 2)]);
-    check_all_groups_requiring(&mut ctx, &cell, &kv, &[1, 2, 4]);
+    check_d512_g1_only(&mut ctx, &cell, &kv);
 }
 
 #[test]
@@ -1363,6 +1392,10 @@ fn pipelines_resolve_on_the_selected_metallib_path() {
     ];
     for dk in [256, 512] {
         for g in fa::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
+            // d512 is instantiated at G = 1 only.
+            if dk == 512 && g != 1 {
+                continue;
+            }
             names.push(format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}"));
         }
     }
@@ -1404,17 +1437,31 @@ fn rejects_illegal_arguments() {
     let mut cell = Cell::new(SLIDING, slots.clone(), 1, 3);
     cell.buckets = Some(vec![]);
     assert_illegal(&mut ctx, &cell, &kv);
-    // G = 8 at d512 only fits threadgroup memory at nsg 1.
+    // d512 is legal at G = 1 only, whatever the NSG (grouped d512 V scale is
+    // not bitwise-stable across Metal toolchains); d256 keeps G = 8 at nsg 1.
+    for nsg in [1, 2, 4] {
+        assert!(fa::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+            16, 2, 512, 1, nsg
+        ));
+        for g in [2, 4, 8] {
+            assert!(!fa::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+                16, 2, 512, g, nsg
+            ));
+        }
+        assert_eq!(
+            fa::flash_attn_vec_hybrid_batched_gqa_pick_group(16, 2, 512, nsg),
+            1
+        );
+    }
     assert!(fa::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
-        16, 2, 512, 8, 1
+        16, 2, 256, 8, 1
     ));
-    assert!(!fa::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
-        16, 2, 512, 8, 4
-    ));
-    assert_eq!(
-        fa::flash_attn_vec_hybrid_batched_gqa_pick_group(16, 2, 512, 4),
-        2
-    );
+    let kv_g = make_kv(&ctx.device, &GLOBAL, false, 0xBAD1);
+    for g in [2, 4, 8] {
+        let cell = Cell::new(GLOBAL, vec![(0, 10), (1, 20)], g, 5);
+        assert_eq!(nsg_max_of(&cell), 1);
+        assert_illegal(&mut ctx, &cell, &kv_g);
+    }
     assert_eq!(
         fa::flash_attn_vec_hybrid_batched_gqa_pick_group(16, 8, 256, 4),
         2

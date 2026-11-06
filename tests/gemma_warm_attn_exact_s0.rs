@@ -640,7 +640,11 @@ fn pipelines_resolve_on_the_selected_metallib_path() {
     };
     let mut ctx = ctx();
     for dk in [256u32, 512] {
+        // d512 is instantiated at G = 1 only (grouped d512 is illegal).
         for g in fa::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS {
+            if dk == 512 && g != 1 {
+                continue;
+            }
             let name = format!("flash_attn_vec_hybrid_batched_gqa{g}_dk{dk}");
             for (cbits, v16) in [(8, 0), (6, 0), (5, 0), (8, 1)] {
                 let label = ctx
@@ -667,7 +671,8 @@ fn pipelines_resolve_on_the_selected_metallib_path() {
 
 /// T-N8's d512 underflow cell (S0_GLOBAL seeds) in the warm form: global
 /// cache of 4096 + 512 rows, rows at positions 714..=904 (bucket (32, 1)),
-/// every legal group, at a non-power-of-two norm divisor (22.6) and at 3.
+/// G = 1 (the only legal d512 group), at a non-power-of-two norm divisor
+/// (22.6) and at 3.
 /// Non-vacuous: some stock partial lies in (0, 1e-37).
 #[test]
 fn global_d512_underflow_cell_bitwise() {
