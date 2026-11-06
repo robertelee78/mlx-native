@@ -516,6 +516,59 @@ pub fn quantized_matmul_id_ggml_mv_grouped_geglu(
     Ok(())
 }
 
+/// ADR-063 Q4-QWEN36 F2b: forced Q4_K expert mat-vec at the peer's layout
+/// (`kernel_mul_mv_id_q4_K_f32_nr2`: two SIMD groups x two output columns,
+/// eight lanes per super-block, uint16 quant loads).
+///
+/// One threadgroup computes one `(pair, 4-column)` tile from that pair's
+/// expert slice and token row, so each pair's output is bitwise independent
+/// of `n_tokens * top_k` and of the other pairs' ids. Not bitwise equal to
+/// `kernel_mul_mv_id_q4_K_f32` (different lane split and accumulation
+/// order). Out-of-range ids write NaN like the stock kernel. Never chosen by
+/// the default routing; callers that need one kernel at every width opt in.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_q4_k_nr2(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    /// Output columns per threadgroup: 2 SIMD groups x 2 rows.
+    const COLUMNS_PER_THREADGROUP: usize = 4;
+    if params.ggml_type != GgmlType::Q4_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_mv_q4_k_nr2 requires Q4_K, got {:?}",
+            params.ggml_type
+        )));
+    }
+    validate_id_call(input, weight, ids, output, params, params.n)?;
+
+    let pipeline = registry.get_pipeline("kernel_mul_mv_id_q4_K_f32_nr2", device.metal_device())?;
+    let gpu_params = mv_id_gpu_params(params);
+    let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        metal::MTLSize::new(
+            div_ceil(params.n as usize, COLUMNS_PER_THREADGROUP) as u64,
+            total_rows,
+            1,
+        ),
+        metal::MTLSize::new(32, 2, 1),
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quantized_matmul_id_ggml_impl(
     encoder: &mut CommandEncoder,
