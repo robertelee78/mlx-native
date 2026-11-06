@@ -93,6 +93,7 @@ mod rope_freqs;
 pub(crate) use rope_freqs::with_inv_freqs as native57_control_with_inv_freqs;
 pub mod rope_multi;
 pub mod rope_train;
+pub mod row_exact_matvec;
 pub mod row_sum;
 pub mod scale_mask_softmax;
 pub mod sigmoid_mul;
