@@ -21,6 +21,7 @@ mod dense_bf16_calibration;
 mod dense_bf16_contract;
 pub mod dense_gemm;
 pub mod dense_gemv_bf16;
+pub mod dense_matvec_f32_rows;
 pub mod dense_matmul_id;
 pub mod dense_matmul_id_auto;
 pub mod dense_mm_bf16;

@@ -1426,6 +1426,11 @@ impl KernelRegistry {
         sources.insert("dense_matvec_f32".into(), dense_gemm_src);
         // Cooperative F32 mat-vec: 4 SIMD groups reduce 2 output rows together.
         sources.insert("dense_matvec_f32_nsg4_exact_k4096".into(), dense_gemm_src);
+        // Row-exact F32 mat-vec over 1..8 input rows (MoE router, shared gate logit).
+        sources.insert(
+            "dense_matvec_f32_rows".into(),
+            include_str!("shaders/dense_matvec_f32_rows.metal"),
+        );
 
         // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
