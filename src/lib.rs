@@ -196,7 +196,7 @@ pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, Quantiz
 pub use ops::quantized_matmul_ggml::{
     dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
-    quantized_matmul_ggml_column_invariant_mv_ext,
+    quantized_matmul_ggml_column_invariant_mma, quantized_matmul_ggml_column_invariant_mv_ext,
     quantized_matmul_ggml_batched_mm_strided_input,
     quantized_matmul_ggml_batched_mm_strided_input_with_policy,
     quantized_matmul_ggml_batched_mm_with_policy, quantized_matmul_ggml_batched_mv,

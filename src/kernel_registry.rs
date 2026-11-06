@@ -473,6 +473,17 @@ impl KernelRegistry {
             }
         }
 
+        // Few-row MMA mat-vec (the reference implementation's `mul_mv_mma`)
+        // at decode widths 1..=8: 4 types × nt ∈ {1, 2, 4}, rt = 1. Each PSO
+        // is specialized with nsg (function_constant 2300) and the block
+        // kind's compile-time K (function_constant 2304).
+        let mul_mv_mma_src: &'static str = include_str!("shaders/mul_mv_mma.metal");
+        for ty in ["q4_K", "q6_K", "q5_0", "q8_0"] {
+            for nt in [1, 2, 4] {
+                sources.insert(format!("kernel_mul_mv_mma_{ty}_f32_nt{nt}_rt1"), mul_mv_mma_src);
+            }
+        }
+
         // Dense bf16×f32 → f32 tensor-API matmul (non-flash-attention
         // prefill Q@K^T and scores@V; peer-pattern
         // kernel_mul_mm_bf16_f32 on the tensor-API

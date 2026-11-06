@@ -1003,6 +1003,137 @@ pub fn quantized_matmul_ggml_column_invariant_mv_ext(
     )
 }
 
+/// Dense GGUF mat-vec for decode widths `m ∈ 1..=8` on the peer's few-row
+/// MMA technique (`mul_mv_mma`): each threadgroup reads every weight of its
+/// `8·nt` rows once and contracts it against an 8-column input tile with
+/// 8×8 simdgroup matrices, so the weight stream is paid once at any width.
+///
+/// Kinds (the peer's at ≤ 8 columns): Q4_K / Q6_K / Q5_0 use the generic
+/// kernel (64-weight chunks dequantized to f32, f32 MMA accumulation);
+/// Q8_0 uses the 32-weight block kernel (exact-integer half weights, f32
+/// input, `d·Σq·x` per block accumulated with an f32 fma). The simdgroups
+/// split K round-robin and are summed in a fixed simdgroup order.
+///
+/// The pipeline — kind, `nt`, `nsg`, `rt = 1`, function constants — is
+/// chosen from (type, N, K) alone with the peer's tiling rule, so every
+/// width, including `m = 1`, runs the same pipeline. Columns past `m` in
+/// the 8-column tile duplicate the last real column (the peer's clamp) and
+/// are never stored; in each MMA an output column depends only on its own
+/// input column. Each column's result is therefore independent of `m`, of
+/// its batch position, and of the other columns (column-invariant).
+///
+/// Numerics class B: results are NOT bitwise equal to the canonical
+/// [`quantized_matmul_ggml`] routes (different accumulation order); they
+/// are bounded against an f64 reference by `c·K·ε_f32·Σ|w·x|` and are
+/// deterministic run to run. The canonical routes are unchanged.
+///
+/// Admitted types: Q4_K, Q6_K, Q5_0, Q8_0. `K` must be a multiple of the
+/// type's block size and of the kind's K step (64 for the generic kind, 32
+/// for Q8_0's block kind); the input row stride (`4·K` bytes) and the input
+/// buffer offset must be multiples of 16 bytes (vector loads).
+///
+/// # Errors
+///
+/// `MlxError::InvalidArgument` for a non-F32 input/output or non-U8 weight
+/// buffer, `m` outside `1..=8`, zero `n`/`k`, an unadmitted type, a `K` or
+/// input alignment violation, undersized buffers, or an output range
+/// overlapping the input or weight range.
+pub fn quantized_matmul_ggml_column_invariant_mma(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    const OPERATION: &str = "quantized_matmul_ggml_column_invariant_mma";
+    validate_native_quantized_dtypes(OPERATION, input, weight, output)?;
+    validate_signed_metal_dimensions(
+        OPERATION,
+        &[("M", params.m), ("N", params.n), ("K", params.k)],
+    )?;
+    let kind = crate::ops::mul_mv_mma::kind(params.ggml_type).ok_or_else(|| {
+        MlxError::InvalidArgument(format!(
+            "{OPERATION} does not support {:?} (admitted: Q4_K, Q6_K, Q5_0, Q8_0)",
+            params.ggml_type
+        ))
+    })?;
+    if !(1..=MM_ROUTING_THRESHOLD).contains(&params.m) {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: M ({}) must be in 1..={MM_ROUTING_THRESHOLD}",
+            params.m
+        )));
+    }
+    if params.n == 0 || params.k == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: N and K must be > 0"
+        )));
+    }
+    let qk = params.ggml_type.block_values();
+    if params.k % qk != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: K ({}) must be divisible by block QK ({qk})",
+            params.k
+        )));
+    }
+    let k_step = crate::ops::mul_mv_mma::k_step(kind);
+    if params.k % k_step != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: K ({}) must be divisible by {k_step} for {:?}",
+            params.k, params.ggml_type
+        )));
+    }
+    let input_row_stride = u64::from(params.k) * DType::F32.size_of() as u64;
+    if input_row_stride % 16 != 0 || input.byte_offset() % 16 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OPERATION}: input row stride ({input_row_stride} bytes) and offset ({} bytes) \
+             must be multiples of 16",
+            input.byte_offset()
+        )));
+    }
+    let weight_bytes = checked_byte_extent(
+        "weight",
+        &[
+            params.n as usize,
+            (params.k / qk) as usize,
+            params.ggml_type.block_bytes() as usize,
+        ],
+    )?;
+    let input_bytes = checked_byte_extent(
+        "input",
+        &[params.m as usize, params.k as usize, DType::F32.size_of()],
+    )?;
+    let output_bytes = checked_byte_extent(
+        "output",
+        &[params.m as usize, params.n as usize, DType::F32.size_of()],
+    )?;
+    let input_range = validate_required_buffer_range(OPERATION, "input", input, input_bytes)?;
+    let weight_range = validate_required_buffer_range(OPERATION, "weight", weight, weight_bytes)?;
+    let output_range = validate_required_buffer_range(OPERATION, "output", output, output_bytes)?;
+    validate_output_disjoint(
+        OPERATION,
+        output_range,
+        &[("input", input_range), ("weight", weight_range)],
+    )?;
+
+    let mma_params = crate::ops::mul_mv_mma::MulMvMmaParams {
+        m: params.m,
+        n: params.n,
+        k: params.k,
+        ggml_type: params.ggml_type,
+    };
+    crate::ops::mul_mv_mma::mul_mv_mma_dispatch(
+        encoder,
+        registry,
+        device,
+        weight,
+        input,
+        output,
+        &mma_params,
+    )
+}
+
 /// Execute the canonical dense GGUF operation under an explicit routing
 /// policy and return typed evidence for the exact Metal dispatches encoded by
 /// this call. The trace scope is fail-closed and cannot coexist with graph

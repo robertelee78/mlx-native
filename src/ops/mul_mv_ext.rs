@@ -87,7 +87,9 @@ pub(super) struct MulMvExtParams {
 }
 
 /// GPU args struct — must match `hf2q_mul_mv_ext_args` in
-/// `shaders/mul_mv_ext.metal` byte-for-byte.
+/// `shaders/mul_mv_ext.metal` and `hf2q_mul_mv_mma_args` in
+/// `shaders/mul_mv_mma.metal` byte-for-byte (both mirror the reference's
+/// `mul_mv_ext` kernel-args layout).
 ///
 /// The reference C layout puts an int32 triple before u64 fields, then more
 /// int32 + u64, ending with two i16. The Metal-side struct's natural
@@ -96,32 +98,32 @@ pub(super) struct MulMvExtParams {
 /// `bytemuck::Pod` is happy and the byte layout matches the GPU struct.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct MulMvExtGpuArgs {
-    ne00: i32,
-    ne01: i32,
-    ne02: i32,
-    _pad0: u32,
-    nb00: u64,
-    nb01: u64,
-    nb02: u64,
-    nb03: u64,
-    ne10: i32,
-    ne11: i32,
-    ne12: i32,
-    _pad1: u32,
-    nb10: u64,
-    nb11: u64,
-    nb12: u64,
-    nb13: u64,
-    ne0: i32,
-    ne1: i32,
-    r2: i16,
-    r3: i16,
+pub(super) struct MulMvExtGpuArgs {
+    pub(super) ne00: i32,
+    pub(super) ne01: i32,
+    pub(super) ne02: i32,
+    pub(super) _pad0: u32,
+    pub(super) nb00: u64,
+    pub(super) nb01: u64,
+    pub(super) nb02: u64,
+    pub(super) nb03: u64,
+    pub(super) ne10: i32,
+    pub(super) ne11: i32,
+    pub(super) ne12: i32,
+    pub(super) _pad1: u32,
+    pub(super) nb10: u64,
+    pub(super) nb11: u64,
+    pub(super) nb12: u64,
+    pub(super) nb13: u64,
+    pub(super) ne0: i32,
+    pub(super) ne1: i32,
+    pub(super) r2: i16,
+    pub(super) r3: i16,
     // Trailing pad: largest member u64 (align 8) → struct size must be a
     // multiple of 8. Without this, bytemuck::Pod's no-padding contract
     // refuses the type. Match the implicit C tail padding the Metal
     // compiler emits for the MSL struct.
-    _pad2: u32,
+    pub(super) _pad2: u32,
 }
 
 /// Pick `nxpsg` for the legacy multi-codec route.

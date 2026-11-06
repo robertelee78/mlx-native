@@ -16,7 +16,8 @@
 //!
 //! Arms: `stock` = `quantized_matmul_ggml` / `quantized_matmul_id_ggml`
 //! default routing (process environment applies); `mv_ext_ci` =
-//! `quantized_matmul_ggml_column_invariant_mv_ext` (dense and lm head only).
+//! `quantized_matmul_ggml_column_invariant_mv_ext` and `mma_ci` =
+//! `quantized_matmul_ggml_column_invariant_mma` (dense and lm head only).
 //!
 //! Cache modes: `warm` reuses one weight buffer (and fixed ids) for every
 //! dispatch, matching the peer's test-backend-ops perf; `cold` rotates
@@ -37,7 +38,7 @@
 //! arm, cache, median_ns, p10, p90, rotation_buffers, dispatches_per_cb,
 //! iters) and `metadata.json` (git head, dirtiness, metallib environment,
 //! `HF2Q_HOST_LOCK_HOLDER`, device, environment snapshot, cold skips,
-//! pipeline identities of the `mv_ext` kernels).
+//! pipeline identities of the `mv_ext` and `mul_mv_mma` kernels).
 //!
 //! Needs the GPU lane and a quiet host:
 //!
@@ -49,11 +50,23 @@
 use std::io::Write;
 
 use mlx_native::{
-    quantized_matmul_ggml, quantized_matmul_ggml_column_invariant_mv_ext,
-    quantized_matmul_id_ggml, CommandEncoder, DType, GgmlQuantizedMatmulIdParams,
-    GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
+    quantized_matmul_ggml, quantized_matmul_ggml_column_invariant_mma,
+    quantized_matmul_ggml_column_invariant_mv_ext, quantized_matmul_id_ggml, CommandEncoder,
+    DType, GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlType, KernelRegistry,
+    MlxBuffer, MlxDevice,
 };
 use serde_json::{json, Value};
+
+/// A dense mat-vec entry (every dense arm has this signature).
+type DenseEntry = fn(
+    &mut CommandEncoder,
+    &mut KernelRegistry,
+    &MlxDevice,
+    &MlxBuffer,
+    &MlxBuffer,
+    &MlxBuffer,
+    &GgmlQuantizedMatmulParams,
+) -> mlx_native::Result<()>;
 
 const WARMUP: usize = 10;
 const MIN_ITERS: usize = 50;
@@ -189,18 +202,37 @@ fn metadata(device: &MlxDevice, options: &Options) -> Value {
     })
 }
 
-/// Identities of the `mv_ext` r1=4 pipelines the `mv_ext_ci` arm compiled
-/// (labels carry the function constants: nsg 2, nxpsg 8 or 4).
+/// Identities of the pipelines the `mv_ext_ci` arm (`mv_ext` r1=4; labels
+/// carry nsg 2, nxpsg 8 or 4) and the `mma_ci` arm (`mul_mv_mma` rt1;
+/// labels carry nsg and the block kind's K) compiled.
 fn pipeline_identities(registry: &KernelRegistry) -> Value {
     let mut map = serde_json::Map::new();
+    let mut insert = |label: String| {
+        if let Ok(identity) = registry.pipeline_identity(&label) {
+            map.insert(
+                label,
+                serde_json::to_value(identity).expect("pipeline identity serializes"),
+            );
+        }
+    };
     for ty in ["q4_0", "q5_0", "q8_0", "q4_K", "q5_K", "q6_K"] {
         for nxpsg in [8, 4] {
-            let label = format!("kernel_mul_mv_ext_{ty}_f32_r1_4|600:i2|601:i{nxpsg}");
-            if let Ok(identity) = registry.pipeline_identity(&label) {
-                map.insert(
-                    label,
-                    serde_json::to_value(identity).expect("pipeline identity serializes"),
-                );
+            insert(format!("kernel_mul_mv_ext_{ty}_f32_r1_4|600:i2|601:i{nxpsg}"));
+        }
+    }
+    let mut mma_k: Vec<u32> = DENSE.iter().chain([&LM_HEAD]).map(|s| s.k).collect();
+    mma_k.sort_unstable();
+    mma_k.dedup();
+    for ty in ["q4_K", "q6_K", "q5_0", "q8_0"] {
+        for nt in [1, 2, 4] {
+            for nsg in [1, 2, 4, 8, 16, 32] {
+                // Only the block kind (q8_0) specializes K; the others pass 0.
+                let ks: Vec<u32> = if ty == "q8_0" { mma_k.clone() } else { vec![0] };
+                for k in ks {
+                    insert(format!(
+                        "kernel_mul_mv_mma_{ty}_f32_nt{nt}_rt1|2300:i{nsg}|2304:i{k}"
+                    ));
+                }
             }
         }
     }
@@ -450,7 +482,7 @@ fn run_dense_shape(
             (Cache::Cold, Err(_)) => continue,
         };
         let weights = weight_buffers(device, &pattern, rotation);
-        for arm in ["stock", "mv_ext_ci"] {
+        for arm in ["stock", "mv_ext_ci", "mma_ci"] {
             for width in 1..=8u32 {
                 let params = GgmlQuantizedMatmulParams {
                     m: width,
@@ -460,16 +492,13 @@ fn run_dense_shape(
                 };
                 let stats = time_gpu(device, options.iters, |encoder, dispatch| {
                     let weight = &weights[dispatch % rotation];
-                    let result = if arm == "stock" {
-                        quantized_matmul_ggml(
-                            encoder, registry, device, &input, weight, &output, &params,
-                        )
-                    } else {
-                        quantized_matmul_ggml_column_invariant_mv_ext(
-                            encoder, registry, device, &input, weight, &output, &params,
-                        )
+                    let entry: DenseEntry = match arm {
+                        "stock" => quantized_matmul_ggml,
+                        "mv_ext_ci" => quantized_matmul_ggml_column_invariant_mv_ext,
+                        _ => quantized_matmul_ggml_column_invariant_mma,
                     };
-                    result.unwrap_or_else(|e| panic!("{arm} {shape_tag} m={width}: {e}"));
+                    entry(encoder, registry, device, &input, weight, &output, &params)
+                        .unwrap_or_else(|e| panic!("{arm} {shape_tag} m={width}: {e}"));
                 });
                 sink.emit(
                     json!({
