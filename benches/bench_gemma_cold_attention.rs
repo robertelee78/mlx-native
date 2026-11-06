@@ -637,8 +637,17 @@ fn main() {
     flash_attn_prefill_mask::register(&mut reg);
     flash_attn_prefill_blk::register(&mut reg);
 
-    let mut cells = Vec::new();
+    // Untimed warm-up pass over the smallest cell of each kind: the first
+    // measured cell otherwise carries first-use cost (measured ~450 us extra
+    // on the first sliding cell, whichever row count came first).
     let mut seed = 0xC01D_u64;
+    let warm_rows = rows.iter().copied().min().unwrap_or(256);
+    for kind in [Kind::Sliding, Kind::Global] {
+        let c = cell(&dev, &mut reg, kind, warm_rows, seed ^ 0xFFFF);
+        let _ = run_cell(&dev, &mut reg, &c);
+    }
+
+    let mut cells = Vec::new();
     for &r in &rows {
         for kind in [Kind::Sliding, Kind::Global] {
             seed += 1;
