@@ -89,6 +89,10 @@ jobs:
           --skip n5_half_tile_skip_against_the_32_row_body
           --skip n6_capacity_bound_and_schedule_contents
           --skip n9_scratch_constructors_serve_every_entry_point
+      - name: Tensor flash attention (recorded skip visible on hosted runners)
+        env:
+          MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR: "1"
+        run: cargo +1.96.0 test --locked --test test_flash_attn_prefill_tensor -- --test-threads=1 --nocapture
       - name: Package
         shell: bash
         run: |
