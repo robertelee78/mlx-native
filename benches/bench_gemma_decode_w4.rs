@@ -572,7 +572,15 @@ impl Bench {
             let (hd, nkv) = (shape.head_dim as usize, shape.num_kv_heads as usize);
             let npp = if hd == 512 { 2 } else { 1 };
             let rows = ATTN_SLOTS * nkv * cap as usize;
-            let caches: Vec<KvCache> = (0..LAYERS)
+            // `GEMMA_W4_KV_CACHES=N` (default LAYERS = 30): distinct KV caches
+            // cycled; 1 keeps one cache hot (the peer's perf mode reuses its
+            // tensors), for the cache-temperature comparison.
+            let n_caches = std::env::var("GEMMA_W4_KV_CACHES")
+                .ok()
+                .map(|v| v.parse::<usize>().expect("GEMMA_W4_KV_CACHES=<positive integer>"))
+                .unwrap_or(LAYERS)
+                .max(1);
+            let caches: Vec<KvCache> = (0..n_caches)
                 .map(|_| {
                     let mut k = self.device.alloc_buffer(rows * hd * 2, DType::F16, vec![rows * hd]).expect("k");
                     random_bytes(&mut k, &mut rng, true);
