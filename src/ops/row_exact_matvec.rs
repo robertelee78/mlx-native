@@ -118,7 +118,8 @@ pub struct RowExactMatvecShape {
     pub n: u32,
     /// Inner dimension.
     pub k: u32,
-    /// Independent products on grid z (>= 1).
+    /// Independent products (>= 1), dispatched batch-major along grid x
+    /// (all threadgroups of batch `b` before those of batch `b + 1`).
     pub batch: u32,
     /// Elements between input rows (multiple of 4).
     pub x_row_stride: u32,
@@ -304,10 +305,26 @@ fn validate(
             y.byte_offset()
         )));
     }
-    if s.m > 1 && s.x_row_stride < s.k {
+    // Output elements must not alias: rows of one product and the products of
+    // one dispatch write disjoint ranges (either layout order is accepted).
+    let rows_disjoint = s.m == 1 || s.y_row_stride >= s.n;
+    let outputs_disjoint = if s.batch == 1 {
+        rows_disjoint
+    } else if s.m == 1 {
+        s.y_batch_stride >= s.n
+    } else if s.y_row_stride >= s.y_batch_stride {
+        s.y_batch_stride >= s.n
+            && u64::from(s.y_row_stride)
+                >= u64::from(s.batch - 1) * u64::from(s.y_batch_stride) + u64::from(s.n)
+    } else {
+        rows_disjoint
+            && u64::from(s.y_batch_stride)
+                >= u64::from(s.m - 1) * u64::from(s.y_row_stride) + u64::from(s.n)
+    };
+    if !outputs_disjoint {
         return Err(invalid(format!(
-            "x_row_stride ({}) is shorter than k ({})",
-            s.x_row_stride, s.k
+            "output strides overlap: y_row_stride {}, y_batch_stride {}, m {}, n {}, batch {}",
+            s.y_row_stride, s.y_batch_stride, s.m, s.n, s.batch
         )));
     }
     let row_bytes = weight_type.row_bytes(s.k);

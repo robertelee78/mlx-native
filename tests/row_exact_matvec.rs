@@ -535,4 +535,15 @@ fn row_exact_matvec_rejects_bad_arguments() {
         RowExactMatvecShape::contiguous(1, 8, 64)
     )
     .is_err());
+    // Overlapping output rows (y_row_stride < n with m > 1) and colliding
+    // batches are refused; overlapping input reads are allowed.
+    let mut rows_overlap = RowExactMatvecShape::contiguous(2, 8, 64);
+    rows_overlap.y_row_stride = 4;
+    assert!(attempt(RowExactWeight::F16, &w, &x, rows_overlap).is_err());
+    let mut batches_overlap = RowExactMatvecShape::grouped_token_major(2, 2, 4, 32);
+    batches_overlap.y_batch_stride = 2;
+    assert!(attempt(RowExactWeight::F16, &w, &x, batches_overlap).is_err());
+    let mut shared_input = RowExactMatvecShape::contiguous(2, 8, 64);
+    shared_input.x_row_stride = 0;
+    assert!(attempt(RowExactWeight::F16, &w, &x, shared_input).is_ok());
 }
