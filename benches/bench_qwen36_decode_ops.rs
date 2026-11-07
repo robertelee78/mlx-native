@@ -119,6 +119,16 @@ const KV_TOTAL: u32 = N_KV_HEADS * HEAD_DIM; // 512
 const TQ_CODEBOOK_BITS: u32 = 8;
 const GQA_Q2_MIN_KV_SEQ_LEN: u32 = 8_192;
 const KV_LENS: [u32; 3] = [2048, 8192, 16384];
+
+/// Attention KV lengths: `QWEN36_BENCH_KV_LENS=a,b,..` overrides [`KV_LENS`].
+fn kv_lens() -> Vec<u32> {
+    std::env::var("QWEN36_BENCH_KV_LENS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect::<Vec<u32>>())
+        .filter(|lens| !lens.is_empty())
+        .unwrap_or_else(|| KV_LENS.to_vec())
+}
+
 // MoE
 const N_EXPERTS: u32 = 256;
 const TOP_K: u32 = 8;
@@ -545,7 +555,7 @@ fn catalogue() -> Vec<Case> {
         (Op::TqEncode, false),
         (Op::FwhtPremult, false),
     ];
-    for kv in KV_LENS {
+    for kv in kv_lens() {
         ops.push((Op::TqSdpa { kv }, true));
         ops.push((Op::TqSdpaRows { kv, route: AttnRoute::Rows }, true));
         ops.push((Op::TqSdpaRows { kv, route: AttnRoute::Batched }, true));
@@ -574,7 +584,7 @@ fn catalogue() -> Vec<Case> {
         Op::LayerGdn { qkv: GgmlType::Q6_K },
         Op::LayerGdn { qkv: GgmlType::Q4_K },
     ];
-    for kv in KV_LENS {
+    for kv in kv_lens() {
         seq.push(Op::LayerAttn { v: GgmlType::Q6_K, kv });
         seq.push(Op::LayerAttn { v: GgmlType::Q4_K, kv });
         for route in [AttnRoute::Rows, AttnRoute::Batched] {

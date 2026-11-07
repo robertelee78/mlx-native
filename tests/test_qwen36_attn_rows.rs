@@ -291,7 +291,7 @@ fn per_row_reference(ctx: &mut Ctx, row: &RowInput, cache: &Cache) -> Vec<u32> {
 
 /// The row-batched chain over `rows` (in this order). Returns each row's
 /// gated output; the rows' K/V land in `cache`.
-fn rows_chain(ctx: &mut Ctx, rows: &[&RowInput], cache: &Cache) -> Vec<Vec<u32>> {
+fn rows_chain(ctx: &mut Ctx, rows: &[&RowInput], cache: &Cache, all_gqa: bool) -> Vec<Vec<u32>> {
     let device = &ctx.device;
     let w = rows.len();
     let pack = |field: fn(&RowInput) -> &[f32]| -> MlxBuffer {
@@ -328,7 +328,7 @@ fn rows_chain(ctx: &mut Ctx, rows: &[&RowInput], cache: &Cache) -> Vec<Vec<u32>>
             output: out,
             tmp,
             params: r.params(),
-            kernel: r.kernel(),
+            kernel: if all_gqa { TqHbRowKernel::Gqa(GqaTile::Q2) } else { r.kernel() },
         })
         .collect();
 
@@ -413,19 +413,24 @@ fn qwen36_attn_rows_match_per_row_chain_at_every_width_and_order() {
         &[3, 2, 1, 0],
         &[1, 3, 0, 2],
     ];
-    for cohort in cohorts {
-        let cache = Cache::new(&ctx.device, &init);
-        let rows: Vec<&RowInput> = cohort.iter().map(|&i| &inputs[i]).collect();
-        let got = rows_chain(&mut ctx, &rows, &cache);
-        for (pos, &i) in cohort.iter().enumerate() {
-            assert_bits(
-                &format!("cohort {cohort:?} row {i} (kv {})", inputs[i].kv_len()),
-                &expected[i],
-                &got[pos],
-            );
-        }
-        if cohort.len() == inputs.len() {
-            assert!(cache.snapshot() == expected_cache, "cohort {cohort:?}: cache bytes differ");
+    // Every cohort twice: each row on the per-row chain's kernel, and every
+    // row on the GQA-Q2 kernel (a caller may pick the kernel by width; the
+    // per-row reference stays scalar below kv 8192).
+    for all_gqa in [false, true] {
+        for cohort in cohorts {
+            let cache = Cache::new(&ctx.device, &init);
+            let rows: Vec<&RowInput> = cohort.iter().map(|&i| &inputs[i]).collect();
+            let got = rows_chain(&mut ctx, &rows, &cache, all_gqa);
+            for (pos, &i) in cohort.iter().enumerate() {
+                assert_bits(
+                    &format!("cohort {cohort:?} all_gqa {all_gqa} row {i} (kv {})", inputs[i].kv_len()),
+                    &expected[i],
+                    &got[pos],
+                );
+            }
+            if cohort.len() == inputs.len() {
+                assert!(cache.snapshot() == expected_cache, "cohort {cohort:?}: cache bytes differ");
+            }
         }
     }
 }
