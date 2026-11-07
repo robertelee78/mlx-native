@@ -1470,6 +1470,14 @@ impl KernelRegistry {
             );
         }
 
+        // Row-exact few-row mat-vec in the stock one-row order (F16 / Q8_0).
+        for name in crate::ops::row_exact_matvec_stock::row_exact_matvec_stock_kernel_names() {
+            sources.insert(
+                name.into(),
+                crate::ops::row_exact_matvec_stock::ROW_EXACT_MATVEC_STOCK_SHADER_SOURCE,
+            );
+        }
+
         // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
         sources.insert("fwht_standalone_f32_d256".into(), fwht_src);
