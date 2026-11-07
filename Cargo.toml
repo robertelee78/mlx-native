@@ -187,3 +187,7 @@ harness = false
 [[bench]]
 name = "bench_row_exact_matvec_stock"
 harness = false
+
+[[bench]]
+name = "bench_gdn_decode_addressing"
+harness = false

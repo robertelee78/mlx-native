@@ -307,6 +307,7 @@ pub(crate) fn expert_routing_policy_from_environment() -> GgmlRoutingPolicy {
         } else {
             GgmlTensorMmPreference::AutoProbe
         },
+        q5_0_tensor_mm: std::env::var("HF2Q_Q5_0_TENSOR_MM").as_deref() == Ok("1"),
         expert_mm_schedule: mm_id_schedule_from_environment(),
         ..GgmlRoutingPolicy::default()
     }
@@ -3231,8 +3232,11 @@ fn dispatch_id_mm_with_layout(
     // ADR-011 Phase 3 Wave P3b-tensor — prefer the tensor_ops::matmul2d
     // mm_id variant on M3+. The device-bound registry caches the exact
     // pipeline result after the first dispatch.
-    let use_tensor = tensor_mm_auto_selected(params.ggml_type, routing.expert_tensor_mm)
-        && probe_tensor_mm_id(registry, device)?;
+    let use_tensor = tensor_mm_auto_selected(
+        params.ggml_type,
+        routing.expert_tensor_mm,
+        routing.q5_0_tensor_mm,
+    ) && probe_tensor_mm_id(registry, device)?;
     // Fall through to the simdgroup variant when the per-type tensor
     // kernel isn't shipped — e.g. IQ4_XS (ADR-033 §Pi Task #20 shipped
     // the simdgroup variant only; tensor-API variant deferred as a

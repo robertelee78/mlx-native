@@ -43,6 +43,30 @@
 //! `NSG = D_k / 32`. Currently supports `NSG ∈ {1, 2, 4}` covering
 //! `D_k ∈ {32, 64, 128}` — the production Qwen3.5/3.6 head dim is 128 → NSG=4.
 //! `D_k` MUST be a multiple of 32 and `<= 128`.
+//!
+//! # Addressing and kernel choice
+//!
+//! Two addressing schemes with bit-identical output and state:
+//!
+//! * `gated_delta_net_decode_seq_f32_<NSG>` advances per-lane
+//!   q/k/v/g/beta/output pointers once per token and takes D_k = 32·NSG as
+//!   a compile-time constant. [`dispatch_gated_delta_net_decode`] uses it
+//!   when `n_tokens >= SEQ_KERNEL_MIN_TOKENS` (prefill token loops and
+//!   multi-token windows), where it measured 1166 → 779 µs warm at n_tokens 512.
+//! * `gated_delta_net_decode_f32_<NSG>` rebuilds wrapping `uint` indexes
+//!   every token. [`dispatch_gated_delta_net_decode`] uses it at
+//!   `n_tokens == 1`, where the pointer kernel measured slower
+//!   (28.4 → 31.8 µs warm for 4 rows).
+//!
+//! Loads, floating-point operations and their order are the same in both,
+//! so the choice never changes results.
+//! [`dispatch_gated_delta_net_decode_legacy`] (the index kernel under the
+//! `gated_delta_net_decode_legacy_f32_<NSG>` names) and
+//! [`dispatch_gated_delta_net_decode_seq`] (the pointer kernel at any
+//! n_tokens) are the references for
+//! `tests/gated_delta_net_decode_addressing.rs` and
+//! `benches/bench_gdn_decode_addressing.rs`. The capture variant
+//! (`gated_delta_net_decode_capture.metal`) uses the index-rebuild loop.
 
 use metal::MTLSize;
 
@@ -81,6 +105,11 @@ pub fn register(registry: &mut KernelRegistry) {
         "gated_delta_net_decode_f32_4",
         GATED_DELTA_NET_DECODE_SHADER_SOURCE,
     );
+    // Pointer-addressing kernels (n_tokens >= 2) and the legacy-named
+    // index-rebuild references (test and bench use only). Same source file.
+    for name in SEQ_KERNEL_NAMES.into_iter().chain(LEGACY_KERNEL_NAMES) {
+        registry.register_source(name, GATED_DELTA_NET_DECODE_SHADER_SOURCE);
+    }
     // ADR-034 task #90 — per-position state-capture variants. Same
     // math + threading as decode_f32_<NSG>; ALSO writes
     // state_capture[D_k, D_v, n_v_heads, n_tokens, n_seqs] after each
@@ -223,6 +252,11 @@ fn validate_params_buf(params_buf: &MlxBuffer) -> Result<()> {
 /// Equivalent math to [`super::gated_delta_net::dispatch_gated_delta_net`];
 /// uses `simd_sum` reductions instead of threadgroup_barrier+shared memory.
 /// Threadgroup `(32, NSG, 1)`; grid `(D_v / NSG, n_v_heads, n_seqs)`.
+///
+/// Selects the pointer-addressing kernel
+/// (`gated_delta_net_decode_seq_f32_<NSG>`) when
+/// `n_tokens >= SEQ_KERNEL_MIN_TOKENS`, else the index-rebuild kernel
+/// (`gated_delta_net_decode_f32_<NSG>`); both give bit-identical results.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_gated_delta_net_decode(
     encoder: &mut CommandEncoder,
@@ -239,14 +273,156 @@ pub fn dispatch_gated_delta_net_decode(
     params_buf: &MlxBuffer,
     p: GatedDeltaNetParams,
 ) -> Result<()> {
+    encode_decode(
+        encoder,
+        registry,
+        device,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_in,
+        output,
+        state_out,
+        params_buf,
+        p,
+        if p.n_tokens >= SEQ_KERNEL_MIN_TOKENS {
+            SEQ_KERNEL_NAMES
+        } else {
+            KERNEL_NAMES
+        },
+    )
+}
+
+const KERNEL_NAMES: [&str; 3] = [
+    "gated_delta_net_decode_f32_1",
+    "gated_delta_net_decode_f32_2",
+    "gated_delta_net_decode_f32_4",
+];
+
+/// Smallest `n_tokens` for which [`dispatch_gated_delta_net_decode`] uses
+/// the pointer-addressing kernel.
+pub const SEQ_KERNEL_MIN_TOKENS: u32 = 2;
+
+const SEQ_KERNEL_NAMES: [&str; 3] = [
+    "gated_delta_net_decode_seq_f32_1",
+    "gated_delta_net_decode_seq_f32_2",
+    "gated_delta_net_decode_seq_f32_4",
+];
+
+const LEGACY_KERNEL_NAMES: [&str; 3] = [
+    "gated_delta_net_decode_legacy_f32_1",
+    "gated_delta_net_decode_legacy_f32_2",
+    "gated_delta_net_decode_legacy_f32_4",
+];
+
+/// Reference dispatch of the index-rebuild decode kernel under its
+/// legacy names (`gated_delta_net_decode_legacy_f32_<NSG>`; same code as
+/// `gated_delta_net_decode_f32_<NSG>`) at any n_tokens. Same contract,
+/// geometry and arithmetic as [`dispatch_gated_delta_net_decode`], whose
+/// output and state it must match bit for bit. Test and bench use only.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gated_delta_net_decode_legacy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    g: &MlxBuffer,
+    beta: &MlxBuffer,
+    state_in: &MlxBuffer,
+    output: &MlxBuffer,
+    state_out: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    p: GatedDeltaNetParams,
+) -> Result<()> {
+    encode_decode(
+        encoder,
+        registry,
+        device,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_in,
+        output,
+        state_out,
+        params_buf,
+        p,
+        LEGACY_KERNEL_NAMES,
+    )
+}
+
+/// Dispatch of the pointer-addressing kernel
+/// (`gated_delta_net_decode_seq_f32_<NSG>`) at any n_tokens, including 1
+/// where [`dispatch_gated_delta_net_decode`] does not select it. Test and
+/// bench use only.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gated_delta_net_decode_seq(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    g: &MlxBuffer,
+    beta: &MlxBuffer,
+    state_in: &MlxBuffer,
+    output: &MlxBuffer,
+    state_out: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    p: GatedDeltaNetParams,
+) -> Result<()> {
+    encode_decode(
+        encoder,
+        registry,
+        device,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_in,
+        output,
+        state_out,
+        params_buf,
+        p,
+        SEQ_KERNEL_NAMES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_decode(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    g: &MlxBuffer,
+    beta: &MlxBuffer,
+    state_in: &MlxBuffer,
+    output: &MlxBuffer,
+    state_out: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    p: GatedDeltaNetParams,
+    names: [&'static str; 3],
+) -> Result<()> {
     validate(&p, q, k, v, g, beta, state_in, output, state_out)?;
     validate_params_buf(params_buf)?;
 
+    // `validate` guarantees D_k % 32 == 0; the kernel derives D_k = 32 * NSG
+    // at compile time, so NSG must be exactly D_k / 32.
     let nsg: u32 = p.d_k / 32;
     let kernel_name = match nsg {
-        1 => "gated_delta_net_decode_f32_1",
-        2 => "gated_delta_net_decode_f32_2",
-        4 => "gated_delta_net_decode_f32_4",
+        1 => names[0],
+        2 => names[1],
+        4 => names[2],
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "gated_delta_net_decode: unsupported NSG={} (D_k={})",
