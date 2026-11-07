@@ -23,7 +23,9 @@
 //!   match the 32-row body, and the partial-tile result is recorded per type
 //!   and path.
 //! * N6 — capacity: the `max_tiles` bound is attained and the device
-//!   schedule equals a host-built one; undersized scratch fails; the
+//!   schedule equals a host-built one (1 to 4101 tokens, 32 to 1024
+//!   experts; padding slots stay unwritten); invalid ids in a later token
+//!   round poison the whole schedule; undersized scratch fails; the
 //!   `alloc` constructor serves the compact schedule.
 //! * N7 — row independence (inside N1).
 //! * N9 — scratch compatibility and accessor contracts.
@@ -1461,15 +1463,30 @@ fn n6_capacity_bound_and_schedule_contents() {
         table.extend(1..32);
         tables.push((format!("full tiles + partial, k={k}"), table, 1, 32, true));
     }
+    // Contents across the launch geometry of the token-parallel map0c: one
+    // or several rounds of up to 1024 tokens, and expert counts whose
+    // prefix scan takes one or several threadgroup-wide chunks.
     for routing in ROUTINGS {
         for top_k in [1u32, 6, 8] {
-            tables.push((
-                format!("{routing:?} top_k={top_k}"),
-                route_table(routing, 355, top_k, n_experts, 99),
-                top_k,
-                n_experts,
-                false,
-            ));
+            for (n_tokens, experts) in [
+                (1, n_experts),
+                (355, n_experts),
+                (1025, n_experts),
+                (1832, n_experts),
+                (4101, n_experts),
+                (355, 32),
+                (1832, 256),
+                (1832, 512),
+                (1832, 1024),
+            ] {
+                tables.push((
+                    format!("{routing:?} top_k={top_k} n_tokens={n_tokens} n_experts={experts}"),
+                    route_table(routing, n_tokens, top_k, experts, 99),
+                    top_k,
+                    experts,
+                    false,
+                ));
+            }
         }
     }
     for (label, table, top_k, n_experts, attained) in tables {
@@ -1537,15 +1554,76 @@ fn n6_capacity_bound_and_schedule_contents() {
             "N6 {label}: descriptor words past tile_count were written"
         );
         let device_list = &hids.as_slice::<u32>().expect("hids")[..list.len()];
-        // Every real entry must match; the per-expert padding slot may hold
-        // map0c's dummy store (branch-free pass 2) and is never read.
+        // Every real entry must match; the per-expert padding slot is never
+        // written (nor read).
         let first_bad = list
             .iter()
             .zip(device_list)
-            .position(|(want, got)| *want != u32::MAX && want != got);
+            .position(|(want, got)| want != got);
         assert!(
             first_bad.is_none(),
             "N6 {label}: compact list (R2 order) differs at entry {first_bad:?}"
+        );
+    }
+
+    // Invalid routing in a later token round poisons the whole schedule:
+    // word 0 only, no descriptor and no list entry is written.
+    for case in ["out_of_range", "duplicate"] {
+        let (n_tokens, top_k, bad_token) = (1832u32, 8u32, 1500usize);
+        let mut table = route_table(Routing::Uniform, n_tokens, top_k, n_experts, 5);
+        let row = bad_token * top_k as usize;
+        table[row + 3] = if case == "out_of_range" {
+            n_experts
+        } else {
+            table[row]
+        };
+        let ids = u32_buffer(&gpu.device, &table);
+        let dispatch = GgmlIdMmDispatchParams {
+            n_tokens,
+            top_k,
+            n: shape.n,
+            k: shape.k,
+            n_experts,
+            expert_stride: expert_stride(shape, GgmlType::Q8_0),
+            ggml_type: GgmlType::Q8_0,
+        };
+        let mut scratch = IdMmScratch::alloc(&gpu.device, n_experts, n_tokens).expect("scratch");
+        scratch
+            .htpe_mut()
+            .as_mut_slice::<u32>()
+            .expect("htpe")
+            .fill(GUARD);
+        scratch
+            .hids_mut()
+            .as_mut_slice::<u32>()
+            .expect("hids")
+            .fill(u32::MAX);
+        let (htpe, hids) = scratch.buffers_mut();
+        gpu.run(|encoder, registry, device| {
+            dispatch_id_mm_map0_for_test(
+                encoder,
+                registry,
+                device,
+                &ids,
+                &mut *htpe,
+                &mut *hids,
+                &dispatch,
+                ExpertMmSchedule::CompactTiles,
+            )
+            .expect("map0c");
+        });
+        let words = htpe.as_slice::<u32>().expect("htpe");
+        assert_eq!(words[0], 0x8000_0000, "N6 late {case}: word 0 not POISON");
+        assert!(
+            words[1..].iter().all(|w| *w == GUARD),
+            "N6 late {case}: a poisoned schedule wrote descriptors"
+        );
+        assert!(
+            hids.as_slice::<u32>()
+                .expect("hids")
+                .iter()
+                .all(|w| *w == u32::MAX),
+            "N6 late {case}: a poisoned schedule wrote list entries"
         );
     }
 
