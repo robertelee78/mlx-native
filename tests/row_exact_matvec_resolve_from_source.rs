@@ -42,5 +42,6 @@ fn row_exact_matvec_kernels_resolve_from_source() {
         );
         count += 1;
     }
-    assert_eq!(count, 32);
+    // F16 / Q8_0: nr0 1, 2; Q4_K / Q6_K / Q5_0: nr0 1, 2, 4; m = 1..=8 each.
+    assert_eq!(count, 2 * 2 * 8 + 3 * 3 * 8);
 }

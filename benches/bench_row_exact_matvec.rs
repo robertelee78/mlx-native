@@ -31,7 +31,7 @@ use std::io::Write;
 
 use mlx_native::ops::dense_gemm::{dispatch_dense_matvec_f16w_f32io, DenseGemmF16Params};
 use mlx_native::ops::row_exact_matvec::{
-    dispatch_row_exact_matvec, dispatch_row_exact_matvec_scheduled, row_exact_reduction_nsg,
+    dispatch_row_exact_matvec, dispatch_row_exact_matvec_scheduled, row_exact_matvec_nsg_limit,
     RowExactMatvecSchedule, RowExactMatvecShape, RowExactWeight,
 };
 use mlx_native::{
@@ -112,6 +112,10 @@ fn weight(device: &MlxDevice, ty: RowExactWeight, rows: usize, k: usize, seed: u
             }
             buffer
         }
+        // The gemma decode op-parity bench covers the block-quant types.
+        other => {
+            panic!("bench_row_exact_matvec generates F16 and Q8_0 weights only, not {other:?}")
+        }
     }
 }
 
@@ -158,6 +162,31 @@ struct Bench {
 impl Bench {
     fn wants(&self, family: &str) -> bool {
         self.families.iter().any(|f| f == family)
+    }
+
+    /// The schedule `dispatch_row_exact_matvec` launches on this device.
+    fn device_schedule(
+        &mut self,
+        ty: RowExactWeight,
+        shape: &RowExactMatvecShape,
+    ) -> RowExactMatvecSchedule {
+        RowExactMatvecSchedule::for_device(
+            &mut self.registry,
+            self.device.metal_device(),
+            ty,
+            shape,
+        )
+        .expect("device schedule")
+    }
+
+    /// Sweep schedules this device's `ty` pipelines can launch.
+    fn launchable_sweep(&mut self, ty: RowExactWeight, k: usize) -> Vec<RowExactMatvecSchedule> {
+        let limit = row_exact_matvec_nsg_limit(&mut self.registry, self.device.metal_device(), ty)
+            .expect("nsg limit");
+        sweep_schedules(k)
+            .into_iter()
+            .filter(|s| s.nsg <= limit)
+            .collect()
     }
 
     /// GPU microseconds per dispatch: (median, p10, p90).
@@ -295,7 +324,7 @@ impl Bench {
                         .expect("f16 matvec");
                     }
                 }
-                RowExactWeight::Q8_0 => quantized_matmul_ggml(
+                quantized => quantized_matmul_ggml(
                     enc,
                     reg,
                     &device,
@@ -306,10 +335,16 @@ impl Bench {
                         m: m as u32,
                         n: n as u32,
                         k: k as u32,
-                        ggml_type: GgmlType::Q8_0,
+                        ggml_type: match quantized {
+                            RowExactWeight::Q8_0 => GgmlType::Q8_0,
+                            RowExactWeight::Q4_K => GgmlType::Q4_K,
+                            RowExactWeight::Q6_K => GgmlType::Q6_K,
+                            RowExactWeight::Q5_0 => GgmlType::Q5_0,
+                            RowExactWeight::F16 => unreachable!("handled above"),
+                        },
                     },
                 )
-                .expect("q8_0 matmul"),
+                .expect("quantized matmul"),
             }
         })
     }
@@ -318,10 +353,12 @@ impl Bench {
         let tag = match ty {
             RowExactWeight::F16 => "f16",
             RowExactWeight::Q8_0 => "q8_0",
+            RowExactWeight::Q4_K => "q4_K",
+            RowExactWeight::Q6_K => "q6_K",
+            RowExactWeight::Q5_0 => "q5_0",
         };
         for &(op, n, k) in shapes {
             let bytes = ty.row_bytes(k as u32) as usize * n;
-            let nsg = row_exact_reduction_nsg(ty, n as u32, k as u32);
             let warm_modes: &[bool] = if bytes > COLD_BYTES {
                 &[false]
             } else {
@@ -343,13 +380,13 @@ impl Bench {
                         if m != 1 && m != 4 {
                             continue;
                         }
-                        for s in sweep_schedules(k) {
+                        for s in self.launchable_sweep(ty, k) {
                             let t = self.time_row_exact(ty, &weights, &x, &y, shape, Some(s));
                             self.sweep_cell(tag, op, n, k, 1, m, warm, s, t);
                         }
                         continue;
                     }
-                    let auto = RowExactMatvecSchedule::auto(ty, &shape);
+                    let auto = self.device_schedule(ty, &shape);
                     let t = self.time_row_exact(ty, &weights, &x, &y, shape, None);
                     let us = t.median;
                     let base = if self.wants("baseline") {
@@ -365,7 +402,7 @@ impl Bench {
                         base.map_or("-".into(), |b| format!("{:8.2} us", b.median)),
                     );
                     self.cell(serde_json::json!({"family": tag, "op": op, "n": n, "k": k, "m": m, "warm": warm,
-                        "copies": copies, "weight_bytes": bytes, "nsg": nsg, "nr0": auto.nr0, "row_exact_us": us,
+                        "copies": copies, "weight_bytes": bytes, "nsg": auto.nsg, "nr0": auto.nr0, "row_exact_us": us,
                         "row_exact_p10_us": t.p10, "row_exact_p90_us": t.p90,
                         "baseline_us": base.map(|b| b.median), "baseline_p10_us": base.map(|b| b.p10),
                         "baseline_p90_us": base.map(|b| b.p90), "gbps": bytes as f64 / us / 1e3}));
@@ -404,7 +441,7 @@ impl Bench {
                     if m != 1 && m != 4 {
                         continue;
                     }
-                    for s in sweep_schedules(gw) {
+                    for s in self.launchable_sweep(ty, gw) {
                         let t = self.time_row_exact(ty, &weights, &x, &y, shape, Some(s));
                         self.sweep_cell(
                             "q8_0",
@@ -420,7 +457,7 @@ impl Bench {
                     }
                     continue;
                 }
-                let auto = RowExactMatvecSchedule::auto(ty, &shape);
+                let auto = self.device_schedule(ty, &shape);
                 let t = self.time_row_exact(ty, &weights, &x, &y, shape, None);
                 let base = if self.wants("baseline") {
                     let device = self.device.clone();

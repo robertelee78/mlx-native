@@ -1,5 +1,6 @@
-//! Row-exact few-row mat-vec: F16 or Q8_0 weights × F32 input → F32 output,
-//! `y[j, :] = W · x[j, :]` for `1 <= m <= 8` input rows in one dispatch.
+//! Row-exact few-row mat-vec: F16, Q8_0, Q4_K, Q6_K or Q5_0 weights × F32
+//! input → F32 output, `y[j, :] = W · x[j, :]` for `1 <= m <= 8` input rows
+//! in one dispatch.
 //!
 //! Wraps `shaders/row_exact_matvec.metal`. One dispatch reads every weight
 //! row once for all `m` input rows (the peer's few-row `mul_mv_ext` idea) and
@@ -41,6 +42,11 @@ pub const ROW_EXACT_MATVEC_MAX_ROWS: u32 = 8;
 
 const Q8_0_BLOCK_VALUES: u32 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
+const QK_K_BLOCK_VALUES: u32 = 256;
+const Q4_K_BLOCK_BYTES: u64 = 144;
+const Q6_K_BLOCK_BYTES: u64 = 210;
+const Q5_0_BLOCK_VALUES: u32 = 32;
+const Q5_0_BLOCK_BYTES: u64 = 22;
 
 macro_rules! row_exact_names {
     ($ty:literal, $r:literal) => {
@@ -57,15 +63,57 @@ macro_rules! row_exact_names {
     };
 }
 
-/// Kernel names indexed `[weight][nr0 - 1][m - 1]`.
+/// Kernel names indexed `[weight][nr0 - 1][m - 1]` (F16, Q8_0).
 const KERNEL_NAMES: [[[&str; 8]; 2]; 2] = [
     [row_exact_names!("f16", "1"), row_exact_names!("f16", "2")],
     [row_exact_names!("q8_0", "1"), row_exact_names!("q8_0", "2")],
 ];
 
+/// Block-quant kernel names indexed `[weight - 2][log2(nr0)][m - 1]`
+/// (Q4_K, Q6_K, Q5_0; nr0 1, 2, 4).
+const BLOCK_KERNEL_NAMES: [[[&str; 8]; 3]; 3] = [
+    [
+        row_exact_names!("q4_K", "1"),
+        row_exact_names!("q4_K", "2"),
+        row_exact_names!("q4_K", "4"),
+    ],
+    [
+        row_exact_names!("q6_K", "1"),
+        row_exact_names!("q6_K", "2"),
+        row_exact_names!("q6_K", "4"),
+    ],
+    [
+        row_exact_names!("q5_0", "1"),
+        row_exact_names!("q5_0", "2"),
+        row_exact_names!("q5_0", "4"),
+    ],
+];
+
 /// Every kernel function name in `row_exact_matvec.metal`.
 pub fn row_exact_matvec_kernel_names() -> impl Iterator<Item = &'static str> {
-    KERNEL_NAMES.iter().flatten().flatten().copied()
+    KERNEL_NAMES
+        .iter()
+        .flatten()
+        .chain(BLOCK_KERNEL_NAMES.iter().flatten())
+        .flatten()
+        .copied()
+}
+
+/// Kernel of a validated `(weight, nr0, m)`.
+fn kernel_name(weight: RowExactWeight, nr0: u32, m: u32) -> &'static str {
+    let m = m as usize - 1;
+    match weight.index() {
+        w @ 0..=1 => KERNEL_NAMES[w][nr0 as usize - 1][m],
+        w => BLOCK_KERNEL_NAMES[w - 2][nr0.trailing_zeros() as usize][m],
+    }
+}
+
+/// Kernel names of one weight type, `[nr0 index][m - 1]`, every packing.
+fn weight_kernel_names(weight: RowExactWeight) -> &'static [[&'static str; 8]] {
+    match weight.index() {
+        w @ 0..=1 => &KERNEL_NAMES[w],
+        w => &BLOCK_KERNEL_NAMES[w - 2],
+    }
 }
 
 /// Register the row-exact mat-vec shader source with the given registry.
@@ -80,11 +128,19 @@ pub fn register(registry: &mut KernelRegistry) {
 
 /// Weight storage of a row-exact mat-vec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)] // GGML type names (Q4_K, Q6_K).
 pub enum RowExactWeight {
     /// Row-major `[batch * n, k]` F16 (`DType::F16`).
     F16,
     /// Row-major `[batch * n, k / 32]` Q8_0 blocks (`DType::U8`, 34 bytes each).
     Q8_0,
+    /// Row-major `[batch * n, k / 256]` Q4_K blocks (`DType::U8`, 144 bytes
+    /// each, 16-byte aligned).
+    Q4_K,
+    /// Row-major `[batch * n, k / 256]` Q6_K blocks (`DType::U8`, 210 bytes each).
+    Q6_K,
+    /// Row-major `[batch * n, k / 32]` Q5_0 blocks (`DType::U8`, 22 bytes each).
+    Q5_0,
 }
 
 impl RowExactWeight {
@@ -92,6 +148,9 @@ impl RowExactWeight {
         match self {
             Self::F16 => 0,
             Self::Q8_0 => 1,
+            Self::Q4_K => 2,
+            Self::Q6_K => 3,
+            Self::Q5_0 => 4,
         }
     }
 
@@ -100,12 +159,27 @@ impl RowExactWeight {
         match self {
             Self::F16 => u64::from(k) * 2,
             Self::Q8_0 => u64::from(k / Q8_0_BLOCK_VALUES) * Q8_0_BLOCK_BYTES,
+            Self::Q4_K => u64::from(k / QK_K_BLOCK_VALUES) * Q4_K_BLOCK_BYTES,
+            Self::Q6_K => u64::from(k / QK_K_BLOCK_VALUES) * Q6_K_BLOCK_BYTES,
+            Self::Q5_0 => u64::from(k / Q5_0_BLOCK_VALUES) * Q5_0_BLOCK_BYTES,
         }
     }
 
-    /// Elements one thread consumes per step (matches the shader).
+    /// Elements one thread consumes per step (matches the shader: one unit
+    /// of 32 values for Q4_K / Q6_K, 16 for Q5_0).
     fn values_per_thread_step(self) -> u32 {
-        16
+        match self {
+            Self::F16 | Self::Q8_0 | Self::Q5_0 => 16,
+            Self::Q4_K | Self::Q6_K => 32,
+        }
+    }
+
+    /// Weight rows per threadgroup the shader instantiates.
+    pub fn supports_nr0(self, nr0: u32) -> bool {
+        match self {
+            Self::F16 | Self::Q8_0 => matches!(nr0, 1 | 2),
+            Self::Q4_K | Self::Q6_K | Self::Q5_0 => matches!(nr0, 1 | 2 | 4),
+        }
     }
 }
 
@@ -169,7 +243,8 @@ pub struct RowExactMatvecSchedule {
     /// Simdgroups per threadgroup (1..=32). Fixes the per-row reduction
     /// order: row exactness holds only between dispatches with equal `nsg`.
     pub nsg: u32,
-    /// Weight rows per threadgroup (1 or 2), sharing each input load.
+    /// Weight rows per threadgroup (1 or 2; also 4 for Q4_K, Q6_K and Q5_0,
+    /// see [`RowExactWeight::supports_nr0`]), sharing each input load.
     /// Numerically inert.
     pub nr0: u32,
 }
@@ -186,34 +261,50 @@ pub struct RowExactMatvecSchedule {
 /// outputs lose to the cross-simdgroup reduction beyond that) and at least
 /// one full 16-value step per thread. An 8/16-lane-per-row layout (the
 /// peer's few-row lane map) was measured too and never won by more than the
-/// run-to-run noise, so it is not provided.
+/// run-to-run noise, so it is not provided. The simdgroup count is rounded
+/// down to a power of two, which only matters for row counts that are not
+/// powers of two: Q8_0 2816×2112 (Gemma 4) measured nsg 1 ≤ nsg 2 at
+/// m = 1..4 (`bench_gemma_decode_op_parity`, cold weights).
+///
+/// Q4_K, Q6_K and Q5_0 (one unit of 32 / 32 / 16 values per thread step)
+/// use a 32768-thread target: every Gemma 4 decode shape (1024 to 262144
+/// rows) measured nsg 1 ahead of nsg 2 at m = 1..4
+/// (`bench_gemma_decode_op_parity`, cold weights, M5 Max), e.g. Q4_K
+/// 1024×2816 at nr0 2: 2.34 / 4.78 µs (m = 1 / 4) at nsg 1 against
+/// 2.51 / 5.35 µs at nsg 2. Fewer rows split K as before (untuned).
 pub fn row_exact_reduction_nsg(weight: RowExactWeight, rows: u32, k: u32) -> u32 {
     let per_sg = 32 * weight.values_per_thread_step();
     let max_nsg = (k / per_sg).clamp(1, 32);
     let target_simdgroups: u32 = match weight {
-        RowExactWeight::F16 => 1024,
+        RowExactWeight::F16
+        | RowExactWeight::Q4_K
+        | RowExactWeight::Q6_K
+        | RowExactWeight::Q5_0 => 1024,
         RowExactWeight::Q8_0 => 4096,
     };
     let cap = if rows >= 256 { 4 } else { 32 };
-    target_simdgroups
-        .div_ceil(rows.max(1))
-        .next_power_of_two()
-        .clamp(1, cap.min(max_nsg))
+    let per_row = (target_simdgroups / rows.max(1)).max(1);
+    (1u32 << per_row.ilog2()).clamp(1, cap.min(max_nsg))
 }
 
 impl RowExactMatvecSchedule {
-    /// Shape-derived schedule: `nsg` from [`row_exact_reduction_nsg`];
-    /// `nr0 = 2` for Q8_0 (faster at m = 4, equal at m = 1), `nr0 = 1` for
-    /// F16 (pairs of F16 rows lose at m = 4). Its `nsg * 32` threads may
-    /// exceed what a device's pipelines can launch; dispatch with
-    /// [`Self::for_device`] (what [`dispatch_row_exact_matvec`] uses).
+    /// Shape-derived schedule: `nsg` from [`row_exact_reduction_nsg`] and
+    /// `nr0` (rows per threadgroup, at most `n`) by weight type, the best
+    /// measured on M5 Max at m = 1..4: F16 1 (pairs of F16 rows lose at
+    /// m = 4), Q8_0 2 (faster at m = 4, equal at m = 1), Q4_K 2, Q5_0 4, Q6_K
+    /// 2 (r4 is a little faster at m = 4 but slower than stock at m = 1).
+    /// Its `nsg * 32` threads may exceed what a device's pipelines can
+    /// launch; dispatch with [`Self::for_device`] (what
+    /// [`dispatch_row_exact_matvec`] uses).
     pub fn auto(weight: RowExactWeight, shape: &RowExactMatvecShape) -> Self {
         let rows = shape.n.saturating_mul(shape.batch);
         let nsg = row_exact_reduction_nsg(weight, rows, shape.k);
-        let nr0 = match weight {
-            RowExactWeight::Q8_0 if shape.n >= 2 => 2,
-            _ => 1,
+        let preferred: u32 = match weight {
+            RowExactWeight::F16 => 1,
+            RowExactWeight::Q8_0 | RowExactWeight::Q4_K | RowExactWeight::Q6_K => 2,
+            RowExactWeight::Q5_0 => 4,
         };
+        let nr0 = preferred.min(1 << shape.n.max(1).ilog2());
         Self { nsg, nr0 }
     }
 
@@ -237,7 +328,7 @@ impl RowExactMatvecSchedule {
 }
 
 /// Largest power-of-two `nsg` (at most 32) whose `nsg * 32` threads every
-/// row-exact pipeline of `weight` (all `m`, both `nr0`) can launch on
+/// row-exact pipeline of `weight` (all `m`, every `nr0` it instantiates) can launch on
 /// `device`: the minimum `max_total_threads_per_threadgroup` over those
 /// pipelines. The pipeline limit depends on the compiled kernel's register
 /// use and the GPU; larger `m` kernels hold more accumulators and can fall
@@ -248,7 +339,7 @@ pub fn row_exact_matvec_nsg_limit(
     weight: RowExactWeight,
 ) -> Result<u32> {
     let mut threads = 32 * 32;
-    for name in KERNEL_NAMES[weight.index()].iter().flatten() {
+    for name in weight_kernel_names(weight).iter().flatten() {
         threads = threads.min(
             registry
                 .get_pipeline(name, device)?
@@ -309,15 +400,19 @@ fn validate(
             s.n, s.k, s.batch
         )));
     }
-    if !(1..=32).contains(&schedule.nsg) || !(1..=2).contains(&schedule.nr0) {
+    if !(1..=32).contains(&schedule.nsg) || !weight_type.supports_nr0(schedule.nr0) {
         return Err(invalid(format!(
-            "schedule nsg ({}) must be in 1..=32 and nr0 ({}) in 1..=2",
+            "schedule nsg ({}) must be in 1..=32 and nr0 ({}) supported by {weight_type:?}",
             schedule.nsg, schedule.nr0
         )));
     }
     let (weight_dtype, k_multiple, weight_align) = match weight_type {
         RowExactWeight::F16 => (DType::F16, 4, 8),
         RowExactWeight::Q8_0 => (DType::U8, Q8_0_BLOCK_VALUES, 2),
+        // 16-byte qs loads; 144-byte blocks keep the alignment row to row.
+        RowExactWeight::Q4_K => (DType::U8, QK_K_BLOCK_VALUES, 16),
+        RowExactWeight::Q6_K => (DType::U8, QK_K_BLOCK_VALUES, 2),
+        RowExactWeight::Q5_0 => (DType::U8, Q5_0_BLOCK_VALUES, 2),
     };
     if w.dtype() != weight_dtype {
         return Err(invalid(format!(
@@ -451,7 +546,7 @@ pub fn dispatch_row_exact_matvec_scheduled(
     schedule: &RowExactMatvecSchedule,
 ) -> Result<()> {
     let row_bytes = validate(weight_type, w, x, y, shape, schedule)?;
-    let name = KERNEL_NAMES[weight_type.index()][schedule.nr0 as usize - 1][shape.m as usize - 1];
+    let name = kernel_name(weight_type, schedule.nr0, shape.m);
     let pipeline = registry.get_pipeline(name, device)?;
     // A launch above the pipeline's limit is dropped by Metal without an
     // error, leaving the output unwritten: refuse it here instead.

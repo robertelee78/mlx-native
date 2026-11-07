@@ -1438,7 +1438,8 @@ impl KernelRegistry {
         // Cooperative F32 mat-vec: 4 SIMD groups reduce 2 output rows together.
         sources.insert("dense_matvec_f32_nsg4_exact_k4096".into(), dense_gemm_src);
 
-        // Row-exact few-row mat-vec (F16 / Q8_0 weights, m = 1..=8 rows).
+        // Row-exact few-row mat-vec (F16 / Q8_0 / Q4_K / Q6_K / Q5_0 weights,
+        // m = 1..=8 rows).
         for name in crate::ops::row_exact_matvec::row_exact_matvec_kernel_names() {
             sources.insert(
                 name.into(),
