@@ -525,6 +525,32 @@ fn mma_q5_0_and_q8_0_down_2816x2112() {
     check_shape(&mut gpu, GgmlType::Q8_0, 2816, 2112, 0x8000_0101);
 }
 
+/// Every Qwen3.8-27B dense decode product at its exact (type, N, K), so the
+/// tiling rule picks the production pipeline: FFN gate/up and down, DeltaNet
+/// qkv / z / alpha / beta / ssm_out, attention q+gate / k / v / output.
+#[test]
+fn mma_qwen38_dense_shapes() {
+    let mut gpu = Gpu::new(MMA);
+    for (index, (ggml_type, n, k)) in [
+        (GgmlType::Q4_K, 17408, 5120), // ffn gate, ffn up
+        (GgmlType::Q4_K, 5120, 17408), // ffn down
+        (GgmlType::Q6_K, 5120, 17408), // ffn down
+        (GgmlType::Q4_K, 10240, 5120), // DeltaNet qkv
+        (GgmlType::Q6_K, 10240, 5120), // DeltaNet qkv
+        (GgmlType::Q4_K, 6144, 5120),  // DeltaNet z
+        (GgmlType::Q4_K, 5120, 6144),  // ssm_out, attention output
+        (GgmlType::Q4_K, 12288, 5120), // attention q + gate
+        (GgmlType::Q4_K, 1024, 5120),  // attention k, v
+        (GgmlType::Q6_K, 1024, 5120),  // attention v
+        (GgmlType::Q4_K, 48, 5120),    // ssm alpha, beta
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        check_shape(&mut gpu, ggml_type, n, k, 0x3800_0101 + index as u64);
+    }
+}
+
 #[test]
 fn mma_small_odd_n_every_admitted_type() {
     let mut gpu = Gpu::new(MMA);

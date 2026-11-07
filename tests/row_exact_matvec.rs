@@ -1,13 +1,16 @@
 //! Row-exact few-row mat-vec (`ops::row_exact_matvec`) correctness on the
-//! DeepSeek-V4 decode shapes.
+//! DeepSeek-V4 (F16, Q8_0), Gemma 4 and Qwen (Q4_K, Q6_K, Q5_0) decode
+//! shapes.
 //!
-//! For every shape and both weight formats:
+//! For every shape and every weight format:
 //! - F64 reference: `|y - ref| <= gamma_K * sum_i |w_i x_i|` with
 //!   `gamma_K = K u / (1 - K u)`, `u = 2^-24` (worst-case F32 summation of K
-//!   products; every reduction path has at most K roundings).
+//!   products; every reduction path has at most K roundings, counting the
+//!   one rounding of a Q4_K dequantized value).
 //! - Row exactness: row `j` of an `m = B` dispatch is bitwise equal to the
-//!   `m = 1` dispatch of row `j`, for B = 1..=8, under `nr0` 1 and 2, at the
-//!   default reduction `nsg` and at nsg 1 and 4 on every shape.
+//!   `m = 1` dispatch of row `j`, for B = 1..=8, under every `nr0` the type
+//!   instantiates (1 and 2; also 4 for Q4_K / Q6_K / Q5_0), at the default
+//!   reduction `nsg` and at nsg 1 and 4 on every shape.
 //! - Determinism: repeated `m = 8` dispatches are bitwise equal.
 //! - Grouped token-major dispatch equals the per-group dispatch (at the
 //!   grouped weight's reduction nsg) bitwise.
@@ -71,8 +74,74 @@ impl Weights {
                     })
                     .collect()
             }
+            RowExactWeight::Q4_K => self.blocks(row, 256, 144).flat_map(dequant_q4_k).collect(),
+            RowExactWeight::Q6_K => self.blocks(row, 256, 210).flat_map(dequant_q6_k).collect(),
+            RowExactWeight::Q5_0 => self.blocks(row, 32, 22).flat_map(dequant_q5_0).collect(),
         }
     }
+
+    /// Blocks of weight row `row`.
+    fn blocks(&self, row: usize, values: usize, bytes: usize) -> std::slice::ChunksExact<'_, u8> {
+        let all = self.buffer.as_slice::<u8>().expect("weight bytes");
+        let row_bytes = self.k / values * bytes;
+        all[row * row_bytes..(row + 1) * row_bytes].chunks_exact(bytes)
+    }
+}
+
+fn f16_at(bytes: &[u8], offset: usize) -> f64 {
+    f64::from(half::f16::from_le_bytes([bytes[offset], bytes[offset + 1]]).to_f32())
+}
+
+/// Q4_K: value `32j + l` of sub-block `j` is `d * sc_j * q - dmin * mn_j`.
+fn dequant_q4_k(block: &[u8]) -> Vec<f64> {
+    let (d, dmin) = (f16_at(block, 0), f16_at(block, 2));
+    let s = &block[4..16];
+    let qs = &block[16..144];
+    (0..256)
+        .map(|v| {
+            let (j, l) = (v / 32, v % 32);
+            let (sc, mn) = if j < 4 {
+                (s[j] & 63, s[j + 4] & 63)
+            } else {
+                (
+                    (s[j + 4] & 0xf) | ((s[j - 4] >> 6) << 4),
+                    (s[j + 4] >> 4) | ((s[j] >> 6) << 4),
+                )
+            };
+            let byte = qs[32 * (j / 2) + l];
+            let q = if j % 2 == 0 { byte & 0xf } else { byte >> 4 };
+            d * f64::from(sc) * f64::from(q) - dmin * f64::from(mn)
+        })
+        .collect()
+}
+
+/// Q6_K: value `128n + 32c + l` is `d * sc[8n + 2c + l/16] * (q - 32)`.
+fn dequant_q6_k(block: &[u8]) -> Vec<f64> {
+    let (ql, qh, sc) = (&block[..128], &block[128..192], &block[192..208]);
+    let d = f16_at(block, 208);
+    (0..256)
+        .map(|v| {
+            let (n, c, l) = (v / 128, v % 128 / 32, v % 32);
+            let low = (ql[64 * n + 32 * (c & 1) + l] >> (4 * (c >> 1))) & 0xf;
+            let high = (qh[32 * n + l] >> (2 * c)) & 3;
+            let q = i32::from(low | (high << 4)) - 32;
+            d * f64::from(sc[8 * n + 2 * c + l / 16] as i8) * f64::from(q)
+        })
+        .collect()
+}
+
+/// Q5_0: value `v` is `d * (q - 16)`, the fifth bit from little-endian `qh`.
+fn dequant_q5_0(block: &[u8]) -> Vec<f64> {
+    let d = f16_at(block, 0);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let qs = &block[6..22];
+    (0..32)
+        .map(|v| {
+            let low = u32::from(qs[v % 16] >> (4 * (v / 16))) & 0xf;
+            let q = (low | (((qh >> v) & 1) << 4)) as i32 - 16;
+            d * f64::from(q)
+        })
+        .collect()
 }
 
 fn f16_weights(device: &MlxDevice, rows: usize, k: usize, seed: u64) -> Weights {
@@ -115,10 +184,46 @@ fn q8_0_weights(device: &MlxDevice, rows: usize, k: usize, seed: u64) -> Weights
     }
 }
 
+/// Random Q4_K / Q6_K / Q5_0 blocks with positive, finite F16 scales.
+fn block_weights(
+    device: &MlxDevice,
+    ty: RowExactWeight,
+    rows: usize,
+    k: usize,
+    seed: u64,
+) -> Weights {
+    let (values, bytes, halves): (usize, usize, &[usize]) = match ty {
+        RowExactWeight::Q4_K => (256, 144, &[0, 2]),
+        RowExactWeight::Q6_K => (256, 210, &[208]),
+        RowExactWeight::Q5_0 => (32, 22, &[0]),
+        other => panic!("{other:?} is not a block-quant type"),
+    };
+    let mut rng = Rng(seed | 1);
+    let len = rows * k / values * bytes;
+    let mut buffer = device
+        .alloc_buffer(len, DType::U8, vec![len])
+        .expect("block weight");
+    let data = buffer.as_mut_slice::<u8>().expect("block slice");
+    for chunk in data.chunks_mut(8) {
+        let r = rng.next().to_le_bytes();
+        chunk.copy_from_slice(&r[..chunk.len()]);
+    }
+    for block in data.chunks_exact_mut(bytes) {
+        for &offset in halves {
+            let d = half::f16::from_f32(0.0005 + (rng.next() % 1024) as f32 * 0.000_004);
+            block[offset..offset + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+        }
+    }
+    Weights { buffer, ty, k }
+}
+
 fn weights(device: &MlxDevice, ty: RowExactWeight, rows: usize, k: usize, seed: u64) -> Weights {
     match ty {
         RowExactWeight::F16 => f16_weights(device, rows, k, seed),
         RowExactWeight::Q8_0 => q8_0_weights(device, rows, k, seed),
+        RowExactWeight::Q4_K | RowExactWeight::Q6_K | RowExactWeight::Q5_0 => {
+            block_weights(device, ty, rows, k, seed)
+        }
     }
 }
 
@@ -285,9 +390,13 @@ fn expected_origin() -> KernelPipelineOrigin {
     }
 }
 
-/// Every packing of a reduction `nsg`.
-fn packings(nsg: u32) -> [RowExactMatvecSchedule; 2] {
-    [1, 2].map(|nr0| RowExactMatvecSchedule { nsg, nr0 })
+/// Every packing of a reduction `nsg` the weight type instantiates.
+fn packings(ty: RowExactWeight, nsg: u32) -> Vec<RowExactMatvecSchedule> {
+    [1, 2, 4]
+        .into_iter()
+        .filter(|&nr0| ty.supports_nr0(nr0))
+        .map(|nr0| RowExactMatvecSchedule { nsg, nr0 })
+        .collect()
 }
 
 /// Row exactness at one reduction `nsg`: rows of every `m = 1..=8` dispatch,
@@ -309,7 +418,7 @@ fn check_reduction(
     let single_shape = RowExactMatvecShape::contiguous(1, n as u32, k as u32);
     // Packing is numerically inert: any m = 1 packing that launches is the
     // reference.
-    let reference = packings(nsg).into_iter().find(|&schedule| {
+    let reference = packings(ty, nsg).into_iter().find(|&schedule| {
         let y = output(device, n);
         try_run(
             device,
@@ -343,7 +452,7 @@ fn check_reduction(
     let mut widest = None;
     for m in 1..=MAX_M {
         let shape = RowExactMatvecShape::contiguous(m as u32, n as u32, k as u32);
-        for schedule in packings(nsg) {
+        for schedule in packings(ty, nsg) {
             let y = output(device, m * n);
             if try_run(device, registry, ty, w, x, &y, &shape, Some(schedule)).is_none() {
                 continue;
@@ -453,7 +562,8 @@ fn check_shape(ty: RowExactWeight, n: usize, k: usize, seed: u64) {
         }
     }
     eprintln!(
-        "{label}: shape nsg {nsg}, device nsg limit {limit}, default nsg {device_nsg}; row-exact m=1..8 under nr0 1 and 2; deterministic; max |err|/bound {}",
+        "{label}: shape nsg {nsg}, device nsg limit {limit}, default nsg {device_nsg}; row-exact m=1..8 under nr0 {:?}; deterministic; max |err|/bound {}",
+        packings(ty, nsg).iter().map(|s| s.nr0).collect::<Vec<_>>(),
         checked.join(", ")
     );
 }
@@ -495,6 +605,50 @@ fn row_exact_matvec_q8_0_decode_shapes() {
     }
     check_shape(RowExactWeight::Q8_0, 37, 4128, 0x08ff);
     check_shape(RowExactWeight::Q8_0, 3, 32, 0x08fe);
+}
+
+/// Gemma 4 decode: attention / MLP projections and the lm head.
+const GEMMA_Q4_K_SHAPES: [(usize, usize); 3] = [(4096, 2816), (2816, 4096), (2048, 2816)];
+const GEMMA_Q6_K_SHAPES: [(usize, usize); 2] = [(2048, 2816), (262_144, 2816)];
+const GEMMA_Q5_0_SHAPES: [(usize, usize); 1] = [(2816, 2112)];
+/// Qwen decode.
+const QWEN_Q4_K_SHAPES: [(usize, usize); 1] = [(8192, 2048)];
+const QWEN_Q6_K_SHAPES: [(usize, usize); 1] = [(8192, 2048)];
+
+#[test]
+fn row_exact_matvec_q4_k_decode_shapes() {
+    for (i, (n, k)) in GEMMA_Q4_K_SHAPES
+        .into_iter()
+        .chain(QWEN_Q4_K_SHAPES)
+        .enumerate()
+    {
+        check_shape(RowExactWeight::Q4_K, n, k, 0x4400 + i as u64);
+    }
+    // Tails: K not a multiple of a full threadgroup pass, odd N.
+    check_shape(RowExactWeight::Q4_K, 37, 2304, 0x44ff);
+    check_shape(RowExactWeight::Q4_K, 3, 256, 0x44fe);
+}
+
+#[test]
+fn row_exact_matvec_q6_k_decode_shapes() {
+    for (i, (n, k)) in GEMMA_Q6_K_SHAPES
+        .into_iter()
+        .chain(QWEN_Q6_K_SHAPES)
+        .enumerate()
+    {
+        check_shape(RowExactWeight::Q6_K, n, k, 0x6600 + i as u64);
+    }
+    check_shape(RowExactWeight::Q6_K, 37, 2304, 0x66ff);
+    check_shape(RowExactWeight::Q6_K, 3, 256, 0x66fe);
+}
+
+#[test]
+fn row_exact_matvec_q5_0_decode_shapes() {
+    for (i, (n, k)) in GEMMA_Q5_0_SHAPES.into_iter().enumerate() {
+        check_shape(RowExactWeight::Q5_0, n, k, 0x5500 + i as u64);
+    }
+    check_shape(RowExactWeight::Q5_0, 37, 2144, 0x55ff);
+    check_shape(RowExactWeight::Q5_0, 3, 32, 0x55fe);
 }
 
 /// DeepSeek-V4 attention output-A: 8 groups of Q8_0 [1024 x 4096] over a
@@ -593,10 +747,19 @@ fn row_exact_matvec_q8_0_grouped_output_a() {
 fn row_exact_matvec_pipeline_thread_limits() {
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
-    for ty in [RowExactWeight::F16, RowExactWeight::Q8_0] {
+    for ty in [
+        RowExactWeight::F16,
+        RowExactWeight::Q8_0,
+        RowExactWeight::Q4_K,
+        RowExactWeight::Q6_K,
+        RowExactWeight::Q5_0,
+    ] {
         let prefix = match ty {
             RowExactWeight::F16 => "row_exact_mv_f16",
             RowExactWeight::Q8_0 => "row_exact_mv_q8_0",
+            RowExactWeight::Q4_K => "row_exact_mv_q4_K",
+            RowExactWeight::Q6_K => "row_exact_mv_q6_K",
+            RowExactWeight::Q5_0 => "row_exact_mv_q5_0",
         };
         let mut min_threads = u64::MAX;
         for name in row_exact_matvec_kernel_names().filter(|name| name.starts_with(prefix)) {
@@ -688,4 +851,50 @@ fn row_exact_matvec_rejects_bad_arguments() {
     let mut shared_input = RowExactMatvecShape::contiguous(2, 8, 64);
     shared_input.x_row_stride = 0;
     assert!(attempt(RowExactWeight::F16, &w, &x, shared_input).is_ok());
+}
+
+#[test]
+fn row_exact_matvec_block_quants_reject_bad_arguments() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let q4 = weights(&device, RowExactWeight::Q4_K, 9, 512, 1).buffer;
+    let q5 = weights(&device, RowExactWeight::Q5_0, 8, 512, 2).buffer;
+    let f16 = f16_weights(&device, 8, 512, 3).buffer;
+    let x = f32_buffer(&device, &[0.0; 2 * 512]);
+    let y = output(&device, 2 * 8);
+    let mut encoder = device.command_encoder().expect("encoder");
+    let mut attempt = |ty, w: &MlxBuffer, shape: RowExactMatvecShape, nr0: u32| {
+        dispatch_row_exact_matvec_scheduled(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            ty,
+            w,
+            &x,
+            &y,
+            &shape,
+            &RowExactMatvecSchedule { nsg: 1, nr0 },
+        )
+    };
+    let dense = RowExactMatvecShape::contiguous(2, 8, 512);
+    // K must hold whole blocks: 256 values for Q4_K / Q6_K, 32 for Q5_0.
+    let k480 = RowExactMatvecShape::contiguous(1, 8, 480);
+    assert!(attempt(RowExactWeight::Q4_K, &q4, k480, 1).is_err());
+    assert!(attempt(RowExactWeight::Q6_K, &q4, k480, 1).is_err());
+    let k496 = RowExactMatvecShape::contiguous(1, 8, 496);
+    assert!(attempt(RowExactWeight::Q5_0, &q5, k496, 1).is_err());
+    // Only instantiated rows per threadgroup.
+    assert!(attempt(RowExactWeight::Q4_K, &q4, dense, 3).is_err());
+    assert!(attempt(RowExactWeight::Q4_K, &q4, dense, 8).is_err());
+    assert!(attempt(RowExactWeight::F16, &f16, dense, 4).is_err());
+    assert!(attempt(RowExactWeight::Q4_K, &q4, dense, 4).is_ok());
+    assert!(attempt(RowExactWeight::Q5_0, &q5, dense, 4).is_ok());
+    // Block weights are U8.
+    assert!(attempt(RowExactWeight::Q6_K, &f16, dense, 1).is_err());
+    // Q4_K blocks must be 16-byte aligned (its qs slices load as uint4).
+    let row_bytes = 2 * 144;
+    let misaligned = q4.slice_view(8, 8 * row_bytes);
+    assert!(attempt(RowExactWeight::Q4_K, &misaligned, dense, 2).is_err());
+    let second_row = q4.slice_view(row_bytes as u64, 8 * row_bytes);
+    assert!(attempt(RowExactWeight::Q4_K, &second_row, dense, 2).is_ok());
 }

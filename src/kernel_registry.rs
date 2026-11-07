@@ -1462,7 +1462,8 @@ impl KernelRegistry {
             sources.insert(name.into(), crate::ops::deepseek_rows::DEEPSEEK_ROWS_SHADER_SOURCE);
         }
 
-        // Row-exact few-row mat-vec (F16 / Q8_0 weights, m = 1..=8 rows).
+        // Row-exact few-row mat-vec (F16 / Q8_0 / Q4_K / Q6_K / Q5_0 weights,
+        // m = 1..=8 rows).
         for name in crate::ops::row_exact_matvec::row_exact_matvec_kernel_names() {
             sources.insert(
                 name.into(),

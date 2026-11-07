@@ -99,6 +99,7 @@ fn weight(device: &MlxDevice, ty: RowExactWeight, rows: usize, k: usize, seed: u
     match ty {
         RowExactWeight::F16 => f16_weight(device, rows, k, seed),
         RowExactWeight::Q8_0 => q8_0_weight(device, rows, k, seed),
+        other => unreachable!("the stock-order family has no {other:?} kernels"),
     }
 }
 
@@ -196,6 +197,7 @@ fn stock_rows(
                 },
             ),
             (RowExactWeight::F16, _) => panic!("no grouped F16 stock product"),
+            (other, _) => unreachable!("the stock-order family has no {other:?} kernels"),
         }
         .expect("stock dispatch");
     }
@@ -239,6 +241,7 @@ fn packings(ty: RowExactWeight) -> Vec<RowExactStockPacking> {
             }
             out
         }
+        other => unreachable!("the stock-order family has no {other:?} kernels"),
     }
 }
 
@@ -366,6 +369,7 @@ fn dequantize_row(ty: RowExactWeight, w: &[u8], row: usize, k: usize) -> Vec<f64
                 })
                 .collect()
         }
+        other => unreachable!("the stock-order family has no {other:?} kernels"),
     }
 }
 
