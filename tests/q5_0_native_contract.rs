@@ -336,7 +336,15 @@ fn q5_0_shader_source_contract_has_every_native_route() {
     assert!(expert_mv.contains("poison_invalid_expert_id"));
     assert!(expert_mv.contains("expert_id, output_row, first_row, nr"));
     assert!(expert_mm.contains("threadgroup uint32_t * sids"));
-    assert!(!expert_mm.contains("threadgroup uint16_t * sids"));
+    // The compact schedule (map0c) stages ids as uint16; every staging store
+    // must saturate ids that do not fit to 0xFFFF (never an expert) so a wide
+    // invalid id cannot wrap onto a valid one.
+    let narrowing_stores = expert_mm.matches("(uint16_t) id;").count();
+    let saturating_stores = expert_mm
+        .matches("id > 0xFFFEu ? (uint16_t) 0xFFFF : (uint16_t) id;")
+        .count();
+    assert_eq!(narrowing_stores, saturating_stores);
+    assert!(!expert_mm.contains("sids[i20] = src2_i32"));
     assert!(expert_mm.contains("sids[i20] >= ntg"));
     assert!(expert_mm.contains("sids[i20] == sids[other]"));
     for consumer in [expert_mm, expert_tensor] {
