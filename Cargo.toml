@@ -181,5 +181,9 @@ name = "bench_gemma_decode_op_parity"
 harness = false
 
 [[bench]]
+name = "bench_row_exact_matvec"
+harness = false
+
+[[bench]]
 name = "bench_gdn_decode_addressing"
 harness = false

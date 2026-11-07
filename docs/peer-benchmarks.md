@@ -60,6 +60,33 @@ covered); would matter if a top_k=2/4/5/6/10/16/22 model arrives.
 - **Dispatch cost** — llama.cpp's Metal backend implies ~0.14 µs/dispatch
   (~150 µs across ~1,070 dispatches); used as the calibration reference in
   `examples/dispatch_cost_calibration.rs`.
+- **Row-exact few-row mat-vec (2026-11-06, `ops::row_exact_matvec`)** —
+  `bench_row_exact_matvec`, M5 Max, median of 3 runs (each the median of 15
+  command buffers of 16 serialized dispatches, GPU time), DeepSeek-V4
+  decode shapes `[n x k]` at m = 1 / 2 / 3 / 4 input rows, warm weights,
+  against the reference implementation's own kernels on the same shapes
+  (its perf mode, warm; m = 1 its `mul_mv`, m = 2..4 its `mul_mv_ext`).
+  Row-exact means each row is bitwise the m = 1 result, which the
+  reference implementation's m-dependent kernel choice is not.
+
+  | weight | shape | row-exact µs | reference µs |
+  |---|---|---|---|
+  | F16 | 24 x 16384 | 3.67 / 4.49 / 5.33 / 6.51 | 4.72 / 13.76 / 9.18 / 9.78 |
+  | F16 | 4 x 16384 | 3.21 / 4.15 / 5.06 / 6.14 | 4.48 / 13.37 / 8.53 / 8.53 |
+  | F16 | 256 x 4096 | 3.54 / 3.90 / 4.83 / 5.64 | 3.98 / 6.06 / 5.14 / 5.15 |
+  | F16 | 1024 x 4096 | 6.28 / 7.16 / 8.24 / 9.83 | 5.97 / 7.94 / 9.37 / 9.77 |
+  | F16 | 512 x 4096 | 4.54 / 5.23 / 5.84 / 6.73 | 4.68 / 7.10 / 6.44 / 6.70 |
+  | F16 | 8192 x 1024 | 18.33 / 18.64 / 19.35 / 20.61 | 18.43 / 19.23 / 20.83 / 20.91 |
+  | F16 | 64 x 4096 | 2.75 / 2.91 / 3.50 / 4.02 | 3.41 / 5.08 / 4.64 / 4.80 |
+  | Q8_0 | 32768 x 1024 | 36.79 / 37.64 / 39.82 / 46.06 | 45.06 / 43.84 / 44.51 / 46.65 |
+  | Q8_0 | 4096 x 8192 | 40.23 / 41.11 / 42.30 / 47.30 | 42.29 / 62.99 / 63.35 / 62.78 |
+  | Q8_0 | 2048 x 4096 | 9.06 / 10.80 / 12.49 / 14.55 | 8.97 / 14.94 / 15.03 / 15.08 |
+  | Q8_0 | 4096 x 2048 | 8.77 / 10.06 / 11.63 / 13.49 | 9.86 / 15.06 / 15.17 / 15.17 |
+  | Q8_0 | 1024 x 4096 | 5.75 / 6.78 / 7.88 / 9.13 | 5.79 / 9.27 / 9.37 / 9.51 |
+  | Q8_0 | 512 x 4096 | 4.09 / 4.80 / 6.05 / 6.95 | 4.47 / 6.12 / 6.33 / 6.17 |
+  | Q8_0 | 129280 x 4096 (cold) | 990 / 1011 / 994 / 1019 | 970 / 1029 / 1048 / 1043 |
+  | Q8_0 | 8 x (1024 x 4096) grouped | 39.39 / 40.29 / 41.91 / 47.34 | 38.83 / 47.84 / 56.92 / 60.22 |
+
 - **MoE compact schedule builder (2026-11-07)** — model-free, M5 Max, 128
   experts × top-8, uniform distinct routing, Gemma prefill op microbench
   (median GPU µs at 458 → 1832 tokens, one hold): the reference
