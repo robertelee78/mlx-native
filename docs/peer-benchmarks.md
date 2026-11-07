@@ -87,6 +87,17 @@ covered); would matter if a top_k=2/4/5/6/10/16/22 model arrives.
   | Q8_0 | 129280 x 4096 (cold) | 990 / 1011 / 994 / 1019 | 970 / 1029 / 1048 / 1043 |
   | Q8_0 | 8 x (1024 x 4096) grouped | 39.39 / 40.29 / 41.91 / 47.34 | 38.83 / 47.84 / 56.92 / 60.22 |
 
+- **MoE compact schedule builder (2026-11-07)** — model-free, M5 Max, 128
+  experts × top-8, uniform distinct routing, Gemma prefill op microbench
+  (median GPU µs at 458 → 1832 tokens, one hold): the reference
+  implementation's `kernel_mul_mm_id_map0` (one threadgroup of `n_experts`
+  threads, every thread scans every routed id in a count and a scatter pass)
+  **78.6 → 279.3**; mlx-native's branch-free `map0c` with the same geometry
+  **210 → 795**; the token-parallel `map0c` (one thread per token, lane-mask
+  ranks) **9.9 → 19.9**, 14× under the reference at 1832 tokens, with an
+  unchanged schedule. The schedule builder is no longer structurally aligned
+  with the reference (structural diff table above).
+
 ## Measurements retained namelessly in code (2026-08-20 sweep)
 
 The reference sweep kept comparative measurements in code comments but

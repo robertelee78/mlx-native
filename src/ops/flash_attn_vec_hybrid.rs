@@ -38,6 +38,8 @@ pub static FLASH_ATTN_VEC_HYBRID_SHADER_SOURCE: &str =
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("flash_attn_vec_hybrid_dk256", FLASH_ATTN_VEC_HYBRID_SHADER_SOURCE);
     registry.register_source("flash_attn_vec_hybrid_dk512", FLASH_ATTN_VEC_HYBRID_SHADER_SOURCE);
+    registry.register_source("flash_attn_vec_hybrid_ne2_dk256", FLASH_ATTN_VEC_HYBRID_SHADER_SOURCE);
+    registry.register_source("flash_attn_vec_hybrid_ne4_dk256", FLASH_ATTN_VEC_HYBRID_SHADER_SOURCE);
 }
 
 /// GPU-side parameter struct (byte-identical layout to `FlashAttnVecTqHbParamsGpu`
@@ -182,6 +184,49 @@ pub fn flash_attn_vec_hybrid(
     tmp: &MlxBuffer,
     params: &FlashAttnVecTqHbParams,
 ) -> Result<()> {
+    flash_attn_vec_hybrid_with_ne(encoder, registry, device, q, k_f16, v_packed, v_norms, output, tmp, params, 1)
+}
+
+/// Head-split variant of [`flash_attn_vec_hybrid`] with the per-row math of
+/// [`flash_attn_vec_hybrid_batched_ne`] (a slot's solo and batched decode stay
+/// bitwise equal). Head dim 256, `ne` 2 or 4.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_hybrid_ne(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    ne: u32,
+) -> Result<()> {
+    if !matches!(ne, 2 | 4) || params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_ne: ne {ne} / head_dim {} unsupported (ne 2 or 4 at head_dim 256)",
+            params.head_dim
+        )));
+    }
+    flash_attn_vec_hybrid_with_ne(encoder, registry, device, q, k_f16, v_packed, v_norms, output, tmp, params, ne)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_vec_hybrid_with_ne(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    ne: u32,
+) -> Result<()> {
     validate_params(params)?;
 
     // K_f16 dtype check — hybrid path requires F16; F32 K would silently
@@ -216,11 +261,13 @@ pub fn flash_attn_vec_hybrid(
         n_queries: 1,
     };
 
-    let kernel_name = match head_dim {
-        256 => "flash_attn_vec_hybrid_dk256",
-        512 => "flash_attn_vec_hybrid_dk512",
+    let kernel_name = match (head_dim, ne) {
+        (256, 1) => "flash_attn_vec_hybrid_dk256",
+        (512, 1) => "flash_attn_vec_hybrid_dk512",
+        (256, 2) => "flash_attn_vec_hybrid_ne2_dk256",
+        (256, 4) => "flash_attn_vec_hybrid_ne4_dk256",
         _ => return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_hybrid: unsupported head_dim {head_dim}"
+            "flash_attn_vec_hybrid: unsupported head_dim {head_dim} / ne {ne}"
         ))),
     };
     // V codebook function constant (same as TQ-HB at index 50). Hybrid path's
@@ -332,6 +379,63 @@ pub fn flash_attn_vec_hybrid_batched(
     seq_pos_arr: &MlxBuffer,
     params: &FlashAttnVecTqHbParams,
 ) -> Result<()> {
+    flash_attn_vec_hybrid_batched_with_ne(
+        encoder, registry, device, n_q, q, k_f16, v_packed, v_norms, output, tmp, slot_id_arr,
+        seq_pos_arr, params, 1,
+    )
+}
+
+/// Head-split variants of [`flash_attn_vec_hybrid_batched`] (hf2q gap
+/// program, decode sliding attention): the peer's NE argument, `NL = 32 / NE`
+/// lanes per key, `ne` keys scored per simdgroup pass. Head dim 256 only;
+/// `ne` is 2 or 4 (1 is [`flash_attn_vec_hybrid_batched`]). Same grid,
+/// buffers, split-K tmp layout and reduce. Class B against `ne = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_vec_hybrid_batched_ne(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    ne: u32,
+) -> Result<()> {
+    if !matches!(ne, 2 | 4) || params.head_dim != 256 {
+        return Err(MlxError::InvalidArgument(format!(
+            "flash_attn_vec_hybrid_batched_ne: ne {ne} / head_dim {} unsupported (ne 2 or 4 at head_dim 256)",
+            params.head_dim
+        )));
+    }
+    flash_attn_vec_hybrid_batched_with_ne(
+        encoder, registry, device, n_q, q, k_f16, v_packed, v_norms, output, tmp, slot_id_arr,
+        seq_pos_arr, params, ne,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_vec_hybrid_batched_with_ne(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    n_q: u32,
+    q: &MlxBuffer,
+    k_f16: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    output: &MlxBuffer,
+    tmp: &MlxBuffer,
+    slot_id_arr: &MlxBuffer,
+    seq_pos_arr: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    ne: u32,
+) -> Result<()> {
     validate_params(params)?;
     if k_f16.dtype() != crate::DType::F16 {
         return Err(MlxError::InvalidArgument(format!(
@@ -362,11 +466,13 @@ pub fn flash_attn_vec_hybrid_batched(
         n_queries: n_q,
     };
 
-    let kernel_name = match head_dim {
-        256 => "flash_attn_vec_hybrid_batched_dk256",
-        512 => "flash_attn_vec_hybrid_batched_dk512",
+    let kernel_name = match (head_dim, ne) {
+        (256, 1) => "flash_attn_vec_hybrid_batched_dk256",
+        (512, 1) => "flash_attn_vec_hybrid_batched_dk512",
+        (256, 2) => "flash_attn_vec_hybrid_batched_ne2_dk256",
+        (256, 4) => "flash_attn_vec_hybrid_batched_ne4_dk256",
         _ => return Err(MlxError::InvalidArgument(format!(
-            "flash_attn_vec_hybrid_batched: unsupported head_dim {head_dim}"
+            "flash_attn_vec_hybrid_batched: unsupported head_dim {head_dim} / ne {ne}"
         ))),
     };
     let cbits_const = (params.codebook_bits as i32, 50usize);
