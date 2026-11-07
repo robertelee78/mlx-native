@@ -625,6 +625,9 @@ impl KernelRegistry {
         // ADR-063 Q4-GEMMA-DECODE F2 — expert-grouped Q4_K gate_up with the
         // moe_swiglu_batch GELU*mul epilogue (frozen R0 = 4).
         sources.insert("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4".into(), ggml_id_src);
+        // ADR-063 Q4-QWEN36 F2b — Q4_K mv_id at the peer's nr0 = 2 layout,
+        // explicit entry `quantized_matmul_id_ggml_mv_q4_k_nr2` only.
+        sources.insert("kernel_mul_mv_id_q4_K_f32_nr2".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
         // in one dispatch — replaces silu_mul + expert_down sequence.
@@ -1437,6 +1440,16 @@ impl KernelRegistry {
         sources.insert("dense_matvec_f32".into(), dense_gemm_src);
         // Cooperative F32 mat-vec: 4 SIMD groups reduce 2 output rows together.
         sources.insert("dense_matvec_f32_nsg4_exact_k4096".into(), dense_gemm_src);
+        // Row-exact F32 mat-vec over 1..8 input rows (MoE router, shared gate logit).
+        sources.insert(
+            "dense_matvec_f32_rows".into(),
+            include_str!("shaders/dense_matvec_f32_rows.metal"),
+        );
+
+        // DeepSeek-V4 decode cores over independent joint-decode rows.
+        for name in crate::ops::deepseek_rows::deepseek_rows_kernel_names() {
+            sources.insert(name.into(), crate::ops::deepseek_rows::DEEPSEEK_ROWS_SHADER_SOURCE);
+        }
 
         // Row-exact few-row mat-vec (F16 / Q8_0 / Q4_K / Q6_K / Q5_0 weights,
         // m = 1..=8 rows).
@@ -1531,6 +1544,11 @@ impl KernelRegistry {
         // ADR-040 M4 — batched multi-seq decode flash (same source file).
         sources.insert("flash_attn_vec_hybrid_batched_dk256".into(), hybrid_src);
         sources.insert("flash_attn_vec_hybrid_batched_dk512".into(), hybrid_src);
+        // hf2q gap program — NE head-split batched decode flash (D = 256).
+        sources.insert("flash_attn_vec_hybrid_ne2_dk256".into(), hybrid_src);
+        sources.insert("flash_attn_vec_hybrid_ne4_dk256".into(), hybrid_src);
+        sources.insert("flash_attn_vec_hybrid_batched_ne2_dk256".into(), hybrid_src);
+        sources.insert("flash_attn_vec_hybrid_batched_ne4_dk256".into(), hybrid_src);
         // ADR-063 lever A — GQA-grouped, per-slot-bucket batched decode flash
         // (same source file and compile flags as the batched reference).
         for name in [

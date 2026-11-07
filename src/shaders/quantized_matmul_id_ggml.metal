@@ -1773,6 +1773,165 @@ kernel void kernel_mul_mv_id_q4_K_f32(
 }
 
 // ====================================================================
+// Q4_K expert-indexed mat-vec, two rows per lane group (peer layout)
+// ====================================================================
+//
+// Port of the peer's `kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K = 2>` under its
+// `kernel_mul_mv_id` thunk (N_SG_Q4_K = 2). Within a SIMD group, 8
+// consecutive lanes share one super-block (`ix = tiisg / 8`); lane
+// `it = tiisg % 8` owns quarter `iq = it / 4` (64 values) and the 8-value
+// run `ir = it % 4` in each of its 4 sub-blocks. The 32 activations a lane
+// reads are loaded once per block for both of its rows; the quants are read
+// as uint16 (two nibble pairs per load) and masked in place, with the
+// high-byte terms scaled by 1/256 and the high-nibble sub-blocks by 1/16.
+//
+// Rows shorter than 4 super-blocks (K = 256 or 512) leave lane groups idle
+// in the peer's kernel (`ix >= nb`). Here those groups take further row
+// pairs instead: with FOLD = 4 / nb (nb = 1 or 2, else FOLD = 1) the four
+// 8-lane groups split into FOLD row groups of 4 / FOLD lanes-of-8 each, so
+// a SIMD group covers 2 * FOLD rows. Each lane's per-block arithmetic is the
+// peer's; a row's partials are reduced with one `simd_sum` in which lanes of
+// other row groups contribute +0. At K >= 1024 (FOLD = 1) this is exactly
+// the peer's lane layout and reduction.
+//
+// One threadgroup computes one (pair, 4 * FOLD-column) tile from that
+// pair's own expert slice and token row only, so every pair's output is
+// independent of how many pairs share the dispatch and of the other pairs'
+// ids; FOLD depends on K alone.
+//
+// Differences from the peer besides FOLD: the pair is routed along grid Y
+// (as every mlx-native `_id` kernel), an out-of-range id writes the stock
+// NaN poison for this SIMD group's columns, and rows past `ne01` re-read
+// the last row (their sums are not written) instead of reading past the
+// tail.
+//
+// Dispatch: threadgroups (ceil(N / (4 * FOLD)), n_tokens * top_k, 1),
+// threads (32, 2, 1). Selected only by `quantized_matmul_id_ggml_mv_q4_k_nr2`.
+kernel void kernel_mul_mv_id_q4_K_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short NR0 = 2;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const int pair = (int)tgpig.y;  // flat: token * top_k + slot
+    if (pair >= (int)p.ne1) return;
+
+    const uint token_idx = (uint)pair / p.top_k;
+    const uint expert_id = ids[pair];
+
+    const int nb = p.ne00 / QK_K;
+    const short fold = (nb == 1) ? 4 : (nb == 2) ? 2 : 1;
+    const short block_lanes = 4 / fold;  // 8-lane groups per row group
+
+    const int sg_first_row = ((int)tgpig.x * NSG + (int)sgitg) * NR0 * fold;
+
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, pair, sg_first_row, NR0 * fold, tiisg == 0)) return;
+    if (sg_first_row >= (int)p.ne01) return;
+
+    const short ix = (tiisg/8) % block_lanes;  // first block of this lane
+    const short rg = (tiisg/8) / block_lanes;  // row group of this lane
+    const short it = tiisg%8;  // 0...7
+    const short iq = it/4;     // 0 or 1
+    const short ir = it%4;     // 0...3
+
+    // This lane's rows, clamped to the last row (block_q4_K is 144 bytes =
+    // 72 uint16 per block); the step to the second row is zero past the tail.
+    const int first_row = sg_first_row + rg * NR0;
+    const int last_row = (int)p.ne01 - 1;
+    const int row0 = min(first_row, last_row);
+    const int row_step = (first_row + 1 <= last_row)
+        ? nb * (int)(sizeof(block_q4_K) / sizeof(uint16_t)) : 0;
+
+    device const block_q4_K * x = (device const block_q4_K *)(src0 + expert_id * p.expert_stride) + row0 * nb;
+    device const float      * y = src1 + token_idx * p.ne10;
+
+    float yl[16];
+    float yh[16];
+
+    float sumf[NR0] = {0.f};
+
+    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += block_lanes) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh = &x[ib].d;
+
+        for (short row = 0; row < NR0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            _Pragma("clang loop unroll(full)")
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += row_step;
+            sc += row_step;
+            dh += row_step;
+        }
+
+        y4 += block_lanes * QK_K;
+    }
+
+    // One simd_sum per row of the SIMD group; lanes of other row groups add
+    // +0. Every lane runs every reduction (fold is uniform).
+    for (short g = 0; g < fold; ++g) {
+        for (short row = 0; row < NR0; ++row) {
+            const float tot = simd_sum(rg == g ? sumf[row] : 0.f);
+            const int out_row = sg_first_row + g * NR0 + row;
+            if (tiisg == 0 && out_row < (int)p.ne01) {
+                dst[pair * p.ne0 + out_row] = tot;
+            }
+        }
+    }
+}
+
+// ====================================================================
 // IQ2_XXS expert-indexed mat-vec kernel (ADR-066 N-IQ2XXS)
 // ====================================================================
 //

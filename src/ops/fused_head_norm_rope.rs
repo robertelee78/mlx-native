@@ -15,7 +15,9 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
-use super::encode_helpers::{as_bytes, encode_threadgroups_with_args_and_shared, KernelArg};
+use super::encode_helpers::{
+    as_bytes, encode_threadgroups_with_args, encode_threadgroups_with_args_and_shared, KernelArg,
+};
 
 /// MSL source embedded at compile time (bf16).
 pub static FUSED_HEAD_NORM_ROPE_SHADER_SOURCE: &str =
@@ -198,6 +200,57 @@ struct GpuFusedHeadNormRopeF32Params {
     bf16_permuted:    u32, // P4.15: write bf16 at permuted layout
     seq_len:          u32, // P4.15: needed for permuted-index calc
     has_f32_perm_output: u32, // D.1: co-write f32 at permuted layout
+    vec4:             u32, // fused_head_norm_rope_f32 float4 lane mapping
+}
+
+/// Whether `fused_head_norm_rope_f32` may use its float4 lane mapping:
+/// `head_dim % 256 == 0` (the earlier kernel's 256-slot reduction maps onto
+/// 4-wide lanes) and every float4-accessed binding 16-byte aligned (the
+/// BF16 output is written as 8-byte bfloat4).
+fn f32_vec4_lanes(head_dim: u32, f32_buffers: &[&MlxBuffer], bf16: Option<&MlxBuffer>) -> u32 {
+    let aligned = f32_buffers.iter().all(|buf| buf.byte_offset() % 16 == 0)
+        && bf16.is_none_or(|buf| buf.byte_offset() % 8 == 0);
+    u32::from(head_dim % 256 == 0 && aligned)
+}
+
+/// (token, head) rows per threadgroup of `fused_head_norm_rope_f32`, which
+/// runs one simdgroup per row.
+const F32_ROWS_PER_THREADGROUP: u64 = 4;
+
+/// Encode the f32 head norm + RoPE kernel over `rows` (token, head) rows.
+///
+/// `fused_head_norm_rope_f32` runs one simdgroup per row without
+/// threadgroup memory; `fused_head_norm_rope_f32_v2` (decode, `v2 = true`)
+/// runs one threadgroup of min(256, next_pow2(head_dim)) threads per row
+/// with a max(threads, head_dim)-float scratch.
+fn encode_f32_rows(
+    encoder: &mut CommandEncoder,
+    pipeline: &metal::ComputePipelineStateRef,
+    v2: bool,
+    bindings: &[(u64, KernelArg<'_>)],
+    rows: u64,
+    head_dim: u32,
+) {
+    if v2 {
+        let tg_size = std::cmp::min(256, head_dim.next_power_of_two());
+        let shared_mem_bytes = u64::from(std::cmp::max(tg_size, head_dim)) * 4;
+        encode_threadgroups_with_args_and_shared(
+            encoder,
+            pipeline,
+            bindings,
+            &[(0, shared_mem_bytes)],
+            MTLSize::new(rows, 1, 1),
+            MTLSize::new(u64::from(tg_size), 1, 1),
+        );
+    } else {
+        encode_threadgroups_with_args(
+            encoder,
+            pipeline,
+            bindings,
+            MTLSize::new(rows.div_ceil(F32_ROWS_PER_THREADGROUP), 1, 1),
+            MTLSize::new(32 * F32_ROWS_PER_THREADGROUP, 1, 1),
+        );
+    }
 }
 
 /// Dispatch a fused per-head RMS norm + NeoX RoPE operation (f32).
@@ -272,17 +325,6 @@ pub fn dispatch_fused_head_norm_rope_f32(
     };
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
-    // Threadgroup must accommodate head_dim elements for shared memory caching.
-    // Use next_power_of_two of head_dim, capped at 256.
-    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
-
-    // Shared memory: head_dim floats for caching normalized values (and reduction).
-    // head_dim may be > tg_size when head_dim > 256, but the kernel loops
-    // with stride=tg_size so shared[i] is accessed for i < head_dim.
-    // Allocate max(tg_size, head_dim) floats.
-    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
-    let shared_mem_bytes = (shared_slots as u64) * 4;
-
     let has_weight = norm_weight.is_some();
     let has_ff = freq_factors.is_some();
     let gpu_params = GpuFusedHeadNormRopeF32Params {
@@ -297,15 +339,17 @@ pub fn dispatch_fused_head_norm_rope_f32(
         bf16_permuted: 0,
         seq_len: 1, // single-token decode variant
         has_f32_perm_output: 0,
+        vec4: f32_vec4_lanes(head_dim, &[input, output, norm_weight.unwrap_or(input)], None),
     };
 
     // Bind dummies for optional buffers
     let weight_buf = norm_weight.unwrap_or(input);
     let ff_buf = freq_factors.unwrap_or(input);
 
-    encode_threadgroups_with_args_and_shared(
+    encode_f32_rows(
         encoder,
         pipeline,
+        use_v2,
         &[
             (0, KernelArg::Buffer(input)),
             (1, KernelArg::Buffer(output)),
@@ -318,9 +362,8 @@ pub fn dispatch_fused_head_norm_rope_f32(
             // buffer(7) unused when has_f32_perm_output=0 — same dummy pattern.
             (7, KernelArg::Buffer(input)),
         ],
-        &[(0, shared_mem_bytes)],
-        MTLSize::new(n_heads as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+        u64::from(n_heads),
+        head_dim,
     );
 
     Ok(())
@@ -332,10 +375,9 @@ pub fn dispatch_fused_head_norm_rope_f32(
 /// separate `dispatch_fused_head_norm_rope_f32` calls). Input/output are the
 /// query-major `[n_queries, n_heads, head_dim]` f32 batched-decode buffers
 /// (tightly packed at `n_heads*head_dim`); `positions_buf` is u32 `[n_queries]`
-/// (each query its own RoPE position). The kernel is UNCHANGED — it already
-/// indexes `seq_idx = head_id / n_heads`, `pos = positions[seq_idx]`,
-/// `base = head_id * head_dim`; we merely widen the grid to `n_queries*n_heads`
-/// so each (query, head) threadgroup processes its own row ⇒ per-row
+/// (each query its own RoPE position). Both kernels index row
+/// `r = query * n_heads + head`, `pos = positions[r / n_heads]`,
+/// `base = r * head_dim`, and compute every row independently ⇒ per-row
 /// BIT-IDENTICAL to `n_queries` single-token calls.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_fused_head_norm_rope_f32_batched(
@@ -371,10 +413,6 @@ pub fn dispatch_fused_head_norm_rope_f32_batched(
     let kernel_name = if use_v2 { "fused_head_norm_rope_f32_v2" } else { "fused_head_norm_rope_f32" };
     let pipeline = registry.get_pipeline(kernel_name, device)?;
 
-    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
-    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
-    let shared_mem_bytes = (shared_slots as u64) * 4;
-
     let has_weight = norm_weight.is_some();
     let has_ff = freq_factors.is_some();
     let gpu_params = GpuFusedHeadNormRopeF32Params {
@@ -389,13 +427,15 @@ pub fn dispatch_fused_head_norm_rope_f32_batched(
         bf16_permuted: 0,
         seq_len: n_queries, // batched decode: n_queries tokens, positions[0..n_queries]
         has_f32_perm_output: 0,
+        vec4: f32_vec4_lanes(head_dim, &[input, output, norm_weight.unwrap_or(input)], None),
     };
     let weight_buf = norm_weight.unwrap_or(input);
     let ff_buf = freq_factors.unwrap_or(input);
 
-    encode_threadgroups_with_args_and_shared(
+    encode_f32_rows(
         encoder,
         pipeline,
+        use_v2,
         &[
             (0, KernelArg::Buffer(input)),
             (1, KernelArg::Buffer(output)),
@@ -406,9 +446,8 @@ pub fn dispatch_fused_head_norm_rope_f32_batched(
             (6, KernelArg::Buffer(input)),
             (7, KernelArg::Buffer(input)),
         ],
-        &[(0, shared_mem_bytes)],
-        MTLSize::new((n_queries * n_heads) as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+        u64::from(n_queries) * u64::from(n_heads),
+        head_dim,
     );
 
     Ok(())
@@ -518,9 +557,9 @@ pub fn dispatch_fused_head_norm_rope_batch_bf16(
 /// Batched fused head norm + RoPE for prefill (f32).
 ///
 /// Processes `seq_len` tokens at once. Input/output buffers have shape
-/// `[seq_len, n_heads, head_dim]` (token-major). Launches
-/// `seq_len * n_heads` threadgroups; the kernel's `seq_idx = head_id / n_heads`
-/// formula picks the correct position from `positions_buf[seq_idx]`.
+/// `[seq_len, n_heads, head_dim]` (token-major). One simdgroup per
+/// (token, head) row; row `r` takes its position from
+/// `positions_buf[r / n_heads]`.
 ///
 /// * `input`/`output`: f32 buffers of shape `[seq_len * n_heads * head_dim]`.
 /// * `positions_buf`: u32 buffer of shape `[seq_len]`.
@@ -556,10 +595,6 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
 
     let pipeline = registry.get_pipeline("fused_head_norm_rope_f32", device)?;
 
-    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
-    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
-    let shared_mem_bytes = (shared_slots as u64) * 4;
-
     let has_weight = norm_weight.is_some();
     let has_ff = freq_factors.is_some();
     let gpu_params = GpuFusedHeadNormRopeF32Params {
@@ -574,14 +609,16 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
         bf16_permuted: 0,
         seq_len,
         has_f32_perm_output: 0,
+        vec4: f32_vec4_lanes(head_dim, &[input, output, norm_weight.unwrap_or(input)], None),
     };
 
     let weight_buf = norm_weight.unwrap_or(input);
     let ff_buf = freq_factors.unwrap_or(input);
 
-    encode_threadgroups_with_args_and_shared(
+    encode_f32_rows(
         encoder,
         pipeline,
+        false,
         &[
             (0, KernelArg::Buffer(input)),
             (1, KernelArg::Buffer(output)),
@@ -593,9 +630,8 @@ pub fn dispatch_fused_head_norm_rope_batch_f32(
             (6, KernelArg::Buffer(input)),
             (7, KernelArg::Buffer(input)),
         ],
-        &[(0, shared_mem_bytes)],
-        MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+        u64::from(n_heads) * u64::from(seq_len),
+        head_dim,
     );
 
     Ok(())
@@ -705,10 +741,6 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
 
     let pipeline = registry.get_pipeline("fused_head_norm_rope_f32", device)?;
 
-    let tg_size = std::cmp::min(256, head_dim.next_power_of_two()) as u64;
-    let shared_slots = std::cmp::max(tg_size as u32, head_dim);
-    let shared_mem_bytes = (shared_slots as u64) * 4;
-
     let has_weight = norm_weight.is_some();
     let has_ff = freq_factors.is_some();
     let has_bf16 = output_bf16.is_some();
@@ -725,6 +757,11 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
         bf16_permuted: u32::from(bf16_permuted && (has_bf16 || has_f32_perm)),
         seq_len,
         has_f32_perm_output: u32::from(has_f32_perm),
+        vec4: f32_vec4_lanes(
+            head_dim,
+            &[input, output, norm_weight.unwrap_or(input), output_f32_perm.unwrap_or(input)],
+            output_bf16,
+        ),
     };
 
     let weight_buf = norm_weight.unwrap_or(input);
@@ -732,9 +769,10 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
     let bf16_buf = output_bf16.unwrap_or(input);
     let f32_perm_buf = output_f32_perm.unwrap_or(input);
 
-    encode_threadgroups_with_args_and_shared(
+    encode_f32_rows(
         encoder,
         pipeline,
+        false,
         &[
             (0, KernelArg::Buffer(input)),
             (1, KernelArg::Buffer(output)),
@@ -745,9 +783,8 @@ pub fn dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
             (6, KernelArg::Buffer(bf16_buf)),
             (7, KernelArg::Buffer(f32_perm_buf)),
         ],
-        &[(0, shared_mem_bytes)],
-        MTLSize::new((n_heads as u64) * (seq_len as u64), 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+        u64::from(n_heads) * u64::from(seq_len),
+        head_dim,
     );
 
     Ok(())
