@@ -68,9 +68,12 @@ jobs:
         # tests/test_mm_id_compact_schedule.rs runs in release on the packed
         # archive below, as in ci.yml's rust-metal-mm-id job.
         # Hosted runners lack the Metal tensor API: tests/test_flash_attn_prefill_tensor.rs
-        # records a skip there (strict by default on local/self-hosted runs).
+        # and tests/q5_0_tensor_f64_reference.rs record a skip there (strict by
+        # default on local/self-hosted runs). Keep this env in step with ci.yml's
+        # rust-metal Test step.
         env:
           MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR: "1"
+          MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
         run: >-
           cargo +1.96.0 test --locked --all-features -- --test-threads=1
           --skip compact_half_tile_settings_equal_uniform_grid
@@ -94,9 +97,12 @@ jobs:
 
       - name: Test packed archive
         # Hosted runners lack the Metal tensor API: tests/test_flash_attn_prefill_tensor.rs
-        # records a skip there (strict by default on local/self-hosted runs).
+        # and tests/q5_0_tensor_f64_reference.rs record a skip there (strict by
+        # default on local/self-hosted runs). Keep this env in step with ci.yml's
+        # rust-metal Test step.
         env:
           MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR: "1"
+          MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
         shell: bash
         run: |
           set -euo pipefail
