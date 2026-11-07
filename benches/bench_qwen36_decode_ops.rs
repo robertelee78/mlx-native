@@ -27,6 +27,11 @@
 //!   the per-row gather copies) and the output head, encoded exactly as hf2q's
 //!   joint step does (serial step at w = 1: no joint-only row copies), repeated
 //!   with the cross-layer barrier, rotating over layer copies (cold).
+//!   The full-attention layer also runs row-batched: `layer_attn_rows_*` (one
+//!   batched K and V encode, one Q premultiply, `flash_attn_vec_tq_hb_rows`
+//!   straight into the packed rows, one fused undo + sigmoid gate; no row
+//!   copies or row barriers) and `layer_attn_batched_*` (the same with the
+//!   one-dispatch `flash_attn_vec_tq_hb_batched` kernel, which has no GQA tile).
 //! * `cb_overhead`: empty command buffer commit+wait, and the 22-CB step pattern
 //!   (21 async `commit_labeled` + 1 `commit_and_wait`), empty and with one tiny
 //!   dispatch per CB.
@@ -39,7 +44,7 @@
 //! CPU cost; GPU times do not.
 //!
 //! Run (needs the GPU lane; HOST-LOCK held by the caller):
-//!   cargo bench -p mlx-native --bench bench_qwen36_decode_ops -- [--filter S]
+//!   cargo bench -p mlx-native --bench bench_qwen36_decode_ops -- [--filter S[,S..]]
 //!     [--samples N] [--target-cb-us U] [--cold-mib M] [--list]
 
 use std::time::Instant;
@@ -52,15 +57,20 @@ use mlx_native::ops::dense_mm_bf16::DenseMmBf16F32Params;
 use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::ops::flash_attn_vec::tmp_buffer_bytes as flash_attn_vec_tmp_bytes;
 use mlx_native::ops::flash_attn_vec_tq_hb::{
-    compute_nsg, flash_attn_vec_tq_hb, flash_attn_vec_tq_hb_gqa, FlashAttnVecTqHbParams, GqaTile,
+    compute_nsg, flash_attn_vec_tq_hb, flash_attn_vec_tq_hb_batched, flash_attn_vec_tq_hb_gqa,
+    flash_attn_vec_tq_hb_rows, tmp_buffer_bytes as tq_hb_tmp_bytes, FlashAttnVecTqHbParams,
+    GqaTile, TqHbDecodeRow, TqHbRowKernel,
 };
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::fwht_standalone::{
     dispatch_fwht_sign_premult_f32, dispatch_fwht_sign_undo_f32,
+    dispatch_fwht_sign_undo_sigmoid_mul_f32,
 };
 use mlx_native::ops::gated_delta_net::GatedDeltaNetParams;
 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode;
-use mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq;
+use mlx_native::ops::hadamard_quantize_kv::{
+    dispatch_hadamard_quantize_kv_hb_batched, dispatch_hadamard_quantize_kv_hb_seq,
+};
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
@@ -303,6 +313,12 @@ enum Op {
     FwhtPremult,
     FwhtUndo,
     TqSdpa { kv: u32 },
+    /// The w rows' attention of the row-batched layer (`route`).
+    TqSdpaRows { kv: u32, route: AttnRoute },
+    /// Batched K and V encode of the w rows into a multi-slot cache.
+    TqEncodeRows,
+    /// Fused FWHT undo + sigmoid gate over the w rows' heads.
+    FwhtUndoSigmoid,
     RowCopy { width: u32 },
     SigmoidMul,
     Bf16Gemv(Bf16Role),
@@ -313,8 +329,30 @@ enum Op {
     Argmax,
     LayerGdn { qkv: GgmlType },
     LayerAttn { v: GgmlType, kv: u32 },
+    /// The full-attention layer with the per-row small ops batched over w.
+    LayerAttnRows { v: GgmlType, kv: u32, route: AttnRoute },
     LayerFfn { down: GgmlType },
     Head,
+}
+
+/// Attention core of the row-batched full-attention layer.
+#[derive(Clone, Copy)]
+enum AttnRoute {
+    /// `flash_attn_vec_tq_hb_rows`: each row's own scalar / GQA-Q2 kernel,
+    /// all mains concurrent, one barrier, all reduces.
+    Rows,
+    /// `flash_attn_vec_tq_hb_batched`: one dispatch over the w rows (scalar
+    /// kernel, no GQA tile) plus its fused reduce + undo.
+    Batched,
+}
+
+impl AttnRoute {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Batched => "batched",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -354,6 +392,11 @@ impl Case {
             Op::FwhtPremult => format!("fwht_premult_f32_{N_HEADS}x{HEAD_DIM}_w{w}"),
             Op::FwhtUndo => format!("fwht_undo_f32_{N_HEADS}x{HEAD_DIM}_w{w}"),
             Op::TqSdpa { kv } => format!("flash_attn_tq_d{HEAD_DIM}_kv{kv}_w{w}"),
+            Op::TqSdpaRows { kv, route } => {
+                format!("flash_attn_tq_{}_d{HEAD_DIM}_kv{kv}_w{w}", route.tag())
+            }
+            Op::TqEncodeRows => format!("tq_encode_kv_rows_d{HEAD_DIM}x{N_KV_HEADS}_w{w}"),
+            Op::FwhtUndoSigmoid => format!("fwht_undo_sigmoid_mul_f32_{N_HEADS}x{HEAD_DIM}_w{w}"),
             Op::RowCopy { width } => format!("copy_f32_{width}_w{w}"),
             Op::SigmoidMul => format!("sigmoid_mul_f32_{Q_TOTAL}_w{w}"),
             Op::Bf16Gemv(role) => {
@@ -373,6 +416,9 @@ impl Case {
             Op::Argmax => format!("argmax_f32_{VOCAB}_w{w}"),
             Op::LayerGdn { qkv } => format!("layer_gdn_qkv{}_w{w}", qname(qkv)),
             Op::LayerAttn { v, kv } => format!("layer_attn_v{}_kv{kv}_w{w}", qname(v)),
+            Op::LayerAttnRows { v, kv, route } => {
+                format!("layer_attn_{}_v{}_kv{kv}_w{w}", route.tag(), qname(v))
+            }
             Op::LayerFfn { down } => format!("layer_ffn_down{}_w{w}", qname(down)),
             Op::Head => format!("head_lm_q6_K_{VOCAB}x{HIDDEN}_w{w}"),
         }
@@ -415,6 +461,15 @@ impl Case {
                 "SET_ROWS(type=f32->f16,ne=[{KV_TOTAL},16384,1,1],r={w}) x2 (peer F16 KV)"
             ),
             Op::FwhtPremult | Op::FwhtUndo => "none (TQ-KV specific)".into(),
+            Op::TqEncodeRows => format!(
+                "SET_ROWS(type=f32->f16,ne=[{KV_TOTAL},16384,1,1],r={w}) x2 (peer F16 KV)"
+            ),
+            Op::FwhtUndoSigmoid => {
+                format!("SIGMOID(ne=[{Q_TOTAL},{w},1,1]) + MUL (undo is TQ-KV specific)")
+            }
+            Op::TqSdpaRows { kv, .. } => format!(
+                "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[8,{w}],kv={kv},nb=1,type_KV=f16) (per-stream)"
+            ),
             Op::TqSdpa { kv } if w == 1 => format!(
                 "FLASH_ATTN_EXT(hsk=256,hsv=256,nh=2,nr23=[8,1],kv={kv},nb=1,type_KV=f16)"
             ),
@@ -453,7 +508,9 @@ impl Case {
             }
             Op::Argmax => "none (not in the peer case list)".into(),
             Op::LayerGdn { .. } => "peer GDN layer (sum of its per-op cases)".into(),
-            Op::LayerAttn { .. } => "peer full-attention layer (sum of its per-op cases)".into(),
+            Op::LayerAttn { .. } | Op::LayerAttnRows { .. } => {
+                "peer full-attention layer (sum of its per-op cases)".into()
+            }
             Op::LayerFfn { .. } => "peer MoE FFN layer (sum of its per-op cases)".into(),
             Op::Head => "peer output head (RMS_NORM + MUL_MAT q6_K 248320x2048)".into(),
         }
@@ -490,9 +547,13 @@ fn catalogue() -> Vec<Case> {
     ];
     for kv in KV_LENS {
         ops.push((Op::TqSdpa { kv }, true));
+        ops.push((Op::TqSdpaRows { kv, route: AttnRoute::Rows }, true));
+        ops.push((Op::TqSdpaRows { kv, route: AttnRoute::Batched }, true));
     }
     ops.extend([
+        (Op::TqEncodeRows, false),
         (Op::FwhtUndo, false),
+        (Op::FwhtUndoSigmoid, false),
         (Op::RowCopy { width: Q_TOTAL }, false),
         (Op::SigmoidMul, false),
         (Op::Bf16Gemv(Bf16Role::Router), true),
@@ -516,6 +577,10 @@ fn catalogue() -> Vec<Case> {
     for kv in KV_LENS {
         seq.push(Op::LayerAttn { v: GgmlType::Q6_K, kv });
         seq.push(Op::LayerAttn { v: GgmlType::Q4_K, kv });
+        for route in [AttnRoute::Rows, AttnRoute::Batched] {
+            seq.push(Op::LayerAttnRows { v: GgmlType::Q6_K, kv, route });
+            seq.push(Op::LayerAttnRows { v: GgmlType::Q4_K, kv, route });
+        }
     }
     seq.push(Op::LayerFfn { down: GgmlType::Q6_K });
     seq.push(Op::LayerFfn { down: GgmlType::Q4_K });
@@ -786,6 +851,166 @@ fn tq_sdpa(
 
 fn sdpa_tmp(dev: &MlxDevice) -> R<MlxBuffer> {
     let bytes = flash_attn_vec_tmp_bytes(N_HEADS, HEAD_DIM);
+    alloc(dev, DType::F32, vec![bytes / 4])
+}
+
+/// The w slots of one layer in one multi-slot TQ cache
+/// (`[w, n_kv_heads, capacity, head_dim]` codes, `[w, n_kv_heads, capacity]`
+/// norms): hf2q's `HybridKvCache` layout, sliced per slot by `slot_views`.
+struct TqSlots {
+    all: TqSlot,
+    kv: u32,
+}
+
+impl TqSlots {
+    fn new(dev: &MlxDevice, w: u32, kv: u32, rng: &mut Rng) -> R<Self> {
+        let packed = (w * N_KV_HEADS * kv * HEAD_DIM) as usize;
+        let norms = (w * N_KV_HEADS * kv) as usize;
+        let mut k_packed = alloc(dev, DType::U8, vec![packed])?;
+        let mut v_packed = alloc(dev, DType::U8, vec![packed])?;
+        fill_bytes(&mut k_packed, rng)?;
+        fill_bytes(&mut v_packed, rng)?;
+        Ok(Self {
+            all: TqSlot {
+                k_packed,
+                k_norms: f32_buf(dev, vec![norms], rng, 0.5, 1.5)?,
+                v_packed,
+                v_norms: f32_buf(dev, vec![norms], rng, 0.5, 1.5)?,
+            },
+            kv,
+        })
+    }
+
+    /// Zero-copy views of slot `s` (hf2q `TqFullAttnKvBuffers::slot_views`).
+    fn slot(&self, s: usize) -> TqSlot {
+        let packed = (N_KV_HEADS * self.kv * HEAD_DIM) as usize;
+        let norms = (N_KV_HEADS * self.kv) as usize;
+        TqSlot {
+            k_packed: self.all.k_packed.slice_view((s * packed) as u64, packed),
+            k_norms: self.all.k_norms.slice_view((s * norms * 4) as u64, norms),
+            v_packed: self.all.v_packed.slice_view((s * packed) as u64, packed),
+            v_norms: self.all.v_norms.slice_view((s * norms * 4) as u64, norms),
+        }
+    }
+}
+
+/// Batched K and V encode of the w rows at their cursors (one dispatch each).
+#[allow(clippy::too_many_arguments)]
+fn tq_encode_kv_rows(
+    enc: &mut CommandEncoder,
+    reg: &mut KernelRegistry,
+    dev: &MlxDevice,
+    k_rows: &MlxBuffer,
+    v_rows: &MlxBuffer,
+    slots: &TqSlots,
+    slot_ids: &MlxBuffer,
+    cursors: &MlxBuffer,
+    w: u32,
+) -> R<()> {
+    for (src, packed, norms) in [
+        (k_rows, &slots.all.k_packed, &slots.all.k_norms),
+        (v_rows, &slots.all.v_packed, &slots.all.v_norms),
+    ] {
+        dispatch_hadamard_quantize_kv_hb_batched(
+            enc,
+            reg,
+            dev.metal_device(),
+            src,
+            packed,
+            norms,
+            slot_ids,
+            cursors,
+            w,
+            N_KV_HEADS,
+            HEAD_DIM,
+            slots.kv,
+            false,
+            1.0,
+            TQ_CODEBOOK_BITS,
+        )?;
+    }
+    Ok(())
+}
+
+/// The w rows' attention of the row-batched layer. Rows route: per-row
+/// `TqHbDecodeRow`s over the slot views, outputs straight into the packed
+/// `out` rows (rotated domain). Batched route: one batched dispatch plus its
+/// fused reduce + undo (output already un-rotated).
+#[allow(clippy::too_many_arguments)]
+fn tq_sdpa_rows(
+    enc: &mut CommandEncoder,
+    reg: &mut KernelRegistry,
+    dev: &MlxDevice,
+    route: AttnRoute,
+    q: &MlxBuffer,
+    slots: &TqSlots,
+    out: &MlxBuffer,
+    tmps: &[MlxBuffer],
+    batched_tmp: &MlxBuffer,
+    slot_ids: &MlxBuffer,
+    cursors: &MlxBuffer,
+    w: u32,
+) -> R<()> {
+    let p = tq_params(slots.kv);
+    match route {
+        AttnRoute::Rows => {
+            let kernel = if tq_uses_gqa_q2(slots.kv) {
+                TqHbRowKernel::Gqa(GqaTile::Q2)
+            } else {
+                TqHbRowKernel::Scalar
+            };
+            let nh = N_HEADS as usize;
+            let hd = HEAD_DIM as usize;
+            let views: Vec<(MlxBuffer, MlxBuffer, TqSlot)> = (0..w as usize)
+                .map(|r| {
+                    Ok((
+                        row_view(q, r, vec![1, nh, hd])?,
+                        row_view(out, r, vec![1, nh, hd])?,
+                        slots.slot(r),
+                    ))
+                })
+                .collect::<R<_>>()?;
+            let rows: Vec<TqHbDecodeRow<'_>> = views
+                .iter()
+                .zip(tmps)
+                .map(|((q, o, s), tmp)| TqHbDecodeRow {
+                    q,
+                    k_packed: &s.k_packed,
+                    k_norms: &s.k_norms,
+                    v_packed: &s.v_packed,
+                    v_norms: &s.v_norms,
+                    output: o,
+                    tmp,
+                    params: p,
+                    kernel,
+                })
+                .collect();
+            flash_attn_vec_tq_hb_rows(enc, reg, dev, &rows)?;
+        }
+        AttnRoute::Batched => {
+            flash_attn_vec_tq_hb_batched(
+                enc,
+                reg,
+                dev,
+                w,
+                q,
+                &slots.all.k_packed,
+                &slots.all.k_norms,
+                &slots.all.v_packed,
+                &slots.all.v_norms,
+                out,
+                batched_tmp,
+                slot_ids,
+                cursors,
+                &p,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn batched_tmp(dev: &MlxDevice, w: u32) -> R<MlxBuffer> {
+    let bytes = tq_hb_tmp_bytes(w * N_HEADS, HEAD_DIM);
     alloc(dev, DType::F32, vec![bytes / 4])
 }
 
@@ -1342,6 +1567,91 @@ fn prepare(
                 }),
             }
         }
+        Op::TqSdpaRows { kv, route } => {
+            let n_sets = sets_for(w as u64 * TqSlot::bytes(kv), cold, cold_bytes, 1, 64);
+            let mut sets = Vec::with_capacity(n_sets);
+            for _ in 0..n_sets {
+                sets.push(TqSlots::new(dev, w, kv, rng)?);
+            }
+            let q = f32_buf(dev, vec![wu, N_HEADS as usize, HEAD_DIM as usize], rng, -1.0, 1.0)?;
+            let out = zeros(dev, DType::F32, vec![wu, N_HEADS as usize, HEAD_DIM as usize])?;
+            let tmps = (0..w).map(|_| sdpa_tmp(dev)).collect::<R<Vec<_>>>()?;
+            let btmp = batched_tmp(dev, w)?;
+            let slot_ids = u32_buf(dev, &(0..w).collect::<Vec<_>>())?;
+            let cursors = u32_buf(dev, &vec![kv - 1; wu])?;
+            Prepared {
+                kernel_hint: match route {
+                    AttnRoute::Rows => "flash_attn_vec_tq_hb_rows: w mains (scalar / gqa_q2), barrier, w reduces",
+                    AttnRoute::Batched => "flash_attn_vec_tq_hb_batched_dk256 + reduce_tq_hb_undo (one dispatch each)",
+                },
+                m: json!(N_HEADS),
+                n: json!(HEAD_DIM),
+                k: json!(kv),
+                qtype: "tq8",
+                bytes: w as u64 * (TqSlot::bytes(kv) + 2 * 4 * Q_TOTAL as u64),
+                sets: n_sets,
+                footprint: n_sets as u64 * w as u64 * TqSlot::bytes(kv),
+                extra: json!({"route": route.tag(), "kv_len": kv, "kv_capacity": kv,
+                    "gqa_q2": matches!(route, AttnRoute::Rows) && tq_uses_gqa_q2(kv),
+                    "nsg": compute_nsg(kv)}),
+                encode: unit(move |enc, reg, dev, i| {
+                    let slots = &sets[i % sets.len()];
+                    tq_sdpa_rows(enc, reg, dev, route, &q, slots, &out, &tmps, &btmp, &slot_ids, &cursors, w)
+                }),
+            }
+        }
+        Op::TqEncodeRows => {
+            let kv = 8192;
+            let k_rows = f32_buf(dev, vec![wu, KV_TOTAL as usize], rng, -1.0, 1.0)?;
+            let v_rows = f32_buf(dev, vec![wu, KV_TOTAL as usize], rng, -1.0, 1.0)?;
+            let slots = TqSlots::new(dev, w, kv, rng)?;
+            let slot_ids = u32_buf(dev, &(0..w).collect::<Vec<_>>())?;
+            let cursors = u32_buf(dev, &vec![kv - 1; wu])?;
+            Prepared {
+                kernel_hint: hint("hadamard_quantize_kv_hb_batched_d256 (K, V; all rows)"),
+                m: json!(w),
+                n: json!(KV_TOTAL),
+                k: json!(null),
+                qtype: "tq8",
+                bytes: w as u64 * 2 * (4 * KV_TOTAL as u64 + KV_TOTAL as u64 + 4 * N_KV_HEADS as u64),
+                sets: 1,
+                footprint: w as u64 * TqSlot::bytes(kv),
+                extra: json!({"dispatches": 2, "row_barrier": false, "kv_capacity": kv}),
+                encode: unit(move |enc, reg, dev, _| {
+                    tq_encode_kv_rows(enc, reg, dev, &k_rows, &v_rows, &slots, &slot_ids, &cursors, w)
+                }),
+            }
+        }
+        Op::FwhtUndoSigmoid => {
+            let n = wu * Q_TOTAL as usize;
+            let data = f32_buf(dev, vec![n], rng, -1.0, 1.0)?;
+            let gate = f32_buf(dev, vec![n], rng, -1.0, 1.0)?;
+            let out = zeros(dev, DType::F32, vec![n])?;
+            Prepared {
+                kernel_hint: hint("fwht_sign_undo_sigmoid_mul_f32_d256 (all rows)"),
+                m: json!(w * N_HEADS),
+                n: json!(HEAD_DIM),
+                k: json!(null),
+                qtype: "f32",
+                bytes: 3 * 4 * n as u64,
+                sets: 1,
+                footprint: 3 * 4 * n as u64,
+                extra: json!({"dispatches": 1}),
+                encode: unit(move |enc, reg, dev, _| {
+                    dispatch_fwht_sign_undo_sigmoid_mul_f32(
+                        enc,
+                        reg,
+                        dev.metal_device(),
+                        &data,
+                        &gate,
+                        &out,
+                        w * N_HEADS,
+                        HEAD_DIM,
+                    )?;
+                    Ok(())
+                }),
+            }
+        }
         Op::RowCopy { width } => {
             let mut srcs = Vec::new();
             for _ in 0..w {
@@ -1630,6 +1940,9 @@ fn prepare(
         }
         Op::LayerGdn { qkv } => prepare_layer_gdn(dev, rng, w, qkv, cold_bytes)?,
         Op::LayerAttn { v, kv } => prepare_layer_attn(dev, rng, w, v, kv, cold_bytes)?,
+        Op::LayerAttnRows { v, kv, route } => {
+            prepare_layer_attn_rows(dev, rng, w, v, kv, route, cold_bytes)?
+        }
         Op::LayerFfn { down } => prepare_layer_ffn(dev, shared, rng, w, down, cold_bytes)?,
         Op::Head => prepare_head(dev, shared, rng, w)?,
     };
@@ -1974,6 +2287,150 @@ fn prepare_layer_attn(
             let attn_src = attn_src.with_shape(vec![wu * q_total])?;
             let gate_src = gate_flat.with_shape(vec![wu * q_total])?;
             dispatch_sigmoid_mul(enc, reg, md, &attn_src, &gate_src, &gated, &sig_params, w * Q_TOTAL)?;
+            enc.memory_barrier();
+            qmm(enc, reg, dev, &gated_2d, &lw.wo, &output, w, HIDDEN, Q_TOTAL, GgmlType::Q4_K)
+        }),
+    })
+}
+
+struct AttnRowsLayerWeights {
+    attn_norm: MlxBuffer,
+    q_gate: MlxBuffer,
+    wk: MlxBuffer,
+    wv: MlxBuffer,
+    q_norm: MlxBuffer,
+    k_norm: MlxBuffer,
+    wo: MlxBuffer,
+    slots: TqSlots,
+    x: MlxBuffer,
+}
+
+/// The full-attention layer with the per-row small ops batched over the w
+/// rows (hf2q `encode_joint_full_attn_layer`, row-batched): one batched K
+/// and one V encode, one Q premultiply over all heads, the rows' attention
+/// (`route`) writing straight into the packed attention rows, then one fused
+/// undo + sigmoid gate (rows route; the batched route's reduce already
+/// un-rotates, so it keeps `sigmoid_mul`). No row copies, no row barriers.
+fn prepare_layer_attn_rows(
+    dev: &MlxDevice,
+    rng: &mut Rng,
+    w: u32,
+    v_t: GgmlType,
+    kv: u32,
+    route: AttnRoute,
+    cold_bytes: u64,
+) -> R<Prepared> {
+    let wu = w as usize;
+    let h = HIDDEN as usize;
+    let hd = HEAD_DIM as usize;
+    let nh = N_HEADS as usize;
+    let nkv = N_KV_HEADS as usize;
+    let q_total = Q_TOTAL as usize;
+    let wbytes = qbytes(GgmlType::Q4_K, 2 * Q_TOTAL, HIDDEN)
+        + qbytes(GgmlType::Q4_K, KV_TOTAL, HIDDEN)
+        + qbytes(v_t, KV_TOTAL, HIDDEN)
+        + qbytes(GgmlType::Q4_K, HIDDEN, Q_TOTAL);
+    let kv_bytes = w as u64 * TqSlot::bytes(kv);
+    let n_sets = sets_for(wbytes + kv_bytes, true, cold_bytes, 2, 32);
+    let mut sets = Vec::with_capacity(n_sets);
+    for _ in 0..n_sets {
+        sets.push(AttnRowsLayerWeights {
+            attn_norm: f32_buf(dev, vec![h], rng, 0.5, 1.5)?,
+            q_gate: quant_buf(dev, GgmlType::Q4_K, 2 * Q_TOTAL, HIDDEN, rng)?,
+            wk: quant_buf(dev, GgmlType::Q4_K, KV_TOTAL, HIDDEN, rng)?,
+            wv: quant_buf(dev, v_t, KV_TOTAL, HIDDEN, rng)?,
+            q_norm: f32_buf(dev, vec![hd], rng, 0.5, 1.5)?,
+            k_norm: f32_buf(dev, vec![hd], rng, 0.5, 1.5)?,
+            wo: quant_buf(dev, GgmlType::Q4_K, HIDDEN, Q_TOTAL, rng)?,
+            slots: TqSlots::new(dev, w, kv, rng)?,
+            x: f32_buf(dev, vec![wu, h], rng, -1.0, 1.0)?,
+        });
+    }
+    let positions = positions_buf(dev, w, (kv - 1) as i32)?;
+    let slot_ids = u32_buf(dev, &(0..w).collect::<Vec<_>>())?;
+    let cursors = u32_buf(dev, &vec![kv - 1; wu])?;
+    let x_norm = zeros(dev, DType::F32, vec![wu, h])?;
+    let fused = zeros(dev, DType::F32, vec![wu, 2 * q_total])?;
+    let fused_3d = fused.with_shape(vec![wu, nh, 2 * hd])?;
+    let q = zeros(dev, DType::F32, vec![wu, nh, hd])?;
+    let gate = zeros(dev, DType::F32, vec![wu, nh, hd])?;
+    let q_flat = q.with_shape(vec![wu, q_total])?;
+    let gate_flat = gate.with_shape(vec![wu * q_total])?;
+    let k_flat = zeros(dev, DType::F32, vec![wu, KV_TOTAL as usize])?;
+    let v_flat = zeros(dev, DType::F32, vec![wu, KV_TOTAL as usize])?;
+    let q_normed = zeros(dev, DType::F32, vec![wu * nh, hd])?;
+    let k_normed = zeros(dev, DType::F32, vec![wu * nkv, hd])?;
+    let q_rope = zeros(dev, DType::F32, vec![wu, nh, hd])?;
+    let k_rope = zeros(dev, DType::F32, vec![wu, nkv, hd])?;
+    let tmps = (0..w).map(|_| sdpa_tmp(dev)).collect::<R<Vec<_>>>()?;
+    let btmp = batched_tmp(dev, w)?;
+    let attention = zeros(dev, DType::F32, vec![wu * q_total])?;
+    let gated = zeros(dev, DType::F32, vec![wu * q_total])?;
+    let gated_2d = gated.with_shape(vec![wu, q_total])?;
+    let output = zeros(dev, DType::F32, vec![wu, h])?;
+    let norm_params = f32_params(dev, &[EPS, HIDDEN as f32])?;
+    let head_params = f32_params(dev, &[EPS, HEAD_DIM as f32])?;
+    let sig_params = u32_buf(dev, &[w * Q_TOTAL])?;
+    Ok(Prepared {
+        kernel_hint: match route {
+            AttnRoute::Rows => "full-attn layer, rows batched: 13 + 2w dispatches",
+            AttnRoute::Batched => "full-attn layer, batched attention kernel: 15 dispatches",
+        },
+        m: json!(w),
+        n: json!(null),
+        k: json!(kv),
+        qtype: qname(v_t),
+        bytes: wbytes + kv_bytes + 4 * w as u64 * (2 * HIDDEN + 6 * Q_TOTAL + 4 * KV_TOTAL) as u64,
+        sets: n_sets,
+        footprint: n_sets as u64 * (wbytes + kv_bytes),
+        extra: json!({"route": route.tag(), "kv_len": kv, "kv_capacity": kv,
+            "gqa_q2": matches!(route, AttnRoute::Rows) && tq_uses_gqa_q2(kv),
+            "layers_per_step": if v_t == GgmlType::Q6_K { 6 } else { 4 },
+            "row_copies": false}),
+        encode: unit(move |enc, reg, dev, i| {
+            let lw = &sets[i % sets.len()];
+            let md = dev.metal_device();
+            // ---- packed pre-norm, projections, Q/K norms, IMROPE (unchanged) ----
+            rms(enc, reg, dev, &lw.x, &lw.attn_norm, &x_norm, &norm_params, w, HIDDEN)?;
+            enc.memory_barrier();
+            qmm(enc, reg, dev, &x_norm, &lw.q_gate, &fused, w, 2 * Q_TOTAL, HIDDEN, GgmlType::Q4_K)?;
+            enc.memory_barrier();
+            dispatch_q_gate_deinterleave_f32(
+                enc,
+                reg,
+                dev,
+                &fused_3d,
+                &q,
+                &gate,
+                QGateDeinterleaveParams { m: w, n_heads: N_HEADS, head_dim: HEAD_DIM },
+            )?;
+            qmm(enc, reg, dev, &x_norm, &lw.wk, &k_flat, w, KV_TOTAL, HIDDEN, GgmlType::Q4_K)?;
+            qmm(enc, reg, dev, &x_norm, &lw.wv, &v_flat, w, KV_TOTAL, HIDDEN, v_t)?;
+            enc.memory_barrier();
+            rms(enc, reg, dev, &q_flat, &lw.q_norm, &q_normed, &head_params, w * N_HEADS, HEAD_DIM)?;
+            rms(enc, reg, dev, &k_flat, &lw.k_norm, &k_normed, &head_params, w * N_KV_HEADS, HEAD_DIM)?;
+            enc.memory_barrier();
+            dispatch_rope_multi_cached(enc, reg, dev, &q_normed, &q_rope, &positions, rope_params(N_HEADS, w))?;
+            dispatch_rope_multi_cached(enc, reg, dev, &k_normed, &k_rope, &positions, rope_params(N_KV_HEADS, w))?;
+            enc.memory_barrier();
+            // ---- all rows: K/V encode at the cursors + Q premultiply ----
+            tq_encode_kv_rows(enc, reg, dev, &k_rope, &v_flat, &lw.slots, &slot_ids, &cursors, w)?;
+            dispatch_fwht_sign_premult_f32(enc, reg, md, &q_rope, w * N_HEADS, HEAD_DIM)?;
+            enc.memory_barrier();
+            tq_sdpa_rows(
+                enc, reg, dev, route, &q_rope, &lw.slots, &attention, &tmps, &btmp, &slot_ids,
+                &cursors, w,
+            )?;
+            enc.memory_barrier();
+            // ---- packed un-rotation + sigmoid gate, output projection ----
+            match route {
+                AttnRoute::Rows => dispatch_fwht_sign_undo_sigmoid_mul_f32(
+                    enc, reg, md, &attention, &gate_flat, &gated, w * N_HEADS, HEAD_DIM,
+                )?,
+                AttnRoute::Batched => dispatch_sigmoid_mul(
+                    enc, reg, md, &attention, &gate_flat, &gated, &sig_params, w * Q_TOTAL,
+                )?,
+            }
             enc.memory_barrier();
             qmm(enc, reg, dev, &gated_2d, &lw.wo, &output, w, HIDDEN, Q_TOTAL, GgmlType::Q4_K)
         }),
@@ -2378,6 +2835,10 @@ fn op_name(op: Op) -> &'static str {
         Op::FwhtPremult => "fwht_sign_premult",
         Op::FwhtUndo => "fwht_sign_undo",
         Op::TqSdpa { .. } => "flash_attn_vec_tq_hb",
+        Op::TqSdpaRows { route: AttnRoute::Rows, .. } => "flash_attn_vec_tq_hb_rows",
+        Op::TqSdpaRows { route: AttnRoute::Batched, .. } => "flash_attn_vec_tq_hb_batched",
+        Op::TqEncodeRows => "hadamard_quantize_kv_hb_batched",
+        Op::FwhtUndoSigmoid => "fwht_sign_undo_sigmoid_mul",
         Op::RowCopy { .. } => "copy_f32",
         Op::SigmoidMul => "sigmoid_mul",
         Op::Bf16Gemv(_) => "dense_gemv_bf16_f32",
@@ -2388,6 +2849,7 @@ fn op_name(op: Op) -> &'static str {
         Op::Argmax => "argmax",
         Op::LayerGdn { .. } => "layer_gdn",
         Op::LayerAttn { .. } => "layer_full_attn",
+        Op::LayerAttnRows { .. } => "layer_full_attn_rows",
         Op::LayerFfn { .. } => "layer_moe_ffn",
         Op::Head => "output_head",
     }
@@ -2524,7 +2986,12 @@ fn main() {
     let cfg = parse_args();
     let cases: Vec<Case> = catalogue()
         .into_iter()
-        .filter(|c| cfg.filter.as_deref().map_or(true, |f| c.name().contains(f)))
+        // `--filter a,b`: cases whose name contains any of the substrings.
+        .filter(|c| {
+            cfg.filter
+                .as_deref()
+                .map_or(true, |f| f.split(',').any(|part| c.name().contains(part)))
+        })
         .collect();
     if cfg.list {
         for c in &cases {
