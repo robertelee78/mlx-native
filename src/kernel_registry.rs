@@ -628,6 +628,11 @@ impl KernelRegistry {
         // ADR-063 Q4-QWEN36 F2b — Q4_K mv_id at the peer's nr0 = 2 layout,
         // explicit entry `quantized_matmul_id_ggml_mv_q4_k_nr2` only.
         sources.insert("kernel_mul_mv_id_q4_K_f32_nr2".into(), ggml_id_src);
+        // ADR-063 Q4-QWEN36 F5 — fused MoE decode at the nr2 layouts: Q4_K
+        // gate + up + SwiGLU, and Q4_K / Q6_K expert down + weighted reduce.
+        sources.insert("kernel_mul_mv_id_q4_K_f32_nr2_swiglu".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q4_K_f32_nr2_moe_reduce".into(), ggml_id_src);
+        sources.insert("kernel_mul_mv_id_q6_K_f32_nr2_moe_reduce".into(), ggml_id_src);
         // Fused-SwiGLU mv_id variants (ADR-012 §Optimize / Task #15):
         // computes y[r][n] = sum_k(dequant(W[expert][n][k]) * silu(gate[r][k]) * up[r][k])
         // in one dispatch — replaces silu_mul + expert_down sequence.
