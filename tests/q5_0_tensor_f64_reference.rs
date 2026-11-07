@@ -437,11 +437,17 @@ fn tensor_available(device: &MlxDevice) -> bool {
         device.name(),
         std::env::var("MLX_PRECOMPILED_METALLIB").ok()
     );
-    assert!(
-        available,
-        "the Q5_0 tensor qualification needs the tensor pipeline on {}",
-        device.name()
-    );
+    // The qualification is of the tensor path; a device without it must opt
+    // out explicitly (as the compact-schedule suite does), and the skip is
+    // recorded.
+    if !available {
+        assert!(
+            std::env::var("MLX_MM_ID_TEST_ALLOW_NO_TENSOR").as_deref() == Ok("1"),
+            "the Q5_0 tensor qualification needs the tensor pipeline on {}: set MLX_MM_ID_TEST_ALLOW_NO_TENSOR=1 to skip it",
+            device.name()
+        );
+        eprintln!("RECORDED SKIP: tensor pipeline unavailable; Q5_0 tensor qualification not run");
+    }
     available
 }
 
@@ -593,7 +599,9 @@ fn r0_original_exclusion_fixture_against_f64_reference() {
     let dense = Dense {
         device: MlxDevice::new().expect("device"),
     };
-    tensor_available(&dense.device);
+    if !tensor_available(&dense.device) {
+        return;
+    }
     let mut violations = Vec::new();
     for m in [9usize, 33] {
         violations.extend(dense_case(&dense, N, K, &[m], &q5, &input_rows(m, m)));
@@ -609,7 +617,9 @@ fn r1_dense_gemma_down_against_f64_reference() {
     let dense = Dense {
         device: MlxDevice::new().expect("device"),
     };
-    tensor_available(&dense.device);
+    if !tensor_available(&dense.device) {
+        return;
+    }
     let violations = dense_case(
         &dense,
         DENSE_N,
@@ -629,7 +639,9 @@ fn r2_dense_k_scaling_against_f64_reference() {
     let dense = Dense {
         device: MlxDevice::new().expect("device"),
     };
-    tensor_available(&dense.device);
+    if !tensor_available(&dense.device) {
+        return;
+    }
     let mut violations = Vec::new();
     for k in [704, 2112, 4224, 8448] {
         let seed = 0x5ca1e ^ k as u64;
@@ -657,7 +669,9 @@ fn a2_dense_q5_0_tensor_rows_are_width_position_and_serial_invariant() {
     let dense = Dense {
         device: MlxDevice::new().expect("device"),
     };
-    tensor_available(&dense.device);
+    if !tensor_available(&dense.device) {
+        return;
+    }
     let (n, k) = (DENSE_N, DENSE_K);
     let q5 = q5_0_bytes(n, k, 0xa2a2);
     let weight = u8_buffer(&dense.device, &q5);
@@ -761,7 +775,9 @@ fn route_ids(n_tokens: usize, seed: u64) -> Vec<u32> {
 #[test]
 fn r3_moe_down_mm_id_against_f64_reference() {
     let device = MlxDevice::new().expect("device");
-    tensor_available(&device);
+    if !tensor_available(&device) {
+        return;
+    }
     let (n, k) = (MOE_N, MOE_K);
     let expert_q5 = n * k / QK * Q5_0_BLOCK;
     let q5 = q5_0_bytes(MOE_EXPERTS * n, k, 0x0e0e_0704);
