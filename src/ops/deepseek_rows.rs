@@ -25,6 +25,8 @@
 //!   compressor per row, each with its own recurrent state; the one-row
 //!   `dispatch_deepseek_compressor` at `seq_len = 1`, nonzero position,
 //!   `write_cache = 0`.
+//! - [`dispatch_deepseek_rows_gather_f32`]: copy B separate one-row F32
+//!   buffers into one `[B, n]` operand (exact copy).
 
 use metal::MTLSize;
 
@@ -60,6 +62,7 @@ pub const DEEPSEEK_INDEXER_TOPK_MERGE_ROWS_KERNEL: &str = "deepseek_indexer_topk
 pub const DEEPSEEK_INDEXER_TOPK_FINALIZE_ROWS_KERNEL: &str =
     "deepseek_indexer_topk_finalize_rows_i32";
 pub const DEEPSEEK_COMPRESSOR_ROWS_KERNEL: &str = "deepseek_compressor_rows_bf16";
+pub const DEEPSEEK_ROWS_GATHER_F32_KERNEL: &str = "deepseek_rows_gather_f32";
 
 pub static DEEPSEEK_ROWS_SHADER_SOURCE: &str = include_str!("../shaders/deepseek_rows.metal");
 
@@ -74,7 +77,7 @@ const INDEXER_MERGE_THREADS: u64 = 256;
 const SPARSE_ROW_ELEMENTS: usize = DEEPSEEK_SPARSE_HEADS * DEEPSEEK_SPARSE_HEAD_DIM;
 
 /// Every kernel in [`DEEPSEEK_ROWS_SHADER_SOURCE`].
-pub fn deepseek_rows_kernel_names() -> [&'static str; 10] {
+pub fn deepseek_rows_kernel_names() -> [&'static str; 11] {
     [
         DEEPSEEK_SPARSE_ATTENTION_SCORE_ROWS_KERNEL,
         DEEPSEEK_SPARSE_ATTENTION_REDUCE_ROWS_KERNEL,
@@ -86,6 +89,7 @@ pub fn deepseek_rows_kernel_names() -> [&'static str; 10] {
         DEEPSEEK_INDEXER_TOPK_MERGE_ROWS_KERNEL,
         DEEPSEEK_INDEXER_TOPK_FINALIZE_ROWS_KERNEL,
         DEEPSEEK_COMPRESSOR_ROWS_KERNEL,
+        DEEPSEEK_ROWS_GATHER_F32_KERNEL,
     ]
 }
 
@@ -977,6 +981,68 @@ pub fn dispatch_deepseek_indexer_rows(
         MTLSize::new(THREADS, 1, 1),
     );
     encoder.memory_barrier();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Row gather
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct RowsGatherParams {
+    rows: u32,
+    row_elements: u32,
+}
+
+/// Copy `sources[r]` (F32, at least `row_elements` each) to row `r` of
+/// `output` (F32 `[sources.len(), row_elements]`) in one dispatch, bit for
+/// bit. Lets callers produce rows into separate buffers (so their producers
+/// carry no write hazard on each other) and still hand a rows kernel one
+/// contiguous operand.
+pub fn dispatch_deepseek_rows_gather_f32(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    sources: &[&MlxBuffer],
+    output: &MlxBuffer,
+    row_elements: usize,
+) -> Result<()> {
+    check_rows(sources.len())?;
+    if row_elements == 0 {
+        return Err(invalid("gather row_elements must be nonzero"));
+    }
+    for source in sources {
+        require(source, "gather source", DType::F32, row_elements)?;
+    }
+    let total = product(&[sources.len(), row_elements])?;
+    require(output, "gather output", DType::F32, total)?;
+    let params = RowsGatherParams {
+        rows: sources.len() as u32,
+        row_elements: to_u32(row_elements, "gather row_elements")?,
+    };
+    to_u32(total, "gather elements")?;
+    let pipeline = registry
+        .get_pipeline(DEEPSEEK_ROWS_GATHER_F32_KERNEL, device.metal_device())?
+        .clone();
+    let slotted = slots(sources);
+    capture(
+        encoder,
+        CapturedOpKind::Other,
+        sources.iter().map(|source| range(source)).collect(),
+        vec![range(output)],
+    );
+    let mut args = vec![
+        (0, KernelArg::Bytes(as_bytes(&params))),
+        (1, KernelArg::Buffer(output)),
+    ];
+    push_slots(&mut args, 2, &slotted);
+    encoder.encode_threadgroups_with_args(
+        &pipeline,
+        &args,
+        MTLSize::new(total.div_ceil(THREADS as usize) as u64, 1, 1),
+        MTLSize::new(THREADS, 1, 1),
+    );
     Ok(())
 }
 

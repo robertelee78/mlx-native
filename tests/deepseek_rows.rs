@@ -34,9 +34,9 @@ use mlx_native::ops::deepseek_rows::{
     deepseek_indexer_rows_workspace_elements, deepseek_rows_kernel_names,
     deepseek_sparse_attention_rows_scratch_elements, deepseek_sparse_flash_rows_contiguous,
     dispatch_deepseek_compressor_rows, dispatch_deepseek_indexer_rows,
-    dispatch_deepseek_sparse_attention_flash_rows, dispatch_deepseek_sparse_attention_rows,
-    DeepSeekCompressorRow, DeepSeekIndexerRow, DeepSeekSparseAttentionRow,
-    DeepSeekSparseFlashRowsWorkspace,
+    dispatch_deepseek_rows_gather_f32, dispatch_deepseek_sparse_attention_flash_rows,
+    dispatch_deepseek_sparse_attention_rows, DeepSeekCompressorRow, DeepSeekIndexerRow,
+    DeepSeekSparseAttentionRow, DeepSeekSparseFlashRowsWorkspace,
 };
 use mlx_native::ops::deepseek_sparse_attention::{
     dispatch_deepseek_sparse_attention_flash_decode,
@@ -1016,5 +1016,51 @@ fn rows_dispatches_reject_invalid_tables_before_encoding() {
     )
     .is_err());
     encoder.commit_and_wait().unwrap();
-    assert_eq!(deepseek_rows_kernel_names().len(), 10);
+    assert_eq!(deepseek_rows_kernel_names().len(), 11);
+}
+
+#[test]
+fn rows_gather_copies_rows_bit_for_bit() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let mut rng = Rng(123);
+    for (b, n) in [(1usize, 1usize), (3, 1024), (8, 8192), (5, 64)] {
+        let rows: Vec<Vec<u32>> = (0..b)
+            .map(|_| {
+                let mut row: Vec<u32> = (0..n).map(|_| rng.unit().to_bits()).collect();
+                // NaN payloads, infinities and negative zero survive.
+                row[0] = 0x7fc0_1234;
+                if n > 2 {
+                    row[1] = f32::NEG_INFINITY.to_bits();
+                    row[2] = (-0.0f32).to_bits();
+                }
+                row
+            })
+            .collect();
+        // Sources are views at nonzero offsets of larger buffers.
+        let backing: Vec<MlxBuffer> = rows
+            .iter()
+            .map(|row| {
+                let mut padded = vec![0xdead_beefu32; 7];
+                padded.extend(row);
+                buffer(&device, DType::F32, &padded, vec![n + 7])
+            })
+            .collect();
+        let views: Vec<MlxBuffer> = backing.iter().map(|b| b.slice_view(28, n)).collect();
+        let sources: Vec<&MlxBuffer> = views.iter().collect();
+        let output = device
+            .alloc_buffer(b * n * 4, DType::F32, vec![b, n])
+            .unwrap();
+        run(&device, |encoder| {
+            dispatch_deepseek_rows_gather_f32(encoder, &mut registry, &device, &sources, &output, n)
+                .expect("gather")
+        });
+        let expected: Vec<u32> = rows.concat();
+        assert_eq!(
+            output.as_slice::<u32>().unwrap(),
+            expected.as_slice(),
+            "b {b} n {n}"
+        );
+    }
+    assert_origins(&registry, &["deepseek_rows_gather_f32"]);
 }

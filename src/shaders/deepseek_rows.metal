@@ -574,6 +574,26 @@ kernel void deepseek_indexer_topk_finalize_rows_i32(
 }
 
 // ---------------------------------------------------------------------------
+// Row gather: B separate one-row buffers into one contiguous [B, n] buffer
+// ---------------------------------------------------------------------------
+
+struct DeepSeekRowsGatherParams {
+    uint rows;
+    uint row_elements;
+};
+
+kernel void deepseek_rows_gather_f32(
+        constant DeepSeekRowsGatherParams &p [[buffer(0)]],
+        device float *output                 [[buffer(1)]],
+        DS_ROW_SLOTS(device const, float, source, 2),
+        uint gid                             [[thread_position_in_grid]]) {
+    const uint row = gid / p.row_elements;
+    if (row >= p.rows) return;
+    device const float *source = DS_ROW_SELECT(row, source);
+    output[gid] = source[gid % p.row_elements];
+}
+
+// ---------------------------------------------------------------------------
 // Learned KV compressor, one decode token per row (state per row)
 // ---------------------------------------------------------------------------
 
