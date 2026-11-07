@@ -291,7 +291,7 @@ fn strided_extent(batch: u32, batch_stride: u32, rows: u32, row_stride: u32, col
         + u64::from(cols)
 }
 
-fn validate(
+pub(crate) fn validate(
     weight_type: RowExactWeight,
     w: &MlxBuffer,
     x: &MlxBuffer,
