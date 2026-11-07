@@ -21,7 +21,8 @@
 
 use mlx_native::ops::row_exact_matvec::{
     dispatch_row_exact_matvec, dispatch_row_exact_matvec_scheduled, row_exact_matvec_kernel_names,
-    row_exact_reduction_nsg, RowExactMatvecSchedule, RowExactMatvecShape, RowExactWeight,
+    row_exact_matvec_nsg_limit, row_exact_reduction_nsg, RowExactMatvecSchedule,
+    RowExactMatvecShape, RowExactWeight,
 };
 use mlx_native::{DType, KernelPipelineOrigin, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -132,6 +133,9 @@ fn f32_buffer(device: &MlxDevice, values: &[f32]) -> MlxBuffer {
     buffer
 }
 
+/// Output fill; a launched dispatch overwrites every element.
+const SENTINEL: u32 = 0x7fc0_dead;
+
 fn output(device: &MlxDevice, len: usize) -> MlxBuffer {
     let mut buffer = device
         .alloc_buffer(len * 4, DType::F32, vec![len])
@@ -139,7 +143,7 @@ fn output(device: &MlxDevice, len: usize) -> MlxBuffer {
     buffer
         .as_mut_slice::<u32>()
         .expect("output slice")
-        .fill(0x7fc0_dead);
+        .fill(SENTINEL);
     buffer
 }
 
@@ -147,7 +151,11 @@ fn bits(buffer: &MlxBuffer) -> Vec<u32> {
     buffer.as_slice::<u32>().expect("bits").to_vec()
 }
 
-fn run(
+/// Encode and wait. `None` when the dispatch refused `schedule` because its
+/// threads exceed the pipeline's threadgroup limit on this device (asserted
+/// from the error, and logged); any other refusal panics. A launched
+/// dispatch must have overwritten every sentinel.
+fn try_run(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     ty: RowExactWeight,
@@ -156,9 +164,9 @@ fn run(
     y: &MlxBuffer,
     shape: &RowExactMatvecShape,
     schedule: Option<RowExactMatvecSchedule>,
-) {
+) -> Option<()> {
     let mut encoder = device.command_encoder().expect("encoder");
-    match schedule {
+    let encoded = match schedule {
         Some(schedule) => dispatch_row_exact_matvec_scheduled(
             &mut encoder,
             registry,
@@ -180,9 +188,51 @@ fn run(
             y,
             shape,
         ),
+    };
+    if let Err(error) = encoded {
+        let message = error.to_string();
+        let schedule = schedule.expect("the default schedule must always launch");
+        assert!(
+            message.contains("threads per threadgroup on this device"),
+            "{ty:?} m={} {schedule:?}: unexpected refusal: {message}",
+            shape.m
+        );
+        let limit =
+            row_exact_matvec_nsg_limit(registry, device.metal_device(), ty).expect("nsg limit");
+        assert!(
+            schedule.nsg > limit,
+            "{ty:?} m={} {schedule:?} refused although the device nsg limit is {limit}",
+            shape.m
+        );
+        eprintln!(
+            "skip {ty:?} m={} {schedule:?}: pipeline threadgroup limit ({message})",
+            shape.m
+        );
+        encoder.commit_and_wait().expect("commit");
+        return None;
     }
-    .expect("dispatch");
     encoder.commit_and_wait().expect("commit");
+    let written = bits(y);
+    assert!(
+        !written.contains(&SENTINEL),
+        "{ty:?} m={} {schedule:?}: launched dispatch left output unwritten",
+        shape.m
+    );
+    Some(())
+}
+
+fn run(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    ty: RowExactWeight,
+    w: &MlxBuffer,
+    x: &MlxBuffer,
+    y: &MlxBuffer,
+    shape: &RowExactMatvecShape,
+    schedule: Option<RowExactMatvecSchedule>,
+) {
+    try_run(device, registry, ty, w, x, y, shape, schedule)
+        .unwrap_or_else(|| panic!("{ty:?} m={} {schedule:?} must launch", shape.m));
 }
 
 /// Max of `|y - ref| / bound` over checked cells; panics past 1.
@@ -241,8 +291,10 @@ fn packings(nsg: u32) -> [RowExactMatvecSchedule; 2] {
 }
 
 /// Row exactness at one reduction `nsg`: rows of every `m = 1..=8` dispatch,
-/// under every packing, equal the `m = 1` dispatch of that row. Returns the
-/// m = 8 output bits.
+/// under every packing, equal the `m = 1` dispatch of that row. Packings the
+/// device cannot launch at this `nsg` are skipped (see [`try_run`]); every
+/// launched one is compared. Returns the widest launched output as
+/// `(m, bits)`, or `None` when no `m = 1` packing launches at this `nsg`.
 fn check_reduction(
     label: &str,
     device: &MlxDevice,
@@ -253,23 +305,49 @@ fn check_reduction(
     n: usize,
     k: usize,
     nsg: u32,
-) -> Vec<u32> {
-    let first = packings(nsg)[0];
+) -> Option<(usize, Vec<u32>)> {
+    let single_shape = RowExactMatvecShape::contiguous(1, n as u32, k as u32);
+    // Packing is numerically inert: any m = 1 packing that launches is the
+    // reference.
+    let reference = packings(nsg).into_iter().find(|&schedule| {
+        let y = output(device, n);
+        try_run(
+            device,
+            registry,
+            ty,
+            w,
+            x,
+            &y,
+            &single_shape,
+            Some(schedule),
+        )
+        .is_some()
+    })?;
     let single: Vec<Vec<u32>> = (0..MAX_M)
         .map(|j| {
             let xj = x.slice_view((j * k * 4) as u64, k);
             let y = output(device, n);
-            let shape = RowExactMatvecShape::contiguous(1, n as u32, k as u32);
-            run(device, registry, ty, w, &xj, &y, &shape, Some(first));
+            run(
+                device,
+                registry,
+                ty,
+                w,
+                &xj,
+                &y,
+                &single_shape,
+                Some(reference),
+            );
             bits(&y)
         })
         .collect();
-    let mut full = Vec::new();
+    let mut widest = None;
     for m in 1..=MAX_M {
         let shape = RowExactMatvecShape::contiguous(m as u32, n as u32, k as u32);
         for schedule in packings(nsg) {
             let y = output(device, m * n);
-            run(device, registry, ty, w, x, &y, &shape, Some(schedule));
+            if try_run(device, registry, ty, w, x, &y, &shape, Some(schedule)).is_none() {
+                continue;
+            }
             let got = bits(&y);
             for (j, row) in single.iter().enumerate().take(m) {
                 if got[j * n..(j + 1) * n] != row[..] {
@@ -282,12 +360,10 @@ fn check_reduction(
                     );
                 }
             }
-            if m == MAX_M {
-                full = got;
-            }
+            widest = Some((m, got));
         }
     }
-    full
+    widest
 }
 
 fn check_shape(ty: RowExactWeight, n: usize, k: usize, seed: u64) {
@@ -300,23 +376,35 @@ fn check_shape(ty: RowExactWeight, n: usize, k: usize, seed: u64) {
     let x = f32_buffer(&device, &xv);
 
     let nsg = row_exact_reduction_nsg(ty, n as u32, k as u32);
+    let limit =
+        row_exact_matvec_nsg_limit(&mut registry, device.metal_device(), ty).expect("nsg limit");
+    let device_nsg = nsg.min(limit);
     for m in 1..=MAX_M {
         let shape = RowExactMatvecShape::contiguous(m as u32, n as u32, k as u32);
         let auto = RowExactMatvecSchedule::auto(ty, &shape);
         assert_eq!(auto.nsg, nsg, "{label}: auto nsg must not depend on m");
+        let on_device =
+            RowExactMatvecSchedule::for_device(&mut registry, device.metal_device(), ty, &shape)
+                .expect("device schedule");
+        assert_eq!(
+            on_device.nsg, device_nsg,
+            "{label}: device nsg must not depend on m"
+        );
     }
 
-    // The default reduction, then the single-simdgroup and the
-    // threadgroup-memory reductions on every shape.
-    let mut reductions = vec![nsg];
-    for other in [1, 4] {
+    // The default (device) reduction, the shape-derived one if the device
+    // caps it, then the single-simdgroup and the threadgroup-memory
+    // reductions on every shape. The default reduction must launch at every
+    // m and packing.
+    let mut reductions = vec![device_nsg];
+    for other in [nsg, 1, 4] {
         if !reductions.contains(&other) {
             reductions.push(other);
         }
     }
     let mut checked = Vec::new();
     for r_nsg in reductions {
-        let full = check_reduction(
+        let Some((m, full)) = check_reduction(
             &label,
             &device,
             &mut registry,
@@ -326,9 +414,22 @@ fn check_shape(ty: RowExactWeight, n: usize, k: usize, seed: u64) {
             n,
             k,
             r_nsg,
-        );
+        ) else {
+            assert!(
+                r_nsg > limit,
+                "{label}: nsg {r_nsg} within the limit {limit} must launch"
+            );
+            checked.push(format!("nsg {r_nsg}: skipped (device limit {limit})"));
+            continue;
+        };
+        if r_nsg <= limit {
+            assert_eq!(
+                m, MAX_M,
+                "{label}: nsg {r_nsg} within the limit must launch at m = 8"
+            );
+        }
         let yv: Vec<f32> = full.iter().map(|b| f32::from_bits(*b)).collect();
-        let worst = check_reference(&label, &w, 0, &xv, &yv, MAX_M, n, k);
+        let worst = check_reference(&label, &w, 0, &xv, &yv, m, n, k);
         checked.push(format!("nsg {r_nsg}: {worst:.2e}"));
     }
 
@@ -352,7 +453,7 @@ fn check_shape(ty: RowExactWeight, n: usize, k: usize, seed: u64) {
         }
     }
     eprintln!(
-        "{label}: default nsg {nsg}; row-exact m=1..8 under nr0 1 and 2; deterministic; max |err|/bound {}",
+        "{label}: shape nsg {nsg}, device nsg limit {limit}, default nsg {device_nsg}; row-exact m=1..8 under nr0 1 and 2; deterministic; max |err|/bound {}",
         checked.join(", ")
     );
 }
@@ -424,7 +525,9 @@ fn row_exact_matvec_q8_0_grouped_output_a() {
     let full = grouped(&mut registry, MAX_M);
     // The grouped weight is one [groups * rank, gw] matrix: its reduction
     // nsg follows the total row count, so a per-group dispatch pins it.
-    let grouped_schedule = RowExactMatvecSchedule::auto(
+    let grouped_schedule = RowExactMatvecSchedule::for_device(
+        &mut registry,
+        device.metal_device(),
         ty,
         &RowExactMatvecShape::grouped_token_major(
             MAX_M as u32,
@@ -432,10 +535,13 @@ fn row_exact_matvec_q8_0_grouped_output_a() {
             rank as u32,
             gw as u32,
         ),
-    );
+    )
+    .expect("grouped device schedule");
+    let limit =
+        row_exact_matvec_nsg_limit(&mut registry, device.metal_device(), ty).expect("nsg limit");
     assert_eq!(
         grouped_schedule.nsg,
-        row_exact_reduction_nsg(ty, (groups * rank) as u32, gw as u32)
+        row_exact_reduction_nsg(ty, (groups * rank) as u32, gw as u32).min(limit)
     );
 
     // Per-group contiguous dispatch on gathered inputs must match bitwise.
@@ -476,6 +582,42 @@ fn row_exact_matvec_q8_0_grouped_output_a() {
     for m in 1..=MAX_M {
         let got = grouped(&mut registry, m);
         assert_eq!(got[..], full[..m * groups * rank], "grouped m={m} vs m=8");
+    }
+}
+
+/// Logs every pipeline's threadgroup limit and checks the derived nsg limit:
+/// the largest power of two whose threads every pipeline of the weight type
+/// can launch. A schedule above a pipeline's limit is refused, never
+/// launched (Metal drops such a launch silently).
+#[test]
+fn row_exact_matvec_pipeline_thread_limits() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    for ty in [RowExactWeight::F16, RowExactWeight::Q8_0] {
+        let prefix = match ty {
+            RowExactWeight::F16 => "row_exact_mv_f16",
+            RowExactWeight::Q8_0 => "row_exact_mv_q8_0",
+        };
+        let mut min_threads = u64::MAX;
+        for name in row_exact_matvec_kernel_names().filter(|name| name.starts_with(prefix)) {
+            let threads = registry
+                .get_pipeline(name, device.metal_device())
+                .expect("pipeline")
+                .max_total_threads_per_threadgroup();
+            eprintln!("{name}: max_total_threads_per_threadgroup {threads}");
+            min_threads = min_threads.min(threads);
+        }
+        assert_ne!(
+            min_threads,
+            u64::MAX,
+            "{ty:?}: no pipelines matched {prefix}"
+        );
+        let limit = row_exact_matvec_nsg_limit(&mut registry, device.metal_device(), ty)
+            .expect("nsg limit");
+        assert!(limit.is_power_of_two() && limit <= 32);
+        assert!(u64::from(limit) * 32 <= min_threads);
+        assert!(limit == 32 || u64::from(limit) * 64 > min_threads);
+        eprintln!("{ty:?}: min pipeline threads {min_threads}, nsg limit {limit}");
     }
 }
 

@@ -202,9 +202,11 @@ pub fn row_exact_reduction_nsg(weight: RowExactWeight, rows: u32, k: u32) -> u32
 }
 
 impl RowExactMatvecSchedule {
-    /// Default schedule: `nsg` from [`row_exact_reduction_nsg`]; `nr0 = 2`
-    /// for Q8_0 (faster at m = 4, equal at m = 1), `nr0 = 1` for F16 (pairs
-    /// of F16 rows lose at m = 4).
+    /// Shape-derived schedule: `nsg` from [`row_exact_reduction_nsg`];
+    /// `nr0 = 2` for Q8_0 (faster at m = 4, equal at m = 1), `nr0 = 1` for
+    /// F16 (pairs of F16 rows lose at m = 4). Its `nsg * 32` threads may
+    /// exceed what a device's pipelines can launch; dispatch with
+    /// [`Self::for_device`] (what [`dispatch_row_exact_matvec`] uses).
     pub fn auto(weight: RowExactWeight, shape: &RowExactMatvecShape) -> Self {
         let rows = shape.n.saturating_mul(shape.batch);
         let nsg = row_exact_reduction_nsg(weight, rows, shape.k);
@@ -214,6 +216,52 @@ impl RowExactMatvecSchedule {
         };
         Self { nsg, nr0 }
     }
+
+    /// [`Self::auto`] with `nsg` capped at [`row_exact_matvec_nsg_limit`],
+    /// the largest reduction every `m` and packing of `weight` can launch
+    /// on this device. The cap depends only on the weight type and device,
+    /// so rows stay equal across `m = 1..=8` on one device.
+    pub fn for_device(
+        registry: &mut KernelRegistry,
+        device: &metal::DeviceRef,
+        weight: RowExactWeight,
+        shape: &RowExactMatvecShape,
+    ) -> Result<Self> {
+        let auto = Self::auto(weight, shape);
+        let limit = row_exact_matvec_nsg_limit(registry, device, weight)?;
+        Ok(Self {
+            nsg: auto.nsg.min(limit),
+            ..auto
+        })
+    }
+}
+
+/// Largest power-of-two `nsg` (at most 32) whose `nsg * 32` threads every
+/// row-exact pipeline of `weight` (all `m`, both `nr0`) can launch on
+/// `device`: the minimum `max_total_threads_per_threadgroup` over those
+/// pipelines. The pipeline limit depends on the compiled kernel's register
+/// use and the GPU; larger `m` kernels hold more accumulators and can fall
+/// below 1024 threads on some devices.
+pub fn row_exact_matvec_nsg_limit(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    weight: RowExactWeight,
+) -> Result<u32> {
+    let mut threads = 32 * 32;
+    for name in KERNEL_NAMES[weight.index()].iter().flatten() {
+        threads = threads.min(
+            registry
+                .get_pipeline(name, device)?
+                .max_total_threads_per_threadgroup(),
+        );
+    }
+    if threads < 32 {
+        return Err(invalid(format!(
+            "{weight:?} pipelines launch at most {threads} threads per threadgroup, below one simdgroup"
+        )));
+    }
+    let simdgroups = (threads / 32) as u32;
+    Ok(1 << (31 - simdgroups.leading_zeros()))
 }
 
 /// MSL-compatible params; must match `RowExactMvParams` in the shader.
@@ -359,7 +407,7 @@ fn validate(
 }
 
 /// Encode `y[b, j, :] = W[b] · x[b, j, :]` with the default schedule
-/// ([`RowExactMatvecSchedule::auto`]).
+/// ([`RowExactMatvecSchedule::for_device`]).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_row_exact_matvec(
     encoder: &mut CommandEncoder,
@@ -371,7 +419,7 @@ pub fn dispatch_row_exact_matvec(
     y: &MlxBuffer,
     shape: &RowExactMatvecShape,
 ) -> Result<()> {
-    let schedule = RowExactMatvecSchedule::auto(weight_type, shape);
+    let schedule = RowExactMatvecSchedule::for_device(registry, device, weight_type, shape)?;
     dispatch_row_exact_matvec_scheduled(
         encoder,
         registry,
@@ -405,6 +453,16 @@ pub fn dispatch_row_exact_matvec_scheduled(
     let row_bytes = validate(weight_type, w, x, y, shape, schedule)?;
     let name = KERNEL_NAMES[weight_type.index()][schedule.nr0 as usize - 1][shape.m as usize - 1];
     let pipeline = registry.get_pipeline(name, device)?;
+    // A launch above the pipeline's limit is dropped by Metal without an
+    // error, leaving the output unwritten: refuse it here instead.
+    let pipeline_threads = pipeline.max_total_threads_per_threadgroup();
+    if u64::from(schedule.nsg) * 32 > pipeline_threads {
+        return Err(invalid(format!(
+            "schedule nsg {} needs {} threads but {name} launches at most {pipeline_threads} threads per threadgroup on this device",
+            schedule.nsg,
+            schedule.nsg * 32
+        )));
+    }
 
     let tgs_per_batch = shape.n.div_ceil(schedule.nr0);
     let params = GpuRowExactMvParams {
