@@ -1064,6 +1064,12 @@ impl KernelRegistry {
         sources.insert("gated_delta_net_decode_seq_f32_1".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_seq_f32_2".into(), gdn_decode_src);
         sources.insert("gated_delta_net_decode_seq_f32_4".into(), gdn_decode_src);
+        // Index-rebuild reference (test/bench only; never selected by the
+        // dispatcher). Registered here so tests that use
+        // `KernelRegistry::new()` also build it from source.
+        sources.insert("gated_delta_net_decode_legacy_f32_1".into(), gdn_decode_src);
+        sources.insert("gated_delta_net_decode_legacy_f32_2".into(), gdn_decode_src);
+        sources.insert("gated_delta_net_decode_legacy_f32_4".into(), gdn_decode_src);
         // Wave 5b — chunk-parallel inter-chunk state-recurrence kernel
         // (the one new kernel in the chunk-parallel pipeline; spec source:
         // arXiv 2412.06464 §4 + FLA chunk_delta_h.py:43-298).

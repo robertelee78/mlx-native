@@ -52,11 +52,11 @@
 //!   q/k/v/g/beta/output pointers once per token and takes D_k = 32·NSG as
 //!   a compile-time constant. [`dispatch_gated_delta_net_decode`] uses it
 //!   when `n_tokens >= SEQ_KERNEL_MIN_TOKENS` (prefill token loops and
-//!   multi-token windows), where it measured 1164 → 851 µs at n_tokens 512.
+//!   multi-token windows), where it measured 1166 → 779 µs warm at n_tokens 512.
 //! * `gated_delta_net_decode_f32_<NSG>` rebuilds wrapping `uint` indexes
 //!   every token. [`dispatch_gated_delta_net_decode`] uses it at
 //!   `n_tokens == 1`, where the pointer kernel measured slower
-//!   (28.2 → 32.4 µs warm for 4 rows).
+//!   (28.4 → 31.8 µs warm for 4 rows).
 //!
 //! Loads, floating-point operations and their order are the same in both,
 //! so the choice never changes results.
