@@ -29,6 +29,12 @@
 //!   for gate/up and slotted down; `map0` against
 //!   `map0c` alone; and ± schedule reuse, timed as one command buffer of
 //!   gate/up followed by down with its own `map0` or with the reusing call.
+//! * `q5t` — Q5_0 on the tensor pipeline (`q5_0_tensor_mm` routing opt-in,
+//!   `HF2Q_Q5_0_TENSOR_MM=1` in production) against the default simdgroup
+//!   route, with Q8_0 on its default tensor route as context, at `n` ∈
+//!   {232, 1180, 1832}: MoE down slotted (704 → 2816, 128 experts, top-8,
+//!   uniform routing, compact schedule; the full call and its `map0c` alone),
+//!   and the dense MLP down (2112 → 2816).
 //!
 //! Clock: `MTLCommandBuffer` `GPUStartTime`/`GPUEndTime`, one command
 //! buffer per measured op, `--warmup` (default 20) warm-up iterations and
@@ -52,6 +58,7 @@
 //! cargo bench --locked --bench bench_mm_id_schedule -- m0c \
 //!     --witness $E/q1-gemma-routing1511-t0-on-actual-v1/output/routing-witness.jsonl \
 //!     --json m0c.json
+//! cargo bench --locked --bench bench_mm_id_schedule -- q5t --json q5t.json
 //! ```
 
 use std::collections::BTreeMap;
@@ -65,10 +72,11 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
     GgmlIdMmDispatchParams, HalfTileSkip, IdMmScheduleOptions,
 };
 use mlx_native::{
-    ggml_routing_policy_from_environment, quantized_matmul_id_ggml_pooled_slotted_with_policy,
+    ggml_routing_policy_from_environment, quantized_matmul_ggml_with_policy,
+    quantized_matmul_id_ggml_pooled_slotted_with_policy,
     quantized_matmul_id_ggml_pooled_with_policy, CommandEncoder, DType, ExpertMmSchedule,
-    GgmlQuantizedMatmulIdParams, GgmlRoutingPolicy, GgmlType, IdMmScratch, KernelRegistry,
-    MlxBuffer, MlxDevice,
+    GgmlQuantizedMatmulIdParams, GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlType,
+    IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice,
 };
 use objc::runtime::{Class, Object, BOOL, NO};
 use objc::{msg_send, sel, sel_impl};
@@ -138,10 +146,10 @@ fn parse_options() -> Options {
                     .and_then(|value| value.parse().ok())
                     .expect("--iters takes a count")
             }
-            "m0a" | "m0b" | "m0c" => options.suites.push(arg),
+            "m0a" | "m0b" | "m0c" | "q5t" => options.suites.push(arg),
             // cargo bench appends `--bench`; libtest-style flags are ignored.
             other if other.starts_with("--") => {}
-            other => panic!("unknown argument {other:?}; suites are m0a, m0b, m0c"),
+            other => panic!("unknown argument {other:?}; suites are m0a, m0b, m0c, q5t"),
         }
     }
     if options.suites.is_empty() {
@@ -318,8 +326,15 @@ fn expert_matrix_bytes(ggml_type: GgmlType, n: u32, k: u32) -> u64 {
     u64::from(n) * u64::from(k / ggml_type.block_values()) * u64::from(ggml_type.block_bytes())
 }
 
-fn weight_buffer(device: &MlxDevice, ggml_type: GgmlType, n: u32, k: u32, seed: u64) -> MlxBuffer {
-    let total = expert_matrix_bytes(ggml_type, n, k) as usize * GEMMA_EXPERTS as usize;
+fn weight_buffer(
+    device: &MlxDevice,
+    ggml_type: GgmlType,
+    n: u32,
+    k: u32,
+    matrices: u32,
+    seed: u64,
+) -> MlxBuffer {
+    let total = expert_matrix_bytes(ggml_type, n, k) as usize * matrices as usize;
     let mut buffer = device
         .alloc_buffer(total, DType::U8, vec![total])
         .expect("weight buffer");
@@ -530,7 +545,7 @@ fn run_m0a(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options)
     let mut cases = Vec::new();
     let mut fits = Vec::new();
     for ggml_type in [GgmlType::Q8_0, GgmlType::Q5_0] {
-        let weight = weight_buffer(device, ggml_type, n, k, 13);
+        let weight = weight_buffer(device, ggml_type, n, k, GEMMA_EXPERTS, 13);
         for busy_expert in [0, GEMMA_EXPERTS - 1] {
             let mut points = Vec::new();
             for &n_tokens in &M0A_TOKENS {
@@ -879,9 +894,30 @@ fn run_m0b_table(
 
 fn served_weights(device: &MlxDevice) -> ServedWeights {
     ServedWeights {
-        gate_up_q4k: weight_buffer(device, GgmlType::Q4_K, GEMMA_GATE_UP_N, GEMMA_HIDDEN, 31),
-        down_q8_0: weight_buffer(device, GgmlType::Q8_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF, 32),
-        down_q5_0: weight_buffer(device, GgmlType::Q5_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF, 33),
+        gate_up_q4k: weight_buffer(
+            device,
+            GgmlType::Q4_K,
+            GEMMA_GATE_UP_N,
+            GEMMA_HIDDEN,
+            GEMMA_EXPERTS,
+            31,
+        ),
+        down_q8_0: weight_buffer(
+            device,
+            GgmlType::Q8_0,
+            GEMMA_HIDDEN,
+            GEMMA_EXPERT_FF,
+            GEMMA_EXPERTS,
+            32,
+        ),
+        down_q5_0: weight_buffer(
+            device,
+            GgmlType::Q5_0,
+            GEMMA_HIDDEN,
+            GEMMA_EXPERT_FF,
+            GEMMA_EXPERTS,
+            33,
+        ),
     }
 }
 
@@ -1235,6 +1271,223 @@ fn run_m0c(device: &MlxDevice, registry: &mut KernelRegistry, options: &Options)
     })
 }
 
+fn weight_of(weights: &[(GgmlType, MlxBuffer)], ggml_type: GgmlType) -> &MlxBuffer {
+    weights
+        .iter()
+        .find(|(t, _)| *t == ggml_type)
+        .map(|(_, buffer)| buffer)
+        .expect("weight for type")
+}
+
+// ---------------------------------------------------------------------------
+// Q5T — Q5_0 on the tensor pipeline (routing opt-in) against the default
+// ---------------------------------------------------------------------------
+
+const Q5T_ROWS: [u32; 3] = [232, 1180, 1832];
+const GEMMA_DENSE_FF: u32 = 2112;
+
+/// Label, weight type and routing policy of each Q5T arm. The Q8_0 tensor
+/// arm is context: the same shapes on a codec the default already routes
+/// to the tensor pipeline.
+fn q5t_arms() -> [(&'static str, GgmlType, GgmlRoutingPolicy); 3] {
+    let base = GgmlRoutingPolicy::default();
+    [
+        ("q5_0_default_simdgroup", GgmlType::Q5_0, base),
+        (
+            "q5_0_tensor_opt_in",
+            GgmlType::Q5_0,
+            GgmlRoutingPolicy {
+                q5_0_tensor_mm: true,
+                ..base
+            },
+        ),
+        ("q8_0_default_tensor", GgmlType::Q8_0, base),
+    ]
+}
+
+/// Dense MM pipelines are specialised with function constants; their cache
+/// key carries the constant suffix.
+const DENSE_MM_CONSTANTS: &str = "|700:i1|701:i1|702:i1";
+
+fn resolved_kernel(registry: &KernelRegistry, candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|name| registry.is_cached(name))
+        .cloned()
+}
+
+fn run_q5t(device: &MlxDevice, options: &Options) -> Value {
+    let expert_weights = [
+        (
+            GgmlType::Q5_0,
+            weight_buffer(
+                device,
+                GgmlType::Q5_0,
+                GEMMA_HIDDEN,
+                GEMMA_EXPERT_FF,
+                GEMMA_EXPERTS,
+                33,
+            ),
+        ),
+        (
+            GgmlType::Q8_0,
+            weight_buffer(
+                device,
+                GgmlType::Q8_0,
+                GEMMA_HIDDEN,
+                GEMMA_EXPERT_FF,
+                GEMMA_EXPERTS,
+                32,
+            ),
+        ),
+    ];
+    let dense_weights = [
+        (
+            GgmlType::Q5_0,
+            weight_buffer(device, GgmlType::Q5_0, GEMMA_HIDDEN, GEMMA_DENSE_FF, 1, 35),
+        ),
+        (
+            GgmlType::Q8_0,
+            weight_buffer(device, GgmlType::Q8_0, GEMMA_HIDDEN, GEMMA_DENSE_FF, 1, 36),
+        ),
+    ];
+    let mut cases = Vec::new();
+    let mut pipelines = serde_json::Map::new();
+    for (index, &rows) in Q5T_ROWS.iter().enumerate() {
+        let table = uniform_table(rows, 5000 + index as u64);
+        let routed = rows * GEMMA_TOP_K;
+        let ids = u32_buffer(device, &table.ids);
+        let down_in = f32_buffer(device, (routed * GEMMA_EXPERT_FF) as usize, 51);
+        let down_out = f32_buffer(device, (routed * GEMMA_HIDDEN) as usize, 52);
+        let dense_in = f32_buffer(device, (rows * GEMMA_DENSE_FF) as usize, 53);
+        let dense_out = f32_buffer(device, (rows * GEMMA_HIDDEN) as usize, 54);
+        // The schedule stage is the same for every arm: time it once, so
+        // `mm_id` = `down_slotted` − `map0c_ne20_8`.
+        {
+            let params = GgmlIdMmDispatchParams {
+                n_tokens: rows,
+                top_k: GEMMA_TOP_K,
+                n: GEMMA_HIDDEN,
+                k: GEMMA_EXPERT_FF,
+                n_experts: GEMMA_EXPERTS,
+                expert_stride: expert_matrix_bytes(GgmlType::Q5_0, GEMMA_HIDDEN, GEMMA_EXPERT_FF),
+                ggml_type: GgmlType::Q5_0,
+            };
+            let mut registry = KernelRegistry::new();
+            let mut scratch = IdMmScratch::alloc(device, GEMMA_EXPERTS, rows).expect("scratch");
+            let (htpe, hids) = scratch.buffers_mut();
+            let stats = time_gpu(device, options, |encoder| {
+                dispatch_id_mm_map0_for_test(
+                    encoder,
+                    &mut registry,
+                    device,
+                    &ids,
+                    &mut *htpe,
+                    &mut *hids,
+                    &params,
+                    ExpertMmSchedule::CompactTiles,
+                )
+                .expect("map0c alone");
+            });
+            eprintln!(
+                "q5t {:<20} {:<24} n={rows:>5} {:<47} median={:>9.2}us p90={:>9.2}us",
+                "map0c_ne20_8", "all", "", stats.median_us, stats.p90_us,
+            );
+            let mut case = case_json(&table, "map0c_ne20_8", None, None, None, stats, None);
+            case["arm"] = json!("all");
+            cases.push(case);
+        }
+        for (arm, ggml_type, policy) in q5t_arms() {
+            // A fresh registry per arm, so the resolved kernel is unambiguous.
+            let mut registry = KernelRegistry::new();
+            let tag = type_tag(ggml_type);
+            let mut push = |op: &str, kernel: Option<String>, stats: Stats| {
+                eprintln!(
+                    "q5t {op:<20} {arm:<24} n={rows:>5} kernel={:<40} median={:>9.2}us p90={:>9.2}us",
+                    kernel.as_deref().unwrap_or("-"),
+                    stats.median_us,
+                    stats.p90_us,
+                );
+                let mut case = case_json(&table, op, Some(ggml_type), None, None, stats, kernel);
+                case["arm"] = json!(arm);
+                cases.push(case);
+            };
+
+            let weight = weight_of(&expert_weights, ggml_type);
+            let down = expert_params(ggml_type, rows, GEMMA_TOP_K, GEMMA_HIDDEN, GEMMA_EXPERT_FF);
+            let mut scratch = IdMmScratch::alloc(device, GEMMA_EXPERTS, rows).expect("scratch");
+            let stats = time_gpu(device, options, |encoder| {
+                quantized_matmul_id_ggml_pooled_slotted_with_policy(
+                    encoder,
+                    &mut registry,
+                    device,
+                    &down_in,
+                    weight,
+                    &ids,
+                    &down_out,
+                    &mut scratch,
+                    &down,
+                    &policy,
+                )
+                .expect("slotted down");
+            });
+            let id_candidates = [
+                format!("kernel_mul_mm_id_{tag}_tensor_f32_c"),
+                format!("kernel_mul_mm_id_{tag}_f32_c"),
+            ];
+            let id_kernel = resolved_kernel(&registry, &id_candidates);
+            push("down_slotted", id_kernel.clone(), stats);
+
+            let dense_weight = weight_of(&dense_weights, ggml_type);
+            let dense = GgmlQuantizedMatmulParams {
+                m: rows,
+                n: GEMMA_HIDDEN,
+                k: GEMMA_DENSE_FF,
+                ggml_type,
+            };
+            let stats = time_gpu(device, options, |encoder| {
+                quantized_matmul_ggml_with_policy(
+                    encoder,
+                    &mut registry,
+                    device,
+                    &dense_in,
+                    &dense_weight,
+                    &dense_out,
+                    &dense,
+                    &policy,
+                )
+                .expect("dense down");
+            });
+            let dense_candidates = [
+                format!("kernel_mul_mm_{tag}_tensor_v2_f32{DENSE_MM_CONSTANTS}"),
+                format!("kernel_mul_mm_{tag}_tensor_f32{DENSE_MM_CONSTANTS}"),
+                format!("kernel_mul_mm_{tag}_f32{DENSE_MM_CONSTANTS}"),
+            ];
+            let dense_kernel = resolved_kernel(&registry, &dense_candidates);
+            push("dense_down", dense_kernel.clone(), stats);
+
+            let kernels: Vec<&str> = [&id_kernel, &dense_kernel]
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            if let Value::Object(map) = pipeline_receipts(&registry, &kernels) {
+                pipelines.extend(map);
+            }
+        }
+    }
+    json!({
+        "routing_sources": { "uniform": true },
+        "arms": q5t_arms().map(|(arm, ggml_type, policy)| json!({
+            "arm": arm,
+            "ggml_type": type_tag(ggml_type),
+            "routing": policy,
+        })),
+        "cases": cases,
+        "pipelines": Value::Object(pipelines),
+    })
+}
+
 fn main() {
     let options = parse_options();
     let device = MlxDevice::new().expect("Metal device");
@@ -1252,6 +1505,7 @@ fn main() {
             "m0a" => run_m0a(&device, &mut registry, &options),
             "m0b" => run_m0b(&device, &mut registry, &options),
             "m0c" => run_m0c(&device, &mut registry, &options),
+            "q5t" => run_q5t(&device, &options),
             _ => unreachable!("validated suite"),
         };
         suites.insert(suite.clone(), result);

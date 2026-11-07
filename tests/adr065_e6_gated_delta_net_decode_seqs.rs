@@ -24,6 +24,7 @@ use mlx_native::ops::gated_delta_net::{
 };
 use mlx_native::ops::gated_delta_net_decode::{
     dispatch_gated_delta_net_decode, dispatch_gated_delta_net_decode_with_capture,
+    SEQ_KERNEL_MIN_TOKENS,
 };
 
 const D: u32 = 128;
@@ -181,9 +182,14 @@ fn run_gdn(
     }
 }
 
-fn kernel_origin(registry: &KernelRegistry, capture: bool) -> String {
+/// Origin of the pipeline the dispatcher selected: the capture kernel, or
+/// for the plain kernel the index-rebuild variant at one token and the
+/// pointer-addressing variant from two tokens on.
+fn kernel_origin(registry: &KernelRegistry, capture: bool, n_tokens: u32) -> String {
     let label = if capture {
         "gated_delta_net_decode_capture_f32_4"
+    } else if n_tokens >= SEQ_KERNEL_MIN_TOKENS {
+        "gated_delta_net_decode_seq_f32_4"
     } else {
         "gated_delta_net_decode_f32_4"
     };
@@ -224,7 +230,7 @@ fn probe_seqs(n_tokens: u32, capture: bool) {
         n_tokens,
         capture,
     );
-    let origin = kernel_origin(&registry, capture);
+    let origin = kernel_origin(&registry, capture, n_tokens);
     let case = format!(
         "{}seqs4_tokens{n_tokens}",
         if capture { "capture_" } else { "" }
@@ -282,12 +288,12 @@ fn e6_gated_delta_net_decode_window_versus_sequential_tokens() {
     let mut rng = E6Rng::new(0xe6_05e9);
     let inputs = seq_inputs(&mut rng, T);
     let window = run_gdn(&device, &mut registry, &inputs, 1, T as u32, true);
-    let origin = format!("{},{}", kernel_origin(&registry, true), {
+    let origin = format!("{},{}", kernel_origin(&registry, true, T as u32), {
         // Make sure the plain kernel is compiled before reading its origin.
         let mut one = token_slice(&inputs, 0);
         one.state = inputs.state.clone();
         let _ = run_gdn(&device, &mut registry, &one, 1, 1, false);
-        kernel_origin(&registry, false)
+        kernel_origin(&registry, false, 1)
     });
     let capture = window.capture.as_ref().unwrap();
     let v_per_token = (D * N_V_HEADS) as usize;

@@ -164,6 +164,14 @@ pub struct GgmlRoutingPolicy {
     /// Absent in schema-2 receipts, which executed the uniform grid.
     #[serde(default = "ExpertMmSchedule::schema2_default")]
     pub expert_mm_schedule: ExpertMmSchedule,
+    /// Opt-in: let the device-selected dense and expert MM routes use the
+    /// tensor pipeline for Q5_0 (`HF2Q_Q5_0_TENSOR_MM=1`). Default off: the
+    /// tensor route is qualified against the F64 reference
+    /// (`tests/q5_0_tensor_f64_reference.rs`) but not yet against the
+    /// downstream quality envelope. Absent in older receipts, which never
+    /// executed Q5_0 on the tensor pipeline.
+    #[serde(default)]
+    pub q5_0_tensor_mm: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +221,7 @@ impl Default for GgmlRoutingPolicy {
             expert_q8_0_mv_nr2: false,
             expert_tensor_mm: GgmlTensorMmPreference::AutoProbe,
             expert_mm_schedule: ExpertMmSchedule::CompactTiles,
+            q5_0_tensor_mm: false,
         }
     }
 }
@@ -625,19 +634,28 @@ fn dense_mv_route(request: &GgmlCapabilityRequest, batched: bool) -> GgmlKernelR
 
 /// Whether the default device-selected MM route may use the tensor pipeline.
 ///
-/// Q5_0 stays on the native simdgroup kernels: the M5 tensor path exceeded
-/// the independent F32 parity bound at dense and expert prompt widths, while
-/// the simdgroup path passed the same bytes and shapes. An explicit future
-/// qualification can reopen this predicate without changing the artifact.
+/// Q5_0 uses the tensor pipeline only when the routing policy opts in
+/// (`q5_0_tensor_mm`). Its tensor kernels dequantize exactly like the
+/// simdgroup kernels; the difference is the F16 rounding of the activation
+/// operand, which the original fixed `2e-3 * max(|expected|, 1)` F32 bound
+/// did not admit. The K-scaled F64 reference bound that qualifies the other
+/// tensor types now qualifies Q5_0 (`tests/q5_0_tensor_f64_reference.rs`);
+/// the default stays off until the downstream quality envelope passes.
 pub(crate) fn tensor_mm_auto_selected(
     ggml_type: GgmlType,
     preference: GgmlTensorMmPreference,
+    q5_0_tensor_mm: bool,
 ) -> bool {
-    preference == GgmlTensorMmPreference::AutoProbe && ggml_type != GgmlType::Q5_0
+    preference == GgmlTensorMmPreference::AutoProbe
+        && (ggml_type != GgmlType::Q5_0 || q5_0_tensor_mm)
 }
 
 fn dense_mm_route(request: &GgmlCapabilityRequest, batched: bool) -> (GgmlKernelRoute, bool) {
-    if tensor_mm_auto_selected(request.ggml_type, request.routing.dense_tensor_mm) {
+    if tensor_mm_auto_selected(
+        request.ggml_type,
+        request.routing.dense_tensor_mm,
+        request.routing.q5_0_tensor_mm,
+    ) {
         (
             if batched {
                 GgmlKernelRoute::DenseBatchedMmDeviceSelected
@@ -1103,7 +1121,11 @@ fn expert_mm_route(
     request: &GgmlCapabilityRequest,
     entrypoint: ExpertEntrypoint,
 ) -> (GgmlKernelRoute, bool) {
-    let tensor = tensor_mm_auto_selected(request.ggml_type, request.routing.expert_tensor_mm);
+    let tensor = tensor_mm_auto_selected(
+        request.ggml_type,
+        request.routing.expert_tensor_mm,
+        request.routing.q5_0_tensor_mm,
+    );
     let route = match (entrypoint, tensor) {
         (ExpertEntrypoint::AutoAllocated, true) => GgmlKernelRoute::ExpertMmDeviceSelected,
         (ExpertEntrypoint::AutoAllocated, false) => GgmlKernelRoute::ExpertMmSimdgroup,
