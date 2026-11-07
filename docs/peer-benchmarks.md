@@ -60,6 +60,16 @@ covered); would matter if a top_k=2/4/5/6/10/16/22 model arrives.
 - **Dispatch cost** — llama.cpp's Metal backend implies ~0.14 µs/dispatch
   (~150 µs across ~1,070 dispatches); used as the calibration reference in
   `examples/dispatch_cost_calibration.rs`.
+- **MoE compact schedule builder (2026-11-07)** — model-free, M5 Max, 128
+  experts × top-8, uniform distinct routing, Gemma prefill op microbench
+  (median GPU µs at 458 → 1832 tokens, one hold): the reference
+  implementation's `kernel_mul_mm_id_map0` (one threadgroup of `n_experts`
+  threads, every thread scans every routed id in a count and a scatter pass)
+  **78.6 → 279.3**; mlx-native's branch-free `map0c` with the same geometry
+  **210 → 795**; the token-parallel `map0c` (one thread per token, lane-mask
+  ranks) **9.9 → 19.9**, 14× under the reference at 1832 tokens, with an
+  unchanged schedule. The schedule builder is no longer structurally aligned
+  with the reference (structural diff table above).
 
 ## Measurements retained namelessly in code (2026-08-20 sweep)
 

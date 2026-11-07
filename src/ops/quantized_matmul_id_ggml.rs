@@ -2946,7 +2946,7 @@ struct GgmlIdMmMap0cGpuParams {
     ne20: i32,      // top_k
     nb21: u64,      // bytes per token in the ids table
     max_tiles: u32, // descriptor capacity; more tiles poison the schedule
-    _pad: u32,
+    n_experts: u32,
 }
 
 /// Encode the compact `kernel_mul_mm_id_map0c_ne20_<top_k>` stage (ADR-063
@@ -2973,11 +2973,30 @@ fn encode_compact_map0(
         }
     };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
-    if u64::from(params.n_experts) > pipeline.max_total_threads_per_threadgroup() {
+    // Token-parallel launch of 32·g threads, g ≤ 32 simdgroups: one per 32
+    // tokens (or experts) up to the pipeline and threadgroup-memory limits.
+    // Threadgroup memory: per-expert positions, max(g, 2) lane masks per
+    // expert, 2·g scan partials and the invalid flag, in u32 words.
+    let n_experts = u64::from(params.n_experts);
+    let word = DType::U32.size_of() as u64;
+    let shmem_bytes =
+        |g: u64| ((n_experts + g.max(2) * n_experts + 2 * g + 1) * word).div_ceil(16) * 16;
+    let shmem_budget = device
+        .metal_device()
+        .max_threadgroup_memory_length()
+        .saturating_sub(pipeline.static_threadgroup_memory_length());
+    let mut simdgroups = u64::from(params.n_tokens)
+        .max(n_experts)
+        .div_ceil(32)
+        .min(32)
+        .min(pipeline.max_total_threads_per_threadgroup() / 32);
+    while simdgroups > 0 && shmem_bytes(simdgroups) > shmem_budget {
+        simdgroups -= 1;
+    }
+    if simdgroups == 0 {
         return Err(MlxError::InvalidArgument(format!(
-            "n_experts ({}) exceeds map0c pipeline threadgroup limit ({})",
+            "n_experts ({}) exceeds the map0c threadgroup memory ({shmem_budget} bytes)",
             params.n_experts,
-            pipeline.max_total_threads_per_threadgroup(),
         )));
     }
     let map0_params = GgmlIdMmMap0cGpuParams {
@@ -2986,13 +3005,9 @@ fn encode_compact_map0(
         nb21: u64::from(params.top_k) * DType::U32.size_of() as u64,
         max_tiles: u32::try_from(max_tiles)
             .map_err(|_| MlxError::InvalidArgument("compact tile bound exceeds u32".into()))?,
-        _pad: 0,
+        n_experts: params.n_experts,
     };
-    // Staged ids (n_experts × top_k) plus per-expert offset, tile and
-    // invalid-flag words and two totals; Metal wants a 16-byte multiple.
-    let words =
-        u64::from(params.n_experts) * u64::from(params.top_k) + 3 * u64::from(params.n_experts) + 2;
-    let shmem = (words * DType::U32.size_of() as u64).div_ceil(16) * 16;
+    let shmem = shmem_bytes(simdgroups);
 
     if encoder.is_capturing() {
         let range = |buffer: &MlxBuffer| {
@@ -3012,7 +3027,7 @@ fn encode_compact_map0(
         ],
         &[(0, shmem)],
         metal::MTLSize::new(1, 1, 1),
-        metal::MTLSize::new(u64::from(params.n_experts), 1, 1),
+        metal::MTLSize::new(32 * simdgroups, 1, 1),
     );
     // The compact mm_id kernel reads the descriptors and list map0c wrote.
     encoder.memory_barrier();
@@ -3189,9 +3204,10 @@ fn dispatch_id_mm_with_layout(
 
     // ---- Stage 1: map0 — build per-expert routed-token lists ----
     //
-    // Dispatch: 1 threadgroup of `n_experts` threads.  Shared memory:
-    // `n_experts * top_k * sizeof(uint32)` staging area. IDs remain full-width
-    // until the shader has proved bounds and per-token distinctness.
+    // Dispatch: legacy map0 runs 1 threadgroup of `n_experts` threads with a
+    // `n_experts * top_k * sizeof(uint32)` staging area; compact map0c runs one
+    // token-parallel threadgroup (`encode_compact_map0`). Both validate ids
+    // (bounds, per-token distinctness) before any id indexes memory.
     //
     // ADR-011 Phase 3 Wave P3b-tensor.2 — pick the map0 instantiation
     // whose `ne20` template arg matches our top_k.  Gemma 4 needs both:

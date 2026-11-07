@@ -704,8 +704,7 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
 // map0c — compact per-expert tile schedule builder (ADR-063 P2)
 // ====================================================================
 //
-// Same launch as map0: one threadgroup of `ntg == n_experts` threads, one
-// thread per expert id. Output layout:
+// Output layout:
 //
 //   htpe word 0           — tile_count, or POISON (bit 31) when any token has
 //                            an out-of-range or duplicate expert id, or the
@@ -719,19 +718,39 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
 //                            (count + 1) over experts < e, and hold
 //                            `token * ne20 + slot` in ascending token order,
 //                            so each expert's 32-row tiles have exactly the
-//                            membership of the uniform-grid schedule.
+//                            membership of the uniform-grid schedule. The
+//                            one padding entry per slice is never written.
 //
-// The staging thread validates its own token (every id < n_experts, the
-// ne20 ids pairwise distinct) — the map0 predicate, evaluated once per
-// token. Threadgroup memory: ntg*ne20 staged ids followed by 3*ntg + 2
-// bookkeeping words.
+// Launch: one threadgroup of `ntg = 32 * G` threads (G simdgroups, chosen by
+// the host from the threadgroup-memory budget; independent of n_experts).
+// Token-parallel: in each round of `ntg` tokens, thread i owns token
+// round + i, so lane l of simdgroup g owns token round + 32g + l.
+//
+//   Pass 1  the owner validates its token (every id < n_experts, the ne20
+//           ids pairwise distinct; the map0 predicate, once per token) and
+//           adds its valid ids to per-expert counts (threadgroup atomics;
+//           the sum is order-free).
+//   Scan    exclusive prefix sums over experts of (count + 1) and
+//           ceil(count / 32); poison on an invalid token or more than
+//           `max_tiles` tiles; each expert then writes its own descriptors.
+//   Pass 2  per round, each simdgroup ORs bit `lane` into its per-expert
+//           mask for every id of its tokens. The entry index of (token,
+//           slot -> expert e) is e's running write position, plus the set
+//           bits of e's masks in earlier simdgroups (an exclusive simd scan
+//           across the G masks), plus the bits below `lane` in its own mask:
+//           ascending token order, without a per-expert sequential scan.
+//
+// Threadgroup memory (words): next[n_experts] (pass-1 counts, then slice
+// starts, then write positions), masks[max(G, 2) * n_experts] (lane masks,
+// then write offsets; the scan keeps the counts and first tiles in its first
+// 2 * n_experts words), part[2 * G] (scan partials), invalid[1].
 
 struct GgmlMatmulIdMm_Map0cParams {
     int32_t  ne21;      // n_tokens
     int32_t  ne20;      // n_expert_used (== top_k)
     uint64_t nb21;      // bytes per token in the source ids table
     uint32_t max_tiles; // descriptor capacity bound
-    uint32_t _pad;
+    uint32_t n_experts; // ne02
 };
 
 template<short ne20>
@@ -742,128 +761,179 @@ kernel void hf2q_mul_mm_id_map0c_impl(
         device       char * hids [[buffer(3)]],
         threadgroup  char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
-    const uint32_t ide = tpitg;
+        ushort   ntg[[threads_per_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const uint n_experts = args.n_experts;
+    const int  n_tokens  = args.ne21;
+    const uint G  = ntg / 32;
+    const uint MG = max(G, 2u);
 
-    // Staged ids are uint16 (n_experts fits in a threadgroup, so every valid
-    // id is < 65535); an id that does not fit saturates to 0xFFFF, which never
-    // matches an expert, and the token is poisoned by its staging thread.
-    threadgroup uint16_t * sids  = (threadgroup uint16_t *) shmem;
-    threadgroup uint32_t * soff  = (threadgroup uint32_t *) shmem + ntg * ne20;
-    threadgroup uint32_t * stile = soff + ntg;
-    threadgroup uint32_t * sflag = stile + ntg;
-    threadgroup uint32_t * stot  = sflag + ntg;
+    threadgroup atomic_uint * next    = (threadgroup atomic_uint *) shmem;
+    threadgroup atomic_uint * masks   = next + n_experts;
+    threadgroup uint        * part    = (threadgroup uint *) (masks + MG * n_experts);
+    threadgroup atomic_uint * invalid = (threadgroup atomic_uint *) (part + 2 * G);
 
-    // ---- Pass 1: validate staged tokens and count this expert's rows ----
-    // Counting is branch-free: every slot is compared (validated ids are
-    // pairwise distinct, so the sum equals the number of matching tokens).
-    bool staged_invalid = false;
-    uint32_t n_all = 0;
-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
-        if (i21 + tpitg < args.ne21) {
-            device const uint32_t * src2_u32 =
-                (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
+    for (uint e = tpitg; e < n_experts; e += ntg) {
+        atomic_store_explicit(&next[e], 0u, memory_order_relaxed);
+    }
+    if (tpitg == 0) {
+        atomic_store_explicit(invalid, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Pass 1: validate owned tokens, count rows per expert ----
+    bool bad = false;
+    for (int i0 = 0; i0 < n_tokens; i0 += ntg) {
+        const int t = i0 + tpitg;
+        if (t < n_tokens) {
+            device const uint32_t * row =
+                (device const uint32_t *) (src2 + (uint64_t) t * args.nb21);
             uint32_t own[ne20];
-            bool token_invalid = false;
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                const uint32_t id = src2_u32[i20];
-                own[i20] = id;
-                token_invalid |= id >= ntg;
+                own[i20] = row[i20];
+                bad |= own[i20] >= n_experts;
 #pragma unroll
                 for (short other = 0; other < i20; other++) {
-                    token_invalid |= id == own[other];
+                    bad |= own[i20] == own[other];
                 }
-                sids[tpitg * ne20 + i20] = id > 0xFFFEu ? (uint16_t) 0xFFFF : (uint16_t) id;
             }
-            staged_invalid |= token_invalid;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        const int staged = min((int) ntg, args.ne21 - i21);
-        for (int t = 0; t < staged; t++) {
-            threadgroup const uint16_t * sids_t = sids + t * ne20;
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                n_all += sids_t[i20] == ide ? 1u : 0u;
+                if (own[i20] < n_experts) {
+                    atomic_fetch_add_explicit(&next[own[i20]], 1u, memory_order_relaxed);
+                }
             }
         }
+    }
+    if (simd_any(bad) && tiisg == 0) {
+        atomic_store_explicit(invalid, 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Scan: slice starts and first tiles, in chunks of ntg experts ----
+    uint carry_entry = 0;
+    uint carry_tile  = 0;
+    for (uint e0 = 0; e0 < n_experts; e0 += ntg) {
+        const uint e = e0 + tpitg;
+        const uint count = e < n_experts
+            ? atomic_load_explicit(&next[e], memory_order_relaxed) : 0u;
+        const uint v_entry = e < n_experts ? count + 1u : 0u;
+        const uint v_tile  = (count + 31u) / 32u;
+        const uint p_entry = simd_prefix_exclusive_sum(v_entry);
+        const uint p_tile  = simd_prefix_exclusive_sum(v_tile);
+        if (tiisg == 31) {
+            part[sgitg]     = p_entry + v_entry;
+            part[G + sgitg] = p_tile + v_tile;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint s_entry = tiisg < G ? part[tiisg] : 0u;
+        const uint s_tile  = tiisg < G ? part[G + tiisg] : 0u;
+        const uint before_entry = simd_shuffle(simd_prefix_exclusive_sum(s_entry), sgitg);
+        const uint before_tile  = simd_shuffle(simd_prefix_exclusive_sum(s_tile), sgitg);
+        if (e < n_experts) {
+            atomic_store_explicit(&next[e], carry_entry + before_entry + p_entry,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&masks[e], count, memory_order_relaxed);
+            atomic_store_explicit(&masks[n_experts + e], carry_tile + before_tile + p_tile,
+                                  memory_order_relaxed);
+        }
+        carry_entry += simd_sum(s_entry);
+        carry_tile  += simd_sum(s_tile);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    soff[ide]  = n_all;
-    stile[ide] = (n_all + 31) / 32;
-    sflag[ide] = staged_invalid ? 1u : 0u;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ---- Exclusive prefix sums of list slices and tile counts ----
+    const bool poison =
+        atomic_load_explicit(invalid, memory_order_relaxed) != 0u || carry_tile > args.max_tiles;
     if (tpitg == 0) {
-        uint32_t entry = 0;
-        uint32_t tile = 0;
-        uint32_t invalid = 0;
-        for (ushort e = 0; e < ntg; e++) {
-            const uint32_t count = soff[e];
-            const uint32_t tiles = stile[e];
-            soff[e]  = entry;
-            stile[e] = tile;
-            entry += count + 1;
-            tile  += tiles;
-            invalid |= sflag[e];
-        }
-        const bool poison = invalid != 0u || tile > args.max_tiles;
-        stot[0] = tile;
-        stot[1] = poison ? 1u : 0u;
         device uint32_t * word0 = (device uint32_t *) htpe;
-        word0[0] = poison ? 0x80000000u : tile;
+        word0[0] = poison ? 0x80000000u : carry_tile;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (stot[1] != 0u) {
+    if (poison) {
         return;
     }
 
-    // ---- Tile descriptors for this expert ----
-    const uint32_t first_entry = soff[ide];
-    const uint32_t first_tile  = stile[ide];
-    device uint32_t * desc = (device uint32_t *) htpe + 1 + 3 * first_tile;
-    for (uint32_t r = 0; r < n_all; r += 32) {
-        desc[0] = ide;
-        desc[1] = first_entry + r;
-        desc[2] = (n_all - r < 32u) ? (n_all - r) : 32u;
-        desc += 3;
+    // ---- Tile descriptors, each expert its own ----
+    for (uint e = tpitg; e < n_experts; e += ntg) {
+        const uint count = atomic_load_explicit(&masks[e], memory_order_relaxed);
+        const uint first_entry = atomic_load_explicit(&next[e], memory_order_relaxed);
+        device uint32_t * desc = (device uint32_t *) htpe + 1
+            + 3 * atomic_load_explicit(&masks[n_experts + e], memory_order_relaxed);
+        for (uint r = 0; r < count; r += 32) {
+            desc[0] = e;
+            desc[1] = first_entry + r;
+            desc[2] = (count - r < 32u) ? (count - r) : 32u;
+            desc += 3;
+        }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tpitg; i < G * n_experts; i += ntg) {
+        atomic_store_explicit(&masks[i], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Pass 2: this expert's entries in ascending token order ----
-    // One store per staged token for every thread, match or not: divergent
-    // conditional stores are slow. A token without a match writes a dummy
-    // to the next free entry, which the next match overwrites; after the
-    // last match it lands on the slice's padding entry (slices are padded by
-    // one entry), which no reader consumes.
-    device int32_t * list = (device int32_t *) hids + first_entry;
-    uint32_t written = 0;
-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
-        if (i21 + tpitg < args.ne21) {
-            device const uint32_t * src2_u32 =
-                (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
+    // ---- Pass 2: entries in ascending token order ----
+    // Every id is valid here (an invalid token poisoned the schedule).
+    threadgroup atomic_uint * own_masks = masks + sgitg * n_experts;
+    device int32_t * list = (device int32_t *) hids;
+    const uint below = (1u << tiisg) - 1u;
+    for (int i0 = 0; i0 < n_tokens; i0 += ntg) {
+        const int t = i0 + tpitg;
+        const bool live = t < n_tokens;
+        uint32_t own[ne20];
+        uint32_t rank[ne20];
+        if (live) {
+            device const uint32_t * row =
+                (device const uint32_t *) (src2 + (uint64_t) t * args.nb21);
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                const uint32_t id = src2_u32[i20];
-                sids[tpitg * ne20 + i20] = id > 0xFFFEu ? (uint16_t) 0xFFFF : (uint16_t) id;
+                own[i20] = row[i20];
+                atomic_fetch_or_explicit(&own_masks[own[i20]], 1u << tiisg, memory_order_relaxed);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        const int staged = min((int) ntg, args.ne21 - i21);
-        for (int t = 0; t < staged; t++) {
-            threadgroup const uint16_t * sids_t = sids + t * ne20;
-            int first = -1;
+        if (live) {
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                first = (first < 0 && sids_t[i20] == ide) ? i20 : first;
+                rank[i20] = popcount(
+                    atomic_load_explicit(&own_masks[own[i20]], memory_order_relaxed) & below);
             }
-            list[written] = first >= 0 ? (i21 + t) * ne20 + first : 0;
-            written += first >= 0 ? 1u : 0u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Masks -> write offsets: simdgroup sgitg converts experts
+        // sgitg, sgitg + G, ...; lane g holds simdgroup g's mask and lane 0
+        // owns the expert's write position.
+        for (uint e = sgitg; e < n_experts; e += G) {
+            threadgroup atomic_uint * cell = masks + tiisg * n_experts + e;
+            const uint bits = tiisg < G
+                ? popcount(atomic_load_explicit(cell, memory_order_relaxed)) : 0u;
+            const uint base = simd_shuffle(
+                tiisg == 0 ? atomic_load_explicit(&next[e], memory_order_relaxed) : 0u, 0);
+            const uint offset = base + simd_prefix_exclusive_sum(bits);
+            if (tiisg < G) {
+                atomic_store_explicit(cell, offset, memory_order_relaxed);
+            }
+            const uint total = simd_sum(bits);
+            if (tiisg == 0) {
+                atomic_store_explicit(&next[e], base + total, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (live) {
+#pragma unroll
+            for (short i20 = 0; i20 < ne20; i20++) {
+                list[atomic_load_explicit(&own_masks[own[i20]], memory_order_relaxed) + rank[i20]] =
+                    t * ne20 + i20;
+            }
+        }
+        if (i0 + (int) ntg < n_tokens) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = tpitg; i < G * n_experts; i += ntg) {
+                atomic_store_explicit(&masks[i], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 }
 
@@ -871,19 +941,19 @@ template [[host_name("kernel_mul_mm_id_map0c_ne20_1")]]
 kernel void hf2q_mul_mm_id_map0c_impl<1>(
     constant GgmlMatmulIdMm_Map0cParams &,
     device const char *, device char *, device char *,
-    threadgroup char *, ushort, ushort);
+    threadgroup char *, ushort, ushort, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_id_map0c_ne20_6")]]
 kernel void hf2q_mul_mm_id_map0c_impl<6>(
     constant GgmlMatmulIdMm_Map0cParams &,
     device const char *, device char *, device char *,
-    threadgroup char *, ushort, ushort);
+    threadgroup char *, ushort, ushort, ushort, ushort);
 
 template [[host_name("kernel_mul_mm_id_map0c_ne20_8")]]
 kernel void hf2q_mul_mm_id_map0c_impl<8>(
     constant GgmlMatmulIdMm_Map0cParams &,
     device const char *, device char *, device char *,
-    threadgroup char *, ushort, ushort);
+    threadgroup char *, ushort, ushort, ushort, ushort);
 
 // ====================================================================
 // mul_mm_id — MoE matmul using the map0-produced expert token lists
