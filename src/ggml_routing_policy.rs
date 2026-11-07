@@ -50,6 +50,7 @@ fn combine_routing_policies(
         expert_q8_0_mv_nr2: expert.expert_q8_0_mv_nr2,
         expert_tensor_mm: expert.expert_tensor_mm,
         expert_mm_schedule: expert.expert_mm_schedule,
+        q5_0_tensor_mm: expert.q5_0_tensor_mm,
     }
 }
 
@@ -76,6 +77,7 @@ mod tests {
             expert_q8_0_mv_nr2: true,
             expert_tensor_mm: GgmlTensorMmPreference::ForceSimd,
             expert_mm_schedule: ExpertMmSchedule::UniformGrid,
+            q5_0_tensor_mm: true,
             ..GgmlRoutingPolicy::default()
         };
         let policy = combine_routing_policies(dense, expert);
@@ -91,6 +93,8 @@ mod tests {
         assert!(policy.expert_q8_0_mv_nr2);
         assert_eq!(policy.expert_tensor_mm, GgmlTensorMmPreference::ForceSimd);
         assert_eq!(policy.expert_mm_schedule, ExpertMmSchedule::UniformGrid);
+        assert!(policy.q5_0_tensor_mm);
+        assert!(!combine_routing_policies(dense, GgmlRoutingPolicy::default()).q5_0_tensor_mm);
     }
 
     #[test]
@@ -113,6 +117,7 @@ mod tests {
         assert!(policy.expert_q8_0_mv_nr2);
         assert_eq!(policy.expert_tensor_mm, GgmlTensorMmPreference::ForceSimd);
         assert_eq!(policy.expert_mm_schedule, ExpertMmSchedule::UniformGrid);
+        assert!(policy.q5_0_tensor_mm);
     }
 
     #[test]
@@ -136,7 +141,8 @@ mod tests {
                 .env("HF2Q_Q6K_ID_MV_NR2", "0")
                 .env("HF2Q_Q8_0_ID_MV_NR2", "1")
                 .env("HF2Q_MM_ID_SCHEDULE", "grid")
-                .env("HF2Q_DISABLE_TENSOR_MM_ID", "1");
+                .env("HF2Q_DISABLE_TENSOR_MM_ID", "1")
+                .env("HF2Q_Q5_0_TENSOR_MM", "1");
             if let Some(value) = q5 {
                 command.env("HF2Q_Q5K_CANONICAL_Q4X4", value);
             } else {
