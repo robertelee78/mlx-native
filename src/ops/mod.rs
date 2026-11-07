@@ -13,6 +13,7 @@ pub mod deepseek_hyper_connection;
 pub mod deepseek_indexer;
 pub mod deepseek_moe_activation;
 pub mod deepseek_moe_routing;
+pub mod deepseek_rows;
 pub mod deepseek_sparse_attention;
 pub mod deepseek_sparse_prefill_mask;
 pub mod deepseek_tail_rope;
