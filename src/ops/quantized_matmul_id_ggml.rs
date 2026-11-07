@@ -578,6 +578,215 @@ pub fn quantized_matmul_id_ggml_mv_q4_k_nr2(
     Ok(())
 }
 
+/// Row sums per Q4_K nr2 SIMD group at reduction length `k`: 2 rows times
+/// the row-group fold (4 / nb for nb = 1, 2 super-blocks per row, else 1).
+fn q4_k_nr2_columns_per_simdgroup(k: u32) -> usize {
+    let fold: usize = match k / 256 {
+        1 => 4,
+        2 => 2,
+        _ => 1,
+    };
+    2 * fold
+}
+
+fn check_f32_elements(op: &str, label: &str, buf: &MlxBuffer, elements: usize) -> Result<()> {
+    if buf.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{op}: {label} must be F32, got {:?}",
+            buf.dtype()
+        )));
+    }
+    let bytes = checked_byte_extent(label, &[elements, DType::F32.size_of()])?;
+    if buf.data_byte_len() < bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "{op}: {label} too small: expected {bytes} bytes, got {}",
+            buf.data_byte_len()
+        )));
+    }
+    Ok(())
+}
+
+/// ADR-063 Q4-QWEN36 F5: Q4_K expert gate + up + SwiGLU in one mv_id at the
+/// peer's nr2 layout. `output[pair, col] = silu(g) * u`, where `g` and `u`
+/// are what [`quantized_matmul_id_ggml_mv_q4_k_nr2`] writes for the gate
+/// and the up weight, and the SwiGLU expression is `silu_mul_f32`'s; the
+/// result is bitwise that three-dispatch sequence. Both weights share
+/// `params.expert_stride`. Each pair's output is independent of the other
+/// pairs of the dispatch. Out-of-range ids write NaN.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_q4_k_nr2_swiglu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gate_weight: &MlxBuffer,
+    up_weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    if params.ggml_type != GgmlType::Q4_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_mv_q4_k_nr2_swiglu requires Q4_K, got {:?}",
+            params.ggml_type
+        )));
+    }
+    validate_id_call(input, gate_weight, ids, output, params, params.n)?;
+    validate_id_call(input, up_weight, ids, output, params, params.n)?;
+
+    let pipeline =
+        registry.get_pipeline("kernel_mul_mv_id_q4_K_f32_nr2_swiglu", device.metal_device())?;
+    let gpu_params = mv_id_gpu_params(params);
+    let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
+    // Two SIMD groups per threadgroup.
+    let columns_per_threadgroup = 2 * q4_k_nr2_columns_per_simdgroup(params.k);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(gate_weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (5, KernelArg::Buffer(up_weight)),
+        ],
+        metal::MTLSize::new(
+            div_ceil(params.n as usize, columns_per_threadgroup) as u64,
+            total_rows,
+            1,
+        ),
+        metal::MTLSize::new(32, 2, 1),
+    );
+    Ok(())
+}
+
+/// GPU params of the down + reduce epilogue; must match the Metal
+/// `MoeDownReduceParams`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MoeDownReduceGpuParams {
+    add_residual: u32,
+}
+
+/// Widest `top_k` the fused down + reduce kernel accepts (one SIMD group per
+/// slot, 32 x 32 = 1024 threads).
+pub const MOE_DOWN_REDUCE_MAX_TOP_K: u32 = 32;
+
+/// Routing and shared-expert operands of the fused MoE down + reduce.
+pub struct MoeDownReduceOperands<'a> {
+    /// `[n_tokens * top_k]` renormalized routing weights.
+    pub route_weights: &'a MlxBuffer,
+    /// `[n_tokens]` raw (pre-sigmoid) shared-expert gate logits.
+    pub sh_logit: &'a MlxBuffer,
+    /// `[n_tokens, n]` shared-expert outputs.
+    pub y_shared: &'a MlxBuffer,
+    /// `[n_tokens, n]` residual added last, when given.
+    pub residual: Option<&'a MlxBuffer>,
+}
+
+/// ADR-063 Q4-QWEN36 F5: expert down + `moe_weighted_reduce_f32` in one
+/// dispatch. `params` describes the token rows: `n_tokens` rows, `top_k`
+/// slots each, `n` output columns (hidden), `k` the SwiGLU width. `input` is
+/// `[n_tokens * top_k, k]` (pair `t * top_k + s` reads its own row), `ids`
+/// `[n_tokens * top_k]`, `output` `[n_tokens, n]`.
+///
+/// Q4_K takes the [`quantized_matmul_id_ggml_mv_q4_k_nr2`] layout, Q6_K the
+/// `kernel_mul_mv_id_q6_K_f32_nr2` layout; the reduce is
+/// `moe_weighted_reduce_f32`'s expression in slot order. The output is
+/// bitwise the down mv_id (`n_tokens * top_k` pairs, top-1) followed by
+/// `dispatch_moe_weighted_reduce`. A token row's output depends only on
+/// that row's operands.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_nr2_moe_reduce(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    operands: &MoeDownReduceOperands<'_>,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    const OP: &str = "quantized_matmul_id_ggml_mv_nr2_moe_reduce";
+    let (kernel, columns_per_threadgroup) = match params.ggml_type {
+        GgmlType::Q4_K => (
+            "kernel_mul_mv_id_q4_K_f32_nr2_moe_reduce",
+            q4_k_nr2_columns_per_simdgroup(params.k),
+        ),
+        GgmlType::Q6_K => ("kernel_mul_mv_id_q6_K_f32_nr2_moe_reduce", 2),
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP} requires Q4_K or Q6_K, got {other:?}"
+            )))
+        }
+    };
+    if params.top_k == 0 || params.top_k > MOE_DOWN_REDUCE_MAX_TOP_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: top_k must be in 1..={MOE_DOWN_REDUCE_MAX_TOP_K}, got {}",
+            params.top_k
+        )));
+    }
+    if params.ggml_type == GgmlType::Q6_K && params.n % 2 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: Q6_K needs an even output width, got {}",
+            params.n
+        )));
+    }
+    let pairs = (params.n_tokens as usize)
+        .checked_mul(params.top_k as usize)
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: pair count overflow")))?;
+    let pair_count = u32::try_from(pairs)
+        .map_err(|_| MlxError::InvalidArgument(format!("{OP}: pair count overflow")))?;
+    // Input, weight and ids as the one-pair-per-row down call sees them.
+    let pair_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: pair_count,
+        top_k: 1,
+        ..*params
+    };
+    validate_id_call(input, weight, ids, input, &pair_params, params.k)?;
+    let rows = params.n_tokens as usize;
+    let n = params.n as usize;
+    check_f32_elements(OP, "output", output, rows * n)?;
+    check_f32_elements(OP, "route_weights", operands.route_weights, pairs)?;
+    check_f32_elements(OP, "sh_logit", operands.sh_logit, rows)?;
+    check_f32_elements(OP, "y_shared", operands.y_shared, rows * n)?;
+    if let Some(residual) = operands.residual {
+        check_f32_elements(OP, "residual", residual, rows * n)?;
+    }
+
+    let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
+    // ne1 = n_tokens * top_k (pairs), ne01 = ne0 = n.
+    let gpu_params = mv_id_gpu_params(params);
+    let reduce_params = MoeDownReduceGpuParams {
+        add_residual: u32::from(operands.residual.is_some()),
+    };
+    // Without a residual the kernel never reads buffer(8); bind y_shared.
+    let residual = operands.residual.unwrap_or(operands.y_shared);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (5, KernelArg::Buffer(operands.route_weights)),
+            (6, KernelArg::Buffer(operands.sh_logit)),
+            (7, KernelArg::Buffer(operands.y_shared)),
+            (8, KernelArg::Buffer(residual)),
+            (9, KernelArg::Bytes(as_bytes(&reduce_params))),
+        ],
+        metal::MTLSize::new(
+            div_ceil(n, columns_per_threadgroup) as u64,
+            u64::from(params.n_tokens),
+            1,
+        ),
+        metal::MTLSize::new(32, u64::from(params.top_k), 1),
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quantized_matmul_id_ggml_impl(
     encoder: &mut CommandEncoder,

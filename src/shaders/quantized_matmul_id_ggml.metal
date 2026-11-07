@@ -2313,3 +2313,411 @@ template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4")]]
 kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<4>(
     device const char *, device const float *, device float *, device const uint *,
     constant GgmlMatvecIdParams &, uint3, uint, uint);
+
+// ====================================================================
+// Qwen3.6 fused MoE decode (ADR-063 Q4-QWEN36 F5): gate + up + SwiGLU in
+// one mv_id, and expert down + weighted reduce in one mv_id
+// ====================================================================
+//
+// Both kernels keep the per-(pair, column) arithmetic of the peer-layout
+// kernels above (`kernel_mul_mv_id_q4_K_f32_nr2`,
+// `kernel_mul_mv_id_q6_K_f32_nr2`): the same lane split, the same per-lane
+// K loop and the same `simd_sum`. The epilogues are literal clones of
+// `silu_mul_f32` (silu_mul.metal) and `moe_weighted_reduce_f32`
+// (moe_weighted_reduce.metal), so a fused result equals the unfused
+// sequence; the gates in tests/test_qwen36_fused_moe.rs hold that bitwise.
+// A pair's (and so a token row's) result never depends on the other pairs
+// or rows of the dispatch.
+
+// The K loop of `kernel_mul_mv_id_q4_K_f32_nr2` for one weight matrix:
+// rows `x` and `x + row_step` (uint16 units) of this lane's row group,
+// accumulated into sumf[0..2). Weight matrices are walked one after
+// another, never interleaved, so each matrix's loop is the stock one.
+inline void q4_K_nr2_matrix_sums(
+    device const block_q4_K * x,
+    const int row_step,
+    device const float * y4,
+    const int nb,
+    const short ix,
+    const short block_lanes,
+    const short iq,
+    const short ir,
+    thread float * sumf
+) {
+    constexpr short NR0 = 2;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    float yl[16];
+    float yh[16];
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += block_lanes) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half     * dh = &x[ib].d;
+
+        for (short row = 0; row < NR0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            _Pragma("clang loop unroll(full)")
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += row_step;
+            sc += row_step;
+            dh += row_step;
+        }
+
+        y4 += block_lanes * QK_K;
+    }
+}
+
+// The K loop of `kernel_mul_mv_id_q6_K_f32_nr2` for two rows starting at
+// `x_base`, accumulated into sumf[0..2).
+inline void q6_K_nr2_matrix_sums(
+    device const block_q6_K * x_base,
+    device const float * yy,
+    const int nb,
+    const ushort tiisg,
+    thread float * sumf
+) {
+    constexpr int nr0 = 2;
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    float yl[16];
+
+    const short tid  = tiisg / 2;
+    const short ix   = tiisg % 2;
+    const short ip   = tid / 8;
+    const short il   = tid % 8;
+    const short l0   = 4 * il;
+    const short is   = 8*ip + l0/16;
+
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l = 64*ip + l0;
+    const short q_offset_h = 32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float * y = yy + i * QK_K + y_offset;
+        for (int l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (int row = 0; row < nr0; ++row) {
+            device const block_q6_K * xr = x_base + row * nb;
+            device const uint8_t * q1 = xr[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xr[i].qh + q_offset_h;
+            device const int8_t  * sc = xr[i].scales + is;
+
+            const float dall = xr[i].d;
+
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[row] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+}
+
+// ---- Q4_K gate + up + SwiGLU ----
+//
+// `kernel_mul_mv_id_q4_K_f32_nr2` over the gate weight and then over the up
+// weight (same expert stride, same pair, same output columns), and lane 0
+// writes `silu_mul_f32`'s expression of the two row sums:
+// dst[pair * ne0 + col] = (g / (1 + exp(-g))) * u. An out-of-range id
+// writes NaN (the stock poison; SwiGLU of NaN is NaN).
+//
+// Dispatch: threadgroups (ceil(N / (4 * FOLD)), n_tokens * top_k, 1),
+// threads (32, 2, 1); FOLD as in the nr2 kernel.
+kernel void kernel_mul_mv_id_q4_K_f32_nr2_swiglu(
+    device const  char  * src_gate [[buffer(0)]],
+    device const float  * src1     [[buffer(1)]],
+    device       float  * dst      [[buffer(2)]],
+    device const  uint  * ids      [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    device const  char  * src_up   [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short NR0 = 2;
+
+    const int pair = (int)tgpig.y;  // flat: token * top_k + slot
+    if (pair >= (int)p.ne1) return;
+
+    const uint token_idx = (uint)pair / p.top_k;
+    const uint expert_id = ids[pair];
+
+    const int nb = p.ne00 / QK_K;
+    const short fold = (nb == 1) ? 4 : (nb == 2) ? 2 : 1;
+    const short block_lanes = 4 / fold;
+
+    const int sg_first_row = ((int)tgpig.x * NSG + (int)sgitg) * NR0 * fold;
+
+    if (poison_invalid_expert_id(
+            dst, p, expert_id, pair, sg_first_row, NR0 * fold, tiisg == 0)) return;
+    if (sg_first_row >= (int)p.ne01) return;
+
+    const short ix = (tiisg/8) % block_lanes;
+    const short rg = (tiisg/8) / block_lanes;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    const int first_row = sg_first_row + rg * NR0;
+    const int last_row = (int)p.ne01 - 1;
+    const int row0 = min(first_row, last_row);
+    const int row_step = (first_row + 1 <= last_row)
+        ? nb * (int)(sizeof(block_q4_K) / sizeof(uint16_t)) : 0;
+
+    device const block_q4_K * xg = (device const block_q4_K *)(src_gate + expert_id * p.expert_stride) + row0 * nb;
+    device const block_q4_K * xu = (device const block_q4_K *)(src_up   + expert_id * p.expert_stride) + row0 * nb;
+    device const float      * y  = src1 + token_idx * p.ne10;
+    device const float      * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+    float sum_gate[NR0] = {0.f};
+    float sum_up[NR0]   = {0.f};
+    q4_K_nr2_matrix_sums(xg, row_step, y4, nb, ix, block_lanes, iq, ir, sum_gate);
+    q4_K_nr2_matrix_sums(xu, row_step, y4, nb, ix, block_lanes, iq, ir, sum_up);
+
+    for (short g = 0; g < fold; ++g) {
+        for (short row = 0; row < NR0; ++row) {
+            const float gate = simd_sum(rg == g ? sum_gate[row] : 0.f);
+            const float up   = simd_sum(rg == g ? sum_up[row]   : 0.f);
+            const int out_row = sg_first_row + g * NR0 + row;
+            if (tiisg == 0 && out_row < (int)p.ne01) {
+                const float silu_g = gate / (1.0f + metal::exp(-gate));
+                dst[pair * p.ne0 + out_row] = silu_g * up;
+            }
+        }
+    }
+}
+
+// ---- expert down + weighted reduce ----
+//
+// One threadgroup owns token row t and a tile of C output columns; its
+// SIMD group k computes pair t * top_k + k over the tile exactly as the
+// nr2 down kernel's SIMD group does (Q4_K: C = 2 * FOLD columns; Q6_K:
+// C = 2), parks the row sums in threadgroup memory, and after one barrier
+// lanes 0..C-1 apply `moe_weighted_reduce_f32`'s expression in slot order:
+// acc = sum_k w[k] * y[k]; acc += sigmoid(sh_logit[t]) * y_shared[t, col];
+// acc += residual[t, col] (when add_residual); out[t, col] = acc.
+// An out-of-range id contributes NaN, as its poisoned y row does in the
+// unfused sequence.
+//
+// The input is the [n_tokens * top_k, K] SwiGLU rows (pair p reads row p);
+// p.ne1 = n_tokens * top_k, p.ne01 = p.ne0 = N (hidden).
+// Dispatch: threadgroups (ceil(N / C), n_tokens, 1), threads (32, top_k, 1),
+// top_k <= 32.
+
+struct MoeDownReduceParams {
+    uint add_residual;
+};
+
+#define MOE_DOWN_REDUCE_MAX_SLOTS 32
+#define MOE_DOWN_REDUCE_MAX_COLS  8
+
+inline void moe_down_reduce_epilogue(
+    threadgroup const float * tg_sums,
+    int C,
+    int t,
+    int col_in_tile,
+    int col,
+    constant GgmlMatvecIdParams & p,
+    constant MoeDownReduceParams & rp,
+    device const float * expert_w,
+    device const float * sh_logit,
+    device const float * y_shared,
+    device const float * residual,
+    device       float * output
+) {
+    const uint h = (uint)p.ne01;
+    float acc = 0.f;
+    for (uint k = 0; k < p.top_k; k++) {
+        const uint slot = t * p.top_k + k;
+        acc += expert_w[slot] * tg_sums[k * C + col_in_tile];
+    }
+
+    const float sh_gate = 1.f / (1.f + exp(-sh_logit[t]));
+    acc += sh_gate * y_shared[t * h + col];
+
+    if (rp.add_residual != 0) {
+        acc += residual[t * h + col];
+    }
+
+    output[t * h + col] = acc;
+}
+
+kernel void kernel_mul_mv_id_q4_K_f32_nr2_moe_reduce(
+    device const  char  * src0     [[buffer(0)]],
+    device const float  * src1     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    device const  uint  * ids      [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    device const float  * expert_w [[buffer(5)]],
+    device const float  * sh_logit [[buffer(6)]],
+    device const float  * y_shared [[buffer(7)]],
+    device const float  * residual [[buffer(8)]],
+    constant MoeDownReduceParams & rp [[buffer(9)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort tiitg [[thread_index_in_threadgroup]]
+) {
+    constexpr short NR0 = 2;
+    threadgroup float tg_sums[MOE_DOWN_REDUCE_MAX_SLOTS * MOE_DOWN_REDUCE_MAX_COLS];
+
+    const int t = (int)tgpig.y;
+    if (t >= (int)p.n_tokens) return;  // uniform per threadgroup
+
+    const int pair = t * (int)p.top_k + (int)sgitg;
+    const uint expert_id = ids[pair];
+    const bool valid = (uint64_t)expert_id < (uint64_t)p.ne02;
+
+    const int nb = p.ne00 / QK_K;
+    const short fold = (nb == 1) ? 4 : (nb == 2) ? 2 : 1;
+    const short block_lanes = 4 / fold;
+    const int C = NR0 * fold;
+    const int tile_first = (int)tgpig.x * C;
+
+    const short ix = (tiisg/8) % block_lanes;
+    const short rg = (tiisg/8) / block_lanes;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    float sumf[NR0] = {0.f};
+    if (valid && tile_first < (int)p.ne01) {
+        const int first_row = tile_first + rg * NR0;
+        const int last_row = (int)p.ne01 - 1;
+        const int row0 = min(first_row, last_row);
+        const int row_step = (first_row + 1 <= last_row)
+            ? nb * (int)(sizeof(block_q4_K) / sizeof(uint16_t)) : 0;
+
+        device const block_q4_K * x = (device const block_q4_K *)(src0 + expert_id * p.expert_stride) + row0 * nb;
+        device const float      * y = src1 + pair * p.ne10;
+        device const float      * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+        q4_K_nr2_matrix_sums(x, row_step, y4, nb, ix, block_lanes, iq, ir, sumf);
+    }
+
+    // Stock NaN poison rebuilt at run time (default Metal math may fold a
+    // compile-time NAN operand); p.r2 is always 1.
+    const float poison = as_type<float>(as_type<uint>(NAN) + (p.r2 - 1u));
+    for (short g = 0; g < fold; ++g) {
+        for (short row = 0; row < NR0; ++row) {
+            const float tot = simd_sum(rg == g ? sumf[row] : 0.f);
+            if (tiisg == 0) {
+                tg_sums[sgitg * C + g * NR0 + row] = valid ? tot : poison;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int col = tile_first + (int)tiitg;
+    if ((int)tiitg < C && col < (int)p.ne01) {
+        moe_down_reduce_epilogue(tg_sums, C, t, (int)tiitg, col, p, rp,
+                                 expert_w, sh_logit, y_shared, residual, output);
+    }
+}
+
+kernel void kernel_mul_mv_id_q6_K_f32_nr2_moe_reduce(
+    device const  char  * src0     [[buffer(0)]],
+    device const float  * src1     [[buffer(1)]],
+    device       float  * output   [[buffer(2)]],
+    device const  uint  * ids      [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    device const float  * expert_w [[buffer(5)]],
+    device const float  * sh_logit [[buffer(6)]],
+    device const float  * y_shared [[buffer(7)]],
+    device const float  * residual [[buffer(8)]],
+    constant MoeDownReduceParams & rp [[buffer(9)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort tiitg [[thread_index_in_threadgroup]]
+) {
+    constexpr int nr0 = 2;
+    constexpr int C = nr0;
+    threadgroup float tg_sums[MOE_DOWN_REDUCE_MAX_SLOTS * MOE_DOWN_REDUCE_MAX_COLS];
+
+    const int t = (int)tgpig.y;
+    if (t >= (int)p.n_tokens) return;  // uniform per threadgroup
+
+    const int pair = t * (int)p.top_k + (int)sgitg;
+    const uint expert_id = ids[pair];
+    const bool valid = (uint64_t)expert_id < (uint64_t)p.ne02;
+
+    const int nb = p.ne00 / QK_K;
+    const int first_row = (int)tgpig.x * C;
+
+    float sumf[nr0] = {0.f, 0.f};
+    if (valid) {
+        device const block_q6_K * x_base = (device const block_q6_K *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
+        device const float      * yy = src1 + pair * p.ne10;
+        q6_K_nr2_matrix_sums(x_base, yy, nb, tiisg, sumf);
+    }
+
+    const float poison = as_type<float>(as_type<uint>(NAN) + (p.r2 - 1u));
+    for (int row = 0; row < nr0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            tg_sums[sgitg * C + row] = valid ? tot : poison;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int col = first_row + (int)tiitg;
+    if ((int)tiitg < C && col < (int)p.ne01) {
+        moe_down_reduce_epilogue(tg_sums, C, t, (int)tiitg, col, p, rp,
+                                 expert_w, sh_logit, y_shared, residual, output);
+    }
+}
