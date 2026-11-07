@@ -1,7 +1,10 @@
-//! `gated_delta_net_decode_f32_<NSG>` (running per-token pointers,
-//! compile-time D_k) versus the pre-rewrite reference
-//! `gated_delta_net_decode_legacy_f32_<NSG>` (per-token `uint` index
-//! rebuild): output `y` and final state must be bitwise identical.
+//! Gated DeltaNet decode addressing: the pointer-addressing kernel
+//! (`gated_delta_net_decode_seq_f32_<NSG>`: running per-token pointers,
+//! compile-time D_k) and the public dispatcher (index-rebuild kernel
+//! `gated_delta_net_decode_f32_<NSG>` at n_tokens 1, pointer kernel from
+//! n_tokens 2) versus the index-rebuild reference
+//! `gated_delta_net_decode_legacy_f32_<NSG>`: output `y` and final state
+//! must be bitwise identical.
 //!
 //! Matrix: Qwen3.8 heads (16 k, 48 v, D 128) and Qwen3.6 heads (16 k,
 //! 32 v, D 128) × n_tokens {1, 2, 17, 512} × n_seqs {1, 4} × q-scale mode
@@ -9,8 +12,9 @@
 //! buffer placement (whole buffers, and slice views at distinct non-zero,
 //! non-16-byte-aligned offsets inside padded parents). Inputs are random
 //! with g/beta extremes mixed in. For slice views the whole parent buffers
-//! (padding included) are compared, so neither kernel may write outside
-//! its view.
+//! (padding included) are compared, so no kernel may write outside its
+//! view. A separate test pins which pipeline the dispatcher compiles at
+//! n_tokens 1 and 2.
 
 #![cfg(target_vendor = "apple")]
 #![allow(clippy::expect_used, clippy::panic)]
@@ -20,6 +24,7 @@ use mlx_native::ops::gated_delta_net::{
 };
 use mlx_native::ops::gated_delta_net_decode::{
     dispatch_gated_delta_net_decode, dispatch_gated_delta_net_decode_legacy,
+    dispatch_gated_delta_net_decode_seq, SEQ_KERNEL_MIN_TOKENS,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -141,10 +146,14 @@ fn arg(device: &MlxDevice, data: Option<&[f32]>, n: usize, pad_elems: usize) -> 
     Arg { parent, view }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kernel {
+    /// Index-rebuild reference (`..._legacy_f32_<NSG>`).
     Legacy,
-    New,
+    /// Pointer-addressing kernel forced at any n_tokens (`..._seq_f32_<NSG>`).
+    Seq,
+    /// The public dispatcher's choice.
+    Public,
 }
 
 /// Run one kernel; returns the full parent contents of output and state_out.
@@ -183,7 +192,8 @@ fn run(
 
     let dispatch = match kernel {
         Kernel::Legacy => dispatch_gated_delta_net_decode_legacy,
-        Kernel::New => dispatch_gated_delta_net_decode,
+        Kernel::Seq => dispatch_gated_delta_net_decode_seq,
+        Kernel::Public => dispatch_gated_delta_net_decode,
     };
     let mut encoder = device.command_encoder().expect("encoder");
     dispatch(
@@ -272,18 +282,14 @@ fn check_heads(n_k_heads: u32, n_v_heads: u32, model: &str) {
                         folded_scale,
                         offsets,
                     );
-                    let (y_new, s_new) = run(
-                        &device,
-                        &mut registry,
-                        &inp,
-                        Kernel::New,
-                        folded_scale,
-                        offsets,
-                    );
                     assert_written(&format!("{label} legacy y"), &y_old);
                     assert_written(&format!("{label} legacy state"), &s_old);
-                    assert_bitwise(&format!("{label} y"), &y_old, &y_new);
-                    assert_bitwise(&format!("{label} state"), &s_old, &s_new);
+                    for kernel in [Kernel::Seq, Kernel::Public] {
+                        let (y_new, s_new) =
+                            run(&device, &mut registry, &inp, kernel, folded_scale, offsets);
+                        assert_bitwise(&format!("{label} {kernel:?} y"), &y_old, &y_new);
+                        assert_bitwise(&format!("{label} {kernel:?} state"), &s_old, &s_new);
+                    }
                 }
             }
         }
@@ -300,13 +306,13 @@ fn gdn_decode_addressing_bitwise_qwen36_heads() {
     check_heads(16, 32, "qwen3.6");
 }
 
-/// NSG 1 and 2 (D_k 32 / 64) share the rewritten impl; cover them too.
+/// NSG 1 and 2 (D_k 32 / 64) share both impls; cover them too.
 #[test]
 fn gdn_decode_addressing_bitwise_small_nsg() {
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
     for &(d, n_k_heads, n_v_heads) in &[(32u32, 2u32, 4u32), (64, 2, 6)] {
-        for &(n_tokens, n_seqs) in &[(1u32, 1u32), (17, 4)] {
+        for &(n_tokens, n_seqs) in &[(1u32, 1u32), (2, 1), (17, 4)] {
             let mut inp = inputs(
                 n_k_heads,
                 n_v_heads,
@@ -326,11 +332,52 @@ fn gdn_decode_addressing_bitwise_small_nsg() {
                 let label = format!("d={d} n_tokens={n_tokens} n_seqs={n_seqs} offsets={offsets}");
                 let (y_old, s_old) =
                     run(&device, &mut registry, &inp, Kernel::Legacy, true, offsets);
-                let (y_new, s_new) = run(&device, &mut registry, &inp, Kernel::New, true, offsets);
                 assert_written(&format!("{label} legacy y"), &y_old);
-                assert_bitwise(&format!("{label} y"), &y_old, &y_new);
-                assert_bitwise(&format!("{label} state"), &s_old, &s_new);
+                for kernel in [Kernel::Seq, Kernel::Public] {
+                    let (y_new, s_new) = run(&device, &mut registry, &inp, kernel, true, offsets);
+                    assert_bitwise(&format!("{label} {kernel:?} y"), &y_old, &y_new);
+                    assert_bitwise(&format!("{label} {kernel:?} state"), &s_old, &s_new);
+                }
             }
         }
+    }
+}
+
+/// The public dispatcher compiles only the index-rebuild pipeline at
+/// n_tokens 1 and only the pointer-addressing pipeline at n_tokens 2.
+#[test]
+fn gdn_decode_dispatcher_kernel_choice() {
+    assert_eq!(SEQ_KERNEL_MIN_TOKENS, 2);
+    let device = MlxDevice::new().expect("device");
+    for (n_tokens, expect, absent) in [
+        (
+            1u32,
+            "gated_delta_net_decode_f32_4",
+            "gated_delta_net_decode_seq_f32_4",
+        ),
+        (
+            2,
+            "gated_delta_net_decode_seq_f32_4",
+            "gated_delta_net_decode_f32_4",
+        ),
+    ] {
+        let mut registry = KernelRegistry::new();
+        let inp = inputs(16, 48, n_tokens, 1, 0xc401 + u64::from(n_tokens));
+        let (y_public, s_public) = run(&device, &mut registry, &inp, Kernel::Public, true, true);
+        assert!(
+            registry.pipeline_identity(expect).is_ok(),
+            "n_tokens={n_tokens}: dispatcher did not compile {expect}"
+        );
+        assert!(
+            registry.pipeline_identity(absent).is_err(),
+            "n_tokens={n_tokens}: dispatcher compiled {absent}"
+        );
+        let (y_old, s_old) = run(&device, &mut registry, &inp, Kernel::Legacy, true, true);
+        assert_bitwise(&format!("choice n_tokens={n_tokens} y"), &y_old, &y_public);
+        assert_bitwise(
+            &format!("choice n_tokens={n_tokens} state"),
+            &s_old,
+            &s_public,
+        );
     }
 }

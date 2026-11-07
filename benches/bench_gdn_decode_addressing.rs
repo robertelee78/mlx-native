@@ -1,6 +1,12 @@
-//! `gated_delta_net_decode_f32_4`: pre-rewrite (`legacy`, per-token `uint`
-//! index rebuild) versus rewritten (`new`, running per-token pointers) at
-//! Qwen3.8 DeltaNet heads (16 k, 48 v, D_k = D_v = 128, q scale folded in).
+//! Gated DeltaNet decode addressing at Qwen3.8 DeltaNet heads (16 k, 48 v,
+//! D_k = D_v = 128, q scale folded in). Kernel arms:
+//!
+//! * `legacy` — index-rebuild kernel (`gated_delta_net_decode_legacy_f32_4`,
+//!   per-token `uint` index rebuild) at every n_tokens;
+//! * `seq` — pointer-addressing kernel (`gated_delta_net_decode_seq_f32_4`,
+//!   running per-token pointers) at every n_tokens;
+//! * `public` — `dispatch_gated_delta_net_decode`, which picks the index
+//!   kernel at n_tokens 1 and the pointer kernel from n_tokens 2.
 //!
 //! Cases (one "step" each):
 //!
@@ -32,6 +38,7 @@ use mlx_native::ops::gated_delta_net::{
 };
 use mlx_native::ops::gated_delta_net_decode::{
     dispatch_gated_delta_net_decode, dispatch_gated_delta_net_decode_legacy,
+    dispatch_gated_delta_net_decode_seq,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -229,13 +236,14 @@ fn main() {
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
     let mut rng = XorShift(0x5eed_9d17_0000_0001);
-    let kernels: [(&str, Dispatch); 2] = [
+    let kernels: [(&str, Dispatch); 3] = [
         ("legacy", dispatch_gated_delta_net_decode_legacy),
-        ("new", dispatch_gated_delta_net_decode),
+        ("seq", dispatch_gated_delta_net_decode_seq),
+        ("public", dispatch_gated_delta_net_decode),
     ];
 
     println!(
-        "# gated_delta_net_decode_f32_4 heads 16k/48v D128; {STEPS_PER_CB} steps/CB with barriers; \
+        "# gated_delta_net_decode NSG=4 heads 16k/48v D128; {STEPS_PER_CB} steps/CB with barriers; \
          {iters} CBs after {WARMUP} warm-up; µs per step"
     );
     println!(

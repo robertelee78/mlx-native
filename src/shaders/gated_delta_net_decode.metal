@@ -81,25 +81,32 @@ using namespace metal;
 // of D_v and (NSG * 32) must be at least D_v (otherwise some lanes are idle
 // and the simd_sum on s_k accumulates wrong sub-sums). Caller enforces these.
 //
-// D_k is a compile-time constant: the dispatcher selects NSG = D_k / 32 and
-// requires D_k % 32 == 0, so D_k == 32 * NSG exactly (params[0] is not read
-// by the production kernel). NSG = 4 covers Qwen3.5/3.6/3.8's D_k = 128.
+// # Two addressing schemes, bit-identical results
 //
-// # Addressing (production kernel)
+// * `gated_delta_net_decode_pointer_impl` (host names
+//   `gated_delta_net_decode_seq_f32_<NSG>`; dispatched for n_tokens >= 2):
+//   advances per-lane pointers once per token (the reference
+//   implementation's pattern) instead of rebuilding `uint` element indexes
+//   every token, and takes D_k = 32 * NSG as a compile-time constant (the
+//   dispatcher selects NSG = D_k / 32 and requires D_k % 32 == 0, so this is
+//   exact; params[0] is not read). A wrapping `uint` index
+//   (`k[kq_base + tx*NSG + j]`) blocks the compiler from folding the
+//   constant `j` into the load's immediate offset; a running pointer `kp`
+//   with `kp[j]` (j constant after unrolling) folds it. Measured ~27% faster
+//   at n_tokens = 512, but slower at n_tokens = 1, where there is no
+//   per-token index math to save.
+// * `gated_delta_net_decode_index_impl` (host names
+//   `gated_delta_net_decode_f32_<NSG>`, dispatched for n_tokens == 1, and
+//   `gated_delta_net_decode_legacy_f32_<NSG>`, the test/bench reference):
+//   rebuilds `uint` indexes every token.
 //
-// The production impl advances per-lane pointers once per token (the peer's
-// pattern) instead of rebuilding `uint` element indexes every token. A
-// wrapping `uint` index (`k[kq_base + tx*NSG + j]`) blocks the compiler from
-// folding the constant `j` into the load's immediate offset; a running
-// pointer `kp` with `kp[j]` (j a compile-time constant after unrolling)
-// folds it. Every load reads the same element as before and the
-// floating-point operations per state element and per output element are
-// unchanged in kind and order, so output and state are bit-identical to
-// `gated_delta_net_decode_legacy_impl`, which is kept below (host names
-// `gated_delta_net_decode_legacy_f32_<NSG>`) as the test reference.
+// Every load reads the same element in both, and the floating-point
+// operations per state element and per output element are the same in kind
+// and order, so output and state are bit-identical
+// (`tests/gated_delta_net_decode_addressing.rs`).
 
 template <short NSG>
-inline void gated_delta_net_decode_impl(
+inline void gated_delta_net_decode_pointer_impl(
     device const float *q,
     device const float *k,
     device const float *v,
@@ -210,12 +217,9 @@ inline void gated_delta_net_decode_impl(
     }
 }
 
-// Pre-addressing-rewrite kernel: rebuilds `uint` indexes every token. Kept
-// verbatim as the bit-exactness reference for the production impl above
-// (`tests/gated_delta_net_decode_addressing.rs`) and for the legacy-vs-new
-// bench; not dispatched by production code.
+// Index-rebuild addressing (the pre-rewrite kernel, unchanged).
 template <short NSG>
-inline void gated_delta_net_decode_legacy_impl(
+inline void gated_delta_net_decode_index_impl(
     device const float *q,
     device const float *k,
     device const float *v,
@@ -350,7 +354,7 @@ kernel void gated_delta_net_decode_f32_1(
     uint3 tpitg                     [[thread_position_in_threadgroup]],
     uint3 tgpig                     [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_impl<1>(
+    gated_delta_net_decode_index_impl<1>(
         q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
 }
 
@@ -367,7 +371,7 @@ kernel void gated_delta_net_decode_f32_2(
     uint3 tpitg                     [[thread_position_in_threadgroup]],
     uint3 tgpig                     [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_impl<2>(
+    gated_delta_net_decode_index_impl<2>(
         q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
 }
 
@@ -384,11 +388,65 @@ kernel void gated_delta_net_decode_f32_4(
     uint3 tpitg                     [[thread_position_in_threadgroup]],
     uint3 tgpig                     [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_impl<4>(
+    gated_delta_net_decode_index_impl<4>(
         q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
 }
 
-// Legacy (pre-addressing-rewrite) entry points — test/bench reference only.
+// Pointer-addressing entry points — dispatched for n_tokens >= 2.
+
+kernel void gated_delta_net_decode_seq_f32_1(
+    device const float *q           [[buffer(0)]],
+    device const float *k           [[buffer(1)]],
+    device const float *v           [[buffer(2)]],
+    device const float *g           [[buffer(3)]],
+    device const float *beta        [[buffer(4)]],
+    device const float *state_in    [[buffer(5)]],
+    device float       *output      [[buffer(6)]],
+    device float       *state_out   [[buffer(7)]],
+    device const uint  *params      [[buffer(8)]],
+    uint3 tpitg                     [[thread_position_in_threadgroup]],
+    uint3 tgpig                     [[threadgroup_position_in_grid]]
+) {
+    gated_delta_net_decode_pointer_impl<1>(
+        q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
+}
+
+kernel void gated_delta_net_decode_seq_f32_2(
+    device const float *q           [[buffer(0)]],
+    device const float *k           [[buffer(1)]],
+    device const float *v           [[buffer(2)]],
+    device const float *g           [[buffer(3)]],
+    device const float *beta        [[buffer(4)]],
+    device const float *state_in    [[buffer(5)]],
+    device float       *output      [[buffer(6)]],
+    device float       *state_out   [[buffer(7)]],
+    device const uint  *params      [[buffer(8)]],
+    uint3 tpitg                     [[thread_position_in_threadgroup]],
+    uint3 tgpig                     [[threadgroup_position_in_grid]]
+) {
+    gated_delta_net_decode_pointer_impl<2>(
+        q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
+}
+
+kernel void gated_delta_net_decode_seq_f32_4(
+    device const float *q           [[buffer(0)]],
+    device const float *k           [[buffer(1)]],
+    device const float *v           [[buffer(2)]],
+    device const float *g           [[buffer(3)]],
+    device const float *beta        [[buffer(4)]],
+    device const float *state_in    [[buffer(5)]],
+    device float       *output      [[buffer(6)]],
+    device float       *state_out   [[buffer(7)]],
+    device const uint  *params      [[buffer(8)]],
+    uint3 tpitg                     [[thread_position_in_threadgroup]],
+    uint3 tgpig                     [[threadgroup_position_in_grid]]
+) {
+    gated_delta_net_decode_pointer_impl<4>(
+        q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
+}
+
+// Legacy-named index-rebuild entry points — test/bench reference only
+// (same code as `gated_delta_net_decode_f32_<NSG>`).
 
 kernel void gated_delta_net_decode_legacy_f32_1(
     device const float *q           [[buffer(0)]],
@@ -403,7 +461,7 @@ kernel void gated_delta_net_decode_legacy_f32_1(
     uint3 tpitg                     [[thread_position_in_threadgroup]],
     uint3 tgpig                     [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_legacy_impl<1>(
+    gated_delta_net_decode_index_impl<1>(
         q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
 }
 
@@ -420,7 +478,7 @@ kernel void gated_delta_net_decode_legacy_f32_2(
     uint3 tpitg                     [[thread_position_in_threadgroup]],
     uint3 tgpig                     [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_legacy_impl<2>(
+    gated_delta_net_decode_index_impl<2>(
         q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
 }
 
@@ -437,6 +495,6 @@ kernel void gated_delta_net_decode_legacy_f32_4(
     uint3 tpitg                     [[thread_position_in_threadgroup]],
     uint3 tgpig                     [[threadgroup_position_in_grid]]
 ) {
-    gated_delta_net_decode_legacy_impl<4>(
+    gated_delta_net_decode_index_impl<4>(
         q, k, v, g, beta, state_in, output, state_out, params, tpitg, tgpig);
 }
