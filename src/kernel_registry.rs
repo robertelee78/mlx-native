@@ -1488,6 +1488,7 @@ impl KernelRegistry {
         sources.insert("fwht_sign_premult_f32_d512".into(), fwht_src);
         sources.insert("fwht_sign_undo_f32_d256".into(), fwht_src);
         sources.insert("fwht_sign_undo_f32_d512".into(), fwht_src);
+        sources.insert("fwht_sign_undo_sigmoid_mul_f32_d256".into(), fwht_src);
 
         // Fast Hadamard quantize (SIMD shuffle, zero barriers)
         let hq_fast_src: &'static str = include_str!("shaders/hadamard_quantize_kv_fast.metal");

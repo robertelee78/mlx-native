@@ -8,6 +8,7 @@
 //!
 //! ADR-007: measure Gate A/B/C at 5/6/8-bit to find smallest shippable bit-width.
 
+use metal::foreign_types::ForeignType;
 use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
@@ -343,10 +344,35 @@ pub fn flash_attn_vec_tq_hb(
     params: &FlashAttnVecTqHbParams,
 ) -> Result<()> {
     validate_params(params)?;
-
-    let head_dim = params.head_dim;
     let nwg = compute_nwg(params.kv_seq_len);
+    let dst_buf = if nwg == 1 { output } else { tmp };
+    encode_scalar_main(
+        encoder, registry, device, q, k_packed, k_norms, v_packed, v_norms, dst_buf, params, nwg,
+    )?;
+    if nwg > 1 {
+        encoder.memory_barrier();
+        encode_reduce(encoder, registry, device, tmp, output, params.num_heads, params.head_dim, nwg)?;
+    }
+    Ok(())
+}
 
+/// Encode the split-K main dispatch of [`flash_attn_vec_tq_hb`] into `dst`
+/// (the final output when `nwg == 1`, else the partials scratch).
+#[allow(clippy::too_many_arguments)]
+fn encode_scalar_main(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    dst: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    nwg: u32,
+) -> Result<()> {
+    let head_dim = params.head_dim;
     let gpu_params = FlashAttnVecTqHbParamsGpu {
         n_heads: params.num_heads,
         n_kv_heads: params.num_kv_heads,
@@ -407,8 +433,6 @@ pub fn flash_attn_vec_tq_hb(
     let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
     let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
 
-    let dst_buf = if nwg == 1 { output } else { tmp };
-
     encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
         &[
@@ -418,44 +442,51 @@ pub fn flash_attn_vec_tq_hb(
             (3, KernelArg::Buffer(k_norms)),
             (4, KernelArg::Buffer(v_packed)),
             (5, KernelArg::Buffer(v_norms)),
-            (6, KernelArg::Buffer(dst_buf)),
+            (6, KernelArg::Buffer(dst)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,
         threadgroup_size,
     );
+    Ok(())
+}
 
-    // Reduce kernel (NWG > 1)
-    if nwg > 1 {
-        encoder.memory_barrier();
-
-        let reduce_params = FlashAttnVecReduceParamsGpu {
-            nrows: params.num_heads,
-        };
-
-        let reduce_kernel = match head_dim {
-            256 => "flash_attn_vec_reduce_dk256",
-            512 => "flash_attn_vec_reduce_dk512",
-            _ => unreachable!(),
-        };
-        let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
-
-        let reduce_tg = MTLSize::new(params.num_heads as u64, 1, 1);
-        let reduce_tg_size = MTLSize::new(32 * nwg as u64, 1, 1);
-
-        encoder.encode_threadgroups_with_args(
-            reduce_pipeline,
-            &[
-                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
-                (1, KernelArg::Buffer(tmp)),
-                (2, KernelArg::Buffer(output)),
-                (3, KernelArg::Bytes(as_bytes(&nwg))),
-            ],
-            reduce_tg,
-            reduce_tg_size,
-        );
-    }
-
+/// Encode the cross-workgroup reduce (`nwg > 1`) of `num_heads` rows from
+/// `tmp` into `output` — the rotated-domain result, as the scalar and GQA
+/// dispatchers produce it.
+#[allow(clippy::too_many_arguments)]
+fn encode_reduce(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    tmp: &MlxBuffer,
+    output: &MlxBuffer,
+    num_heads: u32,
+    head_dim: u32,
+    nwg: u32,
+) -> Result<()> {
+    let reduce_params = FlashAttnVecReduceParamsGpu { nrows: num_heads };
+    let reduce_kernel = match head_dim {
+        256 => "flash_attn_vec_reduce_dk256",
+        512 => "flash_attn_vec_reduce_dk512",
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "flash_attn_vec_tq_hb reduce: unsupported head_dim {head_dim}"
+            )))
+        }
+    };
+    let reduce_pipeline = registry.get_pipeline(reduce_kernel, device.metal_device())?;
+    encoder.encode_threadgroups_with_args(
+        reduce_pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&reduce_params))),
+            (1, KernelArg::Buffer(tmp)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Bytes(as_bytes(&nwg))),
+        ],
+        MTLSize::new(num_heads as u64, 1, 1),
+        MTLSize::new(32 * nwg as u64, 1, 1),
+    );
     Ok(())
 }
 
@@ -485,6 +516,23 @@ pub fn flash_attn_vec_tq_hb_gqa(
     tile: GqaTile,
 ) -> Result<()> {
     validate_params(params)?;
+    validate_gqa(params, tile)?;
+    let nwg = compute_nwg(params.kv_seq_len);
+    let dst_buf = if nwg == 1 { output } else { tmp };
+    encode_gqa_main(
+        encoder, registry, device, q, k_packed, k_norms, v_packed, v_norms, dst_buf, params, tile,
+        nwg,
+    )?;
+    if nwg > 1 {
+        encoder.memory_barrier();
+        encode_reduce(encoder, registry, device, tmp, output, params.num_heads, params.head_dim, nwg)?;
+    }
+    Ok(())
+}
+
+/// The proven contract of the cooperative GQA kernel (see
+/// [`flash_attn_vec_tq_hb_gqa`]).
+fn validate_gqa(params: &FlashAttnVecTqHbParams, tile: GqaTile) -> Result<()> {
     if params.head_dim != 256 {
         return Err(MlxError::InvalidArgument(format!(
             "flash_attn_vec_tq_hb_gqa: head_dim must be 256, got {}",
@@ -509,8 +557,26 @@ pub fn flash_attn_vec_tq_hb_gqa(
             params.num_heads
         )));
     }
+    Ok(())
+}
 
-    let nwg = compute_nwg(params.kv_seq_len);
+/// Encode the split-K main dispatch of [`flash_attn_vec_tq_hb_gqa`] into
+/// `dst` (the final output when `nwg == 1`, else the partials scratch).
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_main(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k_packed: &MlxBuffer,
+    k_norms: &MlxBuffer,
+    v_packed: &MlxBuffer,
+    v_norms: &MlxBuffer,
+    dst: &MlxBuffer,
+    params: &FlashAttnVecTqHbParams,
+    tile: GqaTile,
+    nwg: u32,
+) -> Result<()> {
     let gpu_params = FlashAttnVecTqHbParamsGpu {
         n_heads: params.num_heads,
         n_kv_heads: params.num_kv_heads,
@@ -536,7 +602,7 @@ pub fn flash_attn_vec_tq_hb_gqa(
         &[(cbits_const.1, cbits_const.0)],
     )?;
 
-    let tile_width = tile_width as usize;
+    let tile_width = tile.width() as usize;
     let pv = pad2(params.head_dim as usize, 128);
     let sh = 4 * 32;
     let nsg = params.nsg as usize;
@@ -546,7 +612,6 @@ pub fn flash_attn_vec_tq_hb_gqa(
     encoder.set_op_kind(CapturedOpKind::Sdpa);
     let threadgroups = MTLSize::new(1, (params.num_heads / tile.width()) as u64, nwg as u64);
     let threadgroup_size = MTLSize::new(32, params.nsg as u64, 1);
-    let dst_buf = if nwg == 1 { output } else { tmp };
     encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
         &[
@@ -556,33 +621,165 @@ pub fn flash_attn_vec_tq_hb_gqa(
             (3, KernelArg::Buffer(k_norms)),
             (4, KernelArg::Buffer(v_packed)),
             (5, KernelArg::Buffer(v_norms)),
-            (6, KernelArg::Buffer(dst_buf)),
+            (6, KernelArg::Buffer(dst)),
         ],
         &[(0, shmem_bytes as u64)],
         threadgroups,
         threadgroup_size,
     );
+    Ok(())
+}
 
-    if nwg > 1 {
-        encoder.memory_barrier();
-        let reduce_params = FlashAttnVecReduceParamsGpu {
-            nrows: params.num_heads,
-        };
-        let reduce_pipeline =
-            registry.get_pipeline("flash_attn_vec_reduce_dk256", device.metal_device())?;
-        encoder.encode_threadgroups_with_args(
-            reduce_pipeline,
-            &[
-                (0, KernelArg::Bytes(as_bytes(&reduce_params))),
-                (1, KernelArg::Buffer(tmp)),
-                (2, KernelArg::Buffer(output)),
-                (3, KernelArg::Bytes(as_bytes(&nwg))),
-            ],
-            MTLSize::new(params.num_heads as u64, 1, 1),
-            MTLSize::new(32 * nwg as u64, 1, 1),
-        );
+/// Kernel that computes one row of [`flash_attn_vec_tq_hb_rows`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TqHbRowKernel {
+    /// The kernel of [`flash_attn_vec_tq_hb`].
+    Scalar,
+    /// The cooperative kernel of [`flash_attn_vec_tq_hb_gqa`] with this tile.
+    Gqa(GqaTile),
+}
+
+/// One independent decode attention of [`flash_attn_vec_tq_hb_rows`].
+///
+/// The fields are exactly the arguments of the single-row call the row
+/// stands for: [`flash_attn_vec_tq_hb`] for [`TqHbRowKernel::Scalar`],
+/// [`flash_attn_vec_tq_hb_gqa`] for [`TqHbRowKernel::Gqa`].
+#[derive(Clone, Copy)]
+pub struct TqHbDecodeRow<'a> {
+    pub q: &'a MlxBuffer,
+    pub k_packed: &'a MlxBuffer,
+    pub k_norms: &'a MlxBuffer,
+    pub v_packed: &'a MlxBuffer,
+    pub v_norms: &'a MlxBuffer,
+    pub output: &'a MlxBuffer,
+    pub tmp: &'a MlxBuffer,
+    pub params: FlashAttnVecTqHbParams,
+    pub kernel: TqHbRowKernel,
+}
+
+/// Byte range `[start, end)` of `len` bytes from `buffer`'s binding offset,
+/// keyed by the Metal buffer it lives in.
+fn bound_range(buffer: &MlxBuffer, len: u64) -> (usize, u64, u64) {
+    let start = buffer.byte_offset();
+    (buffer.metal_buffer().as_ptr() as usize, start, start.saturating_add(len))
+}
+
+fn ranges_overlap(a: (usize, u64, u64), b: (usize, u64, u64)) -> bool {
+    a.0 == b.0 && a.1 < b.2 && b.1 < a.2
+}
+
+/// Encode several independent TQ-HB decode attentions behind one barrier.
+///
+/// Row `r` issues exactly the dispatches its single-row call would issue —
+/// same pipeline, parameters, grid, threadgroup memory and buffers — so its
+/// output is bitwise the output of [`flash_attn_vec_tq_hb`] (or
+/// [`flash_attn_vec_tq_hb_gqa`]) run on that row alone, whatever the other
+/// rows hold and however many there are. Only the barrier placement
+/// changes: the split-K main dispatches of all rows run concurrently, one
+/// memory barrier follows, then the reduce dispatches of all rows (the
+/// single-row calls put a barrier between each row's main and its reduce,
+/// and the caller another between rows).
+///
+/// Like the single-row calls, the outputs are in the rotated domain; the
+/// caller applies `fwht_sign_undo` (one dispatch can cover every row when
+/// the outputs are consecutive).
+///
+/// Rows must be independent: every row's `output` and partials `tmp` (the
+/// bytes its dispatches write) must be disjoint from the `output`, `tmp` and
+/// `q` of every other row and from its own `q`; `tmp` must hold the row's
+/// split-K partials (`num_heads * nwg * (head_dim + 2)` F32 values;
+/// [`tmp_buffer_bytes`] covers every `nwg`). Shared K/V caches are fine:
+/// they are only read.
+pub fn flash_attn_vec_tq_hb_rows(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    rows: &[TqHbDecodeRow<'_>],
+) -> Result<()> {
+    const OP: &str = "flash_attn_vec_tq_hb_rows";
+    let mut nwgs = Vec::with_capacity(rows.len());
+    let mut writes = Vec::with_capacity(2 * rows.len());
+    let mut reads = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        validate_params(&row.params)?;
+        if let TqHbRowKernel::Gqa(tile) = row.kernel {
+            validate_gqa(&row.params, tile)?;
+        }
+        let nwg = compute_nwg(row.params.kv_seq_len);
+        let vector_bytes =
+            u64::from(row.params.num_heads) * u64::from(row.params.head_dim) * 4;
+        // Partials of `nwg` workgroups per head: DV values plus S and M.
+        let tmp_bytes = u64::from(row.params.num_heads)
+            * u64::from(nwg)
+            * (u64::from(row.params.head_dim) + 2)
+            * 4;
+        if (row.q.data_byte_len() as u64) < vector_bytes
+            || (row.output.data_byte_len() as u64) < vector_bytes
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: row {index} q/output need {vector_bytes} bytes"
+            )));
+        }
+        if nwg > 1 && (row.tmp.data_byte_len() as u64) < tmp_bytes {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: row {index} tmp has {} bytes but needs {tmp_bytes}",
+                row.tmp.data_byte_len()
+            )));
+        }
+        writes.push((index, bound_range(row.output, vector_bytes)));
+        if nwg > 1 {
+            writes.push((index, bound_range(row.tmp, tmp_bytes)));
+        }
+        reads.push(bound_range(row.q, vector_bytes));
+        nwgs.push(nwg);
+    }
+    for (i, &(row_a, a)) in writes.iter().enumerate() {
+        for &(row_b, b) in &writes[i + 1..] {
+            if ranges_overlap(a, b) {
+                return Err(MlxError::InvalidArgument(format!(
+                    "{OP}: rows {row_a} and {row_b} write overlapping bytes"
+                )));
+            }
+        }
+        for (row_q, &q) in reads.iter().enumerate() {
+            if ranges_overlap(a, q) {
+                return Err(MlxError::InvalidArgument(format!(
+                    "{OP}: row {row_a} writes over the Q of row {row_q}"
+                )));
+            }
+        }
     }
 
+    for (row, &nwg) in rows.iter().zip(&nwgs) {
+        let dst = if nwg == 1 { row.output } else { row.tmp };
+        match row.kernel {
+            TqHbRowKernel::Scalar => encode_scalar_main(
+                encoder, registry, device, row.q, row.k_packed, row.k_norms, row.v_packed,
+                row.v_norms, dst, &row.params, nwg,
+            )?,
+            TqHbRowKernel::Gqa(tile) => encode_gqa_main(
+                encoder, registry, device, row.q, row.k_packed, row.k_norms, row.v_packed,
+                row.v_norms, dst, &row.params, tile, nwg,
+            )?,
+        }
+    }
+    if nwgs.iter().any(|&nwg| nwg > 1) {
+        encoder.memory_barrier();
+        for (row, &nwg) in rows.iter().zip(&nwgs) {
+            if nwg > 1 {
+                encode_reduce(
+                    encoder,
+                    registry,
+                    device,
+                    row.tmp,
+                    row.output,
+                    row.params.num_heads,
+                    row.params.head_dim,
+                    nwg,
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 

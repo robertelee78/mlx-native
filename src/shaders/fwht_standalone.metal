@@ -209,3 +209,57 @@ kernel void fwht_sign_undo_fast<256>(device float *, constant FwhtParams &, uint
 
 template [[host_name("fwht_sign_undo_f32_d512")]]
 kernel void fwht_sign_undo_fast<512>(device float *, constant FwhtParams &, uint, uint);
+
+// ---------------------------------------------------------------------------
+// fwht_sign_undo_fast followed by sigmoid_mul_f32 on the same elements, in one
+// dispatch: output = undo(data) * (1 / (1 + exp(-gate))).
+//
+// Row-exact: every element goes through the two kernels' expressions in their
+// order — the undo's butterfly, 1/sqrt(d) normalization and sign, then
+// sigmoid_mul_f32's `x * (1.0f / (1.0f + exp(-g)))` — so a head's result
+// does not depend on how many heads the dispatch covers. `data` is only read;
+// `output` and `gate` are [num_heads, HEAD_DIM] like `data`.
+// ---------------------------------------------------------------------------
+template<ushort HEAD_DIM>
+kernel void fwht_sign_undo_sigmoid_mul_fast(
+    device const float     *data   [[buffer(0)]],
+    device const float     *gate   [[buffer(1)]],
+    device float           *output [[buffer(2)]],
+    constant FwhtParams    &params [[buffer(3)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    constexpr ushort EPT = HEAD_DIM / 32;
+    const uint head_idx = tgid;
+    const uint lane = tiisg;
+
+    if (head_idx >= params.num_heads) return;
+
+    const uint base = head_idx * HEAD_DIM + lane * EPT;
+    float elems[EPT];
+    for (ushort i = 0; i < EPT; i++) {
+        elems[i] = data[base + i];
+    }
+
+    fwht_simd<EPT>(elems, lane);
+    const float inv_sqrt_d = rsqrt(float(HEAD_DIM));
+    for (ushort i = 0; i < EPT; i++) {
+        elems[i] *= inv_sqrt_d;
+    }
+    for (ushort i = 0; i < EPT; i++) {
+        ushort j = lane * EPT + i;
+        uint8_t sign_byte = (HEAD_DIM == 256) ? TBQ_SIGNS_256[j >> 3] : TBQ_SIGNS_512[j >> 3];
+        float sign_val = ((sign_byte >> (j & 7)) & 1u) ? -1.0f : 1.0f;
+        elems[i] *= sign_val;
+    }
+
+    for (ushort i = 0; i < EPT; i++) {
+        const float g = gate[base + i];
+        const float s = 1.0f / (1.0f + metal::exp(-g));
+        output[base + i] = elems[i] * s;
+    }
+}
+
+template [[host_name("fwht_sign_undo_sigmoid_mul_f32_d256")]]
+kernel void fwht_sign_undo_sigmoid_mul_fast<256>(
+    device const float *, device const float *, device float *, constant FwhtParams &, uint, uint);
