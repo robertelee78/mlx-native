@@ -517,10 +517,12 @@ pub fn quantized_matmul_id_ggml_mv_grouped_geglu(
 }
 
 /// ADR-063 Q4-QWEN36 F2b: forced Q4_K expert mat-vec at the peer's layout
-/// (`kernel_mul_mv_id_q4_K_f32_nr2`: two SIMD groups x two output columns,
-/// eight lanes per super-block, uint16 quant loads).
+/// (`kernel_mul_mv_id_q4_K_f32_nr2`: two SIMD groups, two rows per 8-lane
+/// block group, eight lanes per super-block, uint16 quant loads). Rows of
+/// one or two super-blocks (K = 256, 512) fold the lane groups the peer
+/// leaves idle onto further row pairs (4 / nb row groups per SIMD group).
 ///
-/// One threadgroup computes one `(pair, 4-column)` tile from that pair's
+/// One threadgroup computes one `(pair, column tile)` from that pair's
 /// expert slice and token row, so each pair's output is bitwise independent
 /// of `n_tokens * top_k` and of the other pairs' ids. Not bitwise equal to
 /// `kernel_mul_mv_id_q4_K_f32` (different lane split and accumulation
@@ -537,8 +539,14 @@ pub fn quantized_matmul_id_ggml_mv_q4_k_nr2(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
-    /// Output columns per threadgroup: 2 SIMD groups x 2 rows.
-    const COLUMNS_PER_THREADGROUP: usize = 4;
+    // Output columns per threadgroup: 2 SIMD groups x 2 rows x the kernel's
+    // row-group fold (4 / nb for nb = 1, 2 super-blocks per row, else 1).
+    let fold: usize = match params.k / 256 {
+        1 => 4,
+        2 => 2,
+        _ => 1,
+    };
+    let columns_per_threadgroup = 4 * fold;
     if params.ggml_type != GgmlType::Q4_K {
         return Err(MlxError::InvalidArgument(format!(
             "quantized_matmul_id_ggml_mv_q4_k_nr2 requires Q4_K, got {:?}",
@@ -560,7 +568,7 @@ pub fn quantized_matmul_id_ggml_mv_q4_k_nr2(
             (4, KernelArg::Bytes(as_bytes(&gpu_params))),
         ],
         metal::MTLSize::new(
-            div_ceil(params.n as usize, COLUMNS_PER_THREADGROUP) as u64,
+            div_ceil(params.n as usize, columns_per_threadgroup) as u64,
             total_rows,
             1,
         ),

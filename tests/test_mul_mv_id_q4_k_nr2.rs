@@ -3,7 +3,8 @@
 //! - F64 reference per (row, expert) pair within the K-scaled bound
 //!   `(K / 32 + 16) * 2^-24 * sum_k |x_k| (|d sc q| + |dmin m|)` at the
 //!   Qwen3.6 expert gate/up (512 x 2048, w rows x top-8) and down
-//!   (2048 x 512, w * 8 rows x top-1) shapes and at odd row tails;
+//!   (2048 x 512, w * 8 rows x top-1) shapes and at odd row tails, covering
+//!   every row-group fold of the kernel (K = 256: 4, K = 512: 2, else 1);
 //! - pair independence, bitwise: every pair of a dispatch of 1, 8, 16, 24 or
 //!   32 pairs equals the one-pair dispatch of that (row, expert), in the
 //!   broadcast gate/up layout and in the one-pair-per-row down layout, for
@@ -207,6 +208,8 @@ fn matches_f64_reference_within_k_scaled_bound() {
         (7, 768, 3, 2, "tail N=7 K=768"),
         (5, 256, 2, 3, "tail N=5 K=256"),
         (6, 512, 2, 2, "tail N=6 K=512"),
+        (13, 512, 3, 2, "tail N=13 K=512"),
+        (11, 1024, 2, 2, "tail N=11 K=1024"),
     ];
     for (case, &(n, k, n_tokens, top_k, label)) in cases.iter().enumerate() {
         let w = make_weights(&h.device, GgmlType::Q4_K, n, k, N_EXPERTS, 0xa11 + case as u64);
@@ -414,6 +417,8 @@ fn down_pairs_equal_one_pair_dispatches_bitwise() {
 fn row_tail_pairs_equal_one_pair_dispatches_bitwise() {
     gate_up_independence(7, 768, 0x7a11);
     down_independence(5, 256, 0x5a11);
+    down_independence(13, 512, 0xd13a);
+    gate_up_independence(11, 1024, 0x11a1);
 }
 
 #[test]
