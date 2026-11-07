@@ -7,8 +7,10 @@
 // - F16 (`row_exact_stock_mv_f16_f32_r<NR>_u<U>_m<M>`) replays
 //   `dense_matvec_f16w_f32io` (dense_gemm.metal). Per row, the 32 lanes of one
 //   simdgroup each run `acc += dot(float4 x[4t + 128 s], float4(half4 w))` for
-//   s = 0, 1, ..., then a scalar tail stepping 32 (empty when K % 128 == 0),
-//   then `simd_sum`.
+//   s = 0, 1, ... while 4t + 128 s < K, then `simd_sum`. (The stock kernel's
+//   scalar remainder never runs: the dispatch requires K % 4 == 0, so the
+//   vector loop already covers every element; lanes may take different
+//   step counts when K % 128 != 0.)
 // - Q8_0 (`row_exact_stock_mv_q8_0_f32_r<NR0>_v<V>_m<M>`) replays
 //   `kernel_mul_mv_q8_0_f32_nr2` (quantized_matmul_ggml.metal). Per row, a
 //   team of 4 x 32 threads (virtual simdgroup s, lane l; ix = l / 4,
@@ -118,17 +120,6 @@ kernel void row_exact_stock_mv_f16_f32(
             half4 bv = *((device const half4 *)(bw[r] + k));
             for (short j = 0; j < M; ++j) {
                 acc[r][j] += dot(afv[j], float4(bv));
-            }
-        }
-    }
-    // Stock scalar remainder (never runs when K % 128 == 0).
-    for (; k < K; k += 32) {
-        if (k < K) {
-            for (short j = 0; j < M; ++j) {
-                float av = a[j][k];
-                for (short r = 0; r < NR; ++r) {
-                    acc[r][j] += av * float(bw[r][k]);
-                }
             }
         }
     }

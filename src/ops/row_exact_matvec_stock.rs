@@ -211,6 +211,19 @@ impl RowExactStockPacking {
     }
 }
 
+/// Refuse a packing whose threadgroup exceeds the pipeline's thread limit
+/// (register-heavy instantiations can have a limit below 1024).
+fn check_thread_limit(packing: &RowExactStockPacking, limit: u64) -> Result<u64> {
+    let threads = u64::from(packing.threads_per_threadgroup());
+    if threads > limit {
+        return Err(MlxError::InvalidArgument(format!(
+            "row_exact_matvec_stock: packing {packing:?} needs {threads} threads per threadgroup, \
+             pipeline limit {limit}"
+        )));
+    }
+    Ok(threads)
+}
+
 /// MSL-compatible params; must match `RowExactStockParams` in the shader.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -279,6 +292,7 @@ pub fn dispatch_row_exact_matvec_stock_packed(
         &RowExactMatvecSchedule { nsg: 1, nr0: 1 },
     )?;
     let pipeline = registry.get_pipeline(packing.kernel_name(shape.m), device)?;
+    let threads = check_thread_limit(packing, pipeline.max_total_threads_per_threadgroup())?;
 
     let tgs_per_batch = shape.n.div_ceil(packing.rows_per_threadgroup());
     let params = GpuRowExactStockParams {
@@ -294,7 +308,7 @@ pub fn dispatch_row_exact_matvec_stock_packed(
         w_batch_bytes: row_bytes * u64::from(shape.n),
     };
     let threadgroups = MTLSize::new(u64::from(tgs_per_batch) * u64::from(shape.batch), 1, 1);
-    let threads_per_tg = MTLSize::new(u64::from(packing.threads_per_threadgroup()), 1, 1);
+    let threads_per_tg = MTLSize::new(threads, 1, 1);
     let bindings = [
         (0, KernelArg::Buffer(w)),
         (1, KernelArg::Buffer(x)),
@@ -324,4 +338,27 @@ pub fn dispatch_row_exact_matvec_stock_packed(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_limit_refuses_threadgroups_above_the_pipeline_limit() {
+        let f16 = |simdgroups| RowExactStockPacking::F16 {
+            rows: 1,
+            simdgroups,
+            unroll: 4,
+        };
+        assert_eq!(check_thread_limit(&f16(16), 512).unwrap(), 512);
+        assert!(check_thread_limit(&f16(17), 512).is_err());
+        assert!(check_thread_limit(&f16(32), 896).is_err());
+        let q8 = RowExactStockPacking::Q8_0 {
+            rows: 2,
+            virtual_simdgroups: 1,
+        };
+        assert_eq!(check_thread_limit(&q8, 128).unwrap(), 128);
+        assert!(check_thread_limit(&q8, 96).is_err());
+    }
 }

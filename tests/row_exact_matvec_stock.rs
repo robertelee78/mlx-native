@@ -421,7 +421,7 @@ const F16_SHAPES: [(usize, usize); 8] = [
     (512, 4096),  // HCA main compressor kv / gate
     (8192, 1024), // indexer q_b
     (64, 4096),   // indexer proj
-    (37, 4100),   // tail: K % 128 != 0 (stock scalar remainder), odd N
+    (37, 4100),   // tail: K % 128 != 0 (uneven steps per lane), odd N
 ];
 
 const Q8_0_SHAPES: [(usize, usize); 8] = [
@@ -544,4 +544,54 @@ fn row_exact_stock_rejects_bad_packings() {
             "{packing:?}"
         );
     }
+}
+
+/// A packing whose threadgroup exceeds the pipeline's thread limit is refused
+/// before encoding; one within the limit dispatches and stays exact.
+#[test]
+fn row_exact_stock_refuses_threadgroups_above_the_pipeline_limit() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let (n, k, m) = (64usize, 4096usize, MAX_M);
+    let w = f16_weight(&device, n, k, 3);
+    let x = input(&device, m * k, 4);
+    let shape = RowExactMatvecShape::contiguous(m as u32, n as u32, k as u32);
+    // The heaviest F16 instantiation (4 rows, unroll 4, 8 inputs).
+    let limit = registry
+        .get_pipeline("row_exact_stock_mv_f16_f32_r4_u4_m8", device.metal_device())
+        .expect("pipeline")
+        .max_total_threads_per_threadgroup();
+    let stock = stock_rows(&device, &mut registry, RowExactWeight::F16, &w, &x, 1, n, k);
+    for simdgroups in [1u32, 2, 4, 8, 16, 32] {
+        let packing = RowExactStockPacking::F16 {
+            rows: 4,
+            simdgroups,
+            unroll: 4,
+        };
+        let y = output(&device, m * n);
+        let mut encoder = device.command_encoder().expect("encoder");
+        let result = dispatch_row_exact_matvec_stock_packed(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            RowExactWeight::F16,
+            &w,
+            &x,
+            &y,
+            &shape,
+            &packing,
+        );
+        if u64::from(32 * simdgroups) > limit {
+            assert!(
+                result.is_err(),
+                "{packing:?} exceeds limit {limit} but was encoded"
+            );
+        } else {
+            result.expect("dispatch within the limit");
+            encoder.commit_and_wait().expect("commit");
+            assert_eq!(bits(&y), stock, "{packing:?}");
+        }
+    }
+    // Packings above the limit only exist when the limit is below 1024.
+    eprintln!("row_exact_stock_mv_f16_f32_r4_u4_m8 thread limit {limit}");
 }
