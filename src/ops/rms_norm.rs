@@ -21,6 +21,8 @@ static CACHED_FUSED_POST_FF_NORM2_V2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::encode_helpers::{as_bytes, encode_threadgroups_with_args, KernelArg};
+
 /// MSL source for the RMS norm kernels (embedded at compile time).
 pub static RMS_NORM_SHADER_SOURCE: &str = include_str!("../shaders/rms_norm.metal");
 
@@ -1051,6 +1053,93 @@ pub fn dispatch_rms_norm_no_scale_f32(
         MTLSize::new(tg_size, 1, 1),
     );
 
+    Ok(())
+}
+
+/// (token, head) rows per threadgroup of `rms_norm_no_scale_f32_dual_perm`,
+/// which runs one simdgroup per row.
+const DUAL_PERM_ROWS_PER_THREADGROUP: u64 = 2;
+
+/// Dispatch the per-head unit RMS norm (no weight) with two outputs: f32 at
+/// the natural `[seq_len, n_heads, dim]` layout and BF16 at the permuted
+/// `[n_heads, seq_len, dim]` layout (`rms_norm_no_scale_f32_dual_perm`,
+/// the Gemma 4 prefill V norm: KV-cache copy source + attention input).
+///
+/// * `input`            - f32 `[seq_len, n_heads, dim]`.
+/// * `output`           - f32 `[seq_len, n_heads, dim]`.
+/// * `output_bf16_perm` - BF16 `[n_heads, seq_len, dim]`.
+/// * `params_buf`       - f32 `[eps, dim]`.
+///
+/// # Errors
+///
+/// `MlxError::InvalidArgument` for empty shapes, short or mistyped buffers,
+/// or (when `dim % 256 == 0`, the float4 lane mapping) a binding that is
+/// not 16-byte aligned (8-byte for the BF16 output).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rms_norm_no_scale_f32_dual_perm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    output_bf16_perm: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    n_heads: u32,
+    seq_len: u32,
+    dim: u32,
+) -> Result<()> {
+    if n_heads == 0 || seq_len == 0 || dim == 0 {
+        return Err(MlxError::InvalidArgument(
+            "rms_norm_no_scale_f32_dual_perm: n_heads, seq_len and dim must be > 0".into(),
+        ));
+    }
+    let rows = u64::from(n_heads) * u64::from(seq_len);
+    let expected = rows as usize * dim as usize;
+    for (name, buf, dtype) in [
+        ("input", input, DType::F32),
+        ("output", output, DType::F32),
+        ("output_bf16_perm", output_bf16_perm, DType::BF16),
+    ] {
+        if buf.dtype() != dtype {
+            return Err(MlxError::InvalidArgument(format!(
+                "rms_norm_no_scale_f32_dual_perm: {name} must be {dtype}, got {}",
+                buf.dtype()
+            )));
+        }
+        if buf.element_count() < expected {
+            return Err(MlxError::InvalidArgument(format!(
+                "rms_norm_no_scale_f32_dual_perm: {name} element count {} < {expected}",
+                buf.element_count()
+            )));
+        }
+    }
+    if dim % 256 == 0
+        && (input.byte_offset() % 16 != 0
+            || output.byte_offset() % 16 != 0
+            || output_bf16_perm.byte_offset() % 8 != 0)
+    {
+        return Err(MlxError::InvalidArgument(
+            "rms_norm_no_scale_f32_dual_perm: dim % 256 == 0 needs 16-byte aligned f32 and \
+             8-byte aligned BF16 bindings"
+                .into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32_dual_perm", device)?;
+    let aux: [u32; 2] = [n_heads, seq_len];
+    encode_threadgroups_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(params_buf)),
+            (3, KernelArg::Buffer(output_bf16_perm)),
+            (4, KernelArg::Bytes(as_bytes(&aux))),
+        ],
+        MTLSize::new(rows.div_ceil(DUAL_PERM_ROWS_PER_THREADGROUP), 1, 1),
+        MTLSize::new(32 * DUAL_PERM_ROWS_PER_THREADGROUP, 1, 1),
+    );
     Ok(())
 }
 
