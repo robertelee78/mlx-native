@@ -19,9 +19,19 @@ use crate::kernel_registry::KernelRegistry;
 pub static MOE_SOFTMAX_TOPK_SHADER_SOURCE: &str =
     include_str!("../shaders/moe_softmax_topk.metal");
 
-/// Register the `moe_softmax_topk_f32` pipeline.
+/// Metal shader source of the SIMD-group variant (one SIMD group per row).
+pub static MOE_SOFTMAX_TOPK_SIMD_SHADER_SOURCE: &str =
+    include_str!("../shaders/moe_softmax_topk_simd.metal");
+
+/// Largest expert count the SIMD-group variant accepts (32 lanes x 32 per lane).
+pub const MOE_SOFTMAX_TOPK_SIMD_MAX_EXPERTS: u32 = 1024;
+/// Largest top-k the SIMD-group variant accepts.
+pub const MOE_SOFTMAX_TOPK_SIMD_MAX_TOP_K: u32 = 32;
+
+/// Register the `moe_softmax_topk_f32` and `moe_softmax_topk_simd_f32` pipelines.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("moe_softmax_topk_f32", MOE_SOFTMAX_TOPK_SHADER_SOURCE);
+    registry.register_source("moe_softmax_topk_simd_f32", MOE_SOFTMAX_TOPK_SIMD_SHADER_SOURCE);
 }
 
 /// GPU-side params struct; matches `MoeSoftmaxTopkParams` in the shader.
@@ -60,14 +70,64 @@ pub fn dispatch_moe_softmax_topk(
     n_experts:   u32,
     top_k:       u32,
 ) -> Result<()> {
+    check_args(logits, out_ids, out_weights, n_tokens, n_experts, top_k, 64, u32::MAX)?;
+
+    let gpu_params = MoeSoftmaxTopkGpuParams {
+        n_tokens,
+        n_experts,
+        top_k,
+        _pad: 0.0,
+    };
+
+    let pipeline = registry.get_pipeline("moe_softmax_topk_f32", device.metal_device())?;
+
+    // Threadgroup size = min(n_experts, 128), capped to avoid exceeding limits.
+    let tg_size = (n_experts as u64).min(128);
+    // Shared memory: 2 * tg_size floats (max + sum) + n_experts floats (probs).
+    // = (2 * 128 + n_experts) * 4 bytes.  For n_experts=64: (256+64)*4 = 1280 bytes.
+    let shmem_bytes = (2 * tg_size + n_experts as u64) * 4;
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(logits)),
+            (2, KernelArg::Buffer(out_ids)),
+            (3, KernelArg::Buffer(out_weights)),
+        ],
+        &[(0, shmem_bytes)],
+        MTLSize::new(n_tokens as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(())
+}
+
+/// Parameter and buffer-size checks shared by both routing kernels.
+#[allow(clippy::too_many_arguments)]
+fn check_args(
+    logits:      &MlxBuffer,
+    out_ids:     &MlxBuffer,
+    out_weights: &MlxBuffer,
+    n_tokens:    u32,
+    n_experts:   u32,
+    top_k:       u32,
+    max_top_k:   u32,
+    max_experts: u32,
+) -> Result<()> {
     if n_tokens == 0 || n_experts == 0 || top_k == 0 {
         return Err(MlxError::InvalidArgument(
             "moe_softmax_topk: n_tokens, n_experts, and top_k must be > 0".into(),
         ));
     }
-    if top_k > 64 {
+    if top_k > max_top_k {
         return Err(MlxError::InvalidArgument(format!(
-            "moe_softmax_topk: top_k ({top_k}) > 64 (kernel supports up to 64)"
+            "moe_softmax_topk: top_k ({top_k}) > {max_top_k} (kernel supports up to {max_top_k})"
+        )));
+    }
+    if n_experts > max_experts {
+        return Err(MlxError::InvalidArgument(format!(
+            "moe_softmax_topk: n_experts ({n_experts}) > {max_experts} (kernel supports up to {max_experts})"
         )));
     }
     if top_k > n_experts {
@@ -98,23 +158,57 @@ pub fn dispatch_moe_softmax_topk(
             out_weights.byte_len()
         )));
     }
+    Ok(())
+}
 
+/// Dispatch the SIMD-group variant of the fused softmax + top-K + renorm MoE
+/// routing kernel (`moe_softmax_topk_simd_f32`): one SIMD group per row, every
+/// row in one dispatch. Same inputs, outputs and selection order as
+/// [`dispatch_moe_softmax_topk`] (descending probability, ties to the lower
+/// expert index); the softmax sum is reduced in SIMD order.
+///
+/// Limits: `n_experts <= MOE_SOFTMAX_TOPK_SIMD_MAX_EXPERTS` (1024),
+/// `top_k <= MOE_SOFTMAX_TOPK_SIMD_MAX_TOP_K` (32).
+///
+/// # Errors
+///
+/// `MlxError::InvalidArgument` for out-of-range parameters or buffer sizes.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_moe_softmax_topk_simd(
+    encoder:     &mut CommandEncoder,
+    registry:    &mut KernelRegistry,
+    device:      &MlxDevice,
+    logits:      &MlxBuffer,
+    out_ids:     &MlxBuffer,
+    out_weights: &MlxBuffer,
+    n_tokens:    u32,
+    n_experts:   u32,
+    top_k:       u32,
+) -> Result<()> {
+    check_args(
+        logits,
+        out_ids,
+        out_weights,
+        n_tokens,
+        n_experts,
+        top_k,
+        MOE_SOFTMAX_TOPK_SIMD_MAX_TOP_K,
+        MOE_SOFTMAX_TOPK_SIMD_MAX_EXPERTS,
+    )?;
     let gpu_params = MoeSoftmaxTopkGpuParams {
         n_tokens,
         n_experts,
         top_k,
         _pad: 0.0,
     };
-
-    let pipeline = registry.get_pipeline("moe_softmax_topk_f32", device.metal_device())?;
-
-    // Threadgroup size = min(n_experts, 128), capped to avoid exceeding limits.
-    let tg_size = (n_experts as u64).min(128);
-    // Shared memory: 2 * tg_size floats (max + sum) + n_experts floats (probs).
-    // = (2 * 128 + n_experts) * 4 bytes.  For n_experts=64: (256+64)*4 = 1280 bytes.
-    let shmem_bytes = (2 * tg_size + n_experts as u64) * 4;
-
-    encoder.encode_threadgroups_with_args_and_shared(
+    let per_lane = n_experts.div_ceil(32) as i32;
+    let pipeline = registry.get_pipeline_with_constants(
+        "moe_softmax_topk_simd_f32",
+        device.metal_device(),
+        &[],
+        &[(0, per_lane), (1, top_k as i32)],
+    )?;
+    encoder.encode_threadgroups_with_args(
         pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&gpu_params))),
@@ -122,10 +216,8 @@ pub fn dispatch_moe_softmax_topk(
             (2, KernelArg::Buffer(out_ids)),
             (3, KernelArg::Buffer(out_weights)),
         ],
-        &[(0, shmem_bytes)],
         MTLSize::new(n_tokens as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+        MTLSize::new(32, 1, 1),
     );
-
     Ok(())
 }

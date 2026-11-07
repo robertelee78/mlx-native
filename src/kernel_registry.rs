@@ -125,7 +125,7 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// on the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`) a registry that
 /// skipped the op's `register` call failed with `KernelNotFound`. Kernels a
 /// function registers that the constructor already carries are unaffected.
-const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 24] = [
+const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 25] = [
     crate::ops::add_bias_row_2d::register,
     crate::ops::bilinear_resize_2d::register,
     crate::ops::block_merge_2x2::register,
@@ -139,6 +139,7 @@ const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 24] = [
     crate::ops::flash_attn_prefill_blk::register,
     crate::ops::flash_attn_prefill_d512::register,
     crate::ops::flash_attn_prefill_mask::register,
+    crate::ops::flash_attn_prefill_tensor::register,
     crate::ops::flash_attn_train::register,
     crate::ops::flash_attn_train::register_bwd,
     crate::ops::flash_attn_vec_tq::register,
@@ -1571,6 +1572,7 @@ impl KernelRegistry {
         // Replaces CPU softmax+topk round-trip and CPU weighted accumulate.
         let moe_stk_src: &'static str = include_str!("shaders/moe_softmax_topk.metal");
         sources.insert("moe_softmax_topk_f32".into(), moe_stk_src);
+        sources.insert("moe_softmax_topk_simd_f32".into(), include_str!("shaders/moe_softmax_topk_simd.metal"));
         // Explicit diagnostic producers; ordinary routing names/sources remain unchanged.
         sources.insert("moe_softmax_topk_selection_witness_f32".into(), include_str!("shaders/moe_softmax_topk_selection_witness.metal"));
         let routing_witness = include_str!("shaders/fused_moe_selection_witness.metal");
@@ -2705,7 +2707,7 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
         let constructor = "ssm_conv_forward_f32";
         let mut registry = KernelRegistry::new();
         // Same count as tests/registration_fallback_runtime_sources.rs.
-        assert_eq!(registry.registration_fallbacks.len(), 54);
+        assert_eq!(registry.registration_fallbacks.len(), 56);
         assert!(registry.registration_fallbacks.contains(fallback));
         assert!(!registry.registration_fallbacks.contains(constructor));
         assert!(registry.runtime_source_overrides.is_empty());

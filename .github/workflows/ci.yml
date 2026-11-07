@@ -54,6 +54,8 @@ jobs:
         env:
           MLX_MM_ID_TEST_ALLOW_NO_TENSOR: "1"
         run: cargo +1.96.0 test --release --locked --test test_mm_id_compact_schedule -- --test-threads=1 --nocapture
+      - name: MoE routing top-k, SIMD-group kernel (F64 reference, batched == per row)
+        run: cargo +1.96.0 test --release --locked --test test_moe_softmax_topk_simd -- --test-threads=1
   rust-metal:
     runs-on: macos-15
     # The debug-profile Gemma parity suites (GQA flash T-N8 about 2 min, warm
@@ -75,6 +77,10 @@ jobs:
           cargo +1.96.0 audit
       - name: Test
         # tests/test_mm_id_compact_schedule.rs runs in rust-metal-mm-id.
+        # Hosted runners lack the Metal tensor API: tests/test_flash_attn_prefill_tensor.rs
+        # records a skip there (strict by default on local/self-hosted runs).
+        env:
+          MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR: "1"
         run: >-
           cargo +1.96.0 test --locked -- --test-threads=1
           --skip compact_half_tile_settings_equal_uniform_grid
@@ -85,6 +91,10 @@ jobs:
           --skip n5_half_tile_skip_against_the_32_row_body
           --skip n6_capacity_bound_and_schedule_contents
           --skip n9_scratch_constructors_serve_every_entry_point
+      - name: Tensor flash attention (recorded skip visible on hosted runners)
+        env:
+          MLX_FA_TENSOR_TEST_ALLOW_NO_TENSOR: "1"
+        run: cargo +1.96.0 test --locked --test test_flash_attn_prefill_tensor -- --test-threads=1 --nocapture
       - name: Package
         shell: bash
         run: |

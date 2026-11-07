@@ -13,9 +13,10 @@
 use mlx_native::ops::{
     add_bias_row_2d, bilinear_resize_2d, block_merge_2x2, deepseek_moe_routing, deepseek_tail_rope,
     embedding_kquant, embedding_q2_k, embedding_q8_0, feature_concat, flash_attn_prefill,
-    flash_attn_prefill_blk, flash_attn_prefill_d512, flash_attn_prefill_mask, flash_attn_train,
-    flash_attn_vec_tq, fused_residual_norm, gated_delta_net_decode, gather_bench, hadamard,
-    hadamard_quantize_kv, im2col_2d_3ch, ssm_conv, vision_2d_rope,
+    flash_attn_prefill_blk, flash_attn_prefill_d512, flash_attn_prefill_mask,
+    flash_attn_prefill_tensor, flash_attn_train, flash_attn_vec_tq, fused_residual_norm,
+    gated_delta_net_decode, gather_bench, hadamard, hadamard_quantize_kv, im2col_2d_3ch, ssm_conv,
+    vision_2d_rope,
 };
 use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice, MlxError};
 use sha2::{Digest, Sha256};
@@ -62,7 +63,7 @@ fn cases() -> Vec<Case> {
         &'static str,
         &'static [(usize, bool)],
         &'static [(usize, i32)],
-    ); 32] = [
+    ); 34] = [
         (
             "add_bias_row_2d_f32",
             add_bias_row_2d::ADD_BIAS_ROW_2D_SHADER_SOURCE,
@@ -140,6 +141,18 @@ fn cases() -> Vec<Case> {
             flash_attn_prefill_blk::FLASH_ATTN_PREFILL_BLK_SHADER_SOURCE,
             NO_BOOLS,
             BLK_INTS,
+        ),
+        (
+            "flash_attn_prefill_tensor_f16_d256",
+            flash_attn_prefill_tensor::FLASH_ATTN_PREFILL_TENSOR_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "flash_attn_prefill_tensor_f16_d512",
+            flash_attn_prefill_tensor::FLASH_ATTN_PREFILL_TENSOR_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
         ),
         (
             "flash_attn_prefill_mask_fill_bf16",
@@ -330,9 +343,9 @@ fn registration_fallbacks_build_from_runtime_source() {
     let cases = cases();
     let unique: std::collections::BTreeSet<&str> =
         cases.iter().map(|case| case.0.as_str()).collect();
-    // 54 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
-    assert_eq!(unique.len(), 58);
-    assert_eq!(cases.len(), 58);
+    // 56 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
+    assert_eq!(unique.len(), 60);
+    assert_eq!(cases.len(), 60);
     let mut tensor_unavailable = Vec::new();
     for (name, source, bools, ints) in cases {
         let pipeline = if bools.is_empty() && ints.is_empty() {
