@@ -78,6 +78,7 @@ pub mod moe_mm_id_map0;
 pub mod moe_softmax_topk;
 pub mod moe_weighted_reduce;
 mod mul_mv_ext;
+mod mul_mv_mma;
 pub mod q_gate_deinterleave;
 pub mod qkv_split;
 pub mod quantized_matmul;
