@@ -74,7 +74,7 @@ This is accepted: the invariance requirement rules out switching to stock
 at width 1, because the width-1 column would then differ bitwise from the
 same column inside a wider batch.
 
-Receipts (under `/Users/robert/.local/state/hf2q/v0130/q4-gemma-decode/`):
+Receipts (hf2q v0130 state directory, `q4-gemma-decode/`):
 `op-parity-a888477-20261106T203120Z` (the table above),
 `op-parity-3c5fbb9-20261106T193731Z` (pre-rebase, incl. `mul_mv_ext`),
 `probe-mma-sweep1`, `probe-mma-confirm`, `probe-mma-unroll`, and
