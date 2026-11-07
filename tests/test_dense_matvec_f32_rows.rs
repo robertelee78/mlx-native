@@ -181,4 +181,11 @@ fn rejects_invalid_arguments() {
     assert!(call(&x, 1, 0, 132).is_err());
     assert!(call(&x, 1, 9, 132).is_err(), "weight too small");
     assert!(call(&x.slice_view(4, 132), 1, 8, 132).is_err(), "misaligned view");
+    // Views are checked by their own length, not the whole Metal buffer's.
+    assert!(call(&x.slice_view(0, 132), 2, 8, 132).is_err(), "input view holds one row");
+    let one_row_out = y.slice_view(0, 8);
+    assert!(
+        dispatch_dense_matvec_f32_rows(&mut enc, &mut registry, &device, &x, &w, &one_row_out, 2, 8, 132).is_err(),
+        "output view holds one row"
+    );
 }

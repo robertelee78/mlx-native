@@ -92,11 +92,11 @@ pub fn dispatch_dense_matvec_f32_rows(
         (weight, n as usize * k as usize, "weight"),
         (output, rows as usize * n as usize, "output"),
     ] {
-        if buffer.byte_len() < elements * f32_size {
+        if buffer.data_byte_len() < elements * f32_size {
             return Err(MlxError::InvalidArgument(format!(
                 "dense_matvec_f32_rows: {label} too small (expected {} bytes, got {})",
                 elements * f32_size,
-                buffer.byte_len()
+                buffer.data_byte_len()
             )));
         }
     }
