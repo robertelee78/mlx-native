@@ -115,6 +115,7 @@ fn weight(device: &MlxDevice, ty: RowExactWeight, rows: usize, k: usize, seed: u
             }
             buffer
         }
+        other => unreachable!("the stock-order family has no {other:?} kernels"),
     }
 }
 
@@ -163,6 +164,7 @@ fn sweep_packings(ty: RowExactWeight) -> Vec<RowExactStockPacking> {
                 }
             }
         }
+        other => unreachable!("the stock-order family has no {other:?} kernels"),
     }
     out
 }
@@ -295,6 +297,7 @@ impl Bench {
                     },
                 )
                 .expect("stock grouped q8_0"),
+                (other, _) => unreachable!("the stock-order family has no {other:?} kernels"),
             }
         })
     }
@@ -329,6 +332,7 @@ impl Bench {
             let tag = match ty {
                 RowExactWeight::F16 => "f16",
                 RowExactWeight::Q8_0 => "q8_0",
+                other => unreachable!("the stock-order family has no {other:?} kernels"),
             };
             if !self.weights.iter().any(|w| w == tag) {
                 continue;

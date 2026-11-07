@@ -140,6 +140,12 @@ impl RowExactStockPacking {
                 rows: if rows >= 65_536 { 2 } else { 1 },
                 virtual_simdgroups: if shape.k <= 1024 { 4 } else { 1 },
             },
+            // The stock-order family has no K-quant kernels: this packing is
+            // refused by `validate` for these weights, so dispatch errors.
+            RowExactWeight::Q4_K | RowExactWeight::Q6_K | RowExactWeight::Q5_0 => Self::Q8_0 {
+                rows: 1,
+                virtual_simdgroups: 1,
+            },
         }
     }
 
