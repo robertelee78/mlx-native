@@ -745,41 +745,47 @@ kernel void hf2q_mul_mm_id_map0c_impl(
         ushort   ntg[[threads_per_threadgroup]]) {
     const uint32_t ide = tpitg;
 
-    threadgroup uint32_t * sids  = (threadgroup uint32_t *) shmem;
-    threadgroup uint32_t * soff  = sids + ntg * ne20;
+    // Staged ids are uint16 (n_experts fits in a threadgroup, so every valid
+    // id is < 65535); an id that does not fit saturates to 0xFFFF, which never
+    // matches an expert, and the token is poisoned by its staging thread.
+    threadgroup uint16_t * sids  = (threadgroup uint16_t *) shmem;
+    threadgroup uint32_t * soff  = (threadgroup uint32_t *) shmem + ntg * ne20;
     threadgroup uint32_t * stile = soff + ntg;
     threadgroup uint32_t * sflag = stile + ntg;
     threadgroup uint32_t * stot  = sflag + ntg;
 
     // ---- Pass 1: validate staged tokens and count this expert's rows ----
+    // Counting is branch-free: every slot is compared (validated ids are
+    // pairwise distinct, so the sum equals the number of matching tokens).
     bool staged_invalid = false;
     uint32_t n_all = 0;
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
         if (i21 + tpitg < args.ne21) {
             device const uint32_t * src2_u32 =
                 (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
-            threadgroup uint32_t * mine = sids + tpitg * ne20;
+            uint32_t own[ne20];
             bool token_invalid = false;
+#pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
                 const uint32_t id = src2_u32[i20];
-                mine[i20] = id;
+                own[i20] = id;
                 token_invalid |= id >= ntg;
+#pragma unroll
                 for (short other = 0; other < i20; other++) {
-                    token_invalid |= id == mine[other];
+                    token_invalid |= id == own[other];
                 }
+                sids[tpitg * ne20 + i20] = id > 0xFFFEu ? (uint16_t) 0xFFFF : (uint16_t) id;
             }
             staged_invalid |= token_invalid;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (short t = 0; t < ntg; t++) {
-            if (i21 + t >= args.ne21) break;
-            threadgroup const uint32_t * sids_t = sids + t * ne20;
+        const int staged = min((int) ntg, args.ne21 - i21);
+        for (int t = 0; t < staged; t++) {
+            threadgroup const uint16_t * sids_t = sids + t * ne20;
+#pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                if (sids_t[i20] == ide) {
-                    n_all++;
-                    break;
-                }
+                n_all += sids_t[i20] == ide ? 1u : 0u;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -827,28 +833,35 @@ kernel void hf2q_mul_mm_id_map0c_impl(
     }
 
     // ---- Pass 2: this expert's entries in ascending token order ----
+    // One store per staged token for every thread, match or not: divergent
+    // conditional stores are slow. A token without a match writes a dummy
+    // to the next free entry, which the next match overwrites; after the
+    // last match it lands on the slice's padding entry (slices are padded by
+    // one entry), which no reader consumes.
     device int32_t * list = (device int32_t *) hids + first_entry;
     uint32_t written = 0;
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
         if (i21 + tpitg < args.ne21) {
             device const uint32_t * src2_u32 =
                 (device const uint32_t *) (src2 + (i21 + tpitg) * args.nb21);
-            threadgroup uint32_t * mine = sids + tpitg * ne20;
+#pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                mine[i20] = src2_u32[i20];
+                const uint32_t id = src2_u32[i20];
+                sids[tpitg * ne20 + i20] = id > 0xFFFEu ? (uint16_t) 0xFFFF : (uint16_t) id;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (short t = 0; t < ntg; t++) {
-            if (i21 + t >= args.ne21) break;
-            threadgroup const uint32_t * sids_t = sids + t * ne20;
+        const int staged = min((int) ntg, args.ne21 - i21);
+        for (int t = 0; t < staged; t++) {
+            threadgroup const uint16_t * sids_t = sids + t * ne20;
+            int first = -1;
+#pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                if (sids_t[i20] == ide) {
-                    list[written++] = (i21 + t) * ne20 + i20;
-                    break;
-                }
+                first = (first < 0 && sids_t[i20] == ide) ? i20 : first;
             }
+            list[written] = first >= 0 ? (i21 + t) * ne20 + first : 0;
+            written += first >= 0 ? 1u : 0u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
