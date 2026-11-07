@@ -179,3 +179,7 @@ harness = false
 [[bench]]
 name = "bench_gemma_decode_op_parity"
 harness = false
+
+[[bench]]
+name = "bench_gdn_decode_addressing"
+harness = false
