@@ -56,6 +56,10 @@ jobs:
         run: cargo +1.96.0 test --release --locked --test test_mm_id_compact_schedule -- --test-threads=1 --nocapture
       - name: MoE routing top-k, SIMD-group kernel (F64 reference, batched == per row)
         run: cargo +1.96.0 test --release --locked --test test_moe_softmax_topk_simd -- --test-threads=1
+      - name: Row-exact F32 mat-vec over rows (F64 reference, batched == per row)
+        run: cargo +1.96.0 test --release --locked --test test_dense_matvec_f32_rows -- --test-threads=1
+      - name: Q4_K mv_id at the peer layout (F64 reference, pair independence)
+        run: cargo +1.96.0 test --release --locked --test test_mul_mv_id_q4_k_nr2 -- --test-threads=1
   rust-metal:
     runs-on: macos-15
     # The debug-profile Gemma parity suites (GQA flash T-N8 about 2 min, warm
