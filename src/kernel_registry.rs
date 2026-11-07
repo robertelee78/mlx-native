@@ -1427,6 +1427,11 @@ impl KernelRegistry {
         // Cooperative F32 mat-vec: 4 SIMD groups reduce 2 output rows together.
         sources.insert("dense_matvec_f32_nsg4_exact_k4096".into(), dense_gemm_src);
 
+        // DeepSeek-V4 decode cores over independent joint-decode rows.
+        for name in crate::ops::deepseek_rows::deepseek_rows_kernel_names() {
+            sources.insert(name.into(), crate::ops::deepseek_rows::DEEPSEEK_ROWS_SHADER_SOURCE);
+        }
+
         // Standalone FWHT for TurboQuant pre/post-rotation (SIMD shuffle, zero barriers)
         let fwht_src: &'static str = include_str!("shaders/fwht_standalone.metal");
         sources.insert("fwht_standalone_f32_d256".into(), fwht_src);
