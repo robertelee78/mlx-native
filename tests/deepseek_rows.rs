@@ -722,6 +722,17 @@ fn indexer_rows_equal_one_row_tiled_indexer() {
     }
     check_indexer_case(&device, &mut registry, 81, &shapes[..5], &[3, 0, 4, 1, 2]);
     check_indexer_case(&device, &mut registry, 82, &shapes[2..4], &[5, 1]);
+    // 3+ top-k blocks (5, 9 and 3 blocks) mixed with 1-block rows: the merge
+    // tree runs 4 rounds (merge_round 0..=3) and shorter rows copy through.
+    let many_blocks = [
+        (4097, 16387, false),
+        (512, 2047, false),
+        (9000, 35999, false),
+        (2, 7, false),
+        (3000, 11999, false),
+    ];
+    check_indexer_case(&device, &mut registry, 83, &many_blocks, &[0, 1, 2, 3, 4]);
+    check_indexer_case(&device, &mut registry, 84, &many_blocks[..3], &[2, 0, 1]);
     assert_origins(
         &registry,
         &[
@@ -760,9 +771,19 @@ fn check_compressor(
     let norm_values: Vec<f32> = (0..dim).map(|_| 1.0 + 0.1 * rng.unit()).collect();
     let norm = buffer(device, DType::F32, &norm_values, vec![dim]);
     for b in 1..=8usize {
-        // Positions in different phases of the compression block.
+        // Positions in different phases of the compression block; rows 0 and
+        // 1 start one and two tokens before a block boundary (126 and 127 mod
+        // 128 for ratio 128), so every ratio emits inside the run.
         let starts: Vec<u32> = (0..b)
-            .map(|row| ratio * (3 + row as u32) + (row as u32 * 3 + 1) % ratio)
+            .map(|row| {
+                let row = row as u32;
+                let phase = if row < 2 {
+                    ratio - 2 + row
+                } else {
+                    (row * 3 + 1) % ratio
+                };
+                ratio * (3 + row) + phase
+            })
             .collect();
         let initial: Vec<(Vec<f32>, Vec<f32>)> = (0..b)
             .map(|_| {
@@ -1015,6 +1036,63 @@ fn rows_dispatches_reject_invalid_tables_before_encoding() {
         1e-6,
     )
     .is_err());
+    // Indexer offsets, as the one-row indexer: negative offsets collide with
+    // the -1 sentinel, and offset + (valid - 1) must fit i32.
+    let index_kv = device
+        .alloc_buffer(2 * 128 * 2, DType::BF16, vec![2, 128])
+        .unwrap();
+    let index_q = device
+        .alloc_buffer(64 * 128 * 2, DType::BF16, vec![64, 128])
+        .unwrap();
+    let index_weights = device.alloc_buffer(64 * 4, DType::F32, vec![64]).unwrap();
+    let index_scores = device
+        .alloc_buffer(1024 * 4, DType::F32, vec![1024])
+        .unwrap();
+    let index_topk = device
+        .alloc_buffer(1024 * 4, DType::I32, vec![1024])
+        .unwrap();
+    let index_out = device.alloc_buffer(512 * 4, DType::I32, vec![512]).unwrap();
+    let index_row = |offset| DeepSeekIndexerRow {
+        kv: &index_kv,
+        kv_len: 2,
+        start_pos: 7,
+        offset,
+        q_row: 0,
+        output_offset: 0,
+    };
+    for (offset, what) in [
+        (-1, "negative offset"),
+        (i32::MAX, "offset + valid - 1 beyond i32"),
+    ] {
+        assert!(
+            dispatch_deepseek_indexer_rows(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &index_q,
+                &index_weights,
+                &index_scores,
+                &index_topk,
+                &index_out,
+                &[index_row(offset)],
+            )
+            .is_err(),
+            "{what} must be rejected"
+        );
+    }
+    // The largest offset that still fits (valid = 2) is accepted by validation.
+    assert!(dispatch_deepseek_indexer_rows(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &index_q,
+        &index_weights,
+        &index_scores,
+        &index_topk,
+        &index_out,
+        &[index_row(i32::MAX - 1)],
+    )
+    .is_ok());
     encoder.commit_and_wait().unwrap();
     assert_eq!(deepseek_rows_kernel_names().len(), 11);
 }

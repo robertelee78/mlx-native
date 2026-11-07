@@ -826,6 +826,18 @@ pub fn dispatch_deepseek_indexer_rows(
                 row.kv_len
             )));
         }
+        // As the one-row indexer: -1 is the sentinel, and every emitted
+        // `index + offset` must fit i32.
+        if row.offset < 0 {
+            return Err(invalid(format!(
+                "indexer row {entry}: offset must be nonnegative; -1 is reserved for the sentinel"
+            )));
+        }
+        if causal > 0 && i64::from(row.offset) + i64::from(causal) - 1 > i64::from(i32::MAX) {
+            return Err(invalid(format!(
+                "indexer row {entry}: offset plus compressed index exceeds i32"
+            )));
+        }
         params.kv_len[entry] = to_u32(row.kv_len, "indexer kv_len")?;
         params.start_pos[entry] = row.start_pos;
         params.offset[entry] = row.offset;
