@@ -1,0 +1,117 @@
+name: publish-package
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact main-branch commit to publish
+        required: true
+        type: string
+      version:
+        description: Exact crate version to publish
+        required: true
+        type: string
+      package_sha256:
+        description: SHA256 from the validated macOS cargo package
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-package-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      EXPECTED_VERSION: ${{ inputs.version }}
+      EXPECTED_PACKAGE_SHA256: ${{ inputs.package_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$EXPECTED_SHA"
+          git fetch origin main
+          test "$actual_sha" = "$(git rev-parse origin/main)"
+          actual_version=$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)
+          test "$actual_version" = "$EXPECTED_VERSION"
+          test "$EXPECTED_PACKAGE_SHA256" != ""
+          git diff --exit-code
+
+      - name: Toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Reproduce validated package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/check_package_hygiene.sh
+          cargo +1.96.0 package --locked --no-verify
+          crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
+          test -s "$crate"
+          actual=$(sha256sum "$crate" | cut -d ' ' -f1)
+          test "$actual" = "$EXPECTED_PACKAGE_SHA256"
+
+      - name: Publish exact package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CARGO_REGISTRY_TOKEN"
+          if curl --fail --location --silent --show-error \
+            "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
+            --output "$RUNNER_TEMP/published.crate"; then
+            echo "mlx-native ${EXPECTED_VERSION} already published"
+          else
+            cargo +1.96.0 publish --locked --no-verify --token "$CARGO_REGISTRY_TOKEN"
+          fi
+
+      - name: Verify crates.io bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          downloaded="$RUNNER_TEMP/mlx-native-${EXPECTED_VERSION}.crate"
+          for _ in $(seq 1 24); do
+            if curl --fail --location --silent --show-error \
+              "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
+              --output "$downloaded"; then
+              actual=$(sha256sum "$downloaded" | cut -d ' ' -f1)
+              test "$actual" = "$EXPECTED_PACKAGE_SHA256"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Tag and create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${EXPECTED_VERSION}"
+          if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
+            test "$tag_sha" = "$EXPECTED_SHA"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${tag}" -f sha="$EXPECTED_SHA" >/dev/null
+          fi
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$EXPECTED_SHA" \
+              --title "mlx-native ${EXPECTED_VERSION}" --generate-notes --verify-tag
+          fi
+          gh release upload "$tag" "target/package/mlx-native-${EXPECTED_VERSION}.crate" --clobber
