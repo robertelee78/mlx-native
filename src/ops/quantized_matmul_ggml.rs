@@ -480,6 +480,12 @@ pub(crate) fn dense_routing_policy_from_environment() -> GgmlRoutingPolicy {
 /// At m <= 8 the mv kernel wins on launch overhead for narrow inputs.
 pub const MM_ROUTING_THRESHOLD: u32 = 8;
 
+/// The fixed 32-row continuous tile is faster on tensor-v1's matching row
+/// geometry than on tensor-v2's 128-row tile. Other shapes retain their route.
+pub(crate) fn dense_mm_large_tile_shape(rows: u32) -> bool {
+    rows != 32
+}
+
 /// Parameters for GGML block-format quantized mat-vec.
 #[derive(Debug, Clone, Copy)]
 pub struct GgmlQuantizedMatmulParams {
@@ -2516,16 +2522,19 @@ fn dispatch_mm_impl(
         routing.q5_0_tensor_mm,
     ) && probe_tensor_mm(registry, device)?;
     // ADR-029 iter-23 H28-A — large-tile v2 mm-tensor kernel (64×128
-    // output tile vs the v1 32×64).  Reduces threadgroup count by 4× at
-    // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg).
+    // output tile vs the v1 32×64). It reduces threadgroup count by 4× at
+    // prefill shapes (m=4213, n=5760: 11,880 → 2,970 tg), but a fixed
+    // 32-row continuous tile maps exactly to tensor-v1 and wastes three
+    // quarters of tensor-v2's row tile.
     //
     // ADR-029 default-flip: validated across regimes —
     //   gemma4-APEX-Q5_K_M (2K/4K/8K prefill): +6–7% byte-identical
     //   qwen3.6-APEX-Q5_K_M (4K prefill): +0–2% byte-identical
     //   decode m=1 unaffected (V2 only fires at m > MM_ROUTING_THRESHOLD=8)
-    // 3457/0/11 unit tests pass.  Default ON; opt-out via
-    // `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
-    let use_v2_large_tile = use_tensor && routing.allow_dense_large_tile_mm;
+    // 3457/0/11 unit tests pass. Default ON except at exactly 32 rows;
+    // opt-out globally via `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
+    let use_v2_large_tile =
+        use_tensor && routing.allow_dense_large_tile_mm && dense_mm_large_tile_shape(params.m);
     let q4_decision = dense_q4_auto::select_route(
         registry,
         device,

@@ -14,7 +14,7 @@ use crate::ggml_capability::{
     GgmlRoutingPolicy, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 use crate::kernel_registry::{KernelPipelineIdentity, KernelRegistry};
-use crate::ops::quantized_matmul_ggml::GgmlType;
+use crate::ops::quantized_matmul_ggml::{dense_mm_large_tile_shape, GgmlType};
 
 pub const GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION: u32 = 3;
 
@@ -390,7 +390,8 @@ fn validate_dense_dispatches(
                     vec![(0, 8192)],
                 )
             } else if dispatch.pipeline.kernel_name == request.ggml_type.mm_tensor_kernel_name() {
-                if request.routing.allow_dense_large_tile_mm {
+                if request.routing.allow_dense_large_tile_mm && dense_mm_large_tile_shape(m as u32)
+                {
                     return Err(MlxError::InvalidArgument(
                         "tensor-v1 dispatch violates large-tile routing policy".into(),
                     ));
@@ -417,7 +418,9 @@ fn validate_dense_dispatches(
                 )
             } else if dispatch.pipeline.kernel_name == request.ggml_type.mm_tensor_v2_kernel_name()
             {
-                if !request.routing.allow_dense_large_tile_mm {
+                if !request.routing.allow_dense_large_tile_mm
+                    || !dense_mm_large_tile_shape(m as u32)
+                {
                     return Err(MlxError::InvalidArgument(
                         "large-tile tensor dispatch violates routing policy".into(),
                     ));
