@@ -182,6 +182,14 @@ pub use ops::deepseek_hyper_connection::{
     dispatch_hc_head_weights, dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn,
     DEEPSEEK_HC_EPS, DEEPSEEK_HC_MULT, DEEPSEEK_HC_SINKHORN_ITERS,
 };
+pub use ops::dflash2_dynamic_conv::{
+    dispatch_dflash2_dynamic_conv_f32, DFlash2ConvolutionStage, DFlash2DynamicConvParams,
+};
+pub use ops::dflash2_selector::{
+    dispatch_dflash2_selector, dispatch_dflash2_verify_rows, DFlash2SelectorBuffers,
+    DFlash2SelectorParams, DFlash2VerifyRowsParams, DFLASH2_CANDIDATES, DFLASH2_MAX_LANES,
+    DFLASH2_MAX_POSITIONS, DFLASH2_SELECTOR_RANK, DFLASH2_SHARDS, DFLASH2_VERIFY_COSTS,
+};
 pub use ops::embedding_q2_k::{embedding_gather_q2_k, EmbeddingQ2KParams};
 pub use ops::embedding_dense::{embedding_gather_dense, EmbeddingDenseParams};
 pub use ops::embedding_q4_0::{embedding_gather_q4_0, EmbeddingQ4_0Params};
