@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 150
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
