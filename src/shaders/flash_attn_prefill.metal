@@ -2180,4 +2180,8 @@ instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d64_boolmask", bfloat16_
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d64",           half,       32, 16, 64, 4, 1, half)
 instantiate_flash_attn_prefill("flash_attn_prefill_f16_d64_boolmask",  half,       32, 16, 64, 4, 1, bool)
 
+// D=128 — DFlash2 Qwen/Gemma draft attention.  The D=64 tile geometry
+// remains within the Apple GPU threadgroup-memory limit at BF16.
+instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d128", bfloat16_t, 32, 16, 128, 4, 1, bfloat16_t)
+
 // clang-format on

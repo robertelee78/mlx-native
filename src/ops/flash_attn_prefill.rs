@@ -122,7 +122,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::device::MlxDevice;
-use crate::encoder::{CapturedOpKind, CommandEncoder, KernelArg, as_bytes};
+use crate::encoder::{as_bytes, CapturedOpKind, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::DType;
@@ -159,6 +159,8 @@ const K_BF16_D64_BOOLMASK: &str = "flash_attn_prefill_bf16_d64_boolmask";
 const K_F16_D64: &str = "flash_attn_prefill_f16_d64";
 /// D=64, f16 I/O, bool mask.
 const K_F16_D64_BOOLMASK: &str = "flash_attn_prefill_f16_d64_boolmask";
+/// D=128, bf16 I/O, bf16 additive mask (DFlash2 family).
+const K_BF16_D128: &str = "flash_attn_prefill_bf16_d128";
 
 /// All 12 kernel entry-point names exported by `flash_attn_prefill.metal`.
 ///
@@ -179,6 +181,7 @@ const ALL_KERNEL_NAMES: &[&str] = &[
     K_BF16_D64_BOOLMASK,
     K_F16_D64,
     K_F16_D64_BOOLMASK,
+    K_BF16_D128,
 ];
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -419,7 +422,11 @@ fn validate_params(params: &FlashAttnPrefillParams) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_buffer_size(buf: &MlxBuffer, name: &str, expected_elements: usize) -> Result<()> {
+pub(crate) fn validate_buffer_size(
+    buf: &MlxBuffer,
+    name: &str,
+    expected_elements: usize,
+) -> Result<()> {
     let expected_bytes = expected_elements * buf.dtype().size_of();
     if buf.byte_len() < expected_bytes {
         return Err(MlxError::InvalidArgument(format!(
@@ -1680,10 +1687,9 @@ impl FlashAttnPrefillLayout {
 ///
 /// # Errors
 ///
-/// Same error contract as `dispatch_flash_attn_prefill_bf16_d256` plus
-/// `head_dim != 64`.
+/// Same error contract as `dispatch_flash_attn_prefill_bf16_d256`.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_flash_attn_prefill_bf16_d64(
+fn dispatch_flash_attn_prefill_bf16_d64_or_d128(
     encoder: &mut CommandEncoder,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -1694,11 +1700,13 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     out: &MlxBuffer,
     params: &FlashAttnPrefillParams,
     layout: FlashAttnPrefillLayout,
+    expected_head_dim: u32,
+    kernel_name: &'static str,
 ) -> Result<()> {
     // ── Validate ──────────────────────────────────────────────────────────
-    if params.head_dim != 64 {
+    if params.head_dim != expected_head_dim {
         return Err(MlxError::InvalidArgument(format!(
-            "dispatch_flash_attn_prefill_bf16_d64: head_dim must be 64, got {}",
+            "{kernel_name}: head_dim must be {expected_head_dim}, got {}",
             params.head_dim
         )));
     }
@@ -1708,7 +1716,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
         if buf.dtype() != DType::BF16 {
             return Err(MlxError::InvalidArgument(format!(
-                "dispatch_flash_attn_prefill_bf16_d64: {name} buffer must be BF16, got {:?}",
+                "{kernel_name}: {name} buffer must be BF16, got {:?}",
                 buf.dtype()
             )));
         }
@@ -1716,7 +1724,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     if let Some(m) = mask {
         if m.dtype() != DType::BF16 {
             return Err(MlxError::InvalidArgument(format!(
-                "dispatch_flash_attn_prefill_bf16_d64: mask buffer must be BF16, got {:?}",
+                "{kernel_name}: mask buffer must be BF16, got {:?}",
                 m.dtype()
             )));
         }
@@ -1727,7 +1735,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     let h_kv = params.n_kv_heads as usize;
     let ql = params.seq_len_q as usize;
     let kl = params.seq_len_k as usize;
-    let d = params.head_dim as usize; // = 64
+    let d = params.head_dim as usize;
 
     // Validate buffer element counts (layout-independent: total elements
     // are `B * H * L * D` either way).
@@ -1765,8 +1773,7 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     let has_blk = false;
     let do_causal = params.do_causal;
 
-    // ── Kernel name ───────────────────────────────────────────────────────
-    let kernel_name = K_BF16_D64;
+    // Kernel name is selected by the validated head dimension.
 
     // ── Pipeline lookup (with function constants) ─────────────────────────
     let pipeline = registry.get_pipeline_with_bool_constants(
@@ -1867,6 +1874,57 @@ pub fn dispatch_flash_attn_prefill_bf16_d64(
     Ok(())
 }
 
+/// Dispatch flash-attention prefill for BF16 Q/K/V/O with head dimension 64.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d64(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+    layout: FlashAttnPrefillLayout,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d64_or_d128(
+        encoder, device, registry, q, k, v, mask, out, params, layout, 64, K_BF16_D64,
+    )
+}
+
+/// Dispatch flash-attention prefill for BF16 Q/K/V/O with head dimension 128.
+///
+/// Supports both head-major `[B,H,L,D]` and seq-major `[B,L,H,D]` layouts.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_attn_prefill_bf16_d128(
+    encoder: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    mask: Option<&MlxBuffer>,
+    out: &MlxBuffer,
+    params: &FlashAttnPrefillParams,
+    layout: FlashAttnPrefillLayout,
+) -> Result<()> {
+    dispatch_flash_attn_prefill_bf16_d64_or_d128(
+        encoder,
+        device,
+        registry,
+        q,
+        k,
+        v,
+        mask,
+        out,
+        params,
+        layout,
+        128,
+        K_BF16_D128,
+    )
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1959,7 +2017,10 @@ mod tests {
         };
         // We can only test the head_dim validation path without a real device/encoder.
         // The validation happens before device access, so this is safe to test here.
-        assert!(p.head_dim != 256, "test pre-condition: head_dim must not be 256");
+        assert!(
+            p.head_dim != 256,
+            "test pre-condition: head_dim must not be 256"
+        );
     }
 
     #[test]
@@ -1992,6 +2053,8 @@ mod tests {
             "flash_attn_prefill_bf16_d64_boolmask",
             "flash_attn_prefill_f16_d64",
             "flash_attn_prefill_f16_d64_boolmask",
+            // D=128 — DFlash2 Qwen/Gemma draft attention
+            "flash_attn_prefill_bf16_d128",
         ];
 
         let registered: std::collections::HashSet<&str> =
@@ -2046,5 +2109,54 @@ mod tests {
         assert_eq!(WN_D256, 1,  "WN=1  for D=256");
         // Threadgroup size: 32 × WM × WN = 32 × 4 × 1 = 128 threads.
         assert_eq!(32 * WM_D256 * WN_D256, 128);
+    }
+
+    #[test]
+    fn gpu_d128_zero_attention_compiles_and_runs() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let params = FlashAttnPrefillParams {
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 128,
+            seq_len_q: 2,
+            seq_len_k: 3,
+            batch: 1,
+            scale: 1.0 / 128.0_f32.sqrt(),
+            do_causal: false,
+        };
+        let q = device
+            .alloc_buffer(2 * 128 * 2, DType::BF16, vec![1, 1, 2, 128])
+            .unwrap();
+        let k = device
+            .alloc_buffer(3 * 128 * 2, DType::BF16, vec![1, 1, 3, 128])
+            .unwrap();
+        let v = device
+            .alloc_buffer(3 * 128 * 2, DType::BF16, vec![1, 1, 3, 128])
+            .unwrap();
+        let out = device
+            .alloc_buffer(2 * 128 * 2, DType::BF16, vec![1, 1, 2, 128])
+            .unwrap();
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_flash_attn_prefill_bf16_d128(
+            &mut encoder,
+            &device,
+            &mut registry,
+            &q,
+            &k,
+            &v,
+            None,
+            &out,
+            &params,
+            FlashAttnPrefillLayout::HeadMajor,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        assert!(out
+            .as_slice::<u16>()
+            .unwrap()
+            .iter()
+            .all(|value| *value == 0));
     }
 }
