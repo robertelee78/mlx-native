@@ -144,7 +144,7 @@ See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-nativ
 - `flash_attn_vec_tq` / `flash_attn_vec_tq_hb` — TurboQuant-quantized KV variants (Lloyd-Max + Hadamard)
 - `flash_attn_vec_hybrid` — F16-K + TQ-HB-V SDPA (memory savings without full KV quant cost)
 - `flash_attn_vec_peer_port_f16` (+ `_nwg32` NWG=32 variant with reduce dispatcher) — verbatim peer kernel port for F16 decode
-- `flash_attn_prefill` (D=256, D=512) — Tiled prefill with bf16 kernels, SWA mask, sentinel handling — plus F16/BF16 `_resume` dispatchers for restart from arbitrary `qL` offset
+- `flash_attn_prefill` (D=128, D=256, D=512) — Tiled prefill with bf16 kernels, SWA mask, sentinel handling — plus F16/BF16 `_resume` dispatchers for restart from arbitrary `qL` offset
 - `flash_attn_train` — forward + backward (`dQ` / `dK` / `dV` via FA-2 Algorithm 4) bf16 kernels at D=64 / D=256, the missing piece for transformer training on this backend
 - `sdpa` / `sdpa_sliding` — Reference SDPA with optional sliding window; `do_causal` flag toggles causal vs bidirectional (DFlash drafter block-diffusion)
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
@@ -241,6 +241,7 @@ for allocator boundaries and remaining device-proof requirements.
 - `dflash2_dynamic_conv` — grouped two-stage, two-tap lane-local dynamic convolution with a residual prepare mode
 - `dflash2_top16` / `dflash2_edges` / `dflash2_path` — deterministic top-16 candidate extraction and coherent rank-256 predecessor/successor path selection for up to four lanes
 - `dflash2_verify_rows` — allocation-free per-lane verification-width planning for proposal trees up to 64 rows
+- `dflash2_attention_pack` — exact eight-row non-causal proposal attention packing/mask construction, transactional BF16 sliding-ring commit, and checkpoint mask-row injection
 
 ### State-space (Mamba/Gated DeltaNet)
 - `ssm_conv` — Depthwise causal 1D convolution + SiLU

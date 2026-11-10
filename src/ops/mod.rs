@@ -34,6 +34,7 @@ mod dense_mm_fallback_tests;
 mod dense_q4_acceptance;
 pub mod dense_q4_auto;
 mod dense_q4_calibration;
+pub mod dflash2_attention_pack;
 pub mod dflash2_dynamic_conv;
 pub mod dflash2_selector;
 pub mod dequant_to_f16;
