@@ -367,6 +367,24 @@ fn trace_binds_baseline_nr2_mv_ext_and_small_tile_device_routes() {
         GgmlResolvedKernelRoute::DenseMmSimdgroup | GgmlResolvedKernelRoute::DenseMmTensorV1
     ));
 
+    let continuous_32 = GgmlQuantizedMatmulParams { m: 32, ..prompt };
+    let (tile_input, tile_weight, tile_output) = buffers(&device, continuous_32);
+    let tile_trace = quantized_matmul_ggml_with_policy_and_trace(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &tile_input,
+        &tile_weight,
+        &tile_output,
+        &continuous_32,
+        &GgmlRoutingPolicy::default(),
+        GgmlWorkloadClass::Prompt,
+    )
+    .expect("32-row tensor-v1 trace");
+    assert!(matches!(
+        tile_trace.resolved_route,
+        GgmlResolvedKernelRoute::DenseMmSimdgroup | GgmlResolvedKernelRoute::DenseMmTensorV1
+    ));
     encoder.commit_and_wait().expect("execute traced routes");
 }
 

@@ -168,6 +168,24 @@ fn width_and_dense_mm_policy_knobs_bind_production_dispatch() {
         assert_eq!(tensor_v1, simd);
         assert_eq!(tensor_v2, simd);
     }
+
+    let continuous_32 = GgmlQuantizedMatmulParams { m: 32, ..prompt };
+    let tensor_32 = capture_dense(
+        &device,
+        &mut registry,
+        continuous_32,
+        GgmlRoutingPolicy::default(),
+    );
+    if tensor_v1.iter().any(|label| label.contains("tensor")) {
+        assert!(
+            tensor_32
+                .iter()
+                .all(|label| label.contains("tensor") && !label.contains("tensor_v2")),
+            "{tensor_32:?}"
+        );
+    } else {
+        assert!(tensor_32.iter().all(|label| !label.contains("tensor")));
+    }
 }
 
 fn capture_expert(
