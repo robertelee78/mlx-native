@@ -237,6 +237,11 @@ for allocator boundaries and remaining device-proof requirements.
 - `moe_dispatch` — Per-expert matvec sequence with proper barriers
 - `moe_weighted_reduce` — Weighted sum across selected experts
 
+### Speculative decoding
+- `dflash2_dynamic_conv` — grouped two-stage, two-tap lane-local dynamic convolution with a residual prepare mode
+- `dflash2_top16` / `dflash2_edges` / `dflash2_path` — deterministic top-16 candidate extraction and coherent rank-256 predecessor/successor path selection for up to four lanes
+- `dflash2_verify_rows` — allocation-free per-lane verification-width planning for proposal trees up to 64 rows
+
 ### State-space (Mamba/Gated DeltaNet)
 - `ssm_conv` — Depthwise causal 1D convolution + SiLU
 - `ssm_norm_gate` — Norm + gate fusion (eliminates CPU bridge)
