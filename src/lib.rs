@@ -222,7 +222,8 @@ pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
 };
 pub use ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
+    dispatch_id_mm_for_test, quantized_matmul_id_ggml,
+    quantized_matmul_id_ggml_grouped_mv, quantized_matmul_id_ggml_pooled,
     quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,
     quantized_matmul_id_ggml_pooled_slotted,
     quantized_matmul_id_ggml_pooled_slotted_reusing_schedule,

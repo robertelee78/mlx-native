@@ -3022,6 +3022,160 @@ fn encode_legacy_map0(
     Ok(())
 }
 
+/// GPU parameters for the decode-sized grouped matvec kernels.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GroupedMvGpuParams {
+    k: i32,
+    n: i32,
+    n_tokens: i32,
+    top_k: i32,
+    n_experts: i32,
+    slotted_input: u32,
+    expert_stride: u64,
+}
+
+/// Run one Q4_K or Q6_K expert projection over a five-route grouped matvec
+/// tile. The first projection prepares a compact live-expert schedule; later
+/// projections may reuse that exact schedule, including a slotted down input.
+///
+/// This route is intended for decode-sized MoE batches where the 32-row
+/// `mm_id` tile costs more than it saves but repeated expert routes still make
+/// per-route matvec weight reads wasteful.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_mv(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+) -> Result<()> {
+    if !matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K) {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped expert matvec requires Q4_K or Q6_K, got {:?}",
+            params.ggml_type
+        )));
+    }
+    if !matches!(params.top_k, 1 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped expert matvec has no map0 specialization for top_k={}",
+            params.top_k
+        )));
+    }
+    validate_id_call(input, weight, ids, output, params, params.n)?;
+    scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
+
+    let total_rows = usize::try_from(params.n_tokens)
+        .ok()
+        .and_then(|tokens| {
+            tokens.checked_mul(if slotted_input {
+                params.top_k as usize
+            } else {
+                1
+            })
+        })
+        .ok_or_else(|| MlxError::InvalidArgument("grouped expert input rows overflow".into()))?;
+    let required_input = checked_byte_extent(
+        "grouped expert input",
+        &[total_rows, params.k as usize, DType::F32.size_of()],
+    )?;
+    if input.data_byte_len() < required_input {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped expert input buffer too small: expected {required_input}, got {}",
+            input.data_byte_len()
+        )));
+    }
+
+    let dispatch = GgmlIdMmDispatchParams {
+        n_tokens: params.n_tokens,
+        top_k: params.top_k,
+        n: params.n,
+        k: params.k,
+        n_experts: params.n_experts,
+        expert_stride: params.expert_stride,
+        ggml_type: params.ggml_type,
+    };
+    let maximum_tiles = compact_max_tiles(
+        u64::from(params.n_tokens) * u64::from(params.top_k),
+        u64::from(params.n_experts),
+    );
+    if reuse_schedule {
+        scratch.validate_schedule_reuse(
+            encoder,
+            ids,
+            params.n_tokens,
+            params.top_k,
+            params.n_experts,
+            ExpertMmSchedule::CompactTiles,
+        )?;
+    } else {
+        scratch.invalidate_schedule();
+        let result = encode_compact_map0(
+            encoder,
+            registry,
+            device,
+            ids,
+            &scratch.htpe,
+            &scratch.hids,
+            &dispatch,
+            maximum_tiles,
+        );
+        if let Err(error) = result {
+            scratch.invalidate_schedule();
+            return Err(error);
+        }
+        scratch.encode_serial = scratch.encode_serial.wrapping_add(1);
+        scratch.schedule_key = Some(scratch.schedule_key_for(
+            encoder,
+            ids,
+            params.n_tokens,
+            params.top_k,
+            params.n_experts,
+            ExpertMmSchedule::CompactTiles,
+        ));
+    }
+
+    let (kernel_name, columns_per_group) = match params.ggml_type {
+        GgmlType::Q4_K => ("grouped_mv_id_q4_K_f32_r5", 2u64),
+        GgmlType::Q6_K => ("grouped_mv_id_q6_K_f32_r5", 4u64),
+        _ => unreachable!("validated grouped expert type"),
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
+    let gpu = GroupedMvGpuParams {
+        k: params.k as i32,
+        n: params.n as i32,
+        n_tokens: params.n_tokens as i32,
+        top_k: params.top_k as i32,
+        n_experts: params.n_experts as i32,
+        slotted_input: u32::from(slotted_input),
+        expert_stride: params.expert_stride,
+    };
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(&scratch.htpe)),
+            (4, KernelArg::Buffer(&scratch.hids)),
+            (5, KernelArg::Bytes(as_bytes(&gpu))),
+        ],
+        metal::MTLSize::new(
+            (u64::from(params.n) + columns_per_group - 1) / columns_per_group,
+            maximum_tiles,
+            1,
+        ),
+        metal::MTLSize::new(32, 2, 1),
+    );
+    Ok(())
+}
+
 /// Host-side params for `kernel_mul_mm_id_map0c_ne20_<N>`; matches
 /// `GgmlMatmulIdMm_Map0cParams` in `quantized_matmul_id_mm.metal`.
 #[repr(C)]
