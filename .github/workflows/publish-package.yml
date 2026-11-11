@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, hf2q-gates]
     timeout-minutes: 30
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
@@ -45,7 +45,7 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          test "$actual_sha" = "$(git rev-parse origin/main)"
+          git merge-base --is-ancestor "$actual_sha" origin/main
           actual_version=$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)
           test "$actual_version" = "$EXPECTED_VERSION"
           test "$EXPECTED_PACKAGE_SHA256" != ""
@@ -62,7 +62,7 @@ jobs:
           cargo +1.96.0 package --locked --no-verify
           crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
           test -s "$crate"
-          actual=$(sha256sum "$crate" | cut -d ' ' -f1)
+          actual=$(shasum -a 256 "$crate" | cut -d ' ' -f1)
           echo "package_sha256=$actual"
           test "$actual" = "$EXPECTED_PACKAGE_SHA256"
 
@@ -90,7 +90,7 @@ jobs:
             if curl --fail --location --silent --show-error \
               "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
               --output "$downloaded"; then
-              actual=$(sha256sum "$downloaded" | cut -d ' ' -f1)
+              actual=$(shasum -a 256 "$downloaded" | cut -d ' ' -f1)
               test "$actual" = "$EXPECTED_PACKAGE_SHA256"
               exit 0
             fi
