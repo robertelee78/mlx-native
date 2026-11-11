@@ -24,7 +24,7 @@ struct GroupedM8PrepareParams {
     uint plane1_offset;
     uint meta_offset;
     uint source_row_bytes;
-    uint _pad;
+    uint destination_expert_offset;
 };
 
 inline ulong grouped_m8_tiled_index(uint row, uint unit, uint units) {
@@ -66,7 +66,8 @@ kernel void grouped_m8_prepare_q4k_q6k(
     const uint block = group / 8;
     const uint within = group % 8;
     device const uchar *expert_source = source + uint64_t(expert) * p.source_expert_stride;
-    device uchar *expert_prepared = prepared + uint64_t(expert) * p.prepared_expert_stride;
+    device uchar *expert_prepared =
+        prepared + uint64_t(expert + p.destination_expert_offset) * p.prepared_expert_stride;
     device const uchar *b = expert_source + uint64_t(row) * p.source_row_bytes +
                             uint64_t(block) * (p.format == M8_Q4 ? 144 : 210);
     device uchar *plane0 = expert_prepared + grouped_m8_tiled_index(row, group, groups) * 16;

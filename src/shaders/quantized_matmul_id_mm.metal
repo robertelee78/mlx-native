@@ -700,6 +700,12 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
     device const char *, device char *, device char *,
     threadgroup char *, ushort, ushort);
 
+template [[host_name("kernel_mul_mm_id_map0_ne20_9")]]
+kernel void hf2q_mul_mm_id_map0_impl<9>(
+    constant GgmlMatmulIdMm_Map0Params &,
+    device const char *, device char *, device char *,
+    threadgroup char *, ushort, ushort);
+
 // ====================================================================
 // map0c — compact per-expert tile schedule builder (ADR-063 P2)
 // ====================================================================
@@ -951,6 +957,12 @@ kernel void hf2q_mul_mm_id_map0c_impl<6>(
 
 template [[host_name("kernel_mul_mm_id_map0c_ne20_8")]]
 kernel void hf2q_mul_mm_id_map0c_impl<8>(
+    constant GgmlMatmulIdMm_Map0cParams &,
+    device const char *, device char *, device char *,
+    threadgroup char *, ushort, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_map0c_ne20_9")]]
+kernel void hf2q_mul_mm_id_map0c_impl<9>(
     constant GgmlMatmulIdMm_Map0cParams &,
     device const char *, device char *, device char *,
     threadgroup char *, ushort, ushort, ushort, ushort);

@@ -2,6 +2,7 @@ use half::bf16;
 use mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv;
 use mlx_native::{
     ggml_expert_bytes, prepare_quantized_matmul_id_ggml_grouped_m8,
+    prepare_quantized_matmul_id_ggml_grouped_m8_with_tail,
     quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_grouped_m8_gate_up,
     DType, GgmlQuantizedMatmulIdParams, GgmlType, GroupedM8Epilogue, GroupedM8Input, IdMmScratch,
     KernelRegistry, MlxBuffer, MlxDevice,
@@ -366,6 +367,143 @@ fn grouped_q4_k_matches_mv() {
 #[test]
 fn grouped_q6_k_matches_mv() {
     grouped_matches_mv(GgmlType::Q6_K);
+}
+
+fn grouped_tail_matches_combined_mv(ggml_type: GgmlType) {
+    const TOKENS: u32 = 5;
+    const PRIMARY_EXPERTS: u32 = 8;
+    const TAIL_EXPERTS: u32 = 1;
+    const EXPERTS: u32 = PRIMARY_EXPERTS + TAIL_EXPERTS;
+    const TOP_K: u32 = 9;
+    const WIDTH: u32 = 256;
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let input = f32_buffer(&device, (TOKENS * WIDTH) as usize, 201);
+    let (primary_weight, stride) = weights(&device, ggml_type, PRIMARY_EXPERTS, WIDTH, WIDTH, 202);
+    let (tail_weight, tail_stride) = weights(&device, ggml_type, TAIL_EXPERTS, WIDTH, WIDTH, 203);
+    assert_eq!(stride, tail_stride);
+
+    let primary_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: TOKENS,
+        top_k: TOP_K,
+        n: WIDTH,
+        k: WIDTH,
+        n_experts: PRIMARY_EXPERTS,
+        expert_stride: stride,
+        ggml_type,
+    };
+    let tail_params = GgmlQuantizedMatmulIdParams {
+        n_experts: TAIL_EXPERTS,
+        expert_stride: tail_stride,
+        ..primary_params
+    };
+    let combined_params = GgmlQuantizedMatmulIdParams {
+        n_experts: EXPERTS,
+        ..primary_params
+    };
+
+    let id_values: Vec<u32> = (0..TOKENS)
+        .flat_map(|token| (0..TOP_K).map(move |slot| (slot + token) % EXPERTS))
+        .collect();
+    let mut expert_ids = device
+        .alloc_buffer(
+            id_values.len() * DType::U32.size_of(),
+            DType::U32,
+            vec![id_values.len()],
+        )
+        .expect("combined ids");
+    expert_ids
+        .as_mut_slice::<u32>()
+        .expect("combined id slice")
+        .copy_from_slice(&id_values);
+
+    let combined_bytes = (u64::from(EXPERTS) * stride) as usize;
+    let mut combined_weight = device
+        .alloc_buffer(combined_bytes, DType::U8, vec![combined_bytes])
+        .expect("combined weight");
+    let primary_bytes = primary_weight.as_slice::<u8>().expect("primary bytes");
+    let tail_bytes = tail_weight.as_slice::<u8>().expect("tail bytes");
+    let combined = combined_weight
+        .as_mut_slice::<u8>()
+        .expect("combined bytes");
+    combined[..primary_bytes.len()].copy_from_slice(primary_bytes);
+    combined[primary_bytes.len()..primary_bytes.len() + tail_bytes.len()]
+        .copy_from_slice(tail_bytes);
+
+    let elements = (TOKENS * TOP_K * WIDTH) as usize;
+    let gathered_elements = ((TOKENS * TOP_K + EXPERTS) * WIDTH) as usize;
+    let gathered = device
+        .alloc_buffer(
+            gathered_elements * DType::BF16.size_of(),
+            DType::BF16,
+            vec![gathered_elements],
+        )
+        .expect("gathered input");
+    let candidate = device
+        .alloc_buffer(elements * DType::F32.size_of(), DType::F32, vec![elements])
+        .expect("candidate");
+    let reference = device
+        .alloc_buffer(elements * DType::F32.size_of(), DType::F32, vec![elements])
+        .expect("reference");
+    let mut scratch =
+        IdMmScratch::alloc_with_top_k(&device, EXPERTS, TOKENS, TOP_K).expect("scratch");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let prepared = prepare_quantized_matmul_id_ggml_grouped_m8_with_tail(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &primary_weight,
+        &primary_params,
+        &tail_weight,
+        &tail_params,
+    )
+    .expect("prepare routed and shared experts");
+    quantized_matmul_id_ggml_grouped_m8_epilogue(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &gathered,
+        &prepared,
+        &expert_ids,
+        &candidate,
+        None,
+        &mut scratch,
+        &combined_params,
+        false,
+        false,
+        false,
+        GroupedM8Input::F32,
+        GroupedM8Epilogue::F32,
+    )
+    .expect("combined grouped projection");
+    quantized_matmul_id_ggml_mv(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &combined_weight,
+        &expert_ids,
+        &reference,
+        &combined_params,
+    )
+    .expect("combined MV reference");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.tail")
+        .expect("commit tail parity");
+    assert_tensor_close(&candidate, &reference, elements, "prepared tail projection");
+}
+
+#[test]
+fn grouped_q4_k_tail_matches_combined_mv() {
+    grouped_tail_matches_combined_mv(GgmlType::Q4_K);
+}
+
+#[test]
+fn grouped_q6_k_tail_matches_combined_mv() {
+    grouped_tail_matches_combined_mv(GgmlType::Q6_K);
 }
 
 #[test]

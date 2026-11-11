@@ -38,10 +38,10 @@ pub fn register(registry: &mut KernelRegistry) {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MoeSoftmaxTopkGpuParams {
-    n_tokens:  u32,
-    n_experts: u32,
-    top_k:     u32,
-    _pad:      f32,
+    n_tokens:     u32,
+    n_experts:    u32,
+    top_k:        u32,
+    output_stride: u32,
 }
 
 /// Dispatch a fused softmax + top-K + renorm MoE routing kernel.
@@ -70,13 +70,13 @@ pub fn dispatch_moe_softmax_topk(
     n_experts:   u32,
     top_k:       u32,
 ) -> Result<()> {
-    check_args(logits, out_ids, out_weights, n_tokens, n_experts, top_k, 64, u32::MAX)?;
+    check_args(logits, out_ids, out_weights, n_tokens, n_experts, top_k, top_k, 64, u32::MAX)?;
 
     let gpu_params = MoeSoftmaxTopkGpuParams {
         n_tokens,
         n_experts,
         top_k,
-        _pad: 0.0,
+        output_stride: top_k,
     };
 
     let pipeline = registry.get_pipeline("moe_softmax_topk_f32", device.metal_device())?;
@@ -112,6 +112,7 @@ fn check_args(
     n_tokens:    u32,
     n_experts:   u32,
     top_k:       u32,
+    output_stride: u32,
     max_top_k:   u32,
     max_experts: u32,
 ) -> Result<()> {
@@ -136,9 +137,9 @@ fn check_args(
         )));
     }
 
-    let expected_logits  = (n_tokens  as usize) * (n_experts as usize) * DType::F32.size_of();
-    let expected_ids     = (n_tokens  as usize) * (top_k     as usize) * DType::U32.size_of();
-    let expected_weights = (n_tokens  as usize) * (top_k     as usize) * DType::F32.size_of();
+    let expected_logits  = (n_tokens  as usize) * (n_experts    as usize) * DType::F32.size_of();
+    let expected_ids     = (n_tokens  as usize) * (output_stride as usize) * DType::U32.size_of();
+    let expected_weights = (n_tokens  as usize) * (output_stride as usize) * DType::F32.size_of();
 
     if logits.byte_len() < expected_logits {
         return Err(MlxError::InvalidArgument(format!(
@@ -185,6 +186,49 @@ pub fn dispatch_moe_softmax_topk_simd(
     n_experts:   u32,
     top_k:       u32,
 ) -> Result<()> {
+    dispatch_moe_softmax_topk_simd_layout(
+        encoder, registry, device, logits, out_ids, out_weights,
+        n_tokens, n_experts, top_k, top_k,
+    )
+}
+
+/// SIMD router that appends one always-live shared expert after each token's
+/// routed experts. Its id is `n_experts`; its weight is zero because the shared
+/// gate is applied by the output reducer.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_moe_softmax_topk_simd_with_shared(
+    encoder:     &mut CommandEncoder,
+    registry:    &mut KernelRegistry,
+    device:      &MlxDevice,
+    logits:      &MlxBuffer,
+    out_ids:     &MlxBuffer,
+    out_weights: &MlxBuffer,
+    n_tokens:    u32,
+    n_experts:   u32,
+    top_k:       u32,
+) -> Result<()> {
+    let output_stride = top_k
+        .checked_add(1)
+        .ok_or_else(|| MlxError::InvalidArgument("moe_softmax_topk output stride overflow".into()))?;
+    dispatch_moe_softmax_topk_simd_layout(
+        encoder, registry, device, logits, out_ids, out_weights,
+        n_tokens, n_experts, top_k, output_stride,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_moe_softmax_topk_simd_layout(
+    encoder:     &mut CommandEncoder,
+    registry:    &mut KernelRegistry,
+    device:      &MlxDevice,
+    logits:      &MlxBuffer,
+    out_ids:     &MlxBuffer,
+    out_weights: &MlxBuffer,
+    n_tokens:    u32,
+    n_experts:   u32,
+    top_k:       u32,
+    output_stride: u32,
+) -> Result<()> {
     check_args(
         logits,
         out_ids,
@@ -192,6 +236,7 @@ pub fn dispatch_moe_softmax_topk_simd(
         n_tokens,
         n_experts,
         top_k,
+        output_stride,
         MOE_SOFTMAX_TOPK_SIMD_MAX_TOP_K,
         MOE_SOFTMAX_TOPK_SIMD_MAX_EXPERTS,
     )?;
@@ -199,7 +244,7 @@ pub fn dispatch_moe_softmax_topk_simd(
         n_tokens,
         n_experts,
         top_k,
-        _pad: 0.0,
+        output_stride,
     };
     let per_lane = n_experts.div_ceil(32) as i32;
     let pipeline = registry.get_pipeline_with_constants(

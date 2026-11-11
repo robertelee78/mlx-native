@@ -34,7 +34,7 @@ struct MoeSoftmaxTopkParams {
     uint n_tokens;
     uint n_experts;
     uint top_k;
-    float _pad;
+    uint output_stride;
 };
 
 kernel void moe_softmax_topk_simd_f32(
@@ -127,9 +127,12 @@ kernel void moe_softmax_topk_simd_f32(
     }
 
     const float inv_topk_sum = (topk_sum > 1e-9f) ? (1.0f / topk_sum) : 1.0f;
+    const uint base = row * p.output_stride;
     if (lane < ushort(FC_TOP_K)) {
-        const uint base = row * uint(FC_TOP_K);
         out_ids[base + lane]     = my_id;
         out_weights[base + lane] = my_val * inv_topk_sum;
+    } else if (lane == ushort(FC_TOP_K) && p.output_stride > p.top_k) {
+        out_ids[base + p.top_k] = p.n_experts;
+        out_weights[base + p.top_k] = 0.0f;
     }
 }

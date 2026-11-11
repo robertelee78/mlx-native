@@ -64,3 +64,35 @@ kernel void moe_weighted_reduce_f32(
 
     output[t * p.h + h_idx] = acc;
 }
+
+// The shared expert is stored as the final route in each token's combined
+// projection output. Its routing weight is ignored; sh_logit gates it inline.
+kernel void moe_weighted_reduce_shared_last_f32(
+        constant MoeWeightedReduceParams & p   [[buffer(0)]],
+        device const float * expert_w          [[buffer(1)]],
+        device const float * y_combined        [[buffer(2)]],
+        device const float * sh_logit          [[buffer(3)]],
+        device const float * residual          [[buffer(4)]],
+        device       float * output            [[buffer(5)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        uint   tiitg [[thread_index_in_threadgroup]]) {
+
+    const uint h_idx = tgpig.x * 256 + tiitg;
+    const uint t = tgpig.y;
+    if (h_idx >= p.h || t >= p.n_tokens) return;
+
+    const uint stride = p.top_k + 1;
+    const uint base = t * stride;
+    float acc = 0.f;
+    for (uint k = 0; k < p.top_k; k++) {
+        const uint slot = base + k;
+        acc += expert_w[slot] * y_combined[slot * p.h + h_idx];
+    }
+
+    const float sh_gate = 1.f / (1.f + exp(-sh_logit[t]));
+    acc += sh_gate * y_combined[(base + p.top_k) * p.h + h_idx];
+    if (p.add_residual != 0) {
+        acc += residual[t * p.h + h_idx];
+    }
+    output[t * p.h + h_idx] = acc;
+}

@@ -28,6 +28,10 @@ pub static MOE_WEIGHTED_REDUCE_SHADER_SOURCE: &str =
 /// Register the `moe_weighted_reduce_f32` pipeline.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("moe_weighted_reduce_f32", MOE_WEIGHTED_REDUCE_SHADER_SOURCE);
+    registry.register_source(
+        "moe_weighted_reduce_shared_last_f32",
+        MOE_WEIGHTED_REDUCE_SHADER_SOURCE,
+    );
 }
 
 /// GPU-side params struct.
@@ -139,5 +143,101 @@ pub fn dispatch_moe_weighted_reduce(
         threadgroup_size,
     );
 
+    Ok(())
+}
+
+/// Dispatch weighted reduction when the shared expert output is the final
+/// route in each token's combined `(top_k + 1)` projection buffer.
+///
+/// The final routing weight is ignored. The raw shared gate logit is
+/// sigmoid-gated inline, preserving [`dispatch_moe_weighted_reduce`] semantics
+/// without a separate shared-output allocation.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_moe_weighted_reduce_shared_last(
+    encoder:              &mut CommandEncoder,
+    registry:             &mut KernelRegistry,
+    device:               &MlxDevice,
+    expert_w:             &MlxBuffer,
+    y_expert_and_shared:  &MlxBuffer,
+    sh_logit:             &MlxBuffer,
+    residual:             &MlxBuffer,
+    output:               &mut MlxBuffer,
+    n_tokens:             u32,
+    top_k:                u32,
+    h:                    u32,
+    add_residual:         bool,
+) -> Result<()> {
+    if n_tokens == 0 || top_k == 0 || h == 0 {
+        return Err(MlxError::InvalidArgument(
+            "moe_weighted_reduce_shared_last: n_tokens, top_k, h must be > 0".into(),
+        ));
+    }
+    let stride = (top_k as usize)
+        .checked_add(1)
+        .ok_or_else(|| MlxError::InvalidArgument("shared-last stride overflow".into()))?;
+    let slots = (n_tokens as usize)
+        .checked_mul(stride)
+        .ok_or_else(|| MlxError::InvalidArgument("shared-last slot count overflow".into()))?;
+    let output_elements = (n_tokens as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("shared-last output size overflow".into()))?;
+    let bytes = |elements: usize| {
+        elements
+            .checked_mul(DType::F32.size_of())
+            .ok_or_else(|| MlxError::InvalidArgument("shared-last buffer size overflow".into()))
+    };
+    let check = |buffer: &MlxBuffer, minimum: usize, name: &str| -> Result<()> {
+        if buffer.dtype() != DType::F32 {
+            return Err(MlxError::InvalidArgument(format!(
+                "moe_weighted_reduce_shared_last: {name} must be F32, got {:?}",
+                buffer.dtype()
+            )));
+        }
+        if buffer.byte_len() < minimum {
+            return Err(MlxError::InvalidArgument(format!(
+                "moe_weighted_reduce_shared_last: {name} too small (expected {minimum}, got {})",
+                buffer.byte_len()
+            )));
+        }
+        Ok(())
+    };
+    check(expert_w, bytes(slots)?, "expert_w")?;
+    check(
+        y_expert_and_shared,
+        bytes(
+            slots
+                .checked_mul(h as usize)
+                .ok_or_else(|| MlxError::InvalidArgument("shared-last tensor size overflow".into()))?,
+        )?,
+        "y_expert_and_shared",
+    )?;
+    check(sh_logit, bytes(n_tokens as usize)?, "sh_logit")?;
+    check(output, bytes(output_elements)?, "output")?;
+    if add_residual {
+        check(residual, bytes(output_elements)?, "residual")?;
+    }
+
+    let gpu_params = MoeWeightedReduceGpuParams {
+        n_tokens,
+        top_k,
+        h,
+        add_residual: add_residual as u32,
+    };
+    let pipeline =
+        registry.get_pipeline("moe_weighted_reduce_shared_last_f32", device.metal_device())?;
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Bytes(as_bytes(&gpu_params))),
+            (1, KernelArg::Buffer(expert_w)),
+            (2, KernelArg::Buffer(y_expert_and_shared)),
+            (3, KernelArg::Buffer(sh_logit)),
+            (4, KernelArg::Buffer(residual)),
+            (5, KernelArg::Buffer(output)),
+        ],
+        &[],
+        MTLSize::new((h as u64 + TG_SIZE - 1) / TG_SIZE, n_tokens as u64, 1),
+        MTLSize::new(TG_SIZE, 1, 1),
+    );
     Ok(())
 }

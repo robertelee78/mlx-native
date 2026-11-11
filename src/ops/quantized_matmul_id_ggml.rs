@@ -220,8 +220,9 @@ impl GgmlType {
 #[inline]
 fn has_mm_id_map0(top_k: u32) -> bool {
     // Exact template set used by the production models currently supported:
-    // top-k 6 is DeepSeek-V4; 1 and 8 retain the existing Gemma/Qwen paths.
-    matches!(top_k, 1 | 6 | 8)
+    // top-k 6 is DeepSeek-V4, 1 and 8 retain Gemma/Qwen, and 9 appends Qwen's
+    // shared expert to its eight routed experts.
+    matches!(top_k, 1 | 6 | 8 | 9)
 }
 
 fn required_expert_weight_bytes(
@@ -2960,6 +2961,7 @@ fn encode_legacy_map0(
         1 => "kernel_mul_mm_id_map0_ne20_1",
         6 => "kernel_mul_mm_id_map0_ne20_6",
         8 => "kernel_mul_mm_id_map0_ne20_8",
+        9 => "kernel_mul_mm_id_map0_ne20_9",
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm_for_test: no map0 instantiation for top_k={}",
@@ -3035,7 +3037,7 @@ struct GroupedM8PrepareGpuParams {
     plane1_offset: u32,
     meta_offset: u32,
     source_row_bytes: u32,
-    _pad: u32,
+    destination_expert_offset: u32,
 }
 
 #[repr(C)]
@@ -3058,6 +3060,7 @@ struct GroupedM8GpuParams {
 #[derive(Clone)]
 pub struct PreparedGroupedM8Experts {
     _source: MlxBuffer,
+    _tail_source: Option<MlxBuffer>,
     bytes: MlxBuffer,
     n_experts: u32,
     n: u32,
@@ -3077,12 +3080,43 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
     weight: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<PreparedGroupedM8Experts> {
-    if weight.dtype() != DType::U8 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires U8 expert weights, got {:?}",
-            weight.dtype()
-        )));
-    }
+    prepare_quantized_matmul_id_ggml_grouped_m8_parts(
+        encoder, registry, device, weight, params, None,
+    )
+}
+
+/// Prepare a routed expert stack and one compatible tail stack into a single
+/// allocation. Tail experts are assigned ids beginning at
+/// `primary_params.n_experts`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_quantized_matmul_id_ggml_grouped_m8_with_tail(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    primary_weight: &MlxBuffer,
+    primary_params: &GgmlQuantizedMatmulIdParams,
+    tail_weight: &MlxBuffer,
+    tail_params: &GgmlQuantizedMatmulIdParams,
+) -> Result<PreparedGroupedM8Experts> {
+    prepare_quantized_matmul_id_ggml_grouped_m8_parts(
+        encoder,
+        registry,
+        device,
+        primary_weight,
+        primary_params,
+        Some((tail_weight, tail_params)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_quantized_matmul_id_ggml_grouped_m8_parts(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    tail: Option<(&MlxBuffer, &GgmlQuantizedMatmulIdParams)>,
+) -> Result<PreparedGroupedM8Experts> {
     let format = match params.ggml_type {
         GgmlType::Q4_K => 0,
         GgmlType::Q6_K => 1,
@@ -3092,41 +3126,79 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
             )))
         }
     };
-    if params.n_experts == 0
-        || params.n == 0
-        || params.n % 64 != 0
-        || params.k == 0
-        || params.k % 256 != 0
-    {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
-            params.n_experts, params.n, params.k
-        )));
-    }
-    let matrix_bytes = checked_byte_extent(
-        "grouped M8 source matrix",
-        &[
-            params.n as usize,
-            (params.k / params.ggml_type.block_values()) as usize,
-            params.ggml_type.block_bytes() as usize,
-        ],
-    )?;
-    if params.expert_stride < matrix_bytes as u64 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
-            params.expert_stride
-        )));
-    }
-    let source_bytes = u64::from(params.n_experts - 1)
-        .checked_mul(params.expert_stride)
-        .and_then(|offset| offset.checked_add(matrix_bytes as u64))
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
-    if weight.data_byte_len() < source_bytes as usize {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source needs {source_bytes} bytes, got {}",
-            weight.data_byte_len()
-        )));
-    }
+    let validate_source = |source: &MlxBuffer,
+                           source_params: &GgmlQuantizedMatmulIdParams|
+     -> Result<usize> {
+        if source.dtype() != DType::U8 {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped M8 preparation requires U8 expert weights, got {:?}",
+                source.dtype()
+            )));
+        }
+        if source_params.n_experts == 0
+            || source_params.n == 0
+            || source_params.n % 64 != 0
+            || source_params.k == 0
+            || source_params.k % 256 != 0
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                    "grouped M8 preparation requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
+                    source_params.n_experts, source_params.n, source_params.k
+                )));
+        }
+        let matrix_bytes = checked_byte_extent(
+            "grouped M8 source matrix",
+            &[
+                source_params.n as usize,
+                (source_params.k / source_params.ggml_type.block_values()) as usize,
+                source_params.ggml_type.block_bytes() as usize,
+            ],
+        )?;
+        if source_params.expert_stride < matrix_bytes as u64 {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
+                source_params.expert_stride
+            )));
+        }
+        let source_bytes = u64::from(source_params.n_experts - 1)
+            .checked_mul(source_params.expert_stride)
+            .and_then(|offset| offset.checked_add(matrix_bytes as u64))
+            .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
+        if source.data_byte_len() < source_bytes as usize {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped M8 source needs {source_bytes} bytes, got {}",
+                source.data_byte_len()
+            )));
+        }
+        Ok(matrix_bytes)
+    };
+
+    let matrix_bytes = validate_source(weight, params)?;
+    let tail_experts = if let Some((tail_weight, tail_params)) = tail {
+        if tail_params.ggml_type != params.ggml_type
+            || tail_params.n != params.n
+            || tail_params.k != params.k
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped M8 tail geometry/type must match primary; primary=({:?},{},{}) tail=({:?},{},{})",
+                params.ggml_type,
+                params.n,
+                params.k,
+                tail_params.ggml_type,
+                tail_params.n,
+                tail_params.k
+            )));
+        }
+        let tail_matrix_bytes = validate_source(tail_weight, tail_params)?;
+        debug_assert_eq!(matrix_bytes, tail_matrix_bytes);
+        tail_params.n_experts
+    } else {
+        0
+    };
+    let n_experts = params
+        .n_experts
+        .checked_add(tail_experts)
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 expert count overflow".into()))?;
 
     let rows = params.n as usize;
     let groups = (params.k / 32) as usize;
@@ -3145,7 +3217,7 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
         .and_then(|bytes| bytes.checked_add(metadata))
         .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared stride overflow".into()))?;
     let total = prepared_expert_stride
-        .checked_mul(params.n_experts as usize)
+        .checked_mul(n_experts as usize)
         .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared size overflow".into()))?;
     let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
     let gpu = GroupedM8PrepareGpuParams {
@@ -3162,7 +3234,7 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
         })?,
         source_row_bytes: u32::try_from(matrix_bytes / rows)
             .map_err(|_| MlxError::InvalidArgument("grouped M8 row bytes exceed u32".into()))?,
-        _pad: 0,
+        destination_expert_offset: 0,
     };
     let pipeline = registry.get_pipeline("grouped_m8_prepare_q4k_q6k", device.metal_device())?;
     let threads = u64::from(params.n_experts) * u64::from(params.n) * u64::from(params.k / 32);
@@ -3176,11 +3248,33 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
         metal::MTLSize::new(threads, 1, 1),
         metal::MTLSize::new(256.min(threads), 1, 1),
     );
+    if let Some((tail_weight, tail_params)) = tail {
+        let tail_gpu = GroupedM8PrepareGpuParams {
+            n_experts: tail_params.n_experts,
+            source_expert_stride: tail_params.expert_stride,
+            destination_expert_offset: params.n_experts,
+            ..gpu
+        };
+        let tail_threads = u64::from(tail_params.n_experts)
+            * u64::from(tail_params.n)
+            * u64::from(tail_params.k / 32);
+        encoder.encode_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(tail_weight)),
+                (1, KernelArg::Buffer(&bytes)),
+                (2, KernelArg::Bytes(as_bytes(&tail_gpu))),
+            ],
+            metal::MTLSize::new(tail_threads, 1, 1),
+            metal::MTLSize::new(256.min(tail_threads), 1, 1),
+        );
+    }
     encoder.memory_barrier();
     Ok(PreparedGroupedM8Experts {
         _source: weight.clone(),
+        _tail_source: tail.map(|(tail_weight, _)| tail_weight.clone()),
         bytes,
-        n_experts: params.n_experts,
+        n_experts,
         n: params.n,
         k: params.k,
         ggml_type: params.ggml_type,
@@ -3325,7 +3419,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
         }
         (_, None) => {}
     }
-    if !matches!(params.top_k, 1 | 6 | 8) {
+    if !matches!(params.top_k, 1 | 6 | 8 | 9) {
         return Err(MlxError::InvalidArgument(format!(
             "grouped M8 has no map0 specialization for top_k={}",
             params.top_k
@@ -3587,6 +3681,7 @@ fn encode_compact_map0(
         1 => "kernel_mul_mm_id_map0c_ne20_1",
         6 => "kernel_mul_mm_id_map0c_ne20_6",
         8 => "kernel_mul_mm_id_map0c_ne20_8",
+        9 => "kernel_mul_mm_id_map0c_ne20_9",
         other => {
             return Err(MlxError::InvalidArgument(format!(
                 "dispatch_id_mm: no map0c instantiation for top_k={other}"

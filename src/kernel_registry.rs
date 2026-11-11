@@ -661,6 +661,7 @@ impl KernelRegistry {
         sources.insert("kernel_mul_mm_id_map0_ne20_1".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_6".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
+        sources.insert("kernel_mul_mm_id_map0_ne20_9".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q4_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q5_0_f32".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_q8_0_f32".into(), ggml_id_mm_src);
@@ -683,6 +684,7 @@ impl KernelRegistry {
             "kernel_mul_mm_id_map0c_ne20_1",
             "kernel_mul_mm_id_map0c_ne20_6",
             "kernel_mul_mm_id_map0c_ne20_8",
+            "kernel_mul_mm_id_map0c_ne20_9",
             "kernel_mul_mm_id_q4_0_f32_c",
             "kernel_mul_mm_id_q5_0_f32_c",
             "kernel_mul_mm_id_q8_0_f32_c",
@@ -1667,6 +1669,7 @@ impl KernelRegistry {
 
         let moe_wr_src: &'static str = include_str!("shaders/moe_weighted_reduce.metal");
         sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
+        sources.insert("moe_weighted_reduce_shared_last_f32".into(), moe_wr_src);
         // DeepSeek-V4 Hyper-Connection split/reduce/expand kernels.
         let deepseek_hc_src: &'static str = include_str!("shaders/deepseek_hyper_connection.metal");
         sources.insert("deepseek_hc_split_sinkhorn_f32".into(), deepseek_hc_src);

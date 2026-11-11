@@ -9,7 +9,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(target_vendor = "apple")]
 
-use mlx_native::ops::moe_softmax_topk::{dispatch_moe_softmax_topk, dispatch_moe_softmax_topk_simd};
+use mlx_native::ops::moe_softmax_topk::{
+    dispatch_moe_softmax_topk, dispatch_moe_softmax_topk_simd,
+    dispatch_moe_softmax_topk_simd_with_shared,
+};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 fn lcg(seed: u64, n: usize, scale: f32) -> Vec<f32> {
@@ -121,6 +124,61 @@ fn agrees_with_the_shipped_kernel() {
                 assert!((a - b).abs() <= 2e-6, "weight {i}: shipped {a} vs simd {b}");
             }
         }
+    }
+}
+
+#[test]
+fn shared_route_appends_without_changing_routed_results() {
+    let (n_tokens, n_experts, top_k) = (7u32, 256u32, 8u32);
+    let logits = lcg(9317, (n_tokens * n_experts) as usize, 5.0);
+    let (baseline_ids, baseline_weights) =
+        run(true, &logits, n_tokens, n_experts, top_k);
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let lbuf = upload(&device, &logits);
+    let stride = top_k + 1;
+    let len = (n_tokens * stride) as usize;
+    let ids = device.alloc_buffer(len * 4, DType::U32, vec![len]).expect("ids");
+    let weights = device.alloc_buffer(len * 4, DType::F32, vec![len]).expect("weights");
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_moe_softmax_topk_simd_with_shared(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &lbuf,
+        &ids,
+        &weights,
+        n_tokens,
+        n_experts,
+        top_k,
+    )
+    .expect("dispatch shared route");
+    encoder.commit_and_wait().expect("commit");
+
+    let combined_ids = ids.as_slice::<u32>().expect("ids");
+    let combined_weights = weights.as_slice::<f32>().expect("weights");
+    for token in 0..n_tokens as usize {
+        let baseline = token * top_k as usize;
+        let combined = token * stride as usize;
+        assert_eq!(
+            &combined_ids[combined..combined + top_k as usize],
+            &baseline_ids[baseline..baseline + top_k as usize]
+        );
+        let baseline_bits: Vec<u32> = baseline_weights[baseline..baseline + top_k as usize]
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        let combined_bits: Vec<u32> = combined_weights[combined..combined + top_k as usize]
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(combined_bits, baseline_bits);
+        assert_eq!(combined_ids[combined + top_k as usize], n_experts);
+        assert_eq!(
+            combined_weights[combined + top_k as usize].to_bits(),
+            0.0f32.to_bits()
+        );
     }
 }
 

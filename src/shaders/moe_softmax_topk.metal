@@ -21,7 +21,7 @@ struct MoeSoftmaxTopkParams {
     uint n_tokens;
     uint n_experts;
     uint top_k;
-    float _pad;  // align to 16 bytes
+    uint output_stride;
 };
 
 kernel void moe_softmax_topk_f32(
@@ -140,7 +140,7 @@ kernel void moe_softmax_topk_f32(
         const float inv_topk_sum = (topk_sum > 1e-9f) ? (1.f / topk_sum) : 1.f;
 
         // ---- Phase 4: Write output ----
-        const uint base = token_idx * top_k;
+        const uint base = token_idx * p.output_stride;
         for (uint k = 0; k < top_k; k++) {
             out_ids[base + k]     = top_idxs[k];
             out_weights[base + k] = top_vals[k] * inv_topk_sum;
