@@ -652,6 +652,7 @@ impl KernelRegistry {
                 sources.insert(format!("grouped_m8_id_{format}_{epilogue}"), grouped_mv_src);
                 sources.insert(format!("grouped_m8_register_{format}_{epilogue}"), grouped_mv_src);
             }
+            sources.insert(format!("grouped_m8_gate_up_{format}_bf16"), grouped_mv_src);
             sources.insert(format!("grouped_native_m8_id_{format}_f32"), grouped_mv_src);
         }
 

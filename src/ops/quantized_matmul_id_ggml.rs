@@ -3423,6 +3423,7 @@ pub enum GroupedM8Epilogue {
     F32,
     Bf16,
     SiluMulBf16,
+    FusedGateUpBf16,
 }
 
 /// Run a decode-sized F32 expert projection on exact eight-row live-expert
@@ -3486,8 +3487,50 @@ pub fn quantized_matmul_id_ggml_grouped_m8_epilogue(
     epilogue: GroupedM8Epilogue,
 ) -> Result<()> {
     quantized_matmul_id_ggml_grouped_m8_impl(
-        encoder, registry, device, input, gathered_input, None, prepared, ids, output, aux,
-        scratch, params, slotted_input, reuse_schedule, reuse_gather, input_kind, epilogue,
+        encoder, registry, device, input, gathered_input, None, prepared, None, ids, output,
+        aux, scratch, params, slotted_input, reuse_schedule, reuse_gather, input_kind, epilogue,
+    )
+}
+
+/// Run prepared gate and up expert projections in one staged M8 dispatch.
+///
+/// One simdgroup computes gate while the other computes up over the same
+/// 32 output columns. The up simdgroup applies `BF16(up) * SiLU(BF16(gate))`
+/// from threadgroup storage, so no gate tensor reaches device memory.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_m8_gate_up(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gathered_input: &MlxBuffer,
+    gate: &PreparedGroupedM8Experts,
+    up: &PreparedGroupedM8Experts,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    input_kind: GroupedM8Input,
+) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_m8_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        gathered_input,
+        None,
+        gate,
+        Some(up),
+        ids,
+        output,
+        None,
+        scratch,
+        params,
+        false,
+        false,
+        false,
+        input_kind,
+        GroupedM8Epilogue::FusedGateUpBf16,
     )
 }
 
@@ -3520,6 +3563,7 @@ pub fn quantized_matmul_id_ggml_grouped_m8_register(
         gathered_input,
         Some(gathered_sums),
         prepared,
+        None,
         ids,
         output,
         aux,
@@ -3542,6 +3586,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
     gathered_input: &MlxBuffer,
     gathered_sums: Option<&MlxBuffer>,
     prepared: &PreparedGroupedM8Experts,
+    paired: Option<&PreparedGroupedM8Experts>,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     aux: Option<&MlxBuffer>,
@@ -3564,6 +3609,24 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
             params.ggml_type, params.n_experts, params.n, params.k
         )));
     }
+    match (epilogue, paired) {
+        (GroupedM8Epilogue::FusedGateUpBf16, Some(up))
+            if up.n_experts == prepared.n_experts
+                && up.n == prepared.n
+                && up.k == prepared.k
+                && up.ggml_type == prepared.ggml_type => {}
+        (GroupedM8Epilogue::FusedGateUpBf16, _) => {
+            return Err(MlxError::InvalidArgument(
+                "grouped M8 fused gate/up requires matching prepared up experts".into(),
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(MlxError::InvalidArgument(
+                "grouped M8 paired experts are valid only for fused gate/up".into(),
+            ))
+        }
+        (_, None) => {}
+    }
     if !matches!(params.top_k, 1 | 6 | 8) {
         return Err(MlxError::InvalidArgument(format!(
             "grouped M8 has no map0 specialization for top_k={}",
@@ -3581,7 +3644,9 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
     };
     let output_dtype = match epilogue {
         GroupedM8Epilogue::F32 => DType::F32,
-        GroupedM8Epilogue::Bf16 | GroupedM8Epilogue::SiluMulBf16 => DType::BF16,
+        GroupedM8Epilogue::Bf16
+        | GroupedM8Epilogue::SiluMulBf16
+        | GroupedM8Epilogue::FusedGateUpBf16 => DType::BF16,
     };
     if input.dtype() != input_dtype
         || ids.dtype() != DType::U32
@@ -3638,6 +3703,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
                 "grouped M8 SiluMulBf16 requires a matching BF16 gate buffer".into(),
             ))
         }
+        (GroupedM8Epilogue::FusedGateUpBf16, None) => {}
         (_, Some(_)) => {
             return Err(MlxError::InvalidArgument(
                 "grouped M8 auxiliary input is valid only for SiluMulBf16".into(),
@@ -3791,48 +3857,70 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
         GgmlType::Q6_K => "q6_K",
         _ => unreachable!("prepared grouped M8 type was validated"),
     };
-    let epilogue_name = match epilogue {
-        GroupedM8Epilogue::F32 => "f32",
-        GroupedM8Epilogue::Bf16 => "bf16",
-        GroupedM8Epilogue::SiluMulBf16 => "silu_mul_bf16",
-    };
-    let kernel = if gathered_sums.is_some() {
-        format!("grouped_m8_register_{format}_{epilogue_name}")
-    } else {
-        format!("grouped_m8_id_{format}_{epilogue_name}")
-    };
-    let pipeline = registry.get_pipeline(&kernel, device.metal_device())?;
-    if let Some(gathered_sums) = gathered_sums {
+    if let Some(up) = paired {
+        let kernel = format!("grouped_m8_gate_up_{format}_bf16");
+        let pipeline = registry.get_pipeline(&kernel, device.metal_device())?;
         encoder.encode_threadgroups_with_args(
             pipeline,
             &[
                 (0, KernelArg::Buffer(&prepared.bytes)),
-                (1, KernelArg::Buffer(gathered_input)),
-                (2, KernelArg::Buffer(gathered_sums)),
+                (1, KernelArg::Buffer(&up.bytes)),
+                (2, KernelArg::Buffer(gathered_input)),
                 (3, KernelArg::Buffer(output)),
                 (4, KernelArg::Buffer(&scratch.htpe)),
                 (5, KernelArg::Buffer(&scratch.hids)),
                 (6, KernelArg::Bytes(as_bytes(&gpu))),
-                (7, KernelArg::Buffer(aux.unwrap_or(output))),
             ],
-            metal::MTLSize::new(u64::from(params.n / 64), maximum_tiles, 1),
-            metal::MTLSize::new(32, 4, 1),
-        );
-    } else {
-        encoder.encode_threadgroups_with_args(
-            pipeline,
-            &[
-                (0, KernelArg::Buffer(&prepared.bytes)),
-                (1, KernelArg::Buffer(gathered_input)),
-                (2, KernelArg::Buffer(output)),
-                (3, KernelArg::Buffer(&scratch.htpe)),
-                (4, KernelArg::Buffer(&scratch.hids)),
-                (5, KernelArg::Bytes(as_bytes(&gpu))),
-                (6, KernelArg::Buffer(aux.unwrap_or(output))),
-            ],
-            metal::MTLSize::new(u64::from(params.n / 64), maximum_tiles, 1),
+            metal::MTLSize::new(u64::from(params.n / 32), maximum_tiles, 1),
             metal::MTLSize::new(32, 2, 1),
         );
+    } else {
+        let epilogue_name = match epilogue {
+            GroupedM8Epilogue::F32 => "f32",
+            GroupedM8Epilogue::Bf16 => "bf16",
+            GroupedM8Epilogue::SiluMulBf16 => "silu_mul_bf16",
+            GroupedM8Epilogue::FusedGateUpBf16 => {
+                unreachable!("fused gate/up validated a paired weight")
+            }
+        };
+        let kernel = if gathered_sums.is_some() {
+            format!("grouped_m8_register_{format}_{epilogue_name}")
+        } else {
+            format!("grouped_m8_id_{format}_{epilogue_name}")
+        };
+        let pipeline = registry.get_pipeline(&kernel, device.metal_device())?;
+        if let Some(gathered_sums) = gathered_sums {
+            encoder.encode_threadgroups_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(&prepared.bytes)),
+                    (1, KernelArg::Buffer(gathered_input)),
+                    (2, KernelArg::Buffer(gathered_sums)),
+                    (3, KernelArg::Buffer(output)),
+                    (4, KernelArg::Buffer(&scratch.htpe)),
+                    (5, KernelArg::Buffer(&scratch.hids)),
+                    (6, KernelArg::Bytes(as_bytes(&gpu))),
+                    (7, KernelArg::Buffer(aux.unwrap_or(output))),
+                ],
+                metal::MTLSize::new(u64::from(params.n / 64), maximum_tiles, 1),
+                metal::MTLSize::new(32, 4, 1),
+            );
+        } else {
+            encoder.encode_threadgroups_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(&prepared.bytes)),
+                    (1, KernelArg::Buffer(gathered_input)),
+                    (2, KernelArg::Buffer(output)),
+                    (3, KernelArg::Buffer(&scratch.htpe)),
+                    (4, KernelArg::Buffer(&scratch.hids)),
+                    (5, KernelArg::Bytes(as_bytes(&gpu))),
+                    (6, KernelArg::Buffer(aux.unwrap_or(output))),
+                ],
+                metal::MTLSize::new(u64::from(params.n / 64), maximum_tiles, 1),
+                metal::MTLSize::new(32, 2, 1),
+            );
+        }
     }
     if epilogue != GroupedM8Epilogue::F32 {
         encoder.memory_barrier();

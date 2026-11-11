@@ -225,6 +225,7 @@ pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, prepare_quantized_matmul_id_ggml_grouped_m8,
     quantized_matmul_id_ggml, quantized_matmul_id_ggml_grouped_m8,
     quantized_matmul_id_ggml_grouped_m8_epilogue,
+    quantized_matmul_id_ggml_grouped_m8_gate_up,
     quantized_matmul_id_ggml_grouped_m8_register, quantized_matmul_id_ggml_grouped_mv,
     quantized_matmul_id_ggml_grouped_native_m8, quantized_matmul_id_ggml_pooled,
     quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,

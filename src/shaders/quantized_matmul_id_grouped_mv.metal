@@ -756,6 +756,193 @@ kernel void grouped_m8_impl(
     }
 }
 
+template <bool Q6>
+kernel void grouped_m8_gate_up_impl(
+    device const uchar *gate_weights [[buffer(0)]],
+    device const uchar *up_weights [[buffer(1)]],
+    device bfloat *input [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    device const uint32_t *schedule [[buffer(4)]],
+    device const int32_t *routes [[buffer(5)]],
+    constant GroupedM8Params &p [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint ROWS = 8;
+    constexpr uint COLS = 32;
+    constexpr uint STEP = 32;
+    const uint state = schedule[0];
+    if ((state & 0x80000000u) != 0u || group.y >= state)
+        return;
+    device const uint32_t *descriptor = schedule + 1 + 3 * group.y;
+    const uint expert = descriptor[0];
+    const uint first_route = descriptor[1];
+    const uint route_count = descriptor[2];
+    const uint output_origin = group.x * COLS;
+    const bool up = simdgroup != 0;
+    device const uchar *weights = up ? up_weights : gate_weights;
+    device const uchar *expert_weights =
+        weights + uint64_t(expert) * p.prepared_expert_stride;
+    const uint groups = uint(p.k) / STEP;
+    const uint units = groups / 8;
+
+    if (route_count <= 2) {
+        threadgroup bfloat gates[2 * COLS];
+        int packed[2];
+        float sums[2] = {0.0f, 0.0f};
+        for (uint row = 0; row < route_count; ++row)
+            packed[row] = routes[first_route + row];
+        const uint weight_row = output_origin + lane;
+        for (uint g = 0; g < groups; ++g) {
+            const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
+            const uint4 low = *reinterpret_cast<device const uint4 *>(
+                expert_weights + tiled * 16);
+            bfloat4 decoded[8];
+            if constexpr (Q6) {
+                const uint2 high = *reinterpret_cast<device const uint2 *>(
+                    expert_weights + p.plane1_offset + tiled * 8);
+                device const uchar *meta = expert_weights + p.meta_offset +
+                    grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
+                const packed_uint4 scales =
+                    *reinterpret_cast<device const packed_uint4 *>(meta);
+                const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
+                grouped_m8_decode_q6_thread(
+                    low, high, scales, dh, ushort(g % 8),
+                    reinterpret_cast<thread bfloat *>(decoded));
+            } else {
+                const uint4 meta = *reinterpret_cast<device const uint4 *>(
+                    expert_weights + p.meta_offset +
+                    grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
+                grouped_m8_decode_q4_thread(
+                    low, meta, ushort(g % 8),
+                    reinterpret_cast<thread bfloat *>(decoded));
+            }
+            for (uint row = 0; row < route_count; ++row) {
+                device const bfloat4 *x = reinterpret_cast<device const bfloat4 *>(
+                    input + (uint64_t(first_route) + row) * p.k + g * STEP);
+                float group_sum = 0.0f;
+#pragma unroll
+                for (ushort i = 0; i < 8; ++i) {
+                    const float4 xv = float4(x[i]);
+                    const float4 wv = float4(decoded[i]);
+                    group_sum += wv.x * xv.x;
+                    group_sum += wv.y * xv.y;
+                    group_sum += wv.z * xv.z;
+                    group_sum += wv.w * xv.w;
+                }
+                sums[row] += group_sum;
+            }
+        }
+        if (!up)
+            for (uint row = 0; row < route_count; ++row)
+                gates[row * COLS + lane] = bfloat(sums[row]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (up) {
+            for (uint row = 0; row < route_count; ++row) {
+                const int64_t at = int64_t(packed[row]) * p.n + weight_row;
+                const float gate = float(gates[row * COLS + lane]);
+                const float up_value = float(bfloat(sums[row]));
+                output[at] = bfloat((gate / (1.0f + exp(-gate))) * up_value);
+            }
+        }
+        return;
+    }
+
+    threadgroup bfloat weight_tile[2 * COLS * STEP];
+    threadgroup float result_tile[2 * ROWS * COLS];
+    threadgroup int packed_routes[ROWS];
+    threadgroup ushort live_rows;
+    matmul2d<matmul2d_descriptor(
+        ROWS, COLS, STEP, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<1>> mm;
+
+    for (uint route_base = 0; route_base < route_count; route_base += ROWS) {
+        if (thread_index == 0)
+            live_rows = ushort(min(ROWS, route_count - route_base));
+        if (thread_index < ROWS)
+            packed_routes[thread_index] =
+                thread_index < min(ROWS, route_count - route_base)
+                    ? routes[first_route + route_base + thread_index]
+                    : -1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto all_left = tensor(
+            input + (uint64_t(first_route) + route_base) * p.k,
+            dextents<int32_t, 2>{p.k, ROWS},
+            array<int32_t, 2>{1, p.k});
+        auto first_left = all_left.template slice<STEP, ROWS>(0, 0);
+        threadgroup bfloat *simd_weight =
+            weight_tile + uint(simdgroup) * COLS * STEP;
+        auto right = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(
+            simd_weight, dextents<int32_t, 2>{STEP, COLS},
+            array<int32_t, 2>{1, STEP});
+        auto sum = mm.get_destination_cooperative_tensor<
+            decltype(first_left), decltype(right), float>();
+        for (ushort i = 0; i < sum.get_capacity(); ++i)
+            sum[i] = 0.0f;
+
+        for (uint g = 0; g < groups; ++g) {
+            const uint weight_row = output_origin + lane;
+            const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
+            const uint4 low = *reinterpret_cast<device const uint4 *>(
+                expert_weights + tiled * 16);
+            if constexpr (Q6) {
+                const uint2 high = *reinterpret_cast<device const uint2 *>(
+                    expert_weights + p.plane1_offset + tiled * 8);
+                device const uchar *meta = expert_weights + p.meta_offset +
+                    grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
+                const packed_uint4 scales =
+                    *reinterpret_cast<device const packed_uint4 *>(meta);
+                const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
+                grouped_m8_decode_q6(
+                    low, high, scales, dh, ushort(g % 8), 0,
+                    simd_weight + lane * STEP);
+                grouped_m8_decode_q6(
+                    low, high, scales, dh, ushort(g % 8), 1,
+                    simd_weight + lane * STEP + 16);
+            } else {
+                const uint4 meta = *reinterpret_cast<device const uint4 *>(
+                    expert_weights + p.meta_offset +
+                    grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
+                grouped_m8_decode_q4(
+                    low, meta, ushort(g % 8), 0,
+                    simd_weight + lane * STEP);
+                grouped_m8_decode_q4(
+                    low, meta, ushort(g % 8), 1,
+                    simd_weight + lane * STEP + 16);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            auto left = all_left.template slice<STEP, ROWS>(g * STEP, 0);
+            mm.run(left, right, sum);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float *simd_result =
+            result_tile + uint(simdgroup) * ROWS * COLS;
+        auto stored = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(
+            simd_result, dextents<int32_t, 2>{COLS, ROWS},
+            array<int32_t, 2>{1, COLS});
+        sum.store(stored);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (up) {
+            for (uint index = lane; index < uint(live_rows) * COLS; index += 32) {
+                const uint row = index / COLS;
+                const uint column = index % COLS;
+                const int64_t at =
+                    int64_t(packed_routes[row]) * p.n + output_origin + column;
+                const float gate = float(bfloat(result_tile[row * COLS + column]));
+                const float up_value =
+                    float(bfloat(result_tile[ROWS * COLS + row * COLS + column]));
+                output[at] =
+                    bfloat((gate / (1.0f + exp(-gate))) * up_value);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Apache-2.0 register-matrix structure adapted from incoai/splash
 // 031a25a6, runtime/metal/kernels/{common/gguf_sgmatrix.h,
 // decode/linear_gguf_sgmatrix.metal,shared/moe.metal}. The prepared Q4_K/Q6_K
@@ -1196,6 +1383,18 @@ kernel void grouped_m8_impl<true, M8_EP_SILU_MUL_BF16>(
     device const uchar *, device bfloat *, device uchar *,
     device const uint32_t *, device const int32_t *,
     constant GroupedM8Params &, device const bfloat *, uint2, ushort, ushort, ushort);
+
+template [[host_name("grouped_m8_gate_up_q4_K_bf16")]]
+kernel void grouped_m8_gate_up_impl<false>(
+    device const uchar *, device const uchar *, device bfloat *, device bfloat *,
+    device const uint32_t *, device const int32_t *,
+    constant GroupedM8Params &, uint2, ushort, ushort, ushort);
+
+template [[host_name("grouped_m8_gate_up_q6_K_bf16")]]
+kernel void grouped_m8_gate_up_impl<true>(
+    device const uchar *, device const uchar *, device bfloat *, device bfloat *,
+    device const uint32_t *, device const int32_t *,
+    constant GroupedM8Params &, uint2, ushort, ushort, ushort);
 
 template [[host_name("grouped_m8_gather_table_f32")]]
 kernel void grouped_m8_gather_table_impl<true>(
