@@ -395,3 +395,39 @@ kernel void dflash2_select_verify_rows(
     for (uint lane = 0; lane < params.lanes; ++lane)
         verify_rows[lane] = rows[lane];
 }
+
+struct DFlash2ComposeVerifyInputParams {
+    uint anchor[DFLASH2_MAX_LANES];
+    uint physical_lane[DFLASH2_MAX_LANES];
+    uint rows[DFLASH2_MAX_LANES];
+    uint physical_lanes;
+    uint lanes;
+    uint rows_per_lane;
+    uint width;
+};
+
+kernel void dflash2_compose_verify_input(
+    device const uint *proposals [[buffer(0)]],
+    device uint *target_tokens [[buffer(1)]],
+    constant DFlash2ComposeVerifyInputParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= params.width) return;
+    uint row = index;
+    uint lane = 0;
+    for (; lane < params.lanes; ++lane) {
+        if (row < params.rows[lane]) break;
+        row -= params.rows[lane];
+    }
+    // Padding rows replay the first anchor, matching the fixed-width target
+    // graph's cache-free padding policy.
+    if (lane == params.lanes) {
+        target_tokens[index] = params.anchor[0];
+        return;
+    }
+    if (row == 0) {
+        target_tokens[index] = params.anchor[lane];
+        return;
+    }
+    const uint source = params.physical_lane[lane] * (params.rows_per_lane - 1) + row - 1;
+    target_tokens[index] = proposals[source];
+}
