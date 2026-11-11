@@ -16,6 +16,7 @@ pub const DFLASH2_TOP16_KERNEL: &str = "dflash2_select_top16";
 pub const DFLASH2_EDGES_KERNEL: &str = "dflash2_select_edges";
 pub const DFLASH2_PATH_KERNEL: &str = "dflash2_select_path";
 pub const DFLASH2_VERIFY_ROWS_KERNEL: &str = "dflash2_select_verify_rows";
+pub const DFLASH2_COMPOSE_VERIFY_INPUT_KERNEL: &str = "dflash2_compose_verify_input";
 pub static DFLASH2_SELECTOR_SOURCE: &str = include_str!("../shaders/dflash2_selector.metal");
 
 pub const DFLASH2_MAX_LANES: usize = 4;
@@ -31,6 +32,7 @@ pub fn register(registry: &mut KernelRegistry) {
         DFLASH2_EDGES_KERNEL,
         DFLASH2_PATH_KERNEL,
         DFLASH2_VERIFY_ROWS_KERNEL,
+        DFLASH2_COMPOSE_VERIFY_INPUT_KERNEL,
     ] {
         registry.register_source(name, DFLASH2_SELECTOR_SOURCE);
     }
@@ -60,6 +62,18 @@ pub struct DFlash2VerifyRowsParams {
     pub rows_per_lane: u32,
     pub every_row: u32,
     pub maximum: [u32; DFLASH2_MAX_LANES],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DFlash2ComposeVerifyInputParams {
+    pub anchor: [u32; DFLASH2_MAX_LANES],
+    pub physical_lane: [u32; DFLASH2_MAX_LANES],
+    pub rows: [u32; DFLASH2_MAX_LANES],
+    pub physical_lanes: u32,
+    pub lanes: u32,
+    pub rows_per_lane: u32,
+    pub width: u32,
 }
 
 pub struct DFlash2SelectorBuffers<'a> {
@@ -424,6 +438,85 @@ pub fn dispatch_dflash2_verify_rows(
     Ok(())
 }
 
+/// Compose the fixed-width target token tile directly from GPU-selected
+/// proposals. Logical lanes may name any distinct physical draft lanes;
+/// unused target rows replay logical lane zero's anchor.
+pub fn dispatch_dflash2_compose_verify_input(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    proposals: &MlxBuffer,
+    target_tokens: &MlxBuffer,
+    params: DFlash2ComposeVerifyInputParams,
+) -> Result<()> {
+    let physical_lanes = params.physical_lanes as usize;
+    let lanes = params.lanes as usize;
+    let rows_per_lane = params.rows_per_lane as usize;
+    let width = params.width as usize;
+    if physical_lanes == 0
+        || physical_lanes > DFLASH2_MAX_LANES
+        || lanes == 0
+        || lanes > physical_lanes
+        || !(2..=DFLASH2_MAX_POSITIONS + 1).contains(&rows_per_lane)
+        || width == 0
+        || width > DFLASH2_MAX_LANES * (DFLASH2_MAX_POSITIONS + 1)
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "invalid DFlash2 verify-input geometry: physical_lanes={physical_lanes}, lanes={lanes}, rows_per_lane={rows_per_lane}, width={width}"
+        )));
+    }
+    let mut total = 0usize;
+    for lane in 0..lanes {
+        let physical = params.physical_lane[lane] as usize;
+        let rows = params.rows[lane] as usize;
+        if physical >= physical_lanes
+            || params.physical_lane[..lane].contains(&params.physical_lane[lane])
+            || rows == 0
+            || rows > rows_per_lane
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "invalid DFlash2 logical lane {lane}: physical={physical}, rows={rows}"
+            )));
+        }
+        total = total.checked_add(rows).ok_or_else(|| {
+            MlxError::InvalidArgument("DFlash2 verify-input row total overflow".into())
+        })?;
+    }
+    if total > width {
+        return Err(MlxError::InvalidArgument(format!(
+            "DFlash2 verify-input rows {total} exceed target width {width}"
+        )));
+    }
+    require(
+        proposals,
+        DType::U32,
+        &[physical_lanes, rows_per_lane - 1],
+        "proposals",
+    )?;
+    require(target_tokens, DType::U32, &[width], "target tokens")?;
+    validate_disjoint(&[proposals], &[target_tokens])?;
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![physical_range(proposals)?],
+            vec![physical_range(target_tokens)?],
+        );
+    }
+    let pipeline =
+        registry.get_pipeline(DFLASH2_COMPOSE_VERIFY_INPUT_KERNEL, device.metal_device())?;
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(proposals)),
+            (1, KernelArg::Buffer(target_tokens)),
+            (2, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(width as u64, 1, 1),
+        MTLSize::new(1, 1, 1),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +570,7 @@ mod tests {
     fn parameter_abis_match_metal_layouts() {
         assert_eq!(std::mem::size_of::<DFlash2SelectorParams>(), 48);
         assert_eq!(std::mem::size_of::<DFlash2VerifyRowsParams>(), 352);
+        assert_eq!(std::mem::size_of::<DFlash2ComposeVerifyInputParams>(), 64);
     }
 
     #[test]
@@ -700,5 +794,41 @@ mod tests {
         .unwrap();
         encoder.commit_and_wait().unwrap();
         assert_eq!(verify_rows.as_slice::<u32>().unwrap(), [8, 5]);
+    }
+
+    #[test]
+    fn gpu_verify_input_compacts_physical_lanes_and_pads_with_anchor() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let mut proposals = alloc(&device, DType::U32, &[4, 7]);
+        proposals
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&(100..128).collect::<Vec<_>>());
+        let target_tokens = alloc(&device, DType::U32, &[12]);
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_dflash2_compose_verify_input(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &proposals,
+            &target_tokens,
+            DFlash2ComposeVerifyInputParams {
+                anchor: [11, 22, 0, 0],
+                physical_lane: [2, 0, 0, 0],
+                rows: [4, 2, 0, 0],
+                physical_lanes: 4,
+                lanes: 2,
+                rows_per_lane: 8,
+                width: 12,
+            },
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        assert_eq!(
+            target_tokens.as_slice::<u32>().unwrap(),
+            [11, 114, 115, 116, 22, 100, 11, 11, 11, 11, 11, 11]
+        );
     }
 }
