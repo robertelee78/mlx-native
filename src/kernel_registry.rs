@@ -642,6 +642,18 @@ impl KernelRegistry {
             include_str!("shaders/quantized_matmul_id_grouped_mv.metal");
         sources.insert("grouped_mv_id_q4_K_f32_r5".into(), grouped_mv_src);
         sources.insert("grouped_mv_id_q6_K_f32_r5".into(), grouped_mv_src);
+        sources.insert("grouped_m8_prepare_q4k_q6k".into(), grouped_mv_src);
+        sources.insert("grouped_m8_gather_f32_bf16".into(), grouped_mv_src);
+        sources.insert("grouped_m8_gather_bf16".into(), grouped_mv_src);
+        sources.insert("grouped_m8_gather_table_f32".into(), grouped_mv_src);
+        sources.insert("grouped_m8_gather_table_bf16".into(), grouped_mv_src);
+        for format in ["q4_K", "q6_K"] {
+            for epilogue in ["f32", "bf16", "silu_mul_bf16"] {
+                sources.insert(format!("grouped_m8_id_{format}_{epilogue}"), grouped_mv_src);
+                sources.insert(format!("grouped_m8_register_{format}_{epilogue}"), grouped_mv_src);
+            }
+            sources.insert(format!("grouped_native_m8_id_{format}_f32"), grouped_mv_src);
+        }
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of

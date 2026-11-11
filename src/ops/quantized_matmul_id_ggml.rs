@@ -3038,10 +3038,6 @@ struct GroupedMvGpuParams {
 /// Run one Q4_K or Q6_K expert projection over a five-route grouped matvec
 /// tile. The first projection prepares a compact live-expert schedule; later
 /// projections may reuse that exact schedule, including a slotted down input.
-///
-/// This route is intended for decode-sized MoE batches where the 32-row
-/// `mm_id` tile costs more than it saves but repeated expert routes still make
-/// per-route matvec weight reads wasteful.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_matmul_id_ggml_grouped_mv(
     encoder: &mut CommandEncoder,
@@ -3056,6 +3052,69 @@ pub fn quantized_matmul_id_ggml_grouped_mv(
     slotted_input: bool,
     reuse_schedule: bool,
 ) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_native_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        slotted_input,
+        reuse_schedule,
+        false,
+    )
+}
+
+/// Run one native-layout Q4_K or Q6_K expert projection over exact eight-row
+/// Metal tensor tiles while reusing the compact live-expert schedule.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_native_m8(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_native_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ids,
+        output,
+        scratch,
+        params,
+        slotted_input,
+        reuse_schedule,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantized_matmul_id_ggml_grouped_native_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+    tensor_m8: bool,
+) -> Result<()> {
     if !matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K) {
         return Err(MlxError::InvalidArgument(format!(
             "grouped expert matvec requires Q4_K or Q6_K, got {:?}",
@@ -3066,6 +3125,12 @@ pub fn quantized_matmul_id_ggml_grouped_mv(
         return Err(MlxError::InvalidArgument(format!(
             "grouped expert matvec has no map0 specialization for top_k={}",
             params.top_k
+        )));
+    }
+    if tensor_m8 && params.n % 64 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped native M8 requires N divisible by 64, got {}",
+            params.n
         )));
     }
     validate_id_call(input, weight, ids, output, params, params.n)?;
@@ -3141,9 +3206,11 @@ pub fn quantized_matmul_id_ggml_grouped_mv(
         ));
     }
 
-    let (kernel_name, columns_per_group) = match params.ggml_type {
-        GgmlType::Q4_K => ("grouped_mv_id_q4_K_f32_r5", 2u64),
-        GgmlType::Q6_K => ("grouped_mv_id_q6_K_f32_r5", 4u64),
+    let (kernel_name, columns_per_group) = match (tensor_m8, params.ggml_type) {
+        (false, GgmlType::Q4_K) => ("grouped_mv_id_q4_K_f32_r5", 2u64),
+        (false, GgmlType::Q6_K) => ("grouped_mv_id_q6_K_f32_r5", 4u64),
+        (true, GgmlType::Q4_K) => ("grouped_native_m8_id_q4_K_f32", 64u64),
+        (true, GgmlType::Q6_K) => ("grouped_native_m8_id_q6_K_f32", 64u64),
         _ => unreachable!("validated grouped expert type"),
     };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
@@ -3173,6 +3240,603 @@ pub fn quantized_matmul_id_ggml_grouped_mv(
         ),
         metal::MTLSize::new(32, 2, 1),
     );
+    Ok(())
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GroupedM8PrepareGpuParams {
+    n_experts: u32,
+    n: u32,
+    k: u32,
+    format: u32,
+    source_expert_stride: u64,
+    prepared_expert_stride: u64,
+    plane1_offset: u32,
+    meta_offset: u32,
+    source_row_bytes: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GroupedM8GpuParams {
+    k: i32,
+    n: i32,
+    n_tokens: i32,
+    top_k: i32,
+    n_experts: i32,
+    slotted_input: u32,
+    prepared_expert_stride: u64,
+    plane1_offset: u32,
+    meta_offset: u32,
+}
+
+/// Model-owned Q4_K/Q6_K expert planes prepared for the eight-row Metal
+/// tensor tile. The source owner is retained so unloading either handle
+/// cannot invalidate a command encoded from this representation.
+#[derive(Clone)]
+pub struct PreparedGroupedM8Experts {
+    _source: MlxBuffer,
+    bytes: MlxBuffer,
+    n_experts: u32,
+    n: u32,
+    k: u32,
+    ggml_type: GgmlType,
+    prepared_expert_stride: u64,
+    plane1_offset: u32,
+    meta_offset: u32,
+}
+
+/// Prepare one complete Q4_K or Q6_K expert stack once for the grouped
+/// eight-row Metal tensor tile.
+pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<PreparedGroupedM8Experts> {
+    if weight.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 preparation requires U8 expert weights, got {:?}",
+            weight.dtype()
+        )));
+    }
+    let format = match params.ggml_type {
+        GgmlType::Q4_K => 0,
+        GgmlType::Q6_K => 1,
+        other => {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped M8 preparation requires Q4_K or Q6_K, got {other:?}"
+            )))
+        }
+    };
+    if params.n_experts == 0
+        || params.n == 0
+        || params.n % 64 != 0
+        || params.k == 0
+        || params.k % 256 != 0
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 preparation requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
+            params.n_experts, params.n, params.k
+        )));
+    }
+    let matrix_bytes = checked_byte_extent(
+        "grouped M8 source matrix",
+        &[
+            params.n as usize,
+            (params.k / params.ggml_type.block_values()) as usize,
+            params.ggml_type.block_bytes() as usize,
+        ],
+    )?;
+    if params.expert_stride < matrix_bytes as u64 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
+            params.expert_stride
+        )));
+    }
+    let source_bytes = u64::from(params.n_experts - 1)
+        .checked_mul(params.expert_stride)
+        .and_then(|offset| offset.checked_add(matrix_bytes as u64))
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
+    if weight.data_byte_len() < source_bytes as usize {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 source needs {source_bytes} bytes, got {}",
+            weight.data_byte_len()
+        )));
+    }
+
+    let rows = params.n as usize;
+    let groups = (params.k / 32) as usize;
+    let plane0 = checked_byte_extent("grouped M8 low plane", &[rows, groups, 16])?;
+    let plane1 = if format == 1 {
+        checked_byte_extent("grouped M8 high plane", &[rows, groups, 8])?
+    } else {
+        0
+    };
+    let metadata = checked_byte_extent(
+        "grouped M8 metadata plane",
+        &[rows, groups / 8, if format == 1 { 20 } else { 16 }],
+    )?;
+    let prepared_expert_stride = plane0
+        .checked_add(plane1)
+        .and_then(|bytes| bytes.checked_add(metadata))
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared stride overflow".into()))?;
+    let total = prepared_expert_stride
+        .checked_mul(params.n_experts as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared size overflow".into()))?;
+    let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
+    let gpu = GroupedM8PrepareGpuParams {
+        n_experts: params.n_experts,
+        n: params.n,
+        k: params.k,
+        format,
+        source_expert_stride: params.expert_stride,
+        prepared_expert_stride: prepared_expert_stride as u64,
+        plane1_offset: u32::try_from(plane0)
+            .map_err(|_| MlxError::InvalidArgument("grouped M8 plane offset exceeds u32".into()))?,
+        meta_offset: u32::try_from(plane0 + plane1).map_err(|_| {
+            MlxError::InvalidArgument("grouped M8 metadata offset exceeds u32".into())
+        })?,
+        source_row_bytes: u32::try_from(matrix_bytes / rows)
+            .map_err(|_| MlxError::InvalidArgument("grouped M8 row bytes exceed u32".into()))?,
+        _pad: 0,
+    };
+    let pipeline = registry.get_pipeline("grouped_m8_prepare_q4k_q6k", device.metal_device())?;
+    let threads = u64::from(params.n_experts) * u64::from(params.n) * u64::from(params.k / 32);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(&bytes)),
+            (2, KernelArg::Bytes(as_bytes(&gpu))),
+        ],
+        metal::MTLSize::new(threads, 1, 1),
+        metal::MTLSize::new(256.min(threads), 1, 1),
+    );
+    encoder.memory_barrier();
+    Ok(PreparedGroupedM8Experts {
+        _source: weight.clone(),
+        bytes,
+        n_experts: params.n_experts,
+        n: params.n,
+        k: params.k,
+        ggml_type: params.ggml_type,
+        prepared_expert_stride: prepared_expert_stride as u64,
+        plane1_offset: gpu.plane1_offset,
+        meta_offset: gpu.meta_offset,
+    })
+}
+
+/// Source activation storage consumed by the grouped M8 gather.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GroupedM8Input {
+    F32,
+    Bf16,
+}
+
+/// Projection output conversion performed before the grouped M8 tile stores.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GroupedM8Epilogue {
+    F32,
+    Bf16,
+    SiluMulBf16,
+}
+
+/// Run a decode-sized F32 expert projection on exact eight-row live-expert
+/// tiles. The first projection prepares the compact route schedule; paired
+/// gate/up and slotted down projections may reuse it.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_m8(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gathered_input: &MlxBuffer,
+    prepared: &PreparedGroupedM8Experts,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+    reuse_gather: bool,
+) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_m8_epilogue(
+        encoder,
+        registry,
+        device,
+        input,
+        gathered_input,
+        prepared,
+        ids,
+        output,
+        None,
+        scratch,
+        params,
+        slotted_input,
+        reuse_schedule,
+        reuse_gather,
+        GroupedM8Input::F32,
+        GroupedM8Epilogue::F32,
+    )
+}
+
+/// Grouped M8 projection with BF16 storage/fused-SiLU modes used by a complete
+/// gate -> up -> down MoE expert sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_m8_epilogue(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gathered_input: &MlxBuffer,
+    prepared: &PreparedGroupedM8Experts,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    aux: Option<&MlxBuffer>,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+    reuse_gather: bool,
+    input_kind: GroupedM8Input,
+    epilogue: GroupedM8Epilogue,
+) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_m8_impl(
+        encoder, registry, device, input, gathered_input, None, prepared, ids, output, aux,
+        scratch, params, slotted_input, reuse_schedule, reuse_gather, input_kind, epilogue,
+    )
+}
+
+/// Register-matrix grouped M8 projection over a Table16 activation tile.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_m8_register(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gathered_input: &MlxBuffer,
+    gathered_sums: &MlxBuffer,
+    prepared: &PreparedGroupedM8Experts,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    aux: Option<&MlxBuffer>,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+    reuse_gather: bool,
+    input_kind: GroupedM8Input,
+    epilogue: GroupedM8Epilogue,
+) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_m8_impl(
+        encoder,
+        registry,
+        device,
+        input,
+        gathered_input,
+        Some(gathered_sums),
+        prepared,
+        ids,
+        output,
+        aux,
+        scratch,
+        params,
+        slotted_input,
+        reuse_schedule,
+        reuse_gather,
+        input_kind,
+        epilogue,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantized_matmul_id_ggml_grouped_m8_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gathered_input: &MlxBuffer,
+    gathered_sums: Option<&MlxBuffer>,
+    prepared: &PreparedGroupedM8Experts,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    aux: Option<&MlxBuffer>,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+    reuse_gather: bool,
+    input_kind: GroupedM8Input,
+    epilogue: GroupedM8Epilogue,
+) -> Result<()> {
+    if prepared.n_experts != params.n_experts
+        || prepared.n != params.n
+        || prepared.k != params.k
+        || prepared.ggml_type != params.ggml_type
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 prepared expert shape does not match call: prepared {:?} [{}, {}, {}], call {:?} [{}, {}, {}]",
+            prepared.ggml_type, prepared.n_experts, prepared.n, prepared.k,
+            params.ggml_type, params.n_experts, params.n, params.k
+        )));
+    }
+    if !matches!(params.top_k, 1 | 6 | 8) {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 has no map0 specialization for top_k={}",
+            params.top_k
+        )));
+    }
+    if params.n_tokens == 0 || params.top_k == 0 || params.top_k > params.n_experts {
+        return Err(MlxError::InvalidArgument(
+            "grouped M8 requires n_tokens > 0 and top_k in 1..=n_experts".into(),
+        ));
+    }
+    let input_dtype = match input_kind {
+        GroupedM8Input::F32 => DType::F32,
+        GroupedM8Input::Bf16 => DType::BF16,
+    };
+    let output_dtype = match epilogue {
+        GroupedM8Epilogue::F32 => DType::F32,
+        GroupedM8Epilogue::Bf16 | GroupedM8Epilogue::SiluMulBf16 => DType::BF16,
+    };
+    if input.dtype() != input_dtype
+        || ids.dtype() != DType::U32
+        || output.dtype() != output_dtype
+        || gathered_input.dtype() != DType::BF16
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 requires {input_dtype:?} input, U32 ids, {output_dtype:?} output and BF16 gather; got {:?}/{:?}/{:?}/{:?}",
+            input.dtype(),
+            ids.dtype(),
+            output.dtype(),
+            gathered_input.dtype(),
+        )));
+    }
+    let input_rows = usize::try_from(params.n_tokens)
+        .ok()
+        .and_then(|tokens| {
+            tokens.checked_mul(if slotted_input {
+                params.top_k as usize
+            } else {
+                1
+            })
+        })
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 input rows overflow".into()))?;
+    let total_rows = usize::try_from(params.n_tokens)
+        .ok()
+        .and_then(|tokens| tokens.checked_mul(params.top_k as usize))
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 output rows overflow".into()))?;
+    let required_ids = checked_byte_extent("grouped M8 ids", &[total_rows, DType::U32.size_of()])?;
+    let required_input = checked_byte_extent(
+        "grouped M8 input",
+        &[input_rows, params.k as usize, input_dtype.size_of()],
+    )?;
+    let required_output = checked_byte_extent(
+        "grouped M8 output",
+        &[total_rows, params.n as usize, output_dtype.size_of()],
+    )?;
+    if ids.data_byte_len() < required_ids
+        || input.data_byte_len() < required_input
+        || output.data_byte_len() < required_output
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 buffers too small: ids {}/{required_ids}, input {}/{required_input}, output {}/{required_output}",
+            ids.data_byte_len(),
+            input.data_byte_len(),
+            output.data_byte_len(),
+        )));
+    }
+    match (epilogue, aux) {
+        (GroupedM8Epilogue::SiluMulBf16, Some(aux))
+            if aux.dtype() == DType::BF16 && aux.data_byte_len() >= required_output => {}
+        (GroupedM8Epilogue::SiluMulBf16, _) => {
+            return Err(MlxError::InvalidArgument(
+                "grouped M8 SiluMulBf16 requires a matching BF16 gate buffer".into(),
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(MlxError::InvalidArgument(
+                "grouped M8 auxiliary input is valid only for SiluMulBf16".into(),
+            ))
+        }
+        (_, None) => {}
+    }
+    scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
+    let expert_rows = usize::try_from(params.n_experts)
+        .ok()
+        .and_then(|experts| {
+            experts.checked_mul(if gathered_sums.is_some() { 8 } else { 1 })
+        })
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 expert rows overflow".into()))?;
+    let gathered_rows = expert_rows
+        .checked_add(input_rows)
+        .and_then(|rows| rows.checked_add(7))
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 gathered rows overflow".into()))?;
+    let required_gathered = checked_byte_extent(
+        "grouped M8 gathered input",
+        &[gathered_rows, params.k as usize, DType::BF16.size_of()],
+    )?;
+    if gathered_input.data_byte_len() < required_gathered {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 gathered input buffer too small: expected {required_gathered}, got {}",
+            gathered_input.data_byte_len()
+        )));
+    }
+    if let Some(gathered_sums) = gathered_sums {
+        let required_sums = checked_byte_extent(
+            "grouped M8 Table16 sums",
+            &[
+                gathered_rows,
+                params.k as usize * 3 / 32,
+                DType::F32.size_of(),
+            ],
+        )?;
+        if gathered_sums.dtype() != DType::F32
+            || gathered_sums.data_byte_len() < required_sums
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "grouped M8 Table16 sums require F32 and {required_sums} bytes, got {:?}/{}",
+                gathered_sums.dtype(),
+                gathered_sums.data_byte_len(),
+            )));
+        }
+    }
+
+    let dispatch = GgmlIdMmDispatchParams {
+        n_tokens: params.n_tokens,
+        top_k: params.top_k,
+        n: params.n,
+        k: params.k,
+        n_experts: params.n_experts,
+        expert_stride: params.expert_stride,
+        ggml_type: params.ggml_type,
+    };
+    let maximum_tiles = compact_max_tiles(
+        u64::from(params.n_tokens) * u64::from(params.top_k),
+        u64::from(params.n_experts),
+    );
+    if reuse_schedule {
+        scratch.validate_schedule_reuse(
+            encoder,
+            ids,
+            params.n_tokens,
+            params.top_k,
+            params.n_experts,
+            ExpertMmSchedule::CompactTiles,
+        )?;
+    } else {
+        scratch.invalidate_schedule();
+        if let Err(error) = encode_compact_map0(
+            encoder,
+            registry,
+            device,
+            ids,
+            &scratch.htpe,
+            &scratch.hids,
+            &dispatch,
+            maximum_tiles,
+        ) {
+            scratch.invalidate_schedule();
+            return Err(error);
+        }
+        scratch.encode_serial = scratch.encode_serial.wrapping_add(1);
+        scratch.schedule_key = Some(scratch.schedule_key_for(
+            encoder,
+            ids,
+            params.n_tokens,
+            params.top_k,
+            params.n_experts,
+            ExpertMmSchedule::CompactTiles,
+        ));
+    }
+    let gpu = GroupedM8GpuParams {
+        k: params.k as i32,
+        n: params.n as i32,
+        n_tokens: params.n_tokens as i32,
+        top_k: params.top_k as i32,
+        n_experts: params.n_experts as i32,
+        slotted_input: u32::from(slotted_input),
+        prepared_expert_stride: prepared.prepared_expert_stride,
+        plane1_offset: prepared.plane1_offset,
+        meta_offset: prepared.meta_offset,
+    };
+    if !reuse_gather {
+        if let Some(gathered_sums) = gathered_sums {
+            let gather_name = match input_kind {
+                GroupedM8Input::F32 => "grouped_m8_gather_table_f32",
+                GroupedM8Input::Bf16 => "grouped_m8_gather_table_bf16",
+            };
+            let gather = registry.get_pipeline(gather_name, device.metal_device())?;
+            encoder.encode_threadgroups_with_args(
+                gather,
+                &[
+                    (0, KernelArg::Buffer(input)),
+                    (1, KernelArg::Buffer(gathered_input)),
+                    (2, KernelArg::Buffer(gathered_sums)),
+                    (3, KernelArg::Buffer(&scratch.htpe)),
+                    (4, KernelArg::Buffer(&scratch.hids)),
+                    (5, KernelArg::Bytes(as_bytes(&gpu))),
+                ],
+                metal::MTLSize::new(maximum_tiles, u64::from(params.k).div_ceil(256), 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+        } else {
+            let gather_name = match input_kind {
+                GroupedM8Input::F32 => "grouped_m8_gather_f32_bf16",
+                GroupedM8Input::Bf16 => "grouped_m8_gather_bf16",
+            };
+            let gather = registry.get_pipeline(gather_name, device.metal_device())?;
+            encoder.encode_threadgroups_with_args(
+                gather,
+                &[
+                    (0, KernelArg::Buffer(input)),
+                    (1, KernelArg::Buffer(gathered_input)),
+                    (2, KernelArg::Buffer(&scratch.htpe)),
+                    (3, KernelArg::Buffer(&scratch.hids)),
+                    (4, KernelArg::Bytes(as_bytes(&gpu))),
+                ],
+                metal::MTLSize::new(1, maximum_tiles, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+        }
+        encoder.memory_barrier();
+    }
+
+    let format = match params.ggml_type {
+        GgmlType::Q4_K => "q4_K",
+        GgmlType::Q6_K => "q6_K",
+        _ => unreachable!("prepared grouped M8 type was validated"),
+    };
+    let epilogue_name = match epilogue {
+        GroupedM8Epilogue::F32 => "f32",
+        GroupedM8Epilogue::Bf16 => "bf16",
+        GroupedM8Epilogue::SiluMulBf16 => "silu_mul_bf16",
+    };
+    let kernel = if gathered_sums.is_some() {
+        format!("grouped_m8_register_{format}_{epilogue_name}")
+    } else {
+        format!("grouped_m8_id_{format}_{epilogue_name}")
+    };
+    let pipeline = registry.get_pipeline(&kernel, device.metal_device())?;
+    if let Some(gathered_sums) = gathered_sums {
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(&prepared.bytes)),
+                (1, KernelArg::Buffer(gathered_input)),
+                (2, KernelArg::Buffer(gathered_sums)),
+                (3, KernelArg::Buffer(output)),
+                (4, KernelArg::Buffer(&scratch.htpe)),
+                (5, KernelArg::Buffer(&scratch.hids)),
+                (6, KernelArg::Bytes(as_bytes(&gpu))),
+                (7, KernelArg::Buffer(aux.unwrap_or(output))),
+            ],
+            metal::MTLSize::new(u64::from(params.n / 64), maximum_tiles, 1),
+            metal::MTLSize::new(32, 4, 1),
+        );
+    } else {
+        encoder.encode_threadgroups_with_args(
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(&prepared.bytes)),
+                (1, KernelArg::Buffer(gathered_input)),
+                (2, KernelArg::Buffer(output)),
+                (3, KernelArg::Buffer(&scratch.htpe)),
+                (4, KernelArg::Buffer(&scratch.hids)),
+                (5, KernelArg::Bytes(as_bytes(&gpu))),
+                (6, KernelArg::Buffer(aux.unwrap_or(output))),
+            ],
+            metal::MTLSize::new(u64::from(params.n / 64), maximum_tiles, 1),
+            metal::MTLSize::new(32, 2, 1),
+        );
+    }
+    if epilogue != GroupedM8Epilogue::F32 {
+        encoder.memory_barrier();
+    }
     Ok(())
 }
 
