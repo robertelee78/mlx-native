@@ -17,6 +17,7 @@ pub const DFLASH2_EDGES_KERNEL: &str = "dflash2_select_edges";
 pub const DFLASH2_PATH_KERNEL: &str = "dflash2_select_path";
 pub const DFLASH2_VERIFY_ROWS_KERNEL: &str = "dflash2_select_verify_rows";
 pub const DFLASH2_COMPOSE_VERIFY_INPUT_KERNEL: &str = "dflash2_compose_verify_input";
+pub const DFLASH2_COMPOSE_FIXED_VERIFY_INPUT_KERNEL: &str = "dflash2_compose_fixed_verify_input";
 pub static DFLASH2_SELECTOR_SOURCE: &str = include_str!("../shaders/dflash2_selector.metal");
 
 pub const DFLASH2_MAX_LANES: usize = 4;
@@ -36,6 +37,10 @@ pub fn register(registry: &mut KernelRegistry) {
     ] {
         registry.register_source(name, DFLASH2_SELECTOR_SOURCE);
     }
+    registry.register_source(
+        DFLASH2_COMPOSE_FIXED_VERIFY_INPUT_KERNEL,
+        DFLASH2_SELECTOR_SOURCE,
+    );
 }
 
 #[repr(C)]
@@ -58,10 +63,13 @@ pub struct DFlash2VerifyRowsParams {
     /// bytemuck version implements Pod for arrays only through length 64.
     pub cost: [f32; DFLASH2_VERIFY_COSTS - 1],
     pub cost_64: f32,
+    /// Physical draft-ring lane for each modeled logical lane.
+    pub physical_lane: [u32; DFLASH2_MAX_LANES],
+    pub maximum: [u32; DFLASH2_MAX_LANES],
+    pub physical_lanes: u32,
     pub lanes: u32,
     pub rows_per_lane: u32,
     pub every_row: u32,
-    pub maximum: [u32; DFLASH2_MAX_LANES],
 }
 
 #[repr(C)]
@@ -367,25 +375,32 @@ pub fn dispatch_dflash2_verify_rows(
     verify_rows: &MlxBuffer,
     params: DFlash2VerifyRowsParams,
 ) -> Result<()> {
+    let physical_lanes = params.physical_lanes as usize;
     let lanes = params.lanes as usize;
     let rows = params.rows_per_lane as usize;
-    if lanes == 0
-        || lanes > DFLASH2_MAX_LANES
+    if physical_lanes == 0
+        || physical_lanes > DFLASH2_MAX_LANES
+        || lanes == 0
+        || lanes > physical_lanes
         || !(2..=DFLASH2_MAX_POSITIONS + 1).contains(&rows)
         || params.every_row > 1
     {
         return Err(MlxError::InvalidArgument(format!(
-            "invalid DFlash2 verify-row geometry: lanes={lanes}, rows={rows}, every_row={}",
+            "invalid DFlash2 verify-row geometry: physical_lanes={physical_lanes}, lanes={lanes}, rows={rows}, every_row={}",
             params.every_row
         )));
     }
     let mut maximum_total = 0usize;
     for lane in 0..lanes {
+        let physical = params.physical_lane[lane] as usize;
         let maximum = params.maximum[lane] as usize;
-        if maximum == 0 || maximum > rows {
+        if physical >= physical_lanes
+            || params.physical_lane[..lane].contains(&params.physical_lane[lane])
+            || maximum == 0
+            || maximum > rows
+        {
             return Err(MlxError::InvalidArgument(format!(
-                "DFlash2 maximum verify rows {} for lane {lane} must be in 1..={rows}",
-                params.maximum[lane]
+                "invalid DFlash2 logical verify lane {lane}: physical={physical}, maximum={maximum}, physical_lanes={physical_lanes}, rows={rows}"
             )));
         }
         maximum_total = maximum_total
@@ -414,8 +429,18 @@ pub fn dispatch_dflash2_verify_rows(
             ));
         }
     }
-    require(confidence, DType::F32, &[lanes, rows - 1], "confidence")?;
-    require(verify_rows, DType::U32, &[lanes], "verify rows")?;
+    require(
+        confidence,
+        DType::F32,
+        &[physical_lanes, rows - 1],
+        "confidence",
+    )?;
+    require(
+        verify_rows,
+        DType::U32,
+        &[physical_lanes],
+        "verify rows",
+    )?;
     validate_disjoint(&[confidence], &[verify_rows])?;
     if encoder.is_capturing() {
         encoder.set_pending_buffer_ranges(
@@ -517,6 +542,82 @@ pub fn dispatch_dflash2_compose_verify_input(
     Ok(())
 }
 
+/// Compose one fixed `rows_per_lane` block per logical target lane while
+/// taking each block's live prefix length from the GPU verify-row decision.
+/// Padded rows replay that lane's anchor and therefore cannot affect earlier
+/// causal rows.
+pub fn dispatch_dflash2_compose_fixed_verify_input(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    proposals: &MlxBuffer,
+    verify_rows: &MlxBuffer,
+    target_tokens: &MlxBuffer,
+    params: DFlash2ComposeVerifyInputParams,
+) -> Result<()> {
+    let physical_lanes = params.physical_lanes as usize;
+    let lanes = params.lanes as usize;
+    let rows_per_lane = params.rows_per_lane as usize;
+    let width = params.width as usize;
+    if physical_lanes == 0
+        || physical_lanes > DFLASH2_MAX_LANES
+        || lanes == 0
+        || lanes > physical_lanes
+        || !(2..=DFLASH2_MAX_POSITIONS + 1).contains(&rows_per_lane)
+        || width < lanes * rows_per_lane
+        || width > DFLASH2_MAX_LANES * rows_per_lane
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "invalid fixed DFlash2 verify-input geometry: physical_lanes={physical_lanes}, lanes={lanes}, rows_per_lane={rows_per_lane}, width={width}"
+        )));
+    }
+    for lane in 0..lanes {
+        let physical = params.physical_lane[lane] as usize;
+        if physical >= physical_lanes
+            || params.physical_lane[..lane].contains(&params.physical_lane[lane])
+            || params.rows[lane] == 0
+            || params.rows[lane] as usize > rows_per_lane
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "invalid fixed DFlash2 logical lane {lane}: physical={physical}, maximum={}",
+                params.rows[lane]
+            )));
+        }
+    }
+    require(
+        proposals,
+        DType::U32,
+        &[physical_lanes, rows_per_lane - 1],
+        "proposals",
+    )?;
+    require(verify_rows, DType::U32, &[physical_lanes], "verify rows")?;
+    require(target_tokens, DType::U32, &[width], "target tokens")?;
+    validate_disjoint(&[proposals, verify_rows], &[target_tokens])?;
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![physical_range(proposals)?, physical_range(verify_rows)?],
+            vec![physical_range(target_tokens)?],
+        );
+    }
+    let pipeline = registry.get_pipeline(
+        DFLASH2_COMPOSE_FIXED_VERIFY_INPUT_KERNEL,
+        device.metal_device(),
+    )?;
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(proposals)),
+            (1, KernelArg::Buffer(verify_rows)),
+            (2, KernelArg::Buffer(target_tokens)),
+            (3, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(width as u64, 1, 1),
+        MTLSize::new(64.min(width) as u64, 1, 1),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,7 +670,7 @@ mod tests {
     #[test]
     fn parameter_abis_match_metal_layouts() {
         assert_eq!(std::mem::size_of::<DFlash2SelectorParams>(), 48);
-        assert_eq!(std::mem::size_of::<DFlash2VerifyRowsParams>(), 352);
+        assert_eq!(std::mem::size_of::<DFlash2VerifyRowsParams>(), 372);
         assert_eq!(std::mem::size_of::<DFlash2ComposeVerifyInputParams>(), 64);
     }
 
@@ -769,10 +870,10 @@ mod tests {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
         register(&mut registry);
-        let confidence = alloc(&device, DType::F32, &[2, 7]);
-        let verify_rows = alloc(&device, DType::U32, &[2]);
+        let confidence = alloc(&device, DType::F32, &[3, 7]);
+        let verify_rows = alloc(&device, DType::U32, &[3]);
         let mut maximum = [0; DFLASH2_MAX_LANES];
-        maximum[..2].copy_from_slice(&[8, 5]);
+        maximum[..2].copy_from_slice(&[3, 2]);
         let mut encoder = device.command_encoder().unwrap();
         dispatch_dflash2_verify_rows(
             &mut encoder,
@@ -785,15 +886,17 @@ mod tests {
                 intercept: [0.0; DFLASH2_MAX_POSITIONS],
                 cost: [0.0; DFLASH2_VERIFY_COSTS - 1],
                 cost_64: 0.0,
+                physical_lane: [2, 0, 0, 0],
+                maximum,
+                physical_lanes: 3,
                 lanes: 2,
                 rows_per_lane: 8,
                 every_row: 1,
-                maximum,
             },
         )
         .unwrap();
         encoder.commit_and_wait().unwrap();
-        assert_eq!(verify_rows.as_slice::<u32>().unwrap(), [8, 5]);
+        assert_eq!(verify_rows.as_slice::<u32>().unwrap(), [2, 0, 3]);
     }
 
     #[test]
@@ -829,6 +932,51 @@ mod tests {
         assert_eq!(
             target_tokens.as_slice::<u32>().unwrap(),
             [11, 114, 115, 116, 22, 100, 11, 11, 11, 11, 11, 11]
+        );
+    }
+
+    #[test]
+    fn gpu_fixed_verify_input_preserves_lane_blocks_and_masks_padding() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let mut proposals = alloc(&device, DType::U32, &[4, 7]);
+        proposals
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&(100..128).collect::<Vec<_>>());
+        let mut verify_rows = alloc(&device, DType::U32, &[4]);
+        verify_rows
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&[2, 8, 3, 8]);
+        let target_tokens = alloc(&device, DType::U32, &[24]);
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_dflash2_compose_fixed_verify_input(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &proposals,
+            &verify_rows,
+            &target_tokens,
+            DFlash2ComposeVerifyInputParams {
+                anchor: [11, 22, 0, 0],
+                physical_lane: [2, 0, 0, 0],
+                rows: [8, 4, 0, 0],
+                physical_lanes: 4,
+                lanes: 2,
+                rows_per_lane: 8,
+                width: 24,
+            },
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        assert_eq!(
+            target_tokens.as_slice::<u32>().unwrap(),
+            [
+                11, 114, 115, 11, 11, 11, 11, 11, 22, 100, 22, 22, 22, 22, 22, 22, 11, 11, 11, 11,
+                11, 11, 11, 11
+            ]
         );
     }
 }

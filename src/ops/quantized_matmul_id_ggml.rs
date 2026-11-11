@@ -60,6 +60,8 @@ struct GgmlMatvecIdGpuParams {
     top_k: u32,         // experts per token
     n_tokens: u32,      // number of input tokens
     expert_stride: i64, // bytes between expert weight slices
+    zero_invalid_id: u32,
+    _padding: u32,
 }
 
 // ---- Public types ----
@@ -439,6 +441,27 @@ pub fn quantized_matmul_id_ggml_mv(
     )
 }
 
+/// Forced expert matvec for GPU-authored sparse routing. Out-of-range expert
+/// IDs write zeros without touching expert weights; valid rows preserve the
+/// selected quantized matvec route.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_masked(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    validate_id_call(input, weight, ids, output, params, params.n)?;
+    let routing = ggml_routing_policy_for_registry(registry);
+    dispatch_id_mv(
+        encoder, registry, device, input, weight, ids, output, params, &routing, true,
+    )
+}
+
 /// Forced expert matvec under an explicit routing policy.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_matmul_id_ggml_mv_with_policy(
@@ -495,7 +518,7 @@ pub fn quantized_matmul_id_ggml_mv_grouped_geglu(
     )?;
     let gpu_params = GgmlMatvecIdGpuParams {
         ne0: i64::from(n_ff),
-        ..mv_id_gpu_params(params)
+        ..mv_id_gpu_params(params, false)
     };
     let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
     encoder.encode_threadgroups_with_args(
@@ -557,7 +580,56 @@ pub fn quantized_matmul_id_ggml_mv_q4_k_nr2(
     validate_id_call(input, weight, ids, output, params, params.n)?;
 
     let pipeline = registry.get_pipeline("kernel_mul_mv_id_q4_K_f32_nr2", device.metal_device())?;
-    let gpu_params = mv_id_gpu_params(params);
+    let gpu_params = mv_id_gpu_params(params, false);
+    let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(weight)),
+            (1, KernelArg::Buffer(input)),
+            (2, KernelArg::Buffer(output)),
+            (3, KernelArg::Buffer(ids)),
+            (4, KernelArg::Bytes(as_bytes(&gpu_params))),
+        ],
+        metal::MTLSize::new(
+            div_ceil(params.n as usize, columns_per_threadgroup) as u64,
+            total_rows,
+            1,
+        ),
+        metal::MTLSize::new(32, 2, 1),
+    );
+    Ok(())
+}
+
+/// Q4_K expert matvec for GPU-authored sparse routing. Expert IDs equal to
+/// `n_experts` represent padded DFlash2 rows: the kernel writes zeros for
+/// those pairs without touching expert weights.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_mv_q4_k_nr2_masked(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    let fold: usize = match params.k / 256 {
+        1 => 4,
+        2 => 2,
+        _ => 1,
+    };
+    let columns_per_threadgroup = 4 * fold;
+    if params.ggml_type != GgmlType::Q4_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "quantized_matmul_id_ggml_mv_q4_k_nr2_masked requires Q4_K, got {:?}",
+            params.ggml_type
+        )));
+    }
+    validate_id_call(input, weight, ids, output, params, params.n)?;
+    let pipeline = registry.get_pipeline("kernel_mul_mv_id_q4_K_f32_nr2", device.metal_device())?;
+    let gpu_params = mv_id_gpu_params(params, true);
     let total_rows = u64::from(params.n_tokens) * u64::from(params.top_k);
     encoder.encode_threadgroups_with_args(
         pipeline,
@@ -635,7 +707,7 @@ fn quantized_matmul_id_ggml_impl(
     }
 
     dispatch_id_mv(
-        encoder, registry, device, input, weight, ids, output, params, routing,
+        encoder, registry, device, input, weight, ids, output, params, routing, false,
     )
 }
 
@@ -1369,7 +1441,7 @@ fn quantized_matmul_id_ggml_pooled_impl(
     }
 
     dispatch_id_mv(
-        encoder, registry, device, input, weight, ids, output, params, routing,
+        encoder, registry, device, input, weight, ids, output, params, routing, false,
     )
 }
 
@@ -1411,7 +1483,10 @@ fn mm_id_routing_threshold() -> u32 {
     })
 }
 
-fn mv_id_gpu_params(params: &GgmlQuantizedMatmulIdParams) -> GgmlMatvecIdGpuParams {
+fn mv_id_gpu_params(
+    params: &GgmlQuantizedMatmulIdParams,
+    zero_invalid_id: bool,
+) -> GgmlMatvecIdGpuParams {
     GgmlMatvecIdGpuParams {
         ne00: params.k as i64,
         ne01: params.n as i64,
@@ -1425,6 +1500,8 @@ fn mv_id_gpu_params(params: &GgmlQuantizedMatmulIdParams) -> GgmlMatvecIdGpuPara
         top_k: params.top_k,
         n_tokens: params.n_tokens,
         expert_stride: params.expert_stride as i64,
+        zero_invalid_id: u32::from(zero_invalid_id),
+        _padding: 0,
     }
 }
 
@@ -1440,6 +1517,7 @@ fn dispatch_id_mv(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
     routing: &GgmlRoutingPolicy,
+    zero_invalid_id: bool,
 ) -> Result<()> {
     let total_rows = (params.n_tokens as usize) * (params.top_k as usize);
 
@@ -1464,7 +1542,7 @@ fn dispatch_id_mv(
     };
     let pipeline = registry.get_pipeline(kernel_name, device.metal_device())?;
 
-    let gpu_params = mv_id_gpu_params(params);
+    let gpu_params = mv_id_gpu_params(params, zero_invalid_id);
 
     let (nth0, nth1, align) = match params.ggml_type {
         // Q4_0/Q8_0: historical (8, 8) layout = 64 threads = 2 simdgroups
@@ -1692,6 +1770,8 @@ pub fn build_q6k_id_nr2_m1_record_with_policy(
         top_k,
         n_tokens: 1,
         expert_stride: expert_stride as i64,
+        zero_invalid_id: 0,
+        _padding: 0,
     };
     let params_bytes = as_bytes(&gpu_params).to_vec();
 
@@ -1824,6 +1904,8 @@ pub fn build_q8_0_id_decode_record_with_policy(
         top_k: 1,
         n_tokens: real_top_k,
         expert_stride: expert_stride as i64,
+        zero_invalid_id: 0,
+        _padding: 0,
     };
     let params_bytes = as_bytes(&gpu_params).to_vec();
 
@@ -2014,6 +2096,8 @@ pub fn quantized_matmul_id_swiglu_q4_0(
         top_k: params.top_k,
         n_tokens: params.n_tokens,
         expert_stride: params.expert_stride as i64,
+        zero_invalid_id: 0,
+        _padding: 0,
     };
 
     // Same (8, 8) geometry as the unfused Q4_0 mv_id kernel.

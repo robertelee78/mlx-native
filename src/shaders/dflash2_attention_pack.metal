@@ -18,6 +18,15 @@ struct DFlash2MaskRowsParams {
     uint hidden;
 };
 
+struct DFlash2MoeRouteMaskParams {
+    uint physical_lane[4];
+    uint lanes;
+    uint rows_per_lane;
+    uint top_k;
+    uint n_experts;
+    uint width;
+};
+
 kernel void dflash2_pack_attention_bf16(
     device const bfloat *ring_keys [[buffer(0)]],
     device const bfloat *ring_values [[buffer(1)]],
@@ -126,4 +135,21 @@ kernel void dflash2_set_mask_rows_f32(
     const uint lane = x / (p.rows - 1);
     const uint dst = (lane * p.rows + masked_row + 1) * p.hidden + channel;
     hidden[dst] = float(mask_embedding[channel]);
+}
+
+kernel void dflash2_mask_moe_routes(
+    device const uint *verify_rows [[buffer(0)]],
+    device uint *ids [[buffer(1)]],
+    device float *routing_weights [[buffer(2)]],
+    constant DFlash2MoeRouteMaskParams &p [[buffer(3)]],
+    uint pair [[thread_position_in_grid]]) {
+    const uint pairs = p.width * p.top_k;
+    if (pair >= pairs) return;
+    const uint token = pair / p.top_k;
+    const uint lane = token / p.rows_per_lane;
+    const uint row = token % p.rows_per_lane;
+    if (lane < p.lanes &&
+        row < min(verify_rows[p.physical_lane[lane]], p.rows_per_lane)) return;
+    ids[pair] = p.n_experts;
+    routing_weights[pair] = 0.0f;
 }

@@ -24,7 +24,8 @@ use std::collections::HashMap;
 
 use gemma_expert_data::*;
 use mlx_native::{
-    quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_with_policy,
+    quantized_matmul_id_ggml_mv_masked, quantized_matmul_id_ggml_mv_q4_k_nr2,
+    quantized_matmul_id_ggml_mv_q4_k_nr2_masked, quantized_matmul_id_ggml_mv_with_policy,
     GgmlRoutingPolicy, GgmlType, KernelRegistry, MlxDevice,
 };
 
@@ -94,6 +95,48 @@ impl Harness {
             )
             .expect("nr2 mv_id");
         }
+        encoder.commit_and_wait().expect("GPU");
+        output_parent.as_slice::<u32>().expect("output").to_vec()
+    }
+
+    fn run_masked(
+        &mut self,
+        w: &Weights,
+        n_tokens: usize,
+        top_k: usize,
+        ids: &[u32],
+        input: &[f32],
+    ) -> Vec<u32> {
+        let pairs = n_tokens * top_k;
+        let (_input_parent, input_view) = guarded_f32(&self.device, input);
+        let (_ids_parent, ids_view) = guarded_u32(&self.device, ids);
+        let (output_parent, output_view) =
+            guarded_f32(&self.device, &vec![f32::from_bits(SENTINEL); pairs * w.n]);
+        let mut encoder = self.device.command_encoder().expect("encoder");
+        let dispatched = if w.ty == GgmlType::Q4_K {
+            quantized_matmul_id_ggml_mv_q4_k_nr2_masked(
+                &mut encoder,
+                &mut self.registry,
+                &self.device,
+                &input_view,
+                &w.view,
+                &ids_view,
+                &output_view,
+                &params(w, n_tokens, top_k),
+            )
+        } else {
+            quantized_matmul_id_ggml_mv_masked(
+                &mut encoder,
+                &mut self.registry,
+                &self.device,
+                &input_view,
+                &w.view,
+                &ids_view,
+                &output_view,
+                &params(w, n_tokens, top_k),
+            )
+        };
+        dispatched.expect("masked mv_id");
         encoder.commit_and_wait().expect("GPU");
         output_parent.as_slice::<u32>().expect("output").to_vec()
     }
@@ -446,6 +489,77 @@ fn invalid_ids_write_the_stock_poison_only_in_their_rows() {
             } else {
                 assert_eq!(row(&got, pair, n), row(&clean, pair, n), "{label}: valid pair {pair} changed");
             }
+        }
+    }
+}
+
+#[test]
+fn masked_invalid_ids_skip_weights_and_write_zero() {
+    let mut h = Harness::new();
+    let (n, k, n_tokens, top_k) = (13, 512, 3, 2);
+    let w = make_weights(&h.device, GgmlType::Q4_K, n, k, N_EXPERTS, 0x4d45);
+    let mut rng = Rng(0x4d45_4d41_534b);
+    let clean_ids = distinct_ids(&mut rng, n_tokens, top_k, N_EXPERTS);
+    let input = make_input(n_tokens, k, 0x4d45);
+    let clean = h.run(&w, n_tokens, top_k, &clean_ids, &input, false);
+    let mut ids = clean_ids.clone();
+    ids[1] = N_EXPERTS as u32;
+    ids[4] = u32::MAX;
+    let got = h.run_masked(&w, n_tokens, top_k, &ids, &input);
+    assert_stock_frame(&got, ids.len(), n, "masked invalid IDs");
+    for pair in 0..ids.len() {
+        if pair == 1 || pair == 4 {
+            assert!(
+                row(&got, pair, n).iter().all(|&bits| bits == 0),
+                "masked pair {pair} was not zero"
+            );
+        } else {
+            assert_eq!(
+                row(&got, pair, n),
+                row(&clean, pair, n),
+                "valid pair {pair} changed"
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_masked_q4_ids_skip_weights_and_write_zero() {
+    let mut h = Harness::new();
+    let (n, k, n_tokens, top_k) = (11, 512, 3, 2);
+    let w = make_weights(&h.device, GgmlType::Q4_K, n, k, N_EXPERTS, 0x5134);
+    let mut rng = Rng(0x5134_4d41_534b);
+    let clean_ids = distinct_ids(&mut rng, n_tokens, top_k, N_EXPERTS);
+    let input = make_input(n_tokens, k, 0x5134);
+    let clean = h.run(&w, n_tokens, top_k, &clean_ids, &input, true);
+    let mut ids = clean_ids.clone();
+    ids[0] = N_EXPERTS as u32;
+    ids[5] = u32::MAX;
+    let pairs = n_tokens * top_k;
+    let (_input_parent, input_view) = guarded_f32(&h.device, &input);
+    let (_ids_parent, ids_view) = guarded_u32(&h.device, &ids);
+    let (output_parent, output_view) =
+        guarded_f32(&h.device, &vec![f32::from_bits(SENTINEL); pairs * n]);
+    let mut encoder = h.device.command_encoder().expect("encoder");
+    quantized_matmul_id_ggml_mv_masked(
+        &mut encoder,
+        &mut h.registry,
+        &h.device,
+        &input_view,
+        &w.view,
+        &ids_view,
+        &output_view,
+        &params(&w, n_tokens, top_k),
+    )
+    .expect("generic masked mv_id");
+    encoder.commit_and_wait().expect("GPU");
+    let got = output_parent.as_slice::<u32>().expect("output");
+    assert_stock_frame(got, ids.len(), n, "generic masked Q4 invalid IDs");
+    for pair in 0..ids.len() {
+        if pair == 0 || pair == 5 {
+            assert!(row(got, pair, n).iter().all(|&bits| bits == 0));
+        } else {
+            assert_eq!(row(got, pair, n), row(&clean, pair, n));
         }
     }
 }
