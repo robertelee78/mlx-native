@@ -742,10 +742,10 @@ fn benchmark_qwen36_gate_projection() {
     use std::time::Instant;
 
     const TOKENS: u32 = 18;
-    const EXPERTS: u32 = 128;
+    const EXPERTS: u32 = 256;
     const TOP_K: u32 = 8;
-    const K: u32 = 5120;
-    const N: u32 = 1536;
+    const K: u32 = 2048;
+    const N: u32 = 512;
     const REPEATS: usize = 100;
 
     let device = MlxDevice::new().expect("device");
