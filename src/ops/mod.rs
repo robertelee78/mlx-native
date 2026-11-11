@@ -91,6 +91,7 @@ pub mod quantized_matmul_ggml;
 pub mod quantized_matmul_id;
 pub mod quantized_matmul_id_ggml;
 pub mod repeat_tiled;
+pub mod repacked_gguf_mm;
 pub mod rms_norm;
 pub mod rope;
 mod rope_freqs;
