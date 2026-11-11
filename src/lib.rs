@@ -222,7 +222,9 @@ pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
 };
 pub use ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_for_test, quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled,
+    dispatch_id_mm_for_test, prepare_quantized_matmul_id_ggml_grouped_m8,
+    quantized_matmul_id_ggml, quantized_matmul_id_ggml_grouped_m8_epilogue,
+    quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_pooled,
     quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,
     quantized_matmul_id_ggml_pooled_slotted,
     quantized_matmul_id_ggml_pooled_slotted_reusing_schedule,
@@ -232,8 +234,8 @@ pub use ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml_mv_grouped_geglu, quantized_matmul_id_ggml_mv_masked,
     quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_q4_k_nr2_masked,
     quantized_matmul_id_ggml_mv_with_policy, quantized_matmul_id_swiglu_q4_0,
-    GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams,
-    IdMmScratch, MM_ID_ROUTING_THRESHOLD,
+    GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GroupedM8Epilogue, GroupedM8Input,
+    IdMmScratch, PreparedGroupedM8Experts, MM_ID_ROUTING_THRESHOLD,
 };
 
 // Re-export weight loading utilities.

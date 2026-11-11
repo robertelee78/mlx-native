@@ -636,6 +636,20 @@ impl KernelRegistry {
         // in one dispatch — replaces silu_mul + expert_down sequence.
         sources.insert("kernel_mul_mv_id_q4_0_f32_swiglu".into(), ggml_id_src);
 
+        // Decode-sized MoE expert groups: five routed rows share each Q4_K
+        // or Q6_K weight decode without paying the 32-row mm_id tile.
+        let grouped_mv_src: &'static str =
+            include_str!("shaders/quantized_matmul_id_grouped_mv.metal");
+        sources.insert("grouped_m8_prepare_q4k_q6k".into(), grouped_mv_src);
+        sources.insert("grouped_m8_gather_f32_bf16".into(), grouped_mv_src);
+        sources.insert("grouped_m8_gather_bf16".into(), grouped_mv_src);
+        for format in ["q4_K", "q6_K"] {
+            for epilogue in ["f32", "bf16", "silu_mul_bf16"] {
+                sources.insert(format!("grouped_m8_id_{format}_{epilogue}"), grouped_mv_src);
+            }
+            sources.insert(format!("grouped_m8_gate_up_{format}_bf16"), grouped_mv_src);
+        }
+
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of
         // `kernel_mul_mm_id_map0_ne20_N` + `kernel_mul_mm_id_<q>_f32`).
