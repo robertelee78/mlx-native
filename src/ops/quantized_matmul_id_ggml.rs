@@ -3410,7 +3410,10 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
         (_, None) => {}
     }
     scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
-    let gathered_rows = total_rows;
+    // map0c reserves one guard entry per expert before its compact route list.
+    let gathered_rows = total_rows
+        .checked_add(params.n_experts as usize)
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 gathered rows overflow".into()))?;
     let required_gathered = checked_byte_extent(
         "grouped M8 gathered input",
         &[gathered_rows, params.k as usize, DType::BF16.size_of()],

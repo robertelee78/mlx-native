@@ -136,8 +136,9 @@ fn grouped_matches_mv(ggml_type: GgmlType) {
         ..params
     };
     let elements = (TOKENS * TOP_K * WIDTH) as usize;
+    let gathered_elements = ((TOKENS * TOP_K + EXPERTS) * WIDTH) as usize;
     let gathered = device
-        .alloc_buffer(elements * 2, DType::BF16, vec![elements])
+        .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
         .expect("gathered input");
     let gate_bf16 = device
         .alloc_buffer(elements * 2, DType::BF16, vec![elements])
@@ -190,6 +191,36 @@ fn grouped_matches_mv(ggml_type: GgmlType) {
     encoder
         .commit_and_wait_labeled("test.grouped_m8.prepare")
         .expect("commit preparation");
+
+    let undersized_gather = device
+        .alloc_buffer(elements * 2, DType::BF16, vec![elements])
+        .expect("undersized gather");
+    let mut validation_encoder = device.command_encoder().expect("validation encoder");
+    let error = quantized_matmul_id_ggml_grouped_m8_epilogue(
+        &mut validation_encoder,
+        &mut registry,
+        &device,
+        &input,
+        &undersized_gather,
+        &gate,
+        &ids,
+        &gate_bf16,
+        None,
+        &mut scratch,
+        &params,
+        false,
+        false,
+        false,
+        GroupedM8Input::F32,
+        GroupedM8Epilogue::Bf16,
+    )
+    .expect_err("compact schedule guard rows must be reserved");
+    assert!(
+        error
+            .to_string()
+            .contains("gathered input buffer too small"),
+        "unexpected guard-row validation error: {error}"
+    );
 
     let mut encoder = device.command_encoder().expect("projection encoder");
     quantized_matmul_id_ggml_grouped_m8_epilogue(
@@ -365,12 +396,9 @@ fn benchmark_qwen36_gate_projection() {
         ggml_type: GgmlType::Q4_K,
     };
     let elements = (TOKENS * TOP_K * N) as usize;
+    let gathered_elements = ((TOKENS * TOP_K + EXPERTS) * K) as usize;
     let gathered = device
-        .alloc_buffer(
-            (TOKENS * TOP_K * K * 2) as usize,
-            DType::BF16,
-            vec![(TOKENS * TOP_K * K) as usize],
-        )
+        .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
         .expect("gathered input");
     let output = device
         .alloc_buffer(elements * 4, DType::F32, vec![elements])
