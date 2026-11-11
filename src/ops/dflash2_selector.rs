@@ -18,6 +18,7 @@ pub const DFLASH2_PATH_KERNEL: &str = "dflash2_select_path";
 pub const DFLASH2_VERIFY_ROWS_KERNEL: &str = "dflash2_select_verify_rows";
 pub const DFLASH2_COMPOSE_VERIFY_INPUT_KERNEL: &str = "dflash2_compose_verify_input";
 pub const DFLASH2_COMPOSE_FIXED_VERIFY_INPUT_KERNEL: &str = "dflash2_compose_fixed_verify_input";
+pub const DFLASH2_ACCEPT_GREEDY_KERNEL: &str = "dflash2_accept_greedy";
 pub static DFLASH2_SELECTOR_SOURCE: &str = include_str!("../shaders/dflash2_selector.metal");
 
 pub const DFLASH2_MAX_LANES: usize = 4;
@@ -34,6 +35,7 @@ pub fn register(registry: &mut KernelRegistry) {
         DFLASH2_PATH_KERNEL,
         DFLASH2_VERIFY_ROWS_KERNEL,
         DFLASH2_COMPOSE_VERIFY_INPUT_KERNEL,
+        DFLASH2_ACCEPT_GREEDY_KERNEL,
     ] {
         registry.register_source(name, DFLASH2_SELECTOR_SOURCE);
     }
@@ -82,6 +84,21 @@ pub struct DFlash2ComposeVerifyInputParams {
     pub lanes: u32,
     pub rows_per_lane: u32,
     pub width: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DFlash2GreedyAcceptanceParams {
+    /// Physical draft-ring lane for each packed target lane.
+    pub physical_lane: [u32; DFLASH2_MAX_LANES],
+    /// Maximum retained target rows for each packed target lane.
+    pub maximum: [u32; DFLASH2_MAX_LANES],
+    pub eos_token: [u32; 8],
+    pub physical_lanes: u32,
+    pub lanes: u32,
+    pub rows_per_lane: u32,
+    pub width: u32,
+    pub eos_count: u32,
 }
 
 pub struct DFlash2SelectorBuffers<'a> {
@@ -435,12 +452,7 @@ pub fn dispatch_dflash2_verify_rows(
         &[physical_lanes, rows - 1],
         "confidence",
     )?;
-    require(
-        verify_rows,
-        DType::U32,
-        &[physical_lanes],
-        "verify rows",
-    )?;
+    require(verify_rows, DType::U32, &[physical_lanes], "verify rows")?;
     validate_disjoint(&[confidence], &[verify_rows])?;
     if encoder.is_capturing() {
         encoder.set_pending_buffer_ranges(
@@ -618,6 +630,109 @@ pub fn dispatch_dflash2_compose_fixed_verify_input(
     Ok(())
 }
 
+/// Compute the greedy accepted prefix on the GPU after target verification.
+///
+/// Target rows are fixed lane-major blocks. Results are written by physical
+/// draft lane so the target-state and draft-context commits can consume them
+/// without a host readback. Inactive physical lanes receive zero counts.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_accept_greedy(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    proposals: &MlxBuffer,
+    target_tokens: &MlxBuffer,
+    verify_rows: &MlxBuffer,
+    retained_counts: &MlxBuffer,
+    accepted_counts: &MlxBuffer,
+    params: DFlash2GreedyAcceptanceParams,
+) -> Result<()> {
+    let physical_lanes = params.physical_lanes as usize;
+    let lanes = params.lanes as usize;
+    let rows_per_lane = params.rows_per_lane as usize;
+    let width = params.width as usize;
+    let eos_count = params.eos_count as usize;
+    if physical_lanes == 0
+        || physical_lanes > DFLASH2_MAX_LANES
+        || lanes == 0
+        || lanes > physical_lanes
+        || !(2..=DFLASH2_MAX_POSITIONS + 1).contains(&rows_per_lane)
+        || width < lanes * rows_per_lane
+        || width > DFLASH2_MAX_LANES * rows_per_lane
+        || !(1..=8).contains(&eos_count)
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "invalid DFlash2 greedy-acceptance geometry: physical_lanes={physical_lanes}, lanes={lanes}, rows_per_lane={rows_per_lane}, width={width}, eos_count={eos_count}"
+        )));
+    }
+    for lane in 0..lanes {
+        let physical = params.physical_lane[lane] as usize;
+        let maximum = params.maximum[lane] as usize;
+        if physical >= physical_lanes
+            || params.physical_lane[..lane].contains(&params.physical_lane[lane])
+            || maximum == 0
+            || maximum > rows_per_lane
+        {
+            return Err(MlxError::InvalidArgument(format!(
+                "invalid DFlash2 greedy-acceptance lane {lane}: physical={physical}, maximum={maximum}"
+            )));
+        }
+    }
+    require(
+        proposals,
+        DType::U32,
+        &[physical_lanes, rows_per_lane - 1],
+        "proposals",
+    )?;
+    require(target_tokens, DType::U32, &[width], "target tokens")?;
+    require(verify_rows, DType::U32, &[physical_lanes], "verify rows")?;
+    require(
+        retained_counts,
+        DType::U32,
+        &[physical_lanes],
+        "retained counts",
+    )?;
+    require(
+        accepted_counts,
+        DType::U32,
+        &[physical_lanes],
+        "accepted counts",
+    )?;
+    validate_disjoint(
+        &[proposals, target_tokens, verify_rows],
+        &[retained_counts, accepted_counts],
+    )?;
+    if encoder.is_capturing() {
+        encoder.set_pending_buffer_ranges(
+            vec![
+                physical_range(proposals)?,
+                physical_range(target_tokens)?,
+                physical_range(verify_rows)?,
+            ],
+            vec![
+                physical_range(retained_counts)?,
+                physical_range(accepted_counts)?,
+            ],
+        );
+    }
+    let pipeline = registry.get_pipeline(DFLASH2_ACCEPT_GREEDY_KERNEL, device.metal_device())?;
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(proposals)),
+            (1, KernelArg::Buffer(target_tokens)),
+            (2, KernelArg::Buffer(verify_rows)),
+            (3, KernelArg::Buffer(retained_counts)),
+            (4, KernelArg::Buffer(accepted_counts)),
+            (5, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(physical_lanes as u64, 1, 1),
+        MTLSize::new(physical_lanes as u64, 1, 1),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,6 +787,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<DFlash2SelectorParams>(), 48);
         assert_eq!(std::mem::size_of::<DFlash2VerifyRowsParams>(), 372);
         assert_eq!(std::mem::size_of::<DFlash2ComposeVerifyInputParams>(), 64);
+        assert_eq!(std::mem::size_of::<DFlash2GreedyAcceptanceParams>(), 84);
     }
 
     #[test]
@@ -978,5 +1094,57 @@ mod tests {
                 11, 11, 11, 11
             ]
         );
+    }
+
+    #[test]
+    fn gpu_greedy_acceptance_stops_at_mismatch_and_eos() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let mut proposals = alloc(&device, DType::U32, &[4, 7]);
+        proposals.as_mut_slice::<u32>().unwrap().copy_from_slice(&[
+            10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 2, 24, 25, 26, 30, 31, 32, 33, 34, 35, 36, 40,
+            41, 42, 43, 44, 45, 46,
+        ]);
+        let mut target_tokens = alloc(&device, DType::U32, &[24]);
+        target_tokens
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&[
+                30, 31, 999, 0, 0, 0, 0, 0, 20, 21, 22, 2, 0, 0, 0, 0, 10, 11, 12, 13, 14, 15, 16,
+                99,
+            ]);
+        let mut verify_rows = alloc(&device, DType::U32, &[4]);
+        verify_rows
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&[8, 5, 4, 8]);
+        let retained = alloc(&device, DType::U32, &[4]);
+        let accepted = alloc(&device, DType::U32, &[4]);
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_dflash2_accept_greedy(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &proposals,
+            &target_tokens,
+            &verify_rows,
+            &retained,
+            &accepted,
+            DFlash2GreedyAcceptanceParams {
+                physical_lane: [2, 1, 0, 0],
+                maximum: [8, 5, 0, 0],
+                eos_token: [2, 3, 0, 0, 0, 0, 0, 0],
+                physical_lanes: 4,
+                lanes: 2,
+                rows_per_lane: 8,
+                width: 24,
+                eos_count: 2,
+            },
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        assert_eq!(retained.as_slice::<u32>().unwrap(), [0, 4, 3, 0]);
+        assert_eq!(accepted.as_slice::<u32>().unwrap(), [0, 4, 2, 0]);
     }
 }

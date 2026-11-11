@@ -459,3 +459,57 @@ kernel void dflash2_compose_fixed_verify_input(
     const uint source = physical * (params.rows_per_lane - 1) + row - 1;
     target_tokens[index] = proposals[source];
 }
+
+struct DFlash2GreedyAcceptanceParams {
+    uint physical_lane[DFLASH2_MAX_LANES];
+    uint maximum[DFLASH2_MAX_LANES];
+    uint eos_token[8];
+    uint physical_lanes;
+    uint lanes;
+    uint rows_per_lane;
+    uint width;
+    uint eos_count;
+};
+
+kernel void dflash2_accept_greedy(
+    device const uint *proposals [[buffer(0)]],
+    device const uint *target_tokens [[buffer(1)]],
+    device const uint *verify_rows [[buffer(2)]],
+    device uint *retained_counts [[buffer(3)]],
+    device uint *accepted_counts [[buffer(4)]],
+    constant DFlash2GreedyAcceptanceParams &params [[buffer(5)]],
+    uint physical [[thread_position_in_grid]]) {
+    if (physical >= params.physical_lanes) return;
+    retained_counts[physical] = 0;
+    accepted_counts[physical] = 0;
+
+    uint lane = 0;
+    for (; lane < params.lanes; ++lane)
+        if (params.physical_lane[lane] == physical) break;
+    if (lane == params.lanes) return;
+
+    const uint live = min(verify_rows[physical], params.maximum[lane]);
+    if (live == 0) return;
+    uint retained = live;
+    uint accepted = live - 1;
+    for (uint position = 0; position + 1 < live; ++position) {
+        const uint target = target_tokens[lane * params.rows_per_lane + position];
+        const uint draft =
+            proposals[physical * (params.rows_per_lane - 1) + position];
+        bool eos = false;
+        for (uint index = 0; index < params.eos_count; ++index)
+            eos = eos || target == params.eos_token[index];
+        if (target != draft) {
+            retained = position + 1;
+            accepted = position;
+            break;
+        }
+        if (eos) {
+            retained = position + 1;
+            accepted = position + 1;
+            break;
+        }
+    }
+    retained_counts[physical] = retained;
+    accepted_counts[physical] = accepted;
+}
