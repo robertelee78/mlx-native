@@ -1298,6 +1298,10 @@ impl KernelRegistry {
             "qmm_affine_t_packed_simd4_b4_gs64_bf16".into(),
             qmm_affine_t_packed_simd4_b4_gs64_bf16_src,
         );
+        sources.insert(
+            "qmm_affine_t_packed_simd4_b4_gs64_bf16_silu_mul".into(),
+            qmm_affine_t_packed_simd4_b4_gs64_bf16_src,
+        );
         // ADR-020 iter-11h-b: training-mode causal depthwise 1D
         // convolution (forward + backward dx + backward dw).  Used by
         // GpuTape autograd for differentiable Qwen3.5MoE forward

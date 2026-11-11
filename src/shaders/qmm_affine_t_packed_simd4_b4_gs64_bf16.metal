@@ -189,3 +189,145 @@ kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16(
             y[ulong(row1) * N + output] = accumulators[output_fragment].y;
     }
 }
+
+kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_silu_mul(
+    device const bfloat *table     [[buffer(0)]],
+    device const float *sums       [[buffer(1)]],
+    device const uint *codes       [[buffer(2)]],
+    device const uint *metadata    [[buffer(3)]],
+    device float *y                [[buffer(4)]],
+    constant uint4 &shape          [[buffer(5)]],
+    uint lane                      [[thread_index_in_simdgroup]],
+    uint simdgroup                 [[simdgroup_index_in_threadgroup]],
+    uint2 tile                     [[threadgroup_position_in_grid]]) {
+    const uint M = shape.x;
+    const uint N = shape.y;
+    const uint K = shape.z;
+    const uint groups32 = K / 32;
+    const uint groups64 = K / SPAN;
+    const uint output_tiles = N / OUTPUT_TILE;
+    const uint gate_tile = tile.x;
+    const uint up_tile = gate_tile + output_tiles;
+    const uint output_origin =
+        gate_tile * OUTPUT_TILE + simdgroup * OUTPUTS_PER_SIMDGROUP;
+    const uint row_origin = tile.y * ROWS_PER_TILE;
+    const MatrixLane matrix = matrix_lane(lane);
+    const uint chunk = matrix.column / 2;
+    float2 gate_accumulators[2] = {float2(0.0f), float2(0.0f)};
+    float2 up_accumulators[2] = {float2(0.0f), float2(0.0f)};
+    device const bfloat *row_table = table + ulong(tile.y) * K * ROWS_PER_TILE;
+
+    for (uint group64 = 0; group64 < groups64; ++group64) {
+        float2 gate_groups[2] = {float2(0.0f), float2(0.0f)};
+        float2 up_groups[2] = {float2(0.0f), float2(0.0f)};
+        device const vec<bfloat, 8> *span_table =
+            reinterpret_cast<device const vec<bfloat, 8> *>(
+                row_table + group64 * SPAN_TABLE_VALUES);
+#pragma unroll
+        for (uint group_half = 0; group_half < 2; ++group_half) {
+            const uint group32 = group64 * 2 + group_half;
+            uint4 gate_pairs[2];
+            uint4 up_pairs[2];
+#pragma unroll
+            for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                const uint output_row =
+                    simdgroup * OUTPUTS_PER_SIMDGROUP +
+                    output_fragment * 8 + matrix.row;
+                const ulong gate_code_row =
+                    (ulong(gate_tile) * groups32 + group32) * OUTPUT_TILE +
+                    output_row;
+                const ulong up_code_row =
+                    (ulong(up_tile) * groups32 + group32) * OUTPUT_TILE +
+                    output_row;
+                const uint gate_word = codes[gate_code_row * 4 + chunk];
+                const uint up_word = codes[up_code_row * 4 + chunk];
+                gate_pairs[output_fragment] =
+                    (uint4(gate_word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu;
+                up_pairs[output_fragment] =
+                    (uint4(up_word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu;
+            }
+            const vec<bfloat, 8> activations =
+                span_table[(8 * group_half + matrix.row) * 4 + chunk];
+#pragma unroll
+            for (uint pair = 0; pair < 4; ++pair) {
+                const bfloat2 activation =
+                    reinterpret_cast<thread const bfloat2 *>(&activations)[pair];
+#pragma unroll
+                for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                    const bfloat2 gate_weight = as_type<bfloat2>(
+                        gate_pairs[output_fragment][pair] + 0x43004300u);
+                    const bfloat2 up_weight = as_type<bfloat2>(
+                        up_pairs[output_fragment][pair] + 0x43004300u);
+                    matrix_multiply_accumulate(
+                        gate_groups[output_fragment],
+                        gate_weight,
+                        activation);
+                    matrix_multiply_accumulate(
+                        up_groups[output_fragment],
+                        up_weight,
+                        activation);
+                }
+            }
+        }
+        const float2 input_sum = *reinterpret_cast<device const float2 *>(
+            sums + (tile.y * groups64 + group64) * ROWS_PER_TILE + matrix.column);
+#pragma unroll
+        for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+            const uint output_row =
+                simdgroup * OUTPUTS_PER_SIMDGROUP +
+                output_fragment * 8 + matrix.row;
+            const ulong gate_metadata_row =
+                (ulong(gate_tile) * groups64 + group64) * OUTPUT_TILE +
+                output_row;
+            const ulong up_metadata_row =
+                (ulong(up_tile) * groups64 + group64) * OUTPUT_TILE +
+                output_row;
+            const uint gate_coefficients = metadata[gate_metadata_row];
+            const uint up_coefficients = metadata[up_metadata_row];
+            const float gate_scale =
+                float(as_type<bfloat>(ushort(gate_coefficients & 0xFFFFu)));
+            const float gate_bias =
+                float(as_type<bfloat>(ushort(gate_coefficients >> 16)));
+            const float up_scale =
+                float(as_type<bfloat>(ushort(up_coefficients & 0xFFFFu)));
+            const float up_bias =
+                float(as_type<bfloat>(ushort(up_coefficients >> 16)));
+            gate_accumulators[output_fragment] = fma(
+                gate_groups[output_fragment],
+                float2(gate_scale),
+                gate_accumulators[output_fragment]);
+            gate_accumulators[output_fragment] = fma(
+                input_sum,
+                float2(fma(-128.0f, gate_scale, gate_bias)),
+                gate_accumulators[output_fragment]);
+            up_accumulators[output_fragment] = fma(
+                up_groups[output_fragment],
+                float2(up_scale),
+                up_accumulators[output_fragment]);
+            up_accumulators[output_fragment] = fma(
+                input_sum,
+                float2(fma(-128.0f, up_scale, up_bias)),
+                up_accumulators[output_fragment]);
+        }
+    }
+
+#pragma unroll
+    for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+        const uint output =
+            output_origin + output_fragment * 8 + matrix.row;
+        const uint row0 = row_origin + matrix.column;
+        const uint row1 = row0 + 1;
+        if (output < N && row0 < M) {
+            const float gate = gate_accumulators[output_fragment].x;
+            y[ulong(row0) * N + output] =
+                (gate / (1.0f + metal::exp(-gate))) *
+                up_accumulators[output_fragment].x;
+        }
+        if (output < N && row1 < M) {
+            const float gate = gate_accumulators[output_fragment].y;
+            y[ulong(row1) * N + output] =
+                (gate / (1.0f + metal::exp(-gate))) *
+                up_accumulators[output_fragment].y;
+        }
+    }
+}
