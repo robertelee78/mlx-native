@@ -125,7 +125,7 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// on the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`) a registry that
 /// skipped the op's `register` call failed with `KernelNotFound`. Kernels a
 /// function registers that the constructor already carries are unaffected.
-const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 28] = [
+const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 29] = [
     crate::ops::add_bias_row_2d::register,
     crate::ops::bilinear_resize_2d::register,
     crate::ops::block_merge_2x2::register,
@@ -147,6 +147,7 @@ const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 28] = [
     crate::ops::flash_attn_train::register_bwd,
     crate::ops::flash_attn_vec_tq::register,
     crate::ops::fused_residual_norm::register,
+    crate::ops::repacked_gguf_mm::register,
     crate::ops::gated_delta_net_decode::register,
     crate::ops::gather_bench::register,
     crate::ops::hadamard::register,
