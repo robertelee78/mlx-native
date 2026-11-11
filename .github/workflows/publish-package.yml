@@ -63,6 +63,7 @@ jobs:
           crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
           test -s "$crate"
           actual=$(sha256sum "$crate" | cut -d ' ' -f1)
+          echo "package_sha256=$actual"
           test "$actual" = "$EXPECTED_PACKAGE_SHA256"
 
       - name: Publish exact package
