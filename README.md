@@ -21,7 +21,7 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 - **One `MTLCommandBuffer` + one `ComputeCommandEncoder` per forward pass** (`GraphExecutor` / `GraphSession`) — candle's Metal backend defaults to flushing into a fresh command buffer every 50 dispatches (`CANDLE_METAL_COMPUTE_PER_BUFFER`, verified in `candle-metal-kernels/src/metal/commands.rs`)
 - **TurboQuant KV cache** — Lloyd-Max codebooks (2 / 3 / 4-bit nibble-packed) and byte-packed higher-bit (5 / 6 / 8-bit) variants, with fused Hadamard incoherence transform
-- **MoE routing on GPU** — `moe_gate` + `moe_softmax_topk` + V3 parallel SG-tournament top-K (`fused_moe_routing_f32`, default-on) + expert-routed quantized matmul (no CPU round-trip for top-k expert selection)
+- **MoE routing on GPU** — `moe_gate` + `moe_softmax_topk` + V3 parallel SG-tournament top-K (`fused_moe_routing_f32`, default-on), expert-routed quantized matmul, and prepared staged-M8 Q4_K/Q6_K gate/up/down projections with BF16 intermediates (no CPU round-trip for top-k expert selection)
 - **Custom Metal kernels for state-space models** — `gated_delta_net` (+ chunk variants), `ssm_conv`, `ssm_norm_gate`, `tri_solve`, `cumsum`
 - **Shape-specialized prefill** — D=256 / D=512 tiled flash-attention kernels (bf16 + F16 / BF16 `_resume` dispatchers) tuned for production model shapes (Qwen3, Gemma 4)
 - **Fused norm-family kernels** — `fused_norm_add`, `fused_residual_norm`, `fused_post_attn_triple_norm`, `fused_post_ff_norm2_endlayer` (+ `_v2` default-on), `fused_moe_wsum_norm_add`, `fused_moe_wsum_post_ff_norm2_endlayer_v2`, `fused_head_norm_rope` (+ batch family)

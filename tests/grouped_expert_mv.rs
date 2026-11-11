@@ -2,11 +2,9 @@ use half::bf16;
 use mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv;
 use mlx_native::{
     ggml_expert_bytes, prepare_quantized_matmul_id_ggml_grouped_m8,
-    quantized_matmul_id_ggml_grouped_m8, quantized_matmul_id_ggml_grouped_m8_epilogue,
-    quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_grouped_m8_register,
-    quantized_matmul_id_ggml_grouped_mv, quantized_matmul_id_ggml_grouped_native_m8, DType,
-    GgmlQuantizedMatmulIdParams, GgmlType,
-    GroupedM8Epilogue, GroupedM8Input, IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice,
+    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_grouped_m8_gate_up,
+    DType, GgmlQuantizedMatmulIdParams, GgmlType, GroupedM8Epilogue, GroupedM8Input, IdMmScratch,
+    KernelRegistry, MlxBuffer, MlxDevice,
 };
 
 struct Rng(u64);
@@ -28,7 +26,7 @@ impl Rng {
 fn f32_buffer(device: &MlxDevice, len: usize, seed: u64) -> MlxBuffer {
     let mut buffer = device
         .alloc_buffer(len * 4, DType::F32, vec![len])
-        .expect("f32");
+        .expect("f32 buffer");
     let mut rng = Rng(seed);
     for value in buffer.as_mut_slice::<f32>().expect("f32 slice") {
         *value = rng.value();
@@ -36,9 +34,9 @@ fn f32_buffer(device: &MlxDevice, len: usize, seed: u64) -> MlxBuffer {
     buffer
 }
 
-fn ids(device: &MlxDevice, tokens: usize, experts: usize) -> MlxBuffer {
+fn ids(device: &MlxDevice, tokens: usize, top_k: usize, experts: usize) -> MlxBuffer {
     let values: Vec<u32> = (0..tokens)
-        .flat_map(|token| (0..experts).map(move |slot| ((slot + token) % experts) as u32))
+        .flat_map(|token| (0..top_k).map(move |slot| ((slot * 3 + token * 5) % experts) as u32))
         .collect();
     let mut buffer = device
         .alloc_buffer(values.len() * 4, DType::U32, vec![values.len()])
@@ -88,18 +86,6 @@ fn weights(
     (buffer, stride)
 }
 
-fn assert_bitwise(grouped: &MlxBuffer, reference: &MlxBuffer, elements: usize, label: &str) {
-    let grouped = &grouped.as_slice::<f32>().expect("grouped output")[..elements];
-    let reference = &reference.as_slice::<f32>().expect("reference output")[..elements];
-    for (index, (&actual, &expected)) in grouped.iter().zip(reference).enumerate() {
-        assert_eq!(
-            actual.to_bits(),
-            expected.to_bits(),
-            "{label} element {index}: {actual} != {expected}"
-        );
-    }
-}
-
 fn assert_tensor_close(candidate: &MlxBuffer, reference: &MlxBuffer, elements: usize, label: &str) {
     let candidate = &candidate.as_slice::<f32>().expect("candidate output")[..elements];
     let reference = &reference.as_slice::<f32>().expect("reference output")[..elements];
@@ -126,411 +112,93 @@ fn grouped_matches_mv(ggml_type: GgmlType) {
     const TOKENS: u32 = 11;
     const EXPERTS: u32 = 8;
     const TOP_K: u32 = 8;
-    const K: u32 = 256;
-    const N: u32 = 64;
+    const WIDTH: u32 = 256;
+
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
-    let ids = ids(&device, TOKENS as usize, EXPERTS as usize);
-    let input = f32_buffer(&device, (TOKENS * K) as usize, 11);
-    let slotted = f32_buffer(&device, (TOKENS * TOP_K * K) as usize, 12);
-    let (weight, stride) = weights(&device, ggml_type, EXPERTS, N, K, 13);
+    let ids = ids(&device, TOKENS as usize, TOP_K as usize, EXPERTS as usize);
+    let input = f32_buffer(&device, (TOKENS * WIDTH) as usize, 11);
+    let (gate_weight, stride) = weights(&device, ggml_type, EXPERTS, WIDTH, WIDTH, 13);
+    let (up_weight, _) = weights(&device, ggml_type, EXPERTS, WIDTH, WIDTH, 14);
+    let (down_weight, _) = weights(&device, ggml_type, EXPERTS, WIDTH, WIDTH, 15);
     let params = GgmlQuantizedMatmulIdParams {
         n_tokens: TOKENS,
         top_k: TOP_K,
-        n: N,
-        k: K,
+        n: WIDTH,
+        k: WIDTH,
         n_experts: EXPERTS,
         expert_stride: stride,
         ggml_type,
     };
-    let elements = (TOKENS * TOP_K * N) as usize;
-    let mut grouped = device
-        .alloc_buffer(elements * 4, DType::F32, vec![elements])
-        .expect("grouped");
-    let mut reference = device
-        .alloc_buffer(elements * 4, DType::F32, vec![elements])
-        .expect("reference");
-    let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("scratch");
-    let table_rows = EXPERTS * 8 + TOKENS * TOP_K + 7;
-    let gathered_elements = (table_rows * K) as usize;
-    let gathered = device
-        .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
-        .expect("gathered input");
-    let gathered_sum_elements = (table_rows * K * 3 / 32) as usize;
-    let gathered_sums = device
-        .alloc_buffer(
-            gathered_sum_elements * 4,
-            DType::F32,
-            vec![gathered_sum_elements],
-        )
-        .expect("Table16 sums");
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &grouped,
-        &mut scratch,
-        &params,
-        false,
-        false,
-    )
-    .expect("grouped shared-input projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &reference,
-        &params,
-    )
-    .expect("reference shared-input projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_mv.shared")
-        .expect("commit shared");
-    assert_bitwise(&grouped, &reference, elements, "shared input");
-
-    grouped
-        .as_mut_slice::<u32>()
-        .expect("grouped words")
-        .fill(0x7fc0_0011);
-    reference
-        .as_mut_slice::<u32>()
-        .expect("reference words")
-        .fill(0x7fc0_0012);
-    let slotted_params = params;
     let flat_params = GgmlQuantizedMatmulIdParams {
         n_tokens: TOKENS * TOP_K,
         top_k: 1,
         ..params
     };
-    let prep_output = device
-        .alloc_buffer(elements * 4, DType::F32, vec![elements])
-        .expect("schedule preparation output");
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &prep_output,
-        &mut scratch,
-        &params,
-        false,
-        false,
-    )
-    .expect("prepare grouped schedule");
-    quantized_matmul_id_ggml_grouped_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &slotted,
-        &weight,
-        &ids,
-        &grouped,
-        &mut scratch,
-        &slotted_params,
-        true,
-        true,
-    )
-    .expect("grouped slotted projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &slotted,
-        &weight,
-        &ids,
-        &reference,
-        &flat_params,
-    )
-    .expect("reference slotted projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_mv.slotted")
-        .expect("commit slotted");
-    assert_bitwise(&grouped, &reference, elements, "slotted input");
-
-    grouped
-        .as_mut_slice::<u32>()
-        .expect("grouped words")
-        .fill(0x7fc0_0011);
-    reference
-        .as_mut_slice::<u32>()
-        .expect("reference words")
-        .fill(0x7fc0_0012);
-    let mut encoder = device.command_encoder().expect("encoder");
-    let prepared = prepare_quantized_matmul_id_ggml_grouped_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &weight,
-        &params,
-    )
-    .expect("prepare grouped M8 experts");
-    quantized_matmul_id_ggml_grouped_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &gathered,
-        &prepared,
-        &ids,
-        &grouped,
-        &mut scratch,
-        &params,
-        false,
-        false,
-        false,
-    )
-    .expect("grouped M8 shared-input projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &reference,
-        &params,
-    )
-    .expect("reference M8 shared-input projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_m8.shared")
-        .expect("commit shared M8");
-    assert_tensor_close(&grouped, &reference, elements, "M8 shared input");
-    grouped
-        .as_mut_slice::<u32>()
-        .expect("grouped words")
-        .fill(0x7fc0_0011);
-    reference
-        .as_mut_slice::<u32>()
-        .expect("reference words")
-        .fill(0x7fc0_0012);
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_m8_register(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &gathered,
-        &gathered_sums,
-        &prepared,
-        &ids,
-        &grouped,
-        None,
-        &mut scratch,
-        &params,
-        false,
-        false,
-        false,
-        GroupedM8Input::F32,
-        GroupedM8Epilogue::F32,
-    )
-    .expect("Table16 register shared-input projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &reference,
-        &params,
-    )
-    .expect("reference Table16 shared-input projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_m8.register.shared")
-        .expect("commit Table16 shared M8");
-    assert_tensor_close(
-        &grouped,
-        &reference,
-        elements,
-        "Table16 register shared input",
-    );
-
-    grouped
-        .as_mut_slice::<u32>()
-        .expect("grouped words")
-        .fill(0x7fc0_0011);
-    reference
-        .as_mut_slice::<u32>()
-        .expect("reference words")
-        .fill(0x7fc0_0012);
-    let prep_output = device
-        .alloc_buffer(elements * 4, DType::F32, vec![elements])
-        .expect("M8 schedule preparation output");
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &gathered,
-        &prepared,
-        &ids,
-        &prep_output,
-        &mut scratch,
-        &params,
-        false,
-        false,
-        false,
-    )
-    .expect("prepare grouped M8 schedule");
-    quantized_matmul_id_ggml_grouped_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &slotted,
-        &gathered,
-        &prepared,
-        &ids,
-        &grouped,
-        &mut scratch,
-        &slotted_params,
-        true,
-        true,
-        false,
-    )
-    .expect("grouped M8 slotted projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &slotted,
-        &weight,
-        &ids,
-        &reference,
-        &flat_params,
-    )
-    .expect("reference M8 slotted projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_m8.slotted")
-        .expect("commit slotted M8");
-    assert_tensor_close(&grouped, &reference, elements, "M8 slotted input");
-
-    grouped
-        .as_mut_slice::<u32>()
-        .expect("grouped words")
-        .fill(0x7fc0_0011);
-    reference
-        .as_mut_slice::<u32>()
-        .expect("reference words")
-        .fill(0x7fc0_0012);
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_native_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &grouped,
-        &mut scratch,
-        &params,
-        false,
-        false,
-    )
-    .expect("native M8 shared-input projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &reference,
-        &params,
-    )
-    .expect("reference native M8 shared-input projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_native_m8.shared")
-        .expect("commit native shared M8");
-    assert_tensor_close(&grouped, &reference, elements, "native M8 shared input");
-
-    grouped
-        .as_mut_slice::<u32>()
-        .expect("grouped words")
-        .fill(0x7fc0_0011);
-    reference
-        .as_mut_slice::<u32>()
-        .expect("reference words")
-        .fill(0x7fc0_0012);
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_native_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &weight,
-        &ids,
-        &prep_output,
-        &mut scratch,
-        &params,
-        false,
-        false,
-    )
-    .expect("prepare native M8 schedule");
-    quantized_matmul_id_ggml_grouped_native_m8(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &slotted,
-        &weight,
-        &ids,
-        &grouped,
-        &mut scratch,
-        &slotted_params,
-        true,
-        true,
-    )
-    .expect("native M8 slotted projection");
-    quantized_matmul_id_ggml_mv(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &slotted,
-        &weight,
-        &ids,
-        &reference,
-        &flat_params,
-    )
-    .expect("reference native M8 slotted projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_native_m8.slotted")
-        .expect("commit native slotted M8");
-    assert_tensor_close(&grouped, &reference, elements, "native M8 slotted input");
-
+    let elements = (TOKENS * TOP_K * WIDTH) as usize;
+    let gathered = device
+        .alloc_buffer(elements * 2, DType::BF16, vec![elements])
+        .expect("gathered input");
     let gate_bf16 = device
         .alloc_buffer(elements * 2, DType::BF16, vec![elements])
-        .expect("BF16 gate");
-    let fused_bf16 = device
-        .alloc_buffer(elements * 2, DType::BF16, vec![elements])
-        .expect("BF16 fused output");
+        .expect("gate BF16");
+    let up_f32 = device
+        .alloc_buffer(elements * 4, DType::F32, vec![elements])
+        .expect("up F32");
+    let up_reference = device
+        .alloc_buffer(elements * 4, DType::F32, vec![elements])
+        .expect("up reference");
     let one_pass_bf16 = device
         .alloc_buffer(elements * 2, DType::BF16, vec![elements])
-        .expect("one-pass BF16 fused output");
-    let staged_gate_bf16 = device
-        .alloc_buffer(elements * 2, DType::BF16, vec![elements])
-        .expect("staged BF16 gate");
-    let staged_up_f32 = device
+        .expect("one-pass gate/up");
+    let down_f32 = device
         .alloc_buffer(elements * 4, DType::F32, vec![elements])
-        .expect("staged F32 up");
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_m8_register(
+        .expect("down F32");
+    let down_reference = device
+        .alloc_buffer(elements * 4, DType::F32, vec![elements])
+        .expect("down reference");
+    let mut widened = device
+        .alloc_buffer(elements * 4, DType::F32, vec![elements])
+        .expect("widened intermediate");
+    let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("scratch");
+
+    let mut encoder = device.command_encoder().expect("prepare encoder");
+    let gate = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &gate_weight,
+        &params,
+    )
+    .expect("prepare gate");
+    let up = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &up_weight,
+        &params,
+    )
+    .expect("prepare up");
+    let down = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &down_weight,
+        &params,
+    )
+    .expect("prepare down");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.prepare")
+        .expect("commit preparation");
+
+    let mut encoder = device.command_encoder().expect("projection encoder");
+    quantized_matmul_id_ggml_grouped_m8_epilogue(
         &mut encoder,
         &mut registry,
         &device,
         &input,
         &gathered,
-        &gathered_sums,
-        &prepared,
+        &gate,
         &ids,
         &gate_bf16,
         None,
@@ -542,37 +210,16 @@ fn grouped_matches_mv(ggml_type: GgmlType) {
         GroupedM8Input::F32,
         GroupedM8Epilogue::Bf16,
     )
-    .expect("BF16 gate projection");
-    quantized_matmul_id_ggml_grouped_m8_register(
+    .expect("staged gate");
+    quantized_matmul_id_ggml_grouped_m8_epilogue(
         &mut encoder,
         &mut registry,
         &device,
         &input,
         &gathered,
-        &gathered_sums,
-        &prepared,
+        &up,
         &ids,
-        &fused_bf16,
-        Some(&gate_bf16),
-        &mut scratch,
-        &params,
-        false,
-        true,
-        true,
-        GroupedM8Input::F32,
-        GroupedM8Epilogue::SiluMulBf16,
-    )
-    .expect("fused BF16 up projection");
-    quantized_matmul_id_ggml_grouped_m8_register(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &gathered,
-        &gathered_sums,
-        &prepared,
-        &ids,
-        &reference,
+        &up_f32,
         None,
         &mut scratch,
         &params,
@@ -582,158 +229,112 @@ fn grouped_matches_mv(ggml_type: GgmlType) {
         GroupedM8Input::F32,
         GroupedM8Epilogue::F32,
     )
-    .expect("F32 up reference");
-    quantized_matmul_id_ggml_grouped_m8_epilogue(
+    .expect("staged up");
+    quantized_matmul_id_ggml_mv(
         &mut encoder,
         &mut registry,
         &device,
         &input,
-        &gathered,
-        &prepared,
+        &up_weight,
         &ids,
-        &staged_gate_bf16,
-        None,
-        &mut scratch,
+        &up_reference,
         &params,
-        false,
-        false,
-        false,
-        GroupedM8Input::F32,
-        GroupedM8Epilogue::Bf16,
     )
-    .expect("staged BF16 gate projection");
-    quantized_matmul_id_ggml_grouped_m8_epilogue(
-        &mut encoder,
-        &mut registry,
-        &device,
-        &input,
-        &gathered,
-        &prepared,
-        &ids,
-        &staged_up_f32,
-        None,
-        &mut scratch,
-        &params,
-        false,
-        true,
-        true,
-        GroupedM8Input::F32,
-        GroupedM8Epilogue::F32,
-    )
-    .expect("staged F32 up projection");
+    .expect("up reference");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.projection")
+        .expect("commit projections");
+    assert_tensor_close(&up_f32, &up_reference, elements, "prepared projection");
+
+    let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("fused scratch");
+    let mut encoder = device.command_encoder().expect("fused encoder");
     quantized_matmul_id_ggml_grouped_m8_gate_up(
         &mut encoder,
         &mut registry,
         &device,
         &input,
         &gathered,
-        &prepared,
-        &prepared,
+        &gate,
+        &up,
         &ids,
         &one_pass_bf16,
         &mut scratch,
         &params,
         GroupedM8Input::F32,
     )
-    .expect("one-pass BF16 gate/up projection");
-    encoder
-        .commit_and_wait_labeled("test.grouped_m8.fused_silu")
-        .expect("commit fused BF16 projection");
-    let gates = gate_bf16.as_slice::<u16>().expect("BF16 gates");
-    let fused = fused_bf16.as_slice::<u16>().expect("BF16 fused output");
-    let up = reference.as_slice::<f32>().expect("F32 up output");
-    let one_pass = one_pass_bf16
-        .as_slice::<u16>()
-        .expect("one-pass BF16 fused output");
-    let staged_gates = staged_gate_bf16
-        .as_slice::<u16>()
-        .expect("staged BF16 gates");
-    let staged_up = staged_up_f32.as_slice::<f32>().expect("staged F32 up");
-    for index in 0..elements {
-        let gate = bf16::from_bits(gates[index]).to_f32();
-        let expected = bf16::from_f32((gate / (1.0 + (-gate).exp())) * up[index]).to_f32();
-        let actual = bf16::from_bits(fused[index]).to_f32();
-        let tolerance = 1.0e-5f32.max(expected.abs() * 1.0e-2);
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "fused BF16 SiLU element {index}: {actual} != {expected} (tol {tolerance})"
-        );
-        let staged_gate = bf16::from_bits(staged_gates[index]).to_f32();
-        let expected_one_pass = bf16::from_f32(
-            (staged_gate / (1.0 + (-staged_gate).exp()))
-                * bf16::from_f32(staged_up[index]).to_f32(),
-        )
-        .to_f32();
-        let actual_one_pass = bf16::from_bits(one_pass[index]).to_f32();
-        let one_pass_tolerance = 1.0e-5f32.max(expected_one_pass.abs() * 1.0e-2);
-        assert!(
-            (actual_one_pass - expected_one_pass).abs() <= one_pass_tolerance,
-            "one-pass BF16 SiLU element {index}: {actual_one_pass} != {expected_one_pass} \
-             (tol {one_pass_tolerance})"
-        );
-    }
-    let mut slotted_bf16 = device
-        .alloc_buffer(
-            (TOKENS * TOP_K * K * 2) as usize,
-            DType::BF16,
-            vec![(TOKENS * TOP_K * K) as usize],
-        )
-        .expect("BF16 slotted input");
-    let mut slotted_bf16_f32 = device
-        .alloc_buffer(
-            (TOKENS * TOP_K * K * 4) as usize,
-            DType::F32,
-            vec![(TOKENS * TOP_K * K) as usize],
-        )
-        .expect("widened BF16 slotted input");
-    let source = slotted.as_slice::<f32>().expect("slotted source");
-    let bf16_words = slotted_bf16
-        .as_mut_slice::<u16>()
-        .expect("BF16 slotted words");
-    let widened = slotted_bf16_f32
-        .as_mut_slice::<f32>()
-        .expect("widened BF16 slotted values");
-    for ((word, wide), value) in bf16_words.iter_mut().zip(widened).zip(source) {
-        let rounded = bf16::from_f32(*value);
-        *word = rounded.to_bits();
-        *wide = rounded.to_f32();
-    }
-    let mut encoder = device.command_encoder().expect("encoder");
-    quantized_matmul_id_ggml_grouped_m8_register(
+    .expect("one-pass gate/up");
+    quantized_matmul_id_ggml_grouped_m8_epilogue(
         &mut encoder,
         &mut registry,
         &device,
-        &slotted_bf16,
+        &one_pass_bf16,
         &gathered,
-        &gathered_sums,
-        &prepared,
+        &down,
         &ids,
-        &grouped,
+        &down_f32,
         None,
         &mut scratch,
         &params,
         true,
-        false,
+        true,
         false,
         GroupedM8Input::Bf16,
         GroupedM8Epilogue::F32,
     )
-    .expect("BF16-input down projection");
+    .expect("BF16-input down");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.gate_up_down")
+        .expect("commit fused path");
+
+    let gate_values = gate_bf16.as_slice::<u16>().expect("gate values");
+    let up_values = up_f32.as_slice::<f32>().expect("up values");
+    let fused_values = one_pass_bf16.as_slice::<u16>().expect("fused values");
+    for index in 0..elements {
+        let gate = bf16::from_bits(gate_values[index]).to_f32();
+        let up = bf16::from_f32(up_values[index]).to_f32();
+        let expected = bf16::from_f32((gate / (1.0 + (-gate).exp())) * up).to_f32();
+        let actual = bf16::from_bits(fused_values[index]).to_f32();
+        let tolerance = 1.0e-5f32.max(expected.abs() * 1.0e-2);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "one-pass gate/up element {index}: {actual} != {expected} (tol {tolerance})"
+        );
+    }
+
+    for (wide, &word) in widened
+        .as_mut_slice::<f32>()
+        .expect("widened values")
+        .iter_mut()
+        .zip(fused_values)
+    {
+        *wide = bf16::from_bits(word).to_f32();
+    }
+    let mut encoder = device.command_encoder().expect("reference encoder");
     quantized_matmul_id_ggml_mv(
         &mut encoder,
         &mut registry,
         &device,
-        &slotted_bf16_f32,
-        &weight,
+        &widened,
+        &down_weight,
         &ids,
-        &reference,
+        &down_reference,
         &flat_params,
     )
-    .expect("widened BF16 down reference");
+    .expect("down reference");
     encoder
-        .commit_and_wait_labeled("test.grouped_m8.bf16_input")
-        .expect("commit BF16-input projection");
-    assert_tensor_close(&grouped, &reference, elements, "BF16-input down");
+        .commit_and_wait_labeled("test.grouped_m8.down_reference")
+        .expect("commit down reference");
+    assert_tensor_close(&down_f32, &down_reference, elements, "BF16-input down");
+}
+
+#[test]
+fn grouped_q4_k_matches_mv() {
+    grouped_matches_mv(GgmlType::Q4_K);
+}
+
+#[test]
+fn grouped_q6_k_matches_mv() {
+    grouped_matches_mv(GgmlType::Q6_K);
 }
 
 #[test]
@@ -750,21 +351,10 @@ fn benchmark_qwen36_gate_projection() {
 
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
-    let ids = {
-        let values: Vec<u32> = (0..TOKENS)
-            .flat_map(|token| (0..TOP_K).map(move |slot| (token * 13 + slot * 17) % EXPERTS))
-            .collect();
-        let mut buffer = device
-            .alloc_buffer(values.len() * 4, DType::U32, vec![values.len()])
-            .expect("ids");
-        buffer
-            .as_mut_slice::<u32>()
-            .expect("ids slice")
-            .copy_from_slice(&values);
-        buffer
-    };
+    let ids = ids(&device, TOKENS as usize, TOP_K as usize, EXPERTS as usize);
     let input = f32_buffer(&device, (TOKENS * K) as usize, 101);
-    let (weight, stride) = weights(&device, GgmlType::Q4_K, EXPERTS, N, K, 102);
+    let (gate_weight, stride) = weights(&device, GgmlType::Q4_K, EXPERTS, N, K, 102);
+    let (up_weight, _) = weights(&device, GgmlType::Q4_K, EXPERTS, N, K, 103);
     let params = GgmlQuantizedMatmulIdParams {
         n_tokens: TOKENS,
         top_k: TOP_K,
@@ -775,203 +365,98 @@ fn benchmark_qwen36_gate_projection() {
         ggml_type: GgmlType::Q4_K,
     };
     let elements = (TOKENS * TOP_K * N) as usize;
+    let gathered = device
+        .alloc_buffer(
+            (TOKENS * TOP_K * K * 2) as usize,
+            DType::BF16,
+            vec![(TOKENS * TOP_K * K) as usize],
+        )
+        .expect("gathered input");
     let output = device
         .alloc_buffer(elements * 4, DType::F32, vec![elements])
         .expect("output");
-    let gate_bf16 = device
+    let fused = device
         .alloc_buffer(elements * 2, DType::BF16, vec![elements])
-        .expect("gate BF16 output");
-    let fused_bf16 = device
-        .alloc_buffer(elements * 2, DType::BF16, vec![elements])
-        .expect("fused BF16 output");
-    let table_rows = EXPERTS * 8 + TOKENS * TOP_K + 7;
-    let gathered_elements = (table_rows * K) as usize;
-    let gathered = device
-        .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
-        .expect("gathered input");
-    let gathered_sum_elements = (table_rows * K * 3 / 32) as usize;
-    let gathered_sums = device
-        .alloc_buffer(
-            gathered_sum_elements * 4,
-            DType::F32,
-            vec![gathered_sum_elements],
-        )
-        .expect("Table16 sums");
+        .expect("fused output");
 
-    let prepared = {
-        let mut encoder = device.command_encoder().expect("encoder");
-        let prepared = prepare_quantized_matmul_id_ggml_grouped_m8(
+    let mut encoder = device.command_encoder().expect("prepare encoder");
+    let gate = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &gate_weight,
+        &params,
+    )
+    .expect("prepare gate");
+    let up = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &up_weight,
+        &params,
+    )
+    .expect("prepare up");
+    encoder
+        .commit_and_wait_labeled("bench.grouped_m8.prepare")
+        .expect("commit preparation");
+
+    let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("scratch");
+    let mut encoder = device.command_encoder().expect("projection encoder");
+    for repeat in 0..REPEATS {
+        quantized_matmul_id_ggml_grouped_m8_epilogue(
             &mut encoder,
             &mut registry,
             &device,
-            &weight,
+            &input,
+            &gathered,
+            &gate,
+            &ids,
+            &output,
+            None,
+            &mut scratch,
             &params,
+            false,
+            repeat != 0,
+            repeat != 0,
+            GroupedM8Input::F32,
+            GroupedM8Epilogue::F32,
         )
-        .expect("prepare");
-        encoder
-            .commit_and_wait_labeled("bench.prepare")
-            .expect("commit prepare");
-        prepared
-    };
-
-    for route in ["scalar", "native_m8", "prepared_m8", "register_m8"] {
-        let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("scratch");
-        let mut encoder = device.command_encoder().expect("encoder");
-        for repeat in 0..REPEATS {
-            match route {
-                "scalar" => quantized_matmul_id_ggml_grouped_mv(
-                    &mut encoder,
-                    &mut registry,
-                    &device,
-                    &input,
-                    &weight,
-                    &ids,
-                    &output,
-                    &mut scratch,
-                    &params,
-                    false,
-                    repeat != 0,
-                ),
-                "native_m8" => quantized_matmul_id_ggml_grouped_native_m8(
-                    &mut encoder,
-                    &mut registry,
-                    &device,
-                    &input,
-                    &weight,
-                    &ids,
-                    &output,
-                    &mut scratch,
-                    &params,
-                    false,
-                    repeat != 0,
-                ),
-                "prepared_m8" => quantized_matmul_id_ggml_grouped_m8(
-                    &mut encoder,
-                    &mut registry,
-                    &device,
-                    &input,
-                    &gathered,
-                    &prepared,
-                    &ids,
-                    &output,
-                    &mut scratch,
-                    &params,
-                    false,
-                    repeat != 0,
-                    repeat != 0,
-                ),
-                "register_m8" => quantized_matmul_id_ggml_grouped_m8_register(
-                    &mut encoder,
-                    &mut registry,
-                    &device,
-                    &input,
-                    &gathered,
-                    &gathered_sums,
-                    &prepared,
-                    &ids,
-                    &output,
-                    None,
-                    &mut scratch,
-                    &params,
-                    false,
-                    repeat != 0,
-                    repeat != 0,
-                    GroupedM8Input::F32,
-                    GroupedM8Epilogue::F32,
-                ),
-                _ => unreachable!(),
-            }
-            .unwrap_or_else(|error| panic!("{route} repeat {repeat}: {error}"));
-        }
-        let started = Instant::now();
-        encoder
-            .commit_and_wait_labeled("bench.grouped_expert")
-            .expect("commit benchmark");
-        let elapsed = started.elapsed();
-        eprintln!(
-            "{route}: {:.3} ms/dispatch ({REPEATS} dispatches)",
-            elapsed.as_secs_f64() * 1000.0 / REPEATS as f64
-        );
+        .unwrap_or_else(|error| panic!("prepared projection repeat {repeat}: {error}"));
     }
-    for route in ["prepared_pair", "one_pass_pair"] {
-        let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("pair scratch");
-        let mut encoder = device.command_encoder().expect("pair encoder");
-        for repeat in 0..REPEATS {
-            match route {
-                "prepared_pair" => {
-                    quantized_matmul_id_ggml_grouped_m8_epilogue(
-                        &mut encoder,
-                        &mut registry,
-                        &device,
-                        &input,
-                        &gathered,
-                        &prepared,
-                        &ids,
-                        &gate_bf16,
-                        None,
-                        &mut scratch,
-                        &params,
-                        false,
-                        false,
-                        false,
-                        GroupedM8Input::F32,
-                        GroupedM8Epilogue::Bf16,
-                    )
-                    .unwrap_or_else(|error| panic!("{route} gate repeat {repeat}: {error}"));
-                    quantized_matmul_id_ggml_grouped_m8_epilogue(
-                        &mut encoder,
-                        &mut registry,
-                        &device,
-                        &input,
-                        &gathered,
-                        &prepared,
-                        &ids,
-                        &fused_bf16,
-                        Some(&gate_bf16),
-                        &mut scratch,
-                        &params,
-                        false,
-                        true,
-                        true,
-                        GroupedM8Input::F32,
-                        GroupedM8Epilogue::SiluMulBf16,
-                    )
-                }
-                "one_pass_pair" => quantized_matmul_id_ggml_grouped_m8_gate_up(
-                    &mut encoder,
-                    &mut registry,
-                    &device,
-                    &input,
-                    &gathered,
-                    &prepared,
-                    &prepared,
-                    &ids,
-                    &fused_bf16,
-                    &mut scratch,
-                    &params,
-                    GroupedM8Input::F32,
-                ),
-                _ => unreachable!(),
-            }
-            .unwrap_or_else(|error| panic!("{route} repeat {repeat}: {error}"));
-        }
-        let started = Instant::now();
-        encoder
-            .commit_and_wait_labeled("bench.grouped_expert_gate_up")
-            .expect("commit pair benchmark");
-        let elapsed = started.elapsed();
-        eprintln!(
-            "{route}: {:.3} ms/pair ({REPEATS} pairs)",
-            elapsed.as_secs_f64() * 1000.0 / REPEATS as f64
-        );
-    }
-}
-#[test]
-fn grouped_q4_k_matches_mv() {
-    grouped_matches_mv(GgmlType::Q4_K);
-}
+    let started = Instant::now();
+    encoder
+        .commit_and_wait_labeled("bench.grouped_m8.projection")
+        .expect("commit projection benchmark");
+    eprintln!(
+        "prepared_m8: {:.3} ms/projection ({REPEATS} projections)",
+        started.elapsed().as_secs_f64() * 1000.0 / REPEATS as f64
+    );
 
-#[test]
-fn grouped_q6_k_matches_mv() {
-    grouped_matches_mv(GgmlType::Q6_K);
+    let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("fused scratch");
+    let mut encoder = device.command_encoder().expect("fused encoder");
+    for repeat in 0..REPEATS {
+        quantized_matmul_id_ggml_grouped_m8_gate_up(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &gathered,
+            &gate,
+            &up,
+            &ids,
+            &fused,
+            &mut scratch,
+            &params,
+            GroupedM8Input::F32,
+        )
+        .unwrap_or_else(|error| panic!("one-pass gate/up repeat {repeat}: {error}"));
+    }
+    let started = Instant::now();
+    encoder
+        .commit_and_wait_labeled("bench.grouped_m8.gate_up")
+        .expect("commit gate/up benchmark");
+    eprintln!(
+        "one_pass_gate_up: {:.3} ms/pair ({REPEATS} pairs)",
+        started.elapsed().as_secs_f64() * 1000.0 / REPEATS as f64
+    );
 }
