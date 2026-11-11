@@ -232,6 +232,108 @@ kernel void hf2q_repacked_mm_impl(
     sum.store(out);
 }
 
+template <bool Q6>
+kernel void hf2q_repacked_mm_bf16_input_impl(
+    constant MmParams &a [[buffer(0)]], device const uchar *w [[buffer(1)]],
+    device bfloat *input [[buffer(2)]], device char *output [[buffer(3)]],
+    constant uint2 &offsets [[buffer(4)]], device char *partials [[buffer(5)]],
+    threadgroup char *shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int COLS=32, ROWS=32, STEP=32;
+    threadgroup half *tile=(threadgroup half *)shared+(tid/32)*2*COLS*STEP;
+    threadgroup half *sw0=tile;
+    threadgroup half *sw1=sw0+COLS*STEP;
+    const uint sg=tid/32, lane=tid%32, output_origin=group.y*64+sg*COLS;
+    const uint groups=a.ne00/32, units=groups/8, per=groups/a.splits;
+    const int im=group.z, i12=im%a.ne12, i13=im/a.ne12;
+    device bfloat *src=(device bfloat *)((device char *)input+a.nb13*i13+a.nb12*i12);
+    auto xt=tensor<device bfloat,dextents<int32_t,2>,tensor_inline>(
+        src,dextents<int32_t,2>{a.ne00,ROWS},array<int32_t,2>{1,a.ne00});
+    auto wt0=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(
+        sw0,dextents<int32_t,2>{STEP,COLS},array<int32_t,2>{1,STEP});
+    auto wt1=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(
+        sw1,dextents<int32_t,2>{STEP,COLS},array<int32_t,2>{1,STEP});
+    matmul2d<matmul2d_descriptor(ROWS,COLS,STEP,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate),execution_simdgroups<1>> mm;
+    auto left0=xt.template slice<STEP,ROWS>(0,0);
+    auto right0=wt0.template slice<STEP,COLS>(0,0);
+    auto sum=mm.get_destination_cooperative_tensor<decltype(left0),decltype(right0),float>();
+
+    const uint weight_row=output_origin+lane;
+    const uint begin=group.x*per, end=begin+per;
+    const uint first=begin+uint(ulong((group.y*40503u)&0xFFFFu)*per>>16);
+    ulong ix=tiled_index(weight_row,first,groups);
+    uint4 lo=*((device const uint4 *)(w+ix*16));
+    uint2 hi=uint2(0);
+    uint4 h=uint4(0);
+    packed_uint4 scales=packed_uint4(0);
+    uint dh=0;
+    device const uchar *meta=w+offsets.y+tiled_index(weight_row,first/8,units)*(Q6?20:16);
+    if constexpr(Q6){
+        hi=*((device const uint2 *)(w+offsets.x+ix*8));
+        scales=*((device const packed_uint4 *)meta);
+        dh=*((device const uint *)(meta+16));
+    }else{
+        h=*((device const uint4 *)meta);
+    }
+
+    uint g=first;
+    for(uint walked=0;walked<per;++walked){
+        const uint buffer=walked&1;
+        threadgroup half *sw=buffer?sw1:sw0;
+        if constexpr(Q6){
+            decode_q6k_half(lo,hi,scales,dh,g%8,0,sw+lane*32);
+            decode_q6k_half(lo,hi,scales,dh,g%8,1,sw+lane*32+16);
+        }else{
+            decode_q4k_half(lo,h,g%8,0,sw+lane*32);
+            decode_q4k_half(lo,h,g%8,1,sw+lane*32+16);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint4 next_lo=lo;
+        uint2 next_hi=hi;
+        uint4 next_h=h;
+        packed_uint4 next_scales=scales;
+        uint next_dh=dh;
+        const uint next=g+1<end?g+1:begin;
+        if(walked+1<per){
+            const ulong next_ix=tiled_index(weight_row,next,groups);
+            next_lo=*((device const uint4 *)(w+next_ix*16));
+            if constexpr(Q6) next_hi=*((device const uint2 *)(w+offsets.x+next_ix*8));
+            if(next/8!=g/8){
+                device const uchar *next_meta=w+offsets.y+tiled_index(weight_row,next/8,units)*(Q6?20:16);
+                if constexpr(Q6){
+                    next_scales=*((device const packed_uint4 *)next_meta);
+                    next_dh=*((device const uint *)(next_meta+16));
+                }else{
+                    next_h=*((device const uint4 *)next_meta);
+                }
+            }
+        }
+
+        auto left=xt.template slice<STEP,ROWS>(g*STEP,0);
+        if(buffer){
+            auto right=wt1.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+        }else{
+            auto right=wt0.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+        }
+        if(walked+1<per){
+            g=next; lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
+        }
+    }
+    device float *base=a.splits==1?(device float *)output:
+        (device float *)partials+group.x*a.ne1*a.ne0;
+    device float *dst=base+output_origin+im*a.ne1*a.ne0;
+    auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
+        dst,dextents<int32_t,2>{a.ne0,ROWS},array<int32_t,2>{1,a.ne0});
+    sum.store(out);
+}
+
+
+template [[host_name("hf2q_repacked_mm_q4k_bf16_input_f32")]] kernel void hf2q_repacked_mm_bf16_input_impl<false>(
+    constant MmParams &,device const uchar *,device bfloat *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
+template [[host_name("hf2q_repacked_mm_q6k_bf16_input_f32")]] kernel void hf2q_repacked_mm_bf16_input_impl<true>(
+    constant MmParams &,device const uchar *,device bfloat *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
 template [[host_name("hf2q_repacked_mm_q4k_f32")]] kernel void hf2q_repacked_mm_impl<false>(
     constant MmParams &,device const uchar *,device const char *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
 template [[host_name("hf2q_repacked_mm_q6k_f32")]] kernel void hf2q_repacked_mm_impl<true>(

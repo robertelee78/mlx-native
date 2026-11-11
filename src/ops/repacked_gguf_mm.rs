@@ -14,11 +14,20 @@ use crate::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 pub const REPACK_KERNEL: &str = "hf2q_gguf_repack_q4k_q6k";
 pub const Q4K_MM_KERNEL: &str = "hf2q_repacked_mm_q4k_f32";
 pub const Q6K_MM_KERNEL: &str = "hf2q_repacked_mm_q6k_f32";
+pub const Q4K_MM_BF16_INPUT_KERNEL: &str = "hf2q_repacked_mm_q4k_bf16_input_f32";
+pub const Q6K_MM_BF16_INPUT_KERNEL: &str = "hf2q_repacked_mm_q6k_bf16_input_f32";
 pub const REDUCE_KERNEL: &str = "hf2q_repacked_mm_reduce_f32";
 pub static SOURCE: &str = include_str!("../shaders/gguf_repacked_mm.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
-    for name in [REPACK_KERNEL, Q4K_MM_KERNEL, Q6K_MM_KERNEL, REDUCE_KERNEL] {
+    for name in [
+        REPACK_KERNEL,
+        Q4K_MM_KERNEL,
+        Q6K_MM_KERNEL,
+        Q4K_MM_BF16_INPUT_KERNEL,
+        Q6K_MM_BF16_INPUT_KERNEL,
+        REDUCE_KERNEL,
+    ] {
         registry.register_source(name, SOURCE);
     }
 }
@@ -55,6 +64,27 @@ struct MmParams {
     _pad1: u32,
 }
 
+fn mm_params(params: &GgmlQuantizedMatmulParams, input_dtype: DType, splits: u32) -> MmParams {
+    MmParams {
+        ne00: params.k as i32,
+        ne02: 1,
+        nb01: u64::from(params.k / 256) * u64::from(params.ggml_type.block_bytes()),
+        nb02: 0,
+        nb03: 0,
+        ne12: 1,
+        splits,
+        nb10: input_dtype.size_of() as u64,
+        nb11: u64::from(params.k) * input_dtype.size_of() as u64,
+        nb12: u64::from(params.m) * u64::from(params.k) * input_dtype.size_of() as u64,
+        nb13: 0,
+        ne0: params.n as i32,
+        ne1: params.m as i32,
+        r2: 1,
+        r3: 1,
+        _pad1: 0,
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedGgufWeight {
     _source: MlxBuffer,
@@ -68,15 +98,42 @@ pub struct PreparedGgufWeight {
     splits: u32,
 }
 
-fn target_splits(n: u32, k: u32) -> u32 {
-    const M5_MAX_CORES: u32 = 40;
-    let column_tiles = n / 64;
-    let k_groups = k / 32;
-    if column_tiles <= 5 * M5_MAX_CORES && k_groups % 4 == 0 && k / 4 >= 512 {
-        4
-    } else {
-        1
+fn target_splits(n: u32, k: u32, ggml_type: GgmlType) -> u32 {
+    const M5_MAX_CORES: u64 = 40;
+    const RESIDENT_GROUPS: u64 = 10;
+    const SATURATING_GROUPS: u64 = 6;
+    const FOLLOWING_GROUPS: u64 = 2;
+    const ROWS: u64 = 32;
+    let bits_sixteenths = match ggml_type {
+        GgmlType::Q4_K => 72_u64,
+        GgmlType::Q6_K => 105_u64,
+        _ => return 1,
+    };
+    let mut best_splits = 1;
+    let mut best_cost = u64::MAX;
+    for splits in [1_u32, 2, 4, 8] {
+        if (k / 32) % splits != 0 || (splits > 1 && k / splits < 512) {
+            continue;
+        }
+        let groups = u64::from(n / 64) * u64::from(splits);
+        let steps = u64::from(k / 32 / splits);
+        let per_core = groups.div_ceil(M5_MAX_CORES);
+        let waves = per_core.div_ceil(RESIDENT_GROUPS);
+        let full = (waves - 1) * RESIDENT_GROUPS * M5_MAX_CORES;
+        let floor = if waves > 1 {
+            FOLLOWING_GROUPS
+        } else {
+            SATURATING_GROUPS
+        } * M5_MAX_CORES;
+        let step_bits = 64 * 32 * bits_sixteenths / 16;
+        let partial_bits = if splits > 1 { 2 * ROWS * 64 * 32 } else { 0 };
+        let cost = steps * step_bits * (full + (groups - full).max(floor)) + groups * partial_bits;
+        if cost < best_cost {
+            best_cost = cost;
+            best_splits = splits;
+        }
     }
+    best_splits
 }
 
 pub fn prepare_repacked_gguf_weight(
@@ -101,10 +158,10 @@ pub fn prepare_repacked_gguf_weight(
             )))
         }
     };
-    if params.n % 64 != 0 || params.k % 256 != 0 {
+    if params.m != 32 || params.n % 64 != 0 || params.k % 256 != 0 {
         return Err(MlxError::InvalidArgument(format!(
-            "repacked GGUF MM requires N % 64 == 0 and K % 256 == 0, got N={} K={}",
-            params.n, params.k
+            "repacked GGUF MM requires M == 32, N % 64 == 0, and K % 256 == 0, got M={} N={} K={}",
+            params.m, params.n, params.k
         )));
     }
     let rows = params.n as usize;
@@ -142,7 +199,7 @@ pub fn prepare_repacked_gguf_weight(
         .and_then(|v| v.checked_add(meta))
         .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF size overflow".into()))?;
     let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
-    let splits = target_splits(params.n, params.k);
+    let splits = target_splits(params.n, params.k, params.ggml_type);
     let partials = if splits > 1 {
         let elements = splits as usize * params.m as usize * params.n as usize;
         let bytes = elements
@@ -206,10 +263,59 @@ pub fn dispatch_repacked_gguf_mm(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<()> {
-    if params.m != 32 || input.dtype() != DType::F32 || output.dtype() != DType::F32 {
-        return Err(MlxError::InvalidArgument(
-            "repacked GGUF MM requires M=32 and F32 input/output buffers".into(),
-        ));
+    dispatch_repacked_gguf_mm_typed(
+        encoder,
+        registry,
+        device,
+        input,
+        prepared,
+        output,
+        params,
+        DType::F32,
+    )
+}
+
+/// Dispatch the fixed width-32 prepared projection from a BF16 activation.
+///
+/// Unlike [`dispatch_repacked_gguf_mm`], this route feeds the device BF16
+/// matrix directly to MPP. It does not restage and recast the same activation
+/// once per output-column tile.
+pub fn dispatch_repacked_gguf_mm_bf16_input(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    prepared: &PreparedGgufWeight,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    dispatch_repacked_gguf_mm_typed(
+        encoder,
+        registry,
+        device,
+        input,
+        prepared,
+        output,
+        params,
+        DType::BF16,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_repacked_gguf_mm_typed(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    prepared: &PreparedGgufWeight,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    input_dtype: DType,
+) -> Result<()> {
+    if params.m != 32 || input.dtype() != input_dtype || output.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "repacked GGUF MM requires M=32, {input_dtype:?} input, and F32 output buffers"
+        )));
     }
     if prepared.n != params.n || prepared.k != params.k || prepared.ggml_type != params.ggml_type {
         return Err(MlxError::InvalidArgument(format!(
@@ -217,7 +323,7 @@ pub fn dispatch_repacked_gguf_mm(
             prepared.n, prepared.k, prepared.ggml_type, params.n, params.k, params.ggml_type
         )));
     }
-    let input_bytes = params.m as usize * params.k as usize * std::mem::size_of::<f32>();
+    let input_bytes = params.m as usize * params.k as usize * input_dtype.size_of();
     let output_bytes = params.m as usize * params.n as usize * std::mem::size_of::<f32>();
     if input.data_byte_len() < input_bytes || output.data_byte_len() < output_bytes {
         return Err(MlxError::InvalidArgument(format!(
@@ -226,32 +332,22 @@ pub fn dispatch_repacked_gguf_mm(
             output.data_byte_len()
         )));
     }
-    let kernel = match params.ggml_type {
-        GgmlType::Q4_K => Q4K_MM_KERNEL,
-        GgmlType::Q6_K => Q6K_MM_KERNEL,
+    let kernel = match (params.ggml_type, input_dtype) {
+        (GgmlType::Q4_K, DType::F32) => Q4K_MM_KERNEL,
+        (GgmlType::Q6_K, DType::F32) => Q6K_MM_KERNEL,
+        (GgmlType::Q4_K, DType::BF16) => Q4K_MM_BF16_INPUT_KERNEL,
+        (GgmlType::Q6_K, DType::BF16) => Q6K_MM_BF16_INPUT_KERNEL,
         _ => unreachable!(),
     };
     let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
-    let p = MmParams {
-        ne00: params.k as i32,
-        ne02: 1,
-        nb01: u64::from(params.k / 256) * u64::from(params.ggml_type.block_bytes()),
-        nb02: 0,
-        nb03: 0,
-        ne12: 1,
-        splits: prepared.splits,
-        nb10: 4,
-        nb11: u64::from(params.k) * 4,
-        nb12: u64::from(params.m) * u64::from(params.k) * 4,
-        nb13: 0,
-        ne0: params.n as i32,
-        ne1: params.m as i32,
-        r2: 1,
-        r3: 1,
-        _pad1: 0,
-    };
+    let p = mm_params(params, input_dtype, prepared.splits);
     let offsets = [prepared.plane1_offset, prepared.meta_offset];
     let partials = prepared.partials.as_ref().unwrap_or(output);
+    let shared_bytes = if input_dtype == DType::BF16 {
+        8_192
+    } else {
+        12_288
+    };
     encoder.encode_threadgroups_with_args_and_shared(
         &pipeline,
         &[
@@ -262,7 +358,7 @@ pub fn dispatch_repacked_gguf_mm(
             (4, KernelArg::Bytes(as_bytes(&offsets))),
             (5, KernelArg::Buffer(partials)),
         ],
-        &[(0, 12_288)],
+        &[(0, shared_bytes)],
         MTLSize::new(
             u64::from(prepared.splits),
             u64::from(params.n).div_ceil(64),
@@ -293,29 +389,16 @@ pub fn dispatch_repacked_gguf_mm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
     use crate::ops::quantized_matmul_ggml::quantized_matmul_ggml;
 
     fn buffer(device: &MlxDevice, bytes: usize, dtype: DType, shape: Vec<usize>) -> MlxBuffer {
         device.alloc_buffer(bytes, dtype, shape).unwrap()
     }
 
-    fn parity(ggml_type: GgmlType) {
-        const M: usize = 32;
-        const N: usize = 128;
-        const K: usize = 2048;
-        let device = MlxDevice::new().unwrap();
-        let mut registry = KernelRegistry::new();
-        let mut input = buffer(&device, M * K * 4, DType::F32, vec![M, K]);
-        for (i, value) in input.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
-            *value = ((i * 17 % 257) as f32 - 128.0) / 127.0;
-        }
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    fn fill_weight(ggml_type: GgmlType, salt: usize, weight: &mut MlxBuffer) {
         let block_bytes = ggml_type.block_bytes() as usize;
-        let mut weight = buffer(
-            &device,
-            N * (K / ggml_type.block_values() as usize) * block_bytes,
-            DType::U8,
-            vec![N, K],
-        );
         for (block, bytes) in weight
             .as_mut_slice::<u8>()
             .unwrap()
@@ -323,7 +406,7 @@ mod tests {
             .enumerate()
         {
             for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = ((block * 31 + i * 13 + 7) & 255) as u8;
+                *byte = ((block * 31 + i * 13 + salt) & 255) as u8;
             }
             match ggml_type {
                 GgmlType::Q4_K => {
@@ -342,6 +425,44 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    fn parity(ggml_type: GgmlType, bf16_input: bool) {
+        const M: usize = 32;
+        const N: usize = 128;
+        const K: usize = 2048;
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let mut input = buffer(&device, M * K * 4, DType::F32, vec![M, K]);
+        let mut input_bf16 = buffer(&device, M * K * 2, DType::BF16, vec![M, K]);
+        let mut rounded = Vec::with_capacity(M * K);
+        for i in 0..M * K {
+            let value = ((i * 17 % 257) as f32 - 128.0) / 127.0;
+            rounded.push(half::bf16::from_f32(value));
+        }
+        input_bf16
+            .as_mut_slice::<half::bf16>()
+            .unwrap()
+            .copy_from_slice(&rounded);
+        for (i, (value, rounded)) in input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .iter_mut()
+            .zip(&rounded)
+            .enumerate()
+        {
+            let raw = ((i * 17 % 257) as f32 - 128.0) / 127.0;
+            *value = if bf16_input { rounded.to_f32() } else { raw };
+        }
+        let block_bytes = ggml_type.block_bytes() as usize;
+        let mut weight = buffer(
+            &device,
+            N * (K / ggml_type.block_values() as usize) * block_bytes,
+            DType::U8,
+            vec![N, K],
+        );
+        fill_weight(ggml_type, 7, &mut weight);
         let stock = buffer(&device, M * N * 4, DType::F32, vec![M, N]);
         let candidate = buffer(&device, M * N * 4, DType::F32, vec![M, N]);
         let params = GgmlQuantizedMatmulParams {
@@ -364,15 +485,27 @@ mod tests {
         let prepared =
             prepare_repacked_gguf_weight(&mut encoder, &mut registry, &device, &weight, &params)
                 .unwrap();
-        dispatch_repacked_gguf_mm(
-            &mut encoder,
-            &mut registry,
-            &device,
-            &input,
-            &prepared,
-            &candidate,
-            &params,
-        )
+        if bf16_input {
+            dispatch_repacked_gguf_mm_bf16_input(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input_bf16,
+                &prepared,
+                &candidate,
+                &params,
+            )
+        } else {
+            dispatch_repacked_gguf_mm(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &prepared,
+                &candidate,
+                &params,
+            )
+        }
         .unwrap();
         encoder.commit_and_wait().unwrap();
         let a = stock.as_slice::<f32>().unwrap();
@@ -398,20 +531,55 @@ mod tests {
         );
     }
 
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
     #[test]
     fn q4k_matches_stock_tensor_mm() {
-        parity(GgmlType::Q4_K);
+        parity(GgmlType::Q4_K, false);
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn q6k_matches_stock_tensor_mm() {
+        parity(GgmlType::Q6_K, false);
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn q4k_bf16_input_matches_stock_tensor_mm() {
+        parity(GgmlType::Q4_K, true);
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn q6k_bf16_input_matches_stock_tensor_mm() {
+        parity(GgmlType::Q6_K, true);
     }
 
     #[test]
-    fn q6k_matches_stock_tensor_mm() {
-        parity(GgmlType::Q6_K);
+    fn preparation_rejects_non_width_32() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let weight = buffer(&device, 64 * 144, DType::U8, vec![64, 256]);
+        let params = GgmlQuantizedMatmulParams {
+            m: 16,
+            n: 64,
+            k: 256,
+            ggml_type: GgmlType::Q4_K,
+        };
+        let mut encoder = device.command_encoder().unwrap();
+        let result =
+            prepare_repacked_gguf_weight(&mut encoder, &mut registry, &device, &weight, &params);
+        assert!(matches!(
+            result,
+            Err(MlxError::InvalidArgument(message)) if message.contains("M == 32")
+        ));
     }
+
     #[test]
-    fn m5_max_split_policy_keeps_wide_gate_up_unsplit() {
-        assert_eq!(target_splits(5_120, 17_408), 4);
-        assert_eq!(target_splits(12_288, 5_120), 4);
-        assert_eq!(target_splits(17_408, 5_120), 1);
-        assert_eq!(target_splits(248_320, 5_120), 1);
+    fn m5_max_split_policy_matches_staged_wave_model() {
+        assert_eq!(target_splits(5_120, 17_408, GgmlType::Q4_K), 4);
+        assert_eq!(target_splits(12_288, 5_120, GgmlType::Q4_K), 2);
+        assert_eq!(target_splits(17_408, 5_120, GgmlType::Q4_K), 1);
+        assert_eq!(target_splits(248_320, 5_120, GgmlType::Q6_K), 1);
     }
 }
