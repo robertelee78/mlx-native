@@ -47,12 +47,14 @@ struct GgmlMatvecIdParams {
     uint    top_k;          // experts per token
     uint    n_tokens;       // number of input tokens
     int64_t expert_stride;  // bytes between expert weight slices
+    uint    zero_invalid_id;
+    uint    _padding;
 };
 
 // Fail closed without a host readback: expert IDs may be produced by an
 // earlier kernel in the same command stream. All threads in one threadgroup
-// observe the same ID, return before any expert address calculation, and the
-// lane(s) that own this output-column tile replace it with NaN.
+// observe the same ID and return before any expert address calculation.
+// Production writes NaN poison; DFlash2 routing masks write zeros.
 inline bool poison_invalid_expert_id(
     device float * dst,
     constant GgmlMatvecIdParams & p,
@@ -69,7 +71,8 @@ inline bool poison_invalid_expert_id(
         for (int column = 0; column < column_count; column++) {
             const int output_column = first_column + column;
             if (output_column < p.ne01) {
-                dst[output_row * p.ne0 + output_column] = NAN;
+                dst[output_row * p.ne0 + output_column] =
+                    p.zero_invalid_id != 0 ? 0.0f : NAN;
             }
         }
     }
@@ -1836,6 +1839,16 @@ kernel void kernel_mul_mv_id_q4_K_f32_nr2(
 
     const int sg_first_row = ((int)tgpig.x * NSG + (int)sgitg) * NR0 * fold;
 
+    if (expert_id >= (uint)p.ne02 && p.zero_invalid_id != 0) {
+        const int zero_first_row = ((int)tgpig.x * NSG + (int)sgitg) * NR0 * fold;
+        if (tiisg == 0) {
+            for (short row = 0; row < NR0 * fold; ++row) {
+                const int out_row = zero_first_row + row;
+                if (out_row < (int)p.ne01) dst[pair * p.ne0 + out_row] = 0.0f;
+            }
+        }
+        return;
+    }
     if (poison_invalid_expert_id(
             dst, p, expert_id, pair, sg_first_row, NR0 * fold, tiisg == 0)) return;
     if (sg_first_row >= (int)p.ne01) return;

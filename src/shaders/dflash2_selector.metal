@@ -336,10 +336,12 @@ struct DFlash2VerifyRowsParams {
     float slope;
     float intercept[15];
     float cost[65];
+    uint physical_lane[DFLASH2_MAX_LANES];
+    uint maximum[DFLASH2_MAX_LANES];
+    uint physical_lanes;
     uint lanes;
     uint rows_per_lane;
     uint every_row;
-    uint maximum[DFLASH2_MAX_LANES];
 };
 
 kernel void dflash2_select_verify_rows(
@@ -360,10 +362,11 @@ kernel void dflash2_select_verify_rows(
         uint owners[DFLASH2_MAX_LANES * 15];
         uint count = 0;
         for (uint lane = 0; lane < params.lanes; ++lane) {
+            const uint physical = params.physical_lane[lane];
             float survival = 1.0f;
             for (uint position = 0; position + 1 < params.maximum[lane]; ++position) {
                 const float q = clamp(
-                    confidence[lane * positions + position],
+                    confidence[physical * positions + position],
                     1.0e-6f,
                     1.0f - 1.0e-6f);
                 const float z = params.slope * log(q / (1.0f - q)) +
@@ -392,8 +395,10 @@ kernel void dflash2_select_verify_rows(
         for (uint i = 0; i < taken; ++i)
             ++rows[owners[i]];
     }
+    for (uint physical = 0; physical < params.physical_lanes; ++physical)
+        verify_rows[physical] = 0;
     for (uint lane = 0; lane < params.lanes; ++lane)
-        verify_rows[lane] = rows[lane];
+        verify_rows[params.physical_lane[lane]] = rows[lane];
 }
 
 struct DFlash2ComposeVerifyInputParams {
@@ -429,5 +434,28 @@ kernel void dflash2_compose_verify_input(
         return;
     }
     const uint source = params.physical_lane[lane] * (params.rows_per_lane - 1) + row - 1;
+    target_tokens[index] = proposals[source];
+}
+
+kernel void dflash2_compose_fixed_verify_input(
+    device const uint *proposals [[buffer(0)]],
+    device const uint *verify_rows [[buffer(1)]],
+    device uint *target_tokens [[buffer(2)]],
+    constant DFlash2ComposeVerifyInputParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= params.width) return;
+    const uint lane = index / params.rows_per_lane;
+    const uint row = index % params.rows_per_lane;
+    if (lane >= params.lanes) {
+        target_tokens[index] = params.anchor[0];
+        return;
+    }
+    const uint physical = params.physical_lane[lane];
+    const uint live = min(verify_rows[physical], params.rows[lane]);
+    if (row == 0 || row >= live) {
+        target_tokens[index] = params.anchor[lane];
+        return;
+    }
+    const uint source = physical * (params.rows_per_lane - 1) + row - 1;
     target_tokens[index] = proposals[source];
 }

@@ -16,6 +16,7 @@ pub const PACK_KERNEL: &str = "dflash2_pack_attention_bf16";
 pub const MASK_KERNEL: &str = "dflash2_fill_attention_mask_bf16";
 pub const COMMIT_KERNEL: &str = "dflash2_commit_kv_bf16";
 pub const MASK_ROWS_KERNEL: &str = "dflash2_set_mask_rows_f32";
+pub const MASK_MOE_ROUTES_KERNEL: &str = "dflash2_mask_moe_routes";
 pub static SOURCE: &str = include_str!("../shaders/dflash2_attention_pack.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
@@ -23,6 +24,7 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(MASK_KERNEL, SOURCE);
     registry.register_source(COMMIT_KERNEL, SOURCE);
     registry.register_source(MASK_ROWS_KERNEL, SOURCE);
+    registry.register_source(MASK_MOE_ROUTES_KERNEL, SOURCE);
 }
 
 #[repr(C)]
@@ -67,6 +69,18 @@ pub struct DFlash2MaskRowsParams {
     pub lanes: u32,
     pub rows: u32,
     pub hidden: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DFlash2MoeRouteMaskParams {
+    /// Physical draft-ring lane for each packed target lane.
+    pub physical_lane: [u32; 4],
+    pub lanes: u32,
+    pub rows_per_lane: u32,
+    pub top_k: u32,
+    pub n_experts: u32,
+    pub width: u32,
 }
 
 fn count(shape: &[usize]) -> Result<usize> {
@@ -270,6 +284,61 @@ pub fn dispatch_dflash2_mask_rows_f32(
     Ok(())
 }
 
+pub fn dispatch_dflash2_mask_moe_routes(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    verify_rows: &MlxBuffer,
+    ids: &MlxBuffer,
+    routing_weights: &MlxBuffer,
+    params: DFlash2MoeRouteMaskParams,
+) -> Result<()> {
+    if params.lanes == 0
+        || params.lanes > 4
+        || params.rows_per_lane == 0
+        || params.rows_per_lane > 16
+        || params.top_k == 0
+        || params.n_experts == 0
+        || params.width < params.lanes * params.rows_per_lane
+        || params.width > 32
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "invalid DFlash2 MoE route-mask geometry: {params:?}"
+        )));
+    }
+    let physical_lanes = verify_rows.element_count();
+    if verify_rows.dtype() != DType::U32
+        || verify_rows.shape() != [physical_lanes]
+        || params.physical_lane[..params.lanes as usize]
+            .iter()
+            .any(|&lane| lane as usize >= physical_lanes)
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "DFlash2 MoE verify rows must be a U32 vector covering physical lanes {:?}, got {} {:?}",
+            &params.physical_lane[..params.lanes as usize],
+            verify_rows.dtype(),
+            verify_rows.shape()
+        )));
+    }
+    let pairs = count(&[params.width as usize, params.top_k as usize])?;
+    require(ids, DType::U32, &[pairs], "MoE expert ids")?;
+    require(routing_weights, DType::F32, &[pairs], "MoE routing weights")?;
+    let pipeline = registry.get_pipeline(MASK_MOE_ROUTES_KERNEL, device.metal_device())?;
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(verify_rows)),
+            (1, KernelArg::Buffer(ids)),
+            (2, KernelArg::Buffer(routing_weights)),
+            (3, KernelArg::Bytes(as_bytes(&params))),
+        ],
+        MTLSize::new(pairs as u64, 1, 1),
+        MTLSize::new(256.min(pairs) as u64, 1, 1),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +517,54 @@ mod tests {
             hidden.as_slice::<f32>().unwrap(),
             &[7.0, 8.0, 9.0, 2.0, 3.0, 4.0]
         );
+    }
+
+    #[test]
+    fn gpu_moe_route_mask_uses_physical_lane_budgets() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let mut verify_rows = device.alloc_buffer(12, DType::U32, vec![3]).unwrap();
+        verify_rows
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&[4, 2, 3]);
+        let pairs = 2 * 4 * 2;
+        let mut ids = device
+            .alloc_buffer(pairs * 4, DType::U32, vec![pairs])
+            .unwrap();
+        ids.as_mut_slice::<u32>().unwrap().fill(7);
+        let mut weights = device
+            .alloc_buffer(pairs * 4, DType::F32, vec![pairs])
+            .unwrap();
+        weights.as_mut_slice::<f32>().unwrap().fill(0.25);
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_dflash2_mask_moe_routes(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &verify_rows,
+            &ids,
+            &weights,
+            DFlash2MoeRouteMaskParams {
+                physical_lane: [2, 1, 0, 0],
+                lanes: 2,
+                rows_per_lane: 4,
+                top_k: 2,
+                n_experts: 64,
+                width: 8,
+            },
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        let ids = ids.as_slice::<u32>().unwrap();
+        let weights = weights.as_slice::<f32>().unwrap();
+        for pair in 0..pairs {
+            let row = (pair / 2) % 4;
+            let lane = (pair / 2) / 4;
+            let live = if lane == 0 { row < 3 } else { row < 2 };
+            assert_eq!(ids[pair], if live { 7 } else { 64 });
+            assert_eq!(weights[pair], if live { 0.25 } else { 0.0 });
+        }
     }
 }
