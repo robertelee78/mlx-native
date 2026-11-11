@@ -45,7 +45,9 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          test "$actual_sha" = "$(git rev-parse origin/main)"
+          # A workflow-only recovery commit may follow the frozen package
+          # source. The release commit must remain in main's history.
+          git merge-base --is-ancestor "$actual_sha" origin/main
           actual_version=$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)
           test "$actual_version" = "$EXPECTED_VERSION"
           test "$EXPECTED_PACKAGE_SHA256" != ""
