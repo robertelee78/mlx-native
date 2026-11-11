@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: [self-hosted, macOS, ARM64, mlx-publish-ephemeral]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
@@ -64,7 +64,7 @@ jobs:
           cargo +1.96.0 package --locked --no-verify
           crate="target/package/mlx-native-${EXPECTED_VERSION}.crate"
           test -s "$crate"
-          actual=$(shasum -a 256 "$crate" | cut -d ' ' -f1)
+          actual=$(sha256sum "$crate" | cut -d ' ' -f1)
           echo "package_sha256=$actual"
           test "$actual" = "$EXPECTED_PACKAGE_SHA256"
 
@@ -92,7 +92,7 @@ jobs:
             if curl --fail --location --silent --show-error \
               "https://static.crates.io/crates/mlx-native/mlx-native-${EXPECTED_VERSION}.crate" \
               --output "$downloaded"; then
-              actual=$(shasum -a 256 "$downloaded" | cut -d ' ' -f1)
+              actual=$(sha256sum "$downloaded" | cut -d ' ' -f1)
               test "$actual" = "$EXPECTED_PACKAGE_SHA256"
               exit 0
             fi
