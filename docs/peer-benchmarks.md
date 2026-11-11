@@ -60,6 +60,22 @@ covered); would matter if a top_k=2/4/5/6/10/16/22 model arrives.
 - **Dispatch cost** — llama.cpp's Metal backend implies ~0.14 µs/dispatch
   (~150 µs across ~1,070 dispatches); used as the calibration reference in
   `examples/dispatch_cost_calibration.rs`.
+
+- **Prepared AF4G64 DFlash projection (2026-11-11)** — downstream hf2q
+  Qwen3.6 four-agent stage profile on M5 Max, identical checkpoint and
+  scheduler geometry, every run `CalibrationPass` with proven cleanup. The
+  accepted kernel stores 64-weight groups in 36 bytes, tiles 64 output rows,
+  prepares an eight-row BF16 activation table once per projection, and applies
+  affine scale/bias in FP32 after exact `128 + code` register-matrix products.
+  These are topology-distorting stage diagnostics, not an end-to-end claim
+  against Splash.
+
+  | projection route | width-4 draft GPU median |
+  |---|---:|
+  | BF16 production baseline | 9.318 ms |
+  | generic Q4_K experiment | 8.118 ms |
+  | prepared AF4G64 register tile | 7.878 ms |
+
 - **Row-exact few-row mat-vec (2026-11-06, `ops::row_exact_matvec`)** —
   `bench_row_exact_matvec`, M5 Max, median of 3 runs (each the median of 15
   command buffers of 16 serialized dispatches, GPU time), DeepSeek-V4

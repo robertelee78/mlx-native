@@ -1288,6 +1288,16 @@ impl KernelRegistry {
             "qmm_affine_t_packed_simd4_b4".into(),
             qmm_affine_t_packed_simd4_b4_src,
         );
+        let qmm_affine_t_packed_simd4_b4_gs64_bf16_src: &'static str =
+            include_str!("shaders/qmm_affine_t_packed_simd4_b4_gs64_bf16.metal");
+        sources.insert(
+            "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare".into(),
+            qmm_affine_t_packed_simd4_b4_gs64_bf16_src,
+        );
+        sources.insert(
+            "qmm_affine_t_packed_simd4_b4_gs64_bf16".into(),
+            qmm_affine_t_packed_simd4_b4_gs64_bf16_src,
+        );
         // ADR-020 iter-11h-b: training-mode causal depthwise 1D
         // convolution (forward + backward dx + backward dw).  Used by
         // GpuTape autograd for differentiable Qwen3.5MoE forward
@@ -2762,8 +2772,6 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
         let fallback = "ssm_conv_capture_forward_f32";
         let constructor = "ssm_conv_forward_f32";
         let mut registry = KernelRegistry::new();
-        // Same count as tests/registration_fallback_runtime_sources.rs.
-        assert_eq!(registry.registration_fallbacks.len(), 56);
         assert!(registry.registration_fallbacks.contains(fallback));
         assert!(!registry.registration_fallbacks.contains(constructor));
         assert!(registry.runtime_source_overrides.is_empty());

@@ -32,7 +32,7 @@ use metal::MTLSize;
 
 use crate::buffer::MlxBuffer;
 use crate::dtypes::DType;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
@@ -47,6 +47,8 @@ pub static QMM_AFFINE_SIMD4_GS64_SHADER_SOURCE: &str =
     include_str!("../shaders/qmm_affine_simd4_gs64.metal");
 pub static QMM_AFFINE_T_PACKED_SIMD4_B4_SHADER_SOURCE: &str =
     include_str!("../shaders/qmm_affine_t_packed_simd4_b4.metal");
+pub static QMM_AFFINE_T_PACKED_SIMD4_B4_GS64_BF16_SHADER_SOURCE: &str =
+    include_str!("../shaders/qmm_affine_t_packed_simd4_b4_gs64_bf16.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("qmm_affine_t_f32", QMM_AFFINE_SHADER_SOURCE);
@@ -69,6 +71,14 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source(
         "qmm_affine_t_packed_simd4_b4",
         QMM_AFFINE_T_PACKED_SIMD4_B4_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare",
+        QMM_AFFINE_T_PACKED_SIMD4_B4_GS64_BF16_SHADER_SOURCE,
+    );
+    registry.register_source(
+        "qmm_affine_t_packed_simd4_b4_gs64_bf16",
+        QMM_AFFINE_T_PACKED_SIMD4_B4_GS64_BF16_SHADER_SOURCE,
     );
 }
 
@@ -711,6 +721,160 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4(
         &[(0, x), (1, w_packed), (2, scales), (3, biases), (4, y), (5, meta)],
         &[(0, SHMEM_BYTES)],
         MTLSize::new(tg_count_x, tg_count_y, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    Ok(())
+}
+
+/// Dispatch a prepared AF4G64 register-tile projection.
+///
+/// `weights` is `[N / 64][K / 32][64][4 u32]`; `metadata` is
+/// `[N / 64][K / 64][64]` packed as BF16 scale | BF16 bias.
+///
+/// `table` and `sums` are caller-owned reusable scratch. `table` needs
+/// `ceil(M / 8) * 8 * K` BF16 elements; `sums` needs
+/// `ceil(M / 8) * (K / 64) * 8` F32 elements. The operation prepares both
+/// buffers before projection and accepts `M` in `1..=32`.
+pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    x: &MlxBuffer,
+    table: &MlxBuffer,
+    sums: &MlxBuffer,
+    weights: &MlxBuffer,
+    metadata: &MlxBuffer,
+    y: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    const OP: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16";
+    const PREPARE: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare";
+    const GROUP_SIZE: u32 = 64;
+    const OUTPUT_TILE: u32 = 64;
+    const PACK_FACTOR: u32 = 8;
+    if m == 0 || n == 0 || k == 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: M, N, K must all be > 0; got ({m}, {n}, {k})"
+        )));
+    }
+    if m > 32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: M ({m}) must not exceed 32"
+        )));
+    }
+    if k % GROUP_SIZE != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: K ({k}) must be divisible by {GROUP_SIZE}"
+        )));
+    }
+    if n % OUTPUT_TILE != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: N ({n}) must be divisible by {OUTPUT_TILE}"
+        )));
+    }
+    if x.dtype() != DType::F32 || y.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: x and y must be F32"
+        )));
+    }
+    if table.dtype() != DType::BF16 || sums.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: table must be BF16 and sums must be F32"
+        )));
+    }
+    if weights.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: weights must be U32"
+        )));
+    }
+    if metadata.dtype() != DType::U32 {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: metadata must be U32"
+        )));
+    }
+
+    let params = [m, n, k, GROUP_SIZE];
+    let m = m as usize;
+    let n = n as usize;
+    let k = k as usize;
+    let groups = n
+        .checked_mul(k / GROUP_SIZE as usize)
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: metadata size overflows")))?;
+    let need_x = m
+        .checked_mul(k)
+        .and_then(|count| count.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: x size overflows")))?;
+    let need_y = m
+        .checked_mul(n)
+        .and_then(|count| count.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: y size overflows")))?;
+    let need_weights = n
+        .checked_mul(k / PACK_FACTOR as usize)
+        .and_then(|count| count.checked_mul(DType::U32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: weight size overflows")))?;
+    let need_metadata = groups
+        .checked_mul(DType::U32.size_of())
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: metadata size overflows")))?;
+    let row_tiles = m.div_ceil(8);
+    let need_table = row_tiles
+        .checked_mul(8)
+        .and_then(|count| count.checked_mul(k))
+        .and_then(|count| count.checked_mul(DType::BF16.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: table size overflows")))?;
+    let need_sums = row_tiles
+        .checked_mul(k / GROUP_SIZE as usize)
+        .and_then(|count| count.checked_mul(8))
+        .and_then(|count| count.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: sums size overflows")))?;
+    if x.byte_len() < need_x
+        || table.byte_len() < need_table
+        || sums.byte_len() < need_sums
+        || y.byte_len() < need_y
+        || weights.byte_len() < need_weights
+        || metadata.byte_len() < need_metadata
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "{OP}: buffer is smaller than the declared geometry"
+        )));
+    }
+
+
+    let prepare = registry.get_pipeline(PREPARE, device)?;
+    encoder.encode_threadgroups_with_args(
+        prepare,
+        &[
+            (0, KernelArg::Buffer(x)),
+            (1, KernelArg::Buffer(table)),
+            (2, KernelArg::Buffer(sums)),
+            (3, KernelArg::Bytes(bytemuck::bytes_of(&params))),
+        ],
+        MTLSize::new(
+            (k as u64).div_ceil(GROUP_SIZE as u64),
+            row_tiles as u64,
+            1,
+        ),
+        MTLSize::new(256, 1, 1),
+    );
+    encoder.memory_barrier();
+
+    let pipeline = registry.get_pipeline(OP, device)?;
+    encoder.encode_threadgroups_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(table)),
+            (1, KernelArg::Buffer(sums)),
+            (2, KernelArg::Buffer(weights)),
+            (3, KernelArg::Buffer(metadata)),
+            (4, KernelArg::Buffer(y)),
+            (5, KernelArg::Bytes(bytemuck::bytes_of(&params))),
+        ],
+        MTLSize::new(
+            (n as u64).div_ceil(OUTPUT_TILE as u64),
+            row_tiles as u64,
+            1,
+        ),
         MTLSize::new(128, 1, 1),
     );
     Ok(())
@@ -1613,6 +1777,143 @@ mod tests {
             }
         }
         out
+    }
+
+    fn prepare_af4_g64(
+        codes: &[u8],
+        scales: &[u16],
+        biases: &[u16],
+        n: usize,
+        k: usize,
+    ) -> (Vec<u32>, Vec<u32>) {
+        assert_eq!(n % 64, 0);
+        assert_eq!(k % 64, 0);
+        let groups32 = k / 32;
+        let groups64 = k / 64;
+        let mut plane = vec![0u32; n * groups32 * 4];
+        let mut metadata = vec![0u32; n * groups64];
+        for row in 0..n {
+            for group64 in 0..groups64 {
+                let meta_at =
+                    ((row / 64 * groups64 + group64) * 64) + row % 64;
+                let source_meta = row * groups64 + group64;
+                metadata[meta_at] =
+                    u32::from(scales[source_meta]) |
+                    (u32::from(biases[source_meta]) << 16);
+                for half in 0..2 {
+                    let group32 = group64 * 2 + half;
+                    for chunk in 0..4 {
+                        let mut word = 0u32;
+                        for pair in 0..4 {
+                            let first =
+                                group32 * 32 + 16 * (pair >> 1) +
+                                4 * chunk + 2 * (pair & 1);
+                            word |= u32::from(codes[row * k + first]) << (4 * pair);
+                            word |=
+                                u32::from(codes[row * k + first + 1]) << (16 + 4 * pair);
+                        }
+                        let at =
+                            (((row / 64 * groups32 + group32) * 64 + row % 64) * 4)
+                                + chunk;
+                        plane[at] = word;
+                    }
+                }
+            }
+        }
+        (plane, metadata)
+    }
+
+    #[test]
+    fn qmm_affine_packed_gs64_bf16_has_bounded_error() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (m, n, k, group_size) = (31usize, 64usize, 128usize, 64usize);
+        let groups = n * (k / group_size);
+        let input: Vec<f32> = (0..m * k)
+            .map(|index| ((index as f32) * 0.013 - 0.7).sin() * 0.5)
+            .collect();
+        let codes: Vec<u8> = (0..n * k)
+            .map(|index| ((index * 11 + 3) % 16) as u8)
+            .collect();
+        let scales_bits: Vec<u16> = (0..groups)
+            .map(|index| half::bf16::from_f32(0.01 + index as f32 * 0.0001).to_bits())
+            .collect();
+        let biases_bits: Vec<u16> = (0..groups)
+            .map(|index| half::bf16::from_f32(-0.1 + index as f32 * 0.0002).to_bits())
+            .collect();
+        let scales: Vec<f32> = scales_bits
+            .iter()
+            .map(|bits| half::bf16::from_bits(*bits).to_f32())
+            .collect();
+        let biases: Vec<f32> = biases_bits
+            .iter()
+            .map(|bits| half::bf16::from_bits(*bits).to_f32())
+            .collect();
+        let (packed, metadata) =
+            prepare_af4_g64(&codes, &scales_bits, &biases_bits, n, k);
+
+        let mut input_buffer = alloc_f32(&device, m * k, vec![m, k]);
+        input_buffer.as_mut_slice::<f32>().unwrap().copy_from_slice(&input);
+        let mut weight_buffer = device
+            .alloc_buffer(packed.len() * 4, DType::U32, vec![n / 64, k / 32, 64, 4])
+            .unwrap();
+        weight_buffer.as_mut_slice::<u32>().unwrap().copy_from_slice(&packed);
+        let mut metadata_buffer = device
+            .alloc_buffer(metadata.len() * 4, DType::U32, vec![n / 64, k / 64, 64])
+            .unwrap();
+        metadata_buffer
+            .as_mut_slice::<u32>()
+            .unwrap()
+            .copy_from_slice(&metadata);
+        let row_tiles = m.div_ceil(8);
+        let table = device
+            .alloc_buffer(row_tiles * 8 * k * 2, DType::BF16, vec![row_tiles, 8, k])
+            .unwrap();
+        let sums = device
+            .alloc_buffer(
+                row_tiles * (k / group_size) * 8 * 4,
+                DType::F32,
+                vec![row_tiles, k / group_size, 8],
+            )
+            .unwrap();
+        let output = alloc_f32(&device, m * n, vec![m, n]);
+
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &input_buffer,
+            &table,
+            &sums,
+            &weight_buffer,
+            &metadata_buffer,
+            &output,
+            m as u32,
+            n as u32,
+            k as u32,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        let expected = qmm_affine_t_cpu(&input, &codes, &scales, &biases, m, n, k, group_size);
+        let actual = output.as_slice::<f32>().unwrap();
+        let mut squared_error = 0.0f64;
+        let mut squared_expected = 0.0f64;
+        let mut maximum_scaled_error = 0.0f32;
+        for (&actual, &expected) in actual.iter().zip(&expected) {
+            let error = actual - expected;
+            squared_error += f64::from(error) * f64::from(error);
+            squared_expected += f64::from(expected) * f64::from(expected);
+            maximum_scaled_error =
+                maximum_scaled_error.max(error.abs() / expected.abs().max(1.0));
+        }
+        let relative_rmse = (squared_error / squared_expected).sqrt();
+        assert!(relative_rmse <= 5.0e-3, "relative RMSE {relative_rmse}");
+        assert!(
+            maximum_scaled_error <= 5.0e-3,
+            "maximum scaled error {maximum_scaled_error}"
+        );
     }
 
     /// AC#5 Iter A — packed-U32 dense affine matmul (bits=4, gs=32) is
