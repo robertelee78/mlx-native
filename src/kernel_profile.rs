@@ -192,6 +192,13 @@ pub fn dump_dispatches() -> Vec<(String, Vec<DispatchEntry>)> {
         .collect()
 }
 
+/// Profiling flags are exact-value opt-ins: only `1` enables them. An unset,
+/// empty or any other value leaves profiling off, so a launcher that exports
+/// an empty placeholder cannot silently force synchronous labeled commits.
+fn profile_flag_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
 /// Whether per-CB profiling is enabled via `MLX_PROFILE_CB=1`.
 ///
 /// Cached in an atomic so the hot path is a single load.
@@ -201,7 +208,7 @@ pub fn is_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = std::env::var("MLX_PROFILE_CB").is_ok();
+    let on = profile_flag_enabled(std::env::var("MLX_PROFILE_CB").ok().as_deref());
     CACHED.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -218,7 +225,7 @@ pub fn is_dispatch_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = std::env::var("MLX_PROFILE_DISPATCH").is_ok();
+    let on = profile_flag_enabled(std::env::var("MLX_PROFILE_DISPATCH").ok().as_deref());
     CACHED.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -362,6 +369,14 @@ mod tests {
         let _guard = test_lock();
         reset();
         assert!(dump_dispatches().is_empty());
+    }
+
+    #[test]
+    fn profile_flags_require_exact_one() {
+        assert!(profile_flag_enabled(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true"), Some(" 1"), Some("1 ")] {
+            assert!(!profile_flag_enabled(off), "{off:?} must not enable profiling");
+        }
     }
 
     #[test]
