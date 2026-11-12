@@ -721,6 +721,11 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
 //                            membership of the uniform-grid schedule. The
 //                            one padding entry per slice is never written.
 //
+// With `skip_masked`, an id equal to `n_experts` marks a masked route (the
+// DFlash2 verify-row mask writes it for every slot of an unselected row). A
+// masked route is neither validated, counted nor listed, so its row costs no
+// expert tile. Any other out-of-range id still poisons the schedule.
+//
 // Launch: one threadgroup of `ntg = 32 * G` threads (G simdgroups, chosen by
 // the host from the threadgroup-memory budget; independent of n_experts).
 // Token-parallel: in each round of `ntg` tokens, thread i owns token
@@ -746,11 +751,13 @@ kernel void hf2q_mul_mm_id_map0_impl<8>(
 // 2 * n_experts words), part[2 * G] (scan partials), invalid[1].
 
 struct GgmlMatmulIdMm_Map0cParams {
-    int32_t  ne21;      // n_tokens
-    int32_t  ne20;      // n_expert_used (== top_k)
-    uint64_t nb21;      // bytes per token in the source ids table
-    uint32_t max_tiles; // descriptor capacity bound
-    uint32_t n_experts; // ne02
+    int32_t  ne21;        // n_tokens
+    int32_t  ne20;        // n_expert_used (== top_k)
+    uint64_t nb21;        // bytes per token in the source ids table
+    uint32_t max_tiles;   // descriptor capacity bound
+    uint32_t n_experts;   // ne02
+    uint32_t skip_masked; // 1: id == n_experts is a masked route, not an error
+    uint32_t _pad;
 };
 
 template<short ne20>
@@ -765,6 +772,7 @@ kernel void hf2q_mul_mm_id_map0c_impl(
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
     const uint n_experts = args.n_experts;
+    const bool skip_masked = args.skip_masked != 0u;
     const int  n_tokens  = args.ne21;
     const uint G  = ntg / 32;
     const uint MG = max(G, 2u);
@@ -793,10 +801,11 @@ kernel void hf2q_mul_mm_id_map0c_impl(
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
                 own[i20] = row[i20];
-                bad |= own[i20] >= n_experts;
+                const bool masked = skip_masked && own[i20] == n_experts;
+                bad |= !masked && own[i20] >= n_experts;
 #pragma unroll
                 for (short other = 0; other < i20; other++) {
-                    bad |= own[i20] == own[other];
+                    bad |= !masked && own[i20] == own[other];
                 }
             }
 #pragma unroll
@@ -874,7 +883,8 @@ kernel void hf2q_mul_mm_id_map0c_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ---- Pass 2: entries in ascending token order ----
-    // Every id is valid here (an invalid token poisoned the schedule).
+    // Every id is valid or a masked route here (an invalid token poisoned
+    // the schedule); masked routes own no mask bit and no list entry.
     threadgroup atomic_uint * own_masks = masks + sgitg * n_experts;
     device int32_t * list = (device int32_t *) hids;
     const uint below = (1u << tiisg) - 1u;
@@ -889,15 +899,19 @@ kernel void hf2q_mul_mm_id_map0c_impl(
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
                 own[i20] = row[i20];
-                atomic_fetch_or_explicit(&own_masks[own[i20]], 1u << tiisg, memory_order_relaxed);
+                if (own[i20] < n_experts) {
+                    atomic_fetch_or_explicit(&own_masks[own[i20]], 1u << tiisg, memory_order_relaxed);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (live) {
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                rank[i20] = popcount(
-                    atomic_load_explicit(&own_masks[own[i20]], memory_order_relaxed) & below);
+                if (own[i20] < n_experts) {
+                    rank[i20] = popcount(
+                        atomic_load_explicit(&own_masks[own[i20]], memory_order_relaxed) & below);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -923,8 +937,10 @@ kernel void hf2q_mul_mm_id_map0c_impl(
         if (live) {
 #pragma unroll
             for (short i20 = 0; i20 < ne20; i20++) {
-                list[atomic_load_explicit(&own_masks[own[i20]], memory_order_relaxed) + rank[i20]] =
-                    t * ne20 + i20;
+                if (own[i20] < n_experts) {
+                    list[atomic_load_explicit(&own_masks[own[i20]], memory_order_relaxed) + rank[i20]] =
+                        t * ne20 + i20;
+                }
             }
         }
         if (i0 + (int) ntg < n_tokens) {

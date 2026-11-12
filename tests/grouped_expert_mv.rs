@@ -1,12 +1,14 @@
 #![cfg(mlx_native_has_metal_tensor_artifact)]
 
 use half::bf16;
+use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce_masked;
 use mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv;
 use mlx_native::{
     ggml_expert_bytes, prepare_quantized_matmul_id_ggml_grouped_m8,
-    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_grouped_m8_gate_up,
-    DType, GgmlQuantizedMatmulIdParams, GgmlType, GroupedM8Epilogue, GroupedM8Input, IdMmScratch,
-    KernelRegistry, MlxBuffer, MlxDevice,
+    quantized_matmul_id_ggml_grouped_m8_epilogue,
+    quantized_matmul_id_ggml_grouped_m8_epilogue_masked,
+    quantized_matmul_id_ggml_grouped_m8_gate_up, DType, GgmlQuantizedMatmulIdParams, GgmlType,
+    GroupedM8Epilogue, GroupedM8Input, IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice,
 };
 
 struct Rng(u64);
@@ -368,6 +370,212 @@ fn grouped_q4_k_matches_mv() {
 #[test]
 fn grouped_q6_k_matches_mv() {
     grouped_matches_mv(GgmlType::Q6_K);
+}
+
+/// Verify rows a GPU mask removed carry the id `n_experts` in every slot.
+/// They must cost no expert tile and leave their output rows untouched, while
+/// every live row still matches the reference projection.
+fn masked_routes(ggml_type: GgmlType, bad_id: Option<u32>) {
+    const TOKENS: u32 = 12;
+    const EXPERTS: u32 = 16;
+    const TOP_K: u32 = 8;
+    const WIDTH: u32 = 256;
+    const MASKED: [usize; 3] = [2, 5, 11];
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let live_ids = ids(&device, TOKENS as usize, TOP_K as usize, EXPERTS as usize);
+    let mut masked_ids = ids(&device, TOKENS as usize, TOP_K as usize, EXPERTS as usize);
+    {
+        let values = masked_ids.as_mut_slice::<u32>().expect("masked ids");
+        for token in MASKED {
+            values[token * TOP_K as usize..(token + 1) * TOP_K as usize].fill(EXPERTS);
+        }
+        if let Some(bad) = bad_id {
+            values[0] = bad;
+        }
+    }
+    let input = f32_buffer(&device, (TOKENS * WIDTH) as usize, 41);
+    let (weight, stride) = weights(&device, ggml_type, EXPERTS, WIDTH, WIDTH, 42);
+    let params = GgmlQuantizedMatmulIdParams {
+        n_tokens: TOKENS,
+        top_k: TOP_K,
+        n: WIDTH,
+        k: WIDTH,
+        n_experts: EXPERTS,
+        expert_stride: stride,
+        ggml_type,
+    };
+    let pairs = (TOKENS * TOP_K) as usize;
+    let elements = pairs * WIDTH as usize;
+    let gathered_elements = (pairs + EXPERTS as usize) * WIDTH as usize;
+    let gathered = device
+        .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
+        .expect("gathered input");
+    let mut candidate = device
+        .alloc_buffer(elements * 4, DType::F32, vec![elements])
+        .expect("candidate");
+    candidate
+        .as_mut_slice::<f32>()
+        .expect("candidate prefill")
+        .fill(f32::NAN);
+    let reference = device
+        .alloc_buffer(elements * 4, DType::F32, vec![elements])
+        .expect("reference");
+    let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("scratch");
+
+    let mut encoder = device.command_encoder().expect("encoder");
+    let prepared = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &weight,
+        &params,
+    )
+    .expect("prepare");
+    quantized_matmul_id_ggml_grouped_m8_epilogue_masked(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &gathered,
+        &prepared,
+        &masked_ids,
+        &candidate,
+        None,
+        &mut scratch,
+        &params,
+        false,
+        false,
+        false,
+        GroupedM8Input::F32,
+        GroupedM8Epilogue::F32,
+    )
+    .expect("masked projection");
+    quantized_matmul_id_ggml_mv(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &input,
+        &weight,
+        &live_ids,
+        &reference,
+        &params,
+    )
+    .expect("reference projection");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.masked_routes")
+        .expect("commit masked routes");
+
+    let actual = candidate.as_slice::<f32>().expect("candidate values");
+    let expected = reference.as_slice::<f32>().expect("reference values");
+    let row = |pair: usize| pair * WIDTH as usize..(pair + 1) * WIDTH as usize;
+    if bad_id.is_some() {
+        assert!(
+            actual.iter().all(|value| value.is_nan()),
+            "an out-of-range id other than the mask sentinel must poison the schedule"
+        );
+        return;
+    }
+    let mut squared_error = 0.0f64;
+    let mut squared_reference = 0.0f64;
+    for pair in 0..pairs {
+        if MASKED.contains(&(pair / TOP_K as usize)) {
+            assert!(
+                actual[row(pair)].iter().all(|value| value.is_nan()),
+                "masked route {pair} was written"
+            );
+            continue;
+        }
+        for (&value, &wanted) in actual[row(pair)].iter().zip(&expected[row(pair)]) {
+            assert!(value.is_finite(), "live route {pair} was not written");
+            squared_error += f64::from(value - wanted).powi(2);
+            squared_reference += f64::from(wanted).powi(2);
+        }
+    }
+    let relative_rmse = (squared_error / squared_reference).sqrt();
+    assert!(relative_rmse < 3.0e-3, "live rows: relative RMSE {relative_rmse:e}");
+
+    // Reduce the table the projection left: masked rows hold NaN and must not
+    // be read, live rows average their eight routes.
+    let f32_values = |values: Vec<f32>| {
+        let mut buffer = device
+            .alloc_buffer(values.len() * 4, DType::F32, vec![values.len()])
+            .expect("f32 values");
+        buffer
+            .as_mut_slice::<f32>()
+            .expect("f32 slice")
+            .copy_from_slice(&values);
+        buffer
+    };
+    let routing_weights = f32_values(
+        (0..pairs)
+            .map(|pair| {
+                if MASKED.contains(&(pair / TOP_K as usize)) {
+                    0.0
+                } else {
+                    1.0 / TOP_K as f32
+                }
+            })
+            .collect(),
+    );
+    let shared_logit = f32_values(vec![0.0; TOKENS as usize]);
+    let shared = f32_values(vec![0.0; (TOKENS * WIDTH) as usize]);
+    let unused_residual = f32_values(vec![0.0]);
+    let mut reduced = f32_values(vec![f32::NAN; (TOKENS * WIDTH) as usize]);
+    let mut encoder = device.command_encoder().expect("reduce encoder");
+    dispatch_moe_weighted_reduce_masked(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &routing_weights,
+        &candidate,
+        &shared_logit,
+        &shared,
+        &unused_residual,
+        &mut reduced,
+        TOKENS,
+        TOP_K,
+        WIDTH,
+        false,
+    )
+    .expect("masked reduce");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.masked_reduce")
+        .expect("commit masked reduce");
+    let reduced = reduced.as_slice::<f32>().expect("reduced values");
+    for token in 0..TOKENS as usize {
+        for column in 0..WIDTH as usize {
+            let value = reduced[token * WIDTH as usize + column];
+            if MASKED.contains(&token) {
+                assert_eq!(value, 0.0, "masked token {token} read an unwritten route");
+                continue;
+            }
+            let wanted = (0..TOP_K as usize)
+                .map(|slot| actual[(token * TOP_K as usize + slot) * WIDTH as usize + column])
+                .sum::<f32>()
+                / TOP_K as f32;
+            assert!(
+                (value - wanted).abs() <= 1.0e-4 * wanted.abs().max(1.0),
+                "token {token} column {column}: {value} != {wanted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_q4_k_skips_masked_routes() {
+    masked_routes(GgmlType::Q4_K, None);
+}
+
+#[test]
+fn grouped_q6_k_skips_masked_routes() {
+    masked_routes(GgmlType::Q6_K, None);
+}
+
+#[test]
+fn grouped_masked_routes_still_poison_on_other_invalid_ids() {
+    masked_routes(GgmlType::Q4_K, Some(17));
 }
 
 #[test]

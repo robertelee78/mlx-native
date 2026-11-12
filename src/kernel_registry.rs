@@ -1668,6 +1668,7 @@ impl KernelRegistry {
 
         let moe_wr_src: &'static str = include_str!("shaders/moe_weighted_reduce.metal");
         sources.insert("moe_weighted_reduce_f32".into(), moe_wr_src);
+        sources.insert("moe_weighted_reduce_masked_f32".into(), moe_wr_src);
         // DeepSeek-V4 Hyper-Connection split/reduce/expand kernels.
         let deepseek_hc_src: &'static str = include_str!("shaders/deepseek_hyper_connection.metal");
         sources.insert("deepseek_hc_split_sinkhorn_f32".into(), deepseek_hc_src);

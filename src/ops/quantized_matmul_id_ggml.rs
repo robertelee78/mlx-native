@@ -2941,6 +2941,7 @@ pub fn dispatch_id_mm_map0_for_test(
             hids,
             params,
             compact_max_tiles(total_rows as u64, u64::from(params.n_experts)),
+            false,
         ),
     }
 }
@@ -3230,7 +3231,39 @@ pub fn quantized_matmul_id_ggml_grouped_m8_epilogue(
 ) -> Result<()> {
     quantized_matmul_id_ggml_grouped_m8_impl(
         encoder, registry, device, input, gathered_input, prepared, None, ids, output, aux,
-        scratch, params, slotted_input, reuse_schedule, reuse_gather, input_kind, epilogue,
+        scratch, params, slotted_input, reuse_schedule, reuse_gather, input_kind, epilogue, false,
+    )
+}
+
+/// [`quantized_matmul_id_ggml_grouped_m8_epilogue`] for route tables that a
+/// GPU verify-row mask has already rewritten: an id equal to
+/// `params.n_experts` marks a masked route. Masked routes join no expert
+/// tile, their gathered input is not read and their output rows are not
+/// written, so the consumer must not read them (reduce with
+/// [`crate::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce_masked`]).
+/// Any other out-of-range or duplicate id still poisons the schedule.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_id_ggml_grouped_m8_epilogue_masked(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gathered_input: &MlxBuffer,
+    prepared: &PreparedGroupedM8Experts,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    aux: Option<&MlxBuffer>,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted_input: bool,
+    reuse_schedule: bool,
+    reuse_gather: bool,
+    input_kind: GroupedM8Input,
+    epilogue: GroupedM8Epilogue,
+) -> Result<()> {
+    quantized_matmul_id_ggml_grouped_m8_impl(
+        encoder, registry, device, input, gathered_input, prepared, None, ids, output, aux,
+        scratch, params, slotted_input, reuse_schedule, reuse_gather, input_kind, epilogue, true,
     )
 }
 
@@ -3272,6 +3305,7 @@ pub fn quantized_matmul_id_ggml_grouped_m8_gate_up(
         false,
         input_kind,
         GroupedM8Epilogue::FusedGateUpBf16,
+        false,
     )
 }
 
@@ -3295,6 +3329,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
     reuse_gather: bool,
     input_kind: GroupedM8Input,
     epilogue: GroupedM8Epilogue,
+    masked_routes: bool,
 ) -> Result<()> {
     if prepared.n_experts != params.n_experts
         || prepared.n != params.n
@@ -3458,6 +3493,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
             &scratch.hids,
             &dispatch,
             maximum_tiles,
+            masked_routes,
         ) {
             scratch.invalidate_schedule();
             return Err(error);
@@ -3568,6 +3604,8 @@ struct GgmlIdMmMap0cGpuParams {
     nb21: u64,      // bytes per token in the ids table
     max_tiles: u32, // descriptor capacity; more tiles poison the schedule
     n_experts: u32,
+    skip_masked: u32, // 1: id == n_experts is a masked route, not an error
+    _pad: u32,
 }
 
 /// Encode the compact `kernel_mul_mm_id_map0c_ne20_<top_k>` stage (ADR-063
@@ -3582,6 +3620,7 @@ fn encode_compact_map0(
     hids: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
     max_tiles: u64,
+    skip_masked: bool,
 ) -> Result<()> {
     let kernel_name = match params.top_k {
         1 => "kernel_mul_mm_id_map0c_ne20_1",
@@ -3627,6 +3666,8 @@ fn encode_compact_map0(
         max_tiles: u32::try_from(max_tiles)
             .map_err(|_| MlxError::InvalidArgument("compact tile bound exceeds u32".into()))?,
         n_experts: params.n_experts,
+        skip_masked: u32::from(skip_masked),
+        _pad: 0,
     };
     let shmem = shmem_bytes(simdgroups);
 
@@ -3840,7 +3881,7 @@ fn dispatch_id_mm_with_layout(
     if !schedule_prepared {
         if compact {
             encode_compact_map0(
-                encoder, registry, device, ids, htpe, hids, params, max_tiles,
+                encoder, registry, device, ids, htpe, hids, params, max_tiles, false,
             )?;
         } else {
             encode_legacy_map0(encoder, registry, device, ids, htpe, hids, params)?;
