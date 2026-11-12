@@ -444,6 +444,53 @@ fn dot(w: &[f64], x: &[f64]) -> (f64, f64) {
         })
 }
 
+/// One route's F64 SwiGLU row and down row with the worst-case error of the
+/// live tiles on each element.
+struct RouteReference {
+    h: Vec<f64>,
+    h_bound: Vec<f64>,
+    y: Vec<f64>,
+    y_bound: Vec<f64>,
+}
+
+fn route_reference(row: &[f64], gate_w: &[f64], up_w: &[f64], down_w: &[f64]) -> RouteReference {
+    let epsilon = dot_epsilon(HIDDEN, true);
+    let mut h = vec![0.0f64; INTERMEDIATE];
+    let mut h_bound = vec![0.0f64; INTERMEDIATE];
+    for column in 0..INTERMEDIATE {
+        let (gate, gate_abs) = dot(&gate_w[column * HIDDEN..][..HIDDEN], row);
+        let (up, up_abs) = dot(&up_w[column * HIDDEN..][..HIDDEN], row);
+        let (gate_bound, up_bound) = (epsilon * gate_abs, epsilon * up_abs);
+        h[column] = silu(gate) * up;
+        // |SiLU'| <= 1.1; SiLU and the product are FP32 (within 2^-16
+        // relative, fast exp included) and the result rounds to BF16 once.
+        let exact = 1.1 * gate_bound * (up.abs() + up_bound) + silu(gate).abs() * up_bound;
+        h_bound[column] = exact + (BF16_ULP + 2.0f64.powi(-16)) * (h[column].abs() + exact);
+    }
+    // The down pass reads the BF16 SwiGLU exactly: its own error is the
+    // weights' and the sum's, on top of the SwiGLU's.
+    let epsilon = dot_epsilon(INTERMEDIATE, false);
+    let (y, y_bound) = (0..HIDDEN)
+        .map(|column| {
+            let w = &down_w[column * INTERMEDIATE..][..INTERMEDIATE];
+            let bound: f64 = w
+                .iter()
+                .zip(h.iter().zip(&h_bound))
+                .map(|(w, (h, bound))| {
+                    w.abs() * bound + epsilon * (w.abs() + HALF_MIN_NORMAL) * (h.abs() + bound)
+                })
+                .sum();
+            (dot(w, &h).0, bound)
+        })
+        .unzip();
+    RouteReference {
+        h,
+        h_bound,
+        y,
+        y_bound,
+    }
+}
+
 fn matches_f64_reference(gate_up_type: GgmlType, down_type: GgmlType) {
     let mut layer = Layer::new(gate_up_type, down_type, 0x51);
     let mut rng = Rng(0x52);
@@ -468,52 +515,30 @@ fn matches_f64_reference(gate_up_type: GgmlType, down_type: GgmlType) {
             .map(|v| f64::from(*v))
             .collect();
         let [gate_w, up_w, down_w] = &weights[expert as usize];
-        let epsilon = dot_epsilon(HIDDEN, true);
-        let mut h = vec![0.0f64; INTERMEDIATE];
-        let mut h_bound = vec![0.0f64; INTERMEDIATE];
+        let reference = route_reference(&row, gate_w, up_w, down_w);
         for column in 0..INTERMEDIATE {
-            let (gate, gate_abs) = dot(&gate_w[column * HIDDEN..][..HIDDEN], &row);
-            let (up, up_abs) = dot(&up_w[column * HIDDEN..][..HIDDEN], &row);
-            let (gate_bound, up_bound) = (epsilon * gate_abs, epsilon * up_abs);
-            h[column] = silu(gate) * up;
-            // |SiLU'| <= 1.1; SiLU and the product are FP32 (within 2^-16
-            // relative, fast exp included) and the result rounds to BF16 once.
-            let exact = 1.1 * gate_bound * (up.abs() + up_bound) + silu(gate).abs() * up_bound;
-            h_bound[column] = exact + (BF16_ULP + 2.0f64.powi(-16)) * (h[column].abs() + exact);
+            let (h, bound) = (reference.h[column], reference.h_bound[column]);
             let actual = f64::from(bf16::from_bits(step.swiglu[route][column]).to_f32());
-            let error = (actual - h[column]).abs();
-            assert!(
-                error <= h_bound[column],
-                "route {route} SwiGLU column {column}: {actual} vs {} (error {error:e}, bound {:e})",
-                h[column],
-                h_bound[column]
-            );
-            worst.0 = worst.0.max(error / h_bound[column].max(f64::MIN_POSITIVE));
-            error_h += error * error;
-            norm_h += h[column] * h[column];
-        }
-        let epsilon = dot_epsilon(INTERMEDIATE, false);
-        for column in 0..HIDDEN {
-            let w = &down_w[column * INTERMEDIATE..][..INTERMEDIATE];
-            let reference = dot(w, &h).0;
-            // The pass reads the BF16 SwiGLU exactly: its own error is the
-            // weights' and the sum's, on top of the SwiGLU's.
-            let bound: f64 = w
-                .iter()
-                .zip(h.iter().zip(&h_bound))
-                .map(|(w, (h, bound))| {
-                    w.abs() * bound + epsilon * (w.abs() + HALF_MIN_NORMAL) * (h.abs() + bound)
-                })
-                .sum();
-            let actual = f64::from(f32::from_bits(step.route(route)[column]));
-            let error = (actual - reference).abs();
+            let error = (actual - h).abs();
             assert!(
                 error <= bound,
-                "route {route} output column {column}: {actual} vs {reference} (error {error:e}, bound {bound:e})"
+                "route {route} SwiGLU column {column}: {actual} vs {h} (error {error:e}, bound {bound:e})"
+            );
+            worst.0 = worst.0.max(error / bound.max(f64::MIN_POSITIVE));
+            error_h += error * error;
+            norm_h += h * h;
+        }
+        for column in 0..HIDDEN {
+            let (y, bound) = (reference.y[column], reference.y_bound[column]);
+            let actual = f64::from(f32::from_bits(step.route(route)[column]));
+            let error = (actual - y).abs();
+            assert!(
+                error <= bound,
+                "route {route} output column {column}: {actual} vs {y} (error {error:e}, bound {bound:e})"
             );
             worst.1 = worst.1.max(error / bound.max(f64::MIN_POSITIVE));
             error_y += error * error;
-            norm_y += reference * reference;
+            norm_y += y * y;
         }
     }
     eprintln!(
@@ -588,8 +613,9 @@ fn is_deterministic_and_row_independent(gate_up_type: GgmlType, down_type: GgmlT
     );
 
     // Each row alone, every other row masked (and NaN): its experts each
-    // hold one route, so the row moves from its 2-, 8-, 16- and 32-row
-    // tiles to the register path (or a one-row matmul without it).
+    // hold one route, so the row moves from experts of 2 to 32 routes (one
+    // to four eight-row tiles) to the register path (or a matmul tile of
+    // one live row without it).
     for token in 0..TOKENS {
         let mut alone_ids = vec![MASK; TOKENS * TOP_K];
         alone_ids[token * TOP_K..(token + 1) * TOP_K]
@@ -734,7 +760,7 @@ fn rejects_undersized_buffers_and_unscheduled_passes() {
     };
     let rows =
         moe_tiles_grouped_rows(params.n_tokens, params.top_k, params.n_experts).expect("rows");
-    assert_eq!(rows, TOKENS * TOP_K + EXPERTS + 31);
+    assert_eq!(rows, TOKENS * TOP_K + EXPERTS + 7);
     let bf16_rows = |rows: usize, width: usize| {
         device
             .alloc_buffer(rows * width * 2, DType::BF16, vec![rows, width])
@@ -1086,7 +1112,7 @@ fn shared_planes_rows_are_independent_and_match_f64() {
             "a {rows}-row step changed a row"
         );
     }
-    // F64 reference of the first rows.
+    // F64 reference of every row, with the worst-case bound of the tiles.
     let weights: Vec<Vec<f64>> = [
         (GgmlType::Q4_K, INTERMEDIATE, HIDDEN),
         (GgmlType::Q4_K, INTERMEDIATE, HIDDEN),
@@ -1098,30 +1124,29 @@ fn shared_planes_rows_are_independent_and_match_f64() {
         dequantize(*ggml_type, source.as_slice::<u8>().expect("bytes"), *n, *k)
     })
     .collect();
-    let (mut squared, mut norm) = (0.0f64, 0.0f64);
-    for row in 0..4 {
+    let (mut squared, mut norm, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+    for row in 0..TOKENS {
         let exact: Vec<f64> = x[row * HIDDEN..(row + 1) * HIDDEN]
             .iter()
             .map(|v| f64::from(*v))
             .collect();
-        let h: Vec<f64> = (0..INTERMEDIATE)
-            .map(|column| {
-                silu(dot(&weights[0][column * HIDDEN..][..HIDDEN], &exact).0)
-                    * dot(&weights[1][column * HIDDEN..][..HIDDEN], &exact).0
-            })
-            .collect();
+        let reference = route_reference(&exact, &weights[0], &weights[1], &weights[2]);
         for column in 0..HIDDEN {
-            let reference = dot(&weights[2][column * INTERMEDIATE..][..INTERMEDIATE], &h).0;
+            let (y, bound) = (reference.y[column], reference.y_bound[column]);
             let actual = f64::from(f32::from_bits(full[row * HIDDEN + column]));
-            squared += (actual - reference).powi(2);
-            norm += reference * reference;
+            let error = (actual - y).abs();
+            assert!(
+                error <= bound,
+                "shared planes row {row} column {column}: {actual} vs {y} (error {error:e}, bound {bound:e})"
+            );
+            worst = worst.max(error / bound.max(f64::MIN_POSITIVE));
+            squared += error * error;
+            norm += y * y;
         }
     }
-    let relative = (squared / norm).sqrt();
-    eprintln!("shared planes: relative RMS error against F64 {relative:.3e}");
-    assert!(
-        relative < 1.0e-2,
-        "shared planes: relative RMS error {relative:e}"
+    eprintln!(
+        "shared planes: relative RMS error against F64 {:.3e} (worst error/bound {worst:.3})",
+        (squared / norm).sqrt()
     );
 }
 
@@ -1166,8 +1191,9 @@ impl Layer {
             .as_mut_slice::<u32>()
             .expect("ids")
             .copy_from_slice(ids);
-        let rows = mlx_native::grouped_m8_gathered_rows(tokens as u32, TOP_K as u32, EXPERTS as u32)
-            .expect("gathered rows");
+        let rows =
+            mlx_native::grouped_m8_gathered_rows(tokens as u32, TOP_K as u32, EXPERTS as u32)
+                .expect("gathered rows");
         let gathered = bf16_rows(rows, HIDDEN);
         let output = f32_rows(routes, HIDDEN);
         let mut scratch =

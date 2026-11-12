@@ -31,14 +31,10 @@
 
 use super::{
     as_bytes, checked_byte_extent, compact_max_tiles, encode_compact_map0,
-    prepare_quantized_matmul_id_ggml_grouped_m8, CommandEncoder, DType, ExpertMmSchedule,
-    GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch, KernelArg,
-    KernelRegistry, MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts, Result,
+    grouped_m8_gathered_rows, prepare_quantized_matmul_id_ggml_grouped_m8, CommandEncoder, DType,
+    ExpertMmSchedule, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch,
+    KernelArg, KernelRegistry, MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts, Result,
 };
-
-/// Rows past an expert's last route that its 32-row matmul tile reads (and
-/// discards): the grouped buffers hold this many rows beyond the route list.
-const ROW_SLACK: usize = 31;
 
 /// Routes of an expert that the register path runs when it is enabled.
 const COLUMN_ROWS: u32 = 2;
@@ -48,13 +44,10 @@ pub const MOE_TILES_GRID_WORDS: usize = 6;
 
 /// Rows the grouped buffers of [`MoeTilesBuffers`] hold for `n_tokens` rows of
 /// `top_k` routes over `n_experts` experts: the route list (one guard entry
-/// per expert) and the slack of the widest matmul tile.
+/// per expert) and the seven rows an eight-row matmul tile reads, and drops,
+/// past the route it starts at.
 pub fn moe_tiles_grouped_rows(n_tokens: u32, top_k: u32, n_experts: u32) -> Result<usize> {
-    (n_tokens as usize)
-        .checked_mul(top_k as usize)
-        .and_then(|routes| routes.checked_add(n_experts as usize))
-        .and_then(|entries| entries.checked_add(ROW_SLACK))
-        .ok_or_else(|| MlxError::InvalidArgument("MoE tiles grouped rows overflow".into()))
+    grouped_m8_gathered_rows(n_tokens, top_k, n_experts)
 }
 
 /// One step's shape and route-table semantics.
@@ -72,7 +65,11 @@ pub struct MoeTilesParams {
     pub masked_routes: bool,
     /// Run experts of one or two routes in registers. Pass
     /// [`moe_tiles_column_tile_exact`]: the register path is bitwise the
-    /// matmul only on devices where that probe holds.
+    /// matmul only on devices where that probe holds. Products that
+    /// underflow FP32 are outside that equality (the two paths may round a
+    /// subnormal product differently; observed on results of magnitude at
+    /// most 4e-31), so a row whose result is that small may depend on how
+    /// many routes share its experts.
     pub column_tile: bool,
     /// Every scheduled id reads the planes of one expert (prepared with
     /// `n_experts = 1`): the ids only group rows into tiles.

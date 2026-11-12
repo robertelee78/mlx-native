@@ -6,18 +6,20 @@
 // (quantized_matmul_id_grouped_mv.metal). Each thread decodes its output
 // column's 32-weight groups to half, so every product with a BF16 activation
 // is exact in FP32. An expert of up to `column_rows` routes runs in registers
-// (no stage, no barrier); any other expert stages its weights and runs the
-// 8-, 16- or 32-row `matmul2d` that holds its routes, decoding the weights
-// once for all of them.
+// (no stage, no barrier); any other expert stages its weights and runs
+// eight-row `matmul2d` tiles over its routes, one after another.
 //
 // Row independence. A route's result depends only on its own input row and
 // its expert's weights: the register path adds the 32 exact products of a
 // group in the order `matmul2d` multiply-accumulate adds them on the devices
-// where the host enables it (`moe_tiles_column_tile_exact` proves the two
-// bitwise equal on the running device; otherwise `column_rows` is 0 and every
-// expert takes the matmul), and a matmul row is the same in every tile size
-// and beside any other rows. `reassociate(off)` keeps the source order of the
-// sums; products that underflow FP32 are outside the equality.
+// where the host enables it (`moe_tiles_column_tile_exact` compares the two
+// bitwise on the running device; otherwise `column_rows` is 0 and every
+// expert takes the matmul), and a matmul row is the same beside any other
+// rows and at any place in its tile. `reassociate(off)` keeps the source
+// order of the sums. Products that underflow FP32 are outside the equality:
+// the two paths may round a subnormal product differently, so a result of
+// that magnitude (observed at most 4e-31) may depend on how many routes
+// share its expert.
 
 #pragma clang fp reassociate(off)
 
