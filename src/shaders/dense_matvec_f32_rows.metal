@@ -20,6 +20,10 @@
 // ROWS = 1 and in a batch. (Not bitwise equal to dense_matvec_f32, which
 // uses dot() and a different K split.)
 //
+// Blocks: grid row b computes input rows [b * ROWS, (b + 1) * ROWS) into the
+// same rows of Y, each block exactly as a dispatch of its own would. A
+// dispatch of one grid row is the single block.
+//
 // Host requirements: K % 4 == 0 (float4 rows, 16-byte aligned row starts),
 // 1 <= ROWS <= 8.
 
@@ -42,8 +46,8 @@ constant constexpr short MAX_ROWS = 8;
 
 kernel void dense_matvec_f32_rows(
     device const float *               W      [[buffer(0)]],
-    device const float *               X      [[buffer(1)]],
-    device       float *               Y      [[buffer(2)]],
+    device const float *               X_all  [[buffer(1)]],
+    device       float *               Y_all  [[buffer(2)]],
     constant DenseMatvecF32RowsParams & p     [[buffer(3)]],
     threadgroup float *                shmem  [[threadgroup(0)]],
     uint3   tgpig [[threadgroup_position_in_grid]],
@@ -53,6 +57,8 @@ kernel void dense_matvec_f32_rows(
     const uint N = p.n;
     const uint K = p.k;
     const uint n0 = tgpig.x * NR0;
+    device const float * X = X_all + (ulong)tgpig.y * (ulong)FC_ROWS * K;
+    device       float * Y = Y_all + (ulong)tgpig.y * (ulong)FC_ROWS * N;
 
     float acc[NR0][MAX_ROWS];
 #pragma unroll
