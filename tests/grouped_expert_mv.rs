@@ -1,3 +1,5 @@
+#![cfg(mlx_native_has_metal_tensor_artifact)]
+
 use half::bf16;
 use mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv;
 use mlx_native::{
