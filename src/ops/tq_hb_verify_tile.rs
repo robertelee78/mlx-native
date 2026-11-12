@@ -312,11 +312,15 @@ fn lane_tiles(index: usize, lane: &TqHbVerifyLane) -> impl Iterator<Item = TqHbV
 }
 
 /// Partial slots per (lane, KV head) of a step: the most splits of its
-/// tiles. Windows must lie inside `kv_capacity`.
+/// tiles. Lanes [`tq_hb_verify_tile_attention`] rejects (no rows, more than
+/// [`VERIFY_TILE_ROWS`], a window past `kv_capacity`) do not count.
 pub fn verify_tile_slot_splits(lanes: &[TqHbVerifyLane], kv_capacity: u32) -> u32 {
     lanes
         .iter()
-        .filter(|lane| lane.rows > 0 && lane.committed.saturating_add(lane.rows) <= kv_capacity)
+        .filter(|lane| {
+            (1..=VERIFY_TILE_ROWS).contains(&lane.rows)
+                && lane.committed.saturating_add(lane.rows) <= kv_capacity
+        })
         .enumerate()
         .flat_map(|(index, lane)| lane_tiles(index, lane))
         .map(|tile| tile.splits)
@@ -748,6 +752,19 @@ mod tests {
         );
         assert_eq!(verify_tile_slot_splits(&[lane(1_531, 8)], 4_096), 24);
         assert_eq!(verify_tile_slot_splits(&[lane(1_536, 8)], 4_096), 17);
+        // Lanes the op rejects do not count, whatever boundary they cross.
+        for (committed, rows) in [(1_527, 10), (1_520, 40), (0, 9), (0, 0), (4_090, 8)] {
+            assert_eq!(
+                verify_tile_slot_splits(&[lane(committed, rows)], 4_096),
+                1,
+                "{committed}+{rows}"
+            );
+            assert_eq!(
+                verify_tile_slot_splits(&[lane(committed, rows), lane(1_531, 8)], 4_096),
+                24,
+                "{committed}+{rows} beside a valid lane"
+            );
+        }
         // Every token's tile uses the split length of the token's own page
         // count, at every row of every window.
         for committed in 0..9_100u32 {
