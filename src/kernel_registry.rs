@@ -651,6 +651,15 @@ impl KernelRegistry {
             sources.insert(format!("grouped_m8_gate_up_{format}_bf16"), grouped_mv_src);
         }
 
+        // MoE expert live tiles over the same prepared planes: one gate/up
+        // pass and a down pass on the indirect grid of the schedule's tiles.
+        let moe_tiles_src: &'static str = include_str!("shaders/moe_expert_tiles.metal");
+        sources.insert("moe_tiles_gather_f32".into(), moe_tiles_src);
+        for format in ["q4_K", "q6_K"] {
+            sources.insert(format!("moe_tiles_gate_up_{format}"), moe_tiles_src);
+            sources.insert(format!("moe_tiles_down_{format}"), moe_tiles_src);
+        }
+
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of
         // `kernel_mul_mm_id_map0_ne20_N` + `kernel_mul_mm_id_<q>_f32`).

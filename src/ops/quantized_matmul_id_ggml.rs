@@ -34,6 +34,13 @@ use crate::kernel_registry::KernelRegistry;
 use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
+mod moe_tiles;
+pub use moe_tiles::{
+    moe_tiles_column_tile_exact, moe_tiles_down, moe_tiles_gate_up, moe_tiles_gather,
+    moe_tiles_grouped_rows, moe_tiles_schedule, MoeTilesBuffers, MoeTilesParams,
+    MOE_TILES_GRID_WORDS,
+};
+
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     factors.iter().try_fold(1usize, |total, factor| {
         total.checked_mul(*factor).ok_or_else(|| {

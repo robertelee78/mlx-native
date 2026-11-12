@@ -2054,6 +2054,67 @@ impl CommandEncoder {
         );
     }
 
+    /// Encode a threadgroup dispatch whose grid the GPU reads at run time
+    /// from `indirect` (three `u32` threadgroup counts at `indirect_offset`
+    /// bytes into the buffer's view, written by an earlier dispatch that a
+    /// barrier orders before this one).
+    ///
+    /// `maximum_threadgroups` bounds the grid the buffer may hold. The kernel
+    /// MUST return at once for threadgroups outside the live grid: graph
+    /// capture records a direct dispatch of `maximum_threadgroups`, which is
+    /// also what dispatch observers and receipts report.
+    #[allow(unexpected_cfgs)]
+    pub fn encode_threadgroups_indirect_with_args(
+        &mut self,
+        pipeline: &ComputePipelineStateRef,
+        bindings: &[(u64, KernelArg<'_>)],
+        indirect: &MlxBuffer,
+        indirect_offset: u64,
+        maximum_threadgroups: MTLSize,
+        threadgroup_size: MTLSize,
+    ) {
+        if self.capture.is_some() {
+            self.encode_threadgroups_with_args(
+                pipeline,
+                bindings,
+                maximum_threadgroups,
+                threadgroup_size,
+            );
+            return;
+        }
+        DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        bucket_dispatch(pipeline);
+        let op_kind = self.take_pending_op_kind();
+        let _ = self.take_pending_buffer_ranges();
+        self.ensure_sample_buffer();
+        let encoder_ptr = self.get_or_create_encoder() as *const ComputeCommandEncoderRef;
+        // SAFETY: see encode() above.
+        let encoder = unsafe { &*encoder_ptr };
+        encoder.set_compute_pipeline_state(pipeline);
+        apply_bindings(encoder, bindings);
+        let pre_idx = self.sample_dispatch_pre(encoder, op_kind);
+        assert_tg_size_multiple_of_32_if_hinted(threadgroup_size, pipeline);
+        // SAFETY: `indirect` outlives the command buffer (the caller keeps
+        // its bound buffers alive until completion, as for every binding) and
+        // the selector is MTLComputeCommandEncoder's indirect dispatch.
+        unsafe {
+            let _: () = msg_send![
+                encoder,
+                dispatchThreadgroupsWithIndirectBuffer: &**indirect.metal_buffer()
+                indirectBufferOffset: indirect.byte_offset() + indirect_offset
+                threadsPerThreadgroup: threadgroup_size
+            ];
+        }
+        self.sample_dispatch_post(encoder, pre_idx);
+        self.record_encoded_dispatch(
+            pipeline,
+            DispatchKind::ThreadGroups,
+            maximum_threadgroups,
+            threadgroup_size,
+            &[],
+        );
+    }
+
     // -----------------------------------------------------------------
     // ADR-015 —dataflow-driven auto-barrier dispatch family.
     //
