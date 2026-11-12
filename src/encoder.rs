@@ -547,9 +547,18 @@ pub fn set_encode_trace(active: bool) {
 /// dispatch + memory_barrier as it is encoded, with the active-encoder pointer —
 /// a textual command-stream dump to verify barrier placement/ordering relative
 /// to dispatches (codex-requested for the mN lm_head→softcap race).
+///
+/// The environment variable is read once, at the first dispatch or barrier of
+/// the process. This gate sits on every threadgroup dispatch and every
+/// barrier, and a lookup of an unset variable there costs 64 ns in a process
+/// with a hundred variables (M5 Max): 0.7 ms of encode-thread CPU in a
+/// decode cycle of 9,000 dispatches and 1,700 barriers. [`set_encode_trace`]
+/// remains the gate that can change while the process runs.
+#[inline]
 fn encode_trace_enabled() -> bool {
-    ENCODE_TRACE_ACTIVE.load(Ordering::Relaxed)
-        || std::env::var("MLX_ENCODE_TRACE").as_deref() == Ok("1")
+    static FROM_ENVIRONMENT: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MLX_ENCODE_TRACE").as_deref() == Ok("1"));
+    ENCODE_TRACE_ACTIVE.load(Ordering::Relaxed) || *FROM_ENVIRONMENT
 }
 
 /// Whether `MLX_UNRETAINED_REFS=1` is set in the process environment.
