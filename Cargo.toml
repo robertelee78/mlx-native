@@ -109,6 +109,10 @@ name = "bench_qwen_verify_attn"
 harness = false
 
 [[bench]]
+name = "bench_qwen_dense_ffn"
+harness = false
+
+[[bench]]
 name = "bench_decode_qmatmul_shapes"
 harness = false
 
