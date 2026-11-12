@@ -102,7 +102,7 @@ fn record_mark(name: &'static str) {
 pub(crate) fn mark_at(name: &'static str, seconds: f64) {
     if let Ok(mut marks) = MARKS.lock() {
         if marks.len() >= MAX_PENDING {
-            DROPPED.fetch_add(marks.len() as u64, Ordering::Relaxed);
+            DROPPED_MARKS.fetch_add(marks.len() as u64, Ordering::Relaxed);
             marks.clear();
         }
         marks.push((name, seconds));
@@ -144,15 +144,25 @@ pub fn now_seconds() -> f64 {
     unsafe { mach_absolute_time() as f64 * *SECONDS_PER_TICK }
 }
 
-/// Commands held between drains; reaching it discards the held records.
+/// Commands, and separately marks, held between drains; reaching it
+/// discards the held records. The bound is a count, not bytes: a retained
+/// command keeps every resource it references alive, so drain at a bounded
+/// cadence.
 const MAX_PENDING: usize = 4096;
 
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static DROPPED_MARKS: AtomicU64 = AtomicU64::new(0);
 
-/// Records discarded because [`drain`] was not called for [`MAX_PENDING`]
-/// commits. Nonzero means a drained sequence has a gap.
+/// Command records discarded because [`drain`] was not called for
+/// [`MAX_PENDING`] commits. Nonzero means a drained sequence has a gap.
 pub fn dropped() -> u64 {
     DROPPED.load(Ordering::Relaxed)
+}
+
+/// Host marks discarded because [`drain_marks`] was not called for
+/// [`MAX_PENDING`] marks.
+pub fn dropped_marks() -> u64 {
+    DROPPED_MARKS.load(Ordering::Relaxed)
 }
 
 /// Record a commit. `encode_begin_s` is `0.0` when the command opened no
