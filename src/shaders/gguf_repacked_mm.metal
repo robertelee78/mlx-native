@@ -1,4 +1,4 @@
-// Repacked Q4_K/Q6_K dense MM for fixed-width decode.
+// Repacked Q4_K/Q6_K dense MM over 32-row activation tiles.
 // Layout and dequantization are derived from Splash's Apache-2.0 MDGG0001
 // representation (https://github.com/incoai/splash, commit 031a25a6).
 #pragma clang fp reassociate(off)
@@ -73,23 +73,45 @@ kernel void hf2q_gguf_repack_q4k_q6k(
     }
 }
 
+// `splits` fixes the summation order of every output element: K is cut into
+// that many equal runs, each accumulated from zero, and the runs are added in
+// order. It belongs to the prepared weight, never to the row count, so the
+// bits of an output row do not depend on the batch it is computed in.
 struct MmParams {
-    int32_t ne00;
-    int32_t ne02;
-    uint64_t nb01;
-    uint64_t nb02;
-    uint64_t nb03;
-    int32_t ne12;
-    uint32_t splits;
-    uint64_t nb10;
-    uint64_t nb11;
-    uint64_t nb12;
-    uint64_t nb13;
-    int32_t ne0;
-    int32_t ne1;
-    int16_t r2;
-    int16_t r3;
+    uint k;
+    uint n;
+    uint m;
+    uint splits;
 };
+
+// Activation rows are covered by 32-row tiles. An `Edge` kernel owns a partial
+// tile and neither reads nor writes rows >= m; the others read 32 rows
+// unchecked.
+//
+// `Serial` selects who adds the K runs, not what is added:
+//   false: the bound buffers hold one row tile (m <= 32) and grid x enumerates
+//          the runs; with more than one run the partial sums go to `partials`
+//          for hf2q_repacked_mm_reduce_f32.
+//   true:  the bound buffers hold all m rows and grid x enumerates the full
+//          row tiles, the `Edge` kernel taking the last, partial one; a
+//          threadgroup walks every run and adds the partial sums in
+//          registers, in the reduce kernel's order.
+template <bool Edge, bool Serial>
+inline uint tile_first_row(constant MmParams &a, uint3 group) {
+    return Serial ? 32u * (Edge ? a.m / 32u : group.x) : 0u;
+}
+
+// Add one finished run to the running total and clear it for the next run.
+template <typename Sum>
+inline void fold_run(thread Sum &run, thread Sum &total) {
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < run.get_capacity(); ++i) {
+        if (run.is_valid_element(i)) {
+            total[i] += run[i];
+            run[i] = 0.0f;
+        }
+    }
+}
 
 inline uint4 nibble_pairs(uint word) { return (uint4(word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu; }
 inline uint spread2(uint bits) { return (bits & 0x3333u) | ((bits & 0xCCCCu) << 14); }
@@ -136,11 +158,11 @@ inline void decode_q6k_half(uint4 lo, uint2 hb, packed_uint4 scales, uint dh, us
     }
 }
 
-template <bool Q6>
+template <bool Q6, bool Edge, bool Serial>
 kernel void hf2q_repacked_mm_impl(
     constant MmParams &a [[buffer(0)]], device const uchar *w [[buffer(1)]],
-    device const char *input [[buffer(2)]], device char *output [[buffer(3)]],
-    constant uint2 &offsets [[buffer(4)]], device char *partials [[buffer(5)]],
+    device const float *input [[buffer(2)]], device float *output [[buffer(3)]],
+    constant uint2 &offsets [[buffer(4)]], device float *partials [[buffer(5)]],
     threadgroup char *shared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int COLS=32, ROWS=32, STEP=32;
@@ -149,9 +171,10 @@ kernel void hf2q_repacked_mm_impl(
     threadgroup half *sw0=sx+ROWS*STEP;
     threadgroup half *sw1=sw0+COLS*STEP;
     const uint sg=tid/32, lane=tid%32, output_origin=group.y*64+sg*COLS;
-    const uint groups=a.ne00/32, units=groups/8, per=groups/a.splits;
-    const int im=group.z, i12=im%a.ne12, i13=im/a.ne12;
-    device float *src=(device float *)(input+a.nb13*i13+a.nb12*i12);
+    const uint groups=a.k/32, units=groups/8, per=groups/a.splits;
+    const uint row0=tile_first_row<Edge,Serial>(a,group);
+    const uint rows=Edge?a.m-row0:uint(ROWS);
+    device const float *src=input+ulong(row0)*a.k;
     auto xt=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(
         sx,dextents<int32_t,2>{STEP,ROWS},array<int32_t,2>{1,STEP});
     auto wt0=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(
@@ -161,82 +184,97 @@ kernel void hf2q_repacked_mm_impl(
     matmul2d<matmul2d_descriptor(ROWS,COLS,STEP,false,true,false,
         matmul2d_descriptor::mode::multiply_accumulate),execution_simdgroups<1>> mm;
     auto sum=mm.get_destination_cooperative_tensor<decltype(xt),decltype(wt0),float>();
+    auto total=mm.get_destination_cooperative_tensor<decltype(xt),decltype(wt0),float>();
 
     const uint weight_row=output_origin+lane;
-    const uint first=group.x*per, last=first+per;
-    ulong ix=tiled_index(weight_row,first,groups);
-    uint4 lo=*((device const uint4 *)(w+ix*16));
-    uint2 hi=uint2(0);
-    uint4 h=uint4(0);
-    packed_uint4 scales=packed_uint4(0);
-    uint dh=0;
-    device const uchar *meta=w+offsets.y+tiled_index(weight_row,first/8,units)*(Q6?20:16);
-    if constexpr(Q6){
-        hi=*((device const uint2 *)(w+offsets.x+ix*8));
-        scales=*((device const packed_uint4 *)meta);
-        dh=*((device const uint *)(meta+16));
-    }else{
-        h=*((device const uint4 *)meta);
-    }
-
-    for(uint g=first;g<last;++g){
-        for(ushort row=0;row<ROWS;++row)
-            sx[row*STEP+lane]=half(src[ulong(row)*(a.nb11/sizeof(float))+g*STEP+lane]);
-        const uint buffer=(g-first)&1;
-        threadgroup half *sw=buffer?sw1:sw0;
+    const uint split0=Serial?0u:group.x, split1=Serial?a.splits:group.x+1;
+    for(uint split=split0;split<split1;++split){
+        const uint first=split*per, last=first+per;
+        ulong ix=tiled_index(weight_row,first,groups);
+        uint4 lo=*((device const uint4 *)(w+ix*16));
+        uint2 hi=uint2(0);
+        uint4 h=uint4(0);
+        packed_uint4 scales=packed_uint4(0);
+        uint dh=0;
+        device const uchar *meta=w+offsets.y+tiled_index(weight_row,first/8,units)*(Q6?20:16);
         if constexpr(Q6){
-            decode_q6k_half(lo,hi,scales,dh,g%8,0,sw+lane*32);
-            decode_q6k_half(lo,hi,scales,dh,g%8,1,sw+lane*32+16);
+            hi=*((device const uint2 *)(w+offsets.x+ix*8));
+            scales=*((device const packed_uint4 *)meta);
+            dh=*((device const uint *)(meta+16));
         }else{
-            decode_q4k_half(lo,h,g%8,0,sw+lane*32);
-            decode_q4k_half(lo,h,g%8,1,sw+lane*32+16);
+            h=*((device const uint4 *)meta);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        uint4 next_lo=lo;
-        uint2 next_hi=hi;
-        uint4 next_h=h;
-        packed_uint4 next_scales=scales;
-        uint next_dh=dh;
-        if(g+1<last){
-            const uint next=g+1;
-            const ulong next_ix=tiled_index(weight_row,next,groups);
-            next_lo=*((device const uint4 *)(w+next_ix*16));
-            if constexpr(Q6) next_hi=*((device const uint2 *)(w+offsets.x+next_ix*8));
-            if(next/8!=g/8){
-                device const uchar *next_meta=w+offsets.y+tiled_index(weight_row,next/8,units)*(Q6?20:16);
-                if constexpr(Q6){
-                    next_scales=*((device const packed_uint4 *)next_meta);
-                    next_dh=*((device const uint *)(next_meta+16));
-                }else{
-                    next_h=*((device const uint4 *)next_meta);
+        for(uint g=first;g<last;++g){
+            if constexpr(Edge){
+                for(ushort row=0;row<rows;++row)
+                    sx[row*STEP+lane]=half(src[ulong(row)*a.k+g*STEP+lane]);
+                for(ushort row=rows;row<ROWS;++row) sx[row*STEP+lane]=half(0);
+            }else{
+                for(ushort row=0;row<ROWS;++row)
+                    sx[row*STEP+lane]=half(src[ulong(row)*a.k+g*STEP+lane]);
+            }
+            const uint buffer=(g-first)&1;
+            threadgroup half *sw=buffer?sw1:sw0;
+            if constexpr(Q6){
+                decode_q6k_half(lo,hi,scales,dh,g%8,0,sw+lane*32);
+                decode_q6k_half(lo,hi,scales,dh,g%8,1,sw+lane*32+16);
+            }else{
+                decode_q4k_half(lo,h,g%8,0,sw+lane*32);
+                decode_q4k_half(lo,h,g%8,1,sw+lane*32+16);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint4 next_lo=lo;
+            uint2 next_hi=hi;
+            uint4 next_h=h;
+            packed_uint4 next_scales=scales;
+            uint next_dh=dh;
+            if(g+1<last){
+                const uint next=g+1;
+                const ulong next_ix=tiled_index(weight_row,next,groups);
+                next_lo=*((device const uint4 *)(w+next_ix*16));
+                if constexpr(Q6) next_hi=*((device const uint2 *)(w+offsets.x+next_ix*8));
+                if(next/8!=g/8){
+                    device const uchar *next_meta=w+offsets.y+tiled_index(weight_row,next/8,units)*(Q6?20:16);
+                    if constexpr(Q6){
+                        next_scales=*((device const packed_uint4 *)next_meta);
+                        next_dh=*((device const uint *)(next_meta+16));
+                    }else{
+                        next_h=*((device const uint4 *)next_meta);
+                    }
                 }
             }
-        }
 
-        auto left=xt.slice(0,0);
-        if(buffer){
-            auto right=wt1.slice(0,0); mm.run(left,right,sum);
-        }else{
-            auto right=wt0.slice(0,0); mm.run(left,right,sum);
+            auto left=xt.slice(0,0);
+            if(buffer){
+                auto right=wt1.slice(0,0); mm.run(left,right,sum);
+            }else{
+                auto right=wt0.slice(0,0); mm.run(left,right,sum);
+            }
+            if(g+1<last){
+                lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
+            }
         }
-        if(g+1<last){
-            lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
-        }
+        if constexpr(Serial) if(a.splits>1) fold_run(sum,total);
     }
-    device float *base=a.splits==1?(device float *)output:
-        (device float *)partials+group.x*a.ne1*a.ne0;
-    device float *dst=base+output_origin+im*a.ne1*a.ne0;
+    device float *base=output;
+    if constexpr(!Serial) if(a.splits>1) base=partials+ulong(group.x)*a.m*a.n;
     auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
-        dst,dextents<int32_t,2>{a.ne0,ROWS},array<int32_t,2>{1,a.ne0});
-    sum.store(out);
+        base+ulong(row0)*a.n+output_origin,
+        dextents<int32_t,2>{int(a.n),int(rows)},array<int32_t,2>{1,int(a.n)});
+    if constexpr(Serial){
+        if(a.splits>1) total.store(out); else sum.store(out);
+    }else{
+        sum.store(out);
+    }
 }
 
-template <bool Q6>
+template <bool Q6, bool Edge, bool Serial>
 kernel void hf2q_repacked_mm_bf16_input_impl(
     constant MmParams &a [[buffer(0)]], device const uchar *w [[buffer(1)]],
-    device bfloat *input [[buffer(2)]], device char *output [[buffer(3)]],
-    constant uint2 &offsets [[buffer(4)]], device char *partials [[buffer(5)]],
+    device bfloat *input [[buffer(2)]], device float *output [[buffer(3)]],
+    constant uint2 &offsets [[buffer(4)]], device float *partials [[buffer(5)]],
     threadgroup char *shared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int COLS=32, ROWS=32, STEP=32;
@@ -244,100 +282,125 @@ kernel void hf2q_repacked_mm_bf16_input_impl(
     threadgroup half *sw0=tile;
     threadgroup half *sw1=sw0+COLS*STEP;
     const uint sg=tid/32, lane=tid%32, output_origin=group.y*64+sg*COLS;
-    const uint groups=a.ne00/32, units=groups/8, per=groups/a.splits;
-    const int im=group.z, i12=im%a.ne12, i13=im/a.ne12;
-    device bfloat *src=(device bfloat *)((device char *)input+a.nb13*i13+a.nb12*i12);
+    const uint groups=a.k/32, units=groups/8, per=groups/a.splits;
+    const uint row0=tile_first_row<Edge,Serial>(a,group);
+    const uint rows=Edge?a.m-row0:uint(ROWS);
     auto xt=tensor<device bfloat,dextents<int32_t,2>,tensor_inline>(
-        src,dextents<int32_t,2>{a.ne00,ROWS},array<int32_t,2>{1,a.ne00});
+        input+ulong(row0)*a.k,
+        dextents<int32_t,2>{int(a.k),int(rows)},array<int32_t,2>{1,int(a.k)});
     auto wt0=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(
         sw0,dextents<int32_t,2>{STEP,COLS},array<int32_t,2>{1,STEP});
     auto wt1=tensor<threadgroup half,dextents<int32_t,2>,tensor_inline>(
         sw1,dextents<int32_t,2>{STEP,COLS},array<int32_t,2>{1,STEP});
     matmul2d<matmul2d_descriptor(ROWS,COLS,STEP,false,true,false,
         matmul2d_descriptor::mode::multiply_accumulate),execution_simdgroups<1>> mm;
-    auto left0=xt.template slice<STEP,ROWS>(0,0);
-    auto right0=wt0.template slice<STEP,COLS>(0,0);
-    auto sum=mm.get_destination_cooperative_tensor<decltype(left0),decltype(right0),float>();
+    auto sum=mm.get_destination_cooperative_tensor<
+        decltype(xt.template slice<STEP,ROWS>(0,0)),decltype(wt0.template slice<STEP,COLS>(0,0)),float>();
+    auto total=mm.get_destination_cooperative_tensor<
+        decltype(xt.template slice<STEP,ROWS>(0,0)),decltype(wt0.template slice<STEP,COLS>(0,0)),float>();
 
     const uint weight_row=output_origin+lane;
-    const uint begin=group.x*per, end=begin+per;
-    const uint first=begin+uint(ulong((group.y*40503u)&0xFFFFu)*per>>16);
-    ulong ix=tiled_index(weight_row,first,groups);
-    uint4 lo=*((device const uint4 *)(w+ix*16));
-    uint2 hi=uint2(0);
-    uint4 h=uint4(0);
-    packed_uint4 scales=packed_uint4(0);
-    uint dh=0;
-    device const uchar *meta=w+offsets.y+tiled_index(weight_row,first/8,units)*(Q6?20:16);
-    if constexpr(Q6){
-        hi=*((device const uint2 *)(w+offsets.x+ix*8));
-        scales=*((device const packed_uint4 *)meta);
-        dh=*((device const uint *)(meta+16));
-    }else{
-        h=*((device const uint4 *)meta);
-    }
-
-    uint g=first;
-    for(uint walked=0;walked<per;++walked){
-        const uint buffer=walked&1;
-        threadgroup half *sw=buffer?sw1:sw0;
+    const uint rotation=uint(ulong((group.y*40503u)&0xFFFFu)*per>>16);
+    const uint split0=Serial?0u:group.x, split1=Serial?a.splits:group.x+1;
+    for(uint split=split0;split<split1;++split){
+        const uint begin=split*per, end=begin+per;
+        const uint first=begin+rotation;
+        ulong ix=tiled_index(weight_row,first,groups);
+        uint4 lo=*((device const uint4 *)(w+ix*16));
+        uint2 hi=uint2(0);
+        uint4 h=uint4(0);
+        packed_uint4 scales=packed_uint4(0);
+        uint dh=0;
+        device const uchar *meta=w+offsets.y+tiled_index(weight_row,first/8,units)*(Q6?20:16);
         if constexpr(Q6){
-            decode_q6k_half(lo,hi,scales,dh,g%8,0,sw+lane*32);
-            decode_q6k_half(lo,hi,scales,dh,g%8,1,sw+lane*32+16);
+            hi=*((device const uint2 *)(w+offsets.x+ix*8));
+            scales=*((device const packed_uint4 *)meta);
+            dh=*((device const uint *)(meta+16));
         }else{
-            decode_q4k_half(lo,h,g%8,0,sw+lane*32);
-            decode_q4k_half(lo,h,g%8,1,sw+lane*32+16);
+            h=*((device const uint4 *)meta);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        uint4 next_lo=lo;
-        uint2 next_hi=hi;
-        uint4 next_h=h;
-        packed_uint4 next_scales=scales;
-        uint next_dh=dh;
-        const uint next=g+1<end?g+1:begin;
-        if(walked+1<per){
-            const ulong next_ix=tiled_index(weight_row,next,groups);
-            next_lo=*((device const uint4 *)(w+next_ix*16));
-            if constexpr(Q6) next_hi=*((device const uint2 *)(w+offsets.x+next_ix*8));
-            if(next/8!=g/8){
-                device const uchar *next_meta=w+offsets.y+tiled_index(weight_row,next/8,units)*(Q6?20:16);
-                if constexpr(Q6){
-                    next_scales=*((device const packed_uint4 *)next_meta);
-                    next_dh=*((device const uint *)(next_meta+16));
-                }else{
-                    next_h=*((device const uint4 *)next_meta);
+        uint g=first;
+        for(uint walked=0;walked<per;++walked){
+            const uint buffer=walked&1;
+            threadgroup half *sw=buffer?sw1:sw0;
+            if constexpr(Q6){
+                decode_q6k_half(lo,hi,scales,dh,g%8,0,sw+lane*32);
+                decode_q6k_half(lo,hi,scales,dh,g%8,1,sw+lane*32+16);
+            }else{
+                decode_q4k_half(lo,h,g%8,0,sw+lane*32);
+                decode_q4k_half(lo,h,g%8,1,sw+lane*32+16);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint4 next_lo=lo;
+            uint2 next_hi=hi;
+            uint4 next_h=h;
+            packed_uint4 next_scales=scales;
+            uint next_dh=dh;
+            const uint next=g+1<end?g+1:begin;
+            if(walked+1<per){
+                const ulong next_ix=tiled_index(weight_row,next,groups);
+                next_lo=*((device const uint4 *)(w+next_ix*16));
+                if constexpr(Q6) next_hi=*((device const uint2 *)(w+offsets.x+next_ix*8));
+                if(next/8!=g/8){
+                    device const uchar *next_meta=w+offsets.y+tiled_index(weight_row,next/8,units)*(Q6?20:16);
+                    if constexpr(Q6){
+                        next_scales=*((device const packed_uint4 *)next_meta);
+                        next_dh=*((device const uint *)(next_meta+16));
+                    }else{
+                        next_h=*((device const uint4 *)next_meta);
+                    }
                 }
             }
-        }
 
-        auto left=xt.template slice<STEP,ROWS>(g*STEP,0);
-        if(buffer){
-            auto right=wt1.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
-        }else{
-            auto right=wt0.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+            if constexpr(Edge){
+                // Bounds-checked against the tile's extents: rows >= m read as zero.
+                auto left=xt.slice(int(g*STEP),0);
+                if(buffer){
+                    auto right=wt1.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+                }else{
+                    auto right=wt0.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+                }
+            }else{
+                auto left=xt.template slice<STEP,ROWS>(g*STEP,0);
+                if(buffer){
+                    auto right=wt1.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+                }else{
+                    auto right=wt0.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
+                }
+            }
+            if(walked+1<per){
+                g=next; lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
+            }
         }
-        if(walked+1<per){
-            g=next; lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
-        }
+        if constexpr(Serial) if(a.splits>1) fold_run(sum,total);
     }
-    device float *base=a.splits==1?(device float *)output:
-        (device float *)partials+group.x*a.ne1*a.ne0;
-    device float *dst=base+output_origin+im*a.ne1*a.ne0;
+    device float *base=output;
+    if constexpr(!Serial) if(a.splits>1) base=partials+ulong(group.x)*a.m*a.n;
     auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
-        dst,dextents<int32_t,2>{a.ne0,ROWS},array<int32_t,2>{1,a.ne0});
-    sum.store(out);
+        base+ulong(row0)*a.n+output_origin,
+        dextents<int32_t,2>{int(a.n),int(rows)},array<int32_t,2>{1,int(a.n)});
+    if constexpr(Serial){
+        if(a.splits>1) total.store(out); else sum.store(out);
+    }else{
+        sum.store(out);
+    }
 }
 
-
-template [[host_name("hf2q_repacked_mm_q4k_bf16_input_f32")]] kernel void hf2q_repacked_mm_bf16_input_impl<false>(
-    constant MmParams &,device const uchar *,device bfloat *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
-template [[host_name("hf2q_repacked_mm_q6k_bf16_input_f32")]] kernel void hf2q_repacked_mm_bf16_input_impl<true>(
-    constant MmParams &,device const uchar *,device bfloat *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
-template [[host_name("hf2q_repacked_mm_q4k_f32")]] kernel void hf2q_repacked_mm_impl<false>(
-    constant MmParams &,device const uchar *,device const char *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
-template [[host_name("hf2q_repacked_mm_q6k_f32")]] kernel void hf2q_repacked_mm_impl<true>(
-    constant MmParams &,device const uchar *,device const char *,device char *,constant uint2 &,device char *,threadgroup char *,uint3,ushort);
+#define HF2Q_REPACKED_MM(NAME, IMPL, INPUT, Q6, EDGE, SERIAL) \
+    template [[host_name(NAME)]] kernel void IMPL<Q6, EDGE, SERIAL>( \
+        constant MmParams &, device const uchar *, INPUT, device float *, constant uint2 &, \
+        device float *, threadgroup char *, uint3, ushort);
+#define HF2Q_REPACKED_MM_VARIANTS(NAME, IMPL, INPUT, Q6) \
+    HF2Q_REPACKED_MM(NAME, IMPL, INPUT, Q6, false, false) \
+    HF2Q_REPACKED_MM(NAME "_serial", IMPL, INPUT, Q6, false, true) \
+    HF2Q_REPACKED_MM(NAME "_edge", IMPL, INPUT, Q6, true, false) \
+    HF2Q_REPACKED_MM(NAME "_edge_serial", IMPL, INPUT, Q6, true, true)
+HF2Q_REPACKED_MM_VARIANTS("hf2q_repacked_mm_q4k_bf16_input_f32", hf2q_repacked_mm_bf16_input_impl, device bfloat *, false)
+HF2Q_REPACKED_MM_VARIANTS("hf2q_repacked_mm_q6k_bf16_input_f32", hf2q_repacked_mm_bf16_input_impl, device bfloat *, true)
+HF2Q_REPACKED_MM_VARIANTS("hf2q_repacked_mm_q4k_f32", hf2q_repacked_mm_impl, device const float *, false)
+HF2Q_REPACKED_MM_VARIANTS("hf2q_repacked_mm_q6k_f32", hf2q_repacked_mm_impl, device const float *, true)
 kernel void hf2q_repacked_mm_reduce_f32(
     device const float *partials [[buffer(0)]],
     device float *output [[buffer(1)]],
