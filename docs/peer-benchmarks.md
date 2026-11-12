@@ -8,7 +8,13 @@ carries data, that data lives here. See `AGENTS.md` for the policy.
 **Attribution**: portions of the kernel library are derived from
 [llama.cpp](https://github.com/ggerganov/llama.cpp) (MIT) — the legal
 notice ships as `LICENSE-MIT-llamacpp` at the repo root. Some quantized
-kernels arrived via candle's vendored copies (`LICENSE-APACHE-candle`).
+kernels arrived via candle's vendored copies (`LICENSE-APACHE-candle`). The
+prepared GGUF projection (`gguf_repacked_mm.metal`), the staged AF4G64 draft
+projection (`dflash2_af4g64_staged.metal`) and the ring draft attention
+(`dflash2_ring_attention.metal`) are derived from
+[Splash](https://github.com/incoai/splash) commit `031a25a6` (Apache-2.0,
+`LICENSE-APACHE-splash`); the two DFlash2 shaders' headers list their sources
+and changes.
 
 ## Pinned reference commits
 
