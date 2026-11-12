@@ -41,11 +41,20 @@
 //! committed token of a four-agent coding run, about 2,900 per lane; key
 //! norms 16 to 29).
 //!
-//! Invariants (`tests/test_tq_hb_verify_tile.rs`): a row's output is a
-//! function of its lane's committed length, its offset in the window, its
-//! query, its gate and the cache tokens before its causal end only. It does
-//! not depend on the other lanes, on the window's later rows or row count, on
-//! the packed row it occupies or on the padding.
+//! Invariants (`tests/test_tq_hb_verify_tile.rs`): a token's output is a
+//! function of its position, its query, its gate and the cache tokens before
+//! its causal end only. It does not depend on the window that verifies it
+//! (where the window starts, which of its rows the token is, how many rows
+//! it has), on the other lanes, on the packed row it occupies or on the
+//! padding.
+//!
+//! Window independence comes from the split rule. A token cuts its history
+//! into splits by its own page count ([`verify_tile_pages_per_split`]), and
+//! pages and splits that hold none of a row's tokens leave its bits alone, so
+//! rows with one split length share a tile whatever their page counts. A
+//! window whose rows ask for two split lengths (it crosses the page boundary
+//! where the length steps, once every `24 * 32` tokens of history) runs as
+//! two tiles that share the lane's scratch on disjoint rows.
 //!
 //! The pipelines exist only on devices with the Metal tensor API; use
 //! [`tq_hb_verify_tile_available`] before offering the route.
@@ -67,7 +76,7 @@ pub static TQ_HB_VERIFY_TILE_SHADER_SOURCE: &str =
 pub const VERIFY_TILE_ROWS: u32 = 8;
 /// Cache tokens per page (the kernel's `TQV_PAGE`).
 pub const PAGE_TOKENS: u32 = 32;
-/// Most history splits of one lane (the kernel's `TQV_MAX_SPLITS` bounds it).
+/// Most history splits of one token (the kernel's `TQV_MAX_SPLITS` bounds it).
 pub const MAX_SPLITS: u32 = 24;
 /// Fewest pages of one split.
 pub const MIN_PAGES_PER_SPLIT: u32 = 2;
@@ -257,31 +266,60 @@ pub struct TqHbVerifyLane {
     pub first_row: u32,
 }
 
-/// Pages a lane with `committed` tokens before its window reads: those of its
-/// history and a full window, whatever the window's row count.
-fn verify_tile_pages(committed: u32, kv_capacity: u32) -> u32 {
-    committed
-        .saturating_add(VERIFY_TILE_ROWS)
-        .min(kv_capacity)
-        .div_ceil(PAGE_TOKENS)
+/// Pages per history split of a token whose history and itself fill `pages`
+/// pages: the pages in at most [`MAX_SPLITS`] runs of equal length, at least
+/// [`MIN_PAGES_PER_SPLIT`] pages each. A function of the token's own position
+/// only, so neither the cohort nor the window changes a token's arithmetic.
+pub fn verify_tile_pages_per_split(pages: u32) -> u32 {
+    pages.div_ceil(MAX_SPLITS).max(MIN_PAGES_PER_SPLIT)
 }
 
-/// History splits of a lane with `committed` tokens before its window: its
-/// pages in runs of equal length, at least [`MIN_PAGES_PER_SPLIT`] pages
-/// each and at most [`MAX_SPLITS`] runs. Every split owns a page. A function
-/// of the lane's own committed length only, so the cohort never changes a
-/// lane's arithmetic.
-pub fn verify_tile_splits(committed: u32, kv_capacity: u32) -> u32 {
-    let pages = verify_tile_pages(committed, kv_capacity).max(1);
-    let per_split = pages.div_ceil(MAX_SPLITS).max(MIN_PAGES_PER_SPLIT);
-    pages.div_ceil(per_split)
+/// The tiles of `lane`: its window, or the two parts of it on either side of
+/// the page boundary where the split length steps.
+fn lane_tiles(index: usize, lane: &TqHbVerifyLane) -> impl Iterator<Item = TqHbVerifyTileGpu> {
+    let pages_of = |tokens: u32| tokens.div_ceil(PAGE_TOKENS);
+    let (first_pages, last_pages) = (
+        pages_of(lane.committed + 1),
+        pages_of(lane.committed + lane.rows),
+    );
+    // Rows before the page boundary, when the split length differs across it.
+    let head =
+        if verify_tile_pages_per_split(first_pages) == verify_tile_pages_per_split(last_pages) {
+            0
+        } else {
+            first_pages * PAGE_TOKENS - lane.committed
+        };
+    let tile = move |row: u32, rows: u32, owned: u32, pages: u32| {
+        let per_split = verify_tile_pages_per_split(pages);
+        TqHbVerifyTileGpu {
+            slot: lane.slot,
+            committed: lane.committed + row,
+            rows,
+            first_row: lane.first_row + row,
+            lane: index as u32,
+            row,
+            owned,
+            splits: pages.div_ceil(per_split),
+            per_split,
+        }
+    };
+    let rows = lane.rows;
+    let tail = tile(head, rows - head, VERIFY_TILE_ROWS - head, last_pages);
+    (head > 0)
+        .then(|| tile(0, head, head, first_pages))
+        .into_iter()
+        .chain(std::iter::once(tail))
 }
 
-/// Partial slots per (lane, KV head) of a step: the most splits of its lanes.
+/// Partial slots per (lane, KV head) of a step: the most splits of its
+/// tiles. Windows must lie inside `kv_capacity`.
 pub fn verify_tile_slot_splits(lanes: &[TqHbVerifyLane], kv_capacity: u32) -> u32 {
     lanes
         .iter()
-        .map(|lane| verify_tile_splits(lane.committed, kv_capacity))
+        .filter(|lane| lane.rows > 0 && lane.committed.saturating_add(lane.rows) <= kv_capacity)
+        .enumerate()
+        .flat_map(|(index, lane)| lane_tiles(index, lane))
+        .map(|tile| tile.splits)
         .max()
         .unwrap_or(1)
 }
@@ -308,8 +346,11 @@ pub fn verify_tile_scratch_bytes(
     let tiles = lanes * shape.n_kv_heads as usize;
     let fused = shape.fused_rows() as usize;
     let slots = tiles * slot_splits as usize;
+    // The second tile of a cut window reads a full tile of queries from its
+    // first row: up to seven rows past the last lane's.
+    let overrun = (VERIFY_TILE_ROWS as usize - 1) * shape.group() as usize;
     TqHbVerifyTileScratchBytes {
-        queries: tiles * fused * HEAD_DIM as usize * 2,
+        queries: (tiles * fused + overrun) * HEAD_DIM as usize * 2,
         partials: slots * fused * HEAD_DIM as usize * 4,
         statistics: slots * fused * 2 * 4,
         attention: lanes
@@ -340,15 +381,24 @@ pub struct TqHbVerifyTileCache<'a> {
     pub v_norms: &'a MlxBuffer,
 }
 
-/// Rust mirror of the MSL `TqHbVerifyLane`.
+/// Rust mirror of the MSL `TqHbVerifyLane`: one tile.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TqHbVerifyLaneGpu {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+struct TqHbVerifyTileGpu {
     slot: u32,
+    /// Position of the tile's first row.
     committed: u32,
     rows: u32,
+    /// Packed row of the tile's first row.
     first_row: u32,
+    /// Scratch index of the tile's lane.
+    lane: u32,
+    /// Window row of the tile's first row.
+    row: u32,
+    /// Window rows from `row` whose query scratch the tile fills.
+    owned: u32,
     splits: u32,
+    per_split: u32,
 }
 
 /// Rust mirror of the MSL `TqHbVerifyParams`.
@@ -462,7 +512,12 @@ pub fn tq_hb_verify_tile_attention(
         }
     }
 
-    let slot_splits = verify_tile_slot_splits(lanes, shape.kv_capacity);
+    let tiles: Vec<TqHbVerifyTileGpu> = lanes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, lane)| lane_tiles(index, lane))
+        .collect();
+    let slot_splits = tiles.iter().map(|tile| tile.splits).max().unwrap_or(1);
     if slot_splits > KERNEL_MAX_SPLITS {
         return Err(invalid(format!(
             "{slot_splits} splits exceed the kernel's {KERNEL_MAX_SPLITS}"
@@ -508,23 +563,13 @@ pub fn tq_hb_verify_tile_attention(
     need("k_norms", cache.k_norms, DType::F32, norm_bytes, 16)?;
     need("v_norms", cache.v_norms, DType::F32, norm_bytes, 16)?;
 
-    let gpu_lanes: Vec<TqHbVerifyLaneGpu> = lanes
-        .iter()
-        .map(|lane| TqHbVerifyLaneGpu {
-            slot: lane.slot,
-            committed: lane.committed,
-            rows: lane.rows,
-            first_row: lane.first_row,
-            splits: verify_tile_splits(lane.committed, shape.kv_capacity),
-        })
-        .collect();
-    let lane_bytes: &[u8] = bytemuck::cast_slice(&gpu_lanes);
+    let lane_bytes: &[u8] = bytemuck::cast_slice(&tiles);
     let row_map_bytes: &[u8] = bytemuck::cast_slice(&row_map);
     // Inline constant data is limited to 4 KiB per binding.
     if lane_bytes.len() > 4096 || row_map_bytes.len() > 4096 {
         return Err(invalid(format!(
-            "{} lanes over {} packed rows exceed the inline parameter limit",
-            lanes.len(),
+            "{} tiles over {} packed rows exceed the inline parameter limit",
+            tiles.len(),
             shape.width
         )));
     }
@@ -536,7 +581,7 @@ pub fn tq_hb_verify_tile_attention(
         scale: shape.scale,
     };
     let metal_device = device.metal_device();
-    let lane_count = lanes.len() as u64;
+    let lane_count = tiles.len() as u64;
     let (heads, rows) = (u64::from(shape.n_heads), u64::from(VERIFY_TILE_ROWS));
 
     if let Some(reason) = limit_violation(registry, device, shape)? {
@@ -616,24 +661,109 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splits_follow_the_lane_history_only() {
-        let splits = |committed| verify_tile_splits(committed, 262_144);
-        // One page, then runs of at least MIN_PAGES_PER_SPLIT pages.
-        assert_eq!(splits(0), 1);
-        assert_eq!(splits(24), 1);
-        assert_eq!(splits(512), 9); // 17 pages in runs of 2
-        assert_eq!(splits(2_048), 22); // 65 pages in runs of 3
-        assert_eq!(splits(8_192), 24); // 257 pages in runs of 11
-        assert_eq!(splits(262_136), MAX_SPLITS);
-        // The bound never passes the capacity.
-        assert_eq!(verify_tile_splits(u32::MAX, 64), 1);
-        for committed in (0..40_000).step_by(7) {
-            let pages = verify_tile_pages(committed, 262_144);
-            let count = splits(committed);
-            let per_split = pages.div_ceil(count);
-            assert!((1..=MAX_SPLITS).contains(&count));
-            // Every split owns a page: the kernel's partition writes them all.
-            assert_eq!(pages.div_ceil(per_split), count, "committed {committed}");
+    fn split_length_follows_the_token_page_count() {
+        // Runs of MIN_PAGES_PER_SPLIT pages up to 48 pages, then the pages in
+        // MAX_SPLITS runs.
+        assert_eq!(verify_tile_pages_per_split(1), 2);
+        assert_eq!(verify_tile_pages_per_split(48), 2);
+        assert_eq!(verify_tile_pages_per_split(49), 3);
+        assert_eq!(verify_tile_pages_per_split(65), 3);
+        assert_eq!(verify_tile_pages_per_split(257), 11);
+        assert_eq!(verify_tile_pages_per_split(8_192), 342);
+        for pages in 1..9_000 {
+            let per_split = verify_tile_pages_per_split(pages);
+            assert!(pages.div_ceil(per_split) <= MAX_SPLITS, "{pages}");
+        }
+    }
+
+    fn lane(committed: u32, rows: u32) -> TqHbVerifyLane {
+        TqHbVerifyLane {
+            slot: 3,
+            committed,
+            rows,
+            first_row: 16,
+        }
+    }
+
+    #[test]
+    fn a_window_is_cut_where_its_rows_ask_for_two_split_lengths() {
+        // Inside a page, and across a page boundary with one split length.
+        for (committed, rows) in [
+            (0, 8),
+            (100, 8),
+            (28, 8),
+            (1_531, 1),
+            (1_536, 8),
+            (5_000, 3),
+        ] {
+            let window = lane(committed, rows);
+            let tiles: Vec<_> = lane_tiles(2, &window).collect();
+            let pages = (committed + rows).div_ceil(PAGE_TOKENS);
+            let per_split = verify_tile_pages_per_split(pages);
+            assert_eq!(
+                tiles,
+                [TqHbVerifyTileGpu {
+                    slot: 3,
+                    committed,
+                    rows,
+                    first_row: 16,
+                    lane: 2,
+                    row: 0,
+                    owned: VERIFY_TILE_ROWS,
+                    splits: pages.div_ceil(per_split),
+                    per_split,
+                }],
+                "{committed}+{rows}"
+            );
+        }
+        // Tokens 1,531..1,535 end page 47 (48 pages, runs of 2); tokens
+        // 1,536.. open page 48 (49 pages, runs of 3).
+        let tiles: Vec<_> = lane_tiles(1, &lane(1_531, 8)).collect();
+        assert_eq!(
+            tiles,
+            [
+                TqHbVerifyTileGpu {
+                    slot: 3,
+                    committed: 1_531,
+                    rows: 5,
+                    first_row: 16,
+                    lane: 1,
+                    row: 0,
+                    owned: 5,
+                    splits: 24,
+                    per_split: 2,
+                },
+                TqHbVerifyTileGpu {
+                    slot: 3,
+                    committed: 1_536,
+                    rows: 3,
+                    first_row: 21,
+                    lane: 1,
+                    row: 5,
+                    owned: 3,
+                    splits: 17,
+                    per_split: 3,
+                },
+            ]
+        );
+        assert_eq!(verify_tile_slot_splits(&[lane(1_531, 8)], 4_096), 24);
+        assert_eq!(verify_tile_slot_splits(&[lane(1_536, 8)], 4_096), 17);
+        // Every token's tile uses the split length of the token's own page
+        // count, at every row of every window.
+        for committed in 0..9_100u32 {
+            for rows in [1, 5, 8] {
+                for tile in lane_tiles(0, &lane(committed, rows)) {
+                    for row in 0..tile.rows {
+                        let pages = (tile.committed + row + 1).div_ceil(PAGE_TOKENS);
+                        assert_eq!(tile.per_split, verify_tile_pages_per_split(pages));
+                    }
+                    assert!(
+                        tile.row + tile.rows <= rows && tile.row + tile.owned <= VERIFY_TILE_ROWS
+                    );
+                }
+                let covered: u32 = lane_tiles(0, &lane(committed, rows)).map(|t| t.rows).sum();
+                assert_eq!(covered, rows);
+            }
         }
     }
 
@@ -650,7 +780,8 @@ mod tests {
         };
         assert!(shape.supported());
         let sizes = verify_tile_scratch_bytes(&shape, 4, 22);
-        assert_eq!(sizes.queries, 4 * 4 * 48 * 256 * 2);
+        // Seven rows of six query heads past the last tile.
+        assert_eq!(sizes.queries, (4 * 4 * 48 + 7 * 6) * 256 * 2);
         assert_eq!(sizes.partials, 4 * 4 * 22 * 48 * 256 * 4);
         assert_eq!(sizes.statistics, 4 * 4 * 22 * 48 * 2 * 4);
         assert_eq!(sizes.attention, 4 * 8 * 24 * 256 * 4);

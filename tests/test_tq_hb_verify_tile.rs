@@ -34,8 +34,8 @@
 
 use mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_sigmoid_mul_f32;
 use mlx_native::ops::tq_hb_verify_tile::{
-    tq_hb_verify_tile_attention, tq_hb_verify_tile_available, verify_tile_scratch_bytes,
-    verify_tile_slot_splits, verify_tile_splits, TqHbVerifyLane, TqHbVerifyTileCache,
+    tq_hb_verify_tile_attention, tq_hb_verify_tile_available, verify_tile_pages_per_split,
+    verify_tile_scratch_bytes, verify_tile_slot_splits, TqHbVerifyLane, TqHbVerifyTileCache,
     TqHbVerifyTileScratch, TqHbVerifyTileShape, PAGE_TOKENS, VERIFY_TILE_ROWS,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -518,7 +518,7 @@ fn check_reference(
     let mut worst_definition = 0.0f64;
     let (mut pooled_error, mut pooled_signal, mut worst_head) = (0.0f64, 0.0f64, 0.0f64);
     for (lane_index, lane) in lanes.iter().enumerate() {
-        let splits = verify_tile_splits(lane.committed, cache.capacity) as usize;
+        let splits = verify_tile_slot_splits(&[*lane], cache.capacity) as usize;
         for row in 0..lane.rows as usize {
             let packed = lane.first_row as usize + row;
             let visible = lane.committed as usize + row + 1;
@@ -1076,4 +1076,247 @@ fn invalid_steps_are_rejected() {
         .is_err(),
         "group of four"
     );
+}
+
+/// A slot's cache and scratch kept on the device across many steps, with a
+/// query and a gate per position, for sweeps of window starts.
+struct Sweep {
+    geometry: Geometry,
+    capacity: u32,
+    k_packed: MlxBuffer,
+    k_norms: MlxBuffer,
+    v_packed: MlxBuffer,
+    v_norms: MlxBuffer,
+    q_rows: MlxBuffer,
+    gate_rows: MlxBuffer,
+    output: MlxBuffer,
+    queries: MlxBuffer,
+    partials: MlxBuffer,
+    statistics: MlxBuffer,
+    attention: MlxBuffer,
+    /// Queries and gates of positions `p % SWEEP_PERIOD`.
+    q_table: Vec<f32>,
+    gate_table: Vec<f32>,
+}
+
+/// Positions `p` and `p + SWEEP_PERIOD` share a query and a gate.
+const SWEEP_PERIOD: usize = 61;
+/// The sweeps use one slot and up to four lanes of eight rows.
+const SWEEP_SLOT: u32 = 1;
+const SWEEP_WIDTH: u32 = 32;
+
+impl Sweep {
+    fn new(gpu: &Gpu, geometry: Geometry, capacity: u32, rng: &mut Xor) -> Self {
+        let device = &gpu.device;
+        let cache = Cache::random(geometry, capacity, (4.0, 40.0), rng);
+        let q_total = geometry.n_heads as usize * HD;
+        let shape = geometry.shape(capacity, SWEEP_WIDTH);
+        // Four lanes whose windows end at the capacity: the largest scratch.
+        let last = TqHbVerifyLane {
+            slot: SWEEP_SLOT,
+            committed: capacity - 8,
+            rows: 8,
+            first_row: 0,
+        };
+        let sizes =
+            verify_tile_scratch_bytes(&shape, 4, verify_tile_slot_splits(&[last], capacity));
+        let rows = SWEEP_WIDTH as usize * q_total;
+        Self {
+            geometry,
+            capacity,
+            k_packed: buffer(device, DType::U8, &cache.k_codes),
+            k_norms: buffer(device, DType::F32, &cache.k_norms),
+            v_packed: buffer(device, DType::U8, &cache.v_codes),
+            v_norms: buffer(device, DType::F32, &cache.v_norms),
+            q_rows: buffer(device, DType::F32, &vec![0f32; rows]),
+            gate_rows: buffer(device, DType::F32, &vec![0f32; rows]),
+            output: buffer(device, DType::F32, &vec![f32::NAN; rows]),
+            queries: buffer(device, DType::F16, &vec![half::f16::NAN; sizes.queries / 2]),
+            partials: buffer(device, DType::F32, &vec![f32::NAN; sizes.partials / 4]),
+            statistics: buffer(device, DType::F32, &vec![f32::NAN; sizes.statistics / 4]),
+            attention: buffer(device, DType::F32, &vec![f32::NAN; sizes.attention / 4]),
+            q_table: (0..SWEEP_PERIOD * q_total).map(|_| rng.unit()).collect(),
+            gate_table: (0..SWEEP_PERIOD * q_total)
+                .map(|_| rng.range(-6.0, 6.0))
+                .collect(),
+        }
+    }
+
+    /// One step of windows `(start, rows)` of the sweep slot, one lane each.
+    /// Returns, per lane and window row, the digest of the token's rotated
+    /// attention and gated output bits.
+    fn step(&mut self, gpu: &mut Gpu, windows: &[(u32, u32)]) -> Vec<Vec<u64>> {
+        let geometry = self.geometry;
+        let q_total = geometry.n_heads as usize * HD;
+        let mut lanes = Vec::with_capacity(windows.len());
+        let mut first_row = 0;
+        for &(start, rows) in windows {
+            lanes.push(TqHbVerifyLane {
+                slot: SWEEP_SLOT,
+                committed: start,
+                rows,
+                first_row,
+            });
+            for row in 0..rows as usize {
+                let packed = (first_row as usize + row) * q_total;
+                let entry = (start as usize + row) % SWEEP_PERIOD * q_total;
+                self.q_rows.as_mut_slice::<f32>().expect("q")[packed..packed + q_total]
+                    .copy_from_slice(&self.q_table[entry..entry + q_total]);
+                self.gate_rows.as_mut_slice::<f32>().expect("gate")[packed..packed + q_total]
+                    .copy_from_slice(&self.gate_table[entry..entry + q_total]);
+            }
+            first_row += rows;
+        }
+        let shape = geometry.shape(self.capacity, SWEEP_WIDTH);
+        let mut encoder = gpu.device.command_encoder().expect("encoder");
+        tq_hb_verify_tile_attention(
+            &mut encoder,
+            &mut gpu.registry,
+            &gpu.device,
+            &self.q_rows,
+            &self.gate_rows,
+            &TqHbVerifyTileCache {
+                k_packed: &self.k_packed,
+                k_norms: &self.k_norms,
+                v_packed: &self.v_packed,
+                v_norms: &self.v_norms,
+            },
+            &self.output,
+            &TqHbVerifyTileScratch {
+                queries: &self.queries,
+                partials: &self.partials,
+                statistics: &self.statistics,
+                attention: &self.attention,
+            },
+            &shape,
+            &lanes,
+        )
+        .expect("encode sweep step");
+        encoder.commit_and_wait().expect("commit");
+        let output = self.output.as_slice::<f32>().expect("output");
+        let attention = self.attention.as_slice::<f32>().expect("attention");
+        lanes
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| {
+                (0..lane.rows as usize)
+                    .map(|row| {
+                        let gated = (lane.first_row as usize + row) * q_total;
+                        let rotated = (index * VERIFY_TILE_ROWS as usize + row) * q_total;
+                        output[gated..gated + q_total]
+                            .iter()
+                            .chain(&attention[rotated..rotated + q_total])
+                            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+                                (hash ^ u64::from(value.to_bits()))
+                                    .wrapping_mul(0x0000_0100_0000_01b3)
+                            })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// A token's bits are a function of its own position, query, gate and causal
+/// history: the same whichever row of whichever window verifies it. Every
+/// window start from 0 to past 9,000 tokens of history is run as a full
+/// window (four starts a step, one lane each), so every token is seen at
+/// every row index 0-7 and every page boundary, including those where the
+/// split length steps, is crossed at every alignment; then windows of every
+/// length and steps of one to three lanes are checked against the same table
+/// around every such step.
+#[test]
+fn a_token_is_independent_of_its_window_alignment() {
+    let Some(mut gpu) = gpu() else { return };
+    let mut rng = Xor(0x5EED_1234_ABCD_0005);
+    const CAPACITY: u32 = 9_152;
+    const LAST_START: u32 = CAPACITY - 8;
+    for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
+        let mut sweep = Sweep::new(&gpu, geometry, CAPACITY, &mut rng);
+        // digests[position][row index of the window that verified it]
+        let mut digests = vec![[None::<u64>; 8]; CAPACITY as usize];
+        let starts: Vec<u32> = (0..=LAST_START).collect();
+        for chunk in starts.chunks(4) {
+            let windows: Vec<(u32, u32)> = chunk.iter().map(|&start| (start, 8)).collect();
+            for (lane, rows) in sweep.step(&mut gpu, &windows).into_iter().enumerate() {
+                for (row, digest) in rows.into_iter().enumerate() {
+                    digests[chunk[lane] as usize + row][row] = Some(digest);
+                }
+            }
+        }
+        let mut differing = Vec::new();
+        for (position, seen) in digests.iter().enumerate() {
+            let expected = seen[0].or(seen[7]).expect("every position is verified");
+            let alignments = seen.iter().flatten().count();
+            // Positions 7..=LAST_START sit at all eight row indices.
+            assert!(
+                alignments == 8 || position < 7 || position > LAST_START as usize,
+                "{name}: position {position} seen at {alignments} alignments"
+            );
+            if seen.iter().flatten().any(|&digest| digest != expected) {
+                differing.push(position);
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "{name}: {} tokens depend on their window alignment, first at positions {:?}",
+            differing.len(),
+            &differing[..differing.len().min(8)]
+        );
+        let reference = |position: u32| {
+            let seen = &digests[position as usize];
+            seen[0].or(seen[7]).expect("verified position")
+        };
+
+        // Short windows and other lane counts, around every page boundary
+        // where the split length steps and a few plain starts.
+        let boundaries: Vec<u32> = (1..CAPACITY / 32)
+            .filter(|&pages| {
+                verify_tile_pages_per_split(pages) != verify_tile_pages_per_split(pages + 1)
+            })
+            .map(|pages| pages * 32)
+            .collect();
+        assert!(
+            boundaries.len() >= 10,
+            "{name}: {} split-length steps",
+            boundaries.len()
+        );
+        let mut checked = 0usize;
+        for &boundary in boundaries.iter().chain(&[32, 1_000, 5_555, LAST_START]) {
+            for rows in 1..=8u32 {
+                // Windows that end just before, at, and across the boundary.
+                for start in [
+                    boundary.saturating_sub(rows),
+                    (boundary + 1).saturating_sub(rows),
+                    boundary.saturating_sub(rows / 2),
+                    boundary,
+                ] {
+                    let start = start.min(CAPACITY - rows);
+                    let lanes = 1 + (start + rows) as usize % 3;
+                    let windows: Vec<(u32, u32)> = (0..lanes as u32)
+                        .map(|lane| ((start + 5 * lane).min(CAPACITY - rows), rows))
+                        .collect();
+                    for (lane, digests) in sweep.step(&mut gpu, &windows).into_iter().enumerate() {
+                        for (row, digest) in digests.into_iter().enumerate() {
+                            let position = windows[lane].0 + row as u32;
+                            assert_eq!(
+                                digest,
+                                reference(position),
+                                "{name}: position {position} as row {row} of a {rows}-row window \
+                                 at {} in a {lanes}-lane step",
+                                windows[lane].0
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{name}: {} tokens bitwise equal at every row index over window starts 0..={LAST_START} \
+             ({} split-length steps); {checked} rows of 1-8 row windows in 1-3 lane steps equal",
+            CAPACITY as usize,
+            boundaries.len()
+        );
+    }
 }
