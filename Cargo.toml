@@ -113,6 +113,14 @@ name = "bench_qwen_dense_ffn"
 harness = false
 
 [[bench]]
+name = "bench_qwen_delta_proj"
+harness = false
+
+[[bench]]
+name = "bench_qwen_delta_core"
+harness = false
+
+[[bench]]
 name = "bench_decode_qmatmul_shapes"
 harness = false
 
