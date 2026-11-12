@@ -140,6 +140,11 @@ pub struct PreparedGgufWeight {
 }
 
 impl PreparedGgufWeight {
+    /// K-split count of this weight (see [`PreparedGgufWeight`]).
+    pub fn splits(&self) -> u32 {
+        self.splits
+    }
+
     fn split_schedule(&self, rows: u32) -> SplitSchedule {
         if rows.div_ceil(TILE_ROWS) <= self.split_grid_row_tiles {
             SplitSchedule::Grid
@@ -388,6 +393,7 @@ pub fn dispatch_repacked_gguf_mm(
         output,
         params,
         DType::F32,
+        None,
     )
 }
 
@@ -416,6 +422,43 @@ pub fn dispatch_repacked_gguf_mm_bf16_input(
         output,
         params,
         DType::BF16,
+        None,
+    )
+}
+
+/// [`dispatch_repacked_gguf_mm_bf16_input`] as exactly one kernel pass per
+/// full-tile and partial-tile group, whatever the row count: every
+/// threadgroup walks all K splits of its column tile and adds each finished
+/// split into the output, in the split-grid reduce order. The output bits are
+/// those of [`dispatch_repacked_gguf_mm_bf16_input`].
+///
+/// The pass uses neither the prepared scratch nor a reduce pass, so it needs
+/// no memory barrier of its own and products issued without one overlap on
+/// the GPU. It is meant for the projections of one activation that are issued
+/// together: a product alone at few rows has too few threadgroups to fill the
+/// GPU, which is why the default entry splits K across threadgroups there,
+/// but several products in one wave fill it jointly and then the split-grid
+/// passes, their reduce passes and the barriers between them are pure
+/// latency.
+pub fn dispatch_repacked_gguf_mm_bf16_input_one_pass(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    prepared: &PreparedGgufWeight,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    dispatch_repacked_gguf_mm_typed(
+        encoder,
+        registry,
+        device,
+        input,
+        prepared,
+        output,
+        params,
+        DType::BF16,
+        Some(SplitSchedule::Serial),
     )
 }
 
@@ -429,6 +472,7 @@ fn dispatch_repacked_gguf_mm_typed(
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
     input_dtype: DType,
+    schedule: Option<SplitSchedule>,
 ) -> Result<()> {
     if params.m == 0 || input.dtype() != input_dtype || output.dtype() != DType::F32 {
         return Err(MlxError::InvalidArgument(format!(
@@ -450,7 +494,7 @@ fn dispatch_repacked_gguf_mm_typed(
         output,
         params.m,
         input_dtype,
-        prepared.split_schedule(params.m),
+        schedule.unwrap_or_else(|| prepared.split_schedule(params.m)),
     )
 }
 
@@ -1214,6 +1258,56 @@ mod tests {
                         harness.run(&batch, dtype) == reference[first * n..(first + m) * n],
                         "{name} {dtype:?}: rows {first}..{} computed alone differ from their bits in the {POOL}-row batch",
                         first + m
+                    );
+                }
+            }
+        }
+    }
+
+    /// The one-pass entry gives the default entry's bits at every decode row
+    /// count, and two of its products need no barrier between them.
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn one_pass_entry_is_bitwise_the_default_entry() {
+        // The Qwen3.8 and Qwen3.6 DeltaNet and attention input projections,
+        // with the fused alpha/beta weights.
+        for (name, n, k, ggml_type, splits) in [
+            ("qwen38-ab", 128, 5_120, GgmlType::Q4_K, 8),
+            ("qwen38-qkv", 10_240, 5_120, GgmlType::Q6_K, 2),
+            ("qwen38-z", 6_144, 5_120, GgmlType::Q4_K, 4),
+            ("qwen38-kv", 1_024, 5_120, GgmlType::Q6_K, 8),
+            ("qwen36-ab", 64, 2_048, GgmlType::Q4_K, 4),
+            ("qwen36-qkv", 8_192, 2_048, GgmlType::Q4_K, 2),
+            ("qwen36-z", 4_096, 2_048, GgmlType::Q4_K, 4),
+            ("qwen36-kv", 512, 2_048, GgmlType::Q6_K, 4),
+        ] {
+            let mut harness = Harness::new(ggml_type, n, k);
+            assert_eq!(harness.prepared.splits(), splits, "{name}");
+            for m in [1, 8, 16, 24, 31, 32, 33, 64] {
+                let rows: Vec<usize> = (0..m).collect();
+                let input = harness.input(&rows, DType::BF16);
+                let reference = harness.run_input(&input);
+                assert!(reference.iter().any(|&bits| bits != 0));
+                let outputs = [harness.output(m), harness.output(m)];
+                let params = harness.params(m);
+                let mut encoder = harness.device.command_encoder().unwrap();
+                for output in &outputs {
+                    dispatch_repacked_gguf_mm_bf16_input_one_pass(
+                        &mut encoder,
+                        &mut harness.registry,
+                        &harness.device,
+                        &input,
+                        &harness.prepared,
+                        output,
+                        &params,
+                    )
+                    .unwrap();
+                }
+                encoder.commit_and_wait().unwrap();
+                for output in &outputs {
+                    assert!(
+                        output.as_slice::<u32>().unwrap() == reference,
+                        "{name} M={m}: the one-pass product differs from the default entry"
                     );
                 }
             }
