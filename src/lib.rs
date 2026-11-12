@@ -66,6 +66,7 @@ mod residency;
 mod ggml_routing_policy;
 pub mod gguf;
 pub mod kernel_profile;
+pub mod command_timeline;
 pub mod submission_observer;
 pub mod graph;
 pub mod metal_capture;
