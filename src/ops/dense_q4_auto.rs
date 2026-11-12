@@ -21,7 +21,8 @@ use crate::error::{MlxError, Result};
 use crate::ggml_capability::{GgmlRoutingPolicy, GgmlTensorMmPreference};
 use crate::kernel_registry::{KernelPipelineIdentity, KernelRegistry};
 use crate::ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml_with_policy, GgmlQuantizedMatmulParams, GgmlType,
+    dense_mm_large_tile_shape, quantized_matmul_ggml_with_policy, GgmlQuantizedMatmulParams,
+    GgmlType,
 };
 
 pub use crate::ops::dense_q4_acceptance::{
@@ -371,7 +372,12 @@ pub(crate) fn select_route(
             source: DenseQ4DecisionSource::IneligibleCompatibilityFallback,
         };
     }
-    if !routing.allow_dense_large_tile_mm {
+    // Ordinary dispatch sends exactly 32 rows through tensor-v1 whatever the
+    // frozen plan recorded for that row count, exactly as it does when the
+    // policy disables the large tile. Calibration still proves and times a
+    // declared 32-row shape through its forced routes; that decision is
+    // evidence, not dispatch authority.
+    if !routing.allow_dense_large_tile_mm || !dense_mm_large_tile_shape(shape.m) {
         return DenseQ4DispatchDecision {
             route: DenseQ4Route::CompatibilityTensorV1,
             source: DenseQ4DecisionSource::IneligibleCompatibilityFallback,

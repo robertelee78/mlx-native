@@ -2,8 +2,8 @@
 
 use half::f16;
 use mlx_native::{
-    dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test, DType, GgmlQuantizedMatmulParams,
-    GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
+    dispatch_mm_q4_0_tensor_64x32_for_test, dispatch_mm_q4_0_tensor_v2_for_test, DType,
+    GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
 };
 
 #[derive(Clone, Copy)]
@@ -160,8 +160,10 @@ fn check_shape(
         ggml_type: GgmlType::Q4_0,
     };
 
+    // The control names V2 rather than following the production dispatcher,
+    // which sends exactly 32 rows through tensor-v1.
     let mut encoder = device.command_encoder().expect("create control encoder");
-    dispatch_mm_for_test(
+    dispatch_mm_q4_0_tensor_v2_for_test(
         &mut encoder,
         registry,
         device,
@@ -170,10 +172,8 @@ fn check_shape(
         &control,
         &params,
     )
-    .expect("dispatch current V2 control");
-    encoder
-        .commit_and_wait()
-        .expect("complete current V2 control");
+    .expect("dispatch V2 control");
+    encoder.commit_and_wait().expect("complete V2 control");
 
     let mut encoder = device.command_encoder().expect("create candidate encoder");
     dispatch_mm_q4_0_tensor_64x32_for_test(

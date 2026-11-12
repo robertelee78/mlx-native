@@ -182,3 +182,21 @@ after B may reuse process timing metadata but must reprove A's current buffers.
 Arbitrary tails or undeclared runtime shapes remain on CompatibilityV2. The
 integration must deduplicate by `(N, K)` base shape, not by codec alone, and
 must never retain borrowed weight pointers in a process-global plan or cache.
+
+## Exactly 32 rows since 0.21.0
+
+Since 0.21.0 the dense MM dispatcher sends exactly 32 rows through tensor-v1
+whenever the large-tile policy is enabled. That rule outranks the frozen plan.
+A declared 32-row shape is still proved and timed through the forced V2 and
+Tensor64x32 routes, and its decision is still recorded in the receipt and
+plan, but ordinary dispatch encodes tensor-v1 and `trace_dense_q4_auto`
+reports `CompatibilityTensorV1` with `IneligibleCompatibilityFallback`.
+
+Tensor-v1 stages activations as half, so its output is not bitwise V2. The
+candidate's bitwise control is therefore the forced V2 route
+(`dispatch_mm_q4_0_tensor_v2_for_test`), never the production dispatcher.
+
+The receipts above predate the rule: their 32-row candidate cells describe
+calibration, not what is dispatched now. Whether a frozen Tensor64x32 decision
+should outrank tensor-v1 at 32 rows is undecided; it needs a tensor-v1 versus
+Tensor64x32 measurement at that row count.

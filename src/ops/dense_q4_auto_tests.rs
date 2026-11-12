@@ -265,3 +265,62 @@ fn route_plan_cannot_cross_registry_activation_authority() {
         .is_err());
     assert!(target.dense_q4_plan().is_none());
 }
+
+#[test]
+fn exactly_32_rows_is_tensor_v1_whatever_the_frozen_plan_recorded() {
+    let device = MlxDevice::new().expect("Metal device");
+    let mut registry = KernelRegistry::new();
+    let routing = GgmlRoutingPolicy::default();
+    let decide = |registry: &KernelRegistry, m: u32| {
+        select_route(
+            registry,
+            &device,
+            &params(m, 3072, 768, GgmlType::Q4_0),
+            1,
+            true,
+            &routing,
+        )
+    };
+    let tensor_v1 = DenseQ4DispatchDecision {
+        route: DenseQ4Route::CompatibilityTensorV1,
+        source: DenseQ4DecisionSource::IneligibleCompatibilityFallback,
+    };
+    let unplanned = DenseQ4DispatchDecision {
+        route: DenseQ4Route::CompatibilityV2,
+        source: DenseQ4DecisionSource::NoPlanCompatibilityFallback,
+    };
+    assert_eq!(decide(&registry, 31), unplanned);
+    assert_eq!(decide(&registry, 32), tensor_v1);
+    assert_eq!(decide(&registry, 33), unplanned);
+
+    let shape = |m| DenseQ4Shape {
+        m,
+        n: 3072,
+        k: 768,
+        batch: 1,
+        input_layout: DenseQ4InputLayout::Contiguous,
+    };
+    let plan = DenseQ4RoutePlan {
+        plan_id: "candidate-at-32-and-64".into(),
+        build_fingerprint: "test-build".into(),
+        device_name: device.name(),
+        device_registry_id: device.registry_id(),
+        registry_authority_id: registry.dense_q4_auto.registry_authority_id(),
+        activation_epoch: 1,
+        decisions: HashMap::from([
+            (shape(32), DenseQ4Route::Tensor64x32),
+            (shape(64), DenseQ4Route::Tensor64x32),
+        ]),
+    };
+    registry
+        .install_prevalidated_dense_q4_plan(Arc::new(plan))
+        .expect("install the test plan");
+    assert_eq!(decide(&registry, 32), tensor_v1);
+    assert_eq!(
+        decide(&registry, 64),
+        DenseQ4DispatchDecision {
+            route: DenseQ4Route::Tensor64x32,
+            source: DenseQ4DecisionSource::FrozenPlan,
+        }
+    );
+}

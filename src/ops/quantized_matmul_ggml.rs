@@ -1728,6 +1728,42 @@ pub fn dispatch_mm_q4_0_tensor_64x32_for_test(
     )
 }
 
+/// Test-only Q4_0 tensor-MM compatibility V2 route with its 64-output by
+/// 128-token tile at every row count.
+///
+/// [`dispatch_mm_for_test`] follows the production dispatcher, which sends
+/// exactly 32 rows through tensor-v1 and stages activations as half there.
+/// The 64x32 candidate's bitwise control is V2, so evidence names it here.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mm_q4_0_tensor_v2_for_test(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<()> {
+    validate_native_quantized_dtypes(
+        "dispatch_mm_q4_0_tensor_v2_for_test",
+        input,
+        weight,
+        output,
+    )?;
+    validate_mm_for_test(params)?;
+    dispatch_mm_q4_route_internal(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        params,
+        DenseQ4Route::CompatibilityV2,
+    )
+}
+
 /// Test-only helper that forces the non-tensor simdgroup-MMA fallback.
 /// This proves the path used on devices without Metal tensor support while
 /// leaving the production capability probe and routing unchanged.
@@ -2533,8 +2569,14 @@ fn dispatch_mm_impl(
     //   decode m=1 unaffected (V2 only fires at m > MM_ROUTING_THRESHOLD=8)
     // 3457/0/11 unit tests pass. Default ON except at exactly 32 rows;
     // opt-out globally via `HF2Q_LARGE_TILE_MM=0` / `false` / `off`.
-    let use_v2_large_tile =
-        use_tensor && routing.allow_dense_large_tile_mm && dense_mm_large_tile_shape(params.m);
+    //
+    // A forced Q4 route names its kernel for calibration proofs and evidence
+    // tooling, so the 32-row tensor-v1 default never replaces it: every
+    // declared row count, including 32, must encode the exact route it asked
+    // for or fail.
+    let use_v2_large_tile = use_tensor
+        && routing.allow_dense_large_tile_mm
+        && (forced_q4_route.is_some() || dense_mm_large_tile_shape(params.m));
     let q4_decision = dense_q4_auto::select_route(
         registry,
         device,
@@ -2549,6 +2591,11 @@ fn dispatch_mm_impl(
         && batch.route_batch == 1
         && input_strides.is_none()
         && q4_route == DenseQ4Route::Tensor64x32;
+    if forced_q4_route == Some(DenseQ4Route::CompatibilityV2) && !use_v2_large_tile {
+        return Err(MlxError::InvalidArgument(
+            "forced Q4 tensor V2 route is unavailable for this device".into(),
+        ));
+    }
     if forced_q4_route == Some(DenseQ4Route::Tensor64x32) && !use_q4_short_tile {
         return Err(MlxError::InvalidArgument(
             "forced Q4 tensor 64x32 route is unavailable for this device or layout".into(),

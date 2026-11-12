@@ -2,8 +2,8 @@
 
 use half::f16;
 use mlx_native::{
-    dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test, DType, GgmlQuantizedMatmulParams,
-    GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
+    dispatch_mm_q4_0_tensor_64x32_for_test, dispatch_mm_q4_0_tensor_v2_for_test, DType,
+    GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
 };
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -225,7 +225,7 @@ fn run_once(
     let started = Instant::now();
     match route {
         Route::CurrentV2 => {
-            dispatch_mm_for_test(
+            dispatch_mm_q4_0_tensor_v2_for_test(
                 &mut encoder,
                 registry,
                 device,
