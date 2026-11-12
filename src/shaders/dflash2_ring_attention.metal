@@ -1,8 +1,17 @@
 // DFlash2 draft attention over the persistent K/V rings, read in place.
 //
-// The split/reduce structure and the online softmax are derived from Splash's
-// Apache-2.0 draft attention (https://github.com/incoai/splash, commit
-// 031a25a6: runtime/metal/kernels/decode/draft.metal).
+// Portions of this file are derived from Splash
+// (https://github.com/incoai/splash, commit 031a25a6), Apache-2.0 licensed.
+// Source: runtime/metal/kernels/decode/draft.metal (the attention split and
+// reduce phases).
+// Modifications: slot-major value rings multiplied without a transpose; all
+// lanes' rings and lengths in one buffer each; current rows packed by a
+// kernel of this file; the softmax row state in registers, so the split
+// kernel holds 16,384 bytes of threadgroup memory; exp instead of fast::exp;
+// the reduce writes the row-major rows the output projection reads.
+//
+// Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
+// root.
 //
 // One threadgroup runs one split of one KV head of one lane: the head's four
 // query heads over the lane's eight query rows, as 32 attention rows. The
@@ -118,10 +127,15 @@ kernel void dflash2_ring_attention_split(
     device float *partial =
         all_partials + ((ulong(batch) * p.kv_heads + head) * kSplits + split) * kPartialFloats;
 
+    // The kernel's only threadgroup memory, 16,384 bytes: shader validation
+    // doubles a kernel's static threadgroup memory and the device allows
+    // 32,768.
     threadgroup float score_storage[M * N];
-    threadgroup float row_max[M];
-    threadgroup float row_sum[M];
-    threadgroup float previous_scale[M];
+    // Softmax state of the rows this simdgroup owns, matrix rows
+    // simd_group + 8 j. Every thread of the simdgroup computes the same
+    // values from simdgroup reductions, so they stay in registers.
+    constexpr ushort Owned = M / 8;
+    float row_max[Owned], row_sum[Owned], row_scale[Owned];
 
     const uint common_start = cache_length >= window - 1 ? cache_length - (window - 1) : 0;
     const uint old_count = cache_length - common_start;
@@ -153,11 +167,10 @@ kernel void dflash2_ring_attention_split(
     auto running = pv.template get_destination_cooperative_tensor<
         decltype(p0), decltype(first_v0), float>();
     for (ushort i = 0; i < running.get_capacity(); ++i) running[i] = 0.0f;
-    if (thread_index < M) {
-        row_max[thread_index] = -INFINITY;
-        row_sum[thread_index] = 0.0f;
+    for (ushort owned = 0; owned < Owned; ++owned) {
+        row_max[owned] = -INFINITY;
+        row_sum[owned] = 0.0f;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint tile = split; tile < live_tiles; tile += kSplits) {
         const uint slot = (tile < wrapped ? tile : resume + tile - wrapped) * N;
@@ -177,8 +190,8 @@ kernel void dflash2_ring_attention_split(
         scores.store(pt.slice<N, M>(0, 0));
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (ushort first = 0; first < M; first += 8) {
-            const ushort matrix_row = first + simd_group;
+        for (ushort owned = 0; owned < Owned; ++owned) {
+            const ushort matrix_row = owned * 8 + simd_group;
             const uint query_position = cache_length + matrix_row % kRows;
             const uint row_start =
                 query_position >= window - 1 ? query_position - (window - 1) : 0;
@@ -196,22 +209,20 @@ kernel void dflash2_ring_attention_split(
                 tile_max = max(tile_max, local_scores[i]);
             }
             tile_max = simd_max(tile_max);
-            const float next_max = max(row_max[matrix_row], tile_max);
+            const float next_max = max(row_max[owned], tile_max);
             // A row with no visible key so far keeps its running state instead
             // of scaling it by exp(-inf - -inf).
             const bool empty = next_max == -INFINITY;
-            const float scale = empty ? 1.0f : exp(row_max[matrix_row] - next_max);
+            const float scale = empty ? 1.0f : exp(row_max[owned] - next_max);
             float tile_sum = 0.0f;
             for (ushort i = 0; i < 4; ++i) {
                 local_scores[i] = empty ? 0.0f : exp(local_scores[i] - next_max);
                 tile_sum += local_scores[i];
             }
             tile_sum = simd_sum(tile_sum);
-            if (lane == 0) {
-                previous_scale[matrix_row] = scale;
-                row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
-                row_max[matrix_row] = next_max;
-            }
+            row_scale[owned] = scale;
+            row_sum[owned] = row_sum[owned] * scale + tile_sum;
+            row_max[owned] = next_max;
             for (ushort i = 0; i < 4; ++i)
                 score_storage[matrix_row * N + lane + i * 32] = local_scores[i];
         }
@@ -231,9 +242,17 @@ kernel void dflash2_ring_attention_split(
             for (ushort i = 0; i < tile_output.get_capacity(); ++i)
                 tile_output[i] += chunk_output[i];
         }
+        // The probabilities are consumed; their storage now carries each
+        // row's rescale factor to the threads holding that row's sums.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            for (ushort owned = 0; owned < Owned; ++owned)
+                score_storage[owned * 8 + simd_group] = row_scale[owned];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (ushort i = 0; i < running.get_capacity(); ++i) {
             const auto index = running.get_multidimensional_index(i);
-            running[i] = running[i] * previous_scale[index[1]] + tile_output[i];
+            running[i] = running[i] * score_storage[index[1]] + tile_output[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -241,7 +260,10 @@ kernel void dflash2_ring_attention_split(
     if (split + 1 == kSplits) {
         // The eight current rows: every one is visible to every query row.
         constexpr ushort CurrentN = kRows, CurrentV = kCurrentValues;
+        // Probabilities [M][CurrentV], raw scores [M][CurrentN], then each
+        // row's rescale factor [M].
         threadgroup float *current_raw_scores = score_storage + M * CurrentV;
+        threadgroup float *current_scale = current_raw_scores + M * CurrentN;
         auto current_scores = tensor(current_raw_scores, dextents<int, 2>{CurrentN, M},
                                      array<int, 2>{1, CurrentN});
         constexpr auto current_qk_descriptor =
@@ -264,21 +286,19 @@ kernel void dflash2_ring_attention_split(
         current.store(current_scores.slice<CurrentN, M>(0, 0));
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (ushort first = 0; first < M; first += 8) {
-            const ushort matrix_row = first + simd_group;
+        for (ushort owned = 0; owned < Owned; ++owned) {
+            const ushort matrix_row = owned * 8 + simd_group;
             const float score = lane < CurrentN
                 ? current_raw_scores[matrix_row * CurrentN + lane] * kScale
                 : -INFINITY;
             const float tile_max = simd_max(score);
-            const float next_max = max(row_max[matrix_row], tile_max);
-            const float scale = exp(row_max[matrix_row] - next_max);
+            const float next_max = max(row_max[owned], tile_max);
+            const float scale = exp(row_max[owned] - next_max);
             const float probability = lane < CurrentN ? exp(score - next_max) : 0.0f;
             const float tile_sum = simd_sum(probability);
-            if (lane == 0) {
-                previous_scale[matrix_row] = scale;
-                row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
-                row_max[matrix_row] = next_max;
-            }
+            row_sum[owned] = row_sum[owned] * scale + tile_sum;
+            row_max[owned] = next_max;
+            if (lane == 0) current_scale[matrix_row] = scale;
             if (lane < CurrentV) score_storage[matrix_row * CurrentV + lane] = probability;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -298,16 +318,18 @@ kernel void dflash2_ring_attention_split(
         current_pv.run(current_p0, current_v0, current_output);
         for (ushort i = 0; i < running.get_capacity(); ++i) {
             const auto index = running.get_multidimensional_index(i);
-            running[i] = running[i] * previous_scale[index[1]] + current_output[i];
+            running[i] = running[i] * current_scale[index[1]] + current_output[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     auto accumulator = tensor(partial, dextents<int, 2>{D, M}, array<int, 2>{1, D});
     running.store(accumulator.slice<D, M>(0, 0));
-    if (thread_index < M) {
-        partial[M * D + thread_index] = row_max[thread_index];
-        partial[M * D + M + thread_index] = row_sum[thread_index];
+    if (lane == 0) {
+        for (ushort owned = 0; owned < Owned; ++owned) {
+            partial[M * D + owned * 8 + simd_group] = row_max[owned];
+            partial[M * D + M + owned * 8 + simd_group] = row_sum[owned];
+        }
     }
 }
 

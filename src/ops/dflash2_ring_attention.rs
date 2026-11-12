@@ -5,8 +5,10 @@
 //! multiplies the ring where it lives: one threadgroup per (KV head, lane,
 //! split) walks its share of the live 128-slot ring tiles with an online
 //! softmax, the last split adds the eight current rows, and a reduce combines
-//! the splits in split order. The structure follows Splash (Apache-2.0,
-//! commit 031a25a6: `runtime/metal/kernels/decode/draft.metal`).
+//! the splits in split order.
+//!
+//! Portions derived from Splash commit 031a25a6 (Apache-2.0). See
+//! `src/shaders/dflash2_ring_attention.metal` for full attribution.
 //!
 //! Numerics contract: an attention row's bits depend on its own query, its
 //! lane's ring and current rows and its lane's context length. They do not
@@ -36,6 +38,8 @@ pub const DFLASH2_RING_ATTENTION_TILE: usize = 128;
 pub const DFLASH2_RING_ATTENTION_SPLITS: usize = 4;
 /// Current value rows per (lane, KV head): the eight rows and eight zero rows.
 pub const DFLASH2_RING_ATTENTION_CURRENT_VALUES: usize = 16;
+/// Lanes one dispatch takes, as the packed attention does.
+pub const DFLASH2_RING_ATTENTION_MAX_LANES: usize = 4;
 const ATTENTION_ROWS: usize = DFLASH2_RING_ATTENTION_GROUP_HEADS * DFLASH2_RING_ATTENTION_ROWS;
 const PARTIAL_FLOATS: usize = ATTENTION_ROWS * DFLASH2_RING_ATTENTION_HEAD_DIM + 2 * ATTENTION_ROWS;
 
@@ -70,9 +74,22 @@ pub fn dflash2_ring_attention_supports(
         && window % DFLASH2_RING_ATTENTION_TILE == 0
 }
 
+fn elements(dims: &[usize]) -> Result<usize> {
+    dims.iter()
+        .try_fold(1_usize, |count, dim| count.checked_mul(*dim))
+        .ok_or_else(|| {
+            MlxError::InvalidArgument(format!("DFlash2 ring attention size {dims:?} overflows"))
+        })
+}
+
 /// F32 elements of split partials for `lanes` lanes of `kv_heads` KV heads.
-pub fn dflash2_ring_attention_partial_elements(lanes: usize, kv_heads: usize) -> usize {
-    lanes * kv_heads * DFLASH2_RING_ATTENTION_SPLITS * PARTIAL_FLOATS
+pub fn dflash2_ring_attention_partial_elements(lanes: usize, kv_heads: usize) -> Result<usize> {
+    elements(&[
+        lanes,
+        kv_heads,
+        DFLASH2_RING_ATTENTION_SPLITS,
+        PARTIAL_FLOATS,
+    ])
 }
 
 pub struct DFlash2RingAttentionBuffers<'a> {
@@ -132,15 +149,24 @@ pub fn dispatch_dflash2_ring_attention(
     );
     const ROWS: usize = DFLASH2_RING_ATTENTION_ROWS;
     const DIM: usize = DFLASH2_RING_ATTENTION_HEAD_DIM;
-    if lanes == 0 || !dflash2_ring_attention_supports(q_heads, kv_heads, DIM, ROWS, window) {
+    if lanes == 0
+        || lanes > DFLASH2_RING_ATTENTION_MAX_LANES
+        || !dflash2_ring_attention_supports(q_heads, kv_heads, DIM, ROWS, window)
+    {
         return Err(MlxError::InvalidArgument(format!(
             "unsupported DFlash2 ring attention geometry: lanes={lanes}, q_heads={q_heads}, kv_heads={kv_heads}, window={window}"
         )));
     }
-    let query_elements = lanes * ROWS * q_heads * DIM;
-    let key_elements = lanes * ROWS * kv_heads * DIM;
-    let value_elements = lanes * kv_heads * DFLASH2_RING_ATTENTION_CURRENT_VALUES * DIM;
-    let ring_elements = lanes * kv_heads * window * DIM;
+    let query_elements = elements(&[lanes, ROWS, q_heads, DIM])?;
+    let key_elements = elements(&[lanes, ROWS, kv_heads, DIM])?;
+    let value_elements = elements(&[lanes, kv_heads, DFLASH2_RING_ATTENTION_CURRENT_VALUES, DIM])?;
+    let ring_elements = elements(&[lanes, kv_heads, window, DIM])?;
+    // The pack kernel counts its rows' elements in 32 bits.
+    if u32::try_from(query_elements.max(key_elements).max(value_elements)).is_err() {
+        return Err(MlxError::InvalidArgument(format!(
+            "DFlash2 ring attention of {lanes} lanes and {q_heads} query heads exceeds 32-bit element counts"
+        )));
+    }
     require(buffers.query, DType::F32, query_elements, "query")?;
     require(buffers.key, DType::F32, key_elements, "key")?;
     require(buffers.value, DType::F32, key_elements, "value")?;
@@ -173,11 +199,22 @@ pub fn dispatch_dflash2_ring_attention(
     require(
         buffers.partials,
         DType::F32,
-        dflash2_ring_attention_partial_elements(lanes, kv_heads),
+        dflash2_ring_attention_partial_elements(lanes, kv_heads)?,
         "partials",
     )?;
     require(buffers.output, DType::BF16, query_elements, "output")?;
 
+    // A kernel's static threadgroup memory is fixed when it is compiled (and
+    // doubled by shader validation); refuse before anything is encoded.
+    let limit = device.metal_device().max_threadgroup_memory_length();
+    let used = registry
+        .get_pipeline(SPLIT_KERNEL, device.metal_device())?
+        .static_threadgroup_memory_length();
+    if used > limit {
+        return Err(MlxError::InvalidArgument(format!(
+            "{SPLIT_KERNEL} needs {used} bytes of threadgroup memory; the device allows {limit}"
+        )));
+    }
     let pack = registry.get_pipeline(PACK_KERNEL, device.metal_device())?;
     encode_with_args(
         encoder,
@@ -237,8 +274,46 @@ mod tests {
 
     const ROWS: usize = DFLASH2_RING_ATTENTION_ROWS;
     const DIM: usize = DFLASH2_RING_ATTENTION_HEAD_DIM;
-    const Q_HEADS: usize = 8;
-    const KV_HEADS: usize = 2;
+
+    /// Query heads, KV heads and ring slots of one test attention.
+    #[derive(Clone, Copy, Debug)]
+    struct Shape {
+        q_heads: usize,
+        kv_heads: usize,
+        window: usize,
+    }
+
+    /// The served draft attention.
+    const SERVED: Shape = Shape {
+        q_heads: 32,
+        kv_heads: 8,
+        window: 2_048,
+    };
+    const SMALL: Shape = Shape {
+        q_heads: 8,
+        kv_heads: 2,
+        window: 2_048,
+    };
+    const SHORT_RING: Shape = Shape {
+        q_heads: 8,
+        kv_heads: 2,
+        window: 256,
+    };
+
+    impl Shape {
+        fn lane_elements(self) -> usize {
+            ROWS * self.q_heads * DIM
+        }
+
+        fn params(self, lanes: usize) -> DFlash2RingAttentionParams {
+            DFlash2RingAttentionParams {
+                lanes: lanes as u32,
+                q_heads: self.q_heads as u32,
+                kv_heads: self.kv_heads as u32,
+                window: self.window as u32,
+            }
+        }
+    }
 
     #[test]
     fn only_the_compiled_shape_is_supported() {
@@ -249,6 +324,89 @@ mod tests {
         assert!(!dflash2_ring_attention_supports(32, 8, 128, 4, 2_048));
         assert!(!dflash2_ring_attention_supports(32, 8, 128, 8, 2_000));
         assert!(!dflash2_ring_attention_supports(0, 0, 128, 8, 2_048));
+    }
+
+    #[test]
+    fn sizes_are_checked_before_anything_is_encoded() {
+        assert_eq!(
+            dflash2_ring_attention_partial_elements(4, 8).unwrap(),
+            4 * 8 * 4 * (32 * 128 + 64)
+        );
+        assert!(dflash2_ring_attention_partial_elements(usize::MAX, 2).is_err());
+
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let word = |dtype: DType| {
+            device
+                .alloc_buffer(4, dtype, vec![4 / dtype.size_of()])
+                .unwrap()
+        };
+        let (f32_word, bf16_word, u32_word) =
+            (word(DType::F32), word(DType::BF16), word(DType::U32));
+        let buffers = DFlash2RingAttentionBuffers {
+            query: &f32_word,
+            key: &f32_word,
+            value: &f32_word,
+            ring_keys: &bf16_word,
+            ring_values: &bf16_word,
+            cache_lengths: &u32_word,
+            queries: &bf16_word,
+            current_keys: &bf16_word,
+            current_values: &bf16_word,
+            partials: &f32_word,
+            output: &bf16_word,
+        };
+        let mut refuse = |params: DFlash2RingAttentionParams, expected: &str| {
+            let mut encoder = device.command_encoder().unwrap();
+            let error = dispatch_dflash2_ring_attention(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &buffers,
+                params,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{params:?}: {error}");
+        };
+        // More lanes than one dispatch takes.
+        refuse(
+            SERVED.params(DFLASH2_RING_ATTENTION_MAX_LANES + 1),
+            "geometry",
+        );
+        refuse(SERVED.params(0), "geometry");
+        // Element counts the pack kernel cannot index in 32 bits.
+        refuse(
+            DFlash2RingAttentionParams {
+                lanes: 4,
+                q_heads: 1 << 22,
+                kv_heads: 1 << 20,
+                window: 2_048,
+            },
+            "32-bit",
+        );
+        // Buffers smaller than the geometry.
+        refuse(SERVED.params(4), "at least");
+    }
+
+    /// Shader validation doubles a kernel's static threadgroup memory, and a
+    /// kernel over the device limit aborts under the Metal debug layer.
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn split_kernel_threadgroup_memory_fits_under_shader_validation() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let limit = device.metal_device().max_threadgroup_memory_length();
+        let used = registry
+            .get_pipeline(SPLIT_KERNEL, device.metal_device())
+            .unwrap()
+            .static_threadgroup_memory_length();
+        assert!(used <= limit, "{SPLIT_KERNEL}: {used} bytes exceed {limit}");
+        if std::env::var_os("MTL_SHADER_VALIDATION").is_none() {
+            assert!(
+                2 * used <= limit,
+                "{SPLIT_KERNEL}: {used} bytes leave no room for shader validation under {limit}"
+            );
+        }
     }
 
     fn random(state: &mut u64) -> f32 {
@@ -262,17 +420,17 @@ mod tests {
     #[derive(Clone)]
     struct Lane {
         length: u32,
-        /// `[ROWS][Q_HEADS][DIM]`
+        /// `[ROWS][q_heads][DIM]`
         query: Vec<f32>,
-        /// `[ROWS][KV_HEADS][DIM]`
+        /// `[ROWS][kv_heads][DIM]`
         key: Vec<f32>,
         value: Vec<f32>,
-        /// `[KV_HEADS][window][DIM]`
+        /// `[kv_heads][window][DIM]`
         ring_keys: Vec<f32>,
         ring_values: Vec<f32>,
     }
 
-    fn lane(window: usize, length: u32, seed: u64) -> Lane {
+    fn lane(shape: Shape, length: u32, seed: u64) -> Lane {
         let mut state = seed;
         let mut values = |count: usize, scale: f32| -> Vec<f32> {
             (0..count)
@@ -281,13 +439,13 @@ mod tests {
         };
         Lane {
             length,
-            query: values(ROWS * Q_HEADS * DIM, 4.0),
-            key: values(ROWS * KV_HEADS * DIM, 4.0),
-            value: values(ROWS * KV_HEADS * DIM, 2.0),
+            query: values(ROWS * shape.q_heads * DIM, 4.0),
+            key: values(ROWS * shape.kv_heads * DIM, 4.0),
+            value: values(ROWS * shape.kv_heads * DIM, 2.0),
             // Every slot holds data, so a slot outside the live window that is
             // not masked changes the result.
-            ring_keys: values(KV_HEADS * window * DIM, 4.0),
-            ring_values: values(KV_HEADS * window * DIM, 2.0),
+            ring_keys: values(shape.kv_heads * shape.window * DIM, 4.0),
+            ring_values: values(shape.kv_heads * shape.window * DIM, 2.0),
         }
     }
 
@@ -317,16 +475,33 @@ mod tests {
         buffer
     }
 
-    /// `[lanes][ROWS][Q_HEADS][DIM]` BF16 results as F32.
+    /// Scratch that holds NaN, as a reused workspace may: a result that reads
+    /// an element its command did not write is not finite.
+    fn nan_scratch(device: &MlxDevice, elements: usize, dtype: DType) -> MlxBuffer {
+        let mut buffer = device
+            .alloc_buffer(elements * dtype.size_of(), dtype, vec![elements])
+            .unwrap();
+        match dtype {
+            DType::F32 => buffer.as_mut_slice::<f32>().unwrap().fill(f32::NAN),
+            DType::BF16 => buffer.as_mut_slice::<bf16>().unwrap().fill(bf16::NAN),
+            other => panic!("no NaN scratch of {other}"),
+        }
+        buffer
+    }
+
+    /// `[lanes][ROWS][q_heads][DIM]` BF16 results as F32.
     fn attend(
         device: &MlxDevice,
         registry: &mut KernelRegistry,
-        window: usize,
-        lanes: &[Lane],
+        shape: Shape,
+        lanes: &[&Lane],
     ) -> Vec<f32> {
         let count = lanes.len();
         let concat = |field: fn(&Lane) -> &Vec<f32>| -> Vec<f32> {
-            lanes.iter().flat_map(|lane| field(lane).clone()).collect()
+            lanes
+                .iter()
+                .flat_map(|lane| field(lane).iter().copied())
+                .collect()
         };
         let query = f32_buffer(device, &concat(|lane| &lane.query));
         let key = f32_buffer(device, &concat(|lane| &lane.key));
@@ -344,23 +519,20 @@ mod tests {
         {
             *slot = lane.length;
         }
-        let scratch = |elements: usize, dtype: DType| {
-            device
-                .alloc_buffer(elements * dtype.size_of(), dtype, vec![elements])
-                .unwrap()
-        };
-        let query_elements = count * ROWS * Q_HEADS * DIM;
-        let queries = scratch(query_elements, DType::BF16);
-        let current_keys = scratch(count * KV_HEADS * ROWS * DIM, DType::BF16);
-        let current_values = scratch(
-            count * KV_HEADS * DFLASH2_RING_ATTENTION_CURRENT_VALUES * DIM,
+        let query_elements = count * shape.lane_elements();
+        let queries = nan_scratch(device, query_elements, DType::BF16);
+        let current_keys = nan_scratch(device, count * shape.kv_heads * ROWS * DIM, DType::BF16);
+        let current_values = nan_scratch(
+            device,
+            count * shape.kv_heads * DFLASH2_RING_ATTENTION_CURRENT_VALUES * DIM,
             DType::BF16,
         );
-        let partials = scratch(
-            dflash2_ring_attention_partial_elements(count, KV_HEADS),
+        let partials = nan_scratch(
+            device,
+            dflash2_ring_attention_partial_elements(count, shape.kv_heads).unwrap(),
             DType::F32,
         );
-        let output = scratch(query_elements, DType::BF16);
+        let output = nan_scratch(device, query_elements, DType::BF16);
         let mut encoder = device.command_encoder().unwrap();
         dispatch_dflash2_ring_attention(
             &mut encoder,
@@ -379,21 +551,25 @@ mod tests {
                 partials: &partials,
                 output: &output,
             },
-            DFlash2RingAttentionParams {
-                lanes: count as u32,
-                q_heads: Q_HEADS as u32,
-                kv_heads: KV_HEADS as u32,
-                window: window as u32,
-            },
+            shape.params(count),
         )
         .unwrap();
         encoder.commit_and_wait().unwrap();
-        output
+        let result: Vec<f32> = output
             .as_slice::<bf16>()
             .unwrap()
             .iter()
             .map(|value| value.to_f32())
-            .collect()
+            .collect();
+        assert!(
+            result.iter().all(|value| value.is_finite()),
+            "{shape:?}: a result read scratch its command did not write"
+        );
+        result
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
     }
 
     /// F64 attention of one lane and, per output element, the bound on a
@@ -403,18 +579,23 @@ mod tests {
     /// probability by a factor within `exp(+-2 score_error)`; the `keys`
     /// weighted values are added in F32; `exp` is good to a few ulp; and the
     /// result is rounded once to BF16.
-    fn reference(window: usize, lane: &Lane) -> (Vec<f64>, Vec<f64>) {
+    fn reference(shape: Shape, lane: &Lane) -> (Vec<f64>, Vec<f64>) {
+        let Shape {
+            q_heads,
+            kv_heads,
+            window,
+        } = shape;
         let scale = 1.0 / (DIM as f64).sqrt();
         let length = lane.length as usize;
-        let mut expected = vec![0.0_f64; ROWS * Q_HEADS * DIM];
-        let mut bound = vec![0.0_f64; ROWS * Q_HEADS * DIM];
+        let mut expected = vec![0.0_f64; shape.lane_elements()];
+        let mut bound = vec![0.0_f64; shape.lane_elements()];
         for row in 0..ROWS {
             let first = (length + row).saturating_sub(window - 1);
-            for head in 0..Q_HEADS {
+            for head in 0..q_heads {
                 let kv_head = head / DFLASH2_RING_ATTENTION_GROUP_HEADS;
-                let query = &lane.query[(row * Q_HEADS + head) * DIM..][..DIM];
+                let query = &lane.query[(row * q_heads + head) * DIM..][..DIM];
                 let ring = |position: usize| (kv_head * window + position % window) * DIM;
-                let current = |index: usize| (index * KV_HEADS + kv_head) * DIM;
+                let current = |index: usize| (index * kv_heads + kv_head) * DIM;
                 let keys: Vec<(&[f32], &[f32])> = (first..length)
                     .map(|position| {
                         (
@@ -435,8 +616,9 @@ mod tests {
                     let mut score = 0.0_f64;
                     let mut magnitude = 0.0_f64;
                     for (q, k) in query.iter().zip(*key) {
-                        score += f64::from(*q) * f64::from(*k);
-                        magnitude += (f64::from(*q) * f64::from(*k)).abs();
+                        let product = f64::from(*q) * f64::from(*k);
+                        score += product;
+                        magnitude += product.abs();
                     }
                     scores.push(score * scale);
                     score_magnitude = score_magnitude.max(magnitude * scale);
@@ -445,19 +627,22 @@ mod tests {
                 let weights: Vec<f64> = scores.iter().map(|s| (s - maximum).exp()).collect();
                 let total: f64 = weights.iter().sum();
                 let score_error = (DIM as f64 + 2.0) * 2.0_f64.powi(-24) * score_magnitude;
-                for dim in 0..DIM {
-                    let mut sum = 0.0_f64;
-                    let mut magnitude = 0.0_f64;
-                    for (weight, (_, value)) in weights.iter().zip(&keys) {
-                        sum += weight * f64::from(value[dim]);
-                        magnitude += weight * f64::from(value[dim]).abs();
+                let relative =
+                    (2.0 * score_error).exp_m1() + (keys.len() as f64 + 64.0) * 2.0_f64.powi(-23);
+                let mut sums = [0.0_f64; DIM];
+                let mut magnitudes = [0.0_f64; DIM];
+                for (weight, (_, value)) in weights.iter().zip(&keys) {
+                    for dim in 0..DIM {
+                        let value = f64::from(value[dim]);
+                        sums[dim] += weight * value;
+                        magnitudes[dim] += weight * value.abs();
                     }
-                    let at = (row * Q_HEADS + head) * DIM + dim;
-                    expected[at] = sum / total;
-                    let relative = (2.0 * score_error).exp_m1()
-                        + (keys.len() as f64 + 64.0) * 2.0_f64.powi(-23);
+                }
+                for dim in 0..DIM {
+                    let at = (row * q_heads + head) * DIM + dim;
+                    expected[at] = sums[dim] / total;
                     bound[at] = expected[at].abs() * 2.0_f64.powi(-8)
-                        + relative * magnitude / total
+                        + relative * magnitudes[dim] / total
                         + 2.0_f64.powi(-120);
                 }
             }
@@ -465,39 +650,109 @@ mod tests {
         (expected, bound)
     }
 
-    const LENGTHS: [u32; 8] = [0, 5, 300, 2_047, 2_048, 2_825, 10_000, 129];
+    /// Ring lengths per four-lane batch: empty, partial, one short of the
+    /// window, wrapped, and far past it.
+    const LENGTHS: [[u32; 4]; 2] = [[0, 5, 300, 2_047], [2_048, 2_825, 10_000, 129]];
+    /// The same at the served shape, with every tile and window boundary.
+    const SERVED_LENGTHS: [[u32; 4]; 6] = [
+        [0, 1, 7, 8],
+        [127, 128, 129, 300],
+        [2_039, 2_040, 2_046, 2_047],
+        [2_048, 2_049, 2_055, 2_056],
+        [2_175, 4_095, 4_096, 4_097],
+        [6_143, 10_000, 1_000_003, 5],
+    ];
+
+    fn assert_within_reference(
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        shape: Shape,
+        lanes: &[Lane],
+    ) -> Vec<f32> {
+        let actual = attend(device, registry, shape, &lanes.iter().collect::<Vec<_>>());
+        let per_lane = shape.lane_elements();
+        let mut worst = 0.0_f64;
+        for (index, lane) in lanes.iter().enumerate() {
+            let (expected, bound) = reference(shape, lane);
+            for at in 0..per_lane {
+                let error = (f64::from(actual[index * per_lane + at]) - expected[at]).abs();
+                assert!(
+                    error <= bound[at],
+                    "{shape:?} length {} element {at}: error {error} exceeds {}",
+                    lane.length,
+                    bound[at]
+                );
+                worst = worst.max(error / bound[at]);
+            }
+        }
+        assert!(worst > 0.0, "{shape:?}: reference comparison is vacuous");
+        actual
+    }
 
     #[cfg(mlx_native_has_metal_tensor_artifact)]
     #[test]
     fn attention_is_within_the_bound_of_the_f64_reference() {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
-        for (window, divisor) in [(2_048_usize, 1_u32), (256, 8)] {
-            for (batch, lengths) in LENGTHS.chunks(4).enumerate() {
+        for (shape, divisor) in [(SMALL, 1_u32), (SHORT_RING, 8)] {
+            for (batch, lengths) in LENGTHS.iter().enumerate() {
                 let lanes: Vec<Lane> = lengths
                     .iter()
                     .enumerate()
                     .map(|(index, length)| {
-                        lane(window, length / divisor, (batch * 4 + index) as u64 + 7)
+                        lane(shape, length / divisor, (batch * 4 + index) as u64 + 7)
                     })
                     .collect();
-                let actual = attend(&device, &mut registry, window, &lanes);
-                let per_lane = ROWS * Q_HEADS * DIM;
-                let mut worst = 0.0_f64;
-                for (index, lane) in lanes.iter().enumerate() {
-                    let (expected, bound) = reference(window, lane);
-                    for at in 0..per_lane {
-                        let error = (f64::from(actual[index * per_lane + at]) - expected[at]).abs();
-                        assert!(
-                            error <= bound[at],
-                            "window {window} length {} element {at}: error {error} exceeds {}",
-                            lane.length,
-                            bound[at]
-                        );
-                        worst = worst.max(error / bound[at]);
-                    }
+                assert_within_reference(&device, &mut registry, shape, &lanes);
+            }
+        }
+    }
+
+    /// The served 32-over-8-head attention on a 2,048-slot ring: reference,
+    /// repeat, and every lane alone and in two-, three- and four-lane
+    /// cohorts at other slots.
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn served_attention_matches_the_reference_alone_and_in_every_cohort() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let per_lane = SERVED.lane_elements();
+        for (set, lengths) in SERVED_LENGTHS.iter().enumerate() {
+            let lanes: Vec<Lane> = lengths
+                .iter()
+                .enumerate()
+                .map(|(index, length)| lane(SERVED, *length, (set * 4 + index) as u64 + 901))
+                .collect();
+            let base = assert_within_reference(&device, &mut registry, SERVED, &lanes);
+            let all: Vec<&Lane> = lanes.iter().collect();
+            assert_eq!(
+                bits(&attend(&device, &mut registry, SERVED, &all)),
+                bits(&base),
+                "set {set}: repeat differs"
+            );
+            let orders: [&[usize]; 10] = [
+                &[0],
+                &[1],
+                &[2],
+                &[3],
+                &[1, 0],
+                &[3, 2],
+                &[3, 0, 2],
+                &[1, 3, 0],
+                &[2, 3, 0, 1],
+                &[3, 2, 1, 0],
+            ];
+            for order in orders {
+                let cohort: Vec<&Lane> = order.iter().map(|index| &lanes[*index]).collect();
+                let moved = attend(&device, &mut registry, SERVED, &cohort);
+                for (slot, index) in order.iter().enumerate() {
+                    assert_eq!(
+                        bits(&moved[slot * per_lane..(slot + 1) * per_lane]),
+                        bits(&base[index * per_lane..(index + 1) * per_lane]),
+                        "set {set} lane {index} (length {}) differs at slot {slot} of {order:?}",
+                        lanes[*index].length
+                    );
                 }
-                assert!(worst > 0.0, "reference comparison is vacuous");
             }
         }
     }
@@ -507,36 +762,37 @@ mod tests {
     fn attention_rows_are_deterministic_and_independent_of_their_cohort() {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
-        let window = 2_048;
-        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-        let per_lane = ROWS * Q_HEADS * DIM;
+        let shape = SMALL;
+        let per_lane = shape.lane_elements();
+        let row_elements = shape.q_heads * DIM;
         let lanes: Vec<Lane> = [300_u32, 2_825, 0, 2_047]
             .iter()
             .enumerate()
-            .map(|(index, length)| lane(window, *length, index as u64 + 101))
+            .map(|(index, length)| lane(shape, *length, index as u64 + 101))
             .collect();
-        let base = attend(&device, &mut registry, window, &lanes);
+        let all: Vec<&Lane> = lanes.iter().collect();
+        let base = attend(&device, &mut registry, shape, &all);
         assert_eq!(
             bits(&base),
-            bits(&attend(&device, &mut registry, window, &lanes)),
+            bits(&attend(&device, &mut registry, shape, &all)),
             "repeat differs"
         );
 
-        // Every lane alone, in another slot beside other lanes, and in a
-        // narrower batch.
+        // Every lane alone, and in another slot beside other lanes.
+        let others: Vec<Lane> = (0..4)
+            .map(|other| lane(shape, 77 * other as u32 + 1_900, other as u64 + 211))
+            .collect();
         for (index, subject) in lanes.iter().enumerate() {
-            let alone = attend(&device, &mut registry, window, &[subject.clone()]);
+            let alone = attend(&device, &mut registry, shape, &[subject]);
             assert_eq!(
                 bits(&alone),
                 bits(&base[index * per_lane..(index + 1) * per_lane]),
                 "lane {index} depends on its batch"
             );
             let slot = 3 - index;
-            let mut others: Vec<Lane> = (0..4)
-                .map(|other| lane(window, 77 * other as u32 + 1_900, other as u64 + 211))
-                .collect();
-            others[slot] = subject.clone();
-            let moved = attend(&device, &mut registry, window, &others);
+            let mut cohort: Vec<&Lane> = others.iter().collect();
+            cohort[slot] = subject;
+            let moved = attend(&device, &mut registry, shape, &cohort);
             assert_eq!(
                 bits(&moved[slot * per_lane..(slot + 1) * per_lane]),
                 bits(&base[index * per_lane..(index + 1) * per_lane]),
@@ -546,19 +802,24 @@ mod tests {
 
         // Another query row's query does not move a row.
         let mut perturbed = lanes.clone();
-        for value in &mut perturbed[1].query[3 * Q_HEADS * DIM..4 * Q_HEADS * DIM] {
+        for value in &mut perturbed[1].query[3 * row_elements..4 * row_elements] {
             *value = -*value;
         }
-        let changed = attend(&device, &mut registry, window, &perturbed);
+        let changed = attend(
+            &device,
+            &mut registry,
+            shape,
+            &perturbed.iter().collect::<Vec<_>>(),
+        );
         for row in (0..ROWS).filter(|row| *row != 3) {
-            let range = per_lane + row * Q_HEADS * DIM..per_lane + (row + 1) * Q_HEADS * DIM;
+            let range = per_lane + row * row_elements..per_lane + (row + 1) * row_elements;
             assert_eq!(
                 bits(&changed[range.clone()]),
                 bits(&base[range]),
                 "row {row} depends on row 3's query"
             );
         }
-        let row_three = per_lane + 3 * Q_HEADS * DIM..per_lane + 4 * Q_HEADS * DIM;
+        let row_three = per_lane + 3 * row_elements..per_lane + 4 * row_elements;
         assert_ne!(bits(&changed[row_three.clone()]), bits(&base[row_three]));
     }
 }

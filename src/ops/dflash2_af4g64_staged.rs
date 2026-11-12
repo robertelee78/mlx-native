@@ -4,9 +4,11 @@
 //! [`dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16`](super::qmm_affine::dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16);
 //! only the tile differs. A weight is dequantized once to half, a step's
 //! activation slice is multiplied by a 32-column half stage with `matmul2d`,
-//! and K is cut into the runs the wave law below selects. The tile, the law
-//! and the one-pass gate/up pair follow Splash (Apache-2.0, commit 031a25a6:
-//! `runtime/ops/LinearGguf.cpp`, `runtime/metal/kernels/shared/gguf_linear.metal`).
+//! and K is cut into the runs the wave law below selects.
+//!
+//! Portions derived from Splash commit 031a25a6 (Apache-2.0): the tile, the
+//! wave law of `runtime/ops/LinearGguf.cpp` and the one-pass gate/up pair.
+//! See `src/shaders/dflash2_af4g64_staged.metal` for full attribution.
 //!
 //! Numerics contract: an output's bits depend on its activation row, its
 //! weight row and the run count. The run count is a function of the weight
@@ -610,33 +612,49 @@ mod tests {
         buffer
     }
 
+    /// F32 scratch that holds NaN, as a reused workspace may: a result that
+    /// reads an element its command did not write is not finite.
     fn scratch(device: &MlxDevice, elements: usize) -> MlxBuffer {
         let elements = elements.max(1);
-        device
+        let mut buffer = device
             .alloc_buffer(elements * 4, DType::F32, vec![elements])
-            .unwrap()
+            .unwrap();
+        buffer.as_mut_slice::<f32>().unwrap().fill(f32::NAN);
+        buffer
     }
 
-    /// F64 dot product of one activation row with one exact affine weight
-    /// row, and the bound on a staged result's distance from it:
+    /// Every column of a dense activation row.
+    fn dense(x: &[bf16]) -> impl Iterator<Item = (usize, f32)> + Clone + '_ {
+        x.iter().map(|value| value.to_f32()).enumerate()
+    }
+
+    /// F64 dot product of activation entries `(column, value)` with one exact
+    /// affine weight row, and the bound on a staged result's distance from it:
     /// every weight is rounded once to F32 and once to half (relative 2^-24
     /// and 2^-11, or 2^-25 absolute below the smallest normal half), and the
-    /// K exact half-by-BF16 products are added in F32.
-    fn reference(weight: &Weight, x: &[bf16], row: usize, k: usize) -> (f64, f64) {
+    /// exact half-by-BF16 products of the entries are added in F32. The
+    /// factor 1.001 covers the products of those relative terms.
+    fn reference(
+        weight: &Weight,
+        entries: impl Iterator<Item = (usize, f32)>,
+        row: usize,
+        k: usize,
+    ) -> (f64, f64) {
         let mut sum = 0.0_f64;
         let mut magnitude = 0.0_f64;
         let mut activation_magnitude = 0.0_f64;
-        for (column, activation) in x.iter().enumerate() {
+        let mut terms = 0.0_f64;
+        for (column, activation) in entries {
             let group = row * (k / 64) + column / 64;
             let value = f64::from(weight.scales[group]) * f64::from(weight.codes[row * k + column])
                 + f64::from(weight.biases[group]);
-            let activation = f64::from(activation.to_f32());
+            let activation = f64::from(activation);
             sum += value * activation;
             magnitude += (value * activation).abs();
             activation_magnitude += activation.abs();
+            terms += 1.0;
         }
-        let k = k as f64;
-        let bound = (2.0_f64.powi(-11) + (k + 1.0) * 2.0_f64.powi(-24)) * 1.001 * magnitude
+        let bound = (2.0_f64.powi(-11) + (terms + 2.0) * 2.0_f64.powi(-24)) * 1.001 * magnitude
             + 2.0_f64.powi(-25) * activation_magnitude;
         (sum, bound)
     }
@@ -672,7 +690,12 @@ mod tests {
         )
         .unwrap();
         encoder.commit_and_wait().unwrap();
-        output.as_slice::<f32>().unwrap()[..m * n].to_vec()
+        let result = output.as_slice::<f32>().unwrap()[..m * n].to_vec();
+        assert!(
+            result.iter().all(|value| value.is_finite()),
+            "{n}x{k} M={m}: a result read scratch its command did not write"
+        );
+        result
     }
 
     fn gate_up(
@@ -686,9 +709,10 @@ mod tests {
         k: usize,
     ) -> Vec<bf16> {
         let input = upload(device, x, vec![m, k]);
-        let output = device
+        let mut output = device
             .alloc_buffer(m * n * 2, DType::BF16, vec![m, n])
             .unwrap();
+        output.as_mut_slice::<bf16>().unwrap().fill(bf16::NAN);
         let partials = scratch(
             device,
             dflash2_af4g64_staged_gate_up_partial_elements(m as u32, n as u32, k as u32),
@@ -711,7 +735,12 @@ mod tests {
         )
         .unwrap();
         encoder.commit_and_wait().unwrap();
-        output.as_slice::<bf16>().unwrap().to_vec()
+        let result = output.as_slice::<bf16>().unwrap().to_vec();
+        assert!(
+            result.iter().all(|value| value.is_finite()),
+            "{n}x{k} M={m}: a gated result read scratch its command did not write"
+        );
+        result
     }
 
     /// Unsplit and split shapes: `(n, k)`.
@@ -730,7 +759,7 @@ mod tests {
             for row in 0..32 {
                 for column in 0..n {
                     let (expected, bound) =
-                        reference(&weight, &x[row * k..(row + 1) * k], column, k);
+                        reference(&weight, dense(&x[row * k..(row + 1) * k]), column, k);
                     let error = (f64::from(actual[row * n + column]) - expected).abs();
                     assert!(
                         error <= bound,
@@ -794,6 +823,26 @@ mod tests {
         gate / (1.0 + (-gate).exp())
     }
 
+    /// F64 `SiLU(gate) * up` of activation entries and the bound on a staged
+    /// pair's distance from it: |SiLU'| <= 1.1, the product and SiLU are
+    /// evaluated in F32 and the result is rounded once to BF16.
+    fn gated_reference(
+        gate: &Weight,
+        up: &Weight,
+        entries: impl Iterator<Item = (usize, f32)> + Clone,
+        row: usize,
+        k: usize,
+    ) -> (f64, f64) {
+        let (g, g_bound) = reference(gate, entries.clone(), row, k);
+        let (u, u_bound) = reference(up, entries, row, k);
+        let expected = silu(g) * u;
+        let bound = 1.1 * g_bound * (u.abs() + u_bound)
+            + silu(g).abs() * u_bound
+            + expected.abs() * (2.0_f64.powi(-8) + 2.0_f64.powi(-20))
+            + 2.0_f64.powi(-100);
+        (expected, bound)
+    }
+
     #[cfg(mlx_native_has_metal_tensor_artifact)]
     #[test]
     fn gate_up_is_within_the_k_scaled_bound_of_the_f64_reference() {
@@ -808,15 +857,7 @@ mod tests {
             for row in 0..32 {
                 let x = &x[row * k..(row + 1) * k];
                 for column in 0..n {
-                    let (g, g_bound) = reference(&gate, x, column, k);
-                    let (u, u_bound) = reference(&up, x, column, k);
-                    let expected = silu(g) * u;
-                    // |SiLU'| <= 1.1; the product and SiLU are evaluated in
-                    // F32 and the result is rounded once to BF16.
-                    let bound = 1.1 * g_bound * (u.abs() + u_bound)
-                        + silu(g).abs() * u_bound
-                        + expected.abs() * (2.0_f64.powi(-8) + 2.0_f64.powi(-20))
-                        + 2.0_f64.powi(-100);
+                    let (expected, bound) = gated_reference(&gate, &up, dense(x), column, k);
                     let error = (f64::from(actual[row * n + column].to_f32()) - expected).abs();
                     assert!(
                         error <= bound,
@@ -866,6 +907,127 @@ mod tests {
                         "{n}x{k} M={m} row {row} depends on its cohort"
                     );
                 }
+            }
+        }
+    }
+
+    /// `(n, k)` of every staged projection of the Qwen3.8-27B and
+    /// Qwen3.6-35B drafts: dynamic, q|k|v, attention out, down, context and
+    /// context k|v (the Qwen3.6 dynamic projection keeps the register tile).
+    const SERVED_PROJECTIONS: [(usize, usize); 11] = [
+        (1_280, 5_120),
+        (6_144, 5_120),
+        (5_120, 4_096),
+        (5_120, 17_408),
+        (5_120, 25_600),
+        (2_048, 5_120),
+        (6_144, 2_048),
+        (2_048, 4_096),
+        (2_048, 6_144),
+        (2_048, 16_384),
+        (2_048, 2_048),
+    ];
+    const SERVED_GATE_UP: [(usize, usize); 2] = [(17_408, 5_120), (6_144, 2_048)];
+
+    /// 32 activation rows that together probe every 32-input step of K: row
+    /// `r` owns steps `r, r + 32, ...` and is nonzero at each one's first
+    /// input, its last, and one between. An output is then a sum of
+    /// `3 K / 1024` products, so a step that is skipped, repeated or read
+    /// from another place moves it by far more than the bound. The K-scaled
+    /// bound of dense rows cannot show that at K = 17,408 or 25,600.
+    fn step_probes(k: usize) -> Vec<Vec<(usize, f32)>> {
+        const VALUES: [f32; 7] = [1.0, -0.75, 0.5, 1.5, -1.25, 2.0, -0.375];
+        (0..32_usize)
+            .map(|row| {
+                (row..k / 32)
+                    .step_by(32)
+                    .flat_map(|step| {
+                        [0, 1 + (step * 7 + row * 13) % 30, 31]
+                            .into_iter()
+                            .enumerate()
+                            .map(move |(index, offset)| {
+                                (step * 32 + offset, VALUES[(step + row + index) % 7])
+                            })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn dense_rows(probes: &[Vec<(usize, f32)>], k: usize) -> Vec<bf16> {
+        let mut x = vec![bf16::from_bits(0); probes.len() * k];
+        for (row, entries) in probes.iter().enumerate() {
+            for (column, value) in entries {
+                x[row * k + column] = bf16::from_f32(*value);
+            }
+        }
+        x
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn served_projections_sum_every_input_step_once() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        for (n, k) in SERVED_PROJECTIONS {
+            let weight = weight(&device, n, k, 3_000 + (n + k) as u64);
+            let probes = step_probes(k);
+            assert_eq!(probes.iter().map(Vec::len).sum::<usize>(), 3 * k / 32);
+            let x = dense_rows(&probes, k);
+            let actual = project(&device, &mut registry, &weight, &x, 32, n, k);
+            for (row, entries) in probes.iter().enumerate() {
+                for column in 0..n {
+                    let (expected, bound) = reference(&weight, entries.iter().copied(), column, k);
+                    let error = (f64::from(actual[row * n + column]) - expected).abs();
+                    assert!(
+                        error <= bound,
+                        "{n}x{k} row {row} column {column}: error {error} exceeds {bound}"
+                    );
+                }
+            }
+            // The same rows through the 8- and 16-row tiles.
+            for m in [8_usize, 16, 24] {
+                let part = project(&device, &mut registry, &weight, &x[..m * k], m, n, k);
+                assert!(
+                    part.iter()
+                        .map(|v| v.to_bits())
+                        .eq(actual[..m * n].iter().map(|v| v.to_bits())),
+                    "{n}x{k} M={m} differs from the 32-row tile"
+                );
+            }
+        }
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn served_gate_up_pairs_sum_every_input_step_once() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        for (n, k) in SERVED_GATE_UP {
+            let gate = weight(&device, n, k, 4_000 + n as u64);
+            let up = weight(&device, n, k, 5_000 + n as u64);
+            let probes = step_probes(k);
+            let x = dense_rows(&probes, k);
+            let actual = gate_up(&device, &mut registry, &gate, &up, &x, 32, n, k);
+            for (row, entries) in probes.iter().enumerate() {
+                for column in 0..n {
+                    let (expected, bound) =
+                        gated_reference(&gate, &up, entries.iter().copied(), column, k);
+                    let error = (f64::from(actual[row * n + column].to_f32()) - expected).abs();
+                    assert!(
+                        error <= bound,
+                        "{n}x{k} row {row} column {column}: error {error} exceeds {bound}"
+                    );
+                }
+            }
+            for m in [8_usize, 16, 24] {
+                let part = gate_up(&device, &mut registry, &gate, &up, &x[..m * k], m, n, k);
+                assert!(
+                    part.iter()
+                        .map(|v| v.to_bits())
+                        .eq(actual[..m * n].iter().map(|v| v.to_bits())),
+                    "{n}x{k} M={m} differs from the 32-row tile"
+                );
             }
         }
     }
