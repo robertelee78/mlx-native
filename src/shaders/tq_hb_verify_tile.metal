@@ -1,5 +1,24 @@
 // tq_hb_verify_tile.metal — tiled verify attention over the TQ-HB KV cache.
 //
+// Portions of this file are derived from Splash
+// (https://github.com/incoai/splash, commit 031a25a6), Apache-2.0 licensed.
+// Source: runtime/metal/kernels/common/paged_attention_tile.h,
+// runtime/metal/kernels/decode/paged_attention.metal and
+// runtime/ops/PagedAttention.hpp.
+// Modifications: hf2q's TQ-HB cache (8-bit Lloyd-Max codes and one F32 norm
+// per KV head and token, contiguous per slot) instead of INT8 or BF16 Page32
+// pages behind a page table; a page's codes dequantized to half centroids in
+// threadgroup memory, so four barriers per page instead of three and no
+// device-tensor operands; half probability operands instead of bf16 and no
+// relaxed precision; no window, sinks, tile parts, sparse lists or prefill
+// tiles; a split count of at most 24 with at least two pages each; a query
+// pack with the sign-Hadamard rotation; the reduce per window row and query
+// head into hf2q's row layout; a fused un-rotation and sigmoid gate; exp
+// instead of fast::exp; mlx-native's dispatch arguments.
+//
+// Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
+// root.
+//
 // One joint verify step attends, per lane, a window of up to TQV_ROWS rows at
 // consecutive positions of the lane's slot. The per-row decode kernel
 // (flash_attn_vec_tq_hb) scans a slot's history once per row and query head;
@@ -17,9 +36,17 @@
 // to their half centroids in threadgroup memory (the codebook is not linear,
 // so the codes cannot be a matmul operand). The key norms scale the F32
 // scores; a probability times its token's value norm is the half operand of
-// P·V (Splash carries the same product in bf16), saturated at the largest
-// half, so a value norm above about 1e6 would clip. Both matmuls accumulate
-// in F32.
+// P·V (Splash carries the same product in bf16). Both matmuls accumulate in
+// F32.
+//
+// Value-norm range: the operand is `p * norm / 16` with `p` relative to the
+// row's running maximum in its split. It saturates at the largest half,
+// 65504, i.e. for norms above 1,048,064, and it is subnormal below 2^-14 and
+// zero below 2^-25: a token that shares a split with a dominant one drops
+// out once `p * norm / 16 < 3e-8`. Norms from about 1e-3 to 1e6 are usable;
+// below 1 the dropped mass of such tokens becomes measurable (none visible
+// at 1, 1.7e-3 in the worst head at 0.25, 2% at 0.02). Stored value norms of
+// the served Qwen3.8 and Qwen3.6 caches measure 2.0 to 168.
 //
 // Kernels:
 // - tq_hb_verify_tile_pack_g{6,8}: sign-Hadamard rotation of the window rows'
@@ -443,6 +470,10 @@ inline void tqv_split(
     }
 }
 
+// Threadgroup memory of a split, bound by the host (`[[threadgroup(0)]]`,
+// tqv_split_memory_bytes): staged centroids, scores, probabilities and the
+// three per-row statistics. Bound memory keeps the kernel's static
+// threadgroup memory at a few bytes, which shader validation doubles.
 #define TQV_SPLIT(Name, G)                                                     \
   kernel void Name(                                                            \
       constant TqHbVerifyParams &params [[buffer(0)]],                         \
@@ -454,14 +485,19 @@ inline void tqv_split(
       device const float *v_norms [[buffer(6)]],                               \
       device float *partials [[buffer(7)]],                                    \
       device float *statistics [[buffer(8)]],                                  \
+      threadgroup char *shmem [[threadgroup(0)]],                              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    alignas(16) threadgroup half staged[TQV_PAGE * TQV_DIM];                   \
-    alignas(16) threadgroup float scores[TQV_ROWS * G * TQV_PAGE];             \
-    alignas(16) threadgroup half probabilities[TQV_ROWS * G * TQV_PAGE];       \
-    threadgroup float row_max[TQV_ROWS * G];                                   \
-    threadgroup float row_sum[TQV_ROWS * G];                                   \
-    threadgroup float previous_scale[TQV_ROWS * G];                            \
+    constexpr uint Cells = TQV_ROWS * G * TQV_PAGE;                            \
+    threadgroup half *staged = reinterpret_cast<threadgroup half *>(shmem);    \
+    threadgroup float *scores =                                                \
+        reinterpret_cast<threadgroup float *>(staged + TQV_PAGE * TQV_DIM);    \
+    threadgroup half *probabilities =                                          \
+        reinterpret_cast<threadgroup half *>(scores + Cells);                  \
+    threadgroup float *row_max =                                               \
+        reinterpret_cast<threadgroup float *>(probabilities + Cells);          \
+    threadgroup float *row_sum = row_max + TQV_ROWS * G;                       \
+    threadgroup float *previous_scale = row_sum + TQV_ROWS * G;                \
     threadgroup atomic_uint rescale;                                           \
     tqv_split<G>(params, lanes, queries, k_codes, k_norms, v_codes, v_norms,   \
                  partials, statistics, staged, scores, probabilities, row_max, \

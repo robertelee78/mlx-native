@@ -7,10 +7,14 @@
 //! and all query heads of one KV head over one split of the history, with
 //! Metal 4 `mpp::tensor_ops::matmul2d` for Q·Kᵀ and P·V over pages of
 //! [`PAGE_TOKENS`] cache tokens, and a second dispatch combines the splits in
-//! split order. The structure is Splash's paged verify attention
-//! (`runtime/metal/kernels/common/paged_attention_tile.h`); the cache is the
-//! TQ-HB one, unchanged (8-bit codes, one F32 norm per KV head and token,
-//! rotated domain). See `shaders/tq_hb_verify_tile.metal`.
+//! split order. The cache is the TQ-HB one, unchanged (8-bit codes, one F32
+//! norm per KV head and token, rotated domain).
+//!
+//! Portions derived from Splash commit 031a25a6 (Apache-2.0): the tile, the
+//! page loop, the split and fixed-order reduce and the lane-local split count
+//! of its paged verify attention. See `shaders/tq_hb_verify_tile.metal` for
+//! the sources and modifications and `LICENSE-APACHE-splash` at the
+//! repository root.
 //!
 //! [`tq_hb_verify_tile_attention`] encodes four dispatches: the query
 //! rotation and pack, the split, the reduce, and the un-rotation fused with
@@ -22,10 +26,20 @@
 //! operands of matmuls that accumulate in F32 (the per-row kernel also reads
 //! Q as half; its centroids and probabilities are F32), scores are F32, and
 //! the online softmax runs per page and split instead of per 32-token chunk
-//! and workgroup. The half probability operand saturates at 65504, which a
-//! value norm below about 1e6 cannot reach. The un-rotation and gate are
-//! bitwise
+//! and workgroup. The un-rotation and gate are bitwise
 //! [`crate::ops::fwht_standalone::dispatch_fwht_sign_undo_sigmoid_mul_f32`].
+//!
+//! Value-norm range. The P·V operand is `p * norm / 16` in half, with `p`
+//! relative to the row's running maximum in its split. It saturates at 65504
+//! (norms above 1,048,064) and vanishes below `2^-25`: a token that shares a
+//! split with a dominant one drops out once `p * norm / 16 < 3e-8`. Norms
+//! from about 1e-3 to 1e6 are usable; below 1 the dropped mass of such tokens
+//! becomes measurable (none visible at 1, 1.7e-3 in the worst head at 0.25,
+//! 2% at 0.02). The stored value norms of the served models sit inside the
+//! loss-free part of that range: 2.0 to 168 over the 16 full-attention
+//! layers of Qwen3.8-27B and 2.8 to 36 over the 10 of Qwen3.6-35B-A3B (every
+//! committed token of a four-agent coding run, about 2,900 per lane; key
+//! norms 16 to 29).
 //!
 //! Invariants (`tests/test_tq_hb_verify_tile.rs`): a row's output is a
 //! function of its lane's committed length, its offset in the window, its
@@ -154,9 +168,61 @@ impl TqHbVerifyTileShape {
     }
 }
 
-/// Whether the tile pipelines for `shape` build on this device. `Ok(false)`
-/// when the shape has no kernel or the toolchain or device lacks the Metal
-/// tensor API; any other compile failure is an error.
+/// Threadgroup memory the host binds to a split threadgroup: the staged
+/// half centroids of one page, the F32 scores and half probabilities of the
+/// fused rows, and three F32 statistics per fused row.
+fn split_memory_bytes(shape: &TqHbVerifyTileShape) -> u64 {
+    let cells = shape.fused_rows() * u64::from(PAGE_TOKENS);
+    u64::from(PAGE_TOKENS) * u64::from(HEAD_DIM) * 2
+        + cells * 4
+        + cells * 2
+        + shape.fused_rows() * 12
+}
+
+/// Why the device cannot run the pipelines of `shape`, if it cannot: a
+/// kernel's threads, or its static plus bound threadgroup memory, exceed the
+/// device's limits. The static size is read from the pipeline as built,
+/// because shader validation doubles it.
+fn limit_violation(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    shape: &TqHbVerifyTileShape,
+) -> Result<Option<String>> {
+    let (pack, split, reduce) = shape.kernels()?;
+    let metal_device = device.metal_device();
+    let memory_limit = metal_device.max_threadgroup_memory_length();
+    // (kernel, threads per threadgroup, bound threadgroup memory)
+    for (name, threads, bound) in [
+        (pack, 32, 0),
+        (split, SPLIT_THREADS, split_memory_bytes(shape)),
+        (reduce, u64::from(HEAD_DIM), 0),
+        (UNDO_GATE, 32, 0),
+    ] {
+        let pipeline = registry.get_pipeline(name, metal_device)?;
+        if pipeline.max_total_threads_per_threadgroup() < threads {
+            return Ok(Some(format!(
+                "{name} allows {} threads per threadgroup, needs {threads}",
+                pipeline.max_total_threads_per_threadgroup()
+            )));
+        }
+        let memory = pipeline
+            .static_threadgroup_memory_length()
+            .saturating_add(bound);
+        if memory > memory_limit {
+            return Ok(Some(format!(
+                "{name} needs {memory} bytes of threadgroup memory, the device allows {memory_limit}"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the tile pipelines for `shape` can run on this device. `Ok(false)`
+/// when the shape has no kernel, the toolchain or device lacks the Metal
+/// tensor API, or a kernel's threads or threadgroup memory exceed the
+/// device's limits (as under the Metal debug layer with shader validation on
+/// a kernel with large static memory); any other compile failure is an
+/// error.
 pub fn tq_hb_verify_tile_available(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -177,7 +243,7 @@ pub fn tq_hb_verify_tile_available(
             return Ok(false);
         }
     }
-    Ok(true)
+    Ok(limit_violation(registry, device, shape)?.is_none())
 }
 
 /// One lane of a verify step: a window of `rows` rows at positions
@@ -331,7 +397,8 @@ fn need(name: &str, buffer: &MlxBuffer, dtype: DType, bytes: u64, align: u64) ->
 /// those writes.
 ///
 /// Encodes: pack, barrier, split, barrier, reduce, barrier, un-rotation +
-/// gate. The caller orders readers of `output` with a barrier.
+/// gate. The caller orders readers of `output` with a barrier. Errors, with
+/// nothing encoded, when [`tq_hb_verify_tile_available`] is false.
 #[allow(clippy::too_many_arguments)]
 pub fn tq_hb_verify_tile_attention(
     encoder: &mut CommandEncoder,
@@ -472,6 +539,9 @@ pub fn tq_hb_verify_tile_attention(
     let lane_count = lanes.len() as u64;
     let (heads, rows) = (u64::from(shape.n_heads), u64::from(VERIFY_TILE_ROWS));
 
+    if let Some(reason) = limit_violation(registry, device, shape)? {
+        return Err(invalid(reason));
+    }
     let pipeline = registry.get_pipeline(pack, metal_device)?;
     encoder.encode_threadgroups_with_args(
         pipeline,
@@ -487,7 +557,7 @@ pub fn tq_hb_verify_tile_attention(
     encoder.memory_barrier();
 
     let pipeline = registry.get_pipeline(split, metal_device)?;
-    encoder.encode_threadgroups_with_args(
+    encoder.encode_threadgroups_with_args_and_shared(
         pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&params))),
@@ -500,6 +570,7 @@ pub fn tq_hb_verify_tile_attention(
             (7, KernelArg::Buffer(scratch.partials)),
             (8, KernelArg::Buffer(scratch.statistics)),
         ],
+        &[(0, split_memory_bytes(shape))],
         MTLSize::new(
             u64::from(shape.n_kv_heads),
             u64::from(slot_splits),
@@ -583,6 +654,13 @@ mod tests {
         assert_eq!(sizes.partials, 4 * 4 * 22 * 48 * 256 * 4);
         assert_eq!(sizes.statistics, 4 * 4 * 22 * 48 * 2 * 4);
         assert_eq!(sizes.attention, 4 * 8 * 24 * 256 * 4);
+        // Staged page, scores, probabilities and statistics of 48 or 64 rows.
+        assert_eq!(split_memory_bytes(&shape), 16_384 + 6_144 + 3_072 + 576);
+        let wide = TqHbVerifyTileShape {
+            n_heads: 32,
+            ..shape
+        };
+        assert_eq!(split_memory_bytes(&wide), 16_384 + 8_192 + 4_096 + 768);
         let odd = TqHbVerifyTileShape {
             n_heads: 20,
             ..shape

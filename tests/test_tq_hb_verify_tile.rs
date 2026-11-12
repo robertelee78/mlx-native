@@ -17,7 +17,9 @@
 //!    the half normal range. The pack is checked separately against an F64
 //!    sign-Hadamard transform to half precision.
 //! 2. Distance to the cache's F32 definition (F32 centroids, unrounded
-//!    queries): bounded by the two half roundings, `2^-10` per score.
+//!    queries): bounded by the two half roundings, `2^-10` per score, and,
+//!    as a regression gate that does not loosen with the norms, a relative
+//!    RMS error of every (row, head) and of every case below fixed limits.
 //! 3. The un-rotation + gate dispatch is bitwise
 //!    `fwht_sign_undo_sigmoid_mul_f32` on the same rotated rows.
 //! 4. Determinism: repeated runs are bitwise equal. A value norm beyond the
@@ -467,6 +469,27 @@ fn reference(
     }
 }
 
+/// Regression limits of the relative RMS error against the F32 definition:
+/// one case pooled over its rows and heads, and its worst (row, head).
+#[derive(Clone, Copy)]
+struct RmsLimits {
+    pooled: f64,
+    head: f64,
+}
+
+/// Key norms of 4 to 24 (the stored norms of the served models are 16 to 29):
+/// measured 3.4e-4 to 7.1e-4 pooled and 7.9e-4 to 1.4e-3 in the worst head.
+const SERVED_RMS: RmsLimits = RmsLimits {
+    pooled: 1.2e-3,
+    head: 2.5e-3,
+};
+/// Key norms of 100 to 400, a softmax dominated by a few tokens: measured
+/// 1.7e-3 to 1.8e-3 pooled and 1.5e-2 to 2.0e-2 in the worst head.
+const PEAKED_RMS: RmsLimits = RmsLimits {
+    pooled: 3e-3,
+    head: 3e-2,
+};
+
 /// Relative accuracy assumed of the device `exp` (fast math).
 const EXP_RELATIVE: f64 = 1.0 / (1u64 << 19) as f64;
 
@@ -478,6 +501,7 @@ fn check_reference(
     lanes: &[TqHbVerifyLane],
     run: &TileRun,
     heads: &[usize],
+    limits: RmsLimits,
     label: &str,
 ) -> f64 {
     let geometry = cache.geometry;
@@ -492,6 +516,7 @@ fn check_reference(
     let half_eps = 2f64.powi(-11);
     let mut worst = 0.0f64;
     let mut worst_definition = 0.0f64;
+    let (mut pooled_error, mut pooled_signal, mut worst_head) = (0.0f64, 0.0f64, 0.0f64);
     for (lane_index, lane) in lanes.iter().enumerate() {
         let splits = verify_tile_splits(lane.committed, cache.capacity) as usize;
         for row in 0..lane.rows as usize {
@@ -571,11 +596,24 @@ fn check_reference(
                     );
                     worst_definition = worst_definition.max(error / bound);
                 }
+                let error: f64 = (0..HD)
+                    .map(|d| (f64::from(got[d]) - definition.output[d]).powi(2))
+                    .sum();
+                let signal: f64 = definition.output.iter().map(|v| v * v).sum();
+                pooled_error += error;
+                pooled_signal += signal;
+                worst_head = worst_head.max((error / signal).sqrt());
             }
         }
     }
+    let pooled = (pooled_error / pooled_signal).sqrt();
     eprintln!(
-        "{label}: max error/bound {worst:.4} (same operands), {worst_definition:.4} (F32 definition)"
+        "{label}: max error/bound {worst:.4} (same operands), {worst_definition:.4} (F32 definition); \
+         relative RMS against the F32 definition {pooled:.3e} pooled, {worst_head:.3e} worst head"
+    );
+    assert!(
+        pooled <= limits.pooled && worst_head <= limits.head,
+        "{label}: relative RMS against the F32 definition {pooled:.3e} pooled, {worst_head:.3e} worst head"
     );
     worst
 }
@@ -642,7 +680,7 @@ fn f64_reference_at_served_shapes() {
             let gate = random_gate(geometry, width, &mut rng);
             let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, width);
             let label = format!("{name} committed {committed:?} rows {rows:?}");
-            check_reference(&cache, &q, &lanes, &run, &all_heads, &label);
+            check_reference(&cache, &q, &lanes, &run, &all_heads, SERVED_RMS, &label);
             check_undo_gate(&mut gpu, &run, geometry, &gate, &lanes, width, &label);
         }
         // Peaked softmax (large key norms): rescales on most pages.
@@ -653,7 +691,7 @@ fn f64_reference_at_served_shapes() {
             let gate = random_gate(geometry, 16, &mut rng);
             let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 16);
             let label = format!("{name} peaked");
-            check_reference(&cache, &q, &lanes, &run, &all_heads, &label);
+            check_reference(&cache, &q, &lanes, &run, &all_heads, PEAKED_RMS, &label);
             check_undo_gate(&mut gpu, &run, geometry, &gate, &lanes, 16, &label);
         }
         // Value norms in the thousands: the half probability operand stays
@@ -668,7 +706,7 @@ fn f64_reference_at_served_shapes() {
             let gate = random_gate(geometry, 8, &mut rng);
             let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 8);
             let label = format!("{name} large value norms");
-            check_reference(&cache, &q, &lanes, &run, &all_heads, &label);
+            check_reference(&cache, &q, &lanes, &run, &all_heads, SERVED_RMS, &label);
         }
         // Served histories: several pages per split (2,048: 3; 8,192: 11;
         // 20,000: 27). First and last query head of the first and last KV
@@ -697,7 +735,7 @@ fn f64_reference_at_served_shapes() {
             let gate = random_gate(geometry, 16, &mut rng);
             let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 16);
             let label = format!("{name} committed {committed}");
-            check_reference(&cache, &q, &lanes, &run, &sampled, &label);
+            check_reference(&cache, &q, &lanes, &run, &sampled, SERVED_RMS, &label);
             check_undo_gate(&mut gpu, &run, geometry, &gate, &lanes, 16, &label);
         }
     }
@@ -724,6 +762,32 @@ fn a_saturating_value_norm_stays_finite() {
     assert!(run.output.iter().all(|v| v.is_finite()));
 }
 
+/// The split's page, score and probability storage is bound threadgroup
+/// memory. Shader validation doubles static threadgroup memory, which would
+/// take a kernel that declares that storage statically past the device limit
+/// (and abort under the Metal debug layer).
+#[test]
+fn split_threadgroup_memory_is_bound_not_static() {
+    let Some(mut gpu) = gpu() else { return };
+    let limit = gpu.device.metal_device().max_threadgroup_memory_length();
+    for name in ["tq_hb_verify_tile_split_g6", "tq_hb_verify_tile_split_g8"] {
+        let pipeline = gpu
+            .registry
+            .get_pipeline(name, gpu.device.metal_device())
+            .expect("split pipeline");
+        let fixed = pipeline.static_threadgroup_memory_length();
+        eprintln!(
+            "{name}: static threadgroup memory {fixed} bytes, device limit {limit}, {} threads allowed",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+        assert!(
+            fixed <= 64,
+            "{name}: {fixed} bytes of static threadgroup memory"
+        );
+        assert!(pipeline.max_total_threads_per_threadgroup() >= 256);
+    }
+}
+
 #[test]
 fn repeated_runs_are_bitwise_equal() {
     let Some(mut gpu) = gpu() else { return };
@@ -739,6 +803,18 @@ fn repeated_runs_are_bitwise_equal() {
             assert_eq!(bits(&first.output), bits(&again.output));
             assert_eq!(bits(&first.attention), bits(&again.attention));
         }
+        // Compared across runs: plain, shader validation, debug layer,
+        // runtime-compiled source.
+        let digest = bits(&first.output)
+            .iter()
+            .chain(&bits(&first.attention))
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &word| {
+                (hash ^ u64::from(word)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        eprintln!(
+            "output digest {}/{} heads: {digest:016x}",
+            geometry.n_heads, geometry.n_kv
+        );
     }
 }
 
