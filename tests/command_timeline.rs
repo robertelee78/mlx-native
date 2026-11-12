@@ -122,10 +122,7 @@ fn records_committed_commands_on_one_clock_only_when_enabled() {
         "{second:?}"
     );
     // The counters at commit give each command's own dispatches and barriers.
-    assert_eq!(
-        second.dispatches_at_commit - first.dispatches_at_commit,
-        5
-    );
+    assert_eq!(second.dispatches_at_commit - first.dispatches_at_commit, 5);
     assert_eq!(second.barriers_at_commit - first.barriers_at_commit, 5);
     assert_eq!(empty.dispatches_at_commit, second.dispatches_at_commit);
 

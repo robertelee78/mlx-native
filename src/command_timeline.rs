@@ -95,13 +95,17 @@ pub fn mark(name: &'static str) {
 
 #[cold]
 fn record_mark(name: &'static str) {
-    let now = now_seconds();
+    mark_at(name, now_seconds());
+}
+
+/// Record a mark at a time already taken with [`now_seconds`].
+pub(crate) fn mark_at(name: &'static str, seconds: f64) {
     if let Ok(mut marks) = MARKS.lock() {
         if marks.len() >= MAX_PENDING {
             DROPPED.fetch_add(marks.len() as u64, Ordering::Relaxed);
             marks.clear();
         }
-        marks.push((name, now));
+        marks.push((name, seconds));
     }
 }
 

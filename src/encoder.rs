@@ -2640,7 +2640,17 @@ impl CommandEncoder {
     fn flush_residency_pending(&self) {
         if let Some(set) = self.residency_set.as_ref() {
             set.keep_alive();
-            set.flush_pending();
+            if crate::command_timeline::enabled() {
+                // A residency-set commit runs on the committing thread
+                // before the command is handed to Metal; show it.
+                let begin = crate::command_timeline::now_seconds();
+                if set.flush_pending() {
+                    crate::command_timeline::mark_at("residency_commit_begin", begin);
+                    crate::command_timeline::mark("residency_commit_end");
+                }
+            } else {
+                set.flush_pending();
+            }
         }
     }
 
