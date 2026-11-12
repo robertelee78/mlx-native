@@ -1166,7 +1166,9 @@ impl Layer {
             .as_mut_slice::<u32>()
             .expect("ids")
             .copy_from_slice(ids);
-        let gathered = bf16_rows(routes + EXPERTS, HIDDEN);
+        let rows = mlx_native::grouped_m8_gathered_rows(tokens as u32, TOP_K as u32, EXPERTS as u32)
+            .expect("gathered rows");
+        let gathered = bf16_rows(rows, HIDDEN);
         let output = f32_rows(routes, HIDDEN);
         let mut scratch =
             IdMmScratch::alloc(device, EXPERTS as u32, tokens as u32).expect("scratch");

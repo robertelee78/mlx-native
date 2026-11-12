@@ -313,7 +313,11 @@ impl Layer {
             up_all: zeros(device, pairs * i, DType::F32),
             h_all: zeros(device, pairs * i, DType::F32),
             y_all: zeros(device, pairs * h, DType::F32),
-            gathered: zeros(device, (EXPERTS as usize + pairs) * h, DType::BF16),
+            gathered: zeros(
+                device,
+                mlx_native::grouped_m8_gathered_rows(rows, TOP_K, EXPERTS).expect("gathered rows") * h,
+                DType::BF16,
+            ),
             silu_shared: u32_buffer(device, &[(r * s) as u32]),
             silu_expert: u32_buffer(device, &[(pairs * i) as u32]),
             out: zeros(device, r * h, DType::F32),

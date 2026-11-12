@@ -4,7 +4,7 @@ use half::bf16;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce_masked;
 use mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv;
 use mlx_native::{
-    ggml_expert_bytes, prepare_quantized_matmul_id_ggml_grouped_m8,
+    ggml_expert_bytes, grouped_m8_gathered_rows, prepare_quantized_matmul_id_ggml_grouped_m8,
     quantized_matmul_id_ggml_grouped_m8_epilogue,
     quantized_matmul_id_ggml_grouped_m8_epilogue_masked,
     quantized_matmul_id_ggml_grouped_m8_gate_up, DType, GgmlQuantizedMatmulIdParams, GgmlType,
@@ -140,7 +140,8 @@ fn grouped_matches_mv(ggml_type: GgmlType) {
         ..params
     };
     let elements = (TOKENS * TOP_K * WIDTH) as usize;
-    let gathered_elements = ((TOKENS * TOP_K + EXPERTS) * WIDTH) as usize;
+    let gathered_elements =
+        grouped_m8_gathered_rows(TOKENS, TOP_K, EXPERTS).expect("gathered rows") * WIDTH as usize;
     let gathered = device
         .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
         .expect("gathered input");
@@ -408,7 +409,8 @@ fn masked_routes(ggml_type: GgmlType, bad_id: Option<u32>) {
     };
     let pairs = (TOKENS * TOP_K) as usize;
     let elements = pairs * WIDTH as usize;
-    let gathered_elements = (pairs + EXPERTS as usize) * WIDTH as usize;
+    let gathered_elements =
+        grouped_m8_gathered_rows(TOKENS, TOP_K, EXPERTS).expect("gathered rows") * WIDTH as usize;
     let gathered = device
         .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
         .expect("gathered input");
@@ -606,7 +608,8 @@ fn benchmark_qwen36_gate_projection() {
         ggml_type: GgmlType::Q4_K,
     };
     let elements = (TOKENS * TOP_K * N) as usize;
-    let gathered_elements = ((TOKENS * TOP_K + EXPERTS) * K) as usize;
+    let gathered_elements =
+        grouped_m8_gathered_rows(TOKENS, TOP_K, EXPERTS).expect("gathered rows") * K as usize;
     let gathered = device
         .alloc_buffer(gathered_elements * 2, DType::BF16, vec![gathered_elements])
         .expect("gathered input");
@@ -697,4 +700,110 @@ fn benchmark_qwen36_gate_projection() {
         "one_pass_gate_up: {:.3} ms/pair ({REPEATS} pairs)",
         started.elapsed().as_secs_f64() * 1000.0 / REPEATS as f64
     );
+}
+
+/// The last expert's last tile reads eight gathered rows from its first
+/// route: a buffer of exactly the route list is rejected, and the rows past
+/// the list never reach a result.
+#[test]
+fn grouped_gather_requires_the_tile_slack_rows() {
+    const TOKENS: u32 = 11;
+    const EXPERTS: u32 = 8;
+    const TOP_K: u32 = 8;
+    const WIDTH: u32 = 256;
+
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    // Every expert holds 11 routes: an 8-row tile and a 3-row tile, the last
+    // expert's at the end of the list.
+    let ids = ids(&device, TOKENS as usize, TOP_K as usize, EXPERTS as usize);
+    let input = f32_buffer(&device, (TOKENS * WIDTH) as usize, 71);
+    let (weight, stride) = weights(&device, GgmlType::Q4_K, EXPERTS, WIDTH, WIDTH, 72);
+    let params = GgmlQuantizedMatmulIdParams {
+        n_tokens: TOKENS,
+        top_k: TOP_K,
+        n: WIDTH,
+        k: WIDTH,
+        n_experts: EXPERTS,
+        expert_stride: stride,
+        ggml_type: GgmlType::Q4_K,
+    };
+    let mut encoder = device.command_encoder().expect("prepare encoder");
+    let prepared = prepare_quantized_matmul_id_ggml_grouped_m8(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &weight,
+        &params,
+    )
+    .expect("prepare");
+    encoder
+        .commit_and_wait_labeled("test.grouped_m8.slack.prepare")
+        .expect("commit preparation");
+
+    let route_list = (TOKENS * TOP_K + EXPERTS) as usize;
+    let required = grouped_m8_gathered_rows(TOKENS, TOP_K, EXPERTS).expect("gathered rows");
+    assert_eq!(required, route_list + 7);
+    let elements = (TOKENS * TOP_K * WIDTH) as usize;
+    // One projection over a gathered buffer of `rows` rows, every row
+    // starting as `fill`.
+    let mut run = |rows: usize, fill: u16| {
+        let mut gathered = device
+            .alloc_buffer(rows * WIDTH as usize * 2, DType::BF16, vec![rows, WIDTH as usize])
+            .expect("gathered input");
+        gathered
+            .as_mut_slice::<u16>()
+            .expect("gathered slice")
+            .fill(fill);
+        let output = device
+            .alloc_buffer(elements * 4, DType::F32, vec![elements])
+            .expect("output");
+        let mut scratch = IdMmScratch::alloc(&device, EXPERTS, TOKENS).expect("scratch");
+        let mut encoder = device.command_encoder().expect("encoder");
+        quantized_matmul_id_ggml_grouped_m8_epilogue(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &gathered,
+            &prepared,
+            &ids,
+            &output,
+            None,
+            &mut scratch,
+            &params,
+            false,
+            false,
+            false,
+            GroupedM8Input::F32,
+            GroupedM8Epilogue::F32,
+        )?;
+        encoder
+            .commit_and_wait_labeled("test.grouped_m8.slack")
+            .expect("commit projection");
+        let bits: Vec<u32> = output
+            .as_slice::<f32>()
+            .expect("output values")
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        Ok::<_, mlx_native::MlxError>(bits)
+    };
+
+    let error = run(route_list, 0).expect_err("a buffer of exactly the route list");
+    assert!(
+        error.to_string().contains("gathered input buffer too small"),
+        "unexpected error: {error}"
+    );
+    let error = run(required - 1, 0).expect_err("one row short of the tile slack");
+    assert!(
+        error.to_string().contains("gathered input buffer too small"),
+        "unexpected error: {error}"
+    );
+    // NaN in every row the gather does not write, against a larger zeroed
+    // buffer: the same bits, all finite.
+    let exact = run(required, 0x7fc0).expect("required rows");
+    let roomy = run(required + 64, 0).expect("more rows");
+    assert!(exact.iter().all(|bits| f32::from_bits(*bits).is_finite()));
+    assert!(exact == roomy, "rows past the route list reached a result");
 }
