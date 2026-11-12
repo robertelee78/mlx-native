@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.21.7"
+version = "0.21.8"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
@@ -61,6 +61,10 @@ push-remote = "origin"
 name = "tq_kernel_replay"
 
 [[bench]]
+name = "bench_qwen36_moe_layer"
+harness = false
+
+[[bench]]
 name = "bench_quantized_matmul"
 harness = false
 
@@ -98,6 +102,10 @@ harness = false
 
 [[bench]]
 name = "bench_gemma_decode_w4"
+harness = false
+
+[[bench]]
+name = "bench_qwen_verify_attn"
 harness = false
 
 [[bench]]

@@ -203,6 +203,7 @@ pub use ops::q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinte
 pub use ops::quantized_matmul::{quantized_matmul, quantized_matmul_simd, QuantizedMatmulParams};
 pub use ops::quantized_matmul_ggml::{
     dispatch_mm_for_test, dispatch_mm_q4_0_tensor_64x32_for_test,
+    dispatch_mm_q4_0_tensor_v2_for_test,
     quantized_matmul_ggml, quantized_matmul_ggml_batched_mm,
     quantized_matmul_ggml_column_invariant_mma,
     quantized_matmul_ggml_batched_mm_strided_input,
@@ -222,7 +223,10 @@ pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
 };
 pub use ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_for_test, prepare_quantized_matmul_id_ggml_grouped_m8,
+    dispatch_id_mm_for_test, grouped_m8_gathered_rows, moe_tiles_column_tile_exact,
+    moe_tiles_down, moe_tiles_gate_up,
+    moe_tiles_gather, moe_tiles_grouped_rows, moe_tiles_schedule,
+    prepare_quantized_matmul_id_ggml_grouped_m8,
     quantized_matmul_id_ggml, quantized_matmul_id_ggml_grouped_m8_epilogue,
     quantized_matmul_id_ggml_grouped_m8_epilogue_masked,
     quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_pooled,
@@ -236,7 +240,8 @@ pub use ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_q4_k_nr2_masked,
     quantized_matmul_id_ggml_mv_with_policy, quantized_matmul_id_swiglu_q4_0,
     GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GroupedM8Epilogue, GroupedM8Input,
-    IdMmScratch, PreparedGroupedM8Experts, MM_ID_ROUTING_THRESHOLD,
+    IdMmScratch, MoeTilesBuffers, MoeTilesParams, PreparedGroupedM8Experts,
+    MM_ID_ROUTING_THRESHOLD, MOE_TILES_GRID_WORDS,
 };
 
 // Re-export weight loading utilities.

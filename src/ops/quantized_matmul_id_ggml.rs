@@ -34,6 +34,13 @@ use crate::kernel_registry::KernelRegistry;
 use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
+mod moe_tiles;
+pub use moe_tiles::{
+    moe_tiles_column_tile_exact, moe_tiles_down, moe_tiles_gate_up, moe_tiles_gather,
+    moe_tiles_grouped_rows, moe_tiles_schedule, MoeTilesBuffers, MoeTilesParams,
+    MOE_TILES_GRID_WORDS,
+};
+
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     factors.iter().try_fold(1usize, |total, factor| {
         total.checked_mul(*factor).ok_or_else(|| {
@@ -3207,6 +3214,23 @@ pub enum GroupedM8Epilogue {
     FusedGateUpBf16,
 }
 
+/// Rows an eight-row grouped tile reads past the route it starts at: a tile
+/// whose expert holds fewer than eight further routes still reads eight rows
+/// and drops the rest, also at the end of the route list.
+const GROUPED_M8_TILE_SLACK_ROWS: usize = 7;
+
+/// Rows the BF16 gathered buffer of a grouped M8 projection must hold for
+/// `n_tokens` rows of `top_k` routes over `n_experts` experts: the compact
+/// route list (one guard entry per expert) and the rows the last tile reads
+/// past it.
+pub fn grouped_m8_gathered_rows(n_tokens: u32, top_k: u32, n_experts: u32) -> Result<usize> {
+    (n_tokens as usize)
+        .checked_mul(top_k as usize)
+        .and_then(|routes| routes.checked_add(n_experts as usize))
+        .and_then(|entries| entries.checked_add(GROUPED_M8_TILE_SLACK_ROWS))
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 gathered rows overflow".into()))
+}
+
 
 /// Grouped M8 projection with BF16 storage/fused-SiLU modes used by a complete
 /// gate -> up -> down MoE expert sequence.
@@ -3445,10 +3469,9 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
         (_, None) => {}
     }
     scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
-    // map0c reserves one guard entry per expert before its compact route list.
-    let gathered_rows = total_rows
-        .checked_add(params.n_experts as usize)
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 gathered rows overflow".into()))?;
+    // map0c reserves one guard entry per expert in its compact route list,
+    // and the list's last tile reads its eight rows from any entry.
+    let gathered_rows = grouped_m8_gathered_rows(params.n_tokens, params.top_k, params.n_experts)?;
     let required_gathered = checked_byte_extent(
         "grouped M8 gathered input",
         &[gathered_rows, params.k as usize, DType::BF16.size_of()],

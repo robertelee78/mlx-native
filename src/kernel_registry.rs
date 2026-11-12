@@ -125,14 +125,16 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// on the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`) a registry that
 /// skipped the op's `register` call failed with `KernelNotFound`. Kernels a
 /// function registers that the constructor already carries are unaffected.
-const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 29] = [
+const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 32] = [
     crate::ops::add_bias_row_2d::register,
     crate::ops::bilinear_resize_2d::register,
     crate::ops::block_merge_2x2::register,
     crate::ops::deepseek_moe_routing::register,
     crate::ops::deepseek_tail_rope::register,
+    crate::ops::dflash2_af4g64_staged::register,
     crate::ops::dflash2_attention_pack::register,
     crate::ops::dflash2_dynamic_conv::register,
+    crate::ops::dflash2_ring_attention::register,
     crate::ops::dflash2_selector::register,
     crate::ops::embedding_kquant::register,
     crate::ops::embedding_q2_k::register,
@@ -154,6 +156,7 @@ const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 29] = [
     crate::ops::hadamard_quantize_kv::register,
     crate::ops::im2col_2d_3ch::register,
     crate::ops::ssm_conv::register,
+    crate::ops::tq_hb_verify_tile::register,
     crate::ops::vision_2d_rope::register,
 ];
 
@@ -649,6 +652,15 @@ impl KernelRegistry {
                 sources.insert(format!("grouped_m8_id_{format}_{epilogue}"), grouped_mv_src);
             }
             sources.insert(format!("grouped_m8_gate_up_{format}_bf16"), grouped_mv_src);
+        }
+
+        // MoE expert live tiles over the same prepared planes: one gate/up
+        // pass and a down pass on the indirect grid of the schedule's tiles.
+        let moe_tiles_src: &'static str = include_str!("shaders/moe_expert_tiles.metal");
+        sources.insert("moe_tiles_gather_f32".into(), moe_tiles_src);
+        for format in ["q4_K", "q6_K"] {
+            sources.insert(format!("moe_tiles_gate_up_{format}"), moe_tiles_src);
+            sources.insert(format!("moe_tiles_down_{format}"), moe_tiles_src);
         }
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels

@@ -16,7 +16,7 @@ use mlx_native::ops::{
     flash_attn_prefill_blk, flash_attn_prefill_d512, flash_attn_prefill_mask,
     flash_attn_prefill_tensor, flash_attn_train, flash_attn_vec_tq, fused_residual_norm,
     gated_delta_net_decode, gather_bench, hadamard, hadamard_quantize_kv, im2col_2d_3ch, ssm_conv,
-    vision_2d_rope,
+    tq_hb_verify_tile, vision_2d_rope,
 };
 use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice, MlxError};
 use sha2::{Digest, Sha256};
@@ -63,7 +63,7 @@ fn cases() -> Vec<Case> {
         &'static str,
         &'static [(usize, bool)],
         &'static [(usize, i32)],
-    ); 34] = [
+    ); 41] = [
         (
             "add_bias_row_2d_f32",
             add_bias_row_2d::ADD_BIAS_ROW_2D_SHADER_SOURCE,
@@ -233,6 +233,48 @@ fn cases() -> Vec<Case> {
             NO_INTS,
         ),
         (
+            "tq_hb_verify_tile_pack_g6",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "tq_hb_verify_tile_split_g6",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "tq_hb_verify_tile_reduce_g6",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "tq_hb_verify_tile_pack_g8",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "tq_hb_verify_tile_split_g8",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "tq_hb_verify_tile_reduce_g8",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "tq_hb_verify_tile_undo_gate",
+            tq_hb_verify_tile::TQ_HB_VERIFY_TILE_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
             "vision_2d_rope_f32",
             vision_2d_rope::VISION_2D_ROPE_SHADER_SOURCE,
             NO_BOOLS,
@@ -343,9 +385,9 @@ fn registration_fallbacks_build_from_runtime_source() {
     let cases = cases();
     let unique: std::collections::BTreeSet<&str> =
         cases.iter().map(|case| case.0.as_str()).collect();
-    // 56 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
-    assert_eq!(unique.len(), 60);
-    assert_eq!(cases.len(), 60);
+    // 63 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
+    assert_eq!(unique.len(), 67);
+    assert_eq!(cases.len(), 67);
     let mut tensor_unavailable = Vec::new();
     for (name, source, bools, ints) in cases {
         let pipeline = if bools.is_empty() && ints.is_empty() {
