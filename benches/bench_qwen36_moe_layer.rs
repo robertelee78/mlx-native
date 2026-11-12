@@ -36,7 +36,9 @@
 //! * per layer, every layer its own command that the host waits for (how a
 //!   stage profile commits a layer), median of `rounds` passes.
 
-use mlx_native::ops::dense_matvec_f32_rows::dispatch_dense_matvec_f32_rows;
+use mlx_native::ops::dense_matvec_f32_rows::{
+    dispatch_dense_matvec_f32_row_blocks, dispatch_dense_matvec_f32_rows,
+};
 use mlx_native::ops::dflash2_attention_pack::{
     dispatch_dflash2_mask_moe_routes, DFlash2MoeRouteMaskParams,
 };
@@ -895,10 +897,30 @@ fn encode_fused_tiles(
 ) {
     let rows = l.rows;
     match stage {
-        0 => encode_live_tiles(0, enc, registry, device, w, l),
-        1 => {
-            encode_live_tiles(1, enc, registry, device, w, l);
-            enc.memory_barrier();
+        // Router and shared-gate logit: every block of eight rows in one
+        // dispatch each.
+        0 | 1 => {
+            let (weight, output, n) = if stage == 0 {
+                (&w.router, &l.logits, EXPERTS)
+            } else {
+                (&w.shared_logit, &l.sh_logit, 1)
+            };
+            dispatch_dense_matvec_f32_row_blocks(
+                enc,
+                registry,
+                device,
+                &l.x,
+                weight,
+                output,
+                LANE_ROWS,
+                rows / LANE_ROWS,
+                n,
+                H,
+            )
+            .expect("row-exact router blocks");
+            if stage == 1 {
+                enc.memory_barrier();
+            }
         }
         2 => {
             encode_live_tiles(3, enc, registry, device, w, l);
