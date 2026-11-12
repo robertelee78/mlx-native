@@ -662,6 +662,14 @@ impl KernelRegistry {
             sources.insert(format!("moe_tiles_gate_up_{format}"), moe_tiles_src);
             sources.insert(format!("moe_tiles_down_{format}"), moe_tiles_src);
         }
+        // The fused route of the same shader: one schedule, gather and pass
+        // grid for the routed experts and the shared expert.
+        sources.insert("moe_tiles_fused_schedule".into(), moe_tiles_src);
+        sources.insert("moe_tiles_fused_gather_f32".into(), moe_tiles_src);
+        for format in ["q4_K", "q6_K"] {
+            sources.insert(format!("moe_tiles_fused_gate_up_{format}"), moe_tiles_src);
+            sources.insert(format!("moe_tiles_fused_down_{format}"), moe_tiles_src);
+        }
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of

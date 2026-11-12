@@ -4,8 +4,13 @@
 //!
 //! ```text
 //! cargo +1.96.0 bench --locked --bench bench_qwen36_moe_layer -- \
-//!     [routes=<dump>|pooled|random] [rows=32] [down=q4k|q6k] [rounds=20] [layers=16]
+//!     [routes=<dump>|pooled|random] [rows=32] [down=q4k|q6k] [rounds=20] [layers=16] \
+//!     [weights=1] [route=all|staged|live|fused] [stages=1|0]
 //! ```
+//!
+//! `route` selects the routes to time (the staged-M8 route hf2q serves by
+//! default, the live-tile route, the fused-tile route); `stages=0` skips the
+//! per-stage commands.
 //!
 //! `routes=<dump>` replays expert ids recorded from real verify steps: a
 //! sequence of little-endian records `layer u32, rows u32, top_k u32,
@@ -14,15 +19,22 @@
 //! experts and `random` draws every row from all 256; both keep every row
 //! live.
 //!
-//! Two measurements, both GPU time (`GPUEndTime - GPUStartTime`):
+//! `weights=<n>` allocates `n` sets of expert weights (about 0.47 GiB each);
+//! layer `i` of a command reads set `i % n`. A served cycle reads each
+//! layer's own weights once, so `weights=<layers>` is the served memory
+//! pattern, and `weights=1` re-reads one set `layers` times per command.
+//!
+//! Three measurements, all GPU time (`GPUEndTime - GPUStartTime`):
 //!
 //! * per stage: one command buffer that runs the stage for each of the
 //!   `layers` sampled layers, a barrier between them, median of `rounds`
 //!   commands divided by `layers` (a stage that reuses the route schedule of
 //!   an earlier stage runs after that stage and reports the difference; a
 //!   command of one small dispatch alone measures the GPU's wake-up);
-//! * per layer: `layers` layers of different routes in one command buffer
-//!   over one set of expert weights, median of `rounds` commands.
+//! * per layer: `layers` layers of different routes in one command buffer,
+//!   median of `rounds` commands;
+//! * per layer, every layer its own command that the host waits for (how a
+//!   stage profile commits a layer), median of `rounds` passes.
 
 use mlx_native::ops::dense_matvec_f32_rows::dispatch_dense_matvec_f32_rows;
 use mlx_native::ops::dflash2_attention_pack::{
@@ -36,12 +48,14 @@ use mlx_native::ops::quantized_matmul_ggml::{
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{
     dense_matmul_f32_f32_tensor, ggml_expert_bytes, moe_tiles_column_tile_exact, moe_tiles_down,
-    moe_tiles_gate_up, moe_tiles_gather, moe_tiles_grouped_rows, moe_tiles_schedule,
-    prepare_quantized_matmul_id_ggml_grouped_m8,
+    moe_tiles_fused, moe_tiles_fused_grouped_rows, moe_tiles_fused_output_rows,
+    moe_tiles_fused_schedule_words, moe_tiles_gate_up, moe_tiles_gather, moe_tiles_grouped_rows,
+    moe_tiles_schedule, prepare_quantized_matmul_id_ggml_grouped_m8,
     quantized_matmul_id_ggml_grouped_m8_epilogue_masked, CommandEncoder, DType,
     DenseMmF32F32Params, GgmlQuantizedMatmulIdParams, GroupedM8Epilogue, GroupedM8Input,
-    IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice, MoeTilesBuffers, MoeTilesParams,
-    PreparedGroupedM8Experts, MOE_TILES_GRID_WORDS,
+    IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice, MoeTilesBuffers, MoeTilesFusedBuffers,
+    MoeTilesFusedMask, MoeTilesFusedParams, MoeTilesFusedStage, MoeTilesFusedWeights,
+    MoeTilesParams, PreparedGroupedM8Experts, MOE_TILES_FUSED_GRID_WORDS, MOE_TILES_GRID_WORDS,
 };
 
 const H: u32 = 2048;
@@ -267,6 +281,18 @@ struct Layer {
     shared_gathered: MlxBuffer,
     shared_intermediate: MlxBuffer,
     shared_grids: MlxBuffer,
+    /// The fused route's inputs and scratch: the route table before the
+    /// verify-row mask (a masked row holds experts 0..TOP_K), each lane's
+    /// live rows, and one schedule for routed and shared tiles.
+    fused_ids: MlxBuffer,
+    fused_weights: MlxBuffer,
+    fused_verify_rows: MlxBuffer,
+    fused_schedule: MlxBuffer,
+    fused_routes: MlxBuffer,
+    fused_grids: MlxBuffer,
+    fused_gathered: MlxBuffer,
+    fused_intermediate: MlxBuffer,
+    fused_out: MlxBuffer,
 }
 
 impl Layer {
@@ -294,6 +320,36 @@ impl Layer {
             .as_mut_slice::<f32>()
             .expect("routing weights")
             .copy_from_slice(&routing_weights);
+        let fused = fused_params(rows, false);
+        let fused_rows = moe_tiles_fused_grouped_rows(&fused).expect("fused rows");
+        // A lane's live rows are a prefix of its block.
+        let lane_rows: Vec<u32> = (0..4)
+            .map(|lane| {
+                (0..LANE_ROWS)
+                    .filter(|row| {
+                        let token = lane * LANE_ROWS + row;
+                        token < rows && routes.ids[(token * TOP_K) as usize] < EXPERTS
+                    })
+                    .count() as u32
+            })
+            .collect();
+        let unmasked: Vec<u32> = routes
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(route, &id)| {
+                if id < EXPERTS {
+                    id
+                } else {
+                    route as u32 % TOP_K
+                }
+            })
+            .collect();
+        let mut fused_weights = zeros(device, pairs, DType::F32);
+        fused_weights
+            .as_mut_slice::<f32>()
+            .expect("fused routing weights")
+            .fill(1.0 / TOP_K as f32);
         Self {
             rows,
             x: f32_buffer(device, r * h, rng, 1.0),
@@ -340,6 +396,23 @@ impl Layer {
             shared_gathered: zeros(device, shared_rows * h, DType::BF16),
             shared_intermediate: zeros(device, shared_rows * s, DType::BF16),
             shared_grids: zeros(device, MOE_TILES_GRID_WORDS, DType::U32),
+            fused_ids: u32_buffer(device, &unmasked),
+            fused_weights,
+            fused_verify_rows: u32_buffer(device, &lane_rows),
+            fused_schedule: zeros(
+                device,
+                moe_tiles_fused_schedule_words(&fused).expect("fused schedule"),
+                DType::U32,
+            ),
+            fused_routes: zeros(device, fused_rows, DType::U32),
+            fused_grids: zeros(device, MOE_TILES_FUSED_GRID_WORDS, DType::U32),
+            fused_gathered: zeros(device, fused_rows * h, DType::BF16),
+            fused_intermediate: zeros(device, fused_rows * i, DType::BF16),
+            fused_out: zeros(
+                device,
+                moe_tiles_fused_output_rows(&fused).expect("fused output") * h,
+                DType::F32,
+            ),
         }
     }
 }
@@ -347,19 +420,19 @@ impl Layer {
 /// The stages of the staged-M8 route of hf2q's `moe_batched.rs`
 /// (`HF2Q_QWEN_MOE_BATCHED=1 HF2Q_QWEN_MOE_STAGED_M8=1` under a route mask).
 const STAGED_F32: &[Stage] = &[
-    ("router", None),
-    ("shared_gate_logit", None),
-    ("shared_gate", None),
-    ("shared_up", None),
-    ("route_select", None),
-    ("route_mask", None),
-    ("shared_swiglu", None),
-    ("expert_gate(+schedule,gather)", None),
-    ("expert_up", Some(7)),
-    ("shared_down", None),
-    ("expert_swiglu", None),
-    ("expert_down(+gather)", Some(7)),
-    ("weighted_reduce", None),
+    ("router", Base::Alone, true),
+    ("shared_gate_logit", Base::Alone, true),
+    ("shared_gate", Base::Alone, true),
+    ("shared_up", Base::Alone, true),
+    ("route_select", Base::Alone, true),
+    ("route_mask", Base::Alone, true),
+    ("shared_swiglu", Base::Alone, true),
+    ("expert_gate(+schedule,gather)", Base::Alone, true),
+    ("expert_up", Base::After(7), true),
+    ("shared_down", Base::Alone, true),
+    ("expert_swiglu", Base::Alone, true),
+    ("expert_down(+gather)", Base::After(7), true),
+    ("weighted_reduce", Base::Alone, true),
 ];
 
 fn dense_f32(
@@ -607,19 +680,19 @@ fn encode_staged_f32(
 /// schedule's rows, and down on the same rows. The shared expert runs the
 /// same three stages beside the routed experts, a tile per block of rows.
 const LIVE_TILES: &[Stage] = &[
-    ("router", None),
-    ("shared_gate_logit", None),
-    ("shared_schedule", None),
-    ("route_select", None),
-    ("shared_gather", Some(2)),
-    ("route_mask", None),
-    ("schedule", None),
-    ("gather", Some(6)),
-    ("expert_gate_up", Some(6)),
-    ("shared_gate_up", Some(2)),
-    ("expert_down", Some(6)),
-    ("shared_down", Some(2)),
-    ("weighted_reduce", None),
+    ("router", Base::Alone, true),
+    ("shared_gate_logit", Base::Alone, true),
+    ("shared_schedule", Base::Alone, true),
+    ("route_select", Base::Alone, true),
+    ("shared_gather", Base::After(2), true),
+    ("route_mask", Base::Alone, true),
+    ("schedule", Base::Alone, true),
+    ("gather", Base::After(6), true),
+    ("expert_gate_up", Base::After(6), true),
+    ("shared_gate_up", Base::After(2), true),
+    ("expert_down", Base::After(6), true),
+    ("shared_down", Base::After(2), true),
+    ("weighted_reduce", Base::Alone, true),
 ];
 
 fn tile_params(w: &Weights, rows: u32, shared: bool) -> MoeTilesParams {
@@ -784,8 +857,134 @@ fn encode_live_tiles(
     }
 }
 
-/// A stage's name and the earlier stage whose route schedule it reuses.
-type Stage = (&'static str, Option<usize>);
+/// The fused route of hf2q's `moe_live_tiles.rs` (`moe_tiles_fused`): the
+/// live-tile router and selection, then one schedule (with the verify-row
+/// mask), one gather and one dispatch per pass for the routed experts and
+/// the shared expert together. The expert stages are timed cumulatively:
+/// each row is the stage's command minus the one that stops a stage earlier.
+const FUSED_TILES: &[Stage] = &[
+    ("router", Base::Alone, true),
+    ("shared_gate_logit", Base::Alone, true),
+    ("route_select", Base::Alone, true),
+    ("schedule(+mask,shared)", Base::Alone, false),
+    ("gather(+shared)", Base::Minus(3), false),
+    ("gate_up(+shared)", Base::Minus(4), false),
+    ("down(+shared)", Base::Minus(5), true),
+    ("weighted_reduce", Base::Alone, true),
+];
+
+fn fused_params(rows: u32, column_tile: bool) -> MoeTilesFusedParams {
+    MoeTilesFusedParams {
+        n_tokens: rows,
+        top_k: TOP_K,
+        n_experts: EXPERTS,
+        hidden: H,
+        intermediate: INTERMEDIATE,
+        column_tile,
+    }
+}
+
+/// Encode stage `stage` of `FUSED_TILES` with the barrier that follows it.
+fn encode_fused_tiles(
+    stage: usize,
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    w: &Weights,
+    l: &mut Layer,
+) {
+    let rows = l.rows;
+    match stage {
+        0 => encode_live_tiles(0, enc, registry, device, w, l),
+        1 => {
+            encode_live_tiles(1, enc, registry, device, w, l);
+            enc.memory_barrier();
+        }
+        2 => {
+            encode_live_tiles(3, enc, registry, device, w, l);
+            enc.memory_barrier();
+        }
+        3..=6 => {
+            moe_tiles_fused(
+                enc,
+                registry,
+                device,
+                &l.x,
+                &l.fused_ids,
+                &l.fused_weights,
+                Some(&MoeTilesFusedMask {
+                    verify_rows: &l.fused_verify_rows,
+                    physical_lane: [0, 1, 2, 3],
+                    lanes: rows / LANE_ROWS,
+                    rows_per_lane: LANE_ROWS,
+                }),
+                &MoeTilesFusedWeights {
+                    gate: &w.gate,
+                    up: &w.up,
+                    down: &w.down,
+                    shared_gate: &w.shared_tiles[0],
+                    shared_up: &w.shared_tiles[1],
+                    shared_down: &w.shared_tiles[2],
+                },
+                &MoeTilesFusedBuffers {
+                    schedule: &l.fused_schedule,
+                    routes: &l.fused_routes,
+                    grids: &l.fused_grids,
+                    gathered: &l.fused_gathered,
+                    intermediate: &l.fused_intermediate,
+                },
+                &l.fused_out,
+                &fused_params(rows, w.column_tile),
+                [
+                    MoeTilesFusedStage::Schedule,
+                    MoeTilesFusedStage::Gather,
+                    MoeTilesFusedStage::GateUp,
+                    MoeTilesFusedStage::Down,
+                ][stage - 3],
+            )
+            .expect("fused tiles");
+            enc.memory_barrier();
+        }
+        7 => {
+            let pairs = (rows * TOP_K) as usize;
+            let shared = l.fused_out.slice_view(
+                (pairs * H as usize * 4) as u64,
+                rows as usize * H as usize,
+            );
+            dispatch_moe_weighted_reduce_masked(
+                enc,
+                registry,
+                device,
+                &l.fused_weights,
+                &l.fused_out,
+                &l.sh_logit,
+                &shared,
+                &l.residual,
+                &mut l.out,
+                rows,
+                TOP_K,
+                H,
+                true,
+            )
+            .expect("weighted reduce");
+            enc.memory_barrier();
+        }
+        _ => unreachable!("fused tiles stage"),
+    }
+}
+
+/// How a stage's time is taken: its own command, its command after an
+/// earlier stage whose schedule it reuses (minus that stage alone), or its
+/// own command minus an earlier stage's that it repeats.
+#[derive(Clone, Copy)]
+enum Base {
+    Alone,
+    After(usize),
+    Minus(usize),
+}
+
+/// A stage's name, how it is timed, and whether a whole layer encodes it.
+type Stage = (&'static str, Base, bool);
 
 type Encode = fn(usize, &mut CommandEncoder, &mut KernelRegistry, &MlxDevice, &Weights, &mut Layer);
 
@@ -799,36 +998,71 @@ fn median(samples: &mut [f64]) -> f64 {
     samples[samples.len() / 2]
 }
 
-/// Mean GPU ms per layer of every stage as its own command, and the median
-/// GPU ms per layer of `layers.len()` whole layers in one command.
+/// Mean GPU ms per layer of every stage as its own command, the median GPU
+/// ms per layer of `layers.len()` whole layers in one command, and the same
+/// with every layer committed and waited for as its own command (how a
+/// stage profile commits it). Layer `i` reads weight set `i % sets.len()`.
 fn measure(
     label: &str,
     stages: &[Stage],
     encode: Encode,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
-    w: &Weights,
+    sets: &[Weights],
     layers: &mut [Layer],
     rounds: usize,
+    with_stages: bool,
 ) {
     let whole = |registry: &mut KernelRegistry, layers: &mut [Layer]| {
         let mut enc = device.command_encoder().expect("encoder");
-        for layer in layers.iter_mut() {
-            for stage in 0..stages.len() {
-                encode(stage, &mut enc, registry, device, w, layer);
+        for (index, layer) in layers.iter_mut().enumerate() {
+            for stage in (0..stages.len()).filter(|stage| stages[*stage].2) {
+                encode(
+                    stage,
+                    &mut enc,
+                    registry,
+                    device,
+                    &sets[index % sets.len()],
+                    layer,
+                );
             }
         }
         gpu_ms(&mut enc) / layers.len() as f64
     };
     whole(registry, layers); // compile pipelines, fill every buffer
-                             // `stage` alone (or with `prefix` before it) for every layer, serialized.
+    let separate = |registry: &mut KernelRegistry, layers: &mut [Layer]| {
+        let mut total = 0.0;
+        for (index, layer) in layers.iter_mut().enumerate() {
+            let mut enc = device.command_encoder().expect("encoder");
+            for stage in (0..stages.len()).filter(|stage| stages[*stage].2) {
+                encode(
+                    stage,
+                    &mut enc,
+                    registry,
+                    device,
+                    &sets[index % sets.len()],
+                    layer,
+                );
+            }
+            total += gpu_ms(&mut enc);
+        }
+        total / layers.len() as f64
+    };
+    // `stage` alone (or with `prefix` before it) for every layer, serialized.
     let mut serial = |prefix: Option<usize>, stage: Option<usize>, layers: &mut [Layer]| {
         let mut samples: Vec<f64> = (0..rounds)
             .map(|_| {
                 let mut enc = device.command_encoder().expect("encoder");
-                for layer in layers.iter_mut() {
+                for (index, layer) in layers.iter_mut().enumerate() {
                     for step in [prefix, stage].into_iter().flatten() {
-                        encode(step, &mut enc, registry, device, w, layer);
+                        encode(
+                            step,
+                            &mut enc,
+                            registry,
+                            device,
+                            &sets[index % sets.len()],
+                            layer,
+                        );
                         enc.memory_barrier();
                     }
                 }
@@ -837,39 +1071,127 @@ fn measure(
             .collect();
         median(&mut samples)
     };
-    let per_stage: Vec<f64> = stages
-        .iter()
-        .enumerate()
-        .map(|(stage, (_, schedule))| match schedule {
-            Some(earlier) => {
-                serial(Some(*earlier), Some(stage), layers) - serial(Some(*earlier), None, layers)
-            }
-            None => serial(None, Some(stage), layers),
-        })
-        .collect();
+    let per_stage: Vec<f64> = if with_stages {
+        stages
+            .iter()
+            .enumerate()
+            .map(|(stage, (_, base, _))| match base {
+                Base::After(earlier) => {
+                    serial(Some(*earlier), Some(stage), layers)
+                        - serial(Some(*earlier), None, layers)
+                }
+                Base::Minus(earlier) => {
+                    serial(None, Some(stage), layers) - serial(None, Some(*earlier), layers)
+                }
+                Base::Alone => serial(None, Some(stage), layers),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut samples: Vec<f64> = (0..rounds).map(|_| whole(registry, layers)).collect();
     let layer_ms = median(&mut samples);
-    println!("{label}: {layer_ms:.4} ms per layer in one command (median of {rounds})");
-    for ((name, _), ms) in stages.iter().zip(&per_stage) {
-        println!("    {name:<32} {ms:.4}");
-    }
+    let fastest = samples[0];
+    let mut samples: Vec<f64> = (0..rounds)
+        .map(|_| separate(registry, layers))
+        .collect();
+    let separate_ms = median(&mut samples);
     println!(
-        "    {:<32} {:.4}",
-        "sum of stages",
-        per_stage.iter().sum::<f64>()
+        "{label}: {layer_ms:.4} ms per layer in one command (fastest {fastest:.4}), \
+         {separate_ms:.4} with every layer its own waited command (medians of {rounds})"
     );
+    if with_stages {
+        for ((name, ..), ms) in stages.iter().zip(&per_stage) {
+            println!("    {name:<32} {ms:.4}");
+        }
+        println!(
+            "    {:<32} {:.4}",
+            "sum of stages",
+            per_stage.iter().sum::<f64>()
+        );
+    }
+}
+
+/// One set of expert, shared-expert and router weights.
+fn weight_set(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    rng: &mut Rng,
+    rows: u32,
+    down_type: GgmlType,
+    column_tile: bool,
+) -> Weights {
+    let (gate_q, gate_stride) = quantized(device, GgmlType::Q4_K, EXPERTS, INTERMEDIATE, H, rng);
+    let (up_q, _) = quantized(device, GgmlType::Q4_K, EXPERTS, INTERMEDIATE, H, rng);
+    let (down_q, down_stride) = quantized(device, down_type, EXPERTS, H, INTERMEDIATE, rng);
+    let gate_up_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: rows,
+        top_k: TOP_K,
+        n: INTERMEDIATE,
+        k: H,
+        n_experts: EXPERTS,
+        expert_stride: gate_stride,
+        ggml_type: GgmlType::Q4_K,
+    };
+    let down_params = GgmlQuantizedMatmulIdParams {
+        n: H,
+        k: INTERMEDIATE,
+        expert_stride: down_stride,
+        ggml_type: down_type,
+        ..gate_up_params
+    };
+    let shared_gate = quantized(device, GgmlType::Q4_K, 1, SHARED, H, rng).0;
+    let shared_up = quantized(device, GgmlType::Q4_K, 1, SHARED, H, rng).0;
+    let shared_down = quantized(device, down_type, 1, H, SHARED, rng).0;
+    let one = |params: &GgmlQuantizedMatmulIdParams| GgmlQuantizedMatmulIdParams {
+        n_experts: 1,
+        ..*params
+    };
+    let mut enc = device.command_encoder().expect("prepare encoder");
+    let mut prepare = |weight: &MlxBuffer, params: &GgmlQuantizedMatmulIdParams| {
+        prepare_quantized_matmul_id_ggml_grouped_m8(&mut enc, registry, device, weight, params)
+            .expect("prepare experts")
+    };
+    let gate = prepare(&gate_q, &gate_up_params);
+    let up = prepare(&up_q, &gate_up_params);
+    let down = prepare(&down_q, &down_params);
+    let shared_tiles = [
+        prepare(&shared_gate, &one(&gate_up_params)),
+        prepare(&shared_up, &one(&gate_up_params)),
+        prepare(&shared_down, &one(&down_params)),
+    ];
+    enc.commit_and_wait().expect("commit preparation");
+    Weights {
+        router: f32_buffer(device, (EXPERTS * H) as usize, rng, 0.05),
+        shared_logit: f32_buffer(device, H as usize, rng, 0.05),
+        shared_gate,
+        shared_up,
+        shared_down,
+        shared_down_type: down_type,
+        gate,
+        up,
+        down,
+        gate_up_params,
+        down_params,
+        column_tile,
+        shared_tiles,
+    }
 }
 
 fn main() {
     let mut source = "pooled".to_string();
-    let (mut rows, mut rounds, mut layer_count) = (32u32, 20usize, 16usize);
+    let (mut rows, mut rounds, mut layer_count, mut set_count) = (32u32, 20usize, 16usize, 1usize);
     let mut down_type = GgmlType::Q4_K;
+    let (mut route, mut with_stages) = ("all".to_string(), true);
     for argument in std::env::args().skip(1) {
         match argument.split_once('=') {
             Some(("routes", value)) => source = value.to_string(),
             Some(("rows", value)) => rows = value.parse().expect("rows"),
             Some(("rounds", value)) => rounds = value.parse().expect("rounds"),
             Some(("layers", value)) => layer_count = value.parse().expect("layers"),
+            Some(("weights", value)) => set_count = value.parse().expect("weights"),
+            Some(("route", value)) => route = value.to_string(),
+            Some(("stages", value)) => with_stages = value != "0",
             Some(("down", "q4k")) => down_type = GgmlType::Q4_K,
             Some(("down", "q6k")) => down_type = GgmlType::Q6_K,
             // `cargo bench` passes `--bench`.
@@ -881,6 +1203,7 @@ fn main() {
         rows % LANE_ROWS == 0 && (LANE_ROWS..=32).contains(&rows),
         "rows is 8, 16, 24 or 32"
     );
+    assert!(set_count >= 1, "weights is at least 1");
 
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
@@ -912,107 +1235,62 @@ fn main() {
         mean(&|r| r.tiles().2),
     );
 
-    let (gate_q, gate_stride) =
-        quantized(&device, GgmlType::Q4_K, EXPERTS, INTERMEDIATE, H, &mut rng);
-    let (up_q, _) = quantized(&device, GgmlType::Q4_K, EXPERTS, INTERMEDIATE, H, &mut rng);
-    let (down_q, down_stride) = quantized(&device, down_type, EXPERTS, H, INTERMEDIATE, &mut rng);
-    let gate_up_params = GgmlQuantizedMatmulIdParams {
-        n_tokens: rows,
-        top_k: TOP_K,
-        n: INTERMEDIATE,
-        k: H,
-        n_experts: EXPERTS,
-        expert_stride: gate_stride,
-        ggml_type: GgmlType::Q4_K,
-    };
-    let down_params = GgmlQuantizedMatmulIdParams {
-        n: H,
-        k: INTERMEDIATE,
-        expert_stride: down_stride,
-        ggml_type: down_type,
-        ..gate_up_params
-    };
-    let mut enc = device.command_encoder().expect("prepare encoder");
-    let mut prepare = |weight: &MlxBuffer, params: &GgmlQuantizedMatmulIdParams| {
-        prepare_quantized_matmul_id_ggml_grouped_m8(
-            &mut enc,
-            &mut registry,
-            &device,
-            weight,
-            params,
-        )
-        .expect("prepare experts")
-    };
-    let gate = prepare(&gate_q, &gate_up_params);
-    let up = prepare(&up_q, &gate_up_params);
-    let down = prepare(&down_q, &down_params);
-    enc.commit_and_wait().expect("commit preparation");
-    let shared_gate = quantized(&device, GgmlType::Q4_K, 1, SHARED, H, &mut rng).0;
-    let shared_up = quantized(&device, GgmlType::Q4_K, 1, SHARED, H, &mut rng).0;
-    let shared_down = quantized(&device, down_type, 1, H, SHARED, &mut rng).0;
-    let one = |params: &GgmlQuantizedMatmulIdParams| GgmlQuantizedMatmulIdParams {
-        n_experts: 1,
-        ..*params
-    };
-    let mut enc = device.command_encoder().expect("shared prepare encoder");
-    let mut prepare = |weight: &MlxBuffer, params: &GgmlQuantizedMatmulIdParams| {
-        prepare_quantized_matmul_id_ggml_grouped_m8(
-            &mut enc,
-            &mut registry,
-            &device,
-            weight,
-            params,
-        )
-        .expect("prepare shared expert")
-    };
-    let shared_tiles = [
-        prepare(&shared_gate, &one(&gate_up_params)),
-        prepare(&shared_up, &one(&gate_up_params)),
-        prepare(&shared_down, &one(&down_params)),
-    ];
-    enc.commit_and_wait().expect("commit shared preparation");
-    let weights = Weights {
-        router: f32_buffer(&device, (EXPERTS * H) as usize, &mut rng, 0.05),
-        shared_logit: f32_buffer(&device, H as usize, &mut rng, 0.05),
-        shared_gate,
-        shared_up,
-        shared_down,
-        shared_down_type: down_type,
-        gate,
-        up,
-        down,
-        gate_up_params,
-        down_params,
-        column_tile: moe_tiles_column_tile_exact(&device, &mut registry).expect("column probe"),
-        shared_tiles,
-    };
-    println!(
-        "register path bitwise the matmul tile: {}",
-        weights.column_tile
-    );
+    let column_tile = moe_tiles_column_tile_exact(&device, &mut registry).expect("column probe");
+    println!("register path bitwise the matmul tile: {column_tile}; weight sets {set_count}");
+    let sets: Vec<Weights> = (0..set_count)
+        .map(|_| {
+            weight_set(
+                &device,
+                &mut registry,
+                &mut rng,
+                rows,
+                down_type,
+                column_tile,
+            )
+        })
+        .collect();
     let mut layers: Vec<Layer> = routes
         .iter()
         .map(|routes| Layer::new(&device, routes, &mut rng))
         .collect();
 
-    measure(
-        "staged M8, F32 gate/up (served)",
-        STAGED_F32,
-        encode_staged_f32,
-        &device,
-        &mut registry,
-        &weights,
-        &mut layers,
-        rounds,
+    let runs: [(&str, &str, &[Stage], Encode); 3] = [
+        (
+            "staged",
+            "staged M8, F32 gate/up (served)",
+            STAGED_F32,
+            encode_staged_f32,
+        ),
+        (
+            "live",
+            "live tiles, one gate/up pass",
+            LIVE_TILES,
+            encode_live_tiles,
+        ),
+        (
+            "fused",
+            "fused tiles, shared expert in the routed grid",
+            FUSED_TILES,
+            encode_fused_tiles,
+        ),
+    ];
+    assert!(
+        route == "all" || runs.iter().any(|(name, ..)| *name == route),
+        "route is all, staged, live or fused"
     );
-    measure(
-        "live tiles, one gate/up pass",
-        LIVE_TILES,
-        encode_live_tiles,
-        &device,
-        &mut registry,
-        &weights,
-        &mut layers,
-        rounds,
-    );
+    for (name, label, stages, encode) in runs {
+        if route == "all" || route == name {
+            measure(
+                label,
+                stages,
+                encode,
+                &device,
+                &mut registry,
+                &sets,
+                &mut layers,
+                rounds,
+                with_stages,
+            );
+        }
+    }
 }
