@@ -5,7 +5,7 @@
 //! ```text
 //! cargo +1.96.0 bench --locked --bench bench_qwen36_moe_layer -- \
 //!     [routes=<dump>|pooled|random] [rows=32] [down=q4k|q6k] [rounds=20] [layers=16] \
-//!     [weights=1] [route=all|staged|live|fused] [stages=1|0]
+//!     [weights=1] [route=all|staged|live|fused] [stages=1|0] [idle=<ms>]
 //! ```
 //!
 //! `route` selects the routes to time (the staged-M8 route hf2q serves by
@@ -1034,6 +1034,7 @@ fn measure(
     layers: &mut [Layer],
     rounds: usize,
     with_stages: bool,
+    idle_ms: f64,
 ) {
     let whole = |registry: &mut KernelRegistry, layers: &mut [Layer]| {
         let mut enc = device.command_encoder().expect("encoder");
@@ -1122,6 +1123,20 @@ fn measure(
         "{label}: {layer_ms:.4} ms per layer in one command (fastest {fastest:.4}), \
          {separate_ms:.4} with every layer its own waited command (medians of {rounds})"
     );
+    if idle_ms > 0.0 {
+        // The GPU left idle before every command, as a served cycle leaves
+        // it while the host plans, commits and drafts.
+        let mut samples: Vec<f64> = (0..rounds)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_secs_f64(idle_ms / 1.0e3));
+                whole(registry, layers)
+            })
+            .collect();
+        println!(
+            "    one command after {idle_ms} ms of idle GPU: {:.4} ms per layer (median of {rounds})",
+            median(&mut samples)
+        );
+    }
     if with_stages {
         for ((name, ..), ms) in stages.iter().zip(&per_stage) {
             println!("    {name:<32} {ms:.4}");
@@ -1205,6 +1220,7 @@ fn main() {
     let (mut rows, mut rounds, mut layer_count, mut set_count) = (32u32, 20usize, 16usize, 1usize);
     let mut down_type = GgmlType::Q4_K;
     let (mut route, mut with_stages) = ("all".to_string(), true);
+    let mut idle_ms = 0.0f64;
     for argument in std::env::args().skip(1) {
         match argument.split_once('=') {
             Some(("routes", value)) => source = value.to_string(),
@@ -1214,6 +1230,7 @@ fn main() {
             Some(("weights", value)) => set_count = value.parse().expect("weights"),
             Some(("route", value)) => route = value.to_string(),
             Some(("stages", value)) => with_stages = value != "0",
+            Some(("idle", value)) => idle_ms = value.parse().expect("idle"),
             Some(("down", "q4k")) => down_type = GgmlType::Q4_K,
             Some(("down", "q6k")) => down_type = GgmlType::Q6_K,
             // `cargo bench` passes `--bench`.
@@ -1312,6 +1329,7 @@ fn main() {
                 &mut layers,
                 rounds,
                 with_stages,
+                idle_ms,
             );
         }
     }
