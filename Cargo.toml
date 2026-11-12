@@ -101,6 +101,10 @@ name = "bench_gemma_decode_w4"
 harness = false
 
 [[bench]]
+name = "bench_qwen_verify_attn"
+harness = false
+
+[[bench]]
 name = "bench_decode_qmatmul_shapes"
 harness = false
 
