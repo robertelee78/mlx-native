@@ -39,6 +39,74 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("rms_norm_mul_bf16", RMS_NORM_SHADER_SOURCE);
 }
 
+/// Whether [`dispatch_rms_norm_f32_to_bf16`] serves rows of `dim` elements:
+/// [`dispatch_rms_norm`] would run its float4 kernel on them (`dim % 4 == 0`
+/// and `HF2Q_RMS_NORM_V2` not disabled), whose bits the BF16-output kernel
+/// reproduces.
+pub fn rms_norm_f32_to_bf16_available(dim: u32) -> bool {
+    dim > 0 && dim % 4 == 0 && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2")
+}
+
+/// RMS-normalize F32 rows `[rows, dim]` with an F32 weight `[dim]` and store
+/// the result as BF16 `[rows, dim]`.
+///
+/// Bitwise [`dispatch_rms_norm`] on the same F32 buffers followed by an
+/// F32 to BF16 cast, in one dispatch: a consumer of BF16 rows reads the norm
+/// directly. `params_buf` is `[eps, dim]` as F32. Requires
+/// [`rms_norm_f32_to_bf16_available`].
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rms_norm_f32_to_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    if rows == 0 || !rms_norm_f32_to_bf16_available(dim) {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm F32 to BF16 needs rows > 0 and the float4 kernel (dim % 4 == 0, \
+             HF2Q_RMS_NORM_V2 on); got rows={rows} dim={dim}"
+        )));
+    }
+    let expected = rows as usize * dim as usize;
+    if input.dtype() != DType::F32
+        || weight.dtype() != DType::F32
+        || output.dtype() != DType::BF16
+        || input.element_count() != expected
+        || output.element_count() != expected
+        || weight.element_count() < dim as usize
+        || params_buf.byte_len() < 8
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm F32 to BF16 needs F32 input [{rows}, {dim}], F32 weight [{dim}] and BF16 \
+             output [{rows}, {dim}]; got input {} x{}, weight {} x{}, output {} x{}",
+            input.dtype(),
+            input.element_count(),
+            weight.dtype(),
+            weight.element_count(),
+            output.dtype(),
+            output.element_count()
+        )));
+    }
+    let pipeline = registry.get_pipeline("rms_norm_f32_v2_bf16_out", device)?;
+    // The geometry of `dispatch_rms_norm`'s float4 kernel. One float per
+    // simdgroup, in the 16-byte units the Metal debug layer requires.
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()).max(32) as u64;
+    let shared_mem_bytes = ((tg_size / 32).max(1) * 4).next_multiple_of(16);
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, input), (1, weight), (2, output), (3, params_buf)],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    Ok(())
+}
+
 /// Select the fused RMS norm + multiply kernel name based on input dtype.
 fn fused_rms_norm_mul_kernel_name(dtype: DType) -> Result<&'static str> {
     match dtype {
