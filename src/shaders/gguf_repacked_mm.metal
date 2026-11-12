@@ -1,6 +1,16 @@
-// Repacked Q4_K/Q6_K dense MM over 32-row activation tiles.
-// Layout and dequantization are derived from Splash's Apache-2.0 MDGG0001
-// representation (https://github.com/incoai/splash, commit 031a25a6).
+// Prepared Q4_K/Q6_K dense MM over activation row tiles.
+//
+// Portions of this file are derived from Splash
+// (https://github.com/incoai/splash, commit 031a25a6), Apache-2.0 licensed.
+// Source: the MDGG0001 prepared weight representation and its staged tile
+// (runtime/metal/kernels/common/gguf_staged_tile.h, runtime/ops/LinearGguf.cpp).
+// Modifications: preparation from GGML Q4_K/Q6_K blocks on the GPU; BF16 or
+// F32 activation rows and F32 output rows; split-grid and serial row-tile
+// schedules for any row count; a bounds-checked partial edge tile; source
+// order arithmetic (reassociate off).
+//
+// Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
+// root.
 #pragma clang fp reassociate(off)
 #include <metal_stdlib>
 #include <metal_tensor>

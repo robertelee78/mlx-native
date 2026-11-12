@@ -2,6 +2,20 @@
 // a down pass over the compact route schedule (map0c), with the BF16
 // SwiGLU intermediate kept in the schedule's grouped rows.
 //
+// Portions of this file are derived from Splash
+// (https://github.com/incoai/splash, commit 031a25a6), Apache-2.0 licensed.
+// Source: runtime/ops/MoE.cpp, runtime/metal/kernels/shared/moe_gguf.metal,
+// runtime/metal/kernels/common/gguf_staged_tile.h, gguf_column_tile.h and
+// moe_expert_slab.h (one gate/up pass with a grouped intermediate over an
+// indirect live grid, the alternating half weight stage, the register path
+// for experts of one or two routes, the shared expert as tiles).
+// Modifications: the planes and compact route schedule of this crate's
+// grouped M8 route; eight-row tiles only; the register path enabled by a
+// device probe of the matmul's summation order; masked rows.
+//
+// Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
+// root.
+//
 // The planes are the ones `grouped_m8_prepare_q4k_q6k` writes
 // (quantized_matmul_id_grouped_mv.metal). Each thread decodes its output
 // column's 32-weight groups to half, so every product with a BF16 activation
