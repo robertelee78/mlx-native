@@ -94,22 +94,45 @@ struct MmParams {
 //          for hf2q_repacked_mm_reduce_f32.
 //   true:  the bound buffers hold all m rows and grid x enumerates the full
 //          row tiles, the `Edge` kernel taking the last, partial one; a
-//          threadgroup walks every run and adds the partial sums in
-//          registers, in the reduce kernel's order.
+//          threadgroup walks every run and adds each finished run into the
+//          output, in the reduce kernel's order (fold_run).
 template <bool Edge, bool Serial>
 inline uint tile_first_row(constant MmParams &a, uint3 group) {
     return Serial ? 32u * (Edge ? a.m / 32u : group.x) : 0u;
 }
 
-// Add one finished run to the running total and clear it for the next run.
+// Add one finished run of a serial kernel into its output tile and clear the
+// accumulator for the next run. `first` marks the first run: accumulated from
+// +0.0 it is never -0.0, so storing it equals the reduce kernel's 0.0f + run.
+//
+// The running total lives in the output buffer. It cannot live in
+// thread-private state: a pipeline built with Metal shader validation does
+// not preserve that much of it across the next run's K loop (a second
+// cooperative tensor and a plain thread array both came back with whole
+// SIMD-group slots zeroed). Threadgroup memory of its own costs occupancy:
+// 16 KB more per threadgroup ran 1.5 to 1.7 times slower at 720 rows. So the
+// run is staged through `staging`, the SIMD group's two weight staging
+// buffers, which hold 32x32 floats and are idle between runs. Thread `lane`
+// then adds activation row `lane`, whose 32 output columns are contiguous.
 template <typename Sum>
-inline void fold_run(thread Sum &run, thread Sum &total) {
-    #pragma clang loop unroll(full)
-    for (ushort i = 0; i < run.get_capacity(); ++i) {
-        if (run.is_valid_element(i)) {
-            total[i] += run[i];
-            run[i] = 0.0f;
+inline void fold_run(thread Sum &sum, threadgroup float *staging, device float *tile,
+                     uint n, uint rows, uint lane, bool first) {
+    auto staged=tensor<threadgroup float,dextents<int32_t,2>,tensor_inline>(
+        staging,dextents<int32_t,2>{32,32},array<int32_t,2>{1,32});
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    sum.store(staged);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if(lane<rows){
+        threadgroup packed_float4 *run=(threadgroup packed_float4 *)(staging+lane*32);
+        device packed_float4 *total=(device packed_float4 *)(tile+ulong(lane)*n);
+        for(ushort c=0;c<8;++c){
+            if(first) total[c]=run[c]; else total[c]=float4(total[c])+float4(run[c]);
         }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for(ushort i=0;i<sum.get_capacity();++i){
+        if(sum.is_valid_element(i)) sum[i]=0.0f;
     }
 }
 
@@ -184,7 +207,7 @@ kernel void hf2q_repacked_mm_impl(
     matmul2d<matmul2d_descriptor(ROWS,COLS,STEP,false,true,false,
         matmul2d_descriptor::mode::multiply_accumulate),execution_simdgroups<1>> mm;
     auto sum=mm.get_destination_cooperative_tensor<decltype(xt),decltype(wt0),float>();
-    auto total=mm.get_destination_cooperative_tensor<decltype(xt),decltype(wt0),float>();
+    const bool fold=Serial&&a.splits>1;
 
     const uint weight_row=output_origin+lane;
     const uint split0=Serial?0u:group.x, split1=Serial?a.splits:group.x+1;
@@ -256,16 +279,15 @@ kernel void hf2q_repacked_mm_impl(
                 lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
             }
         }
-        if constexpr(Serial) if(a.splits>1) fold_run(sum,total);
+        if(fold) fold_run(sum,(threadgroup float *)sw0,
+            output+ulong(row0)*a.n+output_origin,a.n,rows,lane,split==0);
     }
-    device float *base=output;
-    if constexpr(!Serial) if(a.splits>1) base=partials+ulong(group.x)*a.m*a.n;
-    auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
-        base+ulong(row0)*a.n+output_origin,
-        dextents<int32_t,2>{int(a.n),int(rows)},array<int32_t,2>{1,int(a.n)});
-    if constexpr(Serial){
-        if(a.splits>1) total.store(out); else sum.store(out);
-    }else{
+    if(!fold){
+        device float *base=output;
+        if constexpr(!Serial) if(a.splits>1) base=partials+ulong(group.x)*a.m*a.n;
+        auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
+            base+ulong(row0)*a.n+output_origin,
+            dextents<int32_t,2>{int(a.n),int(rows)},array<int32_t,2>{1,int(a.n)});
         sum.store(out);
     }
 }
@@ -296,8 +318,7 @@ kernel void hf2q_repacked_mm_bf16_input_impl(
         matmul2d_descriptor::mode::multiply_accumulate),execution_simdgroups<1>> mm;
     auto sum=mm.get_destination_cooperative_tensor<
         decltype(xt.template slice<STEP,ROWS>(0,0)),decltype(wt0.template slice<STEP,COLS>(0,0)),float>();
-    auto total=mm.get_destination_cooperative_tensor<
-        decltype(xt.template slice<STEP,ROWS>(0,0)),decltype(wt0.template slice<STEP,COLS>(0,0)),float>();
+    const bool fold=Serial&&a.splits>1;
 
     const uint weight_row=output_origin+lane;
     const uint rotation=uint(ulong((group.y*40503u)&0xFFFFu)*per>>16);
@@ -355,7 +376,10 @@ kernel void hf2q_repacked_mm_bf16_input_impl(
             }
 
             if constexpr(Edge){
-                // Bounds-checked against the tile's extents: rows >= m read as zero.
+                // A dynamic-extent slice keeps the tile's extents, and matmul2d
+                // "will do edge checking ... against extents of original tensor"
+                // (MPPTensorOpsMatMul2d.h, after its first example), so rows >= m
+                // are not read. The static slices of the full tiles skip the check.
                 auto left=xt.slice(int(g*STEP),0);
                 if(buffer){
                     auto right=wt1.template slice<STEP,COLS>(0,0); mm.run(left,right,sum);
@@ -374,16 +398,15 @@ kernel void hf2q_repacked_mm_bf16_input_impl(
                 g=next; lo=next_lo; hi=next_hi; h=next_h; scales=next_scales; dh=next_dh;
             }
         }
-        if constexpr(Serial) if(a.splits>1) fold_run(sum,total);
+        if(fold) fold_run(sum,(threadgroup float *)sw0,
+            output+ulong(row0)*a.n+output_origin,a.n,rows,lane,split==0);
     }
-    device float *base=output;
-    if constexpr(!Serial) if(a.splits>1) base=partials+ulong(group.x)*a.m*a.n;
-    auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
-        base+ulong(row0)*a.n+output_origin,
-        dextents<int32_t,2>{int(a.n),int(rows)},array<int32_t,2>{1,int(a.n)});
-    if constexpr(Serial){
-        if(a.splits>1) total.store(out); else sum.store(out);
-    }else{
+    if(!fold){
+        device float *base=output;
+        if constexpr(!Serial) if(a.splits>1) base=partials+ulong(group.x)*a.m*a.n;
+        auto out=tensor<device float,dextents<int32_t,2>,tensor_inline>(
+            base+ulong(row0)*a.n+output_origin,
+            dextents<int32_t,2>{int(a.n),int(rows)},array<int32_t,2>{1,int(a.n)});
         sum.store(out);
     }
 }

@@ -111,7 +111,7 @@ enum SplitSchedule {
     /// tiles wide enough to fill the GPU.
     Grid,
     /// One pass over every row tile. A threadgroup walks every split and adds
-    /// the partial sums in registers; no scratch and no reduce pass.
+    /// each finished split into the output; no scratch and no reduce pass.
     Serial,
 }
 
@@ -360,8 +360,15 @@ pub fn prepare_repacked_gguf_weight(
 /// Multiply `params.m >= 1` F32 activation rows `[M, K]` by a prepared weight,
 /// writing F32 `[M, N]`.
 ///
-/// Rows at or beyond `M` are neither read nor written. Each activation tile
-/// is recast to half once per output-column tile; prefer
+/// Rows at or beyond `M` are neither read nor written.
+///
+/// Every activation is recast to half before it is multiplied: it keeps 11
+/// significant bits, and a magnitude beyond the largest finite half, 65504,
+/// overflows to infinity. Stock `quantized_matmul_ggml` does the same at 32
+/// rows but multiplies F32 activations unrounded at other row counts, so for
+/// values that are not exact in half this entry agrees with stock to about
+/// 1e-3 (relative RMSE) there, against 3e-4 at 32 rows and on the BF16 route.
+/// The recast is repeated once per output-column tile; prefer
 /// [`dispatch_repacked_gguf_mm_bf16_input`] for BF16 activations.
 pub fn dispatch_repacked_gguf_mm(
     encoder: &mut CommandEncoder,
@@ -659,9 +666,16 @@ mod tests {
     const ROW_COUNTS: [usize; 7] = [1, 31, 32, 33, 64, 157, 720];
 
     /// Small `(N, K)` shapes with their K-split counts. Together they cover
-    /// every split count the policy can choose.
-    const SPLIT_SHAPES: [(usize, usize, u32); 4] =
-        [(192, 512, 1), (128, 1024, 2), (128, 2048, 4), (64, 4096, 8)];
+    /// every split count the policy can choose; the last has an odd number of
+    /// K steps per split, so consecutive splits of a serial pass start on the
+    /// weight staging buffer the previous one ended on.
+    const SPLIT_SHAPES: [(usize, usize, u32); 5] = [
+        (192, 512, 1),
+        (128, 1024, 2),
+        (128, 2048, 4),
+        (64, 4096, 8),
+        (64, 4352, 8),
+    ];
 
     /// Qwen3.8-27B projections: name, N, K, weight type, K-split count.
     const QWEN_SHAPES: [(&str, usize, usize, GgmlType, u32); 8] = [
@@ -895,6 +909,28 @@ mod tests {
             self.run_input(&self.input(rows, dtype))
         }
 
+        /// Output bits for an activation buffer under an explicit split
+        /// schedule.
+        fn run_input_scheduled(&mut self, input: &MlxBuffer, schedule: SplitSchedule) -> Vec<u32> {
+            let rows = input.shape()[0];
+            let output = self.output(rows);
+            let mut encoder = self.device.command_encoder().unwrap();
+            encode_repacked_gguf_mm(
+                &mut encoder,
+                &mut self.registry,
+                &self.device,
+                input,
+                &self.prepared,
+                &output,
+                rows as u32,
+                input.dtype(),
+                schedule,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+            output.as_slice::<u32>().unwrap().to_vec()
+        }
+
         /// Like [`Self::run`], under an explicit split schedule.
         fn run_scheduled(
             &mut self,
@@ -902,23 +938,7 @@ mod tests {
             dtype: DType,
             schedule: SplitSchedule,
         ) -> Vec<u32> {
-            let input = self.input(rows, dtype);
-            let output = self.output(rows.len());
-            let mut encoder = self.device.command_encoder().unwrap();
-            encode_repacked_gguf_mm(
-                &mut encoder,
-                &mut self.registry,
-                &self.device,
-                &input,
-                &self.prepared,
-                &output,
-                rows.len() as u32,
-                dtype,
-                schedule,
-            )
-            .unwrap();
-            encoder.commit_and_wait().unwrap();
-            output.as_slice::<u32>().unwrap().to_vec()
+            self.run_input_scheduled(&self.input(rows, dtype), schedule)
         }
 
         /// Stock output for an F32 activation buffer.
@@ -1145,8 +1165,8 @@ mod tests {
     }
 
     /// The split schedule is a scheduling choice only: one serial pass that
-    /// adds the K splits in registers gives the bits of per-tile split grids
-    /// and their reduce passes, for one tile and for several.
+    /// adds each finished split into the output gives the bits of per-tile
+    /// split grids and their reduce passes, for one tile and for several.
     #[cfg(mlx_native_has_metal_tensor_artifact)]
     #[test]
     fn split_schedules_give_identical_bits() {
@@ -1163,6 +1183,97 @@ mod tests {
                             "{ggml_type:?} N={n} K={k} {dtype:?} M={m}: schedules differ"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// Row independence and schedule equivalence on the Qwen3.8 shapes, whose
+    /// outputs are wide enough to run many threadgroups at once.
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn qwen_shapes_keep_row_bits_across_row_counts_and_schedules() {
+        const POOL: usize = 200;
+        let pool: Vec<usize> = (0..POOL).collect();
+        for (name, n, k, ggml_type, _) in QWEN_SHAPES {
+            let mut harness = Harness::new(ggml_type, n, k);
+            for dtype in [DType::BF16, DType::F32] {
+                let reference = harness.run_scheduled(&pool, dtype, SplitSchedule::Serial);
+                assert!(reference.iter().any(|&bits| bits != 0));
+                assert!(
+                    harness.run_scheduled(&pool, dtype, SplitSchedule::Grid) == reference,
+                    "{name} {dtype:?} M={POOL}: schedules differ"
+                );
+                for m in [1, 31, 33, 97, 160] {
+                    // Off a tile boundary, so every row changes its position
+                    // within its tile.
+                    let first = (POOL - m) * 5 / 7;
+                    assert!(first % 32 != 0);
+                    let batch: Vec<usize> = (first..first + m).collect();
+                    assert!(
+                        harness.run(&batch, dtype) == reference[first * n..(first + m) * n],
+                        "{name} {dtype:?}: rows {first}..{} computed alone differ from their bits in the {POOL}-row batch",
+                        first + m
+                    );
+                }
+            }
+        }
+    }
+
+    /// A split weight's serial schedule in pipelines built with Metal shader
+    /// validation, whose instrumentation does not preserve thread-private
+    /// state across the K loop the way plain pipelines do: a serial kernel
+    /// that kept its running total there stored blocks of zeros in a tenth to
+    /// a half of such F32 runs. Runs in a child process, because validation is
+    /// fixed when the Metal device is created.
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn serial_schedule_matches_split_grid_under_shader_validation() {
+        const CHILD: &str = "MLX_REPACKED_MM_SHADER_VALIDATION_CHILD";
+        const ROWS: usize = 230;
+        const REPEATS: usize = 40;
+        if std::env::var_os(CHILD).is_none() {
+            let name = concat!(
+                module_path!(),
+                "::serial_schedule_matches_split_grid_under_shader_validation"
+            );
+            let (_crate, name) = name.split_once("::").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("MTL_SHADER_VALIDATION", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "validated child failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stderr.contains("Metal GPU Validation Enabled"),
+                "child ran without shader validation:\n{stderr}"
+            );
+            return;
+        }
+        let rows: Vec<usize> = (0..ROWS).collect();
+        for (n, k, ggml_type) in [
+            (5_120, 17_408, GgmlType::Q6_K),
+            (5_120, 17_408, GgmlType::Q4_K),
+            (5_120, 6_144, GgmlType::Q4_K),
+        ] {
+            let mut harness = Harness::new(ggml_type, n, k);
+            for dtype in [DType::F32, DType::BF16] {
+                let input = harness.input(&rows, dtype);
+                let grid = harness.run_input_scheduled(&input, SplitSchedule::Grid);
+                assert!(grid.iter().any(|&bits| bits != 0));
+                for repeat in 0..REPEATS {
+                    let serial = harness.run_input_scheduled(&input, SplitSchedule::Serial);
+                    let differing = serial.iter().zip(&grid).filter(|(a, b)| a != b).count();
+                    assert!(
+                        differing == 0,
+                        "{ggml_type:?} N={n} K={k} {dtype:?} repeat {repeat}: {differing} elements differ from the split grid"
+                    );
                 }
             }
         }
