@@ -183,7 +183,23 @@ fn exact_union_freezes_once_and_undeclared_shape_falls_back() {
             .any(|timing| timing.route == DenseQ4Route::Tensor64x32)
     }), "the candidate must be proved and timed even when the stable-winner gate selects compatibility: {:?}", receipt.decisions);
 
-    for m in [32u32, 129] {
+    // Calibration proved and timed both declared row counts through forced
+    // routes. Only M=129 is dispatched from the plan: the dense MM dispatcher
+    // sends exactly 32 rows through tensor-v1, so the 32-row decision is
+    // recorded evidence and the trace must name the route actually encoded.
+    assert!(receipt
+        .decisions
+        .iter()
+        .any(|decision| decision.shape.m == 32 && decision.proof_submissions > 0));
+    for (m, route, source, kernel_name) in [
+        (
+            32u32,
+            Some(DenseQ4Route::CompatibilityTensorV1),
+            DenseQ4DecisionSource::IneligibleCompatibilityFallback,
+            Some("kernel_mul_mm_q4_0_tensor_f32"),
+        ),
+        (129, None, DenseQ4DecisionSource::FrozenPlan, None),
+    ] {
         let input = input(&device, m as usize, 768);
         let output = output(&device, m as usize, 3072);
         let params = GgmlQuantizedMatmulParams {
@@ -204,15 +220,23 @@ fn exact_union_freezes_once_and_undeclared_shape_falls_back() {
             &GgmlRoutingPolicy::default(),
         )
         .expect("trace declared shape");
-        assert_eq!(trace.decision.source, DenseQ4DecisionSource::FrozenPlan);
+        assert_eq!(trace.decision.source, source, "M={m}");
+        if let Some(route) = route {
+            assert_eq!(trace.decision.route, route, "M={m}");
+        }
+        if let Some(kernel_name) = kernel_name {
+            assert_eq!(trace.pipeline.kernel_name, kernel_name, "M={m}");
+        }
         assert_eq!(trace.plan_id.as_deref(), Some(plan.plan_id()));
         encoder.commit_and_wait().expect("execute declared shape");
     }
 
-    let policy_input = input(&device, 32, 768);
-    let policy_output = output(&device, 32, 3072);
+    // The large-tile policy knob outranks the frozen decision at a row count
+    // the plan does govern.
+    let policy_input = input(&device, 129, 768);
+    let policy_output = output(&device, 129, 3072);
     let params = GgmlQuantizedMatmulParams {
-        m: 32,
+        m: 129,
         n: 3072,
         k: 768,
         ggml_type: GgmlType::Q4_0,
