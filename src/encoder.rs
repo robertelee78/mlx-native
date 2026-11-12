@@ -946,6 +946,10 @@ pub struct CommandEncoder {
     /// value. Keys caller-owned state recorded against this encoder, such
     /// as an `IdMmScratch` routing schedule.
     instance_id: u64,
+    /// [`crate::command_timeline`]: host time this command buffer's first
+    /// compute encoder was opened; `0.0` when recording is off or nothing
+    /// has been encoded.
+    timeline_encode_begin_s: f64,
 }
 
 /// SAFETY: CommandEncoder is safe to Send across threads provided that:
@@ -1091,6 +1095,7 @@ impl CommandEncoder {
             dispatch_in_cb: 0,
             last_label: String::new(),
             instance_id: NEXT_ENCODER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            timeline_encode_begin_s: 0.0,
         })
     }
 
@@ -1476,6 +1481,9 @@ impl CommandEncoder {
                 let _: () = unsafe { msg_send![encoder, retain] };
                 encoder as *const ComputeCommandEncoderRef
             });
+            if self.timeline_encode_begin_s == 0.0 && crate::command_timeline::enabled() {
+                self.timeline_encode_begin_s = crate::command_timeline::now_seconds();
+            }
         }
         // SAFETY: active_encoder is non-null and points to a valid encoder
         // owned by cmd_buf.
@@ -2930,7 +2938,20 @@ impl CommandEncoder {
             .observation
             .as_ref()
             .and_then(|_| crate::submission_observer::clock_ns());
+        let timeline_begin =
+            crate::command_timeline::enabled().then(crate::command_timeline::now_seconds);
         self.cmd_buf.commit();
+        if let Some(commit_begin_s) = timeline_begin {
+            crate::command_timeline::committed(
+                &self.cmd_buf,
+                &self.last_label,
+                self.timeline_encode_begin_s,
+                commit_begin_s,
+                crate::command_timeline::now_seconds(),
+                DISPATCH_COUNT.load(Ordering::Relaxed),
+                BARRIER_COUNT.load(Ordering::Relaxed),
+            );
+        }
         if let Some(observer) = &self.observation {
             observer.submitted(begin, crate::submission_observer::clock_ns());
         } else {
@@ -2943,7 +2964,16 @@ impl CommandEncoder {
             .observation
             .as_ref()
             .and_then(|_| crate::submission_observer::clock_ns());
+        let timeline_begin =
+            crate::command_timeline::enabled().then(crate::command_timeline::now_seconds);
         self.cmd_buf.wait_until_completed();
+        if let Some(wait_begin_s) = timeline_begin {
+            crate::command_timeline::waited(
+                &self.cmd_buf,
+                wait_begin_s,
+                crate::command_timeline::now_seconds(),
+            );
+        }
         let status = self.cmd_buf.status();
         if self.observation.is_some() {
             crate::submission_observer::inspect_retired_after_wait(
@@ -3334,6 +3364,7 @@ impl CommandEncoder {
         // bounded by a CB lifetime resets here.
         self.active_encoder = std::ptr::null();
         self.dispatch_in_cb = 0;
+        self.timeline_encode_begin_s = 0.0;
         self.last_label.clear();
         self.pending_dispatch_meta.clear();
         // `mem_ranges` is a per-CB barrier inference state; clearing on
