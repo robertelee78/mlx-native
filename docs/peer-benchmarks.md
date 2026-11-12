@@ -11,8 +11,9 @@ notice ships as `LICENSE-MIT-llamacpp` at the repo root. Some quantized
 kernels arrived via candle's vendored copies (`LICENSE-APACHE-candle`). The
 prepared GGUF projection (`gguf_repacked_mm.metal`), the staged AF4G64 draft
 projection (`dflash2_af4g64_staged.metal`), the ring draft attention
-(`dflash2_ring_attention.metal`) and the MoE expert live tiles
-(`moe_expert_tiles.metal`) are derived from
+(`dflash2_ring_attention.metal`), the MoE expert live tiles
+(`moe_expert_tiles.metal`) and the tiled verify attention
+(`tq_hb_verify_tile.metal`) are derived from
 [Splash](https://github.com/incoai/splash) commit `031a25a6` (Apache-2.0,
 `LICENSE-APACHE-splash`); each shader's header lists its sources and changes.
 

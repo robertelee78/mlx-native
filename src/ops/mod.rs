@@ -148,6 +148,7 @@ pub mod sqrt_elementwise;
 pub mod ssm_conv;
 pub mod take_along_axis;
 pub mod tq_dequantize_kv;
+pub mod tq_hb_verify_tile;
 pub mod transpose;
 pub mod tree_attention;
 pub mod tri_solve;
