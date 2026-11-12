@@ -10,8 +10,11 @@
 // Modifications: the arithmetic is that of the stock hf2q kernels, operation
 // for operation (ssm_conv_forward_f32, l2_norm_f32 and scalar_mul_f32,
 // compute_g_beta_f32, gated_delta_net_decode_f32_4, ssm_norm_gate_f32), with
-// F32 operands, F32 state and their tree reductions, so every output bit is
-// the stock chain's; hf2q state layout with per-slot ping-pong buffers; the
+// F32 operands, F32 state and their tree reductions; every output bit is the
+// stock chain's on the Apple M5 Max (tests/test_gdn_window_fused.rs; the
+// phases outside the pinned norm sums and scales keep Metal's fast-math
+// flags as the stock kernels do, so the test is the gate on any other GPU
+// family); hf2q state layout with per-slot ping-pong buffers; the
 // step writes the state after its rows and a replay tape of its inputs
 // instead of folding the previous step's rows; tiled key-head mapping;
 // padding lanes.

@@ -10,6 +10,7 @@
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::rms_norm::{
     dispatch_rms_norm, dispatch_rms_norm_f32_to_bf16, rms_norm_f32_to_bf16_available,
+    rms_norm_f32_to_bf16_supported,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -143,10 +144,14 @@ fn bf16_output_norm_is_bitwise_the_norm_then_the_cast() {
     let Ok(device) = MlxDevice::new() else { return };
     let mut registry = KernelRegistry::new();
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
-    // Dimensions of at least 97 keep the stock norm's threadgroup memory a
+    // Dimensions of at least 65 keep the stock norm's threadgroup memory a
     // multiple of 16 bytes, which the Metal debug layer requires of it.
     for dim in [5_120, 2_048, 1_024, 256, 132, 128, 124, 100] {
         assert!(rms_norm_f32_to_bf16_available(dim as u32));
+        assert!(
+            rms_norm_f32_to_bf16_supported(&mut registry, device.metal_device(), dim as u32).unwrap(),
+            "dim {dim}: the device limits refuse the BF16-output norm"
+        );
         const POOL: usize = 40;
         let pool: Vec<usize> = (0..POOL).collect();
         let reference = stock(&device, &mut registry, &pool, dim);
@@ -182,6 +187,7 @@ fn bf16_output_norm_rejects_other_geometries() {
     let mut registry = KernelRegistry::new();
     assert!(!rms_norm_f32_to_bf16_available(0));
     assert!(!rms_norm_f32_to_bf16_available(130));
+    assert!(!rms_norm_f32_to_bf16_supported(&mut registry, device.metal_device(), 130).unwrap());
     let input = f32_buffer(&device, &[1.0; 16]);
     let weight = f32_buffer(&device, &[1.0; 8]);
     let params = f32_buffer(&device, &[EPS, 8.0]);

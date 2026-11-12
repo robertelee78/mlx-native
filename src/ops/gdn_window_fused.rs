@@ -16,10 +16,19 @@
 //! root.
 //!
 //! Numerics: every stage repeats the stock kernel's operations in its order
-//! (the 128-thread tree of the norm reductions included), so the gated
+//! (the 128-thread tree of the norm reductions included), and the gated
 //! output, both states and the retained rows are bitwise those of the stock
-//! chain (`tests/test_gdn_window_fused.rs`). The BF16 output is the F32
-//! output rounded as `cast_f32_to_bf16` rounds it.
+//! chain. The BF16 output is the F32 output rounded as `cast_f32_to_bf16`
+//! rounds it.
+//!
+//! That equality is qualified by test on the Apple M5 Max
+//! (`tests/test_gdn_window_fused.rs`), not guaranteed by the source alone.
+//! The norm sums and the Q/K scales are compiled with reassociation and
+//! contraction off; the convolution, the gates, the scan and the gate phase
+//! are compiled as the stock kernels are, with Metal's fast-math flags, so
+//! how a backend associates and contracts them is its choice per pipeline.
+//! `tests/test_gdn_window_fused.rs` is the gate for any other GPU family
+//! before the kernel is offered there as a bitwise replacement.
 //!
 //! Invariants: a lane's outputs and state depend only on its own rows, its
 //! slot's state and the weights; not on the other lanes, on its packed
@@ -363,7 +372,7 @@ pub fn dispatch_gdn_window_fused(
         {
             return Err(invalid(format!(
                 "lane rows {first_row}..{} outside 1..={WINDOW_ROWS} rows of {rows} packed rows",
-                first_row + lane_rows
+                u64::from(first_row) + u64::from(lane_rows)
             )));
         }
         for row in &mut covered[first_row as usize..(first_row + lane_rows) as usize] {

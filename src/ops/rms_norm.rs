@@ -42,9 +42,62 @@ pub fn register(registry: &mut KernelRegistry) {
 /// Whether [`dispatch_rms_norm_f32_to_bf16`] serves rows of `dim` elements:
 /// [`dispatch_rms_norm`] would run its float4 kernel on them (`dim % 4 == 0`
 /// and `HF2Q_RMS_NORM_V2` not disabled), whose bits the BF16-output kernel
-/// reproduces.
+/// reproduces. Geometry only; [`rms_norm_f32_to_bf16_supported`] also checks
+/// the device.
 pub fn rms_norm_f32_to_bf16_available(dim: u32) -> bool {
     dim > 0 && dim % 4 == 0 && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2")
+}
+
+const RMS_NORM_F32_TO_BF16_KERNEL: &str = "rms_norm_f32_v2_bf16_out";
+
+/// Threads per threadgroup and bound threadgroup memory of the BF16-output
+/// norm for rows of `dim` elements: the geometry of `dispatch_rms_norm`'s
+/// float4 kernel, one float per simdgroup in the 16-byte units Metal's API
+/// contract requires.
+fn rms_norm_f32_to_bf16_geometry(dim: u32) -> (u64, u64) {
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()).max(32) as u64;
+    (tg_size, ((tg_size / 32).max(1) * 4).next_multiple_of(16))
+}
+
+/// Why the device cannot run the BF16-output norm on rows of `dim` elements,
+/// if it cannot: the pipeline as built allows fewer threads per threadgroup,
+/// or its static plus bound threadgroup memory exceeds the device's limit
+/// (shader validation enlarges the static part).
+fn rms_norm_f32_to_bf16_limit_violation(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    dim: u32,
+) -> Result<Option<String>> {
+    let (tg_size, shared_mem_bytes) = rms_norm_f32_to_bf16_geometry(dim);
+    let pipeline = registry.get_pipeline(RMS_NORM_F32_TO_BF16_KERNEL, device)?;
+    if pipeline.max_total_threads_per_threadgroup() < tg_size {
+        return Ok(Some(format!(
+            "{RMS_NORM_F32_TO_BF16_KERNEL} allows {} threads per threadgroup, needs {tg_size}",
+            pipeline.max_total_threads_per_threadgroup()
+        )));
+    }
+    let memory = pipeline
+        .static_threadgroup_memory_length()
+        .saturating_add(shared_mem_bytes);
+    let limit = device.max_threadgroup_memory_length();
+    if memory > limit {
+        return Ok(Some(format!(
+            "{RMS_NORM_F32_TO_BF16_KERNEL} needs {memory} bytes of threadgroup memory, the device allows {limit}"
+        )));
+    }
+    Ok(None)
+}
+
+/// Whether [`dispatch_rms_norm_f32_to_bf16`] can run on this device for rows
+/// of `dim` elements: [`rms_norm_f32_to_bf16_available`] and the pipeline's
+/// thread count and threadgroup memory within the device's limits.
+pub fn rms_norm_f32_to_bf16_supported(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    dim: u32,
+) -> Result<bool> {
+    Ok(rms_norm_f32_to_bf16_available(dim)
+        && rms_norm_f32_to_bf16_limit_violation(registry, device, dim)?.is_none())
 }
 
 /// RMS-normalize F32 rows `[rows, dim]` with an F32 weight `[dim]` and store
@@ -53,7 +106,7 @@ pub fn rms_norm_f32_to_bf16_available(dim: u32) -> bool {
 /// Bitwise [`dispatch_rms_norm`] on the same F32 buffers followed by an
 /// F32 to BF16 cast, in one dispatch: a consumer of BF16 rows reads the norm
 /// directly. `params_buf` is `[eps, dim]` as F32. Requires
-/// [`rms_norm_f32_to_bf16_available`].
+/// [`rms_norm_f32_to_bf16_supported`].
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_rms_norm_f32_to_bf16(
     encoder: &mut CommandEncoder,
@@ -92,11 +145,13 @@ pub fn dispatch_rms_norm_f32_to_bf16(
             output.element_count()
         )));
     }
-    let pipeline = registry.get_pipeline("rms_norm_f32_v2_bf16_out", device)?;
-    // The geometry of `dispatch_rms_norm`'s float4 kernel. One float per
-    // simdgroup, in the 16-byte units the Metal debug layer requires.
-    let tg_size = std::cmp::min(256, dim.next_power_of_two()).max(32) as u64;
-    let shared_mem_bytes = ((tg_size / 32).max(1) * 4).next_multiple_of(16);
+    if let Some(violation) = rms_norm_f32_to_bf16_limit_violation(registry, device, dim)? {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm F32 to BF16: {violation}; check rms_norm_f32_to_bf16_supported"
+        )));
+    }
+    let pipeline = registry.get_pipeline(RMS_NORM_F32_TO_BF16_KERNEL, device)?;
+    let (tg_size, shared_mem_bytes) = rms_norm_f32_to_bf16_geometry(dim);
     encoder.encode_threadgroups_with_shared(
         pipeline,
         &[(0, input), (1, weight), (2, output), (3, params_buf)],
