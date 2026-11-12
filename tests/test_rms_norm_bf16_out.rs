@@ -144,12 +144,15 @@ fn bf16_output_norm_is_bitwise_the_norm_then_the_cast() {
     let Ok(device) = MlxDevice::new() else { return };
     let mut registry = KernelRegistry::new();
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
-    // Dimensions of at least 65 keep the stock norm's threadgroup memory a
-    // multiple of 16 bytes, which the Metal debug layer requires of it.
-    for dim in [5_120, 2_048, 1_024, 256, 132, 128, 124, 100] {
+    // The Qwen hidden sizes, then every threadgroup size of the kernel (32,
+    // 64, 128 and 256 threads) on both sides of its boundaries.
+    for dim in [
+        5_120, 2_048, 1_024, 256, 132, 128, 124, 100, 68, 64, 36, 32, 28, 4,
+    ] {
         assert!(rms_norm_f32_to_bf16_available(dim as u32));
         assert!(
-            rms_norm_f32_to_bf16_supported(&mut registry, device.metal_device(), dim as u32).unwrap(),
+            rms_norm_f32_to_bf16_supported(&mut registry, device.metal_device(), dim as u32)
+                .unwrap(),
             "dim {dim}: the device limits refuse the BF16-output norm"
         );
         const POOL: usize = 40;
