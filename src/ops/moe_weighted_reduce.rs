@@ -25,9 +25,13 @@ use crate::kernel_registry::KernelRegistry;
 pub static MOE_WEIGHTED_REDUCE_SHADER_SOURCE: &str =
     include_str!("../shaders/moe_weighted_reduce.metal");
 
-/// Register the `moe_weighted_reduce_f32` pipeline.
+/// Register the `moe_weighted_reduce_f32` and masked-route pipelines.
 pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("moe_weighted_reduce_f32", MOE_WEIGHTED_REDUCE_SHADER_SOURCE);
+    registry.register_source(
+        "moe_weighted_reduce_masked_f32",
+        MOE_WEIGHTED_REDUCE_SHADER_SOURCE,
+    );
 }
 
 /// GPU-side params struct.
@@ -74,6 +78,57 @@ pub fn dispatch_moe_weighted_reduce(
     h:            u32,
     add_residual: bool,
 ) -> Result<()> {
+    dispatch_reduce_kernel(
+        "moe_weighted_reduce_f32", encoder, registry, device, expert_w, y_expert, sh_gate,
+        y_shared, residual, output, n_tokens, top_k, h, add_residual,
+    )
+}
+
+/// [`dispatch_moe_weighted_reduce`] for route tables with masked routes.
+///
+/// A route whose `expert_w` is exactly zero is skipped without reading its
+/// `y_expert` row. Use it after a projection that leaves masked rows
+/// unwritten (`quantized_matmul_id_ggml_grouped_m8_epilogue_masked`), where
+/// multiplying a stale non-finite value by zero would poison the output.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_moe_weighted_reduce_masked(
+    encoder:      &mut CommandEncoder,
+    registry:     &mut KernelRegistry,
+    device:       &MlxDevice,
+    expert_w:     &MlxBuffer,
+    y_expert:     &MlxBuffer,
+    sh_gate:      &MlxBuffer,
+    y_shared:     &MlxBuffer,
+    residual:     &MlxBuffer,
+    output:       &mut MlxBuffer,
+    n_tokens:     u32,
+    top_k:        u32,
+    h:            u32,
+    add_residual: bool,
+) -> Result<()> {
+    dispatch_reduce_kernel(
+        "moe_weighted_reduce_masked_f32", encoder, registry, device, expert_w, y_expert, sh_gate,
+        y_shared, residual, output, n_tokens, top_k, h, add_residual,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_reduce_kernel(
+    kernel:       &'static str,
+    encoder:      &mut CommandEncoder,
+    registry:     &mut KernelRegistry,
+    device:       &MlxDevice,
+    expert_w:     &MlxBuffer,
+    y_expert:     &MlxBuffer,
+    sh_gate:      &MlxBuffer,
+    y_shared:     &MlxBuffer,
+    residual:     &MlxBuffer,
+    output:       &mut MlxBuffer,
+    n_tokens:     u32,
+    top_k:        u32,
+    h:            u32,
+    add_residual: bool,
+) -> Result<()> {
     let f32_sz = DType::F32.size_of();
 
     if n_tokens == 0 || top_k == 0 || h == 0 {
@@ -113,7 +168,7 @@ pub fn dispatch_moe_weighted_reduce(
         add_residual: add_residual as u32,
     };
 
-    let pipeline = registry.get_pipeline("moe_weighted_reduce_f32", device.metal_device())?;
+    let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
 
     // Grid: (ceil(h/256), n_tokens, 1).
     let threadgroups = MTLSize::new(

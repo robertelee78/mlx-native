@@ -64,3 +64,41 @@ kernel void moe_weighted_reduce_f32(
 
     output[t * p.h + h_idx] = acc;
 }
+
+// Same reduction for route tables with masked routes: a route whose routing
+// weight is exactly zero is skipped without reading its expert row, which a
+// masked-route projection leaves unwritten.
+kernel void moe_weighted_reduce_masked_f32(
+        constant MoeWeightedReduceParams & p   [[buffer(0)]],
+        device const float * expert_w          [[buffer(1)]],
+        device const float * y_expert          [[buffer(2)]],
+        device const float * sh_logit          [[buffer(3)]],
+        device const float * y_shared          [[buffer(4)]],
+        device const float * residual          [[buffer(5)]],
+        device       float * output            [[buffer(6)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        uint   tiitg [[thread_index_in_threadgroup]]) {
+
+    const uint h_idx = tgpig.x * 256 + tiitg;
+    const uint t     = tgpig.y;
+
+    if (h_idx >= p.h || t >= p.n_tokens) return;
+
+    float acc = 0.f;
+    for (uint k = 0; k < p.top_k; k++) {
+        const uint slot = t * p.top_k + k;
+        const float w = expert_w[slot];
+        if (w != 0.f) {
+            acc += w * y_expert[slot * p.h + h_idx];
+        }
+    }
+
+    const float sh_gate = 1.f / (1.f + exp(-sh_logit[t]));
+    acc += sh_gate * y_shared[t * p.h + h_idx];
+
+    if (p.add_residual != 0) {
+        acc += residual[t * p.h + h_idx];
+    }
+
+    output[t * p.h + h_idx] = acc;
+}
