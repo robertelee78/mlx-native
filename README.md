@@ -325,11 +325,13 @@ for name in gguf.tensor_names() {
 This crate includes Metal kernels and dispatch code derived from:
 - [candle](https://github.com/huggingface/candle) (Apache-2.0) — see `LICENSE-APACHE-candle`
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) (MIT) — see `LICENSE-MIT-llamacpp`
+- [Splash](https://github.com/incoai/splash) (Apache-2.0) — see `LICENSE-APACHE-splash`
 
 Derived-kernel provenance and peer comparisons are consolidated in `docs/peer-benchmarks.md`.
 
 ## License
 
 The packaged crate combines MIT-licensed code with Apache-2.0-derived
-components. Recipients must comply with both licenses. See [LICENSE](LICENSE)
-and [`LICENSE-APACHE-candle`](LICENSE-APACHE-candle).
+components. Recipients must comply with both licenses. See [LICENSE](LICENSE),
+[`LICENSE-APACHE-candle`](LICENSE-APACHE-candle) and
+[`LICENSE-APACHE-splash`](LICENSE-APACHE-splash).

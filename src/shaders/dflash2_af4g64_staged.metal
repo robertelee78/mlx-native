@@ -1,10 +1,18 @@
 // Staged AF4G64 draft projections for Apple10-class GPUs.
 //
-// The tile and its split, walk and one-pass gate/up structure are derived
-// from Splash's Apache-2.0 staged GGUF decode tile
-// (https://github.com/incoai/splash, commit 031a25a6:
-// runtime/metal/kernels/common/gguf_staged_tile.h and
-// runtime/metal/kernels/shared/gguf_linear.metal).
+// Portions of this file are derived from Splash
+// (https://github.com/incoai/splash, commit 031a25a6), Apache-2.0 licensed.
+// Source: runtime/metal/kernels/common/gguf_staged_tile.h,
+// runtime/metal/kernels/common/gguf_staged.h and
+// runtime/metal/kernels/shared/gguf_linear.metal.
+// Modifications: one affine four-bit format instead of the format templates;
+// mlx-native's prepared AF4G64 planes and dispatch arguments; a split count
+// fixed per weight shape and a separate fixed-order reduce kernel instead of
+// the last-arriving partition's reduce; FP32 projection outputs; exp in the
+// pair's SiLU, taken on the FP32 sums.
+//
+// Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
+// root.
 //
 // Weights are the prepared AF4G64 planes of
 // qmm_affine_t_packed_simd4_b4_gs64_bf16.metal: codes
