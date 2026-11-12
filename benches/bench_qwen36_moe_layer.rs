@@ -676,9 +676,10 @@ fn encode_staged_f32(
     }
 }
 
-/// The live-tile route of hf2q's `moe_live_tiles.rs` (`moe_tiles_*`): router
-/// and shared-gate logit per block of eight rows on the single-row kernel,
-/// one route schedule, one gate/up pass with the BF16 SwiGLU left in the
+/// The stage-by-stage live-tile form of hf2q's `moe_live_tiles.rs`
+/// (`moe_tiles_*`, the fallback of its live-tile route): router and
+/// shared-gate logit per block of eight rows on the single-row kernel, one
+/// route schedule, one gate/up pass with the BF16 SwiGLU left in the
 /// schedule's rows, and down on the same rows. The shared expert runs the
 /// same three stages beside the routed experts, a tile per block of rows.
 const LIVE_TILES: &[Stage] = &[
@@ -859,11 +860,13 @@ fn encode_live_tiles(
     }
 }
 
-/// The fused route of hf2q's `moe_live_tiles.rs` (`moe_tiles_fused`): the
-/// live-tile router and selection, then one schedule (with the verify-row
-/// mask), one gather and one dispatch per pass for the routed experts and
-/// the shared expert together. The expert stages are timed cumulatively:
-/// each row is the stage's command minus the one that stops a stage earlier.
+/// The live-tile route of hf2q's `moe_live_tiles_fused.rs`
+/// (`moe_tiles_fused`): router and shared-gate logit as one dispatch each
+/// over the blocks of eight rows, the selection, then one schedule (with the
+/// verify-row mask), one gather and one dispatch per pass for the routed
+/// experts and the shared expert together. The expert stages are timed
+/// cumulatively: each row is the stage's command minus the one that stops a
+/// stage earlier.
 const FUSED_TILES: &[Stage] = &[
     ("router", Base::Alone, true),
     ("shared_gate_logit", Base::Alone, true),

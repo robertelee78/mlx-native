@@ -1,8 +1,9 @@
 //! Fused MoE expert tiles (`moe_tiles_fused`): bitwise the live-tile stages
 //! (`moe_tiles_*`, whose F64 reference, determinism and row independence
 //! `tests/moe_expert_tiles.rs` proves) for the routed experts and the shared
-//! expert, the verify-row mask applied by the schedule, determinism, row
-//! independence, and what the route refuses.
+//! expert, the verify-row mask applied by the schedule, the schedule words,
+//! route list and grids of a 256-expert step against a CPU reference,
+//! determinism, row independence, and what the route refuses.
 //!
 //! Every comparison prints an FNV-1a digest of the compared bits, so runs
 //! under `MTL_SHADER_VALIDATION=1` and `MTL_DEBUG_LAYER=1` can be compared
@@ -25,6 +26,9 @@ use mlx_native::{
 const HIDDEN: usize = 512;
 const INTERMEDIATE: usize = 256;
 const EXPERTS: usize = 24;
+/// The widest schedule: one expert per thread of its threadgroup, eight
+/// simdgroups.
+const WIDE_EXPERTS: usize = 256;
 const TOP_K: usize = 8;
 const TOKENS: usize = 32;
 const LANE_ROWS: usize = 8;
@@ -164,6 +168,7 @@ impl Mask<'_> {
 struct Layer {
     device: MlxDevice,
     registry: KernelRegistry,
+    experts: usize,
     /// Gate, up, down of the routed experts and of the shared expert.
     routed: [PreparedGroupedM8Experts; 3],
     shared: [PreparedGroupedM8Experts; 3],
@@ -182,6 +187,10 @@ struct Step {
     /// Live tiles of the step (the fused schedule's word 0).
     tiles: u32,
     grids: Vec<u32>,
+    /// The fused step's schedule words and route list (empty for the
+    /// live-tile stages).
+    schedule: Vec<u32>,
+    route_list: Vec<u32>,
 }
 
 impl Step {
@@ -200,6 +209,16 @@ impl Layer {
         down_type: GgmlType,
         shared_down_type: GgmlType,
         seed: u64,
+    ) -> Self {
+        Self::with_experts(gate_up_type, down_type, shared_down_type, seed, EXPERTS)
+    }
+
+    fn with_experts(
+        gate_up_type: GgmlType,
+        down_type: GgmlType,
+        shared_down_type: GgmlType,
+        seed: u64,
+        experts: usize,
     ) -> Self {
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
@@ -227,9 +246,9 @@ impl Layer {
             .expect("prepare")
         };
         let routed = [
-            prepare(gate_up_type, EXPERTS, INTERMEDIATE, HIDDEN),
-            prepare(gate_up_type, EXPERTS, INTERMEDIATE, HIDDEN),
-            prepare(down_type, EXPERTS, HIDDEN, INTERMEDIATE),
+            prepare(gate_up_type, experts, INTERMEDIATE, HIDDEN),
+            prepare(gate_up_type, experts, INTERMEDIATE, HIDDEN),
+            prepare(down_type, experts, HIDDEN, INTERMEDIATE),
         ];
         let shared = [
             prepare(gate_up_type, 1, INTERMEDIATE, HIDDEN),
@@ -242,6 +261,7 @@ impl Layer {
         Self {
             device,
             registry,
+            experts,
             routed,
             shared,
             column_tile,
@@ -252,7 +272,7 @@ impl Layer {
         MoeTilesFusedParams {
             n_tokens: tokens as u32,
             top_k: TOP_K as u32,
-            n_experts: EXPERTS as u32,
+            n_experts: self.experts as u32,
             hidden: HIDDEN as u32,
             intermediate: INTERMEDIATE as u32,
             column_tile,
@@ -279,7 +299,7 @@ impl Layer {
                 n_experts: if shared {
                     blocks as u32
                 } else {
-                    EXPERTS as u32
+                    self.experts as u32
                 },
                 hidden: HIDDEN as u32,
                 intermediate: INTERMEDIATE as u32,
@@ -376,6 +396,8 @@ impl Layer {
             weights: Vec::new(),
             tiles,
             grids: grid_words,
+            schedule: Vec::new(),
+            route_list: Vec::new(),
         }
     }
 
@@ -451,6 +473,8 @@ impl Layer {
             weights: weights.as_slice::<u32>().expect("weights").to_vec(),
             tiles: schedule.as_slice::<u32>().expect("schedule")[0],
             grids: grids.as_slice::<u32>().expect("grid words").to_vec(),
+            schedule: schedule.as_slice::<u32>().expect("schedule").to_vec(),
+            route_list: routes.as_slice::<u32>().expect("route list").to_vec(),
         }
     }
 }
@@ -617,6 +641,304 @@ fn q6_k_down_fused_route_is_the_live_tile_route_bitwise() {
 #[test]
 fn q6_k_gate_up_fused_route_is_the_live_tile_route_bitwise() {
     equals_live_tiles(GgmlType::Q6_K, GgmlType::Q4_K, 0x93);
+}
+
+const SHARED_TILE: u32 = 0x8000_0000;
+const COLUMN_TILE: u32 = 0x4000_0000;
+
+/// The schedule words and route list `moe_tiles_fused_schedule` documents,
+/// for a route table whose masked routes hold the id `experts`.
+fn reference_schedule(
+    masked_ids: &[u32],
+    experts: usize,
+    column_tile: bool,
+) -> (Vec<u32>, Vec<u32>) {
+    let tokens = masked_ids.len() / TOP_K;
+    let column_rows = if column_tile { 2 } else { 0 };
+    let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); experts];
+    for (route, id) in masked_ids.iter().enumerate() {
+        if (*id as usize) < experts {
+            by_expert[*id as usize].push(route as u32);
+        }
+    }
+    let mut tiles = Vec::new();
+    let mut routes = Vec::new();
+    for (expert, list) in by_expert.iter().enumerate() {
+        // The register path is an expert's, not a tile's: nine routes are
+        // two matmul tiles.
+        let flag = if list.len() <= column_rows {
+            COLUMN_TILE
+        } else {
+            0
+        };
+        for chunk in list.chunks(8) {
+            tiles.extend_from_slice(&[
+                expert as u32 | flag,
+                routes.len() as u32,
+                chunk.len() as u32,
+            ]);
+            routes.extend_from_slice(chunk);
+        }
+    }
+    let routed_rows = routes.len();
+    for block in 0..tokens.div_ceil(LANE_ROWS) {
+        let rows = LANE_ROWS.min(tokens - block * LANE_ROWS);
+        let flag = if rows <= column_rows { COLUMN_TILE } else { 0 };
+        tiles.extend_from_slice(&[
+            SHARED_TILE | flag,
+            (routed_rows + block * LANE_ROWS) as u32,
+            rows as u32,
+        ]);
+    }
+    routes.extend((0..tokens).map(|token| (masked_ids.len() + token) as u32));
+    let mut schedule = vec![(tiles.len() / 3) as u32];
+    schedule.extend(tiles);
+    (schedule, routes)
+}
+
+/// A 32-row table over `WIDE_EXPERTS` experts in which expert `e` of `plan`
+/// holds exactly the rows of its range, the experts of `unused` hold none
+/// and every other slot holds an expert of one route, drawn from all of the
+/// schedule's simdgroups (a stride of 37 walks every expert once).
+fn edge_table(plan: &[(u32, std::ops::Range<usize>)], unused: &[u32], seed: u64) -> Vec<u32> {
+    let mut rng = Rng(seed);
+    let mut filler = (0..WIDE_EXPERTS as u32)
+        .map(|index| index * 37 % WIDE_EXPERTS as u32)
+        .filter(|expert| {
+            !unused.contains(expert) && plan.iter().all(|(planned, _)| planned != expert)
+        });
+    let mut ids = Vec::with_capacity(TOKENS * TOP_K);
+    for token in 0..TOKENS {
+        let mut row: Vec<u32> = plan
+            .iter()
+            .filter(|(_, range)| range.contains(&token))
+            .map(|(expert, _)| *expert)
+            .collect();
+        while row.len() < TOP_K {
+            row.push(filler.next().expect("filler expert"));
+        }
+        assert_eq!(
+            row.len(),
+            TOP_K,
+            "row {token} holds too many planned experts"
+        );
+        for index in (1..TOP_K).rev() {
+            row.swap(index, rng.below(index + 1));
+        }
+        ids.extend_from_slice(&row);
+    }
+    ids
+}
+
+/// One fused step of the 256-expert layer against the CPU reference of its
+/// schedule and against the live-tile stages; returns the compared bits.
+fn check_wide_step(
+    layer: &mut Layer,
+    label: &str,
+    x: &[f32],
+    ids: &[u32],
+    routing_weights: &[f32],
+    mask: Option<Mask<'_>>,
+    column_tile: bool,
+) -> Vec<u32> {
+    let tokens = ids.len() / TOP_K;
+    let masked_id = layer.experts as u32;
+    let live = |token: usize| mask.map_or(true, |mask| mask.live(token));
+    let masked_ids: Vec<u32> = ids
+        .iter()
+        .enumerate()
+        .map(|(route, id)| if live(route / TOP_K) { *id } else { masked_id })
+        .collect();
+    // Masked rows carry NaN inputs: no live route may read them.
+    let mut masked_x = x.to_vec();
+    for token in (0..tokens).filter(|token| !live(*token)) {
+        masked_x[token * HIDDEN..(token + 1) * HIDDEN].fill(f32::NAN);
+    }
+    let fused = layer.fused(&masked_x, ids, routing_weights, mask, column_tile);
+    assert_eq!(fused.ids, masked_ids, "{label}: route table");
+
+    let (schedule, route_list) = reference_schedule(&masked_ids, layer.experts, column_tile);
+    assert_eq!(
+        fused.schedule[..schedule.len()],
+        schedule[..],
+        "{label}: schedule words"
+    );
+    assert_eq!(
+        fused.route_list[..route_list.len()],
+        route_list[..],
+        "{label}: route list"
+    );
+    let tiles = schedule[0];
+    assert_eq!(
+        fused.grids,
+        [
+            (HIDDEN / 256) as u32,
+            tiles,
+            1,
+            (INTERMEDIATE / 32) as u32,
+            tiles,
+            1,
+            (HIDDEN / 64) as u32,
+            tiles,
+            1
+        ],
+        "{label}: indirect grids"
+    );
+
+    let stages = layer.live(&masked_x, &masked_ids, column_tile);
+    let mut compared = Vec::new();
+    for route in 0..ids.len() {
+        if masked_ids[route] == masked_id {
+            assert!(
+                fused.route(route).iter().all(|bits| *bits == UNWRITTEN),
+                "{label}: masked route {route} was written"
+            );
+        } else {
+            assert!(
+                fused
+                    .route(route)
+                    .iter()
+                    .all(|bits| *bits != UNWRITTEN && f32::from_bits(*bits).is_finite()),
+                "{label}: route {route} was not written or is not finite"
+            );
+            assert!(
+                fused.route(route) == stages.route(route),
+                "{label}: route {route} (expert {}) differs from the live-tile stages",
+                masked_ids[route]
+            );
+            compared.extend_from_slice(fused.route(route));
+        }
+    }
+    for token in (0..tokens).filter(|token| live(*token)) {
+        assert!(
+            fused.shared_row(token) == stages.shared_row(token),
+            "{label}: the shared expert's row {token} differs from the live-tile stages"
+        );
+        compared.extend_from_slice(fused.shared_row(token));
+    }
+    compared
+}
+
+/// Experts in every simdgroup of the schedule's threadgroup, the last index
+/// included: the first row and first tile of an expert sum over the
+/// simdgroups before its own.
+#[test]
+fn schedule_of_256_experts_matches_the_cpu_reference() {
+    let mut layer = Layer::with_experts(
+        GgmlType::Q4_K,
+        GgmlType::Q6_K,
+        GgmlType::Q6_K,
+        0xe0,
+        WIDE_EXPERTS,
+    );
+    let probed = layer.column_tile;
+    let first = edge_table(
+        &[
+            (0, 0..32),
+            (255, 0..17),
+            (1, 0..16),
+            (254, 0..9),
+            (2, 0..8),
+            (3, 30..32),
+            (4, 31..32),
+        ],
+        &[5, 128, 253],
+        0xe1,
+    );
+    let second = edge_table(
+        &[
+            (255, 0..32),
+            (254, 5..6),
+            (0, 3..5),
+            (253, 0..9),
+            (127, 8..24),
+            (128, 15..32),
+            (64, 0..8),
+            (31, 2..12),
+            (32, 20..31),
+        ],
+        &[1, 2, 252],
+        0xe2,
+    );
+    for table in [&first, &second] {
+        let mut counts = vec![0usize; WIDE_EXPERTS];
+        table.iter().for_each(|id| counts[*id as usize] += 1);
+        for wanted in [0usize, 1, 2, 8, 9, 16, 17, 32] {
+            assert!(counts.contains(&wanted), "no expert of {wanted} routes");
+        }
+        // Live experts in each of the eight simdgroups.
+        for group in 0..WIDE_EXPERTS / 32 {
+            assert!(
+                counts[group * 32..(group + 1) * 32]
+                    .iter()
+                    .any(|count| *count > 0),
+                "no live expert in simdgroup {group}"
+            );
+        }
+    }
+    assert_eq!(first.iter().filter(|id| **id == 255).count(), 17);
+    assert_eq!(second.iter().filter(|id| **id == 255).count(), 32);
+    let mut rng = Rng(0xe3);
+    let x = activations(TOKENS, &mut rng);
+    let routing_weights = weights(TOKENS * TOP_K, &mut rng);
+    let mut all = Vec::new();
+    let mut steps = 0;
+
+    // Unmasked: every prefix width, with and without the register path.
+    for (name, table) in [("first", &first), ("second", &second)] {
+        for tokens in [1usize, 2, 3, 7, 8, 9, 10, 16, 17, 24, 31, 32] {
+            for column_tile in [probed, false] {
+                all.extend(check_wide_step(
+                    &mut layer,
+                    &format!("{name} table, {tokens} rows, register {column_tile}"),
+                    &x[..tokens * HIDDEN],
+                    &table[..tokens * TOP_K],
+                    &routing_weights[..tokens * TOP_K],
+                    None,
+                    column_tile,
+                ));
+                steps += 1;
+            }
+        }
+    }
+
+    // Masked: (rows, lanes, verify rows per physical lane, lane order).
+    let cases: [(usize, u32, [u32; 4], [u32; 4]); 10] = [
+        (32, 4, [0, 0, 0, 0], [0, 1, 2, 3]),
+        (32, 4, [0, 0, 1, 0], [0, 1, 2, 3]),
+        (32, 4, [0, 0, 0, 1], [3, 2, 1, 0]),
+        (32, 1, [3, 8, 8, 8], [0, 0, 0, 0]),
+        (32, 2, [8, 5, 8, 8], [3, 1, 0, 2]),
+        (32, 4, [8, 8, 8, 8], [0, 1, 2, 3]),
+        (32, 4, [100, 9, 8, 7], [0, 1, 2, 3]),
+        (32, 4, [5, 8, 1, 3], [0, 1, 2, 3]),
+        (16, 2, [3, 8, 0, 0], [0, 1, 0, 0]),
+        (24, 3, [1, 0, 7, 0], [0, 1, 2, 0]),
+    ];
+    for (name, table) in [("first", &first), ("second", &second)] {
+        for (tokens, lanes, verify_rows, physical_lane) in cases {
+            all.extend(check_wide_step(
+                &mut layer,
+                &format!(
+                    "{name} table, {tokens} rows, lanes {lanes} {verify_rows:?} {physical_lane:?}"
+                ),
+                &x[..tokens * HIDDEN],
+                &table[..tokens * TOP_K],
+                &routing_weights[..tokens * TOP_K],
+                Some(Mask {
+                    verify_rows: &verify_rows,
+                    physical_lane,
+                    lanes,
+                }),
+                probed,
+            ));
+            steps += 1;
+        }
+    }
+    eprintln!(
+        "digest fused_schedule_256 ({steps} steps): {:016x}",
+        digest(&all)
+    );
 }
 
 /// What `dflash2_mask_moe_routes` leaves in the route table.
