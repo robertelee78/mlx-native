@@ -35,6 +35,7 @@ use super::{
     ExpertMmSchedule, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch,
     KernelArg, KernelRegistry, MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts, Result,
 };
+use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
 /// Routes of an expert that the register path runs when it is enabled.
 const COLUMN_ROWS: u32 = 2;
@@ -243,6 +244,7 @@ pub fn moe_tiles_schedule(
         )));
     }
     scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MoeExpertTiles)?;
     scratch.invalidate_schedule();
     encode_compact_map0(
         encoder,
@@ -320,6 +322,7 @@ pub fn moe_tiles_gather(
         gate_up_columns: params.intermediate / 32,
         down_columns: params.hidden / 64,
     };
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MoeExpertTiles)?;
     let pipeline = registry.get_pipeline("moe_tiles_gather_f32", device.metal_device())?;
     encoder.encode_threadgroups_with_args(
         pipeline,
@@ -374,6 +377,7 @@ pub fn moe_tiles_gate_up(
     )?;
     let gpu = pass_params(gate, params);
     let kernel = format!("moe_tiles_gate_up_{}", format_name(gate.ggml_type));
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MoeExpertTiles)?;
     let pipeline = registry.get_pipeline(&kernel, device.metal_device())?;
     encoder.encode_threadgroups_indirect_with_args(
         pipeline,
@@ -436,6 +440,7 @@ pub fn moe_tiles_down(
     )?;
     let gpu = pass_params(down, params);
     let kernel = format!("moe_tiles_down_{}", format_name(down.ggml_type));
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MoeExpertTiles)?;
     let pipeline = registry.get_pipeline(&kernel, device.metal_device())?;
     encoder.encode_threadgroups_indirect_with_args(
         pipeline,
@@ -467,12 +472,14 @@ pub fn moe_tiles_down(
 /// `false` and its steps must keep [`MoeTilesParams::column_tile`] off.
 ///
 /// Blocks on four small command buffers the first time it is called for a
-/// device; the answer is cached per device.
+/// device; the answer is cached per device. On a host that cannot run the
+/// tiles at all the answer is [`MlxError::Unavailable`], not `false`.
 pub fn moe_tiles_column_tile_exact(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
 ) -> Result<bool> {
     static CACHE: std::sync::Mutex<Vec<(u64, bool)>> = std::sync::Mutex::new(Vec::new());
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MoeExpertTiles)?;
     let registry_id = device.registry_id();
     let cached = CACHE
         .lock()

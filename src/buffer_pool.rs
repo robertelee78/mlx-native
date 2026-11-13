@@ -68,6 +68,9 @@ pub struct MlxBufferPool {
     in_use: Vec<(usize, crate::root_authority::KnownRoot)>,
     /// Residency set that owns the allocations registered by this pool.
     residency_set: Option<crate::residency::ResidencySet>,
+    /// Non-owning binding for buffers that own their own membership. A
+    /// registration-only pool must not keep an otherwise retired set alive.
+    residency_identity: Option<crate::residency::WeakResidencySet>,
     /// Unique Metal buffers this pool added to the residency set, keyed by
     /// their stable contents pointer. This avoids double-removing buffers if
     /// callers mix release/reset despite that pattern being unsupported.
@@ -89,6 +92,7 @@ impl MlxBufferPool {
             free: HashMap::new(),
             in_use: Vec::new(),
             residency_set: None,
+            residency_identity: None,
             resident_buffers: HashMap::new(),
         }
     }
@@ -356,7 +360,7 @@ impl MlxBufferPool {
     /// # Errors
     ///
     /// Returns `MlxError::InvalidArgument` if the buffer was allocated on a
-    /// different `MlxDevice` than any previously registered buffer.
+    /// different residency-enabled device than this pool's live binding.
     pub fn register_existing(&mut self, device: &MlxDevice, buffer: &MlxBuffer) -> Result<()> {
         buffer
             .known_root_clone()
@@ -379,20 +383,9 @@ impl MlxBufferPool {
                         .into(),
                 ));
             }
-            // Adopt the buffer's residency set so the pool's same_owner
-            // checks downstream agree, but do NOT add the buffer — it's
-            // already in the set via its own Arc<MlxBufferStorage>.
-            match self.residency_set.as_ref() {
-                Some(pool_set) if !pool_set.same_owner(device_set) => {
-                    return Err(MlxError::InvalidArgument(
-                        "MlxBufferPool cannot mix residency-enabled devices".into(),
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    self.residency_set = Some(device_set.clone());
-                }
-            }
+            // Preserve the live same-device contract without owning a set
+            // whose allocation lifetime belongs entirely to buffer storage.
+            self.bind_residency_identity(device_set)?;
             return Ok(());
         }
 
@@ -405,6 +398,21 @@ impl MlxBufferPool {
                 set.commit();
             }
         }
+        Ok(())
+    }
+
+    fn bind_residency_identity(&mut self, set: &crate::residency::ResidencySet) -> Result<()> {
+        if let Some(bound) = self.residency_identity.as_ref() {
+            if bound.same_owner(set) {
+                return Ok(());
+            }
+            if bound.is_alive() {
+                return Err(MlxError::InvalidArgument(
+                    "MlxBufferPool cannot mix residency-enabled devices".into(),
+                ));
+            }
+        }
+        self.residency_identity = Some(set.downgrade());
         Ok(())
     }
 
@@ -457,16 +465,9 @@ impl MlxBufferPool {
             return Ok(false);
         };
 
-        match self.residency_set.as_ref() {
-            Some(pool_set) if !pool_set.same_owner(device_set) => {
-                return Err(MlxError::InvalidArgument(
-                    "MlxBufferPool cannot mix residency-enabled devices".into(),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                self.residency_set = Some(device_set.clone());
-            }
+        self.bind_residency_identity(device_set)?;
+        if self.residency_set.is_none() {
+            self.residency_set = Some(device_set.clone());
         }
 
         let key = buffer_key(buffer);

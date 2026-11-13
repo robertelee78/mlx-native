@@ -1,7 +1,7 @@
-//! Escrow-backed lifetime witnesses. These allocate at most two host pages of
-//! file-backed Metal storage; they never encode/submit GPU work or read payload.
-//! Before the fix, raw-owner tests deliberately fail while escrow keeps every
-//! no-copy address valid, including during assertion unwinding.
+//! Escrow-backed lifetime witnesses over at most two host pages of file-backed
+//! Metal storage. Raw-owner tests do not submit work; commit/reclaim tests use
+//! the public submission path and a bounded GPU blit on pool-less Rust threads.
+//! Escrow keeps no-copy addresses valid even during assertion unwinding.
 
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
@@ -312,4 +312,151 @@ fn constructor_unwind_disposes_capture_without_metal_or_payload_access() {
     assert_eq!(Arc::strong_count(&escrow), 1);
     drop(escrow);
     assert!(weak.upgrade().is_none());
+}
+
+fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
+    // Deliberately no outer autoreleasepool: a consumer's Rust loading/worker
+    // thread is not required to install one around native API calls.
+    std::thread::spawn(move || {
+        let fixture = Fixture::new();
+        let expected: [u8; LOGICAL_BYTES] = std::array::from_fn(|i| (i % 251) as u8);
+        std::os::unix::fs::FileExt::write_all_at(&fixture.file, &expected, OFFSET as u64)
+            .expect("initialize private mapped GPU sentinel");
+        let escrow = fixture.mapping();
+        let weak = Arc::downgrade(&escrow);
+        let loading_device = device(mode);
+        let set_dropped = loading_device
+            .residency_set()
+            .and_then(|set| set.drop_notification_for_test());
+        let buffer = mapped(&loading_device, &escrow);
+        // Match a surviving loading-thread weight pool. Self-registered
+        // storage owns membership; registration must not extend its lifetime.
+        let mut registration_pool = crate::MlxBufferPool::new();
+        registration_pool
+            .register_existing(&loading_device, &buffer)
+            .unwrap();
+        let binding = RecordedBinding::Buffer {
+            metal_buffer: buffer.metal_buffer().clone(),
+            offset: buffer.byte_offset(),
+        };
+
+        // This device has never encoded a resource. Exactly one empty public
+        // commit publishes the mapped allocation's pending residency membership.
+        let mut loading_encoder = loading_device.command_encoder().unwrap();
+        loading_encoder.commit_and_wait().unwrap();
+        drop(loading_encoder);
+        drop(loading_device);
+
+        if gpu_read {
+            let consumer = device(mode);
+            let output = consumer
+                .alloc_buffer(LOGICAL_BYTES, DType::U8, vec![LOGICAL_BYTES])
+                .unwrap();
+            let mut encoder = consumer.command_encoder().unwrap();
+            encoder
+                .blit_copy_bytes(&buffer, 0, &output, 0, LOGICAL_BYTES as u64)
+                .unwrap();
+            // Metal's retained command owns the mapping independently of its
+            // logical wrapper; RecordedBinding is another independent owner.
+            drop(buffer);
+            assert!(Arc::strong_count(&escrow) > 1);
+            encoder.commit_and_wait().unwrap();
+            assert_eq!(
+                output.as_logical_slice::<u8>().unwrap(),
+                expected,
+                "the private file must survive the GPU read"
+            );
+            drop(encoder);
+            drop(output);
+            drop(consumer);
+        } else {
+            drop(buffer);
+        }
+
+        // No explicit residency owner or removal flush: the final buffer
+        // storage must retire its own set after the loading device has gone.
+        assert!(
+            Arc::strong_count(&escrow) > 1,
+            "recorded Metal owner must still retain its no-copy backing"
+        );
+        drop(binding);
+        if let Some(set_dropped) = set_dropped {
+            // An event, not a sleep/RSS plateau: the heartbeat can briefly
+            // borrow the last set Arc. Require that owner's actual teardown.
+            set_dropped
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("final residency owner must finish teardown");
+        }
+        assert_eq!(
+            Arc::strong_count(&escrow),
+            1,
+            "completed commands and final residency teardown must release mapped backing"
+        );
+        drop(registration_pool);
+        drop(escrow);
+        assert!(weak.upgrade().is_none());
+    })
+    .join()
+    .expect("pool-less consumer commit/drop/reclaim witness");
+}
+
+#[test]
+fn empty_loading_commit_then_drop_reclaims_mapping_without_ambient_pool() {
+    for mode in [ResidencyMode::Disabled, ResidencyMode::Default] {
+        commit_drop_reclaim_witness(mode, false);
+    }
+}
+
+#[test]
+fn loading_commit_then_gpu_read_and_drop_reclaims_mapping_without_ambient_pool() {
+    assert!(
+        !crate::command_buffer_uses_unretained_references(),
+        "this lifetime witness requires Metal's default retained command owners"
+    );
+    for mode in [ResidencyMode::Disabled, ResidencyMode::Default] {
+        commit_drop_reclaim_witness(mode, true);
+    }
+}
+
+#[test]
+fn registration_pool_preserves_live_device_binding_and_rebinds_after_retirement() {
+    let fixture = Fixture::new();
+    let escrow = fixture.mapping();
+    let first = device(ResidencyMode::Default);
+    let second = device(ResidencyMode::Default);
+    let tracks_residency = first.residency_sets_enabled();
+    let first_dropped = first
+        .residency_set()
+        .and_then(|set| set.drop_notification_for_test());
+    let first_buffer = mapped(&first, &escrow);
+    let second_buffer = mapped(&second, &escrow);
+    let mut pool = crate::MlxBufferPool::new();
+    pool.register_existing(&first, &first_buffer).unwrap();
+    assert_eq!(
+        pool.register_existing(&second, &second_buffer).is_err(),
+        tracks_residency,
+        "a live registration-only binding must reject another set"
+    );
+    assert_eq!(
+        pool.alloc(&second, 64, DType::U8, vec![64]).is_err(),
+        tracks_residency,
+        "pool-owned allocations must honor a live registration-only binding"
+    );
+    drop(first_buffer);
+    drop(first);
+    if let Some(first_dropped) = first_dropped {
+        first_dropped
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("registration-only pool must not own the old set");
+    }
+    pool.register_existing(&second, &second_buffer).unwrap();
+    let pooled = pool.alloc(&second, 64, DType::U8, vec![64]).unwrap();
+    let third = device(ResidencyMode::Default);
+    let third_buffer = mapped(&third, &escrow);
+    assert_eq!(
+        pool.register_existing(&third, &third_buffer).is_err(),
+        tracks_residency,
+        "the pool-owned binding must still reject another set"
+    );
+    drop(pooled);
 }

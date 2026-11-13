@@ -23,6 +23,7 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::encode_helpers::{as_bytes, encode_with_args, KernelArg};
+use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
 pub const PACK_KERNEL: &str = "dflash2_ring_attention_pack";
 pub const SPLIT_KERNEL: &str = "dflash2_ring_attention_split";
@@ -203,6 +204,7 @@ pub fn dispatch_dflash2_ring_attention(
         "partials",
     )?;
     require(buffers.output, DType::BF16, query_elements, "output")?;
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::Dflash2RingAttention)?;
 
     // A kernel's static threadgroup memory is fixed when it is compiled (and
     // doubled by shader validation); refuse before anything is encoded.

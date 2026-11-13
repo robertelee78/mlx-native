@@ -114,7 +114,7 @@
 //! the gate is a no-op in default builds — zero behavior change.
 
 use crate::buffer::MlxBuffer;
-use crate::encoder::CommandEncoder;
+use crate::encoder::{CommandEncoder, SubmittedCommand};
 use crate::error::Result;
 use crate::residency::ResidencySet;
 
@@ -586,8 +586,34 @@ impl EncoderSession {
     /// queue-side allocation failure on `new_command_buffer`) would
     /// surface here.
     pub fn reset_for_next_stage(&mut self) -> Result<()> {
+        self.rotate_stage(false).map(drop)
+    }
+
+    /// [`Self::reset_for_next_stage`], handing the command buffer of the
+    /// stage just committed to the caller instead of releasing it.
+    ///
+    /// After [`Self::commit_stage`] or [`Self::fence_stage`] the committed
+    /// command buffer is still running or queued. A caller that waits only
+    /// every few stages needs every stage's completion and status, not the
+    /// last one's alone; the returned [`SubmittedCommand`] is that, with no
+    /// Metal object exposed. The rotation itself is unchanged: one new
+    /// command buffer, the wait for a pending fence encoded on it, the same
+    /// counters. `None` when the session was not drained (nothing was
+    /// committed; the call is the same no-op as `reset_for_next_stage`).
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; the `Result` matches `reset_for_next_stage`.
+    pub fn reset_for_next_stage_keeping(&mut self) -> Result<Option<SubmittedCommand>> {
+        self.rotate_stage(true)
+    }
+
+    /// The rotation behind [`Self::reset_for_next_stage`] (`keep` false:
+    /// the committed command buffer is retired and released here, `None`)
+    /// and [`Self::reset_for_next_stage_keeping`] (`keep` true).
+    fn rotate_stage(&mut self, keep: bool) -> Result<Option<SubmittedCommand>> {
         if !self.drained {
-            return Ok(());
+            return Ok(None);
         }
 
         // Snapshot the wait-event metadata BEFORE rotating cmd_buf so
@@ -598,7 +624,12 @@ impl EncoderSession {
             None
         };
 
-        self.inner.reset_command_buffer();
+        let kept = if keep {
+            Some(self.inner.reset_command_buffer_keeping())
+        } else {
+            self.inner.reset_command_buffer();
+            None
+        };
 
         if let Some((event, value)) = wait_metadata {
             // Deref-coerce SharedEventRef → EventRef via the
@@ -619,7 +650,7 @@ impl EncoderSession {
         self.drained = false;
         self.fence_pending = false;
         self.stage_label.clear();
-        Ok(())
+        Ok(kept)
     }
 
     /// Add a buffer to the device-level residency set.

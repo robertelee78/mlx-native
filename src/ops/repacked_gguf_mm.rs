@@ -15,6 +15,7 @@ use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 use crate::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
+use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
 pub const REPACK_KERNEL: &str = "hf2q_gguf_repack_q4k_q6k";
 pub const Q4K_MM_KERNEL: &str = "hf2q_repacked_mm_q4k_f32";
@@ -283,6 +284,7 @@ pub fn prepare_repacked_gguf_weight(
             weight.data_byte_len()
         )));
     }
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::RepackedGgufMm)?;
 
     let groups = params.k as usize / 32;
     let plane0 = rows
@@ -485,6 +487,7 @@ fn dispatch_repacked_gguf_mm_typed(
             prepared.n, prepared.k, prepared.ggml_type, params.n, params.k, params.ggml_type
         )));
     }
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::RepackedGgufMm)?;
     encode_repacked_gguf_mm(
         encoder,
         registry,
