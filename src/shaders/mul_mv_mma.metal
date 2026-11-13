@@ -142,7 +142,10 @@ inline void mma_dequantize_q4_K(device const block_q4_K * xb, short il, thread f
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = mma_get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];

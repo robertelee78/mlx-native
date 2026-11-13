@@ -51,6 +51,21 @@ mlx-native's `_id` mm has a tighter top_k template instantiation set
 Not a bottleneck for current production models (top_k=1 and top_k=8 are
 covered); would matter if a top_k=2/4/5/6/10/16/22 model arrives.
 
+### Deliberate deviation — tile dequantizer scale precision (2026-11-12)
+
+The 16-weight tile dequantizers for Q4_K, Q5_K and Q4_0 (dense `mm`, tensor
+`mm`, `mm_id`, `mul_mv_ext`, `mul_mv_mma`, `dequant_to_f16`; 17 sites) were
+ported with the reference expression `xb->d / 16.h` for the high-nibble
+scale, a half-precision division. For `|d| < 2^-10` the quotient is a
+subnormal half: 99.99% to 100% of the Q4_K / Q5_K blocks of the model files
+censused, a relative scale error of 1.8e-3 to 9.9e-3 RMS and 1.7e-3 to 7.2e-3
+per product against F64. mlx-native now evaluates `float(xb->d) / 16.f`.
+The "byte-identical ... same dequant" status in the table above therefore
+holds only for blocks with `|d| >= 2^-10`; on real K-quant files these
+kernels are no longer bit-equal to the reference implementation's and are
+more exact than it. Gate: `tests/kquant_real_scale_f64_reference.rs`; cost:
+`benches/bench_kquant_scale_precision.rs`.
+
 ## Wall-clock and throughput comparisons
 
 - **DeepSeek prefill gate (2026-08-06)** — matched three-trial M5 Max gate,
