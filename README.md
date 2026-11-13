@@ -67,6 +67,15 @@ already own their registration. Pool-owned allocations still retain the set
 strongly. An otherwise idle loading-thread pool therefore no longer keeps a
 removed model's copied-weight residency alive.
 
+Known diagnostic limitation on macOS 27.2: Shader Validation can report faults
+or produce wrong values in the existing Q6_K, stock Q8_0 and Class-B Q4_K paths
+([#160](https://github.com/robertelee78/mlx-native/issues/160),
+[#162](https://github.com/robertelee78/mlx-native/issues/162),
+[#166](https://github.com/robertelee78/mlx-native/issues/166)).
+Those shader files are byte-identical to 0.21.9; the failures are not claimed
+fixed here, and their cause and relevance to ordinary execution remain open.
+Unqualified experimental rewrites are not included in this release.
+
 Supported model families used in production:
 - **Qwen3 / Qwen3.5 / Qwen3.6** (dense + MoE, GGUF)
 - **Qwen3-VL** (vision-tower kernels: im2col / bilinear-resize / 2×2 block-merge / feature-concat + `RopeMultiMode::Vision`)
