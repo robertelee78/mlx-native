@@ -6,7 +6,7 @@
 use std::ffi::CStr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use metal::{BufferRef as MTLBufferRef, CommandQueueRef, DeviceRef};
 use objc::runtime::{Class, Object, BOOL, YES};
@@ -49,6 +49,8 @@ enum ResidencySetInner {
         /// commit ONCE at the end of the batch).
         pending: AtomicBool,
         heartbeat_ticks: AtomicUsize,
+        #[cfg(test)]
+        drop_notification: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     },
     Noop,
 }
@@ -66,6 +68,15 @@ impl Drop for ResidencySetInner {
                 let _: () = msg_send![object.ptr, release];
             }
         }
+        #[cfg(test)]
+        if let Self::Active {
+            drop_notification, ..
+        } = self
+        {
+            if let Some(sender) = drop_notification.get_mut().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
     }
 }
 
@@ -76,7 +87,43 @@ pub(crate) struct ResidencySet {
     inner: Arc<ResidencySetInner>,
 }
 
+/// Non-owning device identity for registrations whose buffer storage already
+/// owns residency. Keeping this handle must not defer the final set commit.
+pub(crate) struct WeakResidencySet {
+    inner: Weak<ResidencySetInner>,
+}
+
+impl WeakResidencySet {
+    pub(crate) fn same_owner(&self, other: &ResidencySet) -> bool {
+        // The weak control block prevents address reuse even after expiry.
+        self.inner.as_ptr() == Arc::as_ptr(&other.inner)
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.inner.strong_count() != 0
+    }
+}
+
 impl ResidencySet {
+    pub(crate) fn downgrade(&self) -> WeakResidencySet {
+        WeakResidencySet {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_notification_for_test(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        let ResidencySetInner::Active {
+            drop_notification, ..
+        } = &*self.inner
+        else {
+            return None;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(drop_notification.lock().unwrap().replace(sender).is_none());
+        Some(receiver)
+    }
+
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
@@ -142,6 +189,8 @@ impl ResidencySet {
                 lock: Mutex::new(()),
                 pending: AtomicBool::new(false),
                 heartbeat_ticks: AtomicUsize::new(residency_heartbeat_ticks()),
+                #[cfg(test)]
+                drop_notification: Mutex::new(None),
             });
             spawn_residency_heartbeat(&inner);
             Ok(Self { inner })

@@ -137,6 +137,14 @@ CFString, and autorelease-pool populations across repeated labeled sync and
 async waves.
 See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-native/blob/main/docs/command-buffer-autorelease-lifetime-2026-08-08.md).
 
+Command submission also scopes Metal's temporary residency-snapshot ownership,
+including empty loading-device commits. File mappings remain owned by the Metal
+no-copy resource through raw handles, recorded bindings, and retained GPU commands.
+Consumers do not need an ambient autorelease pool around submission.
+Pools registering already-resident external buffers keep only a weak residency
+identity: a long-lived registration-only pool cannot postpone the final
+buffer-owned set retirement.
+
 ## GPU operations
 
 ### Attention
