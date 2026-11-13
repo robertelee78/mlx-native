@@ -3388,17 +3388,38 @@ impl CommandEncoder {
     /// `new_with_residency` accounting. Does NOT bump `SYNC_COUNT` (no
     /// commit/wait happens here).
     pub(crate) fn reset_command_buffer(&mut self) {
-        // The command buffer that leaves is retired and released here.
-        drop(self.reset_command_buffer_keeping());
+        let (cmd_buf, observation) = self.rotate_command_buffer();
+        // Retire the command that leaves against this encoder's queue, then
+        // release its command buffer.
+        if let Some(observation) = observation {
+            crate::submission_observer::retire_command(observation, &self.queue, &cmd_buf);
+        }
     }
 
     /// [`Self::reset_command_buffer`], handing the command buffer that
     /// leaves to the caller: the caller committed it without a wait and
-    /// wants its completion and status later. Rotation, counters and the
-    /// per-command state reset are those of `reset_command_buffer`; the one
-    /// difference is who releases the old command buffer, and when its
-    /// observation retires (when the returned handle is dropped).
+    /// wants its completion and status later. The rotation is the same one;
+    /// the difference is who releases the old command buffer, and when its
+    /// observation retires (when the returned handle is dropped). Only this
+    /// path takes a reference to the queue, for that later retirement.
     pub(crate) fn reset_command_buffer_keeping(&mut self) -> SubmittedCommand {
+        let (cmd_buf, observation) = self.rotate_command_buffer();
+        SubmittedCommand {
+            cmd_buf,
+            queue: self.queue.to_owned(),
+            observation,
+        }
+    }
+
+    /// Put a fresh command buffer in place and reset the per-command state.
+    /// Returns the command buffer that leaves and its observation: the
+    /// caller retires and releases them, or keeps them.
+    fn rotate_command_buffer(
+        &mut self,
+    ) -> (
+        PooledCommandBuffer,
+        Option<crate::submission_observer::CommandObservation>,
+    ) {
         self.end_active_encoder();
         debug_assert!(
             self.active_encoder.is_null(),
@@ -3425,11 +3446,8 @@ impl CommandEncoder {
                     None
                 }
             });
-        let kept = SubmittedCommand {
-            observation: self.observation.take(),
-            cmd_buf: std::mem::replace(&mut self.cmd_buf, PooledCommandBuffer::new(cmd_buf)),
-            queue: self.queue.to_owned(),
-        };
+        let old_observation = self.observation.take();
+        let old_cmd_buf = std::mem::replace(&mut self.cmd_buf, PooledCommandBuffer::new(cmd_buf));
         self.observation = next_observation;
         self.observation_has_work = false;
         self.observation_replay_bound = false;
@@ -3457,7 +3475,7 @@ impl CommandEncoder {
         // `pending_op_kind` / `pending_reads` / `pending_writes` only
         // hold tags for the NEXT dispatch and are consumed when that
         // dispatch fires — leaving them as-is is correct.
-        kept
+        (old_cmd_buf, old_observation)
     }
 
     /// Commit, wait for GPU completion, AND rotate to a fresh command

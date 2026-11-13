@@ -586,7 +586,7 @@ impl EncoderSession {
     /// queue-side allocation failure on `new_command_buffer`) would
     /// surface here.
     pub fn reset_for_next_stage(&mut self) -> Result<()> {
-        self.reset_for_next_stage_keeping().map(drop)
+        self.rotate_stage(false).map(drop)
     }
 
     /// [`Self::reset_for_next_stage`], handing the command buffer of the
@@ -605,6 +605,13 @@ impl EncoderSession {
     ///
     /// Infallible today; the `Result` matches `reset_for_next_stage`.
     pub fn reset_for_next_stage_keeping(&mut self) -> Result<Option<SubmittedCommand>> {
+        self.rotate_stage(true)
+    }
+
+    /// The rotation behind [`Self::reset_for_next_stage`] (`keep` false:
+    /// the committed command buffer is retired and released here, `None`)
+    /// and [`Self::reset_for_next_stage_keeping`] (`keep` true).
+    fn rotate_stage(&mut self, keep: bool) -> Result<Option<SubmittedCommand>> {
         if !self.drained {
             return Ok(None);
         }
@@ -617,7 +624,12 @@ impl EncoderSession {
             None
         };
 
-        let kept = self.inner.reset_command_buffer_keeping();
+        let kept = if keep {
+            Some(self.inner.reset_command_buffer_keeping())
+        } else {
+            self.inner.reset_command_buffer();
+            None
+        };
 
         if let Some((event, value)) = wait_metadata {
             // Deref-coerce SharedEventRef → EventRef via the
@@ -638,7 +650,7 @@ impl EncoderSession {
         self.drained = false;
         self.fence_pending = false;
         self.stage_label.clear();
-        Ok(Some(kept))
+        Ok(kept)
     }
 
     /// Add a buffer to the device-level residency set.
