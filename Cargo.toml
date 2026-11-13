@@ -69,6 +69,10 @@ name = "bench_kquant_scale_precision"
 harness = false
 
 [[bench]]
+name = "bench_few_row_exact"
+harness = false
+
+[[bench]]
 name = "bench_quantized_matmul"
 harness = false
 
