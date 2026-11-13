@@ -1,4 +1,12 @@
 //! Q5_K q4x4 arithmetic must be byte-identical across decode widths.
+//!
+//! The kernels spell their accumulation out (explicit fma lanes with
+//! contraction and reassociation off, `hf2q_mv_ext_fused_step`), so the
+//! invariance must also hold however Metal compiles them: run this target
+//! plain, under `MTL_SHADER_VALIDATION=1`, under `MTL_DEBUG_LAYER=1` and
+//! with `MLX_PRECOMPILED_METALLIB=0` (with the implicit `dot` sum, the
+//! two-row kernel was one ulp from the one-row kernel under shader
+//! validation).
 
 #![cfg(target_vendor = "apple")]
 #![allow(clippy::expect_used, clippy::panic)]
