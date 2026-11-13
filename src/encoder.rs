@@ -977,6 +977,92 @@ pub struct CommandEncoder {
 /// pipeline where buf1 is encoded on a worker thread while buf0 executes.
 unsafe impl Send for CommandEncoder {}
 
+/// Block until `cmd_buf` has run; record the wait with the command's
+/// observation and the command timeline, and return its terminal status.
+fn wait_observed(
+    cmd_buf: &PooledCommandBuffer,
+    queue: &CommandQueue,
+    observation: Option<&crate::submission_observer::CommandObservation>,
+) -> MTLCommandBufferStatus {
+    let begin = observation.and_then(|_| crate::submission_observer::clock_ns());
+    let timeline_begin =
+        crate::command_timeline::enabled().then(crate::command_timeline::now_seconds);
+    cmd_buf.wait_until_completed();
+    if let Some(wait_begin_s) = timeline_begin {
+        crate::command_timeline::waited(
+            cmd_buf,
+            wait_begin_s,
+            crate::command_timeline::now_seconds(),
+        );
+    }
+    let status = cmd_buf.status();
+    if let Some(observer) = observation {
+        crate::submission_observer::inspect_retired_after_wait(
+            &**queue as *const metal::CommandQueueRef as u64,
+        );
+        observer.drained(begin, crate::submission_observer::clock_ns(), status as u64);
+        observer.completed_gpu_timing(|| crate::gpu_timestamps::read(cmd_buf));
+    }
+    status
+}
+
+/// Map a terminal command-buffer status to the crate's result.
+fn completed_status(
+    status: MTLCommandBufferStatus,
+    cmd_buf: &PooledCommandBuffer,
+) -> Result<()> {
+    match status {
+        MTLCommandBufferStatus::Completed => Ok(()),
+        MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
+            command_buffer_error_message(cmd_buf),
+        )),
+        status => Err(MlxError::CommandBufferError(format!(
+            "Unexpected command buffer status after wait: {:?}",
+            status
+        ))),
+    }
+}
+
+/// A command buffer that was committed without a host wait and has left its
+/// encoder: the opaque owner of its completion and status.
+///
+/// [`EncoderSession::reset_for_next_stage_keeping`] hands one out instead of
+/// releasing the committed command buffer when the session moves on, so a
+/// caller that submits several stages before it waits can still wait for
+/// every one of them and read every status: command buffers of one queue
+/// may overlap, and the status of the last one says nothing about the
+/// earlier ones. The handle exposes no Metal object. A submission observer
+/// attached to the command sees its drain when the handle waits and its
+/// retirement when the handle is dropped, exactly as for a command that
+/// stayed with its encoder.
+///
+/// [`EncoderSession::reset_for_next_stage_keeping`]: crate::EncoderSession::reset_for_next_stage_keeping
+pub struct SubmittedCommand {
+    cmd_buf: PooledCommandBuffer,
+    queue: CommandQueue,
+    observation: Option<crate::submission_observer::CommandObservation>,
+}
+
+impl SubmittedCommand {
+    /// Block until the command buffer has run.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
+    pub fn wait_until_completed(&self) -> Result<()> {
+        let status = wait_observed(&self.cmd_buf, &self.queue, self.observation.as_ref());
+        completed_status(status, &self.cmd_buf)
+    }
+}
+
+impl Drop for SubmittedCommand {
+    fn drop(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            crate::submission_observer::retire_command(observation, &self.queue, &self.cmd_buf);
+        }
+    }
+}
+
 fn command_buffer_error_message(command_buffer: &metal::CommandBufferRef) -> String {
     unsafe {
         let error: *mut Object = msg_send![command_buffer, error];
@@ -2982,31 +3068,7 @@ impl CommandEncoder {
     }
 
     fn wait_observed(&self) -> MTLCommandBufferStatus {
-        let begin = self
-            .observation
-            .as_ref()
-            .and_then(|_| crate::submission_observer::clock_ns());
-        let timeline_begin =
-            crate::command_timeline::enabled().then(crate::command_timeline::now_seconds);
-        self.cmd_buf.wait_until_completed();
-        if let Some(wait_begin_s) = timeline_begin {
-            crate::command_timeline::waited(
-                &self.cmd_buf,
-                wait_begin_s,
-                crate::command_timeline::now_seconds(),
-            );
-        }
-        let status = self.cmd_buf.status();
-        if self.observation.is_some() {
-            crate::submission_observer::inspect_retired_after_wait(
-                &*self.queue as *const metal::CommandQueueRef as u64,
-            );
-        }
-        if let Some(observer) = &self.observation {
-            observer.drained(begin, crate::submission_observer::clock_ns(), status as u64);
-            observer.completed_gpu_timing(|| crate::gpu_timestamps::read(&self.cmd_buf));
-        }
-        status
+        wait_observed(&self.cmd_buf, &self.queue, self.observation.as_ref())
     }
 
     /// Commit the command buffer and block until the GPU finishes execution.
@@ -3260,17 +3322,7 @@ impl CommandEncoder {
     ///
     /// Returns `MlxError::CommandBufferError` if the GPU reports an error.
     pub fn wait_until_completed(&self) -> Result<()> {
-        let completed_status = self.wait_observed();
-        match completed_status {
-            MTLCommandBufferStatus::Completed => Ok(()),
-            MTLCommandBufferStatus::Error => Err(MlxError::CommandBufferError(
-                command_buffer_error_message(&self.cmd_buf),
-            )),
-            status => Err(MlxError::CommandBufferError(format!(
-                "Unexpected command buffer status after wait: {:?}",
-                status
-            ))),
-        }
+        completed_status(self.wait_observed(), &self.cmd_buf)
     }
 
     /// Borrow the underlying Metal command buffer.
@@ -3339,18 +3391,38 @@ impl CommandEncoder {
     /// `new_with_residency` accounting. Does NOT bump `SYNC_COUNT` (no
     /// commit/wait happens here).
     pub(crate) fn reset_command_buffer(&mut self) {
-        // ADR-040 §0.21c-track2: leak-safe + end-safe reset. With the
-        // encoder-retain fix, the bare `active_encoder = null` below would, on
-        // ANY path that reaches here with a non-null active encoder, LEAK the +1
-        // retain AND leave an un-`endEncoding`'d encoder (Metal then asserts
-        // "Command encoder released without endEncoding"). Pre-patch this was a
-        // harmless borrowed +0 pointer guarded only by a debug_assert (compiled
-        // out in release). Now route through `end_active_encoder` FIRST: it ends
-        // + releases the encoder if non-null, and is a no-op if null — so the
-        // reset is correct regardless of caller contract, in debug AND release.
-        // The contract is still that callers commit first; the debug_assert
-        // (after the safe handling) flags a violation in tests without crashing
-        // production.
+        let (cmd_buf, observation) = self.rotate_command_buffer();
+        // Retire the command that leaves against this encoder's queue, then
+        // release its command buffer.
+        if let Some(observation) = observation {
+            crate::submission_observer::retire_command(observation, &self.queue, &cmd_buf);
+        }
+    }
+
+    /// [`Self::reset_command_buffer`], handing the command buffer that
+    /// leaves to the caller: the caller committed it without a wait and
+    /// wants its completion and status later. The rotation is the same one;
+    /// the difference is who releases the old command buffer, and when its
+    /// observation retires (when the returned handle is dropped). Only this
+    /// path takes a reference to the queue, for that later retirement.
+    pub(crate) fn reset_command_buffer_keeping(&mut self) -> SubmittedCommand {
+        let (cmd_buf, observation) = self.rotate_command_buffer();
+        SubmittedCommand {
+            cmd_buf,
+            queue: self.queue.to_owned(),
+            observation,
+        }
+    }
+
+    /// Put a fresh command buffer in place and reset the per-command state.
+    /// Returns the command buffer that leaves and its observation: the
+    /// caller retires and releases them, or keeps them.
+    fn rotate_command_buffer(
+        &mut self,
+    ) -> (
+        PooledCommandBuffer,
+        Option<crate::submission_observer::CommandObservation>,
+    ) {
         self.end_active_encoder();
         debug_assert!(
             self.active_encoder.is_null(),
@@ -3377,8 +3449,8 @@ impl CommandEncoder {
                     None
                 }
             });
-        self.retire_observation();
-        self.cmd_buf = PooledCommandBuffer::new(cmd_buf);
+        let old_observation = self.observation.take();
+        let old_cmd_buf = std::mem::replace(&mut self.cmd_buf, PooledCommandBuffer::new(cmd_buf));
         self.observation = next_observation;
         self.observation_has_work = false;
         self.observation_replay_bound = false;
@@ -3406,6 +3478,7 @@ impl CommandEncoder {
         // `pending_op_kind` / `pending_reads` / `pending_writes` only
         // hold tags for the NEXT dispatch and are consumed when that
         // dispatch fires — leaving them as-is is correct.
+        (old_cmd_buf, old_observation)
     }
 
     /// Commit, wait for GPU completion, AND rotate to a fresh command
