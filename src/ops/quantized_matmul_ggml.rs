@@ -23,8 +23,12 @@ use crate::ggml_capability::{
 };
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
 use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
-use crate::ops::dense_mm_capability::is_unavailable_tensor_api;
+use crate::ops::dense_mm_capability::{is_unavailable_tensor_api, DenseMmBackend};
+use crate::ops::dense_mm_f16::{dense_matmul_f16_f32_with_backend, DenseMmF16F32Params};
 use crate::ops::dense_q4_auto::{self, DenseQ4Route};
+use crate::ops::tensor_kernels::{
+    require_tensor_kernel_family, tensor_kernel_family_available, TensorKernelFamily,
+};
 use std::sync::atomic::AtomicI8;
 
 // ADR-029: cached hot-path env-flag gates for dispatch_mv.
@@ -1590,6 +1594,19 @@ pub fn quantized_matmul_q2_k_batched_mv(
 ///
 /// `f16_weight` is the F16-typed MlxBuffer (per-row stride = K halfs =
 /// 2K bytes).  `input` is F32 [m, k].  `output` is F32 [m, n].
+///
+/// Where the tensor kernel is unavailable
+/// (`TensorKernelFamily::MmV2F16`) the product runs on the portable F16
+/// matmul (`hf2q_dense_mm_f16_f32_fallback`) instead. The two routes are
+/// Class B to each other, not bitwise: the portable kernel stages the
+/// activation as half and accumulates in a different order. Each is within
+/// `(2^-11 + K * 2^-24) * sum(|w * x|)` of the F64 product (the half
+/// rounding of one factor, and the FP32 rounding of K accumulated terms),
+/// the portable route is deterministic, and its output row depends only on
+/// that input row and the weight, not on the row count
+/// (`ops::tensor_kernels_tests`). A probe failure that is not a missing
+/// tensor API is returned as the error; it does not select the portable
+/// route.
 pub fn dispatch_mm_v2_f16(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -1611,6 +1628,25 @@ pub fn dispatch_mm_v2_f16(
         return Err(MlxError::InvalidArgument(
             "dispatch_mm_v2_f16: M, K, N must all be > 0".into(),
         ));
+    }
+    if !tensor_kernel_family_available(registry, device, TensorKernelFamily::MmV2F16)? {
+        // No tensor API: the portable F16 x F32 matmul computes this product.
+        return dense_matmul_f16_f32_with_backend(
+            encoder,
+            registry,
+            device,
+            f16_weight,
+            input,
+            output,
+            &DenseMmF16F32Params {
+                m,
+                n,
+                k,
+                src0_batch: 1,
+                src1_batch: 1,
+            },
+            DenseMmBackend::FallbackRequired,
+        );
     }
     // F16 weight row stride (per-row bytes) = 2K.
     let nb01 = (k as u64) * (DType::F16.size_of() as u64);
@@ -2961,6 +2997,7 @@ fn quantized_matmul_mm_tensor_perm021_impl(
         output_range,
         &[("input_bf16", input_range), ("weight", weight_range)],
     )?;
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MmPerm021)?;
 
     let pipeline = registry.get_pipeline_with_constants(
         kernel_name,
@@ -3088,6 +3125,7 @@ pub fn quantized_matmul_mm_tensor_perm021_f16(
         )));
     }
 
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MmPerm021)?;
     let pipeline = registry.get_pipeline_with_constants(
         "kernel_mul_mm_f16_tensor_bf16_perm021",
         device.metal_device(),

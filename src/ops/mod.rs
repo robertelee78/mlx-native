@@ -110,6 +110,9 @@ pub mod scale_mask_softmax;
 pub mod sigmoid_mul;
 pub mod silu_mul;
 pub mod ssm_norm_gate;
+pub mod tensor_kernels;
+#[cfg(test)]
+mod tensor_kernels_tests;
 pub mod top_k;
 pub mod vision_2d_rope;
 // ADR-037 Phase E1.1 (2026-05-22) — EAGLE-3 + dynamic tree port.

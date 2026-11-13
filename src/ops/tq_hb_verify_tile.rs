@@ -66,6 +66,7 @@ use crate::device::MlxDevice;
 use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::tensor_kernels::typed_unavailable;
 use crate::DType;
 
 /// MSL source.
@@ -588,7 +589,15 @@ pub fn tq_hb_verify_tile_attention(
     let lane_count = tiles.len() as u64;
     let (heads, rows) = (u64::from(shape.n_heads), u64::from(VERIFY_TILE_ROWS));
 
-    if let Some(reason) = limit_violation(registry, device, shape)? {
+    // Builds every pipeline of the step before anything is encoded.
+    let violation = limit_violation(registry, device, shape).map_err(|error| {
+        typed_unavailable(
+            device,
+            "the tiled verify attention (tq_hb_verify_tile)",
+            error,
+        )
+    })?;
+    if let Some(reason) = violation {
         return Err(invalid(reason));
     }
     let pipeline = registry.get_pipeline(pack, metal_device)?;

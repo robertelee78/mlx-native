@@ -1,0 +1,664 @@
+//! The tensor-only kernel families where the Metal tensor API is unavailable.
+//!
+//! Two hosts have no tensor API (`dense_mm_capability`): a runtime compiler
+//! without `<metal_tensor>`, and a device outside the Metal 4 GPU family. The
+//! first is reproduced on any host
+//! (`KernelRegistry::simulate_missing_tensor_header`, and a probe source that
+//! stops the compiler with that diagnostic). The second cannot be reproduced
+//! on a device that supports Metal 4, so `every_family_answers_on_this_device`
+//! runs the unmodified registry: CI runs it on the hosted `macos-15` and
+//! `macos-26` GPUs with `MLX_DENSE_MM_TEST_EXPECT_NO_TENSOR=1`, where every
+//! family must answer "unavailable" and every entry point must return the
+//! typed error, never the compiler's diagnostic.
+
+#![allow(clippy::expect_used, clippy::panic)]
+
+use super::dflash2_af4g64_staged::{
+    dflash2_af4g64_staged_gate_up_partial_elements, dflash2_af4g64_staged_partial_elements,
+    dispatch_dflash2_af4g64_staged, dispatch_dflash2_af4g64_staged_gate_up,
+};
+use super::dflash2_ring_attention::{
+    dflash2_ring_attention_partial_elements, dispatch_dflash2_ring_attention,
+    DFlash2RingAttentionBuffers, DFlash2RingAttentionParams, DFLASH2_RING_ATTENTION_CURRENT_VALUES,
+    DFLASH2_RING_ATTENTION_HEAD_DIM, DFLASH2_RING_ATTENTION_ROWS, DFLASH2_RING_ATTENTION_TILE,
+};
+use super::flash_attn_prefill_tensor::flash_attn_prefill_tensor_available;
+use super::quantized_matmul_ggml::{
+    dispatch_mm_v2_f16, quantized_matmul_mm_tensor_perm021, GgmlQuantizedMatmulParams,
+    GgmlQuantizedMatmulPerm021Params, GgmlType,
+};
+use super::quantized_matmul_id_ggml::{
+    moe_tiles_column_tile_exact, prepare_quantized_matmul_id_ggml_grouped_m8,
+    GgmlQuantizedMatmulIdParams,
+};
+use super::repacked_gguf_mm::prepare_repacked_gguf_weight;
+use super::tensor_kernels::{
+    tensor_kernel_family_available, tensor_kernel_family_unavailable_reason, TensorKernelFamily,
+    TENSOR_API_UNAVAILABLE, TENSOR_KERNELS_DISABLED,
+};
+use crate::{DType, KernelRegistry, MlxBuffer, MlxDevice, MlxError};
+
+/// The runtime compiler's diagnostic on an SDK without the tensor header.
+const MISSING_HEADER_PROBE_SOURCE: &str = "#error fatal error: 'metal_tensor' file not found\n";
+/// A source no compiler accepts, for a reason that is not the tensor API.
+const BROKEN_PROBE_SOURCE: &str = "#error use of undeclared identifier 'broken'\n";
+
+fn expects_no_tensor() -> bool {
+    std::env::var("MLX_DENSE_MM_TEST_EXPECT_NO_TENSOR").as_deref() == Ok("1")
+}
+
+fn buffer(device: &MlxDevice, elements: usize, dtype: DType) -> MlxBuffer {
+    device
+        .alloc_buffer(elements * dtype.size_of(), dtype, vec![elements])
+        .expect("buffer")
+}
+
+fn assert_unavailable<T>(result: crate::Result<T>, family: TensorKernelFamily, label: &str) {
+    match result {
+        Err(MlxError::Unavailable { feature, reason }) => {
+            assert_eq!(feature, family.name(), "{label}");
+            assert_eq!(reason, tensor_kernel_family_unavailable_reason(), "{label}");
+        }
+        Err(other) => panic!("{label}: expected the typed error, got {other}"),
+        Ok(_) => panic!("{label}: ran on a host without the tensor API"),
+    }
+}
+
+/// One valid call of every entry point that owns a tensor-only family, with
+/// the smallest shapes each admits. `check` receives the family, the entry
+/// point's name and whether it returned [`MlxError::Unavailable`]; any other
+/// error fails the test.
+fn for_each_entry_point(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    mut check: impl FnMut(TensorKernelFamily, &str, bool),
+) {
+    let encoded = std::cell::Cell::new(false);
+    let mut report =
+        |family: TensorKernelFamily, label: &str, result: crate::Result<()>| match result {
+            Ok(()) => {
+                encoded.set(true);
+                check(family, label, false);
+            }
+            Err(MlxError::Unavailable { feature, reason }) => {
+                assert_eq!(feature, family.name(), "{label}");
+                assert_eq!(reason, tensor_kernel_family_unavailable_reason(), "{label}");
+                check(family, label, true);
+            }
+            Err(other) => panic!("{label}: {other}"),
+        };
+    let mut encoder = device.command_encoder().expect("encoder");
+
+    // Prepared GGUF matmul: one Q4_K weight of 64 outputs over 256 inputs.
+    {
+        let (n, k) = (64usize, 256usize);
+        let weight = buffer(device, n * 144, DType::U8);
+        let params = GgmlQuantizedMatmulParams {
+            m: 1,
+            n: n as u32,
+            k: k as u32,
+            ggml_type: GgmlType::Q4_K,
+        };
+        let prepared =
+            prepare_repacked_gguf_weight(&mut encoder, registry, device, &weight, &params);
+        report(
+            TensorKernelFamily::RepackedGgufMm,
+            "prepare_repacked_gguf_weight",
+            prepared.map(|_| ()),
+        );
+    }
+
+    // Staged AF4G64 projection and its gate/up pair: 8 rows, 64 outputs.
+    {
+        let (m, n, k) = (8u32, 64u32, 64u32);
+        let (rows, columns, inputs) = (m as usize, n as usize, k as usize);
+        let input = buffer(device, rows * inputs, DType::BF16);
+        let weights = buffer(device, columns * inputs / 8, DType::U32);
+        let metadata = buffer(device, columns * inputs / 64, DType::U32);
+        let partials = buffer(
+            device,
+            dflash2_af4g64_staged_partial_elements(m, n, k).max(1),
+            DType::F32,
+        );
+        let output = buffer(device, rows * columns, DType::F32);
+        report(
+            TensorKernelFamily::Dflash2Af4g64Staged,
+            "dispatch_dflash2_af4g64_staged",
+            dispatch_dflash2_af4g64_staged(
+                &mut encoder,
+                registry,
+                device,
+                &input,
+                &weights,
+                &metadata,
+                &partials,
+                &output,
+                m,
+                n,
+                k,
+            ),
+        );
+        let pair_partials = buffer(
+            device,
+            dflash2_af4g64_staged_gate_up_partial_elements(m, n, k).max(1),
+            DType::F32,
+        );
+        let gated = buffer(device, rows * columns, DType::BF16);
+        report(
+            TensorKernelFamily::Dflash2Af4g64Staged,
+            "dispatch_dflash2_af4g64_staged_gate_up",
+            dispatch_dflash2_af4g64_staged_gate_up(
+                &mut encoder,
+                registry,
+                device,
+                &input,
+                &weights,
+                &metadata,
+                &weights,
+                &metadata,
+                &pair_partials,
+                &gated,
+                m,
+                n,
+                k,
+            ),
+        );
+    }
+
+    // Ring draft attention: one lane, one KV head, one tile of history.
+    {
+        const ROWS: usize = DFLASH2_RING_ATTENTION_ROWS;
+        const DIM: usize = DFLASH2_RING_ATTENTION_HEAD_DIM;
+        let (q_heads, kv_heads, window) = (4usize, 1usize, DFLASH2_RING_ATTENTION_TILE);
+        let query = buffer(device, ROWS * q_heads * DIM, DType::F32);
+        let key = buffer(device, ROWS * kv_heads * DIM, DType::F32);
+        let value = buffer(device, ROWS * kv_heads * DIM, DType::F32);
+        let ring_keys = buffer(device, kv_heads * window * DIM, DType::BF16);
+        let ring_values = buffer(device, kv_heads * window * DIM, DType::BF16);
+        let cache_lengths = buffer(device, 1, DType::U32);
+        let queries = buffer(device, ROWS * q_heads * DIM, DType::BF16);
+        let current_keys = buffer(device, ROWS * kv_heads * DIM, DType::BF16);
+        let current_values = buffer(
+            device,
+            kv_heads * DFLASH2_RING_ATTENTION_CURRENT_VALUES * DIM,
+            DType::BF16,
+        );
+        let partials = buffer(
+            device,
+            dflash2_ring_attention_partial_elements(1, kv_heads).expect("partials"),
+            DType::F32,
+        );
+        let output = buffer(device, ROWS * q_heads * DIM, DType::BF16);
+        report(
+            TensorKernelFamily::Dflash2RingAttention,
+            "dispatch_dflash2_ring_attention",
+            dispatch_dflash2_ring_attention(
+                &mut encoder,
+                registry,
+                device,
+                &DFlash2RingAttentionBuffers {
+                    query: &query,
+                    key: &key,
+                    value: &value,
+                    ring_keys: &ring_keys,
+                    ring_values: &ring_values,
+                    cache_lengths: &cache_lengths,
+                    queries: &queries,
+                    current_keys: &current_keys,
+                    current_values: &current_values,
+                    partials: &partials,
+                    output: &output,
+                },
+                DFlash2RingAttentionParams {
+                    lanes: 1,
+                    q_heads: q_heads as u32,
+                    kv_heads: kv_heads as u32,
+                    window: window as u32,
+                },
+            ),
+        );
+    }
+
+    // Prepared expert planes: two Q4_K experts of 64 outputs over 256 inputs.
+    {
+        let (experts, n, k) = (2usize, 64usize, 256usize);
+        let stride = n * 144;
+        let weight = buffer(device, experts * stride, DType::U8);
+        let params = GgmlQuantizedMatmulIdParams {
+            n_tokens: 1,
+            top_k: 1,
+            n: n as u32,
+            k: k as u32,
+            n_experts: experts as u32,
+            expert_stride: stride as u64,
+            ggml_type: GgmlType::Q4_K,
+        };
+        let prepared = prepare_quantized_matmul_id_ggml_grouped_m8(
+            &mut encoder,
+            registry,
+            device,
+            &weight,
+            &params,
+        );
+        report(
+            TensorKernelFamily::GroupedM8Experts,
+            "prepare_quantized_matmul_id_ggml_grouped_m8",
+            prepared.map(|_| ()),
+        );
+    }
+
+    // Head-major matmul: one Q4_0 weight, two heads of 32.
+    {
+        let (m, n, k, head_dim) = (32usize, 64usize, 64usize, 32usize);
+        let input = buffer(device, m * k, DType::BF16);
+        let weight = buffer(device, n * (k / 32) * 18, DType::U8);
+        let output = buffer(device, m * n, DType::F32);
+        report(
+            TensorKernelFamily::MmPerm021,
+            "quantized_matmul_mm_tensor_perm021",
+            quantized_matmul_mm_tensor_perm021(
+                &mut encoder,
+                registry,
+                device,
+                &input,
+                &weight,
+                &output,
+                &GgmlQuantizedMatmulPerm021Params {
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    head_dim: head_dim as u32,
+                    ggml_type: GgmlType::Q4_0,
+                },
+            ),
+        );
+    }
+    // Zero weights and activations: every command writes finite values.
+    if encoded.get() {
+        encoder.commit_and_wait().expect("commit");
+    }
+
+    // The live tiles' register-path probe runs its own command buffers.
+    report(
+        TensorKernelFamily::MoeExpertTiles,
+        "moe_tiles_column_tile_exact",
+        moe_tiles_column_tile_exact(device, registry).map(|_| ()),
+    );
+}
+
+#[test]
+fn missing_tensor_header_makes_every_family_unavailable() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    registry
+        .simulate_missing_tensor_header()
+        .expect("simulate the missing header");
+    for &family in TensorKernelFamily::ALL {
+        for ask in 0..2 {
+            assert!(
+                !tensor_kernel_family_available(&mut registry, &device, family)
+                    .unwrap_or_else(|error| panic!("{family:?}: {error}")),
+                "{family:?}, ask {ask}"
+            );
+        }
+    }
+    // The families with a query of their own answer the same way.
+    for head_dim in [256, 512] {
+        assert!(
+            !flash_attn_prefill_tensor_available(&mut registry, &device, head_dim)
+                .expect("tensor flash attention query")
+        );
+    }
+    let mut entry_points = 0;
+    for_each_entry_point(&device, &mut registry, |family, label, unavailable| {
+        assert!(
+            unavailable,
+            "{family:?}: {label} ran without the tensor API"
+        );
+        entry_points += 1;
+    });
+    assert_eq!(entry_points, 7);
+}
+
+#[test]
+fn an_unavailable_probe_is_the_family_answer_and_its_typed_error() {
+    let device = MlxDevice::new().expect("device");
+    for &family in TensorKernelFamily::ALL {
+        let mut registry = KernelRegistry::new();
+        registry.register_source(family.probe_kernel(), MISSING_HEADER_PROBE_SOURCE);
+        assert!(
+            !tensor_kernel_family_available(&mut registry, &device, family)
+                .unwrap_or_else(|error| panic!("{family:?}: {error}")),
+            "{family:?}"
+        );
+    }
+    // The entry point of a family returns the typed error from that answer,
+    // before it builds a kernel of its own.
+    let mut registry = KernelRegistry::new();
+    registry.register_source(
+        TensorKernelFamily::RepackedGgufMm.probe_kernel(),
+        MISSING_HEADER_PROBE_SOURCE,
+    );
+    let weight = buffer(&device, 64 * 144, DType::U8);
+    let mut encoder = device.command_encoder().expect("encoder");
+    assert_unavailable(
+        prepare_repacked_gguf_weight(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &weight,
+            &GgmlQuantizedMatmulParams {
+                m: 1,
+                n: 64,
+                k: 256,
+                ggml_type: GgmlType::Q4_K,
+            },
+        ),
+        TensorKernelFamily::RepackedGgufMm,
+        "prepare_repacked_gguf_weight",
+    );
+}
+
+#[test]
+fn any_other_probe_failure_is_an_error_on_a_metal4_device() {
+    let device = MlxDevice::new().expect("device");
+    if tensor_kernel_family_unavailable_reason() == TENSOR_KERNELS_DISABLED {
+        eprintln!("{TENSOR_KERNELS_DISABLED}: no probe pipeline is built");
+        return;
+    }
+    if !device
+        .metal_device()
+        .supports_family(metal::MTLGPUFamily::Metal4)
+    {
+        eprintln!(
+            "{}: outside the Metal 4 family, every failed tensor build is \"unavailable\" here",
+            device.name()
+        );
+        return;
+    }
+    for &family in TensorKernelFamily::ALL {
+        let mut registry = KernelRegistry::new();
+        registry.register_source(family.probe_kernel(), BROKEN_PROBE_SOURCE);
+        for ask in 0..2 {
+            match tensor_kernel_family_available(&mut registry, &device, family) {
+                Err(MlxError::ShaderCompilationError { .. }) => {}
+                other => panic!("{family:?}, ask {ask}: expected a compile error, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_changed_source_is_asked_again() {
+    let device = MlxDevice::new().expect("device");
+    let family = TensorKernelFamily::RepackedGgufMm;
+    let mut registry = KernelRegistry::new();
+    registry.register_source(family.probe_kernel(), MISSING_HEADER_PROBE_SOURCE);
+    assert!(!tensor_kernel_family_available(&mut registry, &device, family).expect("stub"));
+    registry.register_source(family.probe_kernel(), super::repacked_gguf_mm::SOURCE);
+    let restored = tensor_kernel_family_available(&mut registry, &device, family).expect("source");
+    let mut plain = KernelRegistry::new();
+    let expected = tensor_kernel_family_available(&mut plain, &device, family).expect("plain");
+    assert_eq!(restored, expected);
+}
+
+/// One `dispatch_mm_v2_f16` of `m` rows: the kernel it encoded and its
+/// output. The output starts as NaN, so an unwritten element fails a bound.
+fn f16_matmul(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weight: &MlxBuffer,
+    rows: &[f32],
+    (m, n, k): (usize, usize, usize),
+) -> (String, Vec<f32>) {
+    let mut input = buffer(device, m * k, DType::F32);
+    input
+        .as_mut_slice::<f32>()
+        .expect("input")
+        .copy_from_slice(&rows[..m * k]);
+    let mut output = buffer(device, m * n, DType::F32);
+    output.as_mut_slice::<f32>().expect("output").fill(f32::NAN);
+    let label = format!("M={m} N={n} K={k}");
+    let mut encoder = device.command_encoder().expect("encoder");
+    encoder.start_encoded_dispatch_receipt(1).expect("receipt");
+    dispatch_mm_v2_f16(
+        &mut encoder,
+        registry,
+        device,
+        weight,
+        &input,
+        &output,
+        m as u32,
+        n as u32,
+        k as u32,
+    )
+    .unwrap_or_else(|error| panic!("{label}: {error}"));
+    let receipt = encoder.take_encoded_dispatch_receipt().expect("receipt");
+    encoder
+        .commit_and_wait()
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+    let kernel = receipt[0]
+        .pipeline_label
+        .split('|')
+        .next()
+        .expect("kernel")
+        .to_string();
+    (kernel, output.as_slice::<f32>().expect("output").to_vec())
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+/// Where the tensor F16 matmul is unavailable, `dispatch_mm_v2_f16` encodes
+/// the portable F16 matmul. That route is Class B to the tensor kernel, so
+/// it is held to what the class requires rather than to the tensor bits:
+///
+/// * every element is within `(2^-11 + K * 2^-24) * sum(|w * x|)` of the
+///   F64 product: the kernel rounds the activation to half, one factor's
+///   rounding bounds each term, and each of the K accumulated terms adds an
+///   FP32 rounding;
+/// * a repeated dispatch gives the same bits;
+/// * a row's bits do not depend on the row count: the rows of a shorter
+///   batch are the leading rows of a longer one, across the 32-row tile
+///   (130, 64, 33, 32, 9, 8, 2, 1 rows);
+/// * K that is not a multiple of the 32-wide K tile, and K below one tile,
+///   are served.
+///
+/// On a device with the tensor API the tensor kernel is held to the same
+/// F64 bound and the distance between the two routes is reported.
+#[test]
+fn f16_matmul_without_the_tensor_api_is_the_portable_kernel_within_its_class() {
+    const PORTABLE: &str = "hf2q_dense_mm_f16_f32_fallback";
+    const TENSOR: &str = "hf2q_mul_mm_tensor_v2_f16";
+    /// Half rounding of one factor of every term, as a fraction of
+    /// `sum(|w * x|)`.
+    const HALF_ROUNDING: f64 = 1.0 / 2048.0;
+    /// FP32 rounding of one accumulated term, as the same fraction.
+    const ACCUMULATION: f64 = 1.0 / 16_777_216.0;
+    const ROWS: [usize; 8] = [130, 64, 33, 32, 9, 8, 2, 1];
+    // Whole tiles, partial N and K tiles, production-sized K, K below a tile.
+    const SHAPES: [(usize, usize); 7] = [
+        (64, 64),
+        (70, 96),
+        (256, 2048),
+        (128, 1000),
+        (64, 704),
+        (64, 40),
+        (64, 16),
+    ];
+
+    let device = MlxDevice::new().expect("device");
+    let mut portable = KernelRegistry::new();
+    portable
+        .simulate_missing_tensor_header()
+        .expect("simulate the missing header");
+    let mut auto = KernelRegistry::new();
+    let tensor_here =
+        tensor_kernel_family_available(&mut auto, &device, TensorKernelFamily::MmV2F16)
+            .expect("ask this device");
+    assert!(
+        !(tensor_here && expects_no_tensor()),
+        "{}: tensor kernel",
+        device.name()
+    );
+
+    let mut worst = (0.0f64, 0.0f64, 0.0f64);
+    for (n, k) in SHAPES {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((n * 131 + k) as u64);
+        let mut unit = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let mut weight = buffer(&device, n * k, DType::F16);
+        let weights: Vec<f32> = weight
+            .as_mut_slice::<u16>()
+            .expect("weight")
+            .iter_mut()
+            .map(|word| {
+                let value = half::f16::from_f32(unit() * 0.25);
+                *word = value.to_bits();
+                value.to_f32()
+            })
+            .collect();
+        let rows: Vec<f32> = (0..ROWS[0] * k).map(|_| unit()).collect();
+        // The F64 product and the magnitude each element is bounded by.
+        let reference = |row: usize, column: usize| {
+            let (mut exact, mut magnitude) = (0.0f64, 0.0f64);
+            for index in 0..k {
+                let term =
+                    f64::from(weights[column * k + index]) * f64::from(rows[row * k + index]);
+                exact += term;
+                magnitude += term.abs();
+            }
+            (exact, magnitude)
+        };
+        let bound = HALF_ROUNDING + k as f64 * ACCUMULATION;
+        let error = |output: &[f32], m: usize, label: &str| {
+            let mut worst = 0.0f64;
+            for row in 0..m {
+                for column in 0..n {
+                    let (exact, magnitude) = reference(row, column);
+                    let value = f64::from(output[row * n + column]);
+                    let relative = (value - exact).abs() / magnitude;
+                    assert!(
+                        relative <= bound,
+                        "{label}: row {row} column {column} is {value}, the F64 product is \
+                         {exact}: {relative:e} of sum|w*x| exceeds {bound:e}"
+                    );
+                    worst = worst.max(relative);
+                }
+            }
+            worst
+        };
+
+        let mut longest: Option<Vec<u32>> = None;
+        for m in ROWS {
+            let label = format!("portable, M={m} N={n} K={k}");
+            let (kernel, output) = f16_matmul(&device, &mut portable, &weight, &rows, (m, n, k));
+            assert_eq!(kernel, PORTABLE, "{label}");
+            worst.0 = worst.0.max(error(&output, m, &label));
+            let (_, again) = f16_matmul(&device, &mut portable, &weight, &rows, (m, n, k));
+            assert!(
+                bits(&again) == bits(&output),
+                "{label}: a repeated dispatch differs"
+            );
+            match &longest {
+                None => longest = Some(bits(&output)),
+                Some(longest) => assert!(
+                    longest[..m * n] == bits(&output)[..],
+                    "{label}: a row's bits depend on the row count"
+                ),
+            }
+
+            // The unmodified registry: the portable kernel's bits where
+            // this device has no tensor API, the tensor kernel within the
+            // same F64 bound where it has.
+            let label = format!("this device, M={m} N={n} K={k}");
+            let (kernel, here) = f16_matmul(&device, &mut auto, &weight, &rows, (m, n, k));
+            if tensor_here {
+                assert_eq!(kernel, TENSOR, "{label}");
+                worst.1 = worst.1.max(error(&here, m, &label));
+                let (mut difference, mut scale) = (0.0f64, 0.0f64);
+                for (index, (tensor, portable)) in here.iter().zip(&output).enumerate() {
+                    difference += (f64::from(*tensor) - f64::from(*portable)).powi(2);
+                    scale += reference(index / n, index % n).0.powi(2);
+                }
+                worst.2 = worst.2.max((difference / scale).sqrt());
+            } else {
+                assert_eq!(kernel, PORTABLE, "{label}");
+                assert!(
+                    bits(&here) == bits(&output),
+                    "{label}: differs from the portable kernel"
+                );
+            }
+        }
+    }
+    eprintln!(
+        "{}: F16 matmul, worst error over sum|w*x|: portable {:.3e}{}",
+        device.name(),
+        worst.0,
+        if tensor_here {
+            format!(
+                ", tensor {:.3e}; relative RMS between the routes {:.3e}",
+                worst.1, worst.2
+            )
+        } else {
+            String::new()
+        }
+    );
+}
+
+#[test]
+fn every_family_answers_on_this_device() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let mut available = 0;
+    for &family in TensorKernelFamily::ALL {
+        let answer = tensor_kernel_family_available(&mut registry, &device, family)
+            .unwrap_or_else(|error| panic!("{family:?}: {error}"));
+        available += usize::from(answer);
+    }
+    // The reason names the disabling variable only when it is set, and then
+    // no family is available.
+    let disabled = std::env::var("MLX_NATIVE_DISABLE_METAL_TENSOR").as_deref() == Ok("1");
+    assert_eq!(
+        tensor_kernel_family_unavailable_reason(),
+        if disabled {
+            TENSOR_KERNELS_DISABLED
+        } else {
+            TENSOR_API_UNAVAILABLE
+        }
+    );
+    assert!(!disabled || available == 0, "disabled families answered");
+    let families = TensorKernelFamily::ALL.len();
+    let expected = if expects_no_tensor() {
+        available == 0
+    } else {
+        available == 0 || available == families
+    };
+    assert!(
+        expected,
+        "{}: {available} of {families} tensor-only families available",
+        device.name()
+    );
+    // Every entry point agrees with its family's answer: it runs where the
+    // family is available and returns the typed error where it is not.
+    for_each_entry_point(&device, &mut registry, |family, label, unavailable| {
+        assert_eq!(unavailable, available == 0, "{family:?}: {label}");
+    });
+    eprintln!(
+        "{}: Metal 4 family {}, tensor-only kernel families: {}",
+        device.name(),
+        device
+            .metal_device()
+            .supports_family(metal::MTLGPUFamily::Metal4),
+        if available == 0 {
+            "unavailable"
+        } else {
+            "available"
+        }
+    );
+}

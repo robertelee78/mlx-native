@@ -33,6 +33,7 @@ use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::dense_mm_capability::is_unavailable_tensor_api;
 use crate::ops::quantized_matmul_ggml::GgmlType;
+use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
 mod moe_tiles;
 pub use moe_tiles::{
@@ -3166,6 +3167,7 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
     let total = prepared_expert_stride
         .checked_mul(params.n_experts as usize)
         .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared size overflow".into()))?;
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::GroupedM8Experts)?;
     let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
     let gpu = GroupedM8PrepareGpuParams {
         n_experts: params.n_experts,
@@ -3493,6 +3495,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
             gathered_input.data_byte_len()
         )));
     }
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::GroupedM8Experts)?;
 
     let dispatch = GgmlIdMmDispatchParams {
         n_tokens: params.n_tokens,
