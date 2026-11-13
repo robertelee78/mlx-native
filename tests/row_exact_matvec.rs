@@ -651,6 +651,133 @@ fn row_exact_matvec_q5_0_decode_shapes() {
     check_shape(RowExactWeight::Q5_0, 3, 32, 0x55fe);
 }
 
+/// Move a one-hot input through every SIMD lane and input-row slot while
+/// changing the other seven inputs. Odd N also exercises a partial NR0 cohort.
+#[test]
+fn row_exact_matvec_lane_and_cohort_independence() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let (n, k) = (9usize, 4352usize);
+    let single_shape = RowExactMatvecShape::contiguous(1, n as u32, k as u32);
+    let shape = RowExactMatvecShape::contiguous(MAX_M as u32, n as u32, k as u32);
+    for ty in [
+        RowExactWeight::F16,
+        RowExactWeight::Q8_0,
+        RowExactWeight::Q4_K,
+        RowExactWeight::Q6_K,
+        RowExactWeight::Q5_0,
+    ] {
+        let w = weights(&device, ty, n, k, 0x1660);
+        let mut rng = Rng(0x1661);
+        for lane in 0..32usize {
+            let unit = lane + 32 * (lane % 4);
+            let offset = lane % 4;
+            let hot = match ty {
+                RowExactWeight::F16 => 4 * unit + offset,
+                RowExactWeight::Q8_0 => 8 * unit + offset,
+                RowExactWeight::Q4_K => {
+                    256 * (unit / 8) + 64 * ((unit % 8) / 2) + 16 * (unit % 2) + offset
+                }
+                RowExactWeight::Q6_K => {
+                    256 * (unit / 8) + 128 * ((unit % 8) / 4) + 8 * (unit % 4) + offset
+                }
+                RowExactWeight::Q5_0 => 32 * (unit / 2) + 8 * (unit % 2) + offset,
+            };
+            let slot = lane % MAX_M;
+            let mut one = vec![0.0f32; k];
+            one[hot] = 1.0;
+            let single_x = f32_buffer(&device, &one);
+            let mut xv: Vec<f32> = (0..MAX_M * k).map(|_| rng.unit()).collect();
+            xv[slot * k..(slot + 1) * k].copy_from_slice(&one);
+            let x = f32_buffer(&device, &xv);
+            for nsg in [1, 4] {
+                let single_y = output(&device, n);
+                run(
+                    &device, &mut registry, ty, &w.buffer, &single_x, &single_y,
+                    &single_shape, Some(RowExactMatvecSchedule { nsg, nr0: 1 }),
+                );
+                let expected = bits(&single_y);
+                for schedule in packings(ty, nsg) {
+                    let y = output(&device, MAX_M * n);
+                    run(
+                        &device, &mut registry, ty, &w.buffer, &x, &y,
+                        &shape, Some(schedule),
+                    );
+                    let got = bits(&y);
+                    assert_eq!(
+                        &got[slot * n..(slot + 1) * n], &expected,
+                        "{ty:?} lane {lane} slot {slot} {schedule:?}: cohort changed the protected row",
+                    );
+                    if schedule.nr0 == 1 {
+                        check_reference(
+                            &format!("{ty:?} lane {lane} {schedule:?}"),
+                            &w, 0, &xv, y.as_slice::<f32>().expect("output"), MAX_M, n, k,
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("{ty:?}: all 32 lanes and 8 input slots independent at nsg 1/4, all NR0 packings; F64 bound unchanged");
+    }
+}
+
+/// Bounded rare-failure qualification for the exact shape/seed of issue #166.
+/// Run explicitly in both compile modes, including SV with GPU contention.
+#[test]
+#[ignore = "bounded release qualification; run explicitly in each shader mode"]
+fn row_exact_matvec_q4_k_validation_stress() {
+    let iterations = std::env::var("ROW_EXACT_STRESS_DISPATCHES")
+        .map(|s| s.parse::<usize>().expect("ROW_EXACT_STRESS_DISPATCHES integer"))
+        .unwrap_or(4096);
+    assert!((1..=100_000).contains(&iterations), "stress dispatches must be 1..=100000");
+    let (n, k) = (4096usize, 2816usize);
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let w = weights(&device, RowExactWeight::Q4_K, n, k, 0x4400);
+    let mut rng = Rng(0x4400 ^ 0x9e37_79b9_7f4a_7c15);
+    let xv: Vec<f32> = (0..MAX_M * k).map(|_| rng.unit()).collect();
+    let x = f32_buffer(&device, &xv);
+    let single_shape = RowExactMatvecShape::contiguous(1, n as u32, k as u32);
+    let mut expected = Vec::with_capacity(MAX_M * n);
+    for j in 0..MAX_M {
+        let xj = x.slice_view((j * k * 4) as u64, k);
+        let y = output(&device, n);
+        run(
+            &device, &mut registry, RowExactWeight::Q4_K, &w.buffer, &xj, &y,
+            &single_shape, Some(RowExactMatvecSchedule { nsg: 1, nr0: 1 }),
+        );
+        expected.extend(bits(&y));
+    }
+    let expected_f32: Vec<f32> = expected.iter().map(|&b| f32::from_bits(b)).collect();
+    let ratio = check_reference(
+        "Q4_K stress reference", &w, 0, &xv, &expected_f32, MAX_M, n, k,
+    );
+    let shape = RowExactMatvecShape::contiguous(MAX_M as u32, n as u32, k as u32);
+    let schedule = RowExactMatvecSchedule { nsg: 1, nr0: 2 };
+    let mut y = output(&device, MAX_M * n);
+    for iteration in 0..iterations {
+        y.as_mut_slice::<u32>().expect("output fill").fill(SENTINEL);
+        run(
+            &device, &mut registry, RowExactWeight::Q4_K, &w.buffer, &x, &y,
+            &shape, Some(schedule),
+        );
+        let got = y.as_slice::<u32>().expect("output bits");
+        if let Some(index) = got.iter().zip(&expected).position(|(a, b)| a != b) {
+            panic!(
+                "issue #166 iteration {iteration}, row {} col {}: {:#010x} vs m=1 {:#010x}",
+                index / n, index % n, got[index], expected[index],
+            );
+        }
+    }
+    let name = "row_exact_mv_q4_K_f32_r2_m8";
+    let origin = registry.pipeline_identity(name).expect("pipeline identity").origin;
+    assert_eq!(origin, expected_origin(), "{name} origin");
+    eprintln!(
+        "issue #166: {iterations} dispatches, {} output elements checked, 0 mismatches; {origin:?}; F64 max |err|/bound {ratio:.2e}",
+        iterations * MAX_M * n,
+    );
+}
+
 /// DeepSeek-V4 attention output-A: 8 groups of Q8_0 [1024 x 4096] over a
 /// token-major [m, 8 * 4096] input, written token-major [m, 8 * 1024].
 #[test]

@@ -48,3 +48,65 @@ Per operation at m = 1, Q4_K, Q5_0 and Q8_0 are at stock, ±2%.
 - Entry: `dispatch_row_exact_matvec(encoder, registry, device, RowExactWeight::{Q4_K, Q6_K, Q5_0, Q8_0, F16}, w, x, y, &RowExactMatvecShape::contiguous(m, n, k))`.
 - Shape requirements: K must be a multiple of 256 for Q4_K and Q6_K, and of 32 for Q5_0. A Q4_K weight must start on a 16-byte boundary.
 - hf2q selects this route per weight with `HF2Q_GEMMA_DECODE_DENSE=row_exact`.
+
+## Shader-validation failure investigation (2026-11-13)
+
+The historical passes above do not establish current release qualification.
+[Issue #166](https://github.com/robertelee78/mlx-native/issues/166) retains the
+original command, source identity and failure: main `c718ae8`, shader SHA256
+`652324bebd665b95078a8651c778a2f6e6fe6987d0a0fd47d39c2adbf68147ff`,
+runtime source plus `MTL_SHADER_VALIDATION=1`, Q4_K `[4096 x 2816]`,
+`m=8, nsg=1, nr0=2`, row 0 column 2086:
+`0xc1f6152a` versus the single-row result `0xc1f8f532`. This retained failure
+was not rerun unchanged to confirm it.
+
+Five source experiments were rejected, not landed as repairs:
+
+- Fixed-loop unroll annotations still failed Q4_K under runtime source + SV.
+- Forced helper inlining plus those annotations failed Q4_K and Q6_K under
+  both embedded + SV and runtime source + SV.
+- Compile-time index expansion removed **all private allocas and outlined
+  helpers from the emitted early AIR** (104 kernels), but still failed
+  Q4_K, Q5_0 and Q6_K in both SV compile modes. Plain and Metal debug-layer
+  runs passed the ten-test focused target and 4096-dispatch Q4_K stress in
+  each compile mode; Rust debug-profile targets passed too. These passes
+  did not qualify the failed candidate.
+- Splitting Q4_K packed vector loads into four volatile word loads still
+  failed embedded + SV; this experiment was discarded.
+- Reducing Q4_K header/dequantization live ranges preserved arithmetic
+  order and passed embedded numerical checks plus 4096 stress dispatches,
+  but embedded SV still reported invalid parameter reads and runtime + SV
+  failed numerical equality. It was discarded too.
+
+The compile-time-index experiment was also isolated using Swift + Metal, without
+mlx-native: fixed finite Q4_K `[4096 x 2816]`, `m=8, nsg=1, nr0=2`, each
+output compared with a saved plain-mode reference from its own compile
+mode, with two SV GPU processes deliberately overlapping. Runtime source
+failed **557/20000 dispatches** (8104 wrong elements); the actual shipping
+`default.metallib` failed **847/20000** (15752 wrong elements). Neither left
+outputs unwritten. These counts describe this rejected candidate and
+contention campaign, not the original failure's incidence or performance.
+
+SV reported invalid Q4_K header loads, including addresses such as
+`0x1240ac0`, and earlier experiments reported invalid parameter reads at
+offset 20 of a 48-byte parameter buffer. These diagnostics do not establish
+a pointer-half, private-allocation, preemption or compiler root cause.
+Private-table elimination and helper inlining are **insufficient repairs**.
+The issue links the retained failed sources, AIR summaries, complete logs
+and standalone harness. No speed claim or full-model qualification follows
+from this correctness-only investigation.
+
+A separate binding-axis isolation replaced Swift `setBytes` with an owned
+48-byte shared `MTLBuffer` bound by `setBuffer`, using the retained
+compile-time-index shader, identical generated inputs and saved plain
+references. Command buffers reported `retainedReferences=true`; weights,
+inputs, outputs and parameters remained strong top-level objects, and each
+command buffer completed before the next iteration. There was no explicit
+outer autorelease pool. Runtime + SV still failed **1259/20000 dispatches**
+(15912 wrong elements); a regenerated offline metallib + SV failed
+**1973/20000** (35544 wrong elements). This offline artifact is an isolation
+build, **not new shipping-embedded qualification**. Neither left outputs
+unwritten. Different runs' counts are not a controlled incidence comparison.
+Changing parameter ownership/binding was therefore discarded as a repair;
+an invalid parameter-read diagnostic alone does not establish a host
+lifetime defect.
