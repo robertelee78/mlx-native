@@ -2959,7 +2959,10 @@ impl CommandEncoder {
             .and_then(|_| crate::submission_observer::clock_ns());
         let timeline_begin =
             crate::command_timeline::enabled().then(crate::command_timeline::now_seconds);
-        self.cmd_buf.commit();
+        // Metal can autorelease a residency snapshot while committing, even
+        // for an empty command. The command/queue retain in-flight owners;
+        // discharge only the caller thread's temporary ownership here.
+        objc::rc::autoreleasepool(|| self.cmd_buf.commit());
         if let Some(commit_begin_s) = timeline_begin {
             crate::command_timeline::committed(
                 &self.cmd_buf,

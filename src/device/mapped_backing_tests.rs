@@ -323,6 +323,9 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
         let weak = Arc::downgrade(&escrow);
         let loading_device = device(mode);
         let set = loading_device.residency_set().cloned();
+        let set_dropped = set
+            .as_ref()
+            .and_then(|set| set.drop_notification_for_test());
         let buffer = mapped(&loading_device, &escrow);
         let binding = RecordedBinding::Buffer {
             metal_buffer: buffer.metal_buffer().clone(),
@@ -375,12 +378,19 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
             "recorded Metal owner must still retain its no-copy backing"
         );
         drop(binding);
+        drop(set);
+        if let Some(set_dropped) = set_dropped {
+            // An event, not a sleep/RSS plateau: the heartbeat can briefly
+            // borrow the last set Arc. Require that owner's actual teardown.
+            set_dropped
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("final residency owner must finish teardown");
+        }
         assert_eq!(
             Arc::strong_count(&escrow),
             1,
-            "completed commits and retired residency must not keep mapped backing"
+            "completed commands and final residency teardown must release mapped backing"
         );
-        drop(set);
         drop(escrow);
         assert!(weak.upgrade().is_none());
     })

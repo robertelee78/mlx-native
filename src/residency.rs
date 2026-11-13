@@ -49,6 +49,8 @@ enum ResidencySetInner {
         /// commit ONCE at the end of the batch).
         pending: AtomicBool,
         heartbeat_ticks: AtomicUsize,
+        #[cfg(test)]
+        drop_notification: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     },
     Noop,
 }
@@ -60,11 +62,20 @@ impl Drop for ResidencySetInner {
         };
 
         if let Ok(_guard) = lock.lock() {
-            objc::rc::autoreleasepool(|| unsafe {
+            unsafe {
                 let _: () = msg_send![object.ptr, removeAllAllocations];
                 let _: () = msg_send![object.ptr, commit];
                 let _: () = msg_send![object.ptr, release];
-            });
+            }
+        }
+        #[cfg(test)]
+        if let Self::Active {
+            drop_notification, ..
+        } = self
+        {
+            if let Some(sender) = drop_notification.get_mut().unwrap().take() {
+                let _ = sender.send(());
+            }
         }
     }
 }
@@ -77,6 +88,19 @@ pub(crate) struct ResidencySet {
 }
 
 impl ResidencySet {
+    #[cfg(test)]
+    pub(crate) fn drop_notification_for_test(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        let ResidencySetInner::Active {
+            drop_notification, ..
+        } = &*self.inner
+        else {
+            return None;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(drop_notification.lock().unwrap().replace(sender).is_none());
+        Some(receiver)
+    }
+
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
@@ -142,6 +166,8 @@ impl ResidencySet {
                 lock: Mutex::new(()),
                 pending: AtomicBool::new(false),
                 heartbeat_ticks: AtomicUsize::new(residency_heartbeat_ticks()),
+                #[cfg(test)]
+                drop_notification: Mutex::new(None),
             });
             spawn_residency_heartbeat(&inner);
             Ok(Self { inner })
@@ -221,8 +247,8 @@ impl ResidencySet {
     /// `MlxBufferPool::alloc_batch`, `MlxBufferPool::clear`). Also clears
     /// the pending flag so a subsequent `flush_pending` is a no-op.
     pub(crate) fn commit(&self) {
-        self.with_active_set(|set, pending| {
-            commit_set(set);
+        self.with_active_set(|set, pending| unsafe {
+            let _: () = msg_send![set, commit];
             TEST_COMMIT_CALL_COUNT.fetch_add(1, Ordering::AcqRel);
             pending.store(false, Ordering::Release);
         });
@@ -247,7 +273,9 @@ impl ResidencySet {
             // `add_allocation` / `remove_allocation`, so this is belt-and-
             // braces against future lock-free callers.
             if pending.swap(false, Ordering::AcqRel) {
-                commit_set(set);
+                unsafe {
+                    let _: () = msg_send![set, commit];
+                }
                 TEST_COMMIT_CALL_COUNT.fetch_add(1, Ordering::AcqRel);
                 committed = true;
             }
@@ -277,15 +305,6 @@ impl ResidencySet {
             f(object.ptr, pending);
         }
     }
-}
-
-/// Retire temporary Metal allocation snapshots on pool-less Rust threads.
-/// Resource-owned deallocator captures and command-buffer retains survive
-/// this boundary until their actual Metal owners release them.
-fn commit_set(set: *mut Object) {
-    objc::rc::autoreleasepool(|| unsafe {
-        let _: () = msg_send![set, commit];
-    });
 }
 
 const RESIDENCY_HEARTBEAT_INTERVAL_MS: u64 = 5;
@@ -340,9 +359,9 @@ fn spawn_residency_heartbeat(inner: &Arc<ResidencySetInner>) {
                 continue;
             }
             if let Ok(_guard) = lock.lock() {
-                objc::rc::autoreleasepool(|| unsafe {
+                unsafe {
                     let _: () = msg_send![object.ptr, requestResidency];
-                });
+                }
             };
         });
 }
