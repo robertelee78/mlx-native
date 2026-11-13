@@ -117,7 +117,7 @@ pub use encoder::{
     pipeline_dispatch_buckets,
     reset_counters, reset_pipeline_dispatch_buckets, set_encode_trace, sync_count, CapturedNode,
     CapturedOpKind, CommandEncoder, DispatchKind, DispatchRecord, EncodedKernelDispatch, KernelArg,
-    ObservedCapture, RecordedBinding,
+    ObservedCapture, RecordedBinding, SubmittedCommand,
 };
 pub use encoder_session::EncoderSession;
 pub use mem_ranges::{BufferRange, MemRangeRole, MemRanges};
