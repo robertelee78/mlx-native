@@ -1158,7 +1158,9 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
     for (int row = 0; row < nr0; ++row) {
         const int out_row = first_row + row;
         const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0 && out_row < p.ne01) {
+        // Every lane stores the (identical) simdgroup sum: see the note on
+        // the mN kernel's store below.
+        if (out_row < p.ne01) {
             dst_f32[out_row] = tot;
         }
     }
@@ -1293,7 +1295,14 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
         const int out_row = first_row + row;
         for (short c = 0; c < R1; ++c) {
             const float tot = simd_sum(sumf[row][c]);
-            if (tiisg == 0 && out_row < p.ne01 && (r1_base + c) < p.ne1) {
+            // Every lane stores the (identical) simdgroup sum instead of
+            // lane 0 alone. Under MTL_SHADER_VALIDATION=1 the store of a
+            // single lane was sporadically lost (about 1 dispatch in 1,000
+            // at 8192 x 2816, more with a second GPU process running;
+            // never without validation): the element kept its previous
+            // contents. With 32 lanes storing the same value the output no
+            // longer depends on one lane's state. Bits are unchanged.
+            if (out_row < p.ne01 && (r1_base + c) < p.ne1) {
                 dst[(r1_base + c)*p.ne0 + im*p.ne0*p.ne1 + out_row] = tot;
             }
         }
