@@ -65,6 +65,10 @@ name = "bench_qwen36_moe_layer"
 harness = false
 
 [[bench]]
+name = "bench_kquant_scale_precision"
+harness = false
+
+[[bench]]
 name = "bench_quantized_matmul"
 harness = false
 

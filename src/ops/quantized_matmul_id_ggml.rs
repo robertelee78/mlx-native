@@ -3005,8 +3005,12 @@ fn encode_legacy_map0(
         nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
     };
 
-    let map0_shmem =
-        (params.n_experts as u64) * (params.top_k as u64) * DType::U32.size_of() as u64;
+    // Metal requires a threadgroup memory length that is a multiple of 16.
+    let map0_shmem = ((params.n_experts as u64)
+        * (params.top_k as u64)
+        * DType::U32.size_of() as u64)
+        .div_ceil(16)
+        * 16;
     let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
     let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
 
@@ -4294,8 +4298,12 @@ pub fn dispatch_id_mm_fused_gate_up_silu_for_test(
         nb21: (params.top_k as u64) * (DType::U32.size_of() as u64),
     };
 
-    let map0_shmem =
-        (params.n_experts as u64) * (params.top_k as u64) * DType::U32.size_of() as u64;
+    // Metal requires a threadgroup memory length that is a multiple of 16.
+    let map0_shmem = ((params.n_experts as u64)
+        * (params.top_k as u64)
+        * DType::U32.size_of() as u64)
+        .div_ceil(16)
+        * 16;
     let map0_threadgroups = metal::MTLSize::new(1, 1, 1);
     let map0_threads = metal::MTLSize::new(params.n_experts as u64, 1, 1);
 
