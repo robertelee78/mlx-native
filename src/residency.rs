@@ -6,7 +6,7 @@
 use std::ffi::CStr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use metal::{BufferRef as MTLBufferRef, CommandQueueRef, DeviceRef};
 use objc::runtime::{Class, Object, BOOL, YES};
@@ -61,17 +61,13 @@ impl Drop for ResidencySetInner {
             return;
         };
 
-        // Final retirement can emit autoreleased allocation owners just like
-        // command submission. Drain after the native lock guard is released.
-        objc::rc::autoreleasepool(|| {
-            if let Ok(_guard) = lock.lock() {
-                unsafe {
-                    let _: () = msg_send![object.ptr, removeAllAllocations];
-                    let _: () = msg_send![object.ptr, commit];
-                    let _: () = msg_send![object.ptr, release];
-                }
+        if let Ok(_guard) = lock.lock() {
+            unsafe {
+                let _: () = msg_send![object.ptr, removeAllAllocations];
+                let _: () = msg_send![object.ptr, commit];
+                let _: () = msg_send![object.ptr, release];
             }
-        });
+        }
         #[cfg(test)]
         if let Self::Active {
             drop_notification, ..
@@ -91,7 +87,30 @@ pub(crate) struct ResidencySet {
     inner: Arc<ResidencySetInner>,
 }
 
+/// Non-owning device identity for registrations whose buffer storage already
+/// owns residency. Keeping this handle must not defer the final set commit.
+pub(crate) struct WeakResidencySet {
+    inner: Weak<ResidencySetInner>,
+}
+
+impl WeakResidencySet {
+    pub(crate) fn same_owner(&self, other: &ResidencySet) -> bool {
+        // The weak control block prevents address reuse even after expiry.
+        self.inner.as_ptr() == Arc::as_ptr(&other.inner)
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.inner.strong_count() != 0
+    }
+}
+
 impl ResidencySet {
+    pub(crate) fn downgrade(&self) -> WeakResidencySet {
+        WeakResidencySet {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn drop_notification_for_test(&self) -> Option<std::sync::mpsc::Receiver<()>> {
         let ResidencySetInner::Active {

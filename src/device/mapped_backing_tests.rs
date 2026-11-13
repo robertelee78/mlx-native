@@ -329,6 +329,12 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
             .residency_set()
             .and_then(|set| set.drop_notification_for_test());
         let buffer = mapped(&loading_device, &escrow);
+        // Match a surviving loading-thread weight pool. Self-registered
+        // storage owns membership; registration must not extend its lifetime.
+        let mut registration_pool = crate::MlxBufferPool::new();
+        registration_pool
+            .register_existing(&loading_device, &buffer)
+            .unwrap();
         let binding = RecordedBinding::Buffer {
             metal_buffer: buffer.metal_buffer().clone(),
             offset: buffer.byte_offset(),
@@ -386,6 +392,7 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
             1,
             "completed commands and final residency teardown must release mapped backing"
         );
+        drop(registration_pool);
         drop(escrow);
         assert!(weak.upgrade().is_none());
     })
@@ -409,4 +416,47 @@ fn loading_commit_then_gpu_read_and_drop_reclaims_mapping_without_ambient_pool()
     for mode in [ResidencyMode::Disabled, ResidencyMode::Default] {
         commit_drop_reclaim_witness(mode, true);
     }
+}
+
+#[test]
+fn registration_pool_preserves_live_device_binding_and_rebinds_after_retirement() {
+    let fixture = Fixture::new();
+    let escrow = fixture.mapping();
+    let first = device(ResidencyMode::Default);
+    let second = device(ResidencyMode::Default);
+    let tracks_residency = first.residency_sets_enabled();
+    let first_dropped = first
+        .residency_set()
+        .and_then(|set| set.drop_notification_for_test());
+    let first_buffer = mapped(&first, &escrow);
+    let second_buffer = mapped(&second, &escrow);
+    let mut pool = crate::MlxBufferPool::new();
+    pool.register_existing(&first, &first_buffer).unwrap();
+    assert_eq!(
+        pool.register_existing(&second, &second_buffer).is_err(),
+        tracks_residency,
+        "a live registration-only binding must reject another set"
+    );
+    assert_eq!(
+        pool.alloc(&second, 64, DType::U8, vec![64]).is_err(),
+        tracks_residency,
+        "pool-owned allocations must honor a live registration-only binding"
+    );
+    drop(first_buffer);
+    drop(first);
+    if let Some(first_dropped) = first_dropped {
+        first_dropped
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("registration-only pool must not own the old set");
+    }
+    pool.register_existing(&second, &second_buffer).unwrap();
+    let pooled = pool.alloc(&second, 64, DType::U8, vec![64]).unwrap();
+    let third = device(ResidencyMode::Default);
+    let third_buffer = mapped(&third, &escrow);
+    assert_eq!(
+        pool.register_existing(&third, &third_buffer).is_err(),
+        tracks_residency,
+        "the pool-owned binding must still reject another set"
+    );
+    drop(pooled);
 }
