@@ -1029,6 +1029,48 @@ kernel void kernel_mul_mv_q6_K_f32(
 // Hypothesis (ADR-028 iter-308): cuts per-dispatch time on the biggest
 // gemma4 APEX-Q5_K_M decode kernel (17.91% of dispatches) by closing
 // the row-amortization gap with the peer.
+// Canonical Q6_K few-row block term, shared by `kernel_mul_mv_q6_K_f32_nr2`
+// (one activation row) and `kernel_mul_mv_q6_K_f32_mN_r1_*` (2..5 rows).
+//
+// `yl[4*l + k]` is the cached activation that multiplies weight `l` of
+// sub-block lane `k`. The term is written out as explicit fused operations
+// with contraction and reassociation switched off, so its operation graph is
+// exactly this text in every kernel that calls it:
+//
+//   sums  = fma(y_l, w_l, sums)              for l = 0, 1, 2, 3 (four lanes)
+//   t     = sums[0]*sc[0]; t = fma(sums[k], sc[2k], t)   for k = 1, 2, 3
+//   acc'  = fma(dall, t, acc)
+//
+// A row's bits therefore do not depend on the decode width or on how the
+// compiler would contract and order an implicit `a*b + c` in each kernel
+// (which differed between the two kernels under shader validation).
+static inline float hf2q_q6k_few_row_block_term(
+        thread const float   * yl,
+        device const uint8_t * q1,
+        device const uint8_t * q2,
+        device const uint8_t * qh,
+        device const int8_t  * sc,
+        float dall,
+        float acc) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    float4 sums = float4(0.f);
+    for (int l = 0; l < 4; ++l) {
+        const float4 w = float4(
+            (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32),
+            (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32),
+            (float)((int8_t)((q1[l]  >> 4) | ((qh[l] & 0x30) << 0)) - 32),
+            (float)((int8_t)((q2[l]  >> 4) | ((qh[l] & 0xC0) >> 2)) - 32));
+        const float4 y = float4(yl[4*l + 0], yl[4*l + 1], yl[4*l + 2], yl[4*l + 3]);
+        sums = fma(y, w, sums);
+    }
+    float t = sums[0] * (float)sc[0];
+    t = fma(sums[1], (float)sc[2], t);
+    t = fma(sums[2], (float)sc[4], t);
+    t = fma(sums[3], (float)sc[6], t);
+    return fma(dall, t, acc);
+}
+
 kernel void kernel_mul_mv_q6_K_f32_nr2(
     device const  void  * src0   [[buffer(0)]],
     device const float  * src1   [[buffer(1)]],
@@ -1040,10 +1082,6 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 ) {
     constexpr int NSG = 2;   // simdgroups per threadgroup
     constexpr int nr0 = 2;   // rows per simdgroup
-    constexpr uint8_t kmask1 = 0x03;
-    constexpr uint8_t kmask2 = 0x0C;
-    constexpr uint8_t kmask3 = 0x30;
-    constexpr uint8_t kmask4 = 0xC0;
 
     const int nb = p.ne00 / QK_K;
 
@@ -1112,15 +1150,7 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 
             const float dall = xr[i].d;
 
-            float4 sums = {0.f, 0.f, 0.f, 0.f};
-            for (int l = 0; l < 4; ++l) {
-                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
-            }
-
-            sumf[row] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            sumf[row] = hf2q_q6k_few_row_block_term(yl, q1, q2, qh, sc, dall, sumf[row]);
         }
     }
 
@@ -1144,12 +1174,13 @@ kernel void kernel_mul_mv_q6_K_f32_nr2(
 // values ONCE, then reuses them across R1 columns — closing the batched-decode
 // weight-reload gap WITHOUT a coherence tradeoff.
 //
-// BIT-IDENTITY: each column is a literal clone of production NR2's `yl` cache,
-// `sums`, `sc`, `dall`, and `simd_sum` tree. The only column-dependent state is
-// `yy_c` plus its output index; packed weight decode is shared. No `dot()`, no
-// horizontal reduction change, and no accumulation reordering. Therefore
-// `dst_mN[c][row]` is bit-equal to an independent NR2 invocation for column c,
-// as proven by tests/adr_040_q6k_mv_mN_byte_parity.rs.
+// BIT-IDENTITY: each column runs the block term NR2 runs, the shared
+// `hf2q_q6k_few_row_block_term` (explicit fma graph, contraction and
+// reassociation off), over the same `yl` cache layout, and ends in the same
+// `simd_sum`. The only column-dependent state is `yy_c` plus its output
+// index; packed weight decode is shared. Therefore `dst_mN[c][row]` is
+// bit-equal to an independent NR2 invocation for column c by construction,
+// and tests/adr_040_q6k_mv_mN_byte_parity.rs checks it.
 //
 // Dispatch: threadgroups=(ceil(N/4), ceil(M/R1), B), threads_per_tg=(2, 32, 1).
 // Each SIMD group handles 2 weight rows × R1 columns. `r1_base = R1 * tgpig.y`.
@@ -1166,10 +1197,6 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
     uint  sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     constexpr short nr0 = 2;   // weight rows per simdgroup (matches nr2)
-    constexpr uint8_t kmask1 = 0x03;
-    constexpr uint8_t kmask2 = 0x0C;
-    constexpr uint8_t kmask3 = 0x30;
-    constexpr uint8_t kmask4 = 0xC0;
 
     const int nb = p.ne00 / QK_K;
 
@@ -1212,14 +1239,10 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
 
     // BIT-IDENTITY TARGET: kernel_mul_mv_q6_K_f32_nr2.
     //
-    // The gemma4 model runs Q6_K decode through NR2 (default-on), so the serial
-    // m=1 reference the parity test compares against uses NR2 — and NR2 is NOT
-    // byte-equal to plain mv in general (it caches `yl[16]` and reads `yl[...]`
-    // as the multiply operand, which changes the Metal FMA-contraction vs plain
-    // mv's direct `y[...]`; measured: a 1-ULP drift at e.g. n=1024).  Therefore
-    // this kernel is a LITERAL clone of NR2's per-row block body (same `yl`
-    // cache, same `yl[...]` operand form, same array `sumf[]`, same `short`
-    // indexing), specialized across R1 COLUMNS instead of NR2's nr0=2 rows.
+    // The serial m=1 reference is NR2 (default-on), which is not byte-equal to
+    // plain mv. Both kernels call `hf2q_q6k_few_row_block_term` on a `yl`
+    // cache of the same layout, specialized here across R1 COLUMNS instead of
+    // NR2's nr0=2 rows.
     //
     // Amortization: the weight bytes for each of this SG's `nr0` rows are read +
     // dequantized once per block and reused across all R1 columns (NR2 reuses
@@ -1260,16 +1283,8 @@ kernel void hf2q_mul_mv_q6_K_f32_mN_impl(
             const float dall = xr[i].d;
 
             for (short c = 0; c < R1; ++c) {
-                // EXACT clone of NR2's per-row inner body — only `yl` → `yl_c[c]`.
-                float4 sums = {0.f, 0.f, 0.f, 0.f};
-                for (int l = 0; l < 4; ++l) {
-                    sums[0] += yl_c[c][4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                    sums[1] += yl_c[c][4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                    sums[2] += yl_c[c][4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                    sums[3] += yl_c[c][4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
-                }
-
-                sumf[row][c] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+                // The same written term as NR2 — only `yl` → `yl_c[c]`.
+                sumf[row][c] = hf2q_q6k_few_row_block_term(yl_c[c], q1, q2, qh, sc, dall, sumf[row][c]);
             }
         }
     }
