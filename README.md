@@ -53,6 +53,20 @@ Model bytes and storage types are unchanged, but affected arithmetic and generat
 text can differ from 0.21.9. Revalidate pinned outputs and quality comparisons;
 bitwise agreement with the old half-precision quotient is not a correctness gate.
 
+Q5_K few-row projections also use one explicit F32 block term across widths.
+Requalify numerical bounds and model quality rather than preserving outputs
+from the previous arithmetic.
+
+`EncoderSession::reset_for_next_stage_keeping()` returns an opaque
+`SubmittedCommand` for the committed stage. Callers that pipeline stages must
+keep and check every submitted stage at their next host wait; success of the
+last command buffer alone does not prove earlier stages succeeded.
+
+Registration-only buffer pools retain weak residency identity for buffers that
+already own their registration. Pool-owned allocations still retain the set
+strongly. An otherwise idle loading-thread pool therefore no longer keeps a
+removed model's copied-weight residency alive.
+
 Supported model families used in production:
 - **Qwen3 / Qwen3.5 / Qwen3.6** (dense + MoE, GGUF)
 - **Qwen3-VL** (vision-tower kernels: im2col / bilinear-resize / 2×2 block-merge / feature-concat + `RopeMultiMode::Vision`)
@@ -134,6 +148,7 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 | `GraphExecutor` / `GraphSession` | Single-encoder batched forward passes |
 | `ComputeGraph` | Recorded graph IR (capture, fuse, replay) |
 | `EncoderSession` | Per-stage encoder lifecycle with MTLSharedEvent stage-fences (ADR-019, `HF2Q_ENCODER_SESSION=1`) |
+| `SubmittedCommand` | Retained committed stage whose completion and status the caller checks |
 | `DispatchRecord` | Pre-baked dispatch metadata to skip per-call pipeline lookup + env-var reads (ADR-029) |
 | `DType` | Element data type enum (F32, F16, BF16, U8/16/32, I32) |
 | `MlxError` | Unified error type |
