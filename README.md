@@ -41,6 +41,41 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 **Active development, pre-1.0.** API may change between minor versions (`0.x.0 → 0.(x+1).0` signals breaking changes). Public functions and structs evolve as new model families are added. Patch versions (`0.x.y → 0.x.(y+1)`) are non-breaking.
 
+### Migrating to 0.22
+
+`MlxError` is now non-exhaustive; downstream matches must retain a wildcard arm.
+Tensor-API availability has a typed error contract and cached, per-registry
+capability queries. Optional routes must check availability before encoding;
+do not treat arbitrary pipeline failures as evidence of missing hardware support.
+
+Q4_K, Q5_K, and Q4_0 kernels now widen the block scale before dividing by 16.
+Model bytes and storage types are unchanged, but affected arithmetic and generated
+text can differ from 0.21.9. Revalidate pinned outputs and quality comparisons;
+bitwise agreement with the old half-precision quotient is not a correctness gate.
+
+Q5_K few-row projections also use one explicit F32 block term across widths.
+Requalify numerical bounds and model quality rather than preserving outputs
+from the previous arithmetic.
+
+`EncoderSession::reset_for_next_stage_keeping()` returns an opaque
+`SubmittedCommand` for the committed stage. Callers that pipeline stages must
+keep and check every submitted stage at their next host wait; success of the
+last command buffer alone does not prove earlier stages succeeded.
+
+Registration-only buffer pools retain weak residency identity for buffers that
+already own their registration. Pool-owned allocations still retain the set
+strongly. An otherwise idle loading-thread pool therefore no longer keeps a
+removed model's copied-weight residency alive.
+
+Known diagnostic limitation on macOS 27.2: Shader Validation can report faults
+or produce wrong values in the existing Q6_K, stock Q8_0 and Class-B Q4_K paths
+([#160](https://github.com/robertelee78/mlx-native/issues/160),
+[#162](https://github.com/robertelee78/mlx-native/issues/162),
+[#166](https://github.com/robertelee78/mlx-native/issues/166)).
+Those shader files are byte-identical to 0.21.9; the failures are not claimed
+fixed here, and their cause and relevance to ordinary execution remain open.
+Unqualified experimental rewrites are not included in this release.
+
 Supported model families used in production:
 - **Qwen3 / Qwen3.5 / Qwen3.6** (dense + MoE, GGUF)
 - **Qwen3-VL** (vision-tower kernels: im2col / bilinear-resize / 2×2 block-merge / feature-concat + `RopeMultiMode::Vision`)
@@ -122,6 +157,7 @@ session.finish()?;                  // one commit_and_wait for the whole pass
 | `GraphExecutor` / `GraphSession` | Single-encoder batched forward passes |
 | `ComputeGraph` | Recorded graph IR (capture, fuse, replay) |
 | `EncoderSession` | Per-stage encoder lifecycle with MTLSharedEvent stage-fences (ADR-019, `HF2Q_ENCODER_SESSION=1`) |
+| `SubmittedCommand` | Retained committed stage whose completion and status the caller checks |
 | `DispatchRecord` | Pre-baked dispatch metadata to skip per-call pipeline lookup + env-var reads (ADR-029) |
 | `DType` | Element data type enum (F32, F16, BF16, U8/16/32, I32) |
 | `MlxError` | Unified error type |
@@ -158,7 +194,7 @@ buffer-owned set retirement.
 - `sdpa_decode` — Tiled decode-path SDPA with N_SG=4 simdgroups
 
 ### Matrix multiplication
-- **GGUF formats**: F32, F16, BF16 typed storage plus Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS blocks — mat-vec + mul_mm kernels where implemented (byte-parity with the reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented)
+- **GGUF formats**: F32, F16, BF16 typed storage plus Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS blocks — mat-vec + mul_mm kernels where implemented (reference inference subset — see `docs/peer-benchmarks.md`; tensor-core paths where implemented). Codec compatibility does not imply bitwise-identical matrix arithmetic with the reference.
 - **GGUF expert-routed (`mm_id`)**: Q2_K, Q3_K, Q4_0, Q5_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS (top_k>1 MoE mat-vec + tensor-mm where implemented). IQ2_XXS is expert-only: `mv_id`, simdgroup `mm_id` and tensor `mm_id`, with no dense kernel; its CPU dequant is bit-exact against the reference, and its codebook tables come from one Rust source (`mlx_native::quant::iq_tables`) that generates the Metal copies (`MLX_BLESS_IQ_TABLES=1 cargo test --test iq_tables` rewrites them)
 - **Native scalar expert-routed**: `dense_matmul_id` consumes F32, F16, or BF16 expert stacks in their stored bytes, F32 shared-per-token or slotted activations, and U32 expert IDs. Direct execution is one dispatch; the bit-identical grouped route uses two dispatches, a primitive-owned pre-map scratch-reuse barrier, a map-to-multiply barrier, and caller-owned scratch. `calibrate_dense_matmul_id_routes` measures balanced and maximally skewed distinct routing for every exact case declared by a model activation, freezes a pointer-free/epoch-scoped route plan bound to the compiled pipeline identities and value-independence theorem digest, and defaults every unproven or unstable case to Direct. Each exact shape empirically proves one current weight representative with adversarial F32 activations and routing under both profiles; shared source-identical expert-base/address/widen/F32-FMA/reduction helpers then authorize its other declared layer-local weight identities without retaining them. A later width may use Direct only when its complete width-independent contract was admitted; undeclared dtype, N/K, top-k, expert count/stride, layout, or multiplicity still fails. Cached Grouped timing metadata reruns the exact-shape representative proof before activation; no static M threshold or prior model pointer selects production work. Required Direct proof failure aborts without a plan. Every nonzero proof/timing attempt is followed by exactly one empty cleanup boundary before deferred cache eviction and fully validated, deadline-gated plan publication.
 - **MLX format**: 4/6/8-bit affine quantization (`quantized_matmul`)
