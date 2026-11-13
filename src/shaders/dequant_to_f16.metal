@@ -108,7 +108,10 @@ static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q
 template <typename type4x4>
 void dq_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d1 = il ? (float(xb->d) / 16.f) : float(xb->d);
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
