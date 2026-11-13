@@ -20,7 +20,7 @@ use crate::ops::dense_bf16_auto::{
     DenseBf16Shape, DenseBf16TimingDistribution, DENSE_BF16_CALIBRATION_MAX_M,
     DENSE_BF16_ROUTE_SCHEMA_VERSION,
 };
-use crate::ops::dense_mm_capability::{is_unavailable_tensor_header, tensor_disabled_from_env};
+use crate::ops::dense_mm_capability::{is_unavailable_tensor_api, tensor_disabled_from_env};
 
 const CALIBRATION_SAMPLES: usize = 5;
 const MATERIAL_WIN_FRACTION: f64 = 0.05;
@@ -135,7 +135,7 @@ fn prepare_routes(
             device.metal_device(),
         ) {
             Ok(_) => true,
-            Err(error) if is_unavailable_tensor_header(&error) => false,
+            Err(error) if is_unavailable_tensor_api(device, &error) => false,
             Err(error) => return Err(error),
         }
     };

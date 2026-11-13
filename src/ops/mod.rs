@@ -92,6 +92,8 @@ pub mod quantized_matmul;
 pub mod quantized_matmul_ggml;
 pub mod quantized_matmul_id;
 pub mod quantized_matmul_id_ggml;
+#[cfg(test)]
+mod quantized_mm_tensor_unavailable_tests;
 pub mod repeat_tiled;
 pub mod repacked_gguf_mm;
 pub mod rms_norm;

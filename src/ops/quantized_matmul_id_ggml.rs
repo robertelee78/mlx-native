@@ -31,7 +31,7 @@ static CACHED_Q6K_ID_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 static CACHED_Q8_0_ID_MV_NR2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
-use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
+use crate::ops::dense_mm_capability::is_unavailable_tensor_api;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 
 mod moe_tiles;
@@ -298,7 +298,7 @@ fn probe_tensor_mm_id(registry: &mut KernelRegistry, device: &MlxDevice) -> Resu
         "kernel_mul_mm_id_q4_0_tensor_f32",
         device.metal_device(),
         device.registry_id(),
-        is_unavailable_tensor_header,
+        |error| is_unavailable_tensor_api(device, error),
     )?;
     if probe.newly_probed && std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
         eprintln!(

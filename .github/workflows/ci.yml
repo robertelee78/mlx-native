@@ -60,6 +60,30 @@ jobs:
         run: cargo +1.96.0 test --release --locked --test test_dense_matvec_f32_rows -- --test-threads=1
       - name: Q4_K mv_id at the peer layout (F64 reference, pair independence)
         run: cargo +1.96.0 test --release --locked --test test_mul_mv_id_q4_k_nr2 -- --test-threads=1
+  rust-metal-no-metal4-device:
+    # The hosted macos-26 GPU has the <metal_tensor> header and no Metal 4 GPU
+    # family: tensor shaders compile and specialise there, then fail pipeline
+    # creation. Every tensor probe must report the API unavailable and take
+    # its portable route (src/ops/dense_mm_capability.rs). The macos-15 jobs
+    # cover the other host without the tensor API, the missing header.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Dense matmul routes without the tensor API
+        env:
+          MLX_DENSE_MM_TEST_EXPECT_NO_TENSOR: "1"
+        run: >-
+          cargo +1.96.0 test --release --locked --lib --
+          ops::quantized_mm_tensor_unavailable_tests
+          ops::dense_mm_capability
+          ops::dense_mm_fallback_tests
+          --test-threads=1 --nocapture
+
   rust-metal:
     runs-on: macos-15
     # The debug-profile Gemma parity suites (GQA flash T-N8 about 2 min, warm

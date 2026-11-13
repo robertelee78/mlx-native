@@ -89,7 +89,7 @@ pub fn flash_attn_prefill_tensor_available(
             name,
             device.metal_device(),
             device.registry_id(),
-            crate::ops::dense_mm_capability::is_unavailable_tensor_header,
+            |error| crate::ops::dense_mm_capability::is_unavailable_tensor_api(device, error),
         )?
         .available)
 }

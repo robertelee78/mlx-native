@@ -23,7 +23,7 @@ use crate::ggml_capability::{
 };
 use crate::ggml_dispatch_trace::{trace_ggml_operation, GgmlResolvedDispatchTrace};
 use crate::ggml_routing_policy::ggml_routing_policy_for_registry;
-use crate::ops::dense_mm_capability::is_unavailable_tensor_header;
+use crate::ops::dense_mm_capability::is_unavailable_tensor_api;
 use crate::ops::dense_q4_auto::{self, DenseQ4Route};
 use std::sync::atomic::AtomicI8;
 
@@ -435,7 +435,7 @@ fn probe_tensor_mm(registry: &mut KernelRegistry, device: &MlxDevice) -> Result<
         device.registry_id(),
         &[],
         &[(700, 1), (701, 1), (702, 1)],
-        is_unavailable_tensor_header,
+        |error| is_unavailable_tensor_api(device, error),
     )?;
     if probe.newly_probed && std::env::var("MLX_LOG_TENSOR_PROBE").is_ok() {
         eprintln!(
