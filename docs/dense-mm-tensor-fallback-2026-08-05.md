@@ -159,24 +159,51 @@ without building a key.
   allocates or encodes. The query is the contract: a caller asks before it
   chooses the route.
 - `dispatch_mm_v2_f16` has a twin and takes it by itself: where the tensor
-  kernel is unavailable it encodes `hf2q_dense_mm_f16_f32_fallback`.
+  kernel is unavailable it encodes `hf2q_dense_mm_f16_f32_fallback`, at
+  every K (the portable kernel zero-fills the K tail of its last 32-wide
+  tile, so it also serves K below one tile, which the tensor kernel takes
+  too). The two routes are Class B to each other, not bitwise: the portable
+  kernel stages the activation as half and accumulates in another order.
+  On the M5 Max about one element per run is bit-equal, the relative RMS
+  between them is about 4.5e-4, and against the F64 product the worst error
+  over `sum(|w * x|)` is 1.5e-4 for the portable kernel and 2.7e-4 for the
+  tensor kernel (independent review of this change). The gate holds both to
+  `2^-11 * sum(|w * x|)`, the half rounding of one factor.
 - The tensor flash attention and the tiled verify attention already had
   queries; their dispatches now return the same typed error instead of the
   diagnostic when a caller skipped the query.
 - `KernelRegistry::simulate_missing_tensor_header` makes a registry compile
   as a host without the header does, for every tensor source, so a consumer
   can test its portable routes on a tensor-capable machine.
-  `MLX_NATIVE_DISABLE_METAL_TENSOR=1` answers "unavailable" for every family,
-  as it selects the portable dense matmuls.
+- `MLX_NATIVE_DISABLE_METAL_TENSOR=1` answers "unavailable" for every family
+  and the typed error then names the variable as the reason
+  (`TENSOR_KERNELS_DISABLED`; `tensor_kernel_family_unavailable_reason()`
+  says which reason applies in a process). The variable makes a mixed host,
+  not a host without the tensor API: it selects the portable dense
+  BF16/F16/F32 matmuls and turns these families off, but the quantized and
+  expert matmul probes, the tensor flash attention and the tiled verify
+  attention do not read it and keep their tensor kernels. Use
+  `simulate_missing_tensor_header` to reproduce a host without the API.
+- `MlxError` is `#[non_exhaustive]` from this change on. Adding
+  `Unavailable` to an exhaustive public enum is a breaking change by itself
+  (`cargo semver-checks`: `enum_variant_added`), so the release that carries
+  it is 0.22.0, and the attribute makes later variants compatible.
 
 ### Gates
 
 - `ops::tensor_kernels_tests`: with the header missing every family answers
   "unavailable" and each of seven entry points returns the typed error; a
   probe source that fails for another reason is an error on a Metal 4
-  device; a changed source is asked again; `dispatch_mm_v2_f16` encodes the
-  portable kernel and gives its bits; and on the unmodified registry every
-  entry point agrees with its family's answer.
+  device; a changed source is asked again; and on the unmodified registry
+  every entry point agrees with its family's answer.
+- The same module holds the Class B gate of the F16 twin: at seven shapes
+  (whole and partial N and K tiles, K = 2048, K = 40 and K = 16) and 130,
+  64, 33, 32, 9, 8, 2 and 1 rows, `dispatch_mm_v2_f16` without the tensor
+  API encodes the portable kernel, every element is within
+  `2^-11 * sum(|w * x|)` of the F64 product, a repeated dispatch gives the
+  same bits, and the rows of a shorter batch are bitwise the leading rows
+  of a longer one. Where the device has the tensor API the tensor kernel is
+  held to the same F64 bound.
 - `kernel_registry::tests::simulated_missing_tensor_header_stops_tensor_kernels_only`.
 - CI job `rust-metal-no-tensor-api` runs these and the dense gates on the
   hosted `macos-15` (no header) and `macos-26` (no Metal 4 family) runners

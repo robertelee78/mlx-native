@@ -1594,6 +1594,18 @@ pub fn quantized_matmul_q2_k_batched_mv(
 ///
 /// `f16_weight` is the F16-typed MlxBuffer (per-row stride = K halfs =
 /// 2K bytes).  `input` is F32 [m, k].  `output` is F32 [m, n].
+///
+/// Where the tensor kernel is unavailable
+/// (`TensorKernelFamily::MmV2F16`) the product runs on the portable F16
+/// matmul (`hf2q_dense_mm_f16_f32_fallback`) instead. The two routes are
+/// Class B to each other, not bitwise: the portable kernel stages the
+/// activation as half and accumulates in a different order. Each is within
+/// `2^-11 * sum(|w * x|)` of the F64 product (the half rounding of one
+/// factor), the portable route is deterministic, and its output row depends
+/// only on that input row and the weight, not on the row count
+/// (`ops::tensor_kernels_tests`). A probe failure that is not a missing
+/// tensor API is returned as the error; it does not select the portable
+/// route.
 pub fn dispatch_mm_v2_f16(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,

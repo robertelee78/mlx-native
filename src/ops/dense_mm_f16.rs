@@ -121,7 +121,11 @@ pub(super) fn dense_matmul_f16_f32_with_backend(
             "dense_matmul_f16_f32_tensor: M, N, K must all be > 0".into(),
         ));
     }
-    if params.k < 32 {
+    // The tensor kernel needs one whole NK=32 tile of K. The portable
+    // kernel zero-fills the K tail of its last tile, so a caller that asks
+    // for it alone (`dispatch_mm_v2_f16` without the tensor API, whose
+    // tensor kernel takes any K) is served at every K.
+    if params.k < 32 && backend != DenseMmBackend::FallbackRequired {
         return Err(MlxError::InvalidArgument(format!(
             "dense_matmul_f16_f32_tensor: K ({}) must be >= 32",
             params.k

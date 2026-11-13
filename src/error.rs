@@ -17,7 +17,11 @@ macro_rules! static_assertions_send_sync {
 }
 
 /// Unified error type for all Metal GPU operations.
+///
+/// Non-exhaustive: a `match` outside this crate needs a catch-all arm, so a
+/// later variant is not a breaking change.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MlxError {
     /// No Metal-capable GPU device was found on this system.
     #[error("No Metal GPU device found — Apple Silicon required")]
@@ -75,16 +79,19 @@ pub enum MlxError {
     #[error("GGUF parse error: {0}")]
     GgufParseError(String),
 
-    /// A kernel family without a portable twin cannot run on this host.
+    /// A kernel family cannot run on this host and the entry point that was
+    /// called has no other kernel to run instead.
     ///
     /// Not a defect of the call: the host lacks an optional capability the
-    /// family is built on. Callers ask the family's availability query
-    /// before they choose its route (`ops::tensor_kernels`).
+    /// family is built on, or the operator disabled it. Returned by the
+    /// tensor-only families of `ops::tensor_kernels` and by the tensor flash
+    /// attention and the tiled verify attention; each has an availability
+    /// query a caller asks before it chooses the route.
     #[error("{feature} is unavailable on this host: {reason}")]
     Unavailable {
         /// The kernel family that was asked for.
         feature: &'static str,
-        /// The capability the host lacks.
+        /// The capability the host lacks, or the setting that disabled it.
         reason: &'static str,
     },
 }

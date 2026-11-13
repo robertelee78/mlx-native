@@ -1,13 +1,14 @@
 //! Availability of the kernel families that exist only on the Metal tensor
 //! API.
 //!
-//! The dense, quantized and expert matmuls, the tensor flash attention and
-//! the tiled verify attention each have a portable twin and choose it by
-//! themselves where the tensor API is unavailable (`dense_mm_capability`).
-//! The families here have none, with one exception named on its variant:
-//! their layout, tiling or schedule is the route. For them the query is the
-//! contract. A caller asks [`tensor_kernel_family_available`] before it
-//! chooses the route, and a dispatch on a host that cannot run it returns
+//! The dense, quantized and expert matmuls each have a portable twin and
+//! choose it by themselves where the tensor API is unavailable
+//! (`dense_mm_capability`). The tensor flash attention and the tiled verify
+//! attention have availability queries of their own. The families here had
+//! neither. With one exception named on its variant they have no portable
+//! twin: their layout, tiling or schedule is the route. For them the query
+//! is the contract. A caller asks [`tensor_kernel_family_available`] before
+//! it chooses the route, and a dispatch on a host that cannot run it returns
 //! [`MlxError::Unavailable`] instead of the shader compiler's diagnostic.
 //!
 //! The classifier is the one every tensor probe uses
@@ -15,18 +16,44 @@
 //! without `<metal_tensor>`, or a failed pipeline build on a device outside
 //! the Metal 4 GPU family, is "unavailable"; any other failure on a Metal 4
 //! device is returned as the error it is and not cached.
+//!
+//! `MLX_NATIVE_DISABLE_METAL_TENSOR=1` makes every family here answer
+//! "unavailable" ([`TENSOR_KERNELS_DISABLED`]). The variable does not make a
+//! process behave as a host without the tensor API: it also selects the
+//! portable dense BF16/F16/F32 matmuls, but the quantized and expert matmul
+//! probes, the tensor flash attention and the tiled verify attention do not
+//! read it and keep their tensor kernels. A registry that behaves as such a
+//! host in every probe is
+//! [`KernelRegistry::simulate_missing_tensor_header`].
 
 use crate::device::MlxDevice;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::dense_mm_capability::{is_unavailable_tensor_api, tensor_disabled_from_env};
 
-/// Why a tensor-only family is unavailable.
+/// Why a tensor-only family is unavailable on a host without the tensor API.
 pub const TENSOR_API_UNAVAILABLE: &str = "the Metal tensor API is unavailable (a runtime \
     compiler without <metal_tensor>, or a GPU outside the Metal 4 family)";
 
-/// A kernel family built on the Metal tensor API that has no portable twin
-/// in this crate.
+/// Why a tensor-only family is unavailable when the operator disabled it.
+pub const TENSOR_KERNELS_DISABLED: &str =
+    "MLX_NATIVE_DISABLE_METAL_TENSOR=1 disables the tensor-only kernel families";
+
+/// Why [`tensor_kernel_family_available`] answers `false` in this process:
+/// [`TENSOR_KERNELS_DISABLED`] under `MLX_NATIVE_DISABLE_METAL_TENSOR=1`,
+/// [`TENSOR_API_UNAVAILABLE`] otherwise. The `reason` of the
+/// [`MlxError::Unavailable`] a family's entry point returns.
+pub fn tensor_kernel_family_unavailable_reason() -> &'static str {
+    if tensor_disabled_from_env() {
+        TENSOR_KERNELS_DISABLED
+    } else {
+        TENSOR_API_UNAVAILABLE
+    }
+}
+
+/// A kernel family built on the Metal tensor API whose entry points had no
+/// availability probe. All but [`Self::MmV2F16`] have no portable twin in
+/// this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TensorKernelFamily {
@@ -61,9 +88,11 @@ type Probe = (&'static str, &'static [(usize, i32)]);
 /// specialises its pipeline with.
 const MM_TENSOR_CONSTANTS: &[(usize, i32)] = &[(700, 1), (701, 1), (702, 1)];
 
+const _: () = assert!(TensorKernelFamily::ALL.len() == TensorKernelFamily::COUNT);
+
 impl TensorKernelFamily {
     /// Every family.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: &'static [Self] = &[
         Self::RepackedGgufMm,
         Self::Dflash2Af4g64Staged,
         Self::Dflash2RingAttention,
@@ -73,7 +102,8 @@ impl TensorKernelFamily {
         Self::MmV2F16,
     ];
 
-    pub(crate) const COUNT: usize = Self::ALL.len();
+    /// Families, as the registry's answer table is sized.
+    pub(crate) const COUNT: usize = 7;
 
     pub(crate) const fn index(self) -> usize {
         self as usize
@@ -115,21 +145,22 @@ impl TensorKernelFamily {
         }
     }
 
-    /// The kernel the availability query builds. Public so that a test can
-    /// replace its source, as `register_source` allows for any kernel.
+    /// The kernel the availability query builds, for a test that replaces
+    /// its source (`register_source`). Not part of the supported surface.
+    #[doc(hidden)]
     pub const fn probe_kernel(self) -> &'static str {
         self.probe().0
     }
 }
 
 /// Whether `family` can run on `device`: `Ok(false)` where the Metal tensor
-/// API is unavailable (see the module documentation), an error for any other
-/// failure to build the family's probe pipeline.
+/// API is unavailable or the families are disabled (see the module
+/// documentation; [`tensor_kernel_family_unavailable_reason`] says which),
+/// an error for any other failure to build the family's probe pipeline.
 ///
 /// The first call for a registry builds one pipeline; the answer is cached
 /// in the registry, which is bound to one device, and later calls neither
-/// compile nor allocate. `MLX_NATIVE_DISABLE_METAL_TENSOR=1` answers `false`
-/// for every family, as it selects the portable dense matmuls.
+/// compile nor allocate.
 pub fn tensor_kernel_family_available(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -165,8 +196,8 @@ pub fn tensor_kernel_family_available(
     Ok(available)
 }
 
-/// `Ok` when `family` can run on `device`, [`MlxError::Unavailable`] when the
-/// tensor API is unavailable. Every entry point of a family calls it once
+/// `Ok` when `family` can run on `device`, [`MlxError::Unavailable`] when it
+/// cannot. Every entry point of a family calls it once
 /// its arguments are valid, before it allocates or encodes anything.
 pub(crate) fn require_tensor_kernel_family(
     registry: &mut KernelRegistry,
@@ -178,7 +209,7 @@ pub(crate) fn require_tensor_kernel_family(
     } else {
         Err(MlxError::Unavailable {
             feature: family.name(),
-            reason: TENSOR_API_UNAVAILABLE,
+            reason: tensor_kernel_family_unavailable_reason(),
         })
     }
 }

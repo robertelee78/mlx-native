@@ -13,7 +13,6 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
-use super::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use super::dflash2_af4g64_staged::{
     dflash2_af4g64_staged_gate_up_partial_elements, dflash2_af4g64_staged_partial_elements,
     dispatch_dflash2_af4g64_staged, dispatch_dflash2_af4g64_staged_gate_up,
@@ -34,7 +33,8 @@ use super::quantized_matmul_id_ggml::{
 };
 use super::repacked_gguf_mm::prepare_repacked_gguf_weight;
 use super::tensor_kernels::{
-    tensor_kernel_family_available, TensorKernelFamily, TENSOR_API_UNAVAILABLE,
+    tensor_kernel_family_available, tensor_kernel_family_unavailable_reason, TensorKernelFamily,
+    TENSOR_API_UNAVAILABLE, TENSOR_KERNELS_DISABLED,
 };
 use crate::{DType, KernelRegistry, MlxBuffer, MlxDevice, MlxError};
 
@@ -57,7 +57,7 @@ fn assert_unavailable<T>(result: crate::Result<T>, family: TensorKernelFamily, l
     match result {
         Err(MlxError::Unavailable { feature, reason }) => {
             assert_eq!(feature, family.name(), "{label}");
-            assert_eq!(reason, TENSOR_API_UNAVAILABLE, "{label}");
+            assert_eq!(reason, tensor_kernel_family_unavailable_reason(), "{label}");
         }
         Err(other) => panic!("{label}: expected the typed error, got {other}"),
         Ok(_) => panic!("{label}: ran on a host without the tensor API"),
@@ -82,7 +82,7 @@ fn for_each_entry_point(
             }
             Err(MlxError::Unavailable { feature, reason }) => {
                 assert_eq!(feature, family.name(), "{label}");
-                assert_eq!(reason, TENSOR_API_UNAVAILABLE, "{label}");
+                assert_eq!(reason, tensor_kernel_family_unavailable_reason(), "{label}");
                 check(family, label, true);
             }
             Err(other) => panic!("{label}: {other}"),
@@ -293,7 +293,7 @@ fn missing_tensor_header_makes_every_family_unavailable() {
     registry
         .simulate_missing_tensor_header()
         .expect("simulate the missing header");
-    for family in TensorKernelFamily::ALL {
+    for &family in TensorKernelFamily::ALL {
         for ask in 0..2 {
             assert!(
                 !tensor_kernel_family_available(&mut registry, &device, family)
@@ -323,7 +323,7 @@ fn missing_tensor_header_makes_every_family_unavailable() {
 #[test]
 fn an_unavailable_probe_is_the_family_answer_and_its_typed_error() {
     let device = MlxDevice::new().expect("device");
-    for family in TensorKernelFamily::ALL {
+    for &family in TensorKernelFamily::ALL {
         let mut registry = KernelRegistry::new();
         registry.register_source(family.probe_kernel(), MISSING_HEADER_PROBE_SOURCE);
         assert!(
@@ -362,6 +362,10 @@ fn an_unavailable_probe_is_the_family_answer_and_its_typed_error() {
 #[test]
 fn any_other_probe_failure_is_an_error_on_a_metal4_device() {
     let device = MlxDevice::new().expect("device");
+    if tensor_kernel_family_unavailable_reason() == TENSOR_KERNELS_DISABLED {
+        eprintln!("{TENSOR_KERNELS_DISABLED}: no probe pipeline is built");
+        return;
+    }
     if !device
         .metal_device()
         .supports_family(metal::MTLGPUFamily::Metal4)
@@ -372,7 +376,7 @@ fn any_other_probe_failure_is_an_error_on_a_metal4_device() {
         );
         return;
     }
-    for family in TensorKernelFamily::ALL {
+    for &family in TensorKernelFamily::ALL {
         let mut registry = KernelRegistry::new();
         registry.register_source(family.probe_kernel(), BROKEN_PROBE_SOURCE);
         for ask in 0..2 {
@@ -398,111 +402,208 @@ fn a_changed_source_is_asked_again() {
     assert_eq!(restored, expected);
 }
 
-/// Where the tensor F16 matmul is unavailable, `dispatch_mm_v2_f16` encodes
-/// the portable F16 matmul and gives its bits.
-#[test]
-fn f16_matmul_without_the_tensor_api_is_the_portable_kernel() {
-    let device = MlxDevice::new().expect("device");
-    let (m, n, k) = (33usize, 70usize, 96usize);
-    let mut weight = buffer(&device, n * k, DType::F16);
-    for (index, value) in weight
-        .as_mut_slice::<u16>()
-        .expect("weight")
-        .iter_mut()
-        .enumerate()
-    {
-        *value = half::f16::from_f32(((index * 37 % 201) as f32 - 100.0) / 128.0).to_bits();
-    }
-    let mut input = buffer(&device, m * k, DType::F32);
-    for (index, value) in input
+/// One `dispatch_mm_v2_f16` of `m` rows: the kernel it encoded and its
+/// output. The output starts as NaN, so an unwritten element fails a bound.
+fn f16_matmul(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weight: &MlxBuffer,
+    rows: &[f32],
+    (m, n, k): (usize, usize, usize),
+) -> (String, Vec<f32>) {
+    let mut input = buffer(device, m * k, DType::F32);
+    input
         .as_mut_slice::<f32>()
         .expect("input")
-        .iter_mut()
-        .enumerate()
-    {
-        *value = ((index * 53 % 157) as f32 - 78.0) / 64.0;
-    }
-    let run = |registry: &mut KernelRegistry, portable_entry: bool| -> (String, Vec<u32>) {
-        let output = buffer(&device, m * n, DType::F32);
-        let mut encoder = device.command_encoder().expect("encoder");
-        encoder.start_encoded_dispatch_receipt(1).expect("receipt");
-        if portable_entry {
-            dense_matmul_f16_f32_tensor(
-                &mut encoder,
-                registry,
-                &device,
-                &weight,
-                &input,
-                &output,
-                &DenseMmF16F32Params {
-                    m: m as u32,
-                    n: n as u32,
-                    k: k as u32,
-                    src0_batch: 1,
-                    src1_batch: 1,
-                },
-            )
-            .expect("portable F16 matmul");
-        } else {
-            dispatch_mm_v2_f16(
-                &mut encoder,
-                registry,
-                &device,
-                &weight,
-                &input,
-                &output,
-                m as u32,
-                n as u32,
-                k as u32,
-            )
-            .expect("dispatch_mm_v2_f16");
-        }
-        let receipt = encoder.take_encoded_dispatch_receipt().expect("receipt");
-        encoder.commit_and_wait().expect("commit");
-        let kernel = receipt[0]
-            .pipeline_label
-            .split('|')
-            .next()
-            .expect("kernel")
-            .to_string();
-        let bits = output
-            .as_slice::<f32>()
-            .expect("output")
-            .iter()
-            .map(|value| value.to_bits())
-            .collect();
-        (kernel, bits)
-    };
-    let mut unavailable = KernelRegistry::new();
-    unavailable
-        .simulate_missing_tensor_header()
-        .expect("simulate the missing header");
-    let (kernel, bits) = run(&mut unavailable, false);
-    assert_eq!(kernel, "hf2q_dense_mm_f16_f32_fallback");
+        .copy_from_slice(&rows[..m * k]);
+    let mut output = buffer(device, m * n, DType::F32);
+    output.as_mut_slice::<f32>().expect("output").fill(f32::NAN);
+    let label = format!("M={m} N={n} K={k}");
+    let mut encoder = device.command_encoder().expect("encoder");
+    encoder.start_encoded_dispatch_receipt(1).expect("receipt");
+    dispatch_mm_v2_f16(
+        &mut encoder,
+        registry,
+        device,
+        weight,
+        &input,
+        &output,
+        m as u32,
+        n as u32,
+        k as u32,
+    )
+    .unwrap_or_else(|error| panic!("{label}: {error}"));
+    let receipt = encoder.take_encoded_dispatch_receipt().expect("receipt");
+    encoder
+        .commit_and_wait()
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+    let kernel = receipt[0]
+        .pipeline_label
+        .split('|')
+        .next()
+        .expect("kernel")
+        .to_string();
+    (kernel, output.as_slice::<f32>().expect("output").to_vec())
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+/// Where the tensor F16 matmul is unavailable, `dispatch_mm_v2_f16` encodes
+/// the portable F16 matmul. That route is Class B to the tensor kernel, so
+/// it is held to what the class requires rather than to the tensor bits:
+///
+/// * every element is within `2^-11 * sum(|w * x|)` of the F64 product (the
+///   kernel rounds the activation to half; one factor's rounding bounds each
+///   term);
+/// * a repeated dispatch gives the same bits;
+/// * a row's bits do not depend on the row count: the rows of a shorter
+///   batch are the leading rows of a longer one, across the 32-row tile
+///   (130, 64, 33, 32, 9, 8, 2, 1 rows);
+/// * K that is not a multiple of the 32-wide K tile, and K below one tile,
+///   are served.
+///
+/// On a device with the tensor API the tensor kernel is held to the same
+/// F64 bound and the distance between the two routes is reported.
+#[test]
+fn f16_matmul_without_the_tensor_api_is_the_portable_kernel_within_its_class() {
+    const PORTABLE: &str = "hf2q_dense_mm_f16_f32_fallback";
+    const TENSOR: &str = "hf2q_mul_mm_tensor_v2_f16";
+    /// Half rounding of one factor of every term.
+    const BOUND: f64 = 1.0 / 2048.0;
+    const ROWS: [usize; 8] = [130, 64, 33, 32, 9, 8, 2, 1];
+    // Whole tiles, partial N and K tiles, production-sized K, K below a tile.
+    const SHAPES: [(usize, usize); 7] = [
+        (64, 64),
+        (70, 96),
+        (256, 2048),
+        (128, 1000),
+        (64, 704),
+        (64, 40),
+        (64, 16),
+    ];
+
+    let device = MlxDevice::new().expect("device");
     let mut portable = KernelRegistry::new();
     portable
         .simulate_missing_tensor_header()
         .expect("simulate the missing header");
-    let (portable_kernel, portable_bits) = run(&mut portable, true);
-    assert_eq!(portable_kernel, "hf2q_dense_mm_f16_f32_fallback");
-    assert!(bits == portable_bits, "differs from the portable kernel");
+    let mut auto = KernelRegistry::new();
+    let tensor_here =
+        tensor_kernel_family_available(&mut auto, &device, TensorKernelFamily::MmV2F16)
+            .expect("ask this device");
     assert!(
-        bits.iter().any(|&word| word != 0),
-        "the product is not zero"
+        !(tensor_here && expects_no_tensor()),
+        "{}: tensor kernel",
+        device.name()
     );
 
-    // The unmodified registry encodes whichever kernel this device has.
-    let mut auto = KernelRegistry::new();
-    let (auto_kernel, auto_bits) = run(&mut auto, false);
-    if auto_kernel == "hf2q_dense_mm_f16_f32_fallback" {
-        assert!(
-            auto_bits == portable_bits,
-            "differs from the portable kernel"
-        );
-    } else {
-        assert_eq!(auto_kernel, "hf2q_mul_mm_tensor_v2_f16");
-        assert!(!expects_no_tensor(), "{}: tensor kernel", device.name());
+    let mut worst = (0.0f64, 0.0f64, 0.0f64);
+    for (n, k) in SHAPES {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((n * 131 + k) as u64);
+        let mut unit = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let mut weight = buffer(&device, n * k, DType::F16);
+        let weights: Vec<f32> = weight
+            .as_mut_slice::<u16>()
+            .expect("weight")
+            .iter_mut()
+            .map(|word| {
+                let value = half::f16::from_f32(unit() * 0.25);
+                *word = value.to_bits();
+                value.to_f32()
+            })
+            .collect();
+        let rows: Vec<f32> = (0..ROWS[0] * k).map(|_| unit()).collect();
+        // The F64 product and the magnitude each element is bounded by.
+        let reference = |row: usize, column: usize| {
+            let (mut exact, mut magnitude) = (0.0f64, 0.0f64);
+            for index in 0..k {
+                let term =
+                    f64::from(weights[column * k + index]) * f64::from(rows[row * k + index]);
+                exact += term;
+                magnitude += term.abs();
+            }
+            (exact, magnitude)
+        };
+        let error = |output: &[f32], m: usize, label: &str| {
+            let mut worst = 0.0f64;
+            for row in 0..m {
+                for column in 0..n {
+                    let (exact, magnitude) = reference(row, column);
+                    let value = f64::from(output[row * n + column]);
+                    let relative = (value - exact).abs() / magnitude;
+                    assert!(
+                        relative <= BOUND,
+                        "{label}: row {row} column {column} is {value}, the F64 product is \
+                         {exact}: {relative:e} of sum|w*x| exceeds {BOUND:e}"
+                    );
+                    worst = worst.max(relative);
+                }
+            }
+            worst
+        };
+
+        let mut longest: Option<Vec<u32>> = None;
+        for m in ROWS {
+            let label = format!("portable, M={m} N={n} K={k}");
+            let (kernel, output) = f16_matmul(&device, &mut portable, &weight, &rows, (m, n, k));
+            assert_eq!(kernel, PORTABLE, "{label}");
+            worst.0 = worst.0.max(error(&output, m, &label));
+            let (_, again) = f16_matmul(&device, &mut portable, &weight, &rows, (m, n, k));
+            assert!(
+                bits(&again) == bits(&output),
+                "{label}: a repeated dispatch differs"
+            );
+            match &longest {
+                None => longest = Some(bits(&output)),
+                Some(longest) => assert!(
+                    longest[..m * n] == bits(&output)[..],
+                    "{label}: a row's bits depend on the row count"
+                ),
+            }
+
+            // The unmodified registry: the portable kernel's bits where
+            // this device has no tensor API, the tensor kernel within the
+            // same F64 bound where it has.
+            let label = format!("this device, M={m} N={n} K={k}");
+            let (kernel, here) = f16_matmul(&device, &mut auto, &weight, &rows, (m, n, k));
+            if tensor_here {
+                assert_eq!(kernel, TENSOR, "{label}");
+                worst.1 = worst.1.max(error(&here, m, &label));
+                let (mut difference, mut scale) = (0.0f64, 0.0f64);
+                for (index, (tensor, portable)) in here.iter().zip(&output).enumerate() {
+                    difference += (f64::from(*tensor) - f64::from(*portable)).powi(2);
+                    scale += reference(index / n, index % n).0.powi(2);
+                }
+                worst.2 = worst.2.max((difference / scale).sqrt());
+            } else {
+                assert_eq!(kernel, PORTABLE, "{label}");
+                assert!(
+                    bits(&here) == bits(&output),
+                    "{label}: differs from the portable kernel"
+                );
+            }
+        }
     }
+    eprintln!(
+        "{}: F16 matmul, worst error over sum|w*x|: portable {:.3e}{}",
+        device.name(),
+        worst.0,
+        if tensor_here {
+            format!(
+                ", tensor {:.3e}; relative RMS between the routes {:.3e}",
+                worst.1, worst.2
+            )
+        } else {
+            String::new()
+        }
+    );
 }
 
 #[test]
@@ -510,11 +611,23 @@ fn every_family_answers_on_this_device() {
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
     let mut available = 0;
-    for family in TensorKernelFamily::ALL {
+    for &family in TensorKernelFamily::ALL {
         let answer = tensor_kernel_family_available(&mut registry, &device, family)
             .unwrap_or_else(|error| panic!("{family:?}: {error}"));
         available += usize::from(answer);
     }
+    // The reason names the disabling variable only when it is set, and then
+    // no family is available.
+    let disabled = std::env::var("MLX_NATIVE_DISABLE_METAL_TENSOR").as_deref() == Ok("1");
+    assert_eq!(
+        tensor_kernel_family_unavailable_reason(),
+        if disabled {
+            TENSOR_KERNELS_DISABLED
+        } else {
+            TENSOR_API_UNAVAILABLE
+        }
+    );
+    assert!(!disabled || available == 0, "disabled families answered");
     let families = TensorKernelFamily::ALL.len();
     let expected = if expects_no_tensor() {
         available == 0

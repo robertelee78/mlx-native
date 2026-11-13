@@ -221,7 +221,8 @@ pub use ops::quantized_matmul_ggml::{
     GgmlQuantizedMatmulPerm021Params, GgmlType, MM_ROUTING_THRESHOLD,
 };
 pub use ops::tensor_kernels::{
-    tensor_kernel_family_available, TensorKernelFamily, TENSOR_API_UNAVAILABLE,
+    tensor_kernel_family_available, tensor_kernel_family_unavailable_reason, TensorKernelFamily,
+    TENSOR_API_UNAVAILABLE, TENSOR_KERNELS_DISABLED,
 };
 pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
