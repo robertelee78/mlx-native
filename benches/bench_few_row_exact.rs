@@ -1,17 +1,22 @@
-//! Cost of the width-exact Q5_K `mul_mv_ext` accumulation (explicit fma
-//! lanes) against the implicit `dot + dot + dot + dot` form it replaced.
+//! Cost of the width-exact few-row accumulations (explicit fma graph)
+//! against the implicit fast-math sums they replaced:
 //!
-//! One process, three registries whose `mul_mv_ext.metal` kernels compile
+//! * `--codec q5_K`: `kernel_mul_mv_ext_q5_K_f32_r1_*`, shader
+//!   `mul_mv_ext.metal`;
+//! * `--codec q6_K`: `kernel_mul_mv_q6_K_f32_nr2` (one row) and
+//!   `kernel_mul_mv_q6_K_f32_mN_r1_*` (2 to 8 rows), shader
+//!   `quantized_matmul_ggml.metal`.
+//!
+//! One process, three registries whose kernels of that shader file compile
 //! from runtime source with identical options: `base` (a baseline copy of
 //! the shader file given on the command line), `exact` (the shipped source)
 //! and `exact_b` (the shipped source again, the A/A control). Samples
 //! alternate in a rotating order, each right behind a filler command buffer
-//! of six repeats of the same product, over a ring of distinct weights with
-//! real-file block scales.
+//! of six repeats of the same product, over a ring of distinct weights.
 //!
 //! ```text
-//! git show <baseline-rev>:src/shaders/mul_mv_ext.metal > /tmp/mul_mv_ext.base.metal
-//! bench_q5k_mv_ext_width_exact --baseline-shader /tmp/mul_mv_ext.base.metal [--repeat 60] [--json PATH]
+//! git show <baseline-rev>:src/shaders/<file>.metal > /tmp/base.metal
+//! bench_few_row_exact --codec q5_K|q6_K --baseline-shader /tmp/base.metal [--repeat 60] [--json PATH]
 //! ```
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
@@ -28,7 +33,8 @@ type R<T> = Result<T, Box<dyn std::error::Error>>;
 const FILLER: usize = 6;
 const WARMUP: usize = 3;
 const VARIANTS: [&str; 3] = ["base", "exact", "exact_b"];
-const SHIPPED: &str = include_str!("../src/shaders/mul_mv_ext.metal");
+const MUL_MV_EXT: &str = include_str!("../src/shaders/mul_mv_ext.metal");
+const GGML_MV: &str = include_str!("../src/shaders/quantized_matmul_ggml.metal");
 
 /// Every kernel entry point a shader file defines.
 fn kernel_names(source: &str) -> Vec<String> {
@@ -51,11 +57,12 @@ fn kernel_names(source: &str) -> Vec<String> {
 /// The shader text each variant compiles.
 static SOURCES: OnceLock<Vec<String>> = OnceLock::new();
 
-/// A registry whose `mul_mv_ext` kernels compile from the variant's source.
-fn registry(variant: usize) -> KernelRegistry {
+/// A registry whose kernels of the shader file compile from the variant's
+/// source.
+fn registry(variant: usize, shipped: &str) -> KernelRegistry {
     let mut registry = KernelRegistry::new();
     let text: &'static str = SOURCES.get().expect("sources")[variant].as_str();
-    for name in kernel_names(SHIPPED) {
+    for name in kernel_names(shipped) {
         registry.register_source(name, text);
     }
     registry
@@ -87,20 +94,20 @@ fn weight(
     let block = ggml_type.block_bytes() as usize;
     let bytes = rows * k / ggml_type.block_values() as usize * block;
     let mut buffer = dev.alloc_buffer(bytes, DType::U8, vec![bytes])?;
-    let (low, high) = if ggml_type == GgmlType::Q4_0 {
-        (6.0e-5, 9.0e-4)
-    } else {
-        (2.0e-5f64, 3.0e-4f64)
-    };
+    // Block scales in the range real model files carry; the F16 scale sits
+    // at the head of a Q5_K block and at the tail of a Q6_K block.
+    let (low, high) = (2.0e-5f64, 3.0e-4f64);
     for block in buffer.as_mut_slice::<u8>()?.chunks_exact_mut(block) {
         for chunk in block.chunks_mut(8) {
             let word = rng.next().to_le_bytes();
             chunk.copy_from_slice(&word[..chunk.len()]);
         }
         let d = f16::from_f64(low * (high / low).powf(rng.unit()));
-        block[..2].copy_from_slice(&d.to_bits().to_le_bytes());
-        if ggml_type != GgmlType::Q4_0 {
+        if ggml_type == GgmlType::Q6_K {
+            block[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+        } else {
             let dmin = f16::from_f64(d.to_f64() * (5.0 + 5.0 * rng.unit()));
+            block[..2].copy_from_slice(&d.to_bits().to_le_bytes());
             block[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
         }
     }
@@ -213,23 +220,47 @@ fn main() -> R<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    let codec = arg("--codec").ok_or("--codec q5_K|q6_K is required")?;
+    // (codec, shipped shader, label, [(shape, N, K, ring)])
+    let (ggml_type, shipped, label, shapes): (_, _, _, &[(&str, usize, usize, usize)]) =
+        match codec.as_str() {
+            "q5_K" => (
+                GgmlType::Q5_K,
+                MUL_MV_EXT,
+                "mul_mv_ext q5_K",
+                &[("17408x5120", 17408, 5120, 4), ("8192x2048", 8192, 2048, 4)],
+            ),
+            "q6_K" => (
+                GgmlType::Q6_K,
+                GGML_MV,
+                "mv_nr2/mN q6_K",
+                &[
+                    ("262144x2816", 262_144, 2816, 2),
+                    ("248320x5120", 248_320, 5120, 2),
+                    ("2048x2816", 2048, 2816, 4),
+                ],
+            ),
+            other => return Err(format!("unknown codec {other}").into()),
+        };
     let baseline = std::fs::read_to_string(
         arg("--baseline-shader").ok_or("--baseline-shader PATH is required")?,
     )?;
     assert_ne!(
-        baseline, SHIPPED,
+        baseline, shipped,
         "the baseline shader equals the shipped one"
     );
     // A distinct trailing comment makes every variant a runtime-source
     // override, so none of them resolves from the embedded metallib.
-    let sources = [baseline.as_str(), SHIPPED, SHIPPED]
+    let sources = [baseline.as_str(), shipped, shipped]
         .iter()
         .zip(VARIANTS)
         .map(|(text, variant)| format!("{text}\n// bench variant: {variant}\n"))
         .collect();
     SOURCES.set(sources).map_err(|_| "sources set twice")?;
     let mut bench = Bench {
-        registries: (0..VARIANTS.len()).map(registry).collect(),
+        registries: (0..VARIANTS.len())
+            .map(|variant| registry(variant, shipped))
+            .collect(),
         repeat: arg("--repeat").and_then(|v| v.parse().ok()).unwrap_or(60),
         only: arg("--only"),
         records: Vec::new(),
@@ -237,18 +268,13 @@ fn main() -> R<()> {
     let dev = MlxDevice::new()?;
     let mut rng = Rng(0x5ca1_e16);
     let policy = GgmlRoutingPolicy::default();
-    const RING: usize = 4;
-    for (shape, n, k) in [
-        ("17408x5120", 17408usize, 5120usize),
-        ("8192x2048", 8192, 2048),
-    ] {
-        let ggml_type = GgmlType::Q5_K;
-        let weights = (0..RING)
+    for &(shape, n, k, ring) in shapes {
+        let weights = (0..ring)
             .map(|_| weight(&dev, ggml_type, n, k, &mut rng))
             .collect::<R<Vec<_>>>()?;
         let input = activations(&dev, 8, k, &mut rng)?;
         let output = dev.alloc_buffer(8 * n * 4, DType::F32, vec![8, n])?;
-        for m in [1u32, 2, 3, 4, 5, 8] {
+        for m in 1u32..=8 {
             let params = GgmlQuantizedMatmulParams {
                 m,
                 n: n as u32,
@@ -258,8 +284,8 @@ fn main() -> R<()> {
             let view = input.slice_view(0, m as usize * k);
             bench.cell(
                 &dev,
-                &format!("mul_mv_ext q5_K {shape} rows={m}"),
-                RING,
+                &format!("{label} {shape} rows={m}"),
+                ring,
                 |encoder, registry, dev, at| {
                     Ok(quantized_matmul_ggml_with_policy(
                         encoder,
