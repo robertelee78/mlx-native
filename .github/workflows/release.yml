@@ -21,7 +21,8 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: macos-14
+    # Match CI: the macos-14 hosted configuration cannot acquire a runner.
+    runs-on: macos-15
     timeout-minutes: 150
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
