@@ -137,6 +137,12 @@ CFString, and autorelease-pool populations across repeated labeled sync and
 async waves.
 See [the command-buffer lifetime note](https://github.com/robertelee78/mlx-native/blob/main/docs/command-buffer-autorelease-lifetime-2026-08-08.md).
 
+Residency commits, background residency requests, and final set teardown also
+scope their temporary Objective-C owners. File mappings remain owned by the
+Metal no-copy resource through raw handles, recorded bindings, and retained GPU
+commands; retiring residency does not release a still-owned mapping. Consumers
+do not need an ambient autorelease pool around loading or teardown.
+
 ## GPU operations
 
 ### Attention

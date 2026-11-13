@@ -1,7 +1,7 @@
-//! Escrow-backed lifetime witnesses. These allocate at most two host pages of
-//! file-backed Metal storage; they never encode/submit GPU work or read payload.
-//! Before the fix, raw-owner tests deliberately fail while escrow keeps every
-//! no-copy address valid, including during assertion unwinding.
+//! Escrow-backed lifetime witnesses over at most two host pages of file-backed
+//! Metal storage. Raw-owner tests do not submit work; commit/reclaim tests use
+//! the public submission path and a bounded GPU blit on pool-less Rust threads.
+//! Escrow keeps no-copy addresses valid even during assertion unwinding.
 
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
@@ -312,4 +312,96 @@ fn constructor_unwind_disposes_capture_without_metal_or_payload_access() {
     assert_eq!(Arc::strong_count(&escrow), 1);
     drop(escrow);
     assert!(weak.upgrade().is_none());
+}
+
+fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
+    // Deliberately no outer autoreleasepool: a consumer's Rust loading/worker
+    // thread is not required to install one around native API calls.
+    std::thread::spawn(move || {
+        let fixture = Fixture::new();
+        let escrow = fixture.mapping();
+        let weak = Arc::downgrade(&escrow);
+        let loading_device = device(mode);
+        let set = loading_device.residency_set().cloned();
+        let buffer = mapped(&loading_device, &escrow);
+        let binding = RecordedBinding::Buffer {
+            metal_buffer: buffer.metal_buffer().clone(),
+            offset: buffer.byte_offset(),
+        };
+
+        // This device has never encoded a resource. Exactly one empty public
+        // commit publishes the mapped allocation's pending residency membership.
+        let mut loading_encoder = loading_device.command_encoder().unwrap();
+        loading_encoder.commit_and_wait().unwrap();
+        drop(loading_encoder);
+        drop(loading_device);
+
+        if gpu_read {
+            let consumer = device(mode);
+            let output = consumer
+                .alloc_buffer(LOGICAL_BYTES, DType::U8, vec![LOGICAL_BYTES])
+                .unwrap();
+            let mut encoder = consumer.command_encoder().unwrap();
+            encoder
+                .blit_copy_bytes(&buffer, 0, &output, 0, LOGICAL_BYTES as u64)
+                .unwrap();
+            // Metal's retained command owns the mapping independently of its
+            // logical wrapper; RecordedBinding is another independent owner.
+            drop(buffer);
+            if let Some(set) = &set {
+                set.flush_pending();
+            }
+            assert!(Arc::strong_count(&escrow) > 1);
+            encoder.commit_and_wait().unwrap();
+            assert!(
+                output.as_logical_slice::<u8>().unwrap().iter().all(|&b| b == 0),
+                "the private, zero-initialized file must survive the GPU read"
+            );
+            drop(encoder);
+            drop(output);
+            drop(consumer);
+        } else {
+            drop(buffer);
+        }
+
+        // Keep the set alive for a deterministic removal boundary even if its
+        // heartbeat is concurrently borrowing it. This retires committed
+        // membership, not the independent raw Metal owner below.
+        if let Some(set) = &set {
+            set.flush_pending();
+        }
+        assert!(
+            Arc::strong_count(&escrow) > 1,
+            "recorded Metal owner must still retain its no-copy backing"
+        );
+        drop(binding);
+        assert_eq!(
+            Arc::strong_count(&escrow),
+            1,
+            "completed commits and retired residency must not keep mapped backing"
+        );
+        drop(set);
+        drop(escrow);
+        assert!(weak.upgrade().is_none());
+    })
+    .join()
+    .expect("pool-less consumer commit/drop/reclaim witness");
+}
+
+#[test]
+fn empty_loading_commit_then_drop_reclaims_mapping_without_ambient_pool() {
+    for mode in [ResidencyMode::Disabled, ResidencyMode::Default] {
+        commit_drop_reclaim_witness(mode, false);
+    }
+}
+
+#[test]
+fn loading_commit_then_gpu_read_and_drop_reclaims_mapping_without_ambient_pool() {
+    assert!(
+        !crate::command_buffer_uses_unretained_references(),
+        "this lifetime witness requires Metal's default retained command owners"
+    );
+    for mode in [ResidencyMode::Disabled, ResidencyMode::Default] {
+        commit_drop_reclaim_witness(mode, true);
+    }
 }

@@ -60,11 +60,11 @@ impl Drop for ResidencySetInner {
         };
 
         if let Ok(_guard) = lock.lock() {
-            unsafe {
+            objc::rc::autoreleasepool(|| unsafe {
                 let _: () = msg_send![object.ptr, removeAllAllocations];
                 let _: () = msg_send![object.ptr, commit];
                 let _: () = msg_send![object.ptr, release];
-            }
+            });
         }
     }
 }
@@ -221,8 +221,8 @@ impl ResidencySet {
     /// `MlxBufferPool::alloc_batch`, `MlxBufferPool::clear`). Also clears
     /// the pending flag so a subsequent `flush_pending` is a no-op.
     pub(crate) fn commit(&self) {
-        self.with_active_set(|set, pending| unsafe {
-            let _: () = msg_send![set, commit];
+        self.with_active_set(|set, pending| {
+            commit_set(set);
             TEST_COMMIT_CALL_COUNT.fetch_add(1, Ordering::AcqRel);
             pending.store(false, Ordering::Release);
         });
@@ -247,9 +247,7 @@ impl ResidencySet {
             // `add_allocation` / `remove_allocation`, so this is belt-and-
             // braces against future lock-free callers.
             if pending.swap(false, Ordering::AcqRel) {
-                unsafe {
-                    let _: () = msg_send![set, commit];
-                }
+                commit_set(set);
                 TEST_COMMIT_CALL_COUNT.fetch_add(1, Ordering::AcqRel);
                 committed = true;
             }
@@ -279,6 +277,15 @@ impl ResidencySet {
             f(object.ptr, pending);
         }
     }
+}
+
+/// Retire temporary Metal allocation snapshots on pool-less Rust threads.
+/// Resource-owned deallocator captures and command-buffer retains survive
+/// this boundary until their actual Metal owners release them.
+fn commit_set(set: *mut Object) {
+    objc::rc::autoreleasepool(|| unsafe {
+        let _: () = msg_send![set, commit];
+    });
 }
 
 const RESIDENCY_HEARTBEAT_INTERVAL_MS: u64 = 5;
@@ -333,9 +340,9 @@ fn spawn_residency_heartbeat(inner: &Arc<ResidencySetInner>) {
                 continue;
             }
             if let Ok(_guard) = lock.lock() {
-                unsafe {
+                objc::rc::autoreleasepool(|| unsafe {
                     let _: () = msg_send![object.ptr, requestResidency];
-                }
+                });
             };
         });
 }
