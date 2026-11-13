@@ -183,7 +183,10 @@ void dequantize_iq4_nl_t4(device const block_iq4_nl * xb, short il, thread type4
 template <typename type4>
 void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
-    const float d1 = (il/4) ? (xb->d / 16.h) : xb->d;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d1 = (il/4) ? (float(xb->d) / 16.f) : float(xb->d);
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
     const ushort mask0 = (il/4) ? 0x00F0 : 0x000F;
@@ -223,7 +226,10 @@ void dequantize_q4_K_t4x4(device const block_q4_K * xb, short il, thread type4x4
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2_v(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
     const float min = xb->dmin;
     const float dl  = d * sc[0];
     const float ml  = min * sc[1];
@@ -245,7 +251,10 @@ void dequantize_q5_K_t4x4(device const block_q5_K * xb, short il, thread type4x4
     uint8_t ul = 1 << (il/2);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2_v(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
     const float min = xb->dmin;
     const float dl  = d * sc[0];
     const float ml  = min * sc[1];

@@ -166,7 +166,10 @@ constant int8_t kvalues_iq4nl[16] = {
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d1 = il ? (float(xb->d) / 16.f) : float(xb->d);
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
@@ -361,7 +364,10 @@ void dequantize_q5_K(device const block_q5_K * xb, short il, thread type4x4 & re
     uint8_t ul = 1 << (il/2);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
     const float min = xb->dmin;
     const float dl  = d * sc[0];
     const float ml  = min * sc[1];
@@ -385,7 +391,10 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // The scale is widened before the division: |d| / 16 is a subnormal half
+    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
+    // model files carry (nearly every Q4_K / Q5_K block).
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
     const float min = xb->dmin;
     const float dl  = d * sc[0];
     const float ml  = min * sc[1];
