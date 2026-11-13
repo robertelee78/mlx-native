@@ -262,7 +262,11 @@ void dequantize_q5_K_t4x4(device const block_q5_K * xb, short il, thread type4x4
     const ushort mask  = il < 2 ? 0x0F : 0xF0;
     const float qh_val = il < 2 ? 16.f : 256.f;
     for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
+        // One fused operation per weight, written out: the Q5_K kernels are
+        // bit-equal across decode widths by construction (see
+        // hf2q_mv_ext_fused_step below), not by how each instantiation's
+        // `a * b - c` happens to be contracted.
+        reg[i/4][i%4] = fma(dl, float((q[i] & mask) + (qh[i] & ul ? qh_val : 0)), -ml);
     }
 }
 
@@ -557,8 +561,36 @@ kernel void hf2q_mul_mv_ext_q4_f32_impl<5, block_q8_0, 8, dequantize_q8_0_t4>(
 // chpb = QK_K/16 = 16. Otherwise structurally identical to the q4 variant
 // above — same FC dispatch, same r1ptg parallelization, same simdgroup reduction.
 
+// Width-exact accumulation (Q5_K). Every activation row keeps four F32 lane
+// accumulators that advance by one explicit fma per weight column of a
+// chunk, in a fixed order, and are reduced once at the end in a fixed
+// order. Contraction and reassociation are switched off inside the two
+// helpers, so the operation graph of a row is exactly what is written and
+// is the same in every `r1ptg` instantiation: a row's bits do not depend on
+// the decode width, on which row of the threadgroup it is, or on how the
+// compiler would contract and order an implicit `dot + dot + dot + dot`
+// (which differed for one instantiation under shader validation).
+static inline float4 hf2q_mv_ext_fused_step(float4x4 w, float4x4 y, float4 acc) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    acc = fma(w[0], y[0], acc);
+    acc = fma(w[1], y[1], acc);
+    acc = fma(w[2], y[2], acc);
+    acc = fma(w[3], y[3], acc);
+    return acc;
+}
+
+static inline float hf2q_mv_ext_fused_reduce(float4 acc) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const float lo = acc.x + acc.y;
+    const float hi = acc.z + acc.w;
+    return lo + hi;
+}
+
 template <short r1ptg, typename q_t, short chpb,
-          void (*deq_t4x4)(device const q_t *, short, thread float4x4 &)>
+          void (*deq_t4x4)(device const q_t *, short, thread float4x4 &),
+          bool width_exact = false>
 kernel void hf2q_mul_mv_ext_q4x4_f32_impl(
         constant hf2q_mul_mv_ext_args & args   [[buffer(0)]],
         device const char * src0               [[buffer(1)]],
@@ -599,6 +631,7 @@ kernel void hf2q_mul_mv_ext_q4x4_f32_impl(
     }
 
     float sumf[r1ptg] = { 0.0f };
+    float4 sum4[r1ptg] = { float4(0.0f) };
 
     short cch = tx % chpb;
 
@@ -620,17 +653,27 @@ kernel void hf2q_mul_mv_ext_q4x4_f32_impl(
         for (short ch = 0; ch < chpt; ++ch) {
 #pragma unroll(r1ptg)
             for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-                sumf[ir1] +=
-                    dot(lx[ch][0], y4x4[ir1][ch*nxpsg][0]) +
-                    dot(lx[ch][1], y4x4[ir1][ch*nxpsg][1]) +
-                    dot(lx[ch][2], y4x4[ir1][ch*nxpsg][2]) +
-                    dot(lx[ch][3], y4x4[ir1][ch*nxpsg][3]);
+                if (width_exact) {
+                    sum4[ir1] = hf2q_mv_ext_fused_step(lx[ch], y4x4[ir1][ch*nxpsg], sum4[ir1]);
+                } else {
+                    sumf[ir1] +=
+                        dot(lx[ch][0], y4x4[ir1][ch*nxpsg][0]) +
+                        dot(lx[ch][1], y4x4[ir1][ch*nxpsg][1]) +
+                        dot(lx[ch][2], y4x4[ir1][ch*nxpsg][2]) +
+                        dot(lx[ch][3], y4x4[ir1][ch*nxpsg][3]);
+                }
             }
         }
 
 #pragma unroll(r1ptg)
         for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
             y4x4[ir1] += chpt*nxpsg;
+        }
+    }
+
+    if (width_exact) {
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            sumf[ir1] = hf2q_mv_ext_fused_reduce(sum4[ir1]);
         }
     }
 
@@ -682,27 +725,27 @@ kernel void hf2q_mul_mv_ext_q4x4_f32_impl<5, block_q4_K, 16, dequantize_q4_K_t4x
 // --- Q5_K mv_ext (K-quant, q4x4 variant) ---
 
 template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_1")]]
-kernel void hf2q_mul_mv_ext_q4x4_f32_impl<1, block_q5_K, 16, dequantize_q5_K_t4x4>(
+kernel void hf2q_mul_mv_ext_q4x4_f32_impl<1, block_q5_K, 16, dequantize_q5_K_t4x4, true>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
     device char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_2")]]
-kernel void hf2q_mul_mv_ext_q4x4_f32_impl<2, block_q5_K, 16, dequantize_q5_K_t4x4>(
+kernel void hf2q_mul_mv_ext_q4x4_f32_impl<2, block_q5_K, 16, dequantize_q5_K_t4x4, true>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
     device char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_3")]]
-kernel void hf2q_mul_mv_ext_q4x4_f32_impl<3, block_q5_K, 16, dequantize_q5_K_t4x4>(
+kernel void hf2q_mul_mv_ext_q4x4_f32_impl<3, block_q5_K, 16, dequantize_q5_K_t4x4, true>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
     device char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_4")]]
-kernel void hf2q_mul_mv_ext_q4x4_f32_impl<4, block_q5_K, 16, dequantize_q5_K_t4x4>(
+kernel void hf2q_mul_mv_ext_q4x4_f32_impl<4, block_q5_K, 16, dequantize_q5_K_t4x4, true>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
     device char *, uint3, ushort, ushort);
 
 template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_5")]]
-kernel void hf2q_mul_mv_ext_q4x4_f32_impl<5, block_q5_K, 16, dequantize_q5_K_t4x4>(
+kernel void hf2q_mul_mv_ext_q4x4_f32_impl<5, block_q5_K, 16, dequantize_q5_K_t4x4, true>(
     constant hf2q_mul_mv_ext_args &, device const char *, device const char *,
     device char *, uint3, ushort, ushort);
 
