@@ -141,6 +141,8 @@ Command submission also scopes Metal's temporary residency-snapshot ownership,
 including empty loading-device commits. File mappings remain owned by the Metal
 no-copy resource through raw handles, recorded bindings, and retained GPU commands.
 Consumers do not need an ambient autorelease pool around submission.
+Final residency-set retirement scopes its temporary owners as well, draining
+after releasing the residency mutex.
 
 ## GPU operations
 

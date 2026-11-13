@@ -61,13 +61,17 @@ impl Drop for ResidencySetInner {
             return;
         };
 
-        if let Ok(_guard) = lock.lock() {
-            unsafe {
-                let _: () = msg_send![object.ptr, removeAllAllocations];
-                let _: () = msg_send![object.ptr, commit];
-                let _: () = msg_send![object.ptr, release];
+        // Final retirement can emit autoreleased allocation owners just like
+        // command submission. Drain after the native lock guard is released.
+        objc::rc::autoreleasepool(|| {
+            if let Ok(_guard) = lock.lock() {
+                unsafe {
+                    let _: () = msg_send![object.ptr, removeAllAllocations];
+                    let _: () = msg_send![object.ptr, commit];
+                    let _: () = msg_send![object.ptr, release];
+                }
             }
-        }
+        });
         #[cfg(test)]
         if let Self::Active {
             drop_notification, ..

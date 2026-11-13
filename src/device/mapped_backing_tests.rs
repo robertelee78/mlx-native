@@ -319,12 +319,14 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
     // thread is not required to install one around native API calls.
     std::thread::spawn(move || {
         let fixture = Fixture::new();
+        let expected: [u8; LOGICAL_BYTES] = std::array::from_fn(|i| (i % 251) as u8);
+        std::os::unix::fs::FileExt::write_all_at(&fixture.file, &expected, OFFSET as u64)
+            .expect("initialize private mapped GPU sentinel");
         let escrow = fixture.mapping();
         let weak = Arc::downgrade(&escrow);
         let loading_device = device(mode);
-        let set = loading_device.residency_set().cloned();
-        let set_dropped = set
-            .as_ref()
+        let set_dropped = loading_device
+            .residency_set()
             .and_then(|set| set.drop_notification_for_test());
         let buffer = mapped(&loading_device, &escrow);
         let binding = RecordedBinding::Buffer {
@@ -351,14 +353,12 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
             // Metal's retained command owns the mapping independently of its
             // logical wrapper; RecordedBinding is another independent owner.
             drop(buffer);
-            if let Some(set) = &set {
-                set.flush_pending();
-            }
             assert!(Arc::strong_count(&escrow) > 1);
             encoder.commit_and_wait().unwrap();
-            assert!(
-                output.as_logical_slice::<u8>().unwrap().iter().all(|&b| b == 0),
-                "the private, zero-initialized file must survive the GPU read"
+            assert_eq!(
+                output.as_logical_slice::<u8>().unwrap(),
+                expected,
+                "the private file must survive the GPU read"
             );
             drop(encoder);
             drop(output);
@@ -367,18 +367,13 @@ fn commit_drop_reclaim_witness(mode: ResidencyMode, gpu_read: bool) {
             drop(buffer);
         }
 
-        // Keep the set alive for a deterministic removal boundary even if its
-        // heartbeat is concurrently borrowing it. This retires committed
-        // membership, not the independent raw Metal owner below.
-        if let Some(set) = &set {
-            set.flush_pending();
-        }
+        // No explicit residency owner or removal flush: the final buffer
+        // storage must retire its own set after the loading device has gone.
         assert!(
             Arc::strong_count(&escrow) > 1,
             "recorded Metal owner must still retain its no-copy backing"
         );
         drop(binding);
-        drop(set);
         if let Some(set_dropped) = set_dropped {
             // An event, not a sleep/RSS plateau: the heartbeat can briefly
             // borrow the last set Arc. Require that owner's actual teardown.
