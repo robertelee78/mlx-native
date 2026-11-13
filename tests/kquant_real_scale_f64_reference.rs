@@ -19,10 +19,14 @@
 //! blocks: evaluated in F16 the quotient is a subnormal with an absolute
 //! step of 2^-24 and a relative error of 4e-3 to 1e-2 RMS. The fixture
 //! draws `|d|` log-uniformly from [2e-5, 3e-4] (the census range) for the
-//! K-quants. No Q4_0 file was in the census; Q4_0 has the same expression,
-//! live when `|d| < 2^-10`, and the fixture draws its `|d|` log-uniformly
-//! from [6e-5, 9e-4]. `dmin` (not in the census) is `d` times a uniform
-//! factor in [5, 10): a 4-bit code's offset is about half its range.
+//! K-quants. Q4_0 has the same expression, live when `|d| < 2^-10`, but its
+//! scale is the block maximum over 7 or 8, sixty times a K-quant's: eight
+//! Q4_K tensors of two of those files re-encoded as Q4_0 give `|d|` of
+//! 3.4e-3 to 1.5e-2 (p10 to p90) with 0% to 0.07% of blocks below 2^-10.
+//! The Q4_0 fixture therefore draws `|d|` log-uniformly from [6e-5, 9e-4]:
+//! not the common case, but the blocks on which the Q4_0 sites misbehave
+//! (small-magnitude rows). `dmin` (not in the census) is `d` times a
+//! uniform factor in [5, 10): a 4-bit code's offset is about half its range.
 //!
 //! Gates, per kernel family and codec (each prints one `REALSCALE` line):
 //!
