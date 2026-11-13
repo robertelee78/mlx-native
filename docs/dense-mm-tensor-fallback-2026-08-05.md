@@ -57,3 +57,60 @@ On the M5 Max, both routes were exercised from separate test processes:
 
 The hosted M1 result and exact packaged-crate digest are release gates and are
 recorded in the release evidence after the source commit is created.
+
+## 2026-11-12: a device outside the Metal 4 GPU family
+
+### Problem
+
+Since 0.10.16 every tensor probe (dense F32/BF16/F16 matmul, quantized
+`mul_mm`, expert `mul_mm_id`, tensor flash attention, the tiled verify
+attention) treated exactly one failure as "tensor API unavailable": the
+runtime compiler's missing `<metal_tensor>` header. Any other failure of the
+probe pipeline was returned as the error of the dispatch that asked.
+
+The GitHub-hosted `macos-26` runner (macOS 26.7.2, Xcode 26.6, "Apple
+Paravirtual device") has the header and cannot build a tensor pipeline. Each
+stage was run on it (scratch branch `diag/ci835-macos26-probe`, run
+43347804223):
+
+| stage | `macos-15` (15.8.2, Xcode 16.4) | `macos-26` (26.7.2, Xcode 26.6) | M5 Max |
+|---|---|---|---|
+| `supportsFamily(Metal4)` | false | false | true |
+| source compile of the tensor shader | `fatal error: 'metal_tensor' file not found` | ok | ok |
+| function specialisation | n/a | ok | ok |
+| pipeline creation | n/a | `error: unsupported deferred-static-alloca-size function body in ...metal18cooperative_tensor...MTL_SIZEAS` | ok |
+| default-policy quantized matmul at 9, 32, 33, 64 rows (Q4_0, Q4_K) | simdgroup kernel | error of the probe pipeline `kernel_mul_mm_q4_0_tensor_f32` at every row count | tensor kernel |
+| the same with `GgmlTensorMmPreference::ForceSimd` | ok | ok | ok |
+
+The probe runs before any route is chosen, so the failure does not depend on
+the shape, the row count or the weight's type: on that device no dense
+quantized matmul of more than eight rows could be encoded under the default
+policy, and the other tensor probes failed the same way.
+
+### Decision
+
+The tensor API belongs to the Metal 4 GPU family, and the reference
+implementation asks the device for that family before it tries a tensor
+kernel (`docs/peer-benchmarks.md`). A failed tensor pipeline build now means
+"unavailable" in two cases (`dense_mm_capability::is_unavailable_tensor_api`):
+
+- the missing `<metal_tensor>` header, on any device, as before;
+- any pipeline build failure on a device that does not support
+  `MTLGPUFamilyMetal4`.
+
+On a device that supports Metal 4 every other failure still propagates
+without being cached, so a shader or toolchain regression on the hardware the
+tensor kernels are tuned for stays fatal. The family is consulted only after a
+build failed: a device outside the family whose tensor pipeline does build
+keeps the tensor route.
+
+### Gates
+
+- `ops::dense_mm_capability` pins the classifier with the hosted diagnostic.
+- `ops::quantized_mm_tensor_unavailable_tests` pins the quantized matmul
+  route: with the tensor probe unavailable, Q4_0, Q8_0, Q4_K, Q5_K and Q6_K at
+  9, 32, 33, 64 and 130 rows each encode the simdgroup kernel of their type
+  and give the bits of the policy that forces it.
+- CI job `rust-metal-no-metal4-device` runs both and the dense fallback tests
+  on the hosted `macos-26` device, where the unmodified registry must take the
+  simdgroup route (`MLX_DENSE_MM_TEST_EXPECT_NO_TENSOR=1`).

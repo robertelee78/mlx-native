@@ -3,7 +3,7 @@
 use half::{bf16, f16};
 
 use super::dense_mm_bf16::{dense_matmul_bf16_f32_with_backend, DenseMmBf16F32Params};
-use super::dense_mm_capability::{is_unavailable_tensor_header, DenseMmBackend};
+use super::dense_mm_capability::{is_unavailable_tensor_api, DenseMmBackend};
 use super::dense_mm_f16::{dense_matmul_f16_f32_with_backend, DenseMmF16F32Params};
 use super::dense_mm_f32_f32::{dense_matmul_f32_f32_with_backend, DenseMmF32F32Params};
 use crate::{DType, KernelRegistry, MlxDevice};
@@ -107,7 +107,7 @@ fn assert_short_bf16_backend_matches_cpu(k: u32, backend: DenseMmBackend) {
         backend,
     ) {
         assert!(
-            backend == DenseMmBackend::TensorRequired && is_unavailable_tensor_header(&error),
+            backend == DenseMmBackend::TensorRequired && is_unavailable_tensor_api(&device, &error),
             "short-K {backend:?} dispatch failed: {error}"
         );
         return;
@@ -203,7 +203,7 @@ fn bf16_tensor_and_tiled_fallback_preserve_numerical_contract() {
         &params,
         DenseMmBackend::TensorRequired,
     ) {
-        assert!(is_unavailable_tensor_header(&error), "{error}");
+        assert!(is_unavailable_tensor_api(&device, &error), "{error}");
         return;
     }
     tensor_encoder.commit_and_wait().expect("tensor completion");
@@ -283,7 +283,7 @@ fn f16_tensor_and_tiled_fallback_preserve_numerical_contract() {
         &params,
         DenseMmBackend::TensorRequired,
     ) {
-        assert!(is_unavailable_tensor_header(&error), "{error}");
+        assert!(is_unavailable_tensor_api(&device, &error), "{error}");
         return;
     }
     tensor_encoder.commit_and_wait().expect("tensor completion");
@@ -359,7 +359,7 @@ fn f32_tensor_and_tiled_fallback_preserve_numerical_contract() {
         &params,
         DenseMmBackend::TensorRequired,
     ) {
-        assert!(is_unavailable_tensor_header(&error), "{error}");
+        assert!(is_unavailable_tensor_api(&device, &error), "{error}");
         return;
     }
     tensor_encoder.commit_and_wait().expect("tensor completion");
@@ -425,7 +425,7 @@ fn bf16_production_shape_tensor_vs_tiled_fallback_benchmark() {
 
     for _ in 0..5 {
         if let Err(error) = dispatch(&mut tensor_registry, DenseMmBackend::TensorRequired) {
-            assert!(is_unavailable_tensor_header(&error), "{error}");
+            assert!(is_unavailable_tensor_api(&device, &error), "{error}");
             eprintln!("tensor API unavailable; M1 fallback benchmark requires hosted evidence");
             return;
         }
