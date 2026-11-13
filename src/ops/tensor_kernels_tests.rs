@@ -454,9 +454,10 @@ fn bits(values: &[f32]) -> Vec<u32> {
 /// the portable F16 matmul. That route is Class B to the tensor kernel, so
 /// it is held to what the class requires rather than to the tensor bits:
 ///
-/// * every element is within `2^-11 * sum(|w * x|)` of the F64 product (the
-///   kernel rounds the activation to half; one factor's rounding bounds each
-///   term);
+/// * every element is within `(2^-11 + K * 2^-24) * sum(|w * x|)` of the
+///   F64 product: the kernel rounds the activation to half, one factor's
+///   rounding bounds each term, and each of the K accumulated terms adds an
+///   FP32 rounding;
 /// * a repeated dispatch gives the same bits;
 /// * a row's bits do not depend on the row count: the rows of a shorter
 ///   batch are the leading rows of a longer one, across the 32-row tile
@@ -470,8 +471,11 @@ fn bits(values: &[f32]) -> Vec<u32> {
 fn f16_matmul_without_the_tensor_api_is_the_portable_kernel_within_its_class() {
     const PORTABLE: &str = "hf2q_dense_mm_f16_f32_fallback";
     const TENSOR: &str = "hf2q_mul_mm_tensor_v2_f16";
-    /// Half rounding of one factor of every term.
-    const BOUND: f64 = 1.0 / 2048.0;
+    /// Half rounding of one factor of every term, as a fraction of
+    /// `sum(|w * x|)`.
+    const HALF_ROUNDING: f64 = 1.0 / 2048.0;
+    /// FP32 rounding of one accumulated term, as the same fraction.
+    const ACCUMULATION: f64 = 1.0 / 16_777_216.0;
     const ROWS: [usize; 8] = [130, 64, 33, 32, 9, 8, 2, 1];
     // Whole tiles, partial N and K tiles, production-sized K, K below a tile.
     const SHAPES: [(usize, usize); 7] = [
@@ -531,6 +535,7 @@ fn f16_matmul_without_the_tensor_api_is_the_portable_kernel_within_its_class() {
             }
             (exact, magnitude)
         };
+        let bound = HALF_ROUNDING + k as f64 * ACCUMULATION;
         let error = |output: &[f32], m: usize, label: &str| {
             let mut worst = 0.0f64;
             for row in 0..m {
@@ -539,9 +544,9 @@ fn f16_matmul_without_the_tensor_api_is_the_portable_kernel_within_its_class() {
                     let value = f64::from(output[row * n + column]);
                     let relative = (value - exact).abs() / magnitude;
                     assert!(
-                        relative <= BOUND,
+                        relative <= bound,
                         "{label}: row {row} column {column} is {value}, the F64 product is \
-                         {exact}: {relative:e} of sum|w*x| exceeds {BOUND:e}"
+                         {exact}: {relative:e} of sum|w*x| exceeds {bound:e}"
                     );
                     worst = worst.max(relative);
                 }

@@ -164,11 +164,14 @@ without building a key.
   tile, so it also serves K below one tile, which the tensor kernel takes
   too). The two routes are Class B to each other, not bitwise: the portable
   kernel stages the activation as half and accumulates in another order.
-  On the M5 Max about one element per run is bit-equal, the relative RMS
-  between them is about 4.5e-4, and against the F64 product the worst error
-  over `sum(|w * x|)` is 1.5e-4 for the portable kernel and 2.7e-4 for the
-  tensor kernel (independent review of this change). The gate holds both to
-  `2^-11 * sum(|w * x|)`, the half rounding of one factor.
+  On the M5 Max the worst error over `sum(|w * x|)` against the F64 product
+  is 2.6e-4 for the portable kernel and 4.4e-4 for the tensor kernel (the
+  worst cases are at K = 16 and K = 40, where one term's half rounding is
+  not averaged over many terms), and the relative RMS between the two routes
+  is at most 5.9e-4; the independent review of this change found at most one
+  bit-equal element per run. The gate holds both to
+  `(2^-11 + K * 2^-24) * sum(|w * x|)`: the half rounding of one factor and
+  the FP32 rounding of K accumulated terms.
 - The tensor flash attention and the tiled verify attention already had
   queries; their dispatches now return the same typed error instead of the
   diagnostic when a caller skipped the query.
@@ -200,7 +203,7 @@ without building a key.
   (whole and partial N and K tiles, K = 2048, K = 40 and K = 16) and 130,
   64, 33, 32, 9, 8, 2 and 1 rows, `dispatch_mm_v2_f16` without the tensor
   API encodes the portable kernel, every element is within
-  `2^-11 * sum(|w * x|)` of the F64 product, a repeated dispatch gives the
+  `(2^-11 + K * 2^-24) * sum(|w * x|)` of the F64 product, a repeated dispatch gives the
   same bits, and the rows of a shorter batch are bitwise the leading rows
   of a longer one. Where the device has the tensor API the tensor kernel is
   held to the same F64 bound.

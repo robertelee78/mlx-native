@@ -1600,9 +1600,10 @@ pub fn quantized_matmul_q2_k_batched_mv(
 /// matmul (`hf2q_dense_mm_f16_f32_fallback`) instead. The two routes are
 /// Class B to each other, not bitwise: the portable kernel stages the
 /// activation as half and accumulates in a different order. Each is within
-/// `2^-11 * sum(|w * x|)` of the F64 product (the half rounding of one
-/// factor), the portable route is deterministic, and its output row depends
-/// only on that input row and the weight, not on the row count
+/// `(2^-11 + K * 2^-24) * sum(|w * x|)` of the F64 product (the half
+/// rounding of one factor, and the FP32 rounding of K accumulated terms),
+/// the portable route is deterministic, and its output row depends only on
+/// that input row and the weight, not on the row count
 /// (`ops::tensor_kernels_tests`). A probe failure that is not a missing
 /// tensor API is returned as the error; it does not select the portable
 /// route.
