@@ -161,6 +161,14 @@ const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 33] = [
     crate::ops::vision_2d_rope::register,
 ];
 
+/// What the runtime compiler of a host without the tensor header says of a
+/// source that includes it ([`KernelRegistry::simulate_missing_tensor_header`]).
+const MISSING_TENSOR_HEADER_SOURCE: &str = "#error fatal error: 'metal_tensor' file not found\n";
+
+fn includes_tensor_header(source: &str) -> bool {
+    source.contains("#include <metal_tensor>")
+}
+
 // MTLDataType numeric values (from metal-rs argument.rs, confirmed in Apple Metal spec):
 //   Int  = 29
 //   Bool = 53
@@ -206,6 +214,14 @@ pub struct KernelRegistry {
     /// A registry already caches device-specific pipeline objects, so its
     /// capability decisions have the same lifetime and identity scope.
     optional_pipeline_capabilities: HashMap<String, bool>,
+    /// Availability of each tensor-only kernel family on the bound device
+    /// (`ops::tensor_kernels`); `None` until asked. Kept beside the
+    /// string-keyed capabilities so that a family's entry points can check
+    /// it on every dispatch without building a key.
+    tensor_kernel_families:
+        [Option<bool>; crate::ops::tensor_kernels::TensorKernelFamily::COUNT],
+    /// [`Self::simulate_missing_tensor_header`] was called.
+    missing_tensor_header_simulated: bool,
     /// Exact immutable build identity of every compiled cache entry.
     pipeline_identities: HashMap<String, KernelPipelineIdentity>,
     /// MSL source text keyed by kernel function name.
@@ -1803,6 +1819,9 @@ impl KernelRegistry {
             bound_device_registry_id: None,
             cache: HashMap::new(),
             optional_pipeline_capabilities: HashMap::new(),
+            tensor_kernel_families: [None;
+                crate::ops::tensor_kernels::TensorKernelFamily::COUNT],
+            missing_tensor_header_simulated: false,
             pipeline_identities: HashMap::new(),
             sources,
             runtime_source_overrides: HashSet::new(),
@@ -1900,6 +1919,11 @@ impl KernelRegistry {
         source: &'static str,
     ) -> Result<()> {
         let name = name.into();
+        let source = if self.missing_tensor_header_simulated && includes_tensor_header(source) {
+            MISSING_TENSOR_HEADER_SOURCE
+        } else {
+            source
+        };
         let protected_dense_bf16 = matches!(
             name.as_str(),
             "hf2q_dense_gemv_bf16_f32_4"
@@ -1954,8 +1978,60 @@ impl KernelRegistry {
         });
         self.pipeline_identities
             .retain(|key, _| key != &name && !key.starts_with(&specialized_prefix));
+        // A family's answer is its probe kernel's build; any changed source
+        // may be that kernel.
+        self.tensor_kernel_families = [None; crate::ops::tensor_kernels::TensorKernelFamily::COUNT];
         self.runtime_source_overrides.insert(name.clone());
         self.sources.insert(name, source);
+        Ok(())
+    }
+
+    /// Make this registry build pipelines as a host whose runtime compiler
+    /// has no `<metal_tensor>` header does: every kernel whose source
+    /// includes the header, registered now or later, fails to compile with
+    /// that compiler's diagnostic, so every tensor probe reports the API
+    /// unavailable and every portable route is taken.
+    ///
+    /// For tests of the portable routes on a tensor-capable host; the other
+    /// host without the tensor API (a device outside the Metal 4 GPU family)
+    /// cannot be simulated on one. Pipelines built before the call are
+    /// dropped. Fails if a frozen route plan protects a tensor kernel.
+    pub fn simulate_missing_tensor_header(&mut self) -> Result<()> {
+        self.missing_tensor_header_simulated = true;
+        let names: Vec<String> = self
+            .sources
+            .iter()
+            .filter(|(_, source)| includes_tensor_header(source))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            self.try_register_source(name, MISSING_TENSOR_HEADER_SOURCE)?;
+        }
+        Ok(())
+    }
+
+    /// The cached availability of a tensor-only kernel family on the device
+    /// with `device_registry_id`, if this registry has asked it.
+    pub(crate) fn tensor_kernel_family(
+        &self,
+        family: crate::ops::tensor_kernels::TensorKernelFamily,
+        device_registry_id: u64,
+    ) -> Option<bool> {
+        if self.bound_device_registry_id != Some(device_registry_id) {
+            return None;
+        }
+        self.tensor_kernel_families[family.index()]
+    }
+
+    /// Record the availability of a tensor-only kernel family on `device`.
+    pub(crate) fn set_tensor_kernel_family(
+        &mut self,
+        device: &metal::DeviceRef,
+        family: crate::ops::tensor_kernels::TensorKernelFamily,
+        available: bool,
+    ) -> Result<()> {
+        self.bind_device(device)?;
+        self.tensor_kernel_families[family.index()] = Some(available);
         Ok(())
     }
 
@@ -2844,5 +2920,76 @@ kernel void label_smoke_kernel(device int* out [[buffer(0)]], uint tid [[thread_
             KernelPipelineOrigin::RuntimeSource
         );
         assert_eq!(origin(&mut registry, &device, constructor), default_origin);
+    }
+
+    /// A simulated missing tensor header stops every kernel whose source
+    /// includes the header with the diagnostic every tensor probe classifies
+    /// as "unavailable", keeps doing so when an op registers its source
+    /// again, and leaves every other kernel alone.
+    #[test]
+    fn simulated_missing_tensor_header_stops_tensor_kernels_only() {
+        let device = metal::Device::system_default().expect("Metal device");
+        let tensor_kernels = |registry: &KernelRegistry| -> Vec<String> {
+            let mut names: Vec<String> = registry
+                .sources
+                .iter()
+                .filter(|(_, source)| includes_tensor_header(source))
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        let mut registry = KernelRegistry::new();
+        let names = tensor_kernels(&registry);
+        // One kernel of each of the twelve tensor shader sources.
+        for expected in [
+            "kernel_mul_mm_q4_0_tensor_f32",
+            "kernel_mul_mm_id_q4_0_tensor_f32",
+            "hf2q_dense_mm_bf16_f32_tensor",
+            "hf2q_dense_mm_f16_f32_tensor",
+            "hf2q_dense_mm_f32_f32_tensor",
+            "flash_attn_prefill_tensor_f16_d256",
+            "tq_hb_verify_tile_undo_gate",
+            crate::ops::repacked_gguf_mm::REPACK_KERNEL,
+            crate::ops::dflash2_af4g64_staged::REDUCE_KERNEL,
+            crate::ops::dflash2_ring_attention::PACK_KERNEL,
+            "grouped_m8_prepare_q4k_q6k",
+            "moe_tiles_gather_f32",
+        ] {
+            assert!(names.iter().any(|name| name == expected), "{expected}");
+        }
+
+        registry
+            .simulate_missing_tensor_header()
+            .expect("simulate the missing header");
+        assert!(tensor_kernels(&registry).is_empty());
+        // An op that registers its tensor source again stays stopped.
+        crate::ops::repacked_gguf_mm::register(&mut registry);
+        assert!(tensor_kernels(&registry).is_empty());
+        for name in &names {
+            assert_eq!(
+                registry.sources.get(name).copied(),
+                Some(MISSING_TENSOR_HEADER_SOURCE),
+                "{name}"
+            );
+        }
+        for name in [
+            "hf2q_dense_mm_bf16_f32_tensor",
+            crate::ops::repacked_gguf_mm::REPACK_KERNEL,
+            "moe_tiles_gather_f32",
+        ] {
+            match registry.get_pipeline(name, &device) {
+                Err(MlxError::ShaderCompilationError { message, .. }) => assert!(
+                    message.contains("fatal error")
+                        && message.contains("'metal_tensor' file not found"),
+                    "{name}: {message}"
+                ),
+                Err(other) => panic!("{name}: {other}"),
+                Ok(_) => panic!("{name}: built without the tensor header"),
+            }
+        }
+        registry
+            .get_pipeline("hf2q_dense_mm_bf16_f32_fallback", &device)
+            .expect("a portable kernel builds");
     }
 }

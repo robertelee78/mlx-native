@@ -28,6 +28,7 @@ use super::{
     as_bytes, checked_byte_extent, CommandEncoder, DType, GgmlType, KernelArg, KernelRegistry,
     MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts, Result,
 };
+use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
 /// Words of the three indirect grids the schedule writes.
 pub const MOE_TILES_FUSED_GRID_WORDS: usize = 9;
@@ -365,6 +366,8 @@ pub fn moe_tiles_fused(
             )));
         }
     }
+
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::MoeExpertTiles)?;
 
     let gate_up_kernel = format!(
         "moe_tiles_fused_gate_up_{}",

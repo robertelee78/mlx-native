@@ -28,6 +28,7 @@ use crate::device::MlxDevice;
 use crate::encoder::{as_bytes, CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::tensor_kernels::typed_unavailable;
 use crate::DType;
 
 /// MSL source.
@@ -42,6 +43,8 @@ pub const K_TENSOR_F16_D512: &str = "flash_attn_prefill_tensor_f16_d512";
 /// Cache rows per step (the kernel's `C`, the blk `bk`).
 pub const CACHE_ROWS_PER_STEP: u32 = 64;
 const SIMDGROUPS: u64 = 8;
+/// The route as [`MlxError::Unavailable`] names it.
+const FEATURE: &str = "the tensor flash attention (flash_attn_prefill_tensor)";
 
 /// Register both entry points against the shader source.
 pub fn register(registry: &mut KernelRegistry) {
@@ -281,7 +284,9 @@ pub fn dispatch_flash_attn_prefill_tensor_f16(
         mask_row_stride: p.kv_pad as i32,
         scale: p.scale,
     };
-    let pipeline = registry.get_pipeline(name, device.metal_device())?;
+    let pipeline = registry
+        .get_pipeline(name, device.metal_device())
+        .map_err(|error| typed_unavailable(device, FEATURE, error))?;
     if pipeline.max_total_threads_per_threadgroup() < 32 * SIMDGROUPS {
         return Err(invalid(format!(
             "{name}: pipeline allows {} threads per threadgroup, needs {}",

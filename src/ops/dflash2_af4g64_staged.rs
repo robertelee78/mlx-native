@@ -24,6 +24,7 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::encode_helpers::{as_bytes, encode_with_args, KernelArg};
+use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
 pub const PROJECTION_KERNELS: [&str; 3] = [
     "dflash2_af4g64_staged_m8",
@@ -280,6 +281,7 @@ pub fn dispatch_dflash2_af4g64_staged(
         )?,
         "partials",
     )?;
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::Dflash2Af4g64Staged)?;
 
     let params = StagedParams {
         k,
@@ -400,6 +402,7 @@ pub fn dispatch_dflash2_af4g64_staged_gate_up(
         )?,
         "partials",
     )?;
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::Dflash2Af4g64Staged)?;
 
     let params = StagedParams {
         k,

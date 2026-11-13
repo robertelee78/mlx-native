@@ -220,6 +220,9 @@ pub use ops::quantized_matmul_ggml::{
     GgmlQuantizedMatmulParams,
     GgmlQuantizedMatmulPerm021Params, GgmlType, MM_ROUTING_THRESHOLD,
 };
+pub use ops::tensor_kernels::{
+    tensor_kernel_family_available, TensorKernelFamily, TENSOR_API_UNAVAILABLE,
+};
 pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
 };

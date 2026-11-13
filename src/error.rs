@@ -74,6 +74,19 @@ pub enum MlxError {
     /// A GGUF file could not be parsed or contains invalid data.
     #[error("GGUF parse error: {0}")]
     GgufParseError(String),
+
+    /// A kernel family without a portable twin cannot run on this host.
+    ///
+    /// Not a defect of the call: the host lacks an optional capability the
+    /// family is built on. Callers ask the family's availability query
+    /// before they choose its route (`ops::tensor_kernels`).
+    #[error("{feature} is unavailable on this host: {reason}")]
+    Unavailable {
+        /// The kernel family that was asked for.
+        feature: &'static str,
+        /// The capability the host lacks.
+        reason: &'static str,
+    },
 }
 
 /// Convenience alias used throughout the crate.
