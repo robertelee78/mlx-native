@@ -40,6 +40,13 @@ pub use moe_tiles::{
     moe_tiles_grouped_rows, moe_tiles_schedule, MoeTilesBuffers, MoeTilesParams,
     MOE_TILES_GRID_WORDS,
 };
+mod moe_tiles_fused;
+pub use moe_tiles_fused::{
+    moe_tiles_fused, moe_tiles_fused_admits, moe_tiles_fused_grouped_rows,
+    moe_tiles_fused_output_rows, moe_tiles_fused_schedule_words, MoeTilesFusedBuffers,
+    MoeTilesFusedMask, MoeTilesFusedParams, MoeTilesFusedStage, MoeTilesFusedWeights,
+    MOE_TILES_FUSED_GRID_WORDS, MOE_TILES_FUSED_MAX_EXPERTS, MOE_TILES_FUSED_MAX_ROUTES,
+};
 
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     factors.iter().try_fold(1usize, |total, factor| {

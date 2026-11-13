@@ -60,9 +60,39 @@ pub fn dispatch_dense_matvec_f32_rows(
     n: u32,
     k: u32,
 ) -> Result<()> {
-    if !(1..=DENSE_MATVEC_F32_ROWS_MAX_ROWS).contains(&rows) {
+    dispatch_dense_matvec_f32_row_blocks(
+        encoder, registry, device, input, weight, output, rows, 1, n, k,
+    )
+}
+
+/// Encode `blocks` consecutive blocks of `rows` input rows in one dispatch:
+/// `output[blocks * rows, n] = input[blocks * rows, k] @ weight[n, k]^T`.
+///
+/// Block `b` is computed by the threadgroups of grid row `b` exactly as
+/// [`dispatch_dense_matvec_f32_rows`] computes it from the block's own
+/// views, so every row is bitwise the row of that dispatch (and of a
+/// `rows = 1` dispatch).
+///
+/// # Errors
+///
+/// As [`dispatch_dense_matvec_f32_rows`], and when `blocks` is zero.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dense_matvec_f32_row_blocks(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    rows: u32,
+    blocks: u32,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    if !(1..=DENSE_MATVEC_F32_ROWS_MAX_ROWS).contains(&rows) || blocks == 0 {
         return Err(MlxError::InvalidArgument(format!(
-            "dense_matvec_f32_rows: rows must be in 1..={DENSE_MATVEC_F32_ROWS_MAX_ROWS}, got {rows}"
+            "dense_matvec_f32_rows: rows must be in 1..={DENSE_MATVEC_F32_ROWS_MAX_ROWS} and \
+             blocks nonzero, got rows={rows} blocks={blocks}"
         )));
     }
     if n == 0 || k == 0 || k % 4 != 0 {
@@ -87,10 +117,11 @@ pub fn dispatch_dense_matvec_f32_rows(
         }
     }
     let f32_size = DType::F32.size_of();
+    let all_rows = rows as usize * blocks as usize;
     for (buffer, elements, label) in [
-        (input, rows as usize * k as usize, "input"),
+        (input, all_rows * k as usize, "input"),
         (weight, n as usize * k as usize, "weight"),
-        (output, rows as usize * n as usize, "output"),
+        (output, all_rows * n as usize, "output"),
     ] {
         if buffer.data_byte_len() < elements * f32_size {
             return Err(MlxError::InvalidArgument(format!(
@@ -118,7 +149,7 @@ pub fn dispatch_dense_matvec_f32_rows(
             (3, KernelArg::Bytes(as_bytes(&params))),
         ],
         &[(0, shared_bytes)],
-        MTLSize::new(u64::from(n).div_ceil(NR0), 1, 1),
+        MTLSize::new(u64::from(n).div_ceil(NR0), u64::from(blocks), 1),
         MTLSize::new(NW, NSG, 1),
     );
     Ok(())

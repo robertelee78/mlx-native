@@ -39,6 +39,137 @@ pub fn register(registry: &mut KernelRegistry) {
     registry.register_source("rms_norm_mul_bf16", RMS_NORM_SHADER_SOURCE);
 }
 
+/// Whether [`dispatch_rms_norm_f32_to_bf16`] serves rows of `dim` elements:
+/// [`dispatch_rms_norm`] would run its float4 kernel on them (`dim % 4 == 0`
+/// and `HF2Q_RMS_NORM_V2` not disabled), whose bits the BF16-output kernel
+/// reproduces. Geometry only; [`rms_norm_f32_to_bf16_supported`] also checks
+/// the device.
+pub fn rms_norm_f32_to_bf16_available(dim: u32) -> bool {
+    dim > 0 && dim % 4 == 0 && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2")
+}
+
+/// Length to bind for `bytes` of threadgroup memory. Metal's API contract
+/// (`setThreadgroupMemoryLength:atIndex:`) takes multiples of 16 bytes, and
+/// the debug layer aborts on anything else; the kernels use only the bytes
+/// they index, so rounding up changes no result.
+fn threadgroup_memory_length(bytes: u64) -> u64 {
+    bytes.next_multiple_of(16)
+}
+
+const RMS_NORM_F32_TO_BF16_KERNEL: &str = "rms_norm_f32_v2_bf16_out";
+
+/// Threads per threadgroup and bound threadgroup memory of the BF16-output
+/// norm for rows of `dim` elements: the geometry of `dispatch_rms_norm`'s
+/// float4 kernel, one float per simdgroup in the 16-byte units Metal's API
+/// contract requires.
+fn rms_norm_f32_to_bf16_geometry(dim: u32) -> (u64, u64) {
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()).max(32) as u64;
+    (tg_size, threadgroup_memory_length((tg_size / 32).max(1) * 4))
+}
+
+/// Why the device cannot run the BF16-output norm on rows of `dim` elements,
+/// if it cannot: the pipeline as built allows fewer threads per threadgroup,
+/// or its static plus bound threadgroup memory exceeds the device's limit
+/// (shader validation enlarges the static part).
+fn rms_norm_f32_to_bf16_limit_violation(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    dim: u32,
+) -> Result<Option<String>> {
+    let (tg_size, shared_mem_bytes) = rms_norm_f32_to_bf16_geometry(dim);
+    let pipeline = registry.get_pipeline(RMS_NORM_F32_TO_BF16_KERNEL, device)?;
+    if pipeline.max_total_threads_per_threadgroup() < tg_size {
+        return Ok(Some(format!(
+            "{RMS_NORM_F32_TO_BF16_KERNEL} allows {} threads per threadgroup, needs {tg_size}",
+            pipeline.max_total_threads_per_threadgroup()
+        )));
+    }
+    let memory = pipeline
+        .static_threadgroup_memory_length()
+        .saturating_add(shared_mem_bytes);
+    let limit = device.max_threadgroup_memory_length();
+    if memory > limit {
+        return Ok(Some(format!(
+            "{RMS_NORM_F32_TO_BF16_KERNEL} needs {memory} bytes of threadgroup memory, the device allows {limit}"
+        )));
+    }
+    Ok(None)
+}
+
+/// Whether [`dispatch_rms_norm_f32_to_bf16`] can run on this device for rows
+/// of `dim` elements: [`rms_norm_f32_to_bf16_available`] and the pipeline's
+/// thread count and threadgroup memory within the device's limits.
+pub fn rms_norm_f32_to_bf16_supported(
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    dim: u32,
+) -> Result<bool> {
+    Ok(rms_norm_f32_to_bf16_available(dim)
+        && rms_norm_f32_to_bf16_limit_violation(registry, device, dim)?.is_none())
+}
+
+/// RMS-normalize F32 rows `[rows, dim]` with an F32 weight `[dim]` and store
+/// the result as BF16 `[rows, dim]`.
+///
+/// Bitwise [`dispatch_rms_norm`] on the same F32 buffers followed by an
+/// F32 to BF16 cast, in one dispatch: a consumer of BF16 rows reads the norm
+/// directly. `params_buf` is `[eps, dim]` as F32. Requires
+/// [`rms_norm_f32_to_bf16_supported`].
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rms_norm_f32_to_bf16(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    if rows == 0 || !rms_norm_f32_to_bf16_available(dim) {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm F32 to BF16 needs rows > 0 and the float4 kernel (dim % 4 == 0, \
+             HF2Q_RMS_NORM_V2 on); got rows={rows} dim={dim}"
+        )));
+    }
+    let expected = rows as usize * dim as usize;
+    if input.dtype() != DType::F32
+        || weight.dtype() != DType::F32
+        || output.dtype() != DType::BF16
+        || input.element_count() != expected
+        || output.element_count() != expected
+        || weight.element_count() < dim as usize
+        || params_buf.byte_len() < 8
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm F32 to BF16 needs F32 input [{rows}, {dim}], F32 weight [{dim}] and BF16 \
+             output [{rows}, {dim}]; got input {} x{}, weight {} x{}, output {} x{}",
+            input.dtype(),
+            input.element_count(),
+            weight.dtype(),
+            weight.element_count(),
+            output.dtype(),
+            output.element_count()
+        )));
+    }
+    if let Some(violation) = rms_norm_f32_to_bf16_limit_violation(registry, device, dim)? {
+        return Err(MlxError::InvalidArgument(format!(
+            "RMS norm F32 to BF16: {violation}; check rms_norm_f32_to_bf16_supported"
+        )));
+    }
+    let pipeline = registry.get_pipeline(RMS_NORM_F32_TO_BF16_KERNEL, device)?;
+    let (tg_size, shared_mem_bytes) = rms_norm_f32_to_bf16_geometry(dim);
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, input), (1, weight), (2, output), (3, params_buf)],
+        &[(0, shared_mem_bytes)],
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    Ok(())
+}
+
 /// Select the fused RMS norm + multiply kernel name based on input dtype.
 fn fused_rms_norm_mul_kernel_name(dtype: DType) -> Result<&'static str> {
     match dtype {
@@ -183,11 +314,11 @@ pub fn dispatch_rms_norm(
     // Threadgroup shared memory: v2 only needs one float per simdgroup
     // (≤ 32 SGs for tg_size ≤ 1024 → ≤ 128 bytes).  Scalar path uses
     // tg_size floats for the tree reduction.
-    let shared_mem_bytes = if use_v2 {
+    let shared_mem_bytes = threadgroup_memory_length(if use_v2 {
         (tg_size / 32).max(1) * 4
     } else {
         tg_size * 4
-    };
+    });
 
     // Tag for the fusion pass (Phase 4e.2): RMS norm can fuse with a
     // subsequent elementwise multiply.
@@ -236,7 +367,8 @@ pub fn dispatch_rms_norm(
 ///   noted at iter-360 (cap raised to 1024 = -0.5/-0.7%) and iter-361
 ///   (right-size to float4 = -0.4%); production keeps 256.
 /// - V2 path uses `(tg_size / 32).max(1) * 4` bytes shmem; scalar path
-///   uses `tg_size * 4` bytes (one float per thread for the tree-sum).
+///   uses `tg_size * 4` bytes (one float per thread for the tree-sum);
+///   bound rounded up to a multiple of 16 bytes.
 /// - `op_kind = CapturedOpKind::RmsNorm` for the fusion pass (Phase 4e.2).
 /// - Bindings: input=0, weight=1, output=2, params_buf=3.
 /// - threadgroups = `(rows, 1, 1)`, threads_per_tg = `(tg_size, 1, 1)`.
@@ -279,11 +411,11 @@ pub fn build_rms_norm_decode_record(
         tg_size = 32;
     }
 
-    let shared_mem_bytes = if use_v2 {
+    let shared_mem_bytes = threadgroup_memory_length(if use_v2 {
         (tg_size / 32).max(1) * 4
     } else {
         tg_size * 4
-    };
+    });
 
     let threadgroups = MTLSize::new(rows as u64, 1, 1);
     let threads_per_tg = MTLSize::new(tg_size, 1, 1);
@@ -664,11 +796,11 @@ pub fn dispatch_fused_post_ff_norm2_endlayer_f32(
     // V2 needs only one float per simdgroup for cross-SG reduction
     // (≤ 32 SGs at tg ≤ 1024 → ≤ 128 bytes).  V1 uses tg_size floats for
     // the tree reduction.
-    let shared_mem_bytes = if use_v2 {
+    let shared_mem_bytes = threadgroup_memory_length(if use_v2 {
         (tg_size / 32).max(1) * 4
     } else {
         tg_size * 4
-    };
+    });
 
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

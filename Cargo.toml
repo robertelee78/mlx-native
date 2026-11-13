@@ -1,6 +1,6 @@
 [package]
 name = "mlx-native"
-version = "0.21.8"
+version = "0.21.9"
 edition = "2021"
 rust-version = "1.82.0"
 description = "Pure-Rust Metal GPU compute library for MLX-compatible inference on Apple Silicon"
@@ -106,6 +106,18 @@ harness = false
 
 [[bench]]
 name = "bench_qwen_verify_attn"
+harness = false
+
+[[bench]]
+name = "bench_qwen_dense_ffn"
+harness = false
+
+[[bench]]
+name = "bench_qwen_delta_proj"
+harness = false
+
+[[bench]]
+name = "bench_qwen_delta_core"
 harness = false
 
 [[bench]]

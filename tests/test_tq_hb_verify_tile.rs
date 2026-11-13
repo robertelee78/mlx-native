@@ -28,15 +28,21 @@
 //!    on the other lanes, the lane order, the packed row it occupies, the
 //!    padding, the window's later rows (present or not) or cache bytes at or
 //!    after its causal end.
+//! 6. Window independence, bitwise: a token's output does not depend on the
+//!    window that verifies it (its start, the token's row in it, its length).
+//!
+//! A window whose rows ask for two split lengths runs as two tiles (a cut
+//! window; the first is the one that crosses 1,536 tokens). Every invariant
+//! above has such windows among its fixtures.
 
 #![cfg(target_vendor = "apple")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
 
 use mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_sigmoid_mul_f32;
 use mlx_native::ops::tq_hb_verify_tile::{
-    tq_hb_verify_tile_attention, tq_hb_verify_tile_available, verify_tile_scratch_bytes,
-    verify_tile_slot_splits, verify_tile_splits, TqHbVerifyLane, TqHbVerifyTileCache,
-    TqHbVerifyTileScratch, TqHbVerifyTileShape, PAGE_TOKENS, VERIFY_TILE_ROWS,
+    tq_hb_verify_tile_attention, tq_hb_verify_tile_available, verify_tile_pages_per_split,
+    verify_tile_scratch_bytes, verify_tile_slot_splits, TqHbVerifyLane, TqHbVerifyTileCache,
+    TqHbVerifyTileScratch, TqHbVerifyTileShape, MAX_SPLITS, PAGE_TOKENS, VERIFY_TILE_ROWS,
 };
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -518,7 +524,7 @@ fn check_reference(
     let mut worst_definition = 0.0f64;
     let (mut pooled_error, mut pooled_signal, mut worst_head) = (0.0f64, 0.0f64, 0.0f64);
     for (lane_index, lane) in lanes.iter().enumerate() {
-        let splits = verify_tile_splits(lane.committed, cache.capacity) as usize;
+        let splits = verify_tile_slot_splits(&[*lane], cache.capacity) as usize;
         for row in 0..lane.rows as usize {
             let packed = lane.first_row as usize + row;
             let visible = lane.committed as usize + row + 1;
@@ -663,6 +669,7 @@ fn rows_of(output: &[f32], geometry: Geometry, first_row: u32, rows: u32) -> &[f
 fn f64_reference_at_served_shapes() {
     let Some(mut gpu) = gpu() else { return };
     let mut rng = Xor(0x5EED_1234_ABCD_0001);
+    let mut cut_rng = Xor(0x5EED_1234_ABCD_0152);
     for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
         // Short histories: window inside, across and at page boundaries, an
         // empty history, one to four lanes, short windows. Every head.
@@ -738,6 +745,45 @@ fn f64_reference_at_served_shapes() {
             check_reference(&cache, &q, &lanes, &run, &sampled, SERVED_RMS, &label);
             check_undo_gate(&mut gpu, &run, geometry, &gate, &lanes, 16, &label);
         }
+        // Cut windows: rows on both sides of the page boundaries at 1,536 and
+        // 2,304 tokens, where the split length steps (two tiles per lane),
+        // full and short, beside windows that end or start at the boundary;
+        // peaked; and the step at 23,040 tokens. Their own generator, so the
+        // fixtures above keep their inputs.
+        for (committed, rows, key_norms, limits) in [
+            (
+                vec![1_531u32, 1_529, 2_299, 1_535],
+                vec![8u32, 8, 8, 8],
+                (4.0, 24.0),
+                SERVED_RMS,
+            ),
+            (
+                vec![2_303, 1_533, 1_530, 1_528],
+                vec![2, 5, 7, 8],
+                (4.0, 24.0),
+                SERVED_RMS,
+            ),
+            (vec![1_532, 2_300], vec![8, 8], (100.0, 400.0), PEAKED_RMS),
+        ] {
+            let cache = Cache::random(geometry, 2_336, key_norms, &mut cut_rng);
+            let lanes = lanes_of(&committed, &rows);
+            let q = random_q(geometry, 32, &mut cut_rng);
+            let gate = random_gate(geometry, 32, &mut cut_rng);
+            let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 32);
+            let label = format!("{name} cut windows {committed:?} rows {rows:?}");
+            check_reference(&cache, &q, &lanes, &run, &all_heads, limits, &label);
+            check_undo_gate(&mut gpu, &run, geometry, &gate, &lanes, 32, &label);
+        }
+        {
+            let cache = Cache::random(geometry, 23_104, (4.0, 24.0), &mut cut_rng);
+            let lanes = lanes_of(&[23_037, 23_033], &[8, 8]);
+            let q = random_q(geometry, 16, &mut cut_rng);
+            let gate = random_gate(geometry, 16, &mut cut_rng);
+            let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 16);
+            let label = format!("{name} cut windows [23037, 23033]");
+            check_reference(&cache, &q, &lanes, &run, &sampled, SERVED_RMS, &label);
+            check_undo_gate(&mut gpu, &run, geometry, &gate, &lanes, 16, &label);
+        }
     }
 }
 
@@ -745,21 +791,27 @@ fn f64_reference_at_served_shapes() {
 fn a_saturating_value_norm_stays_finite() {
     let Some(mut gpu) = gpu() else { return };
     let mut rng = Xor(0x5EED_1234_ABCD_0004);
-    let geometry = QWEN38;
-    let mut cache = Cache::random(geometry, 128, (4.0, 24.0), &mut rng);
-    // Far beyond the half operand's range for any probability near one.
-    for norm in &mut cache.v_norms {
-        *norm = 1e9;
+    // One tile, and a cut window (two tiles).
+    for (geometry, capacity, committed) in [
+        (QWEN38, 128, 40),
+        (QWEN38, 1_600, 1_531),
+        (QWEN36, 1_600, 1_531),
+    ] {
+        let mut cache = Cache::random(geometry, capacity, (4.0, 24.0), &mut rng);
+        // Far beyond the half operand's range for any probability near one.
+        for norm in &mut cache.v_norms {
+            *norm = 1e9;
+        }
+        let lanes = lanes_of(&[committed], &[8]);
+        let q = random_q(geometry, 8, &mut rng);
+        let gate = random_gate(geometry, 8, &mut rng);
+        let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 8);
+        assert!(
+            run.attention.iter().all(|v| v.is_finite()),
+            "saturated operand overflowed at {committed}"
+        );
+        assert!(run.output.iter().all(|v| v.is_finite()));
     }
-    let lanes = lanes_of(&[40], &[8]);
-    let q = random_q(geometry, 8, &mut rng);
-    let gate = random_gate(geometry, 8, &mut rng);
-    let run = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 8);
-    assert!(
-        run.attention.iter().all(|v| v.is_finite()),
-        "saturated operand overflowed"
-    );
-    assert!(run.output.iter().all(|v| v.is_finite()));
 }
 
 /// The split's page, score and probability storage is bound threadgroup
@@ -792,29 +844,43 @@ fn split_threadgroup_memory_is_bound_not_static() {
 fn repeated_runs_are_bitwise_equal() {
     let Some(mut gpu) = gpu() else { return };
     let mut rng = Xor(0x5EED_1234_ABCD_0002);
+    // Windows that are cut at 1,536 and 2,304 tokens, one that ends at the
+    // boundary and one that starts just before its last token. Their own
+    // generator: the first fixture's digests are those of 0.21.8.
+    let mut cut_rng = Xor(0x5EED_1234_ABCD_0153);
     for geometry in [QWEN38, QWEN36] {
-        let cache = Cache::random(geometry, 2_112, (4.0, 200.0), &mut rng);
-        let lanes = lanes_of(&[2_048, 513, 0, 1_000], &[8, 8, 8, 8]);
-        let q = random_q(geometry, 32, &mut rng);
-        let gate = random_gate(geometry, 32, &mut rng);
-        let first = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 32);
-        for _ in 0..4 {
-            let again = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 32);
-            assert_eq!(bits(&first.output), bits(&again.output));
-            assert_eq!(bits(&first.attention), bits(&again.attention));
+        for (label, capacity, committed, rng) in [
+            ("output", 2_112, [2_048, 513, 0, 1_000], &mut rng),
+            (
+                "cut windows",
+                2_336,
+                [1_531, 2_299, 1_529, 1_535],
+                &mut cut_rng,
+            ),
+        ] {
+            let cache = Cache::random(geometry, capacity, (4.0, 200.0), rng);
+            let lanes = lanes_of(&committed, &[8, 8, 8, 8]);
+            let q = random_q(geometry, 32, rng);
+            let gate = random_gate(geometry, 32, rng);
+            let first = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 32);
+            for _ in 0..4 {
+                let again = run_tile(&mut gpu, &cache, &q, &gate, &lanes, 32);
+                assert_eq!(bits(&first.output), bits(&again.output));
+                assert_eq!(bits(&first.attention), bits(&again.attention));
+            }
+            // Compared across runs: plain, shader validation, debug layer,
+            // runtime-compiled source.
+            let digest = bits(&first.output)
+                .iter()
+                .chain(&bits(&first.attention))
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &word| {
+                    (hash ^ u64::from(word)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+            eprintln!(
+                "{label} digest {}/{} heads: {digest:016x}",
+                geometry.n_heads, geometry.n_kv
+            );
         }
-        // Compared across runs: plain, shader validation, debug layer,
-        // runtime-compiled source.
-        let digest = bits(&first.output)
-            .iter()
-            .chain(&bits(&first.attention))
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &word| {
-                (hash ^ u64::from(word)).wrapping_mul(0x0000_0100_0000_01b3)
-            });
-        eprintln!(
-            "output digest {}/{} heads: {digest:016x}",
-            geometry.n_heads, geometry.n_kv
-        );
     }
 }
 
@@ -824,7 +890,8 @@ fn a_row_is_independent_of_its_cohort() {
     let mut rng = Xor(0x5EED_1234_ABCD_0003);
     for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
         let q_total = geometry.n_heads as usize * HD;
-        for committed in [0u32, 27, 1_500] {
+        // 1,531: a cut window (rows 0-4 and 5-7 are two tiles).
+        for committed in [0u32, 27, 1_500, 1_531] {
             let capacity = 1_600;
             let cache = Cache::random(geometry, capacity, (4.0, 200.0), &mut rng);
             // The subject: 8 rows of slot 1, alone, at packed rows 0..8.
@@ -1076,4 +1143,321 @@ fn invalid_steps_are_rejected() {
         .is_err(),
         "group of four"
     );
+}
+
+/// A slot's cache and scratch kept on the device across many steps, with a
+/// query and a gate per position, for sweeps of window starts.
+struct Sweep {
+    geometry: Geometry,
+    capacity: u32,
+    k_packed: MlxBuffer,
+    k_norms: MlxBuffer,
+    v_packed: MlxBuffer,
+    v_norms: MlxBuffer,
+    q_rows: MlxBuffer,
+    gate_rows: MlxBuffer,
+    output: MlxBuffer,
+    queries: MlxBuffer,
+    partials: MlxBuffer,
+    statistics: MlxBuffer,
+    attention: MlxBuffer,
+    /// Queries and gates of positions `p % SWEEP_PERIOD`.
+    q_table: Vec<f32>,
+    gate_table: Vec<f32>,
+}
+
+/// Positions `p` and `p + SWEEP_PERIOD` share a query and a gate.
+const SWEEP_PERIOD: usize = 61;
+/// The sweeps use one slot and up to four lanes of eight rows.
+const SWEEP_SLOT: u32 = 1;
+const SWEEP_WIDTH: u32 = 32;
+
+impl Sweep {
+    fn new(gpu: &Gpu, geometry: Geometry, capacity: u32, rng: &mut Xor) -> Self {
+        let device = &gpu.device;
+        let cache = Cache::random(geometry, capacity, (4.0, 40.0), rng);
+        let q_total = geometry.n_heads as usize * HD;
+        let shape = geometry.shape(capacity, SWEEP_WIDTH);
+        // Four lanes at the most splits a tile can have.
+        let sizes = verify_tile_scratch_bytes(&shape, 4, MAX_SPLITS);
+        let rows = SWEEP_WIDTH as usize * q_total;
+        Self {
+            geometry,
+            capacity,
+            k_packed: buffer(device, DType::U8, &cache.k_codes),
+            k_norms: buffer(device, DType::F32, &cache.k_norms),
+            v_packed: buffer(device, DType::U8, &cache.v_codes),
+            v_norms: buffer(device, DType::F32, &cache.v_norms),
+            q_rows: buffer(device, DType::F32, &vec![0f32; rows]),
+            gate_rows: buffer(device, DType::F32, &vec![0f32; rows]),
+            output: buffer(device, DType::F32, &vec![f32::NAN; rows]),
+            queries: buffer(device, DType::F16, &vec![half::f16::NAN; sizes.queries / 2]),
+            partials: buffer(device, DType::F32, &vec![f32::NAN; sizes.partials / 4]),
+            statistics: buffer(device, DType::F32, &vec![f32::NAN; sizes.statistics / 4]),
+            attention: buffer(device, DType::F32, &vec![f32::NAN; sizes.attention / 4]),
+            q_table: (0..SWEEP_PERIOD * q_total).map(|_| rng.unit()).collect(),
+            gate_table: (0..SWEEP_PERIOD * q_total)
+                .map(|_| rng.range(-6.0, 6.0))
+                .collect(),
+        }
+    }
+
+    /// One step of windows `(start, rows)` of the sweep slot, one lane each.
+    /// Returns, per lane and window row, the digest of the token's rotated
+    /// attention and gated output bits.
+    fn step(&mut self, gpu: &mut Gpu, windows: &[(u32, u32)]) -> Vec<Vec<u64>> {
+        let geometry = self.geometry;
+        let q_total = geometry.n_heads as usize * HD;
+        let mut lanes = Vec::with_capacity(windows.len());
+        let mut first_row = 0;
+        for &(start, rows) in windows {
+            lanes.push(TqHbVerifyLane {
+                slot: SWEEP_SLOT,
+                committed: start,
+                rows,
+                first_row,
+            });
+            for row in 0..rows as usize {
+                let packed = (first_row as usize + row) * q_total;
+                let entry = (start as usize + row) % SWEEP_PERIOD * q_total;
+                self.q_rows.as_mut_slice::<f32>().expect("q")[packed..packed + q_total]
+                    .copy_from_slice(&self.q_table[entry..entry + q_total]);
+                self.gate_rows.as_mut_slice::<f32>().expect("gate")[packed..packed + q_total]
+                    .copy_from_slice(&self.gate_table[entry..entry + q_total]);
+            }
+            first_row += rows;
+        }
+        let shape = geometry.shape(self.capacity, SWEEP_WIDTH);
+        let mut encoder = gpu.device.command_encoder().expect("encoder");
+        tq_hb_verify_tile_attention(
+            &mut encoder,
+            &mut gpu.registry,
+            &gpu.device,
+            &self.q_rows,
+            &self.gate_rows,
+            &TqHbVerifyTileCache {
+                k_packed: &self.k_packed,
+                k_norms: &self.k_norms,
+                v_packed: &self.v_packed,
+                v_norms: &self.v_norms,
+            },
+            &self.output,
+            &TqHbVerifyTileScratch {
+                queries: &self.queries,
+                partials: &self.partials,
+                statistics: &self.statistics,
+                attention: &self.attention,
+            },
+            &shape,
+            &lanes,
+        )
+        .expect("encode sweep step");
+        encoder.commit_and_wait().expect("commit");
+        let output = self.output.as_slice::<f32>().expect("output");
+        let attention = self.attention.as_slice::<f32>().expect("attention");
+        lanes
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| {
+                (0..lane.rows as usize)
+                    .map(|row| {
+                        let gated = (lane.first_row as usize + row) * q_total;
+                        let rotated = (index * VERIFY_TILE_ROWS as usize + row) * q_total;
+                        output[gated..gated + q_total]
+                            .iter()
+                            .chain(&attention[rotated..rotated + q_total])
+                            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+                                (hash ^ u64::from(value.to_bits()))
+                                    .wrapping_mul(0x0000_0100_0000_01b3)
+                            })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// Digest of a position at each row index of the windows that verified it.
+type Alignments = Vec<[Option<u64>; 8]>;
+
+/// Page boundaries (in tokens) below `capacity` where the split length steps.
+fn split_length_steps(capacity: u32) -> Vec<u32> {
+    (1..capacity / PAGE_TOKENS)
+        .filter(|&pages| {
+            verify_tile_pages_per_split(pages) != verify_tile_pages_per_split(pages + 1)
+        })
+        .map(|pages| pages * PAGE_TOKENS)
+        .collect()
+}
+
+/// Run every start of `starts` as a full window, four windows a step, and
+/// require that every position has the same bits at every row index it was
+/// verified at.
+fn full_windows(sweep: &mut Sweep, gpu: &mut Gpu, starts: &[u32], name: &str) -> Alignments {
+    let mut digests: Alignments = vec![[None; 8]; sweep.capacity as usize];
+    for chunk in starts.chunks(4) {
+        let windows: Vec<(u32, u32)> = chunk.iter().map(|&start| (start, 8)).collect();
+        for (lane, rows) in sweep.step(gpu, &windows).into_iter().enumerate() {
+            for (row, digest) in rows.into_iter().enumerate() {
+                digests[chunk[lane] as usize + row][row] = Some(digest);
+            }
+        }
+    }
+    let differing: Vec<usize> = digests
+        .iter()
+        .enumerate()
+        .filter(|(_, seen)| {
+            let mut seen = seen.iter().flatten();
+            let first = seen.next();
+            seen.any(|digest| Some(digest) != first)
+        })
+        .map(|(position, _)| position)
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{name}: {} tokens depend on their window alignment, first at positions {:?}",
+        differing.len(),
+        &differing[..differing.len().min(8)]
+    );
+    digests
+}
+
+/// Windows of one to eight rows in steps of one to three lanes that end just
+/// before, at and across each of `boundaries`: every row must have the bits
+/// `digests` holds for its position. Returns the rows checked.
+fn short_windows(
+    sweep: &mut Sweep,
+    gpu: &mut Gpu,
+    digests: &Alignments,
+    boundaries: &[u32],
+    name: &str,
+) -> usize {
+    let capacity = sweep.capacity;
+    let mut checked = 0;
+    for &boundary in boundaries {
+        for rows in 1..=8u32 {
+            for start in [
+                boundary.saturating_sub(rows),
+                (boundary + 1).saturating_sub(rows),
+                boundary.saturating_sub(rows / 2),
+                boundary,
+            ] {
+                let start = start.min(capacity - rows);
+                let lanes = 1 + (start + rows) as usize % 3;
+                let windows: Vec<(u32, u32)> = (0..lanes as u32)
+                    .map(|lane| ((start + 5 * lane).min(capacity - rows), rows))
+                    .collect();
+                for (lane, row_digests) in sweep.step(gpu, &windows).into_iter().enumerate() {
+                    for (row, digest) in row_digests.into_iter().enumerate() {
+                        let position = windows[lane].0 + row as u32;
+                        let expected = digests[position as usize]
+                            .iter()
+                            .flatten()
+                            .next()
+                            .expect("a position the full windows verified");
+                        assert_eq!(
+                            digest, *expected,
+                            "{name}: position {position} as row {row} of a {rows}-row window at \
+                             {} in a {lanes}-lane step",
+                            windows[lane].0
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    checked
+}
+
+/// A token's bits are a function of its own position, query, gate and causal
+/// history: the same whichever row of whichever window verifies it. Every
+/// window start from 0 to past 9,000 tokens of history is run as a full
+/// window (four starts a step, one lane each), so every token is seen at
+/// every row index 0-7 and every page boundary, including those where the
+/// split length steps, is crossed at every alignment; then windows of every
+/// length and steps of one to three lanes are checked against the same table
+/// around every such step.
+#[test]
+fn a_token_is_independent_of_its_window_alignment() {
+    let Some(mut gpu) = gpu() else { return };
+    let mut rng = Xor(0x5EED_1234_ABCD_0005);
+    const CAPACITY: u32 = 9_152;
+    const LAST_START: u32 = CAPACITY - 8;
+    for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
+        let mut sweep = Sweep::new(&gpu, geometry, CAPACITY, &mut rng);
+        let starts: Vec<u32> = (0..=LAST_START).collect();
+        let digests = full_windows(&mut sweep, &mut gpu, &starts, name);
+        for (position, seen) in digests.iter().enumerate() {
+            // Positions 7..=LAST_START sit at all eight row indices.
+            let alignments = seen.iter().flatten().count();
+            assert!(
+                alignments == 8 || position < 7 || position > LAST_START as usize,
+                "{name}: position {position} seen at {alignments} alignments"
+            );
+        }
+        let steps = split_length_steps(CAPACITY);
+        assert_eq!(steps.len(), 10, "{name}: split-length steps {steps:?}");
+        // Around every step of the split length and a few plain starts.
+        let boundaries: Vec<u32> = steps
+            .iter()
+            .copied()
+            .chain([32, 1_000, 5_555, LAST_START])
+            .collect();
+        let checked = short_windows(&mut sweep, &mut gpu, &digests, &boundaries, name);
+        eprintln!(
+            "{name}: {} tokens bitwise equal at every row index over window starts 0..={LAST_START} \
+             ({} split-length steps); {checked} rows of 1-8 row windows in 1-3 lane steps equal",
+            CAPACITY as usize,
+            steps.len()
+        );
+    }
+}
+
+/// The same up to 33,824 tokens of history, sampled: every window start
+/// within 48 tokens of each of the 43 page boundaries where the split length
+/// steps (1,536 to 33,792 in steps of 768), and the last starts of the cache.
+/// The 7 tokens before each boundary are the head rows of cut windows.
+#[test]
+fn a_token_is_independent_of_its_window_alignment_at_every_split_length_step() {
+    let Some(mut gpu) = gpu() else { return };
+    let mut rng = Xor(0x5EED_1234_ABCD_0006);
+    const CAPACITY: u32 = 33_824;
+    const LAST_START: u32 = CAPACITY - 8;
+    const NEAR: u32 = 48;
+    let steps = split_length_steps(CAPACITY);
+    assert_eq!(steps.len(), 43, "split-length steps {steps:?}");
+    assert_eq!((steps[0], steps[42]), (1_536, 33_792));
+    let starts: Vec<u32> = (0..=LAST_START)
+        .filter(|&start| {
+            start + 80 >= CAPACITY
+                || steps
+                    .iter()
+                    .any(|&step| start + NEAR >= step && start <= step + NEAR)
+        })
+        .collect();
+    for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
+        let mut sweep = Sweep::new(&gpu, geometry, CAPACITY, &mut rng);
+        let digests = full_windows(&mut sweep, &mut gpu, &starts, name);
+        let mut observations = 0;
+        for &step in &steps {
+            // The tokens on both sides of the boundary sit at all eight row
+            // indices: the head rows of every cut window among them.
+            for position in step - 8..(step + 8).min(LAST_START) {
+                let alignments = digests[position as usize].iter().flatten().count();
+                assert_eq!(alignments, 8, "{name}: position {position}");
+            }
+        }
+        for seen in &digests {
+            observations += seen.iter().flatten().count();
+        }
+        let checked = short_windows(&mut sweep, &mut gpu, &digests, &steps, name);
+        eprintln!(
+            "{name}: {observations} observations of full windows at {} starts around {} \
+             split-length steps up to {CAPACITY} tokens bitwise equal; {checked} rows of 1-8 row \
+             windows in 1-3 lane steps equal",
+            starts.len(),
+            steps.len()
+        );
+    }
 }

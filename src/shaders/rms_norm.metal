@@ -133,6 +133,69 @@ kernel void rms_norm_f32_v2(
 }
 
 // ---------------------------------------------------------------------------
+// rms_norm_f32_v2_bf16_out: `rms_norm_f32_v2` whose result is stored as BF16.
+//
+// The same loads, reductions and products as `rms_norm_f32_v2`, in the same
+// order; each F32 result is then rounded to BF16 as `cast_f32_to_bf16` rounds
+// it. A consumer that reads BF16 rows (the prepared GGUF projection) takes
+// the norm's output directly, without a cast dispatch and its barrier.
+// Bitwise `rms_norm_f32_v2` followed by `cast_f32_to_bf16`
+// (`ops::rms_norm` tests).
+//
+// REQUIREMENT: `dim % 4 == 0`. Geometry and shared memory as
+// `rms_norm_f32_v2`.
+kernel void rms_norm_f32_v2_bf16_out(
+    device const float4 *input  [[buffer(0)]],
+    device const float4 *weight [[buffer(1)]],
+    device bfloat       *output [[buffer(2)]],
+    device const float  *params [[buffer(3)]],
+    uint row_idx   [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    threadgroup float *shared [[threadgroup(0)]]
+) {
+    const float eps = params[0];
+    const uint dim  = uint(params[1]);
+    const uint dim4 = dim / 4u;
+
+    const uint base4 = row_idx * dim4;
+
+    float sumf = 0.0f;
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 v = input[base4 + i];
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    if (tiisg == 0) {
+        shared[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_sg = tg_size / 32u;
+    if (sgitg == 0) {
+        const float v = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        const float total = simd_sum(v);
+        if (tiisg == 0) {
+            shared[0] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms_inv = rsqrt(shared[0] / float(dim) + eps);
+
+    for (uint i = tid; i < dim4; i += tg_size) {
+        const float4 normed = (input[base4 + i] * rms_inv) * weight[i];
+        device bfloat *out = output + ulong(base4 + i) * 4;
+        out[0] = static_cast<bfloat>(normed.x);
+        out[1] = static_cast<bfloat>(normed.y);
+        out[2] = static_cast<bfloat>(normed.z);
+        out[3] = static_cast<bfloat>(normed.w);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // rms_norm_no_scale_f32_v2 (ADR-028 iter-310) — peer-pattern port,
 // no-weight variant.  Same math as rms_norm_no_scale_f32, but float4 +
 // simd_sum.  Used for the V-rms-norm site (no learnable weight).

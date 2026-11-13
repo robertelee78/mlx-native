@@ -125,7 +125,7 @@ fn requires_precise_fp32_math(name: &str) -> bool {
 /// on the runtime-source path (`MLX_PRECOMPILED_METALLIB=0`) a registry that
 /// skipped the op's `register` call failed with `KernelNotFound`. Kernels a
 /// function registers that the constructor already carries are unaffected.
-const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 32] = [
+const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 33] = [
     crate::ops::add_bias_row_2d::register,
     crate::ops::bilinear_resize_2d::register,
     crate::ops::block_merge_2x2::register,
@@ -152,6 +152,7 @@ const REGISTRATION_FALLBACKS: [fn(&mut KernelRegistry); 32] = [
     crate::ops::repacked_gguf_mm::register,
     crate::ops::gated_delta_net_decode::register,
     crate::ops::gather_bench::register,
+    crate::ops::gdn_window_fused::register,
     crate::ops::hadamard::register,
     crate::ops::hadamard_quantize_kv::register,
     crate::ops::im2col_2d_3ch::register,
@@ -662,6 +663,14 @@ impl KernelRegistry {
             sources.insert(format!("moe_tiles_gate_up_{format}"), moe_tiles_src);
             sources.insert(format!("moe_tiles_down_{format}"), moe_tiles_src);
         }
+        // The fused route of the same shader: one schedule, gather and pass
+        // grid for the routed experts and the shared expert.
+        sources.insert("moe_tiles_fused_schedule".into(), moe_tiles_src);
+        sources.insert("moe_tiles_fused_gather_f32".into(), moe_tiles_src);
+        for format in ["q4_K", "q6_K"] {
+            sources.insert(format!("moe_tiles_fused_gate_up_{format}"), moe_tiles_src);
+            sources.insert(format!("moe_tiles_fused_down_{format}"), moe_tiles_src);
+        }
 
         // Expert-routed (MoE) GGML block-format QUANTIZED MATRIX-MATRIX kernels
         // (ADR-011 Phase 3 Wave P3a: peer port of
@@ -1026,6 +1035,7 @@ impl KernelRegistry {
         // kernel_rms_norm_fuse_impl<float4, 1>).
         // Env-gated via HF2Q_RMS_NORM_V2=1 in the dispatchers.
         sources.insert("rms_norm_f32_v2".into(), rms_norm_src);
+        sources.insert("rms_norm_f32_v2_bf16_out".into(), rms_norm_src);
         sources.insert("rms_norm_no_scale_f32_v2".into(), rms_norm_src);
         sources.insert("rms_norm_f16".into(), rms_norm_src);
         sources.insert("rms_norm_bf16".into(), rms_norm_src);

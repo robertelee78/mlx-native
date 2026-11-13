@@ -130,6 +130,7 @@ pub mod gated_delta_net_chunk_o;
 pub mod gated_delta_net_decode;
 pub mod gated_delta_net_kkt;
 pub mod gated_delta_net_recompute_wu;
+pub mod gdn_window_fused;
 pub mod outer_product;
 pub mod qdq_affine;
 pub mod qdq_legacy;

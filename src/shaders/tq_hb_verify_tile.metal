@@ -11,10 +11,12 @@
 // threadgroup memory, so four barriers per page instead of three and no
 // device-tensor operands; half probability operands instead of bf16 and no
 // relaxed precision; no window, sinks, tile parts, sparse lists or prefill
-// tiles; a split count of at most 24 with at least two pages each; a query
-// pack with the sign-Hadamard rotation; the reduce per window row and query
-// head into hf2q's row layout; a fused un-rotation and sigmoid gate; exp
-// instead of fast::exp; mlx-native's dispatch arguments.
+// tiles; a split length taken from each token's own page count (at most 24
+// splits of at least two pages), with a window cut into two tiles where its
+// rows ask for two lengths, instead of one split count per lane and step; a
+// query pack with the sign-Hadamard rotation; the reduce per window row and
+// query head into hf2q's row layout; a fused un-rotation and sigmoid gate;
+// exp instead of fast::exp; mlx-native's dispatch arguments.
 //
 // Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
 // root.
@@ -22,13 +24,14 @@
 // One joint verify step attends, per lane, a window of up to TQV_ROWS rows at
 // consecutive positions of the lane's slot. The per-row decode kernel
 // (flash_attn_vec_tq_hb) scans a slot's history once per row and query head;
-// here a threadgroup owns one (lane, KV head, history split) and computes all
-// of the window's rows and the KV head's query heads together, M = TQV_ROWS *
-// G fused rows, with `mpp::tensor_ops::matmul2d` for Q·Kᵀ and P·V over pages
-// of TQV_PAGE cache tokens. The structure follows Splash's paged verify
-// attention (runtime/metal/kernels/common/paged_attention_tile.h): balanced
-// history splits writing F32 partials and (max, sum) statistics, and a
-// fixed-order reduce.
+// here a threadgroup owns one (tile, KV head, history split) and computes
+// all of the tile's rows and the KV head's query heads together, M = TQV_ROWS
+// * G fused rows, with `mpp::tensor_ops::matmul2d` for Q·Kᵀ and P·V over
+// pages of TQV_PAGE cache tokens. A tile is a lane's window (or one of the
+// two parts of a cut window, see below). The structure follows Splash's
+// paged verify attention (runtime/metal/kernels/common/paged_attention_tile.h):
+// balanced history splits writing F32 partials and (max, sum) statistics,
+// and a fixed-order reduce.
 //
 // The cache is hf2q's TQ-HB format, unchanged: 8-bit Lloyd-Max codes
 // `[slot, kv_head, capacity, 256]` and one F32 norm per (slot, kv_head,
@@ -61,10 +64,17 @@
 //   fwht_sign_undo_sigmoid_mul_f32_d256 for every packed row, reading the
 //   rotated row its map names (padding rows repeat a window row).
 //
-// Row independence: a lane's split count and page partition depend only on
-// its committed length; a fused row's scores, running maximum, sum and
-// rescale are its own (a row whose maximum did not move is scaled by exactly
-// 1.0); tokens at or after a row's causal end get probability exactly 0.
+// Row independence: a fused row's scores, running maximum, sum and rescale
+// are its own (a row whose maximum did not move is scaled by exactly 1.0);
+// tokens at or after a row's causal end get probability exactly 0, so a page
+// or a split that holds none of a row's tokens leaves the row's bits alone.
+//
+// Window independence: a token's history is cut into splits by its own page
+// count alone (tqv tiles, below), and the splits are combined in their
+// order, so a token's bits do not depend on the window that verifies it, on
+// its row in that window or on the window's length. The host cuts a window
+// into two tiles where its rows' page counts ask for different split
+// lengths.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -79,13 +89,21 @@ using namespace mpp::tensor_ops;
 #define TQV_MAX_SPLITS 128u
 #define TQV_HALF_MAX 65504.0f
 
-// One lane of the step. Must match `TqHbVerifyLaneGpu`.
+// One tile of the step: a lane's window, or the rows of it on one side of a
+// page boundary where the split length changes. Every row of a tile cuts its
+// history into runs of `per_split` pages. The tiles of a lane share the
+// lane's scratch (queries, partial slots, rotated rows) on disjoint window
+// rows. Must match `TqHbVerifyTileGpu`.
 struct TqHbVerifyLane {
     uint slot;       // outer index of the lane's slot in the cache buffers
-    uint committed;  // tokens before the window (position of its first row)
-    uint rows;       // window rows, 1..TQV_ROWS
-    uint first_row;  // packed row of the window's first row
-    uint splits;     // history splits of this lane
+    uint committed;  // tokens before the tile (position of its first row)
+    uint rows;       // tile rows, 1..TQV_ROWS
+    uint first_row;  // packed row of the tile's first row
+    uint lane;       // scratch index of the tile's lane
+    uint row;        // window row of the tile's first row
+    uint owned;      // window rows from `row` whose query scratch it fills
+    uint splits;     // history splits that hold a page of this tile
+    uint per_split;  // pages per split
 };
 
 // Must match `TqHbVerifyParamsGpu`.
@@ -174,19 +192,13 @@ constant uint8_t TQV_SIGNS_256[32] = {
     0x76,0xc4,0x19,0xfe,0x4a,0x85,0x2c,0xdb,
 };
 
-// The pages a lane's tiles read: those holding its committed tokens and a
-// full window. The bound does not depend on the window's row count.
-inline uint tqv_pages(TqHbVerifyLane lane, uint kv_capacity) {
-    const uint bound = min(lane.committed + TQV_ROWS, kv_capacity);
-    return (bound + TQV_PAGE - 1) / TQV_PAGE;
-}
-
-inline uint tqv_pages_per_split(uint pages, uint splits) {
-    return (pages + splits - 1) / splits;
+// The pages a tile reads: those that hold a token one of its rows attends.
+inline uint tqv_pages(TqHbVerifyLane lane) {
+    return (lane.committed + lane.rows + TQV_PAGE - 1) / TQV_PAGE;
 }
 
 // ---------------------------------------------------------------------------
-// Query pack: one simdgroup per (query head, window row, lane).
+// Query pack: one simdgroup per (query head, tile row, tile).
 // ---------------------------------------------------------------------------
 template <uint G>
 inline void tqv_pack(
@@ -201,8 +213,13 @@ inline void tqv_pack(
     constexpr uint EPT = D / 32;
     const uint head = group.x, row = group.y;
     const TqHbVerifyLane l = lanes[group.z];
+    // A tile fills its own rows and, when it is the last of its lane, the
+    // rest of the lane's tile with zeros.
+    if (row >= l.owned)
+        return;
     const uint kv_head = head / G;
-    const ulong tile = (ulong(group.z) * params.n_kv_heads + kv_head) * TQV_ROWS + row;
+    const ulong tile =
+        (ulong(l.lane) * params.n_kv_heads + kv_head) * TQV_ROWS + l.row + row;
     device half *dst = queries + (tile * G + head % G) * D + lane * EPT;
     if (row >= l.rows) {
         for (uint i = 0; i < EPT; ++i) dst[i] = 0.0h;
@@ -378,25 +395,29 @@ inline void tqv_split(
     const TqHbVerifyLane lane = lanes[group.z];
     if (split >= lane.splits)
         return;
-    const uint pages = tqv_pages(lane, params.kv_capacity);
-    const uint per_split = tqv_pages_per_split(pages, lane.splits);
-    const uint page_begin = split * per_split;
+    const uint pages = tqv_pages(lane);
+    const uint page_begin = split * lane.per_split;
     if (page_begin >= pages)
         return;
-    const uint page_end = min(pages, page_begin + per_split);
+    const uint page_end = min(pages, page_begin + lane.per_split);
     if (thread_index < M) {
         row_max[thread_index] = -INFINITY;
         row_sum[thread_index] = 0.0f;
     }
 
-    const ulong tile = ulong(group.z) * params.n_kv_heads + kv_head;
+    // The tile's fused rows start at its first window row in the lane's
+    // scratch. Fused rows past its own (another tile's, or past the lane's
+    // tile) are computed and never stored.
+    const ulong tile = ulong(lane.lane) * params.n_kv_heads + kv_head;
+    const uint first_fused = lane.row * G;
+    const uint active = lane.rows * G;
     const ulong head_tokens =
         (ulong(lane.slot) * params.n_kv_heads + kv_head) * params.kv_capacity;
     const float score_scale = rsqrt(float(D)) * params.scale;
 
     // Q·Kᵀ: half queries (device) x half keys (staged) -> F32 scores.
     // P·V: half probabilities x half values (staged) -> F32 accumulation.
-    auto qt = tensor(queries + tile * TQV_ROWS * G * D, dextents<int, 2>{D, M},
+    auto qt = tensor(queries + (tile * M + first_fused) * D, dextents<int, 2>{D, M},
                      array<int, 2>{1, D});
     auto kt = tensor(staged, dextents<int, 2>{D, N}, array<int, 2>{1, D});
     auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
@@ -460,13 +481,14 @@ inline void tqv_split(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const ulong slot = tile * params.slot_splits + split;
-    auto target = tensor(partials + slot * M * D, dextents<int, 2>{D, M},
+    // Only the tile's own fused rows leave: the extents clip the others.
+    const ulong cell = (tile * params.slot_splits + split) * M + first_fused;
+    auto target = tensor(partials + cell * D, dextents<int, 2>{D, int(active)},
                          array<int, 2>{1, D});
-    running.store(target.slice<D, M>(0, 0));
-    if (thread_index < M) {
-        statistics[(slot * M + thread_index) * 2] = row_max[thread_index];
-        statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
+    running.store(target);
+    if (thread_index < active) {
+        statistics[(cell + thread_index) * 2] = row_max[thread_index];
+        statistics[(cell + thread_index) * 2 + 1] = row_sum[thread_index];
     }
 }
 
@@ -509,7 +531,7 @@ TQV_SPLIT(tq_hb_verify_tile_split_g8, 8)
 #undef TQV_SPLIT
 
 // ---------------------------------------------------------------------------
-// Reduce: 256 threads (one per dimension) per (query head, window row, lane).
+// Reduce: 256 threads (one per dimension) per (query head, tile row, tile).
 // ---------------------------------------------------------------------------
 template <uint G>
 inline void tqv_reduce(
@@ -526,12 +548,11 @@ inline void tqv_reduce(
     const TqHbVerifyLane lane = lanes[group.z];
     if (row >= lane.rows)
         return;
-    const uint fused_row = row * G + head % G;
-    const uint pages = tqv_pages(lane, params.kv_capacity);
-    const uint per_split = tqv_pages_per_split(pages, lane.splits);
-    const uint written = (pages + per_split - 1) / per_split;
+    const uint window_row = lane.row + row;
+    const uint fused_row = window_row * G + head % G;
+    const uint written = lane.splits;
     const ulong head_slot =
-        (ulong(group.z) * params.n_kv_heads + head / G) * params.slot_splits;
+        (ulong(lane.lane) * params.n_kv_heads + head / G) * params.slot_splits;
 
     const uint lane32 = thread_index % 32, sg = thread_index / 32;
     const float maximum = thread_index < written
@@ -541,8 +562,9 @@ inline void tqv_reduce(
     if (lane32 == 0) group_values[sg] = group_maximum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float row_maximum = simd_max(lane32 < D / 32 ? group_values[lane32] : -INFINITY);
+    // A split that holds none of the row's tokens has weight exactly 0.
     if (thread_index < written)
-        weights[thread_index] = exp(maximum - row_maximum);
+        weights[thread_index] = maximum == -INFINITY ? 0.0f : exp(maximum - row_maximum);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Both accumulations run in split order.
     float numerator = 0.0f, denominator = 0.0f;
@@ -552,7 +574,8 @@ inline void tqv_reduce(
         numerator += weight * partials[cell * D + thread_index];
         denominator += weight * statistics[cell * 2 + 1];
     }
-    attention[((ulong(group.z) * TQV_ROWS + row) * params.n_heads + head) * D + thread_index] =
+    attention[((ulong(lane.lane) * TQV_ROWS + window_row) * params.n_heads + head) * D +
+              thread_index] =
         denominator > 0.0f ? numerator / denominator : 0.0f;
 }
 

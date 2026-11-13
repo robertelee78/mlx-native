@@ -9,7 +9,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![cfg(target_vendor = "apple")]
 
-use mlx_native::ops::dense_matvec_f32_rows::dispatch_dense_matvec_f32_rows;
+use mlx_native::ops::dense_matvec_f32_rows::{
+    dispatch_dense_matvec_f32_row_blocks, dispatch_dense_matvec_f32_rows,
+};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 fn lcg(seed: u64, n: usize, scale: f32) -> Vec<f32> {
@@ -162,6 +164,81 @@ fn row_views_are_honoured() {
         bits(whole.as_slice::<f32>().unwrap()),
         bits(parts.as_slice::<f32>().unwrap())
     );
+}
+
+/// One dispatch of `blocks` blocks is bitwise one dispatch per block, and so
+/// one `rows = 1` dispatch per row.
+#[test]
+fn row_blocks_equal_one_dispatch_per_block_bitwise() {
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    for &(n, k, rows, blocks) in &[
+        (256usize, 2048usize, 8usize, 4usize),
+        (1, 2048, 8, 4),
+        (256, 2048, 8, 2),
+        (7, 132, 3, 5),
+        (1, 2048, 1, 3),
+    ] {
+        let all = rows * blocks;
+        let x = lcg(21 + n as u64, all * k, 1.0);
+        let w = lcg(22 + k as u64, n * k, 0.05);
+        let xbuf = upload(&device, &x, vec![all, k]);
+        let wbuf = upload(&device, &w, vec![n, k]);
+        let out = |device: &MlxDevice| {
+            device
+                .alloc_buffer(all * n * 4, DType::F32, vec![all, n])
+                .expect("out")
+        };
+        let (whole, parts, singles) = (out(&device), out(&device), out(&device));
+        let mut enc = device.command_encoder().expect("enc");
+        dispatch_dense_matvec_f32_row_blocks(
+            &mut enc, &mut registry, &device, &xbuf, &wbuf, &whole, rows as u32, blocks as u32,
+            n as u32, k as u32,
+        )
+        .expect("blocks");
+        for block in 0..blocks {
+            let xin = xbuf.slice_view((block * rows * k * 4) as u64, rows * k);
+            let yout = parts.slice_view((block * rows * n * 4) as u64, rows * n);
+            dispatch_dense_matvec_f32_rows(
+                &mut enc, &mut registry, &device, &xin, &wbuf, &yout, rows as u32, n as u32,
+                k as u32,
+            )
+            .expect("block");
+        }
+        for row in 0..all {
+            let xin = xbuf.slice_view((row * k * 4) as u64, k);
+            let yout = singles.slice_view((row * n * 4) as u64, n);
+            dispatch_dense_matvec_f32_rows(
+                &mut enc, &mut registry, &device, &xin, &wbuf, &yout, 1, n as u32, k as u32,
+            )
+            .expect("row");
+        }
+        enc.commit_and_wait().expect("commit");
+        let whole = bits(whole.as_slice::<f32>().unwrap());
+        assert_eq!(
+            whole,
+            bits(parts.as_slice::<f32>().unwrap()),
+            "n={n} k={k} rows={rows} blocks={blocks}: a block differs from its own dispatch"
+        );
+        assert_eq!(
+            whole,
+            bits(singles.as_slice::<f32>().unwrap()),
+            "n={n} k={k} rows={rows} blocks={blocks}: a row differs from its rows=1 dispatch"
+        );
+    }
+    // An output one block short is refused.
+    let (n, k) = (4usize, 64usize);
+    let xbuf = upload(&device, &lcg(1, 16 * k, 1.0), vec![16, k]);
+    let wbuf = upload(&device, &lcg(2, n * k, 1.0), vec![n, k]);
+    let short = device.alloc_buffer(8 * n * 4, DType::F32, vec![8, n]).expect("out");
+    let mut enc = device.command_encoder().expect("enc");
+    for (rows, blocks) in [(8u32, 2u32), (8, 0)] {
+        assert!(dispatch_dense_matvec_f32_row_blocks(
+            &mut enc, &mut registry, &device, &xbuf, &wbuf, &short, rows, blocks, n as u32,
+            k as u32,
+        )
+        .is_err());
+    }
 }
 
 #[test]

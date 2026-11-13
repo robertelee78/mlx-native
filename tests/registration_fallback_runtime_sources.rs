@@ -15,8 +15,8 @@ use mlx_native::ops::{
     embedding_kquant, embedding_q2_k, embedding_q8_0, feature_concat, flash_attn_prefill,
     flash_attn_prefill_blk, flash_attn_prefill_d512, flash_attn_prefill_mask,
     flash_attn_prefill_tensor, flash_attn_train, flash_attn_vec_tq, fused_residual_norm,
-    gated_delta_net_decode, gather_bench, hadamard, hadamard_quantize_kv, im2col_2d_3ch, ssm_conv,
-    tq_hb_verify_tile, vision_2d_rope,
+    gated_delta_net_decode, gather_bench, gdn_window_fused, hadamard, hadamard_quantize_kv,
+    im2col_2d_3ch, ssm_conv, tq_hb_verify_tile, vision_2d_rope,
 };
 use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice, MlxError};
 use sha2::{Digest, Sha256};
@@ -63,7 +63,7 @@ fn cases() -> Vec<Case> {
         &'static str,
         &'static [(usize, bool)],
         &'static [(usize, i32)],
-    ); 41] = [
+    ); 43] = [
         (
             "add_bias_row_2d_f32",
             add_bias_row_2d::ADD_BIAS_ROW_2D_SHADER_SOURCE,
@@ -217,6 +217,18 @@ fn cases() -> Vec<Case> {
         (
             "hadamard_quantize_kv",
             hadamard_quantize_kv::HADAMARD_QUANTIZE_KV_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "gdn_window_fused_f32",
+            gdn_window_fused::GDN_WINDOW_FUSED_SHADER_SOURCE,
+            NO_BOOLS,
+            NO_INTS,
+        ),
+        (
+            "gdn_window_fused_bf16",
+            gdn_window_fused::GDN_WINDOW_FUSED_SHADER_SOURCE,
             NO_BOOLS,
             NO_INTS,
         ),
@@ -385,9 +397,9 @@ fn registration_fallbacks_build_from_runtime_source() {
     let cases = cases();
     let unique: std::collections::BTreeSet<&str> =
         cases.iter().map(|case| case.0.as_str()).collect();
-    // 63 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
-    assert_eq!(unique.len(), 67);
-    assert_eq!(cases.len(), 67);
+    // 65 constructor fallbacks (unit test in kernel_registry.rs) + 4 IQ4_XS.
+    assert_eq!(unique.len(), 69);
+    assert_eq!(cases.len(), 69);
     let mut tensor_unavailable = Vec::new();
     for (name, source, bools, ints) in cases {
         let pipeline = if bools.is_empty() && ints.is_empty() {
