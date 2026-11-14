@@ -10,10 +10,10 @@
 // Algorithm:
 //   The "flash-attention" formulation as described by Dao et al. (2022,
 //   arXiv:2205.14135), implemented for Apple GPU's 8x8x8 simdgroup MMA
-//   primitives.  Q is pre-scaled by `scale * log2(e)` so the inner softmax
-//   is computed via `fast::exp2`; per-row max and sum are maintained as
-//   running registers across the K-tile sweep; output is normalized at the
-//   end with a single divide.
+//   primitives. D128 scales F32 scores by `scale * log2(e)` after QK^T;
+//   other T-I/O shapes pre-scale Q. Softmax uses `fast::exp2`, with per-row
+//   max and sum held in registers across the K-tile sweep; output is
+//   normalized at the end with a single divide.
 //
 // Tile geometry (this kernel):
 //   D=256: BQ=32, BK=16, 4 simdgroups per threadgroup (128 threads).
@@ -1324,10 +1324,10 @@ struct AttnTgpGeometry {
 
 // Body of every flash-attention prefill entry point.
 //
-// The pre-existing entry points instantiate it with OutT = T,
-// ScaleScores = false and VForm = PFA_V_STAGED, which is exactly the
-// historical kernel.  The precise entry points (ADR-063 Q4-GEMMA-KERNEL)
-// set:
+// T-I/O entry points use OutT = T and VForm = PFA_V_STAGED. D128 keeps
+// its BF16 query unchanged and scales F32 scores; other T-I/O shapes
+// retain their historical T-scaled query. The dedicated precise entry
+// points (ADR-063 Q4-GEMMA-KERNEL) set:
 //   OutT = float      — O stored without the final T rounding;
 //   ScaleScores=true  — Q stays exactly as loaded and the F32 scores are
 //                       multiplied by `scale * log2(e)` (factor formed in
@@ -2044,7 +2044,7 @@ METAL_FUNC void attention_impl(
   }
 }
 
-// Pre-existing entry points: T I/O, T-scaled Q, staged V, T output.
+// T I/O and staged V; D128 scales F32 scores without re-rounding Q.
 // clang-format off
 template <
     typename T,
@@ -2076,7 +2076,7 @@ template <
   threadgroup T Q_smem[tgp_geometry::tgp_mem_q];
   threadgroup T KV_smem[tgp_geometry::tgp_mem_s];
 
-  attention_impl<T, BQ, BK, BD, WM, WN, MaskType, AccumType, T, false, PFA_V_STAGED>(
+  attention_impl<T, BQ, BK, BD, WM, WN, MaskType, AccumType, T, BD == 128, PFA_V_STAGED>(
       Q, K, V, O, params, mask_params, mask, blk, nullptr, nullptr,
       Q_smem, KV_smem, nullptr, simd_lane_id, simd_group_id, tid);
 }

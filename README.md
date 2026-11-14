@@ -57,6 +57,11 @@ Q5_K few-row projections also use one explicit F32 block term across widths.
 Requalify numerical bounds and model quality rather than preserving outputs
 from the previous arithmetic.
 
+D128 BF16 prefill preserves the supplied BF16 query and scales the accumulated
+F32 dot products. Q/K/V and output storage remain BF16. This removes an extra
+BF16 scaling-rounding step that can destroy dot-product cancellation.
+Requalify numerical outputs rather than preserving the previous output bits.
+
 `EncoderSession::reset_for_next_stage_keeping()` returns an opaque
 `SubmittedCommand` for the committed stage. Callers that pipeline stages must
 keep and check every submitted stage at their next host wait; success of the
