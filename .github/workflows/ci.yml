@@ -103,9 +103,9 @@ jobs:
 
   rust-metal:
     runs-on: macos-15
-    # The debug-profile Gemma parity suites (GQA flash T-N8 about 2 min, warm
-    # prefill about 10 min on the runner) pushed the job past 40 minutes.
-    timeout-minutes: 60
+    # The complete debug suite plus packed-archive witnesses can exceed an
+    # hour on hosted GPUs; keep every test and allow packaging to finish.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
