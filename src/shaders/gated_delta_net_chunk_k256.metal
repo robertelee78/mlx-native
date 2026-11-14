@@ -41,26 +41,19 @@ using namespace metal;
 //   AMX/Tensor units. Per-thread MAC loops in the prior implementation
 //   underused the simdgroup matrix engines.
 //
-//   Tile partitioning (BT=64, BV=32, K=128, TG_THREADS=128 = 4 simdgroups):
+//   Tile partitioning (BT=64, BV=16, K=256, TG_THREADS=64 = 2 simdgroups):
 //
 //   Section 2b: `bv[BT, BV] = u - w @ bh^T`
-//     * Each simdgroup `s` owns BT rows [s*16, s*16+16) (2 row-tiles of 8)
-//       × all 4 BV col-tiles → 8 accumulator fragments per simdgroup.
-//     * K-reduction: 16 8×8 K-tiles. Per K-tile: load 2 w-frags (bf16 from
-//       device, K-row-stride = w_t_stride) + 4 bh-frags (f32 from
-//       threadgroup, transposed via `simdgroup_load(..., true)`); 8 MMAs.
-//     * After loop, extract per-thread fragment elements and compute
-//       `local_v[c] = u_val - bv_acc[c]` cell-wise (16 cells/thread).
+//     * Each simdgroup s owns BT rows [s*32, s*32+32) (4 row-tiles of 8)
+//       × both BV col-tiles → 8 accumulator fragments per simdgroup.
+//     * K-reduction visits the same 32 8×8 K-tiles in increasing order.
+//       Each tile loads 4 w-frags + 2 bh-frags and performs 8 MMAs.
+//     * Each thread still extracts 16 local_v cells.
 //
 //   Section 2f: `bh[BV, K] += bv_stage @ k`
-//     * Each simdgroup `s` owns BV rows [s*8, s*8+8) (1 row-tile of 8)
-//       × all 16 K col-tiles → 16 accumulator fragments per simdgroup.
-//     * Initial accumulator load: bh frags from threadgroup memory
-//       (already gated by exp_g_last in section 2d).
-//     * BT-reduction: 8 8×8 BT-tiles. Per BT-tile: load 1 bv-frag (bf16
-//       from threadgroup, layout `[BV, BT]`) + 16 k-frags (bf16 from
-//       device, K-row-stride = k_t_stride); 16 MMAs.
-//     * After loop, store 16 bh frags back to threadgroup `bh`.
+//     * Each simdgroup s owns BV rows [s*8, s*8+8), all 32 K col-tiles.
+//     * The 8 BT reduction tiles and each cell's MMA order are unchanged.
+//     * Accumulators begin with the gated f32 bh and are stored back to bh.
 //
 //   Per-thread fragment-element mapping (BaseMMAFrag<T, 8, 8>::get_coord):
 //     qid = lane_id / 4
@@ -69,10 +62,10 @@ using namespace metal;
 //   Each lane owns 2 elements per 8×8 frag at row=fm, cols=fn,fn+1.
 //
 //   For section 2b's per-thread `local_v[c]` (c ∈ 0..16):
-//     i = c / 8                  (row-tile within sg, 0..1)
-//     j = (c % 8) / 2            (col-tile, 0..3)
+//     i = c / 4                  (row-tile within sg, 0..3)
+//     j = (c % 4) / 2            (col-tile, 0..1)
 //     e = c % 2                  (lane sub-element, 0..1)
-//     bt = sgid*16 + i*8 + fm
+//     bt = sgid*32 + i*8 + fm
 //     bv_idx = j*8 + fn + e
 //
 // # Numerical precision
@@ -109,14 +102,10 @@ using namespace metal;
 //
 // # Threadgroup memory layout (post-iter-1 simdgroup_matrix MMA)
 //
-//   We allocate (BV*K * 4) + (BV*BT * 2) bytes = 16 KB + 4 KB = 20 KB at
-//   threadgroup(0). The first BV*K floats are `bh` (the running f32 state
-//   tile); the next BV*BT bfloats are `bv_stage` (used to publish per-thread
-//   bv values to all threads for the outer-update). bv_stage layout is
-//   `[BV, BT]` (transposed from the prior `[BT, BV]` f32 layout — this
-//   saves 4 KB threadgroup memory and lets section 2f's MMA load
-//   `simdgroup_matrix<bfloat>` frags directly without transpose).
-//   20 KB < 32 KB M5 Max max threadgroup memory.
+//   Threadgroup(0) contains BV*K f32 state cells followed by BV*BT bf16
+//   stage cells: 16*256*4 + 16*64*2 = 18432 bytes (18 KiB).
+//   bv_stage is [BV, BT], so the outer-update MMA loads remain unchanged.
+//   The K=256 inter-state tile is independent of chunk_o's 32-wide V tile.
 //
 // # Memory layouts (innermost-first)
 //
@@ -132,7 +121,7 @@ using namespace metal;
 // # Threading
 //
 //   Grid: (NV_TILES = V/BV, H, B)
-//   Threadgroup: TG_THREADS = 128 (4 simdgroups × 32 lanes), flat 1D.
+//   Threadgroup: TG_THREADS = 64 (2 simdgroups × 32 lanes), flat 1D.
 //
 // # Buffer bindings (matching the host)
 //
@@ -146,8 +135,8 @@ using namespace metal;
 //   buffer(7): final_state f32
 //   buffer(8): params      uint[8] = [B, T, Hg, H, K, V, BT, NT]
 
-constant uint BV = 32u;          // V-tile width (per-threadgroup V slice)
-constant uint TG_THREADS = 128u; // threadgroup size (= 4 simdgroups)
+constant uint BV = 16u;         // K=256 inter-state V tile, not chunk_o's tile
+constant uint TG_THREADS = 64u; // threadgroup size (= 2 simdgroups)
 
 // bf16 round-trip — cast to bfloat then back to float to truncate
 // f32 -> bf16 -> f32 (matches PyTorch `.to(bfloat16).float()`).
@@ -155,24 +144,11 @@ inline float bf16_round(float x) {
     return float(bfloat(x));
 }
 
-// ADR-033 §Pi Task #25 iter 19 (2026-05-23) — K=256 native variant.
-//
-// Clone of `gated_delta_net_chunk_inter_state_bf16` (K=128) with all
-// compile-time tile counts bumped from 16 to 32 (K=128/8 → K=256/8).
-// Same algorithm structure, same shmem layout (sized via params at
-// dispatch time — host allocates BV*K + BV*BT bytes, K=256 here).
-//
-// Per-simdgroup register footprint:
-//   bh_acc[32] simdgroup_matrix<float, 8, 8>: 32 8×8 tiles per simdgroup.
-//   k_frag[32] simdgroup_matrix<bfloat, 8, 8>: same, bfloat.
-// Both fit within Apple Silicon's per-lane budget. Crucially the loops
-// are COMPILE-TIME-known (32 iterations exactly), so the MMA scheduler
-// can fully unroll — no 3.15× regression like the runtime-K-bounds
-// attempt documented in gated_delta_net_chunk.metal:441.
-//
-// Math contract: bit-equivalent to running the K=128 kernel on a K=256
-// problem if the K=128 kernel supported arbitrary K. The state recurrence
-// is mathematically the same; only the inner K-tile loop is longer.
+// K=256 native variant. The per-cell reduction order and precision match
+// the K=128 recurrence with 32 K-tiles. Only the independent V/BT cells
+// assigned to each SIMDgroup differ: BV=16 keeps f32 state + bf16 stage
+// within the 32 KiB threadgroup-memory limit, without splitting a reduction.
+// Section 2f retains 32 bh_acc and k_frag tiles per SIMDgroup.
 kernel void gated_delta_net_chunk_inter_state_bf16_k256(
     device const bfloat *k         [[buffer(0)]],
     device const bfloat *w         [[buffer(1)]],
@@ -224,10 +200,8 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
     const uint h_chunk_stride    = H * state_head_stride;
     const uint h_seq_stride      = NT * h_chunk_stride;
 
-    // Threadgroup-memory partition (20 KB total — host allocates exactly
-    // this much; see gated_delta_net_chunk.rs `dispatch_*`).
-    //   shared_mem[0          .. BV*K)            = bh          [BV, K]   f32 (16 KB)
-    //   shared_mem[BV*K bytes .. BV*K+BV*BT bytes)= bv_stage_bf [BV, BT]  bf16 (4 KB)
+    // Host allocates 18 KiB: bh [16,256] f32, then stage [16,64] bf16.
+    // The stage begins after BV*K floats, with no aliasing between them.
     threadgroup float  *bh          = shared_mem;
     threadgroup bfloat *bv_stage_bf =
         (threadgroup bfloat *)(shared_mem + (BV * K));
@@ -258,9 +232,8 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
     // Per-thread accumulator for bv during phase 2b — populated from MMA
     // fragment elements after the K-reduction MMA loop.
     //
-    // CELLS_PER_THREAD = 16: 2 row-tiles × 4 col-tiles × 2 elements.
-    // c-mapping: c = i*8 + j*2 + e where i = row-tile (0..1), j = col-tile
-    // (0..3), e = lane sub-element (0..1).
+    // CELLS_PER_THREAD = 16: 4 row-tiles × 2 col-tiles × 2 elements.
+    // c = i*4 + j*2 + e, i in [0,4), j in [0,2), e in [0,2).
     //   bt_local = i*8 + fm                (within sg)
     //   bv_local = j*8 + fn + e
     constexpr uint CELLS_PER_THREAD = 16u;
@@ -290,43 +263,42 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
 
         // -----------------------------------------------------------
         // 2b. Compute bv = u - w @ bh^T  via simdgroup_matrix<float, 8, 8>
-        //     8×8 MMA. Each simdgroup owns BT rows [sgid*16, sgid*16+16)
-        //     (2 row-tiles) × all 4 BV col-tiles = 8 fragments.
+        //     8×8 MMA. Each simdgroup owns BT rows [sgid*32, sgid*32+32)
+        //     (4 row-tiles) × both BV col-tiles = 8 fragments.
         // -----------------------------------------------------------
         const uint w_base = i_b * w_seq_stride + (t_start * w_t_stride) + i_h * K;
         const uint u_base = i_b * u_seq_stride + (t_start * u_t_stride) + i_h * V;
 
-        // 8 accumulator frags per simdgroup, indexed [i*4 + j].
+        // 8 accumulator frags per simdgroup, indexed [i*2 + j].
         simdgroup_matrix<float, 8, 8> bv_acc[8];
         for (uint t = 0; t < 8; ++t) {
             bv_acc[t] = simdgroup_matrix<float, 8, 8>(0);
         }
 
-        // K-reduction: 16 K-tiles of 8.
+        // K-reduction: 32 K-tiles of 8, in the original increasing order.
         const uint num_k_tiles = K / 8u;
         for (uint kt = 0; kt < num_k_tiles; ++kt) {
             const uint k_origin = kt * 8u;
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            // Load 2 w fragments — sgid's BT row-tiles (2 of them).
-            //   w[B,T,H,K] row-major K-innermost; bt-row stride = w_t_stride.
-            //   Frag i covers BT rows [sgid*16 + i*8, sgid*16 + i*8 + 8).
-            simdgroup_matrix<bfloat, 8, 8> w_frag[2];
+            // Load 4 w fragments for this simdgroup's 32 BT rows.
+            // w[B,T,H,K] has row stride w_t_stride, K innermost.
+            simdgroup_matrix<bfloat, 8, 8> w_frag[4];
             const device bfloat *w_ptr_base =
-                w + w_base + sgid * 16u * w_t_stride + k_origin;
-            simdgroup_load(w_frag[0], w_ptr_base + 0u * 8u * w_t_stride,
-                           w_t_stride, 0, false);
-            simdgroup_load(w_frag[1], w_ptr_base + 1u * 8u * w_t_stride,
-                           w_t_stride, 0, false);
+                w + w_base + sgid * 32u * w_t_stride + k_origin;
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(w_frag[i], w_ptr_base + i * 8u * w_t_stride,
+                               w_t_stride, 0, false);
+            }
 
-            // Load 4 bh^T fragments — all 4 BV col-tiles.
+            // Load both bh^T fragments — all 16 BV columns.
             //   bh layout is [BV, K] row-major (K-innermost, row stride = K).
             //   bh^T frag at (k_origin..k_origin+8, bv_origin..bv_origin+8)
             //   reads bh[bv_origin+j][k_origin+i] which is bh + bv_origin*K
             //   + k_origin with row stride K and transpose=true.
-            simdgroup_matrix<float, 8, 8> bh_frag_T[4];
-            for (uint j = 0; j < 4; ++j) {
+            simdgroup_matrix<float, 8, 8> bh_frag_T[2];
+            for (uint j = 0; j < 2; ++j) {
                 const uint bv_origin = j * 8u;
                 threadgroup const float *bh_ptr =
                     bh + bv_origin * K + k_origin;
@@ -335,22 +307,22 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            // 8 MMAs: bv_acc[i*4+j] += w_frag[i] @ bh_frag_T[j].
-            for (uint i = 0; i < 2; ++i) {
-                for (uint j = 0; j < 4; ++j) {
+            // 8 MMAs: bv_acc[i*2+j] += w_frag[i] @ bh_frag_T[j].
+            for (uint i = 0; i < 4; ++i) {
+                for (uint j = 0; j < 2; ++j) {
                     simdgroup_multiply_accumulate(
-                        bv_acc[i * 4 + j], w_frag[i], bh_frag_T[j],
-                        bv_acc[i * 4 + j]);
+                        bv_acc[i * 2 + j], w_frag[i], bh_frag_T[j],
+                        bv_acc[i * 2 + j]);
                 }
             }
         }
 
         // Extract per-thread fragment elements into local_v and subtract u.
-        // c-mapping: c = i*8 + j*2 + e (see CELLS_PER_THREAD comment).
-        for (uint i = 0; i < 2; ++i) {
-            for (uint j = 0; j < 4; ++j) {
-                thread auto &elems = bv_acc[i * 4 + j].thread_elements();
-                const uint bt = sgid * 16u + i * 8u + fm;
+        // c = i*4 + j*2 + e (see CELLS_PER_THREAD comment).
+        for (uint i = 0; i < 4; ++i) {
+            for (uint j = 0; j < 2; ++j) {
+                thread auto &elems = bv_acc[i * 2 + j].thread_elements();
+                const uint bt = sgid * 32u + i * 8u + fm;
                 const uint bv0 = j * 8u + fn;
                 // u_val for the two elements at (bt, bv0) and (bt, bv0+1).
                 float u0 = 0.0f, u1 = 0.0f;
@@ -362,8 +334,8 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
                 if (vidx1 < V) {
                     u1 = float(u[u_base + bt * u_t_stride + vidx1]);
                 }
-                const uint c0 = i * 8u + j * 2u + 0u;
-                const uint c1 = i * 8u + j * 2u + 1u;
+                const uint c0 = i * 4u + j * 2u + 0u;
+                const uint c1 = i * 4u + j * 2u + 1u;
                 local_v[c0] = u0 - float(elems[0]);
                 local_v[c1] = u1 - float(elems[1]);
             }
@@ -375,12 +347,12 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
         //     u - w @ h^T without the gate scaling).
         // -----------------------------------------------------------
         const uint vn_base = i_b * u_seq_stride + (t_start * u_t_stride) + i_h * V;
-        for (uint i = 0; i < 2; ++i) {
-            for (uint j = 0; j < 4; ++j) {
-                const uint bt = sgid * 16u + i * 8u + fm;
+        for (uint i = 0; i < 4; ++i) {
+            for (uint j = 0; j < 2; ++j) {
+                const uint bt = sgid * 32u + i * 8u + fm;
                 const uint bv0 = j * 8u + fn;
-                const uint c0 = i * 8u + j * 2u + 0u;
-                const uint c1 = i * 8u + j * 2u + 1u;
+                const uint c0 = i * 4u + j * 2u + 0u;
+                const uint c1 = i * 4u + j * 2u + 1u;
                 const uint vidx0 = v_base + bv0;
                 const uint vidx1 = v_base + bv0 + 1u;
                 if (vidx0 < V) {
@@ -401,19 +373,24 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
         const float g_last = g[g_base + last_t * g_t_stride];
         const float exp_g_last = metal::exp(g_last);
 
-        // Per-thread gate of local_v. Each thread holds 16 cells across
-        // 2 distinct BT rows (i = 0, 1) — so two distinct g_t values.
-        for (uint i = 0; i < 2; ++i) {
-            const uint bt = sgid * 16u + i * 8u + fm;
+        // Per-thread gate of local_v across four distinct BT rows.
+        for (uint i = 0; i < 4; ++i) {
+            const uint bt = sgid * 32u + i * 8u + fm;
             const float g_t = g[g_base + (t_start + bt) * g_t_stride];
             const float scale = metal::exp(g_last - g_t);
-            for (uint j = 0; j < 4; ++j) {
-                const uint c0 = i * 8u + j * 2u + 0u;
-                const uint c1 = i * 8u + j * 2u + 1u;
+            for (uint j = 0; j < 2; ++j) {
+                const uint c0 = i * 4u + j * 2u + 0u;
+                const uint c1 = i * 4u + j * 2u + 1u;
                 local_v[c0] *= scale;
                 local_v[c1] *= scale;
             }
         }
+
+        // All SIMDgroups read every bh row in 2a/2b, but the cooperative
+        // scale below overwrites those rows. Finish every reader before
+        // any writer proceeds; a SIMDgroup barrier cannot order other
+        // SIMDgroups, and the post-scale barrier only protects later reads.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Scale bh by exp_g_last in place (cooperative across threads).
         for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
@@ -427,12 +404,12 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
         //     This lets section 2f's MMA load bf16 frags directly without
         //     a transpose flag.
         // -----------------------------------------------------------
-        for (uint i = 0; i < 2; ++i) {
-            for (uint j = 0; j < 4; ++j) {
-                const uint bt = sgid * 16u + i * 8u + fm;
+        for (uint i = 0; i < 4; ++i) {
+            for (uint j = 0; j < 2; ++j) {
+                const uint bt = sgid * 32u + i * 8u + fm;
                 const uint bv0 = j * 8u + fn;
-                const uint c0 = i * 8u + j * 2u + 0u;
-                const uint c1 = i * 8u + j * 2u + 1u;
+                const uint c0 = i * 4u + j * 2u + 0u;
+                const uint c1 = i * 4u + j * 2u + 1u;
                 bv_stage_bf[bv0 * BT + bt]      = bfloat(local_v[c0]);
                 bv_stage_bf[(bv0 + 1u) * BT + bt] = bfloat(local_v[c1]);
             }
@@ -442,23 +419,15 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
         // -----------------------------------------------------------
         // 2f. Outer-update: bh += bv_stage_bf @ k  (MMA).
         //     Each simdgroup `s` owns BV rows [s*8, s*8+8) (1 row-tile)
-        //     × all 16 K col-tiles → 16 accumulator fragments per sg.
+        //     × all 32 K col-tiles → 32 accumulator fragments per sg.
         //     Initial accumulator = (already-gated) bh frags loaded from
         //     threadgroup memory.
         // -----------------------------------------------------------
         const uint k_chunk_base =
             i_b * k_seq_stride + t_start * k_t_stride + kh * K;
 
-        // Load 16 bh accumulator frags (BV row-tile = sgid, all K col-tiles).
-        //   Tile count is hard-coded for K=128 (= 16 8-element K-tiles). The
-        //   compile-time loop bound is LOAD-BEARING — Metal's MMA scheduler
-        //   needs unrollable loops for the simdgroup_matrix tile sequence;
-        //   making the bound runtime via `K/8` collapses inter_state from
-        //   1.08 ms to 3.40 ms (3.15× regression, measured 2026-04-27).
-        //   So MAX_K is narrowed to 128 in src/ops/gated_delta_net_chunk.rs;
-        //   K=192 dispatch is rejected by validate(). To support K=192/256
-        //   later, port FLA's b_h1..b_h4 bank-split (chunk_delta_h.py:215-221)
-        //   which keeps each kernel's K-tile count compile-time-known per bank.
+        // Load all 32 bh accumulator frags for this simdgroup's 8 BV rows.
+        // The K-col tile count remains compile-time fixed at K=256 / 8.
         simdgroup_matrix<float, 8, 8> bh_acc[32]; // iter 19 K=256: 32 K-tiles
         {
             threadgroup const float *bh_row_ptr = bh + sgid * 8u * K;
@@ -483,7 +452,7 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
                            bv_stage_bf + sgid * 8u * BT + bt_origin,
                            BT, 0, false);
 
-            // Load 16 k frags — 8 BT rows × 8 K cols each.
+            // Load 32 k frags — 8 BT rows × 8 K cols each.
             //   k[B,T,Hg,K] row-major K-innermost; bt-row stride = k_t_stride.
             simdgroup_matrix<bfloat, 8, 8> k_frag[32]; // iter 19 K=256
             const device bfloat *k_row_base =
@@ -495,7 +464,7 @@ kernel void gated_delta_net_chunk_inter_state_bf16_k256(
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            // 16 MMAs: bh_acc[kj] += bv_frag @ k_frag[kj].
+            // 32 MMAs: bh_acc[kj] += bv_frag @ k_frag[kj].
             for (uint kj = 0; kj < 32; ++kj) { // iter 19 K=256
                 simdgroup_multiply_accumulate(
                     bh_acc[kj], bv_frag, k_frag[kj], bh_acc[kj]);

@@ -53,3 +53,60 @@ Apple M5 Max, macOS, debug test profile.
   processes diverged; with this fix 15 of 15 were bit-exact (96,000 decode
   steps). This was a local path patch for diagnosis only; hf2q adoption
   requires the published crate and a locked pin.
+
+## Chunk recurrence follow-on (0.22.1)
+
+The K128 and K256 chunk inter-state kernels had the same dependency error.
+Every SIMDgroup reads the old shared `bh` state for the output snapshot and
+the `w @ bh` product, but a faster SIMDgroup could start scaling that state
+before another finished reading it. Both kernels now place a threadgroup
+barrier before the cooperative scale, retaining the post-scale and
+end-of-chunk barriers. No reduction, gate or rounding order changes.
+
+The first debug-layer check also exposed an independent K256 resource error:
+the old V32 tile requested more shared memory than the device advertises.
+
+| K256 inter-state layout | Threads | Shared bytes |
+| --- | ---: | ---: |
+| Previous V32 | 128 | 36,864 |
+| Corrected V16 | 64 | 18,432 |
+
+The observed device limit was 32,768 bytes. The corrected two-SIMDgroup
+layout covers four BT row tiles and two V column tiles per SIMDgroup;
+each output cell retains the same increasing K/BT reduction sequence.
+K128 and the downstream K256 output kernel's V32/TG256 layout are unchanged.
+Global state/output layouts are unchanged.
+
+### Scoped validation
+
+Apple M5 Max, 128 GiB, macOS 27.2, Rust/Cargo 1.99.1:
+
+- 28 source-bound positions passed with owned process cleanup: embedded and
+  runtime-source paths, each plain, default shader validation and Metal API
+  debug validation; two exact regressions and K256 inter-state/full-pipeline
+  smoke checks, plus the original reference fixture and structural checks.
+- The nonzero-state regression checks independent first-chunk values and
+  eight reused-buffer output/state trials for K128 and K256.
+- The nonuniform K256 oracle checks both batches/chunks, every head, V16
+  boundary and K tile against an independent exact recurrence.
+- Pipeline identities from both exact regressions prove the selected origin;
+  enabling precompiled lookup alone is not accepted as embedded coverage.
+  The local matrix's embedded artifact SHA256 was
+  `5c67c50ed273a562e963b9dcb86a34da1d2d49b298f568f2a25cb96c71487ecb`.
+- The preceding 36,864-byte debug failure is retained, not counted as a pass.
+  These results establish neither global numerical equivalence nor an hf2q
+  model-serving or performance qualification.
+
+Reproduce the focused assertions with the full existing fixture:
+
+```sh
+cargo test --release --locked --test test_gated_delta_net_chunk -- --test-threads=1 --nocapture
+cargo test --release --locked --lib chunk_inter_state_k256_dispatch_smoke -- --test-threads=1 --nocapture
+cargo test --release --locked --lib chunk_k256_pipeline_smoke -- --test-threads=1 --nocapture
+```
+
+Run each exact GPU assertion in a fresh process for
+`MLX_PRECOMPILED_METALLIB=1`/`0` (same setting for
+`MLX_PRECOMPILED_METALLIB_FCV`), plain, `MTL_SHADER_VALIDATION=1` with
+`MTL_SHADER_VALIDATION_COMPILER_INLINING=default`, and `MTL_DEBUG_LAYER=1`.
+No selective validation exclusion or full-inlining workaround is used.

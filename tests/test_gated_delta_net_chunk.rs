@@ -318,6 +318,285 @@ fn test_chunk_inter_state_zero_inputs_yield_zero() {
     );
 }
 
+/// Every SIMDgroup must finish reading the old state before any scales it.
+/// With h0=1, w=1/K and u=k=0, the first chunk has the exact oracle
+/// v_new=-1 and h_out=1, regardless of exp's implementation. Nonzero g
+/// makes an early in-place state scale observable to a lagging reader.
+#[test]
+fn test_chunk_inter_state_nonzero_state_read_before_scale() {
+    use mlx_native::ops::chunk_gated_delta_rule_bank_split::dispatch_chunk_inter_state_k256;
+
+    let device = MlxDevice::new().expect("MlxDevice::new");
+    let mut registry = KernelRegistry::new();
+    for head_dim in [128u32, 256] {
+        let p = GatedDeltaNetChunkParams {
+            b: B,
+            t: T,
+            hg: HG,
+            h: H,
+            k: head_dim,
+            v: V,
+            bt: BT,
+        };
+        let k_buf = alloc_zeroed_bf16(&device, (B * T * HG * head_dim) as usize);
+        let w_elems = (B * T * H * head_dim) as usize;
+        let w_bits = ((1.0f32 / head_dim as f32).to_bits() >> 16) as u16;
+        let w_bytes: Vec<u8> = (0..w_elems).flat_map(|_| w_bits.to_le_bytes()).collect();
+        let w_buf = upload_bf16(&device, &w_bytes);
+        let value_elems = (B * T * H * V) as usize;
+        let u_buf = alloc_zeroed_bf16(&device, value_elems);
+        let g_buf = upload_f32(&device, &vec![-1.0; (B * T * H) as usize]);
+        let state_elems = (B * H * V * head_dim) as usize;
+        let h0_buf = upload_f32(&device, &vec![1.0; state_elems]);
+        let h_out_buf = alloc_zeroed_bf16(&device, state_elems * NT as usize);
+        let v_new_buf = alloc_zeroed_bf16(&device, value_elems);
+        let final_buf = upload_f32(&device, &vec![0.0; state_elems]);
+        let params_buf = build_gated_delta_net_chunk_params(&device, p).expect("params");
+        let mut baseline: Option<[Vec<u8>; 3]> = None;
+
+        for trial in 0..8 {
+            let mut enc = device.command_encoder().expect("enc");
+            let dispatch = if head_dim == 128 {
+                dispatch_gated_delta_net_chunk_inter_state
+            } else {
+                dispatch_chunk_inter_state_k256
+            };
+            dispatch(
+                &mut enc,
+                &mut registry,
+                device.metal_device(),
+                &k_buf,
+                &w_buf,
+                &u_buf,
+                &g_buf,
+                &h0_buf,
+                &h_out_buf,
+                &v_new_buf,
+                &final_buf,
+                &params_buf,
+                p,
+            )
+            .expect("dispatch");
+            enc.commit_and_wait().expect("commit");
+            if trial == 0 {
+                let label = if head_dim == 128 {
+                    "gated_delta_net_chunk_inter_state_bf16"
+                } else {
+                    "gated_delta_net_chunk_inter_state_bf16_k256"
+                };
+                eprintln!(
+                    "chunk_state_pipeline {}",
+                    serde_json::to_string(
+                        &registry.pipeline_identity(label).expect("pipeline identity")
+                    )
+                    .expect("serialize pipeline identity")
+                );
+            }
+
+            let h_bytes = h_out_buf.as_slice::<u8>().expect("read h");
+            let v_bytes = v_new_buf.as_slice::<u8>().expect("read v_new");
+            let final_values = final_buf.as_slice::<f32>().expect("read final");
+            for (i, value) in bf16_bytes_to_f32(&h_bytes[..state_elems * 2])
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    value.to_bits(), 1.0f32.to_bits(),
+                    "K={head_dim} trial={trial} first-chunk h[{i}]"
+                );
+            }
+            let first_chunk_values = (BT * H * V) as usize;
+            for (i, value) in bf16_bytes_to_f32(&v_bytes[..first_chunk_values * 2])
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    value.to_bits(), (-1.0f32).to_bits(),
+                    "K={head_dim} trial={trial} first-chunk v_new[{i}] read scaled state"
+                );
+            }
+            assert!(
+                final_values.iter().all(|value| value.is_finite() && *value > 0.0),
+                "K={head_dim} trial={trial} final state must be finite and nonzero"
+            );
+            let current = [
+                h_bytes.to_vec(),
+                v_bytes.to_vec(),
+                final_buf.as_slice::<u8>().expect("read final bytes").to_vec(),
+            ];
+            if let Some(expected) = &baseline {
+                for (name, (actual, expected)) in ["h", "v_new", "final_state"]
+                    .into_iter()
+                    .zip(current.iter().zip(expected.iter()))
+                {
+                    assert!(
+                        actual == expected,
+                        "K={head_dim} trial={trial} reused {name} must be byte-identical"
+                    );
+                }
+            } else {
+                baseline = Some(current);
+            }
+        }
+    }
+}
+
+/// Independent exact recurrence oracle for the K=256 V16 layout. Values vary
+/// across batches, heads, BT rows, V16 boundaries, and all 32 K tiles.
+/// Sparse w selects one old-state cell; k updates every K cell only at each
+/// chunk's first timestep. Thus each dot has one nonzero product, eliminating
+/// reduction-order ambiguity while exercising both MMA phases and chunk two.
+#[test]
+fn test_chunk_inter_state_k256_v16_layout_matches_exact_recurrence() {
+    use mlx_native::ops::chunk_gated_delta_rule_bank_split::dispatch_chunk_inter_state_k256;
+
+    let batches = 2usize;
+    let time = T as usize;
+    let heads = H as usize;
+    let key_heads = HG as usize;
+    let keys = 256usize;
+    let values = V as usize;
+    let chunk = BT as usize;
+    let chunks = time / chunk;
+    let state_index = |b: usize, h: usize, v: usize, k: usize| {
+        ((b * heads + h) * values + v) * keys + k
+    };
+    let value_index = |b: usize, t: usize, h: usize, v: usize| {
+        ((b * time + t) * heads + h) * values + v
+    };
+    let round_bf16 = |value: f32| {
+        let bits = value.to_bits();
+        f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+    };
+    let bf16_bytes = |data: &[f32]| -> Vec<u8> {
+        data.iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
+
+    let mut k_input = vec![0.0f32; batches * time * key_heads * keys];
+    let mut w_input = vec![0.0f32; batches * time * heads * keys];
+    let mut u_input = vec![0.0f32; batches * time * heads * values];
+    let mut initial_state = vec![0.0f32; batches * heads * values * keys];
+    for b in 0..batches {
+        for t in 0..time {
+            if t % chunk == 0 {
+                for kh in 0..key_heads {
+                    for k in 0..keys {
+                        k_input[((b * time + t) * key_heads + kh) * keys + k] =
+                            (1 + b + kh + k % 7) as f32 / 64.0;
+                    }
+                }
+            }
+            for h in 0..heads {
+                let selected_k = (t * 17 + h * 31) % keys;
+                w_input[((b * time + t) * heads + h) * keys + selected_k] = 1.0 / 16.0;
+                for v in 0..values {
+                    u_input[value_index(b, t, h, v)] =
+                        (1 + b * 3 + h * 5 + t % 17 + v % 31 + v / 16) as f32 / 256.0;
+                }
+            }
+        }
+        for h in 0..heads {
+            for v in 0..values {
+                for k in 0..keys {
+                    initial_state[state_index(b, h, v, k)] =
+                        (1 + b * 7 + h * 11 + v % 19 + v / 16 + k % 23) as f32 / 256.0;
+                }
+            }
+        }
+    }
+
+    let mut expected_state = initial_state.clone();
+    let mut expected_h = vec![0.0f32; batches * chunks * heads * values * keys];
+    let mut expected_v = vec![0.0f32; u_input.len()];
+    for b in 0..batches {
+        for c in 0..chunks {
+            let start = c * chunk;
+            for h in 0..heads {
+                let kh = h / (heads / key_heads);
+                for v in 0..values {
+                    for k in 0..keys {
+                        let out = (((b * chunks + c) * heads + h) * values + v) * keys + k;
+                        expected_h[out] = round_bf16(expected_state[state_index(b, h, v, k)]);
+                    }
+                    // All rows read the same chunk-start state, not a state
+                    // updated by an earlier timestep within this chunk.
+                    for t in start..start + chunk {
+                        let selected_k = (t * 17 + h * 31) % keys;
+                        let old = expected_state[state_index(b, h, v, selected_k)];
+                        let out = value_index(b, t, h, v);
+                        expected_v[out] = round_bf16(u_input[out] - old / 16.0);
+                    }
+                    let first_v = expected_v[value_index(b, start, h, v)];
+                    for k in 0..keys {
+                        let index = state_index(b, h, v, k);
+                        let coefficient = k_input[((b * time + start) * key_heads + kh) * keys + k];
+                        // BF16 × BF16 is exact in F32, so this matches the
+                        // sole nonzero outer-update MMA product plus old bh.
+                        expected_state[index] += first_v * coefficient;
+                    }
+                }
+            }
+        }
+    }
+
+    let device = MlxDevice::new().expect("MlxDevice::new");
+    let mut registry = KernelRegistry::new();
+    let k_buf = upload_bf16(&device, &bf16_bytes(&k_input));
+    let w_buf = upload_bf16(&device, &bf16_bytes(&w_input));
+    let u_buf = upload_bf16(&device, &bf16_bytes(&u_input));
+    let g_buf = upload_f32(&device, &vec![0.0; batches * time * heads]);
+    let h0_buf = upload_f32(&device, &initial_state);
+    let h_buf = alloc_zeroed_bf16(&device, expected_h.len());
+    let v_buf = alloc_zeroed_bf16(&device, expected_v.len());
+    let final_buf = upload_f32(&device, &vec![0.0; expected_state.len()]);
+    let p = GatedDeltaNetChunkParams {
+        b: batches as u32,
+        t: T,
+        hg: HG,
+        h: H,
+        k: keys as u32,
+        v: V,
+        bt: BT,
+    };
+    let params = build_gated_delta_net_chunk_params(&device, p).expect("params");
+    let mut encoder = device.command_encoder().expect("encoder");
+    dispatch_chunk_inter_state_k256(
+        &mut encoder, &mut registry, device.metal_device(),
+        &k_buf, &w_buf, &u_buf, &g_buf, &h0_buf,
+        &h_buf, &v_buf, &final_buf, &params, p,
+    )
+    .expect("K256 V16 dispatch");
+    encoder.commit_and_wait().expect("K256 V16 commit");
+    eprintln!(
+        "chunk_state_pipeline {}",
+        serde_json::to_string(
+            &registry
+                .pipeline_identity("gated_delta_net_chunk_inter_state_bf16_k256")
+                .expect("pipeline identity")
+        )
+        .expect("serialize pipeline identity")
+    );
+
+    let got_h = bf16_bytes_to_f32(h_buf.as_slice::<u8>().expect("read h"));
+    let got_v = bf16_bytes_to_f32(v_buf.as_slice::<u8>().expect("read v_new"));
+    let got_state = final_buf.as_slice::<f32>().expect("read final state");
+    for (name, got, expected) in [
+        ("h", got_h.as_slice(), expected_h.as_slice()),
+        ("v_new", got_v.as_slice(), expected_v.as_slice()),
+        ("final_state", got_state, expected_state.as_slice()),
+    ] {
+        assert_eq!(got.len(), expected.len(), "{name} length");
+        for (i, (&actual, &expected)) in got.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(), expected.to_bits(),
+                "K256 V16 {name}[{i}]: got={actual} expected={expected}"
+            );
+        }
+    }
+}
+
 /// Wave 5b.2 iter-1.5 regression: K=192 must be rejected by validate().
 ///
 /// Codex iter-1 audit caught that section 2f's simdgroup_matrix MMA loop

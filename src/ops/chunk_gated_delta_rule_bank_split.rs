@@ -115,6 +115,10 @@ pub const BANK_SPLIT_K: u32 = 256;
 /// Number of K-banks in the iter-15 implementation. K=256 = 2 × MAX_K(128).
 pub const NUM_BANKS: u32 = BANK_SPLIT_K / MAX_K;
 
+// K=256 inter-state geometry only. chunk_o retains its independent V=32 tile.
+const K256_INTER_STATE_BV: u32 = 16;
+const K256_INTER_STATE_THREADS: u64 = 64;
+
 /// Validate inputs for the K-bank-split dispatch. Same shape rules as the
 /// underlying [`ChunkGatedDeltaRuleParams`] except K is locked to 256.
 #[allow(clippy::too_many_arguments)]
@@ -593,16 +597,10 @@ pub fn dispatch_bank_slice_f32(
 /// Sister to [`dispatch_gated_delta_net_chunk_inter_state`] in the K=128
 /// path. Same shape contract except K must equal `BANK_SPLIT_K` (= 256).
 ///
-/// Threadgroup memory budget at K=256, BV=32:
-///   bh tile     : BV × K  × 4 = 32 × 256 × 4 = 32 KB (running f32 state)
-///   bv_stage_bf : BV × BT × 2 = 32 × 64  × 2 =  4 KB
-///   Total: 36 KB
-///
-/// **NOTE (iter 21):** M-series threadgroup-memory cap is 32 KB. This
-/// dispatch WILL FAIL at runtime if device.maxThreadgroupMemoryLength
-/// < 36 KB. Iter 22 may pivot to BV=16 (16 KB bh + 2 KB stage = 18 KB)
-/// or fp16 bh staging if the cap is hit on M5 Max. Shipping this wrapper
-/// to surface the empirical constraint per "code+test==truth".
+/// Threadgroup memory at K=256, BV=16: 16*256*4 bytes of f32 bh plus
+/// 16*64*2 bytes of bf16 stage = 18432 bytes (18 KiB), below 32 KiB.
+/// Two SIMDgroups cover all 64 BT rows and 16 V columns without splitting
+/// any cell's K or BT reduction. chunk_o keeps its own 32-wide V tile.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_chunk_inter_state_k256(
     encoder: &mut CommandEncoder,
@@ -619,8 +617,6 @@ pub fn dispatch_chunk_inter_state_k256(
     params_buf: &MlxBuffer,
     p: crate::ops::gated_delta_net_chunk::GatedDeltaNetChunkParams,
 ) -> Result<()> {
-    use crate::ops::gated_delta_net_chunk::DEFAULT_BV;
-
     if p.k != BANK_SPLIT_K {
         return Err(MlxError::InvalidArgument(format!(
             "dispatch_chunk_inter_state_k256: K ({}) must equal {} exactly. \
@@ -631,12 +627,12 @@ pub fn dispatch_chunk_inter_state_k256(
 
     let pipeline = registry.get_pipeline("gated_delta_net_chunk_inter_state_bf16_k256", device)?;
 
-    let nv_tiles = (p.v / DEFAULT_BV) as u64;
+    let nv_tiles = (p.v / K256_INTER_STATE_BV) as u64;
     let grid_tgs = MTLSize::new(nv_tiles, p.h as u64, p.b as u64);
-    let tg = MTLSize::new(128, 1, 1);
+    let tg = MTLSize::new(K256_INTER_STATE_THREADS, 1, 1);
 
-    let bh_bytes: u64 = (DEFAULT_BV * p.k) as u64 * 4;
-    let bv_stage_bytes: u64 = (DEFAULT_BV * p.bt) as u64 * 2;
+    let bh_bytes: u64 = (K256_INTER_STATE_BV * p.k) as u64 * 4;
+    let bv_stage_bytes: u64 = (K256_INTER_STATE_BV * p.bt) as u64 * 2;
     let shared_bytes = bh_bytes + bv_stage_bytes;
 
     encoder.encode_threadgroups_with_shared(
@@ -1059,13 +1055,9 @@ mod tests {
         );
     }
 
-    /// Iter 21 SMOKE TEST — verify the K=256 native chunk_inter_state
-    /// kernel can be dispatched without runtime error (shmem cap +
-    /// pipeline-state creation). This is the empirical check that the
-    /// 36 KB threadgroup memory budget at K=256, BV=32 fits the device.
-    /// If this test fails with "newComputePipelineState…" or
-    /// "setThreadgroupMemoryLength…" error, iter 22 needs to pivot to
-    /// BV=16 (16 KB bh) or fp16 bh storage.
+    /// The K=256 inter-state dispatch must encode and execute within the
+    /// 32 KiB threadgroup-memory cap. Fail closed on encode/commit errors;
+    /// numerical layout coverage lives in test_gated_delta_net_chunk.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn chunk_inter_state_k256_dispatch_smoke() {
@@ -1074,7 +1066,7 @@ mod tests {
         };
         use crate::{DType, KernelRegistry, MlxDevice};
 
-        // Smallest valid K=256 shape: B=1, T=64=FIXED_BT, Hg=H=1, V=32=DEFAULT_BV.
+        // Keep the original smoke workload: two independent V16 tiles.
         let p = GatedDeltaNetChunkParams {
             b: 1,
             t: FIXED_BT,
@@ -1120,39 +1112,8 @@ mod tests {
             &params_buf, p,
         );
 
-        match result {
-            Ok(()) => {
-                // Dispatch was queued; commit and confirm execution doesn't
-                // panic. Don't validate output values — this is a smoke test
-                // for capability, not numerical parity (iter 22 adds that).
-                let commit = encoder.commit_and_wait();
-                match commit {
-                    Ok(()) => {
-                        eprintln!(
-                            "[iter 21 smoke] K=256 chunk_inter_state \
-                             dispatch SUCCEEDED — shmem budget fits within \
-                             device cap. Native kernel viable."
-                        );
-                    }
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        // Empirical finding: surface the shmem-cap signal if hit.
-                        eprintln!(
-                            "[iter 21 smoke] K=256 chunk_inter_state commit \
-                             FAILED — likely shmem cap exceeded. Error: {msg}"
-                        );
-                        // Don't fail the test — this is an EMPIRICAL probe.
-                        // Iter 22 will use this signal to decide BV=16 pivot.
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[iter 21 smoke] K=256 chunk_inter_state ENCODE failed \
-                     (validation or pipeline creation): {e}"
-                );
-            }
-        }
+        result.expect("K=256 inter-state encode");
+        encoder.commit_and_wait().expect("K=256 inter-state commit");
     }
 
     /// Iter 17 GPU parity test — verify bank_concat_f32 correctly writes

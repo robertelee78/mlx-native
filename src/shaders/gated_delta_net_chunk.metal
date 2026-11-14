@@ -397,6 +397,12 @@ kernel void gated_delta_net_chunk_inter_state_bf16(
             }
         }
 
+        // All SIMDgroups read every bh row in 2a/2b, but the cooperative
+        // scale below overwrites those rows. Finish every reader before
+        // any writer proceeds; a SIMDgroup barrier cannot order other
+        // SIMDgroups, and the post-scale barrier only protects later reads.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         // Scale bh by exp_g_last in place (cooperative across threads).
         for (uint flat = tid; flat < BV * K; flat += TG_THREADS) {
             bh[flat] *= exp_g_last;
