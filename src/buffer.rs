@@ -270,6 +270,62 @@ impl MlxBuffer {
         })
     }
 
+    /// Reinterpret this handle's full logical byte window as flat dense scalars.
+    ///
+    /// This is not a numerical conversion: the returned shape is
+    /// `[data_byte_len() / dtype.size_of()]`, including any capacity beyond the
+    /// source shape but excluding bytes outside this handle's window. Source
+    /// shape arithmetic must fit inside that window; packed quantized tensors
+    /// whose shape describes unpacked elements are not dense scalar views.
+    /// Every current [`DType`] is scalar; packed bytes explicitly described as
+    /// dense `U8` cannot be distinguished from ordinary byte data.
+    ///
+    /// The storage Arc, root authority, residency guard, file mapping, CPU
+    /// writability and absolute byte offset are retained. No GPU allocation,
+    /// copy, conversion or synchronization is performed. The destination size
+    /// must divide the window length and align its absolute byte offset.
+    ///
+    /// # Alias safety
+    ///
+    /// Both handles alias the same bytes. The caller must synchronize CPU/GPU
+    /// accesses and must not retain conflicting typed references. Scratch reuse
+    /// across phases requires nonoverlapping access lifetimes; this method
+    /// establishes no barrier and grants no additional mutation permission.
+    pub fn view_dtype(&self, dtype: DType) -> Result<Self> {
+        let source_bytes = self
+            .shape
+            .iter()
+            .try_fold(self.dtype.size_of(), |bytes, &dim| bytes.checked_mul(dim))
+            .ok_or_else(|| {
+                MlxError::InvalidArgument("Buffer dtype view source shape overflow".into())
+            })?;
+        if source_bytes > self.data_byte_len {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer dtype view requires dense scalars: source shape spans {source_bytes} bytes, exceeding logical data length {}",
+                self.data_byte_len
+            )));
+        }
+        let element_size = dtype.size_of();
+        if self.data_byte_len % element_size != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer dtype view byte length {} is not a multiple of {dtype} element size {element_size}",
+                self.data_byte_len
+            )));
+        }
+        if self.byte_offset % element_size as u64 != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "Buffer dtype view offset {} is not aligned for {dtype}",
+                self.byte_offset
+            )));
+        }
+        self.data_view(
+            0,
+            self.data_byte_len,
+            dtype,
+            vec![self.data_byte_len / element_size],
+        )
+    }
+
     /// Create a zero-copy slice view of this buffer.
     ///
     /// Returns a new `MlxBuffer` that shares the same underlying Metal buffer
@@ -671,5 +727,77 @@ impl fmt::Debug for MlxBuffer {
             .field("byte_offset", &self.byte_offset)
             .field("file_backed", &self.is_file_backed())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MlxDevice;
+
+    #[test]
+    fn view_dtype_preserves_full_window_and_nested_root_lifetime() {
+        let device = MlxDevice::new().unwrap();
+        // Physical/logical byte capacity may exceed the source shape.
+        let mut root = device.alloc_buffer(32, DType::BF16, vec![4]).unwrap();
+        root.as_mut_slice::<u32>().unwrap().copy_from_slice(&[
+            10, 11, 12, 13, 14, 15, 16, 17,
+        ]);
+        let full = root.view_dtype(DType::F32).unwrap();
+        assert_eq!(full.shape(), &[8]);
+        assert_eq!(full.data_byte_len(), 32);
+        assert!(Arc::ptr_eq(&root.storage, &full.storage));
+        assert_eq!(full.backing_snapshot().unwrap(), root.backing_snapshot().unwrap());
+
+        let middle = root.slice_view(4, 8);
+        let nested = middle.slice_view(4, 4);
+        let alias = nested.view_dtype(DType::U32).unwrap();
+        assert_eq!(alias.shape(), &[2]);
+        assert_eq!(alias.byte_offset(), 8);
+        assert_eq!(alias.data_byte_len(), 8);
+        assert_eq!(alias.root_origin_snapshot(), root.root_origin_snapshot());
+        assert!(Arc::ptr_eq(&root.storage, &alias.storage));
+        drop(nested);
+        drop(middle);
+        drop(full);
+        drop(root);
+        assert_eq!(alias.as_logical_slice::<u32>().unwrap(), &[12, 13]);
+    }
+
+    #[test]
+    fn view_dtype_validates_absolute_alignment_and_divisibility() {
+        let device = MlxDevice::new().unwrap();
+        let root = device.alloc_buffer(32, DType::U8, vec![32]).unwrap();
+        assert!(root.slice_view(1, 8).view_dtype(DType::U32).is_err());
+        assert!(root.slice_view(4, 6).view_dtype(DType::F32).is_err());
+        // Relative offsets need not align when their absolute sum does.
+        let nested = root.slice_view(1, 16).slice_view(3, 8);
+        let alias = nested.view_dtype(DType::F32).unwrap();
+        assert_eq!(alias.byte_offset(), 4);
+        assert_eq!(alias.shape(), &[2]);
+        let empty = root.slice_view(32, 0).view_dtype(DType::U32).unwrap();
+        assert_eq!(empty.shape(), &[0]);
+        assert_eq!(empty.data_byte_len(), 0);
+    }
+
+    #[test]
+    fn view_dtype_rejects_packed_shapes_and_overflowing_extents() {
+        let device = MlxDevice::new().unwrap();
+        let mut buffer = device.alloc_buffer(32, DType::U8, vec![32]).unwrap();
+        buffer.shape = vec![256];
+        assert!(buffer.view_dtype(DType::U8).is_err());
+        buffer.shape = vec![usize::MAX, 2];
+        assert!(buffer.view_dtype(DType::U8).is_err());
+        buffer.dtype = DType::F32;
+        buffer.shape = vec![usize::MAX];
+        assert!(buffer.view_dtype(DType::U8).is_err());
+        buffer.dtype = DType::U8;
+        buffer.shape = vec![32];
+        buffer.byte_offset = u64::MAX;
+        assert!(buffer.view_dtype(DType::U8).is_err());
+        buffer.byte_offset = 0;
+        buffer.shape = vec![0];
+        buffer.data_byte_len = usize::MAX;
+        assert!(buffer.view_dtype(DType::U8).is_err());
     }
 }

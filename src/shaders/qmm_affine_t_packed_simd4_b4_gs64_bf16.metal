@@ -5,6 +5,8 @@ using namespace metal;
 // Prepared AF4G64 projection: 64 output rows per storage tile. Code plane:
 // [N / 64][K / 32][64][4 words]. Metadata plane:
 // [N / 64][K / 64][64] packed as BF16 scale | BF16 bias.
+// shape.xyz is M/N/K. Prepare ignores shape.w; only the BF16-output
+// specialization uses it as the host-selected virtual reference split count.
 constant constexpr uint OUTPUT_TILE = 64;
 constant constexpr uint OUTPUTS_PER_SIMDGROUP = 16;
 constant constexpr uint ROWS_PER_TILE = 8;
@@ -114,67 +116,157 @@ kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_impl(
     float2 accumulators[2] = {float2(0.0f), float2(0.0f)};
     device const bfloat *row_table = table + ulong(tile.y) * K * ROWS_PER_TILE;
 
-    for (uint group64 = 0; group64 < groups64; ++group64) {
-        float2 group_accumulators[2] = {float2(0.0f), float2(0.0f)};
-        device const vec<bfloat, 8> *span_table =
-            reinterpret_cast<device const vec<bfloat, 8> *>(
-                row_table + group64 * SPAN_TABLE_VALUES);
+    if (Bf16Output) {
+#pragma clang fp reassociate(off)
+        const uint splits = shape.w;
+        // Canonical K uses floor(split * (K / 256) / splits) * 256.
+        // Round up the unit count for generic K%64, clamping the last unit
+        // to its actual groups so a 64/128/192-input tail is never dropped.
+        const uint units = (groups64 + 3) / 4;
+        for (uint split = 0; split < splits; ++split) {
+            const uint first_group = min((split * units / splits) * 4, groups64);
+            const uint last_group = min(((split + 1) * units / splits) * 4, groups64);
+            float2 partial[2] = {float2(0.0f), float2(0.0f)};
+            for (uint group64 = first_group; group64 < last_group; ++group64) {
+                float scales[2], corrections[2];
 #pragma unroll
-        for (uint group_half = 0; group_half < 2; ++group_half) {
-            const uint group32 = group64 * 2 + group_half;
-            uint4 pairs[2];
+                for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                    const uint output_row =
+                        simdgroup * OUTPUTS_PER_SIMDGROUP +
+                        output_fragment * 8 + matrix.row;
+                    const ulong metadata_row =
+                        (ulong(output_tile) * groups64 + group64) * OUTPUT_TILE +
+                        output_row;
+                    const uint coefficients = metadata[metadata_row];
+                    const float scale =
+                        float(as_type<bfloat>(ushort(coefficients & 0xFFFFu)));
+                    const float bias =
+                        float(as_type<bfloat>(ushort(coefficients >> 16)));
+                    scales[output_fragment] = scale;
+                    corrections[output_fragment] = fma(-128.0f, scale, bias);
+                }
+                device const vec<bfloat, 8> *span_table =
+                    reinterpret_cast<device const vec<bfloat, 8> *>(
+                        row_table + group64 * SPAN_TABLE_VALUES);
+#pragma unroll
+                for (uint group_half = 0; group_half < 2; ++group_half) {
+                    // Four existing eight-wide MMAs, reset for each half.
+                    float2 dot[2] = {float2(0.0f), float2(0.0f)};
+                    const uint group32 = group64 * 2 + group_half;
+                    uint4 pairs[2];
+#pragma unroll
+                    for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                        const uint output_row =
+                            simdgroup * OUTPUTS_PER_SIMDGROUP +
+                            output_fragment * 8 + matrix.row;
+                        const ulong code_row =
+                            (ulong(output_tile) * groups32 + group32) * OUTPUT_TILE +
+                            output_row;
+                        const uint word = codes[code_row * 4 + chunk];
+                        pairs[output_fragment] =
+                            (uint4(word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu;
+                    }
+                    const vec<bfloat, 8> activations =
+                        span_table[(8 * group_half + matrix.row) * 4 + chunk];
+#pragma unroll
+                    for (uint pair = 0; pair < 4; ++pair) {
+                        const bfloat2 activation =
+                            reinterpret_cast<thread const bfloat2 *>(&activations)[pair];
+#pragma unroll
+                        for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                            const bfloat2 weight = as_type<bfloat2>(
+                                pairs[output_fragment][pair] + 0x43004300u);
+                            matrix_multiply_accumulate(dot[output_fragment], weight, activation);
+                        }
+                    }
+#pragma unroll
+                    for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                        partial[output_fragment] = fma(
+                            dot[output_fragment],
+                            float2(scales[output_fragment]),
+                            partial[output_fragment]);
+                    }
+                }
+                // Correction follows the second scale FMA, never the first.
+                const float2 input_sum = *reinterpret_cast<device const float2 *>(
+                    sums + (tile.y * groups64 + group64) * ROWS_PER_TILE + matrix.column);
+#pragma unroll
+                for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                    partial[output_fragment] = fma(
+                        input_sum,
+                        float2(corrections[output_fragment]),
+                        partial[output_fragment]);
+                }
+            }
+#pragma unroll
+            for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                accumulators[output_fragment] += partial[output_fragment];
+            }
+        }
+    } else {
+        // Keep the legacy F32 specialization's original operation order.
+        for (uint group64 = 0; group64 < groups64; ++group64) {
+            float2 group_accumulators[2] = {float2(0.0f), float2(0.0f)};
+            device const vec<bfloat, 8> *span_table =
+                reinterpret_cast<device const vec<bfloat, 8> *>(
+                    row_table + group64 * SPAN_TABLE_VALUES);
+#pragma unroll
+            for (uint group_half = 0; group_half < 2; ++group_half) {
+                const uint group32 = group64 * 2 + group_half;
+                uint4 pairs[2];
+#pragma unroll
+                for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                    const uint output_row =
+                        simdgroup * OUTPUTS_PER_SIMDGROUP +
+                        output_fragment * 8 + matrix.row;
+                    const ulong code_row =
+                        (ulong(output_tile) * groups32 + group32) * OUTPUT_TILE +
+                        output_row;
+                    const uint word = codes[code_row * 4 + chunk];
+                    pairs[output_fragment] =
+                        (uint4(word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu;
+                }
+                const vec<bfloat, 8> activations =
+                    span_table[(8 * group_half + matrix.row) * 4 + chunk];
+#pragma unroll
+                for (uint pair = 0; pair < 4; ++pair) {
+                    const bfloat2 activation =
+                        reinterpret_cast<thread const bfloat2 *>(&activations)[pair];
+#pragma unroll
+                    for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
+                        const bfloat2 weight = as_type<bfloat2>(
+                            pairs[output_fragment][pair] + 0x43004300u);
+                        matrix_multiply_accumulate(
+                            group_accumulators[output_fragment],
+                            weight,
+                            activation);
+                    }
+                }
+            }
+            const float2 input_sum = *reinterpret_cast<device const float2 *>(
+                sums + (tile.y * groups64 + group64) * ROWS_PER_TILE + matrix.column);
 #pragma unroll
             for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
                 const uint output_row =
                     simdgroup * OUTPUTS_PER_SIMDGROUP +
                     output_fragment * 8 + matrix.row;
-                const ulong code_row =
-                    (ulong(output_tile) * groups32 + group32) * OUTPUT_TILE +
+                const ulong metadata_row =
+                    (ulong(output_tile) * groups64 + group64) * OUTPUT_TILE +
                     output_row;
-                const uint word = codes[code_row * 4 + chunk];
-                pairs[output_fragment] =
-                    (uint4(word) >> uint4(0, 4, 8, 12)) & 0x000F000Fu;
+                const uint coefficients = metadata[metadata_row];
+                const float scale =
+                    float(as_type<bfloat>(ushort(coefficients & 0xFFFFu)));
+                const float bias =
+                    float(as_type<bfloat>(ushort(coefficients >> 16)));
+                accumulators[output_fragment] = fma(
+                    group_accumulators[output_fragment],
+                    float2(scale),
+                    accumulators[output_fragment]);
+                accumulators[output_fragment] = fma(
+                    input_sum,
+                    float2(fma(-128.0f, scale, bias)),
+                    accumulators[output_fragment]);
             }
-            const vec<bfloat, 8> activations =
-                span_table[(8 * group_half + matrix.row) * 4 + chunk];
-#pragma unroll
-            for (uint pair = 0; pair < 4; ++pair) {
-                const bfloat2 activation =
-                    reinterpret_cast<thread const bfloat2 *>(&activations)[pair];
-#pragma unroll
-                for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
-                    const bfloat2 weight = as_type<bfloat2>(
-                        pairs[output_fragment][pair] + 0x43004300u);
-                    matrix_multiply_accumulate(
-                        group_accumulators[output_fragment],
-                        weight,
-                        activation);
-                }
-            }
-        }
-        const float2 input_sum = *reinterpret_cast<device const float2 *>(
-            sums + (tile.y * groups64 + group64) * ROWS_PER_TILE + matrix.column);
-#pragma unroll
-        for (uint output_fragment = 0; output_fragment < 2; ++output_fragment) {
-            const uint output_row =
-                simdgroup * OUTPUTS_PER_SIMDGROUP +
-                output_fragment * 8 + matrix.row;
-            const ulong metadata_row =
-                (ulong(output_tile) * groups64 + group64) * OUTPUT_TILE +
-                output_row;
-            const uint coefficients = metadata[metadata_row];
-            const float scale =
-                float(as_type<bfloat>(ushort(coefficients & 0xFFFFu)));
-            const float bias =
-                float(as_type<bfloat>(ushort(coefficients >> 16)));
-            accumulators[output_fragment] = fma(
-                group_accumulators[output_fragment],
-                float2(scale),
-                accumulators[output_fragment]);
-            accumulators[output_fragment] = fma(
-                input_sum,
-                float2(fma(-128.0f, scale, bias)),
-                accumulators[output_fragment]);
         }
     }
 

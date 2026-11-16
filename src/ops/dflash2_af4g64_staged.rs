@@ -10,10 +10,13 @@
 //! wave law of `runtime/ops/LinearGguf.cpp` and the one-pass gate/up pair.
 //! See `src/shaders/dflash2_af4g64_staged.metal` for full attribution.
 //!
-//! Numerics contract: an output's bits depend on its activation row, its
-//! weight row and the run count. The run count is a function of the weight
-//! shape alone, never of the row count, and rows are covered by tiles of 32,
-//! 16 and 8 rows whose rows are bitwise independent of the tile height.
+//! Numerics contract: for a fixed phase and precision, an output's bits depend
+//! on its activation row, its weight row and the run count. The run count is a
+//! function of the weight shape alone, never of the row count, and rows are
+//! covered by tiles of 32, 16 and 8 rows independently of tile height.
+//! Context-prefill BF16 projections use reference32 splits and an unshifted K
+//! walk; BF16 staged/decode projections use reference8 splits and tile spread.
+//! Legacy/F32 projections and gate/up retain reference32 splits.
 
 use metal::MTLSize;
 
@@ -51,6 +54,16 @@ const BF16_GATE_UP_KERNELS: [&str; 3] = [
 ];
 const BF16_REDUCE_KERNEL: &str = "dflash2_af4g64_staged_reduce_precision_bf16";
 const BF16_GATE_UP_REDUCE_KERNEL: &str = "dflash2_af4g64_staged_gate_up_reduce_precision_bf16";
+const PREFILL_PROJECTION_KERNELS: [&str; 3] = [
+    "dflash2_af4g64_prefill_m8",
+    "dflash2_af4g64_prefill_m16",
+    "dflash2_af4g64_prefill_m32",
+];
+const BF16_PREFILL_PROJECTION_KERNELS: [&str; 3] = [
+    "dflash2_af4g64_prefill_m8_precision_bf16",
+    "dflash2_af4g64_prefill_m16_precision_bf16",
+    "dflash2_af4g64_prefill_m32_precision_bf16",
+];
 pub static SOURCE: &str = include_str!("../shaders/dflash2_af4g64_staged.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
@@ -58,6 +71,8 @@ pub fn register(registry: &mut KernelRegistry) {
         .into_iter()
         .chain(GATE_UP_KERNELS)
         .chain([REDUCE_KERNEL, GATE_UP_REDUCE_KERNEL])
+        .chain(PREFILL_PROJECTION_KERNELS)
+        .chain(BF16_PREFILL_PROJECTION_KERNELS)
     {
         registry.register_source(name, SOURCE);
     }
@@ -70,6 +85,17 @@ struct StagedParams {
     n: u32,
     splits: u32,
     spread: u32,
+}
+
+/// Prefill-only ABI: a tile may contain fewer real rows than its MMA height.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PrefillParams {
+    k: u32,
+    n: u32,
+    splits: u32,
+    spread: u32,
+    rows: u32,
 }
 
 #[repr(C)]
@@ -103,12 +129,13 @@ const GATE_UP_PAIR_TILE: Occupancy = Occupancy {
 /// The law is evaluated for one reference device and one row tile so that the
 /// run count, and with it every output bit, is the same on every host and at
 /// every row count.
-const LAW_CORES: u64 = 40;
-const LAW_ROWS: u64 = 32;
+pub(super) const LAW_CORES: u64 = 40;
+const LEGACY_LAW_ROWS: u64 = 32;
+const BF16_DECODE_LAW_ROWS: u64 = 8;
 /// AF4G64 stores 36 bytes per 64 weights: 4.5 bits, in sixteenths.
 const WEIGHT_BITS_16: u64 = 72;
 
-fn staged_time(groups: u64, steps: u64, splits: u32, tile: &Occupancy) -> u64 {
+fn staged_time(groups: u64, steps: u64, splits: u32, tile: &Occupancy, reference_rows: u64) -> u64 {
     let per_core = groups.div_ceil(LAW_CORES);
     let waves = per_core.div_ceil(tile.resident);
     let full = (waves - 1) * tile.resident * LAW_CORES;
@@ -119,14 +146,14 @@ fn staged_time(groups: u64, steps: u64, splits: u32, tile: &Occupancy) -> u64 {
     } * LAW_CORES;
     let step_bits = 64 * 32 * WEIGHT_BITS_16 / 16;
     let partial_bits = if splits > 1 {
-        2 * LAW_ROWS * 64 * 32
+        2 * reference_rows * 64 * 32
     } else {
         0
     };
     steps * step_bits * (full + (groups - full).max(floor)) + groups * partial_bits
 }
 
-fn law_splits(n: u32, k: u32, pair: bool) -> u32 {
+fn law_splits(n: u32, k: u32, pair: bool, reference_rows: u64) -> u32 {
     let tile = if pair {
         &GATE_UP_PAIR_TILE
     } else {
@@ -140,7 +167,7 @@ fn law_splits(n: u32, k: u32, pair: bool) -> u32 {
         }
         let tiles = u64::from(n / 64) * u64::from(splits);
         let groups = if pair { 2 * tiles } else { tiles };
-        let time = staged_time(groups, u64::from(k / 32 / splits), splits, tile);
+        let time = staged_time(groups, u64::from(k / 32 / splits), splits, tile, reference_rows);
         if time < least {
             least = time;
             best = splits;
@@ -149,19 +176,49 @@ fn law_splits(n: u32, k: u32, pair: bool) -> u32 {
     best
 }
 
-/// K runs of a staged `n x k` AF4G64 projection.
+/// K runs of a legacy/F32 staged or any context-prefill `n x k` projection.
 pub fn dflash2_af4g64_staged_splits(n: u32, k: u32) -> u32 {
-    law_splits(n, k, false)
+    law_splits(n, k, false, LEGACY_LAW_ROWS)
+}
+
+/// K runs of a staged/decode projection with explicit logical output precision.
+/// F32 retains reference32; BF16 uses the reference8 wave law. Prefill must use
+/// [`dflash2_af4g64_staged_splits`] instead, including for BF16.
+pub fn dflash2_af4g64_staged_splits_with_precision(
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+) -> u32 {
+    match precision {
+        ActivationPrecision::F32 => dflash2_af4g64_staged_splits(n, k),
+        ActivationPrecision::Bf16 => law_splits(n, k, false, BF16_DECODE_LAW_ROWS),
+    }
 }
 
 /// K runs of a one-pass staged gate/up pair of two `n x k` AF4G64 tensors.
 pub fn dflash2_af4g64_staged_gate_up_splits(n: u32, k: u32) -> u32 {
-    law_splits(n, k, true)
+    law_splits(n, k, true, LEGACY_LAW_ROWS)
 }
 
-/// F32 elements of partial scratch an `m`-row projection needs.
+/// F32 elements of partial scratch a legacy/F32 or context-prefill projection needs.
+/// Prefill accepts any positive `m` and uses the same compact real-row count;
+/// there is no padded-row scratch requirement.
 pub fn dflash2_af4g64_staged_partial_elements(m: u32, n: u32, k: u32) -> usize {
     match dflash2_af4g64_staged_splits(n, k) {
+        1 => 0,
+        splits => splits as usize * m as usize * n as usize,
+    }
+}
+
+/// F32 scratch elements for staged/decode with explicit output precision.
+/// Context prefill uses [`dflash2_af4g64_staged_partial_elements`] instead.
+pub fn dflash2_af4g64_staged_partial_elements_with_precision(
+    m: u32,
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+) -> usize {
+    match dflash2_af4g64_staged_splits_with_precision(n, k, precision) {
         1 => 0,
         splits => splits as usize * m as usize * n as usize,
     }
@@ -177,15 +234,24 @@ pub fn dflash2_af4g64_staged_gate_up_partial_elements(m: u32, n: u32, k: u32) ->
 
 /// Row tiles covering `m` rows: `(first row, kernel index, rows)`.
 fn row_tiles(m: u32) -> impl Iterator<Item = (u32, usize, u32)> {
+    projection_tiles(m, false)
+}
+
+/// Prefill rounds only the final MMA height up, never the logical row count.
+/// A 17-row tail uses one 32-row MMA rather than extra 16- and 8-row dispatches.
+fn projection_tiles(m: u32, prefill: bool) -> impl Iterator<Item = (u32, usize, u32)> {
     let mut first = 0;
     std::iter::from_fn(move || {
         let remaining = m - first;
-        let (kernel, rows) = match remaining {
+        let kernel = match remaining {
             0 => return None,
-            32.. => (2, 32),
-            16.. => (1, 16),
-            _ => (0, 8),
+            17.. if prefill => 2,
+            9.. if prefill => 1,
+            32.. => 2,
+            16.. => 1,
+            _ => 0,
         };
+        let rows = remaining.min([8, 16, 32][kernel]);
         let tile = (first, kernel, rows);
         first += rows;
         Some(tile)
@@ -214,6 +280,15 @@ fn require_geometry(m: u32, n: u32, k: u32) -> Result<()> {
     if m == 0 || m % 8 != 0 || n == 0 || n % 64 != 0 || k == 0 || k % 64 != 0 {
         return Err(MlxError::InvalidArgument(format!(
             "staged AF4G64 requires M % 8 == 0, N % 64 == 0 and K % 64 == 0, got M={m} N={n} K={k}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_prefill_geometry(m: u32, n: u32, k: u32) -> Result<()> {
+    if m == 0 || n == 0 || n % 64 != 0 || k == 0 || k % 64 != 0 {
+        return Err(MlxError::InvalidArgument(format!(
+            "prefill AF4G64 requires M > 0, N % 64 == 0 and K % 64 == 0, got M={m} N={n} K={k}"
         )));
     }
     Ok(())
@@ -279,7 +354,10 @@ pub fn dispatch_dflash2_af4g64_staged(
 ///
 /// `Bf16` rounds only the complete F32 reduction to nearest-even BF16, then
 /// widens exactly into F32 output storage. Split partials remain F32.
-/// Geometry, scratch and barrier contracts match [`dispatch_dflash2_af4g64_staged`].
+/// Geometry and barriers match [`dispatch_dflash2_af4g64_staged`]. Scratch needs
+/// [`dflash2_af4g64_staged_partial_elements_with_precision`] elements for the same
+/// precision. BF16 uses reference8 splits; F32 retains reference32. Both modes
+/// use the tile-spread K walk.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_dflash2_af4g64_staged_with_precision(
     encoder: &mut CommandEncoder,
@@ -295,8 +373,74 @@ pub fn dispatch_dflash2_af4g64_staged_with_precision(
     k: u32,
     precision: ActivationPrecision,
 ) -> Result<()> {
-    require_geometry(m, n, k)?;
-    let splits = dflash2_af4g64_staged_splits(n, k);
+    dispatch_projection(
+        encoder, registry, device, input, weights, metadata, partials, output, m, n, k,
+        precision, false,
+    )
+}
+
+/// Context-prefill projection with explicit logical output precision.
+///
+/// BF16 context prefill walks each K run from its beginning (`spread = 0`);
+/// [`dispatch_dflash2_af4g64_staged_with_precision`] retains the staged/decode
+/// tile-spread walk. `F32` preserves the legacy staged walk and output bits.
+/// Input remains BF16; output and split partial storage remain F32. Any positive
+/// real `m` is supported without padding input/output: the final MMA tile masks
+/// absent input rows and stores only real rows. Shape-only splits, rounding and
+/// barriers retain the reference32 profile. Scratch needs
+/// [`dflash2_af4g64_staged_partial_elements`] with the real `m`: tile blocks are
+/// `[split][real tile row][n]`, with no space reserved for masked rows.
+///
+/// Scratch must not overlap the input, weights, metadata or output during this
+/// operation. Reusing another phase's storage requires the caller to order its
+/// last access before prefill and its next access after prefill completes.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_af4g64_prefill_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MlxBuffer,
+    metadata: &MlxBuffer,
+    partials: &MlxBuffer,
+    output: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+) -> Result<()> {
+    dispatch_projection(
+        encoder, registry, device, input, weights, metadata, partials, output, m, n, k,
+        precision, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_projection(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MlxBuffer,
+    metadata: &MlxBuffer,
+    partials: &MlxBuffer,
+    output: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+    prefill: bool,
+) -> Result<()> {
+    if prefill {
+        require_prefill_geometry(m, n, k)?;
+    } else {
+        require_geometry(m, n, k)?;
+    }
+    let splits = if prefill {
+        dflash2_af4g64_staged_splits(n, k)
+    } else {
+        dflash2_af4g64_staged_splits_with_precision(n, k, precision)
+    };
     let (rows, columns, inputs) = (m as usize, n as usize, k as usize);
     require(
         input,
@@ -314,10 +458,7 @@ pub fn dispatch_dflash2_af4g64_staged_with_precision(
     require(
         partials,
         DType::F32,
-        bytes(
-            &[dflash2_af4g64_staged_partial_elements(m, n, k)],
-            DType::F32,
-        )?,
+        bytes(&[if splits == 1 { 0 } else { splits as usize }, rows, columns], DType::F32)?,
         "partials",
     )?;
     require_tensor_kernel_family(registry, device, TensorKernelFamily::Dflash2Af4g64Staged)?;
@@ -326,23 +467,37 @@ pub fn dispatch_dflash2_af4g64_staged_with_precision(
         k,
         n,
         splits,
-        spread: 1,
+        spread: if prefill && precision == ActivationPrecision::Bf16 { 0 } else { 1 },
     };
-    let (kernels, reduce_kernel) = match precision {
-        ActivationPrecision::F32 => (&PROJECTION_KERNELS, REDUCE_KERNEL),
-        ActivationPrecision::Bf16 => (&BF16_PROJECTION_KERNELS, BF16_REDUCE_KERNEL),
+    let (kernels, masked_kernels, reduce_kernel) = match precision {
+        ActivationPrecision::F32 =>
+            (&PROJECTION_KERNELS, &PREFILL_PROJECTION_KERNELS, REDUCE_KERNEL),
+        ActivationPrecision::Bf16 =>
+            (&BF16_PROJECTION_KERNELS, &BF16_PREFILL_PROJECTION_KERNELS, BF16_REDUCE_KERNEL),
     };
     if precision == ActivationPrecision::Bf16 {
         // The captured pipeline retains the specialized rounding boundary.
         encoder.set_op_kind(crate::encoder::CapturedOpKind::Other);
     }
-    for (first, kernel, _) in row_tiles(m) {
+    for (first, kernel, tile_rows) in projection_tiles(m, prefill) {
+        let masked = prefill && tile_rows != [8, 16, 32][kernel];
+        let prefill_params = PrefillParams {
+            k,
+            n,
+            splits,
+            spread: params.spread,
+            rows: tile_rows,
+        };
+        let params_bytes = if masked { as_bytes(&prefill_params) } else { as_bytes(&params) };
         let first = first as usize;
-        let pipeline = registry.get_pipeline(kernels[kernel], device.metal_device())?;
+        let pipeline = registry.get_pipeline(
+            if masked { masked_kernels[kernel] } else { kernels[kernel] },
+            device.metal_device(),
+        )?;
         encoder.encode_threadgroups_with_args_and_shared(
             pipeline,
             &[
-                (0, KernelArg::Bytes(as_bytes(&params))),
+                (0, KernelArg::Bytes(params_bytes)),
                 (1, KernelArg::Buffer(weights)),
                 (2, KernelArg::Buffer(metadata)),
                 (
@@ -370,7 +525,7 @@ pub fn dispatch_dflash2_af4g64_staged_with_precision(
         return Ok(());
     }
     encoder.memory_barrier();
-    for (first, _, tile_rows) in row_tiles(m) {
+    for (first, _, tile_rows) in projection_tiles(m, prefill) {
         let first = first as usize;
         let reduce = registry.get_pipeline(reduce_kernel, device.metal_device())?;
         let dims = ReduceParams {
@@ -582,6 +737,7 @@ mod tests {
         assert_eq!(dflash2_af4g64_staged_splits(64, 256), 1);
     }
 
+
     #[test]
     fn row_tiles_cover_every_multiple_of_eight() {
         let tiles = |m| row_tiles(m).collect::<Vec<_>>();
@@ -598,6 +754,73 @@ mod tests {
         assert!(require_geometry(8, 96, 64).is_err());
         assert!(require_geometry(8, 64, 96).is_err());
         assert!(require_geometry(24, 128, 128).is_ok());
+    }
+
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn prefill_real_row_tails_match_padded_rows_and_preserve_guards() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        for (n, k) in SHAPES {
+            let weights = weight(&device, n, k, 403);
+            for m in [1_usize, 3, 7, 9, 15, 17, 31, 33, 49] {
+                let x = activations(m, k, 809);
+                // No padded rows are available through this input handle.
+                let input = upload(&device, &x, vec![m, k]);
+                let padded_m = m.div_ceil(32) * 32;
+                let mut padded_x = x.clone();
+                padded_x.resize(padded_m * k, bf16::ZERO);
+                let padded_input = upload(&device, &padded_x, vec![padded_m, k]);
+                let elements =
+                    dflash2_af4g64_staged_partial_elements(m as u32, n as u32, k as u32);
+                let padded_elements =
+                    dflash2_af4g64_staged_partial_elements(padded_m as u32, n as u32, k as u32);
+                for precision in [ActivationPrecision::F32, ActivationPrecision::Bf16] {
+                    let output_root = scratch(&device, (m + 2) * n);
+                    let output = output_root.slice_view((n * 4) as u64, m * n);
+                    let partial_root = scratch(&device, elements + 2 * n);
+                    let partials = partial_root.slice_view((n * 4) as u64, elements);
+                    let padded_output = scratch(&device, padded_m * n);
+                    let padded_partials = scratch(&device, padded_elements);
+                    let mut encoder = device.command_encoder().unwrap();
+                    dispatch_dflash2_af4g64_prefill_with_precision(
+                        &mut encoder, &mut registry, &device, &input, &weights.planes,
+                        &weights.metadata, &partials, &output,
+                        m as u32, n as u32, k as u32, precision,
+                    ).unwrap();
+                    encoder.memory_barrier();
+                    // F32 must retain the legacy arithmetic, even for new tails.
+                    let reference_dispatch = if precision == ActivationPrecision::F32 {
+                        dispatch_dflash2_af4g64_staged_with_precision
+                    } else {
+                        dispatch_dflash2_af4g64_prefill_with_precision
+                    };
+                    reference_dispatch(
+                        &mut encoder, &mut registry, &device, &padded_input, &weights.planes,
+                        &weights.metadata, &padded_partials, &padded_output,
+                        padded_m as u32, n as u32, k as u32, precision,
+                    ).unwrap();
+                    encoder.commit_and_wait().unwrap();
+                    let actual = output.as_slice::<f32>().unwrap();
+                    let expected = &padded_output.as_slice::<f32>().unwrap()[..m * n];
+                    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                        assert!(actual.is_finite());
+                        assert_eq!(
+                            actual.to_bits(), expected.to_bits(),
+                            "{n}x{k} real M={m}, index={index}, {precision:?}"
+                        );
+                    }
+                    let output_bytes = output_root.as_slice::<f32>().unwrap();
+                    assert!(output_bytes[..n].iter().all(|v| v.is_nan()));
+                    assert!(output_bytes[(m + 1) * n..].iter().all(|v| v.is_nan()));
+                    let partial_bytes = partial_root.as_slice::<f32>().unwrap();
+                    assert!(partial_bytes[..n].iter().all(|v| v.is_nan()));
+                    assert!(partial_bytes[n + elements..].iter().all(|v| v.is_nan()));
+                    assert!(partial_bytes[n..n + elements].iter().all(|v| v.is_finite()));
+                }
+            }
+        }
     }
 
     struct Weight {
@@ -1161,18 +1384,36 @@ mod tests {
     fn staged_projection_precision_rounds_after_complete_split_reduction() {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
-        for (n, k) in SHAPES {
+        for (n, k) in SHAPES.into_iter().chain([(6_144, 2_048)]) {
             let splits = dflash2_af4g64_staged_splits(n as u32, k as u32);
             assert_eq!(splits == 1, k == 256);
             let (weights, metadata) = precision_weights(&device, n, k, |_| true);
             for m in [8_usize, 16, 24, 32] {
                 let input = precision_input(&device, m, k, true);
-                let elements = dflash2_af4g64_staged_partial_elements(m as u32, n as u32, k as u32);
-                let partials = scratch(&device, elements);
+                // Each precision owns its profile's exact scratch capacity.
                 let output = scratch(&device, m * n);
                 let mut f32_partials = Vec::new();
                 for mode in [None, Some(ActivationPrecision::F32), Some(ActivationPrecision::Bf16)] {
+                    let precision = mode.unwrap_or(ActivationPrecision::F32);
+                    let profile_splits = dflash2_af4g64_staged_splits_with_precision(
+                        n as u32, k as u32, precision,
+                    );
+                    let elements = dflash2_af4g64_staged_partial_elements_with_precision(
+                        m as u32, n as u32, k as u32, precision,
+                    );
+                    let partials = scratch(&device, elements);
                     let mut encoder = device.command_encoder().unwrap();
+                    if precision == ActivationPrecision::Bf16 && profile_splits > splits {
+                        let legacy_elements = dflash2_af4g64_staged_partial_elements(
+                            m as u32, n as u32, k as u32,
+                        );
+                        let undersized = partials.slice_view(0, legacy_elements);
+                        let error = dispatch_dflash2_af4g64_staged_with_precision(
+                            &mut encoder, &mut registry, &device, &input, &weights, &metadata,
+                            &undersized, &output, m as u32, n as u32, k as u32, precision,
+                        ).unwrap_err();
+                        assert!(matches!(error, MlxError::InvalidArgument(_)));
+                    }
                     if mode == Some(ActivationPrecision::Bf16) {
                         encoder.start_capture();
                         encoder.set_op_kind(crate::encoder::CapturedOpKind::RmsNorm);
@@ -1206,10 +1447,29 @@ mod tests {
                     }
                     let bits: Vec<u32> = partials.as_slice::<f32>().unwrap()[..elements]
                         .iter().map(|v| v.to_bits()).collect();
+                    if profile_splits > 1 {
+                        let values = partials.as_slice::<f32>().unwrap();
+                        for row in 0..m {
+                            let sign = if row % 2 == 1 { -1.0 } else { 1.0 };
+                            let want: f32 = sign * (1.0 + 1.0 / 256.0 + 1.0 / 65_536.0);
+                            let (first, _, height) = row_tiles(m as u32)
+                                .find(|&(first, _, height)| row >= first as usize && row < (first + height) as usize)
+                                .unwrap();
+                            for column in 0..n {
+                                let sum: f32 = (0..profile_splits as usize)
+                                    .map(|split| values[
+                                        first as usize * profile_splits as usize * n
+                                            + split * height as usize * n
+                                            + (row - first as usize) * n + column
+                                    ]).sum();
+                                assert_eq!(sum.to_bits(), want.to_bits(), "partial reduction {mode:?}");
+                            }
+                        }
+                    }
                     if mode.is_none() {
                         f32_partials = bits;
-                    } else {
-                        assert_eq!(bits, f32_partials, "precision must not change split partials");
+                    } else if profile_splits == splits {
+                        assert_eq!(bits, f32_partials, "same-profile partials must be unchanged");
                     }
                 }
             }

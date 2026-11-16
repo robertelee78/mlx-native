@@ -41,6 +41,14 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 **Active development, pre-1.0.** API may change between minor versions (`0.x.0 → 0.(x+1).0` signals breaking changes). Public functions and structs evolve as new model families are added. Patch versions (`0.x.y → 0.x.(y+1)`) are non-breaking.
 
+### Migrating to 0.23
+
+BF16 AF4G64 staged decode projections use a precision-specific split profile.
+Their scratch requirement can exceed the legacy F32 requirement: use
+`dflash2_af4g64_staged_partial_elements_with_precision` with the dispatch's
+precision. The legacy getter remains correct for F32 and context prefill.
+This caller contract change is a minor release, not a patch release.
+
 ### Migrating to 0.22
 
 `MlxError` is now non-exhaustive; downstream matches must retain a wildcard arm.
@@ -80,6 +88,27 @@ or produce wrong values in the existing Q6_K, stock Q8_0 and Class-B Q4_K paths
 Those shader files are byte-identical to 0.21.9; the failures are not claimed
 fixed here, and their cause and relevance to ordinary execution remain open.
 Unqualified experimental rewrites are not included in this release.
+
+### Changelog — unreleased
+
+- BF16 AF4G64 register projections preserve the pinned register kernel's packed
+  accumulation association and split reduction order. Legacy F32 arithmetic is
+  unchanged; requalify BF16 model outputs rather than preserving prior bits.
+- `MlxBuffer::view_dtype` reinterprets a complete logical byte window without
+  copying, with checked span, alignment and divisibility. Root ownership,
+  residency and read-only mapping authority remain attached to the view.
+- `dispatch_dflash2_af4g64_prefill_with_precision` accepts real, unpadded row
+  counts with masked final tiles and caller-owned compact F32 partials. BF16
+  prefill uses reference32 splits and an unshifted K walk; F32 retains the
+  legacy staged walk. Use the legacy staged partial-size getter for prefill.
+- AF4G64 staged/decode projections with explicit BF16 precision now use the
+  reference8 split profile and retain the tile-spread K walk. Callers must size
+  scratch with `dflash2_af4g64_staged_partial_elements_with_precision`; the
+  matching `dflash2_af4g64_staged_splits_with_precision` exposes the run count.
+  This selects four runs for a 6144-by-2048 projection. Legacy/F32 getters and
+  dispatch, context-prefill reference32 splits (BF16 spread0), gate/up, and
+  register projections are unchanged. This profile correction is not a
+  full-model parity or performance qualification.
 
 Supported model families used in production:
 - **Qwen3 / Qwen3.5 / Qwen3.6** (dense + MoE, GGUF)

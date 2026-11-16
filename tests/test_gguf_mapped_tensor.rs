@@ -243,6 +243,32 @@ fn truncated_tensor_payload_is_rejected_before_mmap_access() {
 }
 
 #[test]
+fn dtype_view_retains_readonly_mapping_after_source_drop() {
+    let values = [1.0f32, 4.0, 9.0];
+    let path = std::env::temp_dir().join(format!(
+        "mlx_mapped_gguf_dtype_view_{}.gguf",
+        std::process::id()
+    ));
+    std::fs::write(&path, fixture(&values)).unwrap();
+    let device = MlxDevice::new().unwrap();
+    let gguf = GgufFile::open(&path).unwrap();
+    let input = gguf.load_tensor_mapped("weight.mapped", &device).unwrap();
+    let backing = input.backing_snapshot().unwrap();
+    let mut alias = input.view_dtype(DType::U32).unwrap();
+    assert_eq!(alias.shape(), &[values.len()]);
+    assert_eq!(alias.backing_snapshot().unwrap(), backing);
+    assert!(alias.is_file_backed());
+    assert!(!alias.is_cpu_writable());
+    drop(input);
+    drop(gguf);
+    std::fs::remove_file(path).unwrap();
+    let expected = values.map(f32::to_bits);
+    assert_eq!(alias.as_logical_slice::<u32>().unwrap(), &expected);
+    assert!(alias.as_mut_slice::<u32>().is_err());
+    assert!(alias.as_logical_mut_slice::<u32>().is_err());
+}
+
+#[test]
 fn quantized_logical_view_cannot_cross_packed_tensor_bytes() {
     let path = std::env::temp_dir().join(format!(
         "mlx_mapped_gguf_quantized_{}.gguf",
@@ -257,6 +283,7 @@ fn quantized_logical_view_cannot_cross_packed_tensor_bytes() {
         .expect("map Q2_K tensor");
     assert_eq!(mapped.data_byte_len(), 84);
     assert_eq!(mapped.as_slice::<u8>().expect("read packed Q2_K").len(), 84);
+    assert!(mapped.view_dtype(DType::U8).is_err());
     let error = mapped
         .as_logical_slice::<u8>()
         .expect_err("dequantized element shape must not widen a packed data view");
