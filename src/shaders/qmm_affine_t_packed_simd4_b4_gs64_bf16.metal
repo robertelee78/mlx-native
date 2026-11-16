@@ -91,6 +91,41 @@ kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare(
     }
 }
 
+// Direct typed producer for an already-rounded BF16 activation interface.
+// Keep the F32 preparation kernel above unchanged, including its rounding.
+kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare_bf16(
+    device const bfloat *x         [[buffer(0)]],
+    device bfloat *table           [[buffer(1)]],
+    device float *sums             [[buffer(2)]],
+    constant uint4 &shape          [[buffer(3)]],
+    uint lane                      [[thread_index_in_simdgroup]],
+    uint request_row               [[simdgroup_index_in_threadgroup]],
+    uint2 tile                     [[threadgroup_position_in_grid]]) {
+    const uint M = shape.x;
+    const uint K = shape.z;
+    const uint row = tile.y * ROWS_PER_TILE + request_row;
+    if (row >= M) return;
+    const uint inner = tile.x * SPAN + 2 * lane;
+    const bfloat first = x[ulong(row) * K + inner];
+    const bfloat second = x[ulong(row) * K + inner + 1];
+    const uint2 logical = logical_inner(2 * lane);
+    device bfloat *row_table =
+        table + ulong(tile.y) * K * ROWS_PER_TILE + tile.x * SPAN_TABLE_VALUES;
+    row_table[table_offset(logical.x, logical.y, request_row)] = first;
+    row_table[table_offset(logical.x, logical.y + 1, request_row)] = second;
+
+    float sum = float(first) + float(second);
+    sum += simd_shuffle_xor(sum, 1u);
+    sum += simd_shuffle_xor(sum, 2u);
+    sum += simd_shuffle_xor(sum, 4u);
+    sum += simd_shuffle_xor(sum, 8u);
+    sum += simd_shuffle_xor(sum, 16u);
+    if (lane == 0) {
+        const uint groups64 = K / SPAN;
+        sums[(tile.y * groups64 + tile.x) * ROWS_PER_TILE + request_row] = sum;
+    }
+}
+
 template <bool Bf16Output>
 kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_impl(
     device const bfloat *table     [[buffer(0)]],

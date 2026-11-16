@@ -78,6 +78,10 @@ pub fn register(registry: &mut KernelRegistry) {
         QMM_AFFINE_T_PACKED_SIMD4_B4_GS64_BF16_SHADER_SOURCE,
     );
     registry.register_source(
+        "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare_bf16",
+        QMM_AFFINE_T_PACKED_SIMD4_B4_GS64_BF16_SHADER_SOURCE,
+    );
+    registry.register_source(
         "qmm_affine_t_packed_simd4_b4_gs64_bf16",
         QMM_AFFINE_T_PACKED_SIMD4_B4_GS64_BF16_SHADER_SOURCE,
     );
@@ -785,6 +789,11 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
 /// Reference partitions cover whole 256-input units; a final partial unit is
 /// clamped to K, preserving every accepted K divisible by 64. The F32 arithmetic,
 /// input preparation, scratch requirements and dispatch geometry are unchanged.
+///
+/// F32 input retains its existing preparation and arithmetic. With `Bf16`
+/// output precision, input may instead be physical BF16: its table and sums
+/// are prepared directly, without a temporary F32 widening buffer. F32 output
+/// precision still requires F32 input. Scratch requirements are unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
     encoder: &mut CommandEncoder,
@@ -803,6 +812,7 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
 ) -> Result<()> {
     const OP: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16";
     const PREPARE: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare";
+    const PREPARE_BF16: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare_bf16";
     const GROUP_SIZE: u32 = 64;
     const OUTPUT_TILE: u32 = 64;
     const PACK_FACTOR: u32 = 8;
@@ -826,10 +836,21 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
             "{OP}: N ({n}) must be divisible by {OUTPUT_TILE}"
         )));
     }
-    if x.dtype() != DType::F32 || y.dtype() != DType::F32 {
-        return Err(MlxError::InvalidArgument(format!(
-            "{OP}: x and y must be F32"
-        )));
+    let (prepare_name, input_element_size, input_byte_len) = match (x.dtype(), precision) {
+        (DType::F32, _) => (PREPARE, DType::F32.size_of(), x.byte_len()),
+        (DType::BF16, ActivationPrecision::Bf16) => (
+            PREPARE_BF16,
+            DType::BF16.size_of(),
+            x.data_byte_len(),
+        ),
+        _ => {
+            return Err(MlxError::InvalidArgument(format!(
+                "{OP}: x must be F32, or BF16 with BF16 output precision"
+            )));
+        }
+    };
+    if y.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(format!("{OP}: y must be F32")));
     }
     if table.dtype() != DType::BF16 || sums.dtype() != DType::F32 {
         return Err(MlxError::InvalidArgument(format!(
@@ -863,7 +884,7 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
         .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: metadata size overflows")))?;
     let need_x = m
         .checked_mul(k)
-        .and_then(|count| count.checked_mul(DType::F32.size_of()))
+        .and_then(|count| count.checked_mul(input_element_size))
         .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: x size overflows")))?;
     let need_y = m
         .checked_mul(n)
@@ -887,7 +908,7 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
         .and_then(|count| count.checked_mul(8))
         .and_then(|count| count.checked_mul(DType::F32.size_of()))
         .ok_or_else(|| MlxError::InvalidArgument(format!("{OP}: sums size overflows")))?;
-    if x.byte_len() < need_x
+    if input_byte_len < need_x
         || table.byte_len() < need_table
         || sums.byte_len() < need_sums
         || y.byte_len() < need_y
@@ -900,7 +921,7 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
     }
 
 
-    let prepare = registry.get_pipeline(PREPARE, device)?;
+    let prepare = registry.get_pipeline(prepare_name, device)?;
     if precision == ActivationPrecision::Bf16 {
         // Generic F32 graph fusion cannot represent this rounding boundary.
         encoder.set_op_kind(crate::encoder::CapturedOpKind::Other);
@@ -2221,6 +2242,14 @@ mod tests {
                 x[row * k + 128] = sign * extra;
                 expected.push(sign * (1.0 + fraction + extra));
             }
+            let mut bf16_input = device
+                .alloc_buffer(m * k * 2, DType::BF16, vec![m, k])
+                .unwrap();
+            for (dst, &value) in bf16_input.as_mut_slice::<u16>().unwrap().iter_mut()
+                .zip(input.as_slice::<f32>().unwrap())
+            {
+                *dst = bf16::from_f32(value).to_bits();
+            }
             // Zero scale and unit bias make every weight exactly one.
             let weights = device
                 .alloc_buffer(n * k / 8 * 4, DType::U32, vec![n / 64, k / 32, 64, 4])
@@ -2234,7 +2263,13 @@ mod tests {
                 .unwrap();
             let sums = alloc_f32(&device, m.div_ceil(8) * (k / 64) * 8, vec![m.div_ceil(8), k / 64, 8]);
             let mut output = alloc_f32(&device, m * n, vec![m, n]);
-            for mode in [None, Some(ActivationPrecision::F32), Some(ActivationPrecision::Bf16)] {
+            for (mode, direct_bf16) in [
+                (None, false),
+                (Some(ActivationPrecision::F32), false),
+                (Some(ActivationPrecision::Bf16), false),
+                (Some(ActivationPrecision::Bf16), true),
+            ] {
+                let source = if direct_bf16 { &bf16_input } else { &input };
                 output.as_mut_slice::<f32>().unwrap().fill(f32::NAN);
                 let mut encoder = device.command_encoder().unwrap();
                 if mode == Some(ActivationPrecision::Bf16) {
@@ -2243,7 +2278,7 @@ mod tests {
                 }
                 if let Some(precision) = mode {
                     dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
-                        &mut encoder, &mut registry, device.metal_device(), &input, &table, &sums,
+                        &mut encoder, &mut registry, device.metal_device(), source, &table, &sums,
                         &weights, &metadata, &output, m as u32, n as u32, k as u32, precision,
                     ).unwrap();
                 } else {
@@ -2263,10 +2298,22 @@ mod tests {
                         sum
                     };
                     for &actual in &output.as_slice::<f32>().unwrap()[row * n..(row + 1) * n] {
-                        assert_eq!(actual.to_bits(), want.to_bits(), "N={n} row={row} {mode:?}");
+                        assert_eq!(actual.to_bits(), want.to_bits(), "N={n} row={row} {mode:?} BF16-input={direct_bf16}");
                     }
                 }
             }
+            let short_input = bf16_input.slice_view(0, m * k - 1);
+            let mut encoder = device.command_encoder().unwrap();
+            assert!(dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
+                &mut encoder, &mut registry, device.metal_device(), &short_input, &table, &sums,
+                &weights, &metadata, &output, m as u32, n as u32, k as u32,
+                ActivationPrecision::Bf16,
+            ).is_err(), "BF16 input must be checked against its logical byte extent");
+            assert!(dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
+                &mut encoder, &mut registry, device.metal_device(), &bf16_input, &table, &sums,
+                &weights, &metadata, &output, m as u32, n as u32, k as u32,
+                ActivationPrecision::F32,
+            ).is_err(), "legacy F32 output keeps its F32 input contract");
             // Tie-even, above-tie, negative and odd-mantissa tie are distinct probes.
             assert_eq!(bf16::from_f32(expected[0]).to_f32(), 1.0);
             assert_eq!(bf16::from_f32(expected[1]).to_f32(), 1.0078125);

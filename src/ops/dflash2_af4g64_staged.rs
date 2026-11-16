@@ -135,6 +135,15 @@ const BF16_DECODE_LAW_ROWS: u64 = 8;
 /// AF4G64 stores 36 bytes per 64 weights: 4.5 bits, in sixteenths.
 const WEIGHT_BITS_16: u64 = 72;
 
+/// Select the AF4 decode arithmetic family on the same fixed 40-core reference
+/// device as the staged split law. `rows` consists of complete eight-row decode
+/// tiles and `columns` of complete 64-column AF4 tiles, validated by the caller.
+/// This is the pinned Apple10 narrow-grid law, not a failure-triggered fallback.
+/// Gate/up pairs have their own one-pass plan and do not use this projection law.
+pub fn dflash2_af4g64_decode_uses_register(rows: u32, columns: u32) -> bool {
+    2 * u64::from(columns / 64) * u64::from(rows / 8) < 3 * LAW_CORES
+}
+
 fn staged_time(groups: u64, steps: u64, splits: u32, tile: &Occupancy, reference_rows: u64) -> u64 {
     let per_core = groups.div_ceil(LAW_CORES);
     let waves = per_core.div_ceil(tile.resident);
