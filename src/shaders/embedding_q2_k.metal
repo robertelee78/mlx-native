@@ -18,7 +18,8 @@ struct EmbeddingQ2KParams {
     uint n_tokens;
 };
 
-kernel void embedding_gather_q2_k_f32(
+template <bool BF16_BOUNDARY>
+kernel void embedding_gather_q2_k_impl(
     device const block_q2_K *weights [[buffer(0)]],
     device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -46,7 +47,17 @@ kernel void embedding_gather_q2_k_f32(
         weights[token * p.blocks_per_row + column / QK_K];
     const uchar packed_scale = block.scales[group];
     const uint quant = (block.qs[q_offset] >> shift) & 0x03;
-    output[token_index * p.embed_dim + column] =
-        float(block.d) * float(packed_scale & 0x0f) * float(quant)
+    const float value = float(block.d) * float(packed_scale & 0x0f) * float(quant)
         - float(block.dmin) * float(packed_scale >> 4);
+    output[token_index * p.embed_dim + column] =
+        BF16_BOUNDARY ? float(bfloat(value)) : value;
 }
+
+template [[host_name("embedding_gather_q2_k_f32")]]
+kernel void embedding_gather_q2_k_impl<false>(
+    device const block_q2_K *, device const uint *, device float *,
+    constant EmbeddingQ2KParams &, uint2);
+template [[host_name("embedding_gather_q2_k_f32_bf16_boundary")]]
+kernel void embedding_gather_q2_k_impl<true>(
+    device const block_q2_K *, device const uint *, device float *,
+    constant EmbeddingQ2KParams &, uint2);

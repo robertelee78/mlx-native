@@ -264,6 +264,21 @@ resolver is the same one used by auto dispatch and submits no work.
 See [the GGUF execution capability decision](https://github.com/robertelee78/mlx-native/blob/main/docs/gguf-execution-capability-2026-08-19.md)
 for allocator boundaries and remaining device-proof requirements.
 
+### Logical activation precision
+
+`mlx_native::ops::ActivationPrecision::{F32, Bf16}` selects completed-producer
+precision through explicit `*_with_precision` dispatchers for RMS normalization,
+scalar multiplication, dense/GGUF embedding gathers, dynamic convolution, and
+AF4G64 register/staged projections, including staged gate/up.
+BF16 uses round-to-nearest-even after F32 accumulation, inside the existing
+producer dispatch: no extra activation allocation, copy, or rounding pass.
+Split-reduction partials stay F32; gate/up producers round before SiLU.
+Existing entry points retain their F32 behavior.
+
+Call `CommandEncoder::memory_barrier()` between dependent dispatches as before.
+Precision selection does not change synchronization ownership or establish a
+model's precision policy, numerical conformance, or performance qualification.
+
 ### Normalization
 - `rms_norm` — RMS normalization (f32 + triple-output variants)
 - `l2_norm` — L2 normalization

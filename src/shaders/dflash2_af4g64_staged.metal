@@ -8,8 +8,8 @@
 // Modifications: one affine four-bit format instead of the format templates;
 // mlx-native's prepared AF4G64 planes and dispatch arguments; a split count
 // fixed per weight shape and a separate fixed-order reduce kernel instead of
-// the last-arriving partition's reduce; FP32 projection outputs; exp in the
-// pair's SiLU, taken on the FP32 sums.
+// the last-arriving partition's reduce; FP32 projection storage; selectable
+// logical BF16 producer boundaries and exp in the pair's SiLU.
 //
 // Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
 // root.
@@ -108,7 +108,7 @@ struct Af4Column {
     }
 };
 
-template <ushort Rows>
+template <ushort Rows, bool Bf16Output>
 kernel void dflash2_af4g64_staged_impl(
     constant Af4StagedParams &p     [[buffer(0)]],
     device const uint *codes        [[buffer(1)]],
@@ -157,26 +157,35 @@ kernel void dflash2_af4g64_staged_impl(
         step = next;
     }
 
+    // Split partials stay F32: rounding belongs only to the completed sum.
     device float *destination =
         (p.splits == 1 ? output : partials + ulong(group.x) * Rows * p.n) + origin;
 #pragma unroll
     for (ushort i = 0; i < sum.get_capacity(); ++i) {
         if (!sum.is_valid_element(i)) continue;
         const auto index = sum.get_multidimensional_index(i);
-        destination[ulong(index[1]) * p.n + index[0]] = sum[i];
+        const float value = Bf16Output && p.splits == 1 ? float(bfloat(sum[i])) : sum[i];
+        destination[ulong(index[1]) * p.n + index[0]] = value;
     }
 }
 
-typedef decltype(dflash2_af4g64_staged_impl<32>) dflash2_af4g64_staged_t;
+typedef decltype(dflash2_af4g64_staged_impl<32, false>) dflash2_af4g64_staged_t;
 template [[host_name("dflash2_af4g64_staged_m8")]]
-kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<8>;
+kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<8, false>;
 template [[host_name("dflash2_af4g64_staged_m16")]]
-kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<16>;
+kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<16, false>;
 template [[host_name("dflash2_af4g64_staged_m32")]]
-kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<32>;
+kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<32, false>;
+template [[host_name("dflash2_af4g64_staged_m8_precision_bf16")]]
+kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<8, true>;
+template [[host_name("dflash2_af4g64_staged_m16_precision_bf16")]]
+kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<16, true>;
+template [[host_name("dflash2_af4g64_staged_m32_precision_bf16")]]
+kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<32, true>;
 
 // Adds the runs of one row tile in run order.
-kernel void dflash2_af4g64_staged_reduce(
+template <bool Bf16Output>
+kernel void dflash2_af4g64_staged_reduce_impl(
     device const float *partials    [[buffer(0)]],
     device float *output            [[buffer(1)]],
     constant Af4ReduceParams &p     [[buffer(2)]],
@@ -185,10 +194,21 @@ kernel void dflash2_af4g64_staged_reduce(
     if (i >= elements) return;
     float sum = 0.0f;
     for (uint split = 0; split < p.splits; ++split) sum += partials[ulong(split) * elements + i];
-    output[i] = sum;
+    output[i] = Bf16Output ? float(bfloat(sum)) : sum;
 }
 
+typedef decltype(dflash2_af4g64_staged_reduce_impl<false>) dflash2_af4g64_staged_reduce_t;
+template [[host_name("dflash2_af4g64_staged_reduce")]]
+kernel dflash2_af4g64_staged_reduce_t dflash2_af4g64_staged_reduce_impl<false>;
+template [[host_name("dflash2_af4g64_staged_reduce_precision_bf16")]]
+kernel dflash2_af4g64_staged_reduce_t dflash2_af4g64_staged_reduce_impl<true>;
+
+template <bool Bf16Precision>
 inline bfloat gated(float gate, float up) {
+    if constexpr (Bf16Precision) {
+        gate = float(bfloat(gate));
+        up = float(bfloat(up));
+    }
     return bfloat(gate / (1.0f + exp(-gate)) * up);
 }
 
@@ -197,7 +217,7 @@ inline bfloat gated(float gate, float up) {
 // pair. Each tensor sums its steps in the order of its own projection, and
 // the output is BF16 SiLU(gate) * up. Partials are [split][row][2 * n]: the
 // gate's columns, then the up's.
-template <ushort Rows>
+template <ushort Rows, bool Bf16Precision>
 kernel void dflash2_af4g64_staged_gate_up_impl(
     constant Af4StagedParams &p     [[buffer(0)]],
     device const uint *gate_codes   [[buffer(1)]],
@@ -264,7 +284,7 @@ kernel void dflash2_af4g64_staged_gate_up_impl(
         const auto index = gate.get_multidimensional_index(i);
         const uint row = index[1], column = origin + index[0];
         if (p.splits == 1) {
-            output[ulong(row) * p.n + column] = gated(gate[i], up[i]);
+            output[ulong(row) * p.n + column] = gated<Bf16Precision>(gate[i], up[i]);
         } else {
             device float *partial =
                 partials + (ulong(group.x) * Rows + row) * (2 * p.n) + column;
@@ -274,16 +294,23 @@ kernel void dflash2_af4g64_staged_gate_up_impl(
     }
 }
 
-typedef decltype(dflash2_af4g64_staged_gate_up_impl<32>) dflash2_af4g64_staged_gate_up_t;
+typedef decltype(dflash2_af4g64_staged_gate_up_impl<32, false>) dflash2_af4g64_staged_gate_up_t;
 template [[host_name("dflash2_af4g64_staged_gate_up_m8")]]
-kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<8>;
+kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<8, false>;
 template [[host_name("dflash2_af4g64_staged_gate_up_m16")]]
-kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<16>;
+kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<16, false>;
 template [[host_name("dflash2_af4g64_staged_gate_up_m32")]]
-kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<32>;
+kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<32, false>;
+template [[host_name("dflash2_af4g64_staged_gate_up_m8_precision_bf16")]]
+kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<8, true>;
+template [[host_name("dflash2_af4g64_staged_gate_up_m16_precision_bf16")]]
+kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<16, true>;
+template [[host_name("dflash2_af4g64_staged_gate_up_m32_precision_bf16")]]
+kernel dflash2_af4g64_staged_gate_up_t dflash2_af4g64_staged_gate_up_impl<32, true>;
 
 // Adds the gate and up runs of one row tile in run order and applies the gate.
-kernel void dflash2_af4g64_staged_gate_up_reduce(
+template <bool Bf16Precision>
+kernel void dflash2_af4g64_staged_gate_up_reduce_impl(
     device const float *partials    [[buffer(0)]],
     device bfloat *output           [[buffer(1)]],
     constant Af4ReduceParams &p     [[buffer(2)]],
@@ -297,5 +324,12 @@ kernel void dflash2_af4g64_staged_gate_up_reduce(
         gate += partial[0];
         up += partial[p.n];
     }
-    output[i] = gated(gate, up);
+    output[i] = gated<Bf16Precision>(gate, up);
 }
+
+typedef decltype(dflash2_af4g64_staged_gate_up_reduce_impl<false>)
+    dflash2_af4g64_staged_gate_up_reduce_t;
+template [[host_name("dflash2_af4g64_staged_gate_up_reduce")]]
+kernel dflash2_af4g64_staged_gate_up_reduce_t dflash2_af4g64_staged_gate_up_reduce_impl<false>;
+template [[host_name("dflash2_af4g64_staged_gate_up_reduce_precision_bf16")]]
+kernel dflash2_af4g64_staged_gate_up_reduce_t dflash2_af4g64_staged_gate_up_reduce_impl<true>;

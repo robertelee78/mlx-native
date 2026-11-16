@@ -18,7 +18,8 @@ struct EmbeddingQ5_0Params {
     uint n_tokens;
 };
 
-kernel void embedding_gather_q5_0_f32(
+template <bool BF16_BOUNDARY>
+kernel void embedding_gather_q5_0_impl(
     device const block_q5_0 *weights [[buffer(0)]],
     device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -51,6 +52,16 @@ kernel void embedding_gather_q5_0_f32(
         const uint value_index = lane + (high_nibble ? VALUES_PER_THREAD : 0);
         const uint low = high_nibble ? packed_quant >> 4 : packed_quant & 0x0f;
         const uint quant = low | (((qh >> value_index) & 1) << 4);
-        output[output_base + lane] = scale * (float(quant) - 16.0f);
+        const float value = scale * (float(quant) - 16.0f);
+        output[output_base + lane] = BF16_BOUNDARY ? float(bfloat(value)) : value;
     }
 }
+
+template [[host_name("embedding_gather_q5_0_f32")]]
+kernel void embedding_gather_q5_0_impl<false>(
+    device const block_q5_0 *, device const uint *, device float *,
+    constant EmbeddingQ5_0Params &, uint2);
+template [[host_name("embedding_gather_q5_0_f32_bf16_boundary")]]
+kernel void embedding_gather_q5_0_impl<true>(
+    device const block_q5_0 *, device const uint *, device float *,
+    constant EmbeddingQ5_0Params &, uint2);

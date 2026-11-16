@@ -9,6 +9,7 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::ActivationPrecision;
 use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 
 const KERNEL_BF16: &str = "embedding_gather_bf16_f32";
@@ -50,16 +51,36 @@ pub fn embedding_gather_dense(
     output: &MlxBuffer,
     params: &EmbeddingDenseParams,
 ) -> Result<()> {
+    embedding_gather_dense_with_precision(
+        encoder, registry, device, weight, token_ids, output, params, ActivationPrecision::F32,
+    )
+}
+
+/// Gather selected rows with a completed-producer precision boundary.
+/// BF16 rounds each selected value RNE and widens it into the F32 output.
+pub fn embedding_gather_dense_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    token_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &EmbeddingDenseParams,
+    precision: ActivationPrecision,
+) -> Result<()> {
     if params.vocab_size == 0 || params.embed_dim == 0 || params.n_tokens == 0 {
         return Err(MlxError::InvalidArgument(
             "embedding_dense: all dimensions must be greater than zero".into(),
         ));
     }
-    let kernel = match weight.dtype() {
-        DType::BF16 => KERNEL_BF16,
-        DType::F16 => KERNEL_F16,
-        DType::F32 => KERNEL_F32,
-        other => {
+    let kernel = match (weight.dtype(), precision) {
+        (DType::BF16, ActivationPrecision::F32) => KERNEL_BF16,
+        (DType::F16, ActivationPrecision::F32) => KERNEL_F16,
+        (DType::F32, ActivationPrecision::F32) => KERNEL_F32,
+        (DType::BF16, ActivationPrecision::Bf16) => "embedding_gather_bf16_f32_bf16_boundary",
+        (DType::F16, ActivationPrecision::Bf16) => "embedding_gather_f16_f32_bf16_boundary",
+        (DType::F32, ActivationPrecision::Bf16) => "embedding_gather_f32_f32_bf16_boundary",
+        (other, _) => {
             return Err(MlxError::InvalidArgument(format!(
                 "embedding_dense: weight must be BF16, F16, or F32, got {other:?}"
             )))

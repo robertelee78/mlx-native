@@ -266,6 +266,25 @@ pub fn scalar_mul_f32(
     n_elements: usize,
     scalar: f32,
 ) -> Result<()> {
+    scalar_mul_f32_with_precision(
+        encoder, registry, device, input, output, n_elements, scalar,
+        super::ActivationPrecision::F32,
+    )
+}
+
+/// Multiply F32 values, optionally rounding only the completed product RNE to
+/// BF16 and widening into F32 output. In-place input/output remains supported.
+#[allow(clippy::too_many_arguments)]
+pub fn scalar_mul_f32_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    n_elements: usize,
+    scalar: f32,
+    precision: super::ActivationPrecision,
+) -> Result<()> {
     if n_elements == 0 {
         return Err(MlxError::InvalidArgument(
             "scalar_mul_f32: n_elements must be > 0".into(),
@@ -288,7 +307,11 @@ pub fn scalar_mul_f32(
         )));
     }
 
-    let pipeline = registry.get_pipeline("scalar_mul_f32", device)?;
+    let kernel = match precision {
+        super::ActivationPrecision::F32 => "scalar_mul_f32",
+        super::ActivationPrecision::Bf16 => "scalar_mul_f32_bf16_boundary",
+    };
+    let pipeline = registry.get_pipeline(kernel, device)?;
 
     let gpu_params = GpuScalarMulParams {
         scalar,

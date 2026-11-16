@@ -8,7 +8,7 @@ struct EmbeddingDenseParams {
     uint reserved;
 };
 
-template <typename T>
+template <typename T, bool BF16_BOUNDARY = false>
 inline void embedding_gather_dense_impl(
     device const T *weights,
     device const uint *token_ids,
@@ -25,8 +25,9 @@ inline void embedding_gather_dense_impl(
         output[token_index * p.embed_dim + column] = 0.0f;
         return;
     }
+    const float value = float(weights[token * p.embed_dim + column]);
     output[token_index * p.embed_dim + column] =
-        float(weights[token * p.embed_dim + column]);
+        BF16_BOUNDARY ? float(bfloat(value)) : value;
 }
 
 kernel void embedding_gather_bf16_f32(
@@ -54,4 +55,31 @@ kernel void embedding_gather_f32_f32(
     constant EmbeddingDenseParams &p [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
     embedding_gather_dense_impl(weights, token_ids, output, p, gid);
+}
+
+kernel void embedding_gather_bf16_f32_bf16_boundary(
+    device const bfloat *weights [[buffer(0)]],
+    device const uint *token_ids [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant EmbeddingDenseParams &p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    embedding_gather_dense_impl<bfloat, true>(weights, token_ids, output, p, gid);
+}
+
+kernel void embedding_gather_f16_f32_bf16_boundary(
+    device const half *weights [[buffer(0)]],
+    device const uint *token_ids [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant EmbeddingDenseParams &p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    embedding_gather_dense_impl<half, true>(weights, token_ids, output, p, gid);
+}
+
+kernel void embedding_gather_f32_f32_bf16_boundary(
+    device const float *weights [[buffer(0)]],
+    device const uint *token_ids [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant EmbeddingDenseParams &p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    embedding_gather_dense_impl<float, true>(weights, token_ids, output, p, gid);
 }

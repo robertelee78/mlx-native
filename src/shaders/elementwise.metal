@@ -306,15 +306,24 @@ kernel void scalar_mul_bf16(
 //   2: params — { float scalar; uint count; }
 // --------------------------------------------------------------------------
 
-kernel void scalar_mul_f32(
+template <bool BF16_BOUNDARY>
+kernel void scalar_mul_f32_impl(
     device const float* input  [[buffer(0)]],
     device float*       output [[buffer(1)]],
     constant ScalarMulParams& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.count) return;
-    output[gid] = input[gid] * params.scalar;
+    const float value = input[gid] * params.scalar;
+    output[gid] = BF16_BOUNDARY ? float(bfloat(value)) : value;
 }
+
+template [[host_name("scalar_mul_f32")]]
+kernel void scalar_mul_f32_impl<false>(
+    device const float *, device float *, constant ScalarMulParams &, uint);
+template [[host_name("scalar_mul_f32_bf16_boundary")]]
+kernel void scalar_mul_f32_impl<true>(
+    device const float *, device float *, constant ScalarMulParams &, uint);
 
 // --------------------------------------------------------------------------
 // embedding_gather_scale_f32 — Gather one embedding row and scale it.

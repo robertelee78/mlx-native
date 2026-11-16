@@ -9,7 +9,8 @@ struct DFlash2DynamicConvParams {
     uint stage;
 };
 
-kernel void dflash2_dynamic_conv_f32(
+template <bool BF16_BOUNDARY>
+kernel void dflash2_dynamic_conv_impl(
     device const float *input [[buffer(0)]],
     device const float *dynamic_weights [[buffer(1)]],
     device const bfloat *base_kernel [[buffer(2)]],
@@ -38,5 +39,14 @@ kernel void dflash2_dynamic_conv_f32(
              dynamic_weights[row * dynamic_width + (stage_tap + 1) * params.groups + group]);
     }
     if (params.stage == 1) value += residual[element];
-    output[element] = value;
+    output[element] = BF16_BOUNDARY ? float(bfloat(value)) : value;
 }
+
+template [[host_name("dflash2_dynamic_conv_f32")]]
+kernel void dflash2_dynamic_conv_impl<false>(
+    device const float *, device const float *, device const bfloat *,
+    device const float *, device float *, constant DFlash2DynamicConvParams &, uint);
+template [[host_name("dflash2_dynamic_conv_f32_bf16_boundary")]]
+kernel void dflash2_dynamic_conv_impl<true>(
+    device const float *, device const float *, device const bfloat *,
+    device const float *, device float *, constant DFlash2DynamicConvParams &, uint);

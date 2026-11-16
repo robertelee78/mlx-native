@@ -35,6 +35,7 @@ use crate::dtypes::DType;
 use crate::encoder::{CommandEncoder, KernelArg};
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
+use crate::ops::ActivationPrecision;
 
 pub static QMM_AFFINE_SHADER_SOURCE: &str = include_str!("../shaders/qmm_affine.metal");
 pub static QMM_AFFINE_TILED_SHADER_SOURCE: &str =
@@ -749,6 +750,33 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
     n: u32,
     k: u32,
 ) -> Result<()> {
+    dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
+        encoder, registry, device, x, table, sums, weights, metadata, y, m, n, k,
+        ActivationPrecision::F32,
+    )
+}
+
+/// Prepared register-tile projection with explicit logical output precision.
+///
+/// Accumulation stays F32. `Bf16` rounds the completed reduction to nearest-even
+/// BF16 and widens it into the existing F32 output, without rounding group sums.
+/// Input preparation, scratch requirements and geometry match the F32 API.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    x: &MlxBuffer,
+    table: &MlxBuffer,
+    sums: &MlxBuffer,
+    weights: &MlxBuffer,
+    metadata: &MlxBuffer,
+    y: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+) -> Result<()> {
     const OP: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16";
     const PREPARE: &str = "qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare";
     const GROUP_SIZE: u32 = 64;
@@ -842,6 +870,10 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
 
 
     let prepare = registry.get_pipeline(PREPARE, device)?;
+    if precision == ActivationPrecision::Bf16 {
+        // Generic F32 graph fusion cannot represent this rounding boundary.
+        encoder.set_op_kind(crate::encoder::CapturedOpKind::Other);
+    }
     encoder.encode_threadgroups_with_args(
         prepare,
         &[
@@ -859,7 +891,11 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
     );
     encoder.memory_barrier();
 
-    let pipeline = registry.get_pipeline(OP, device)?;
+    let kernel = match precision {
+        ActivationPrecision::F32 => OP,
+        ActivationPrecision::Bf16 => "qmm_affine_t_packed_simd4_b4_gs64_bf16_precision_bf16",
+    };
+    let pipeline = registry.get_pipeline(kernel, device)?;
     encoder.encode_threadgroups_with_args(
         pipeline,
         &[
@@ -2133,5 +2169,98 @@ mod tests {
             m, n, k, 32, 4,
         );
         assert!(res.is_err(), "should reject u8 weight");
+    }
+
+    #[test]
+    fn qmm_affine_register_precision_rounds_only_completed_outputs() {
+        use half::bf16;
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let (m, k) = (9_usize, 256_usize);
+        for n in [256_usize, 512] {
+            let mut input = alloc_f32(&device, m * k, vec![m, k]);
+            let mut expected = Vec::with_capacity(m);
+            for row in 0..m {
+                let sign = if row % 4 == 2 { -1.0 } else { 1.0 };
+                let fraction = if row % 4 == 3 { 3.0 / 256.0 } else { 1.0 / 256.0 };
+                let extra = if row % 4 == 1 || row % 4 == 2 { 1.0 / 65_536.0 } else { 0.0 };
+                let x = input.as_mut_slice::<f32>().unwrap();
+                x[row * k] = sign;
+                x[row * k + 64] = sign * fraction;
+                x[row * k + 128] = sign * extra;
+                expected.push(sign * (1.0 + fraction + extra));
+            }
+            // Zero scale and unit bias make every weight exactly one.
+            let weights = device
+                .alloc_buffer(n * k / 8 * 4, DType::U32, vec![n / 64, k / 32, 64, 4])
+                .unwrap();
+            let mut metadata = device
+                .alloc_buffer(n * k / 64 * 4, DType::U32, vec![n / 64, k / 64, 64])
+                .unwrap();
+            metadata.as_mut_slice::<u32>().unwrap().fill(u32::from(bf16::ONE.to_bits()) << 16);
+            let table = device
+                .alloc_buffer(m.div_ceil(8) * 8 * k * 2, DType::BF16, vec![m.div_ceil(8), 8, k])
+                .unwrap();
+            let sums = alloc_f32(&device, m.div_ceil(8) * (k / 64) * 8, vec![m.div_ceil(8), k / 64, 8]);
+            let mut output = alloc_f32(&device, m * n, vec![m, n]);
+            for mode in [None, Some(ActivationPrecision::F32), Some(ActivationPrecision::Bf16)] {
+                output.as_mut_slice::<f32>().unwrap().fill(f32::NAN);
+                let mut encoder = device.command_encoder().unwrap();
+                if mode == Some(ActivationPrecision::Bf16) {
+                    encoder.start_capture();
+                    encoder.set_op_kind(crate::encoder::CapturedOpKind::RmsNorm);
+                }
+                if let Some(precision) = mode {
+                    dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
+                        &mut encoder, &mut registry, device.metal_device(), &input, &table, &sums,
+                        &weights, &metadata, &output, m as u32, n as u32, k as u32, precision,
+                    ).unwrap();
+                } else {
+                    dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
+                        &mut encoder, &mut registry, device.metal_device(), &input, &table, &sums,
+                        &weights, &metadata, &output, m as u32, n as u32, k as u32,
+                    ).unwrap();
+                }
+                if mode == Some(ActivationPrecision::Bf16) {
+                    replay_precision_capture(&mut encoder);
+                }
+                encoder.commit_and_wait().unwrap();
+                for (row, &sum) in expected.iter().enumerate() {
+                    let want = if mode == Some(ActivationPrecision::Bf16) {
+                        bf16::from_f32(sum).to_f32()
+                    } else {
+                        sum
+                    };
+                    for &actual in &output.as_slice::<f32>().unwrap()[row * n..(row + 1) * n] {
+                        assert_eq!(actual.to_bits(), want.to_bits(), "N={n} row={row} {mode:?}");
+                    }
+                }
+            }
+            // Tie-even, above-tie, negative and odd-mantissa tie are distinct probes.
+            assert_eq!(bf16::from_f32(expected[0]).to_f32(), 1.0);
+            assert_eq!(bf16::from_f32(expected[1]).to_f32(), 1.0078125);
+            assert_eq!(bf16::from_f32(expected[2]).to_f32(), -1.0078125);
+            assert_eq!(bf16::from_f32(expected[3]).to_f32(), 1.015625);
+        }
+    }
+
+    fn replay_precision_capture(encoder: &mut CommandEncoder) {
+        use crate::encoder::{CapturedNode, CapturedOpKind};
+        for node in encoder.take_capture().unwrap() {
+            match node {
+                CapturedNode::Dispatch {
+                    pipeline, bindings, threads_per_grid, threads_per_threadgroup,
+                    threadgroup_memory, dispatch_kind, op_kind, ..
+                } => {
+                    assert_eq!(op_kind, CapturedOpKind::Other);
+                    encoder.set_op_kind(op_kind);
+                    encoder.replay_dispatch(
+                        &pipeline, &bindings, &threadgroup_memory,
+                        threads_per_grid, threads_per_threadgroup, dispatch_kind,
+                    );
+                }
+                CapturedNode::Barrier => encoder.memory_barrier(),
+            }
+        }
     }
 }

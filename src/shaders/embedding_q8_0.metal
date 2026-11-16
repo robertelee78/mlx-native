@@ -16,7 +16,8 @@ struct EmbeddingQ8_0Params {
     uint n_tokens;
 };
 
-kernel void embedding_gather_q8_0_f32(
+template <bool BF16_BOUNDARY>
+kernel void embedding_gather_q8_0_impl(
     device const block_q8_0 *weights [[buffer(0)]],
     device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -35,6 +36,16 @@ kernel void embedding_gather_q8_0_f32(
 
     device const block_q8_0 &block =
         weights[token * p.blocks_per_row + column / QK8_0];
+    const float value = float(block.d) * float(block.qs[column % QK8_0]);
     output[token_index * p.embed_dim + column] =
-        float(block.d) * float(block.qs[column % QK8_0]);
+        BF16_BOUNDARY ? float(bfloat(value)) : value;
 }
+
+template [[host_name("embedding_gather_q8_0_f32")]]
+kernel void embedding_gather_q8_0_impl<false>(
+    device const block_q8_0 *, device const uint *, device float *,
+    constant EmbeddingQ8_0Params &, uint2);
+template [[host_name("embedding_gather_q8_0_f32_bf16_boundary")]]
+kernel void embedding_gather_q8_0_impl<true>(
+    device const block_q8_0 *, device const uint *, device float *,
+    constant EmbeddingQ8_0Params &, uint2);

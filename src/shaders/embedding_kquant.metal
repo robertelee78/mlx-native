@@ -37,7 +37,8 @@ static inline uchar2 q5_k_scale_min(device const uchar *scales, uint group) {
         (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4));
 }
 
-kernel void embedding_gather_q5_k_f32(
+template <bool BF16_BOUNDARY>
+kernel void embedding_gather_q5_k_impl(
     device const block_q5_K *weights [[buffer(0)]],
     device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -68,11 +69,13 @@ kernel void embedding_gather_q5_k_f32(
         const uchar packed_quant = block.qs[quant_base + lane];
         const uchar low = group & 1 ? packed_quant >> 4 : packed_quant & 0x0f;
         const uchar high = block.qh[lane_base + lane] & high_mask ? 16 : 0;
-        output[output_base + lane] = scale * float(low + high) - minimum;
+        const float value = scale * float(low + high) - minimum;
+        output[output_base + lane] = BF16_BOUNDARY ? float(bfloat(value)) : value;
     }
 }
 
-kernel void embedding_gather_q6_k_f32(
+template <bool BF16_BOUNDARY>
+kernel void embedding_gather_q6_k_impl(
     device const block_q6_K *weights [[buffer(0)]],
     device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -119,6 +122,24 @@ kernel void embedding_gather_q6_k_f32(
         }
         const int quant = int(quant_bits) - 32;
         const float scale = float(block.d) * float(sub_scale);
-        output[output_base + lane] = scale * float(quant);
+        const float value = scale * float(quant);
+        output[output_base + lane] = BF16_BOUNDARY ? float(bfloat(value)) : value;
     }
 }
+
+template [[host_name("embedding_gather_q5_k_f32")]]
+kernel void embedding_gather_q5_k_impl<false>(
+    device const block_q5_K *, device const uint *, device float *,
+    constant EmbeddingKQuantParams &, uint2);
+template [[host_name("embedding_gather_q5_k_f32_bf16_boundary")]]
+kernel void embedding_gather_q5_k_impl<true>(
+    device const block_q5_K *, device const uint *, device float *,
+    constant EmbeddingKQuantParams &, uint2);
+template [[host_name("embedding_gather_q6_k_f32")]]
+kernel void embedding_gather_q6_k_impl<false>(
+    device const block_q6_K *, device const uint *, device float *,
+    constant EmbeddingKQuantParams &, uint2);
+template [[host_name("embedding_gather_q6_k_f32_bf16_boundary")]]
+kernel void embedding_gather_q6_k_impl<true>(
+    device const block_q6_K *, device const uint *, device float *,
+    constant EmbeddingKQuantParams &, uint2);

@@ -10,6 +10,7 @@ use crate::{
 };
 use metal::MTLSize;
 
+use super::ActivationPrecision;
 use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 
 pub const DFLASH2_DYNAMIC_CONV_KERNEL: &str = "dflash2_dynamic_conv_f32";
@@ -91,8 +92,32 @@ pub fn dispatch_dflash2_dynamic_conv_f32(
     base_kernel: &MlxBuffer,
     residual: Option<&MlxBuffer>,
     output: &MlxBuffer,
+    params: DFlash2DynamicConvParams,
+    stage: DFlash2ConvolutionStage,
+) -> Result<()> {
+    dispatch_dflash2_dynamic_conv_f32_with_precision(
+        encoder, registry, device, input, dynamic_weights, base_kernel, residual,
+        output, params, stage, ActivationPrecision::F32,
+    )
+}
+
+/// Encode F32 convolution with an optional RNE BF16 producer boundary widened
+/// into F32 output. Inputs and dynamic coefficients must already have their
+/// intended precision. Round only after both taps and, for the residual stage,
+/// the complete residual sum; there is no intermediate tap/residual rounding.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_dynamic_conv_f32_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    dynamic_weights: &MlxBuffer,
+    base_kernel: &MlxBuffer,
+    residual: Option<&MlxBuffer>,
+    output: &MlxBuffer,
     mut params: DFlash2DynamicConvParams,
     stage: DFlash2ConvolutionStage,
+    precision: ActivationPrecision,
 ) -> Result<()> {
     params.stage = stage as u32;
     if params.lanes == 0
@@ -146,7 +171,11 @@ pub fn dispatch_dflash2_dynamic_conv_f32(
             .collect::<Result<Vec<_>>>()?;
         encoder.set_pending_buffer_ranges(reads, vec![physical_range(output)?]);
     }
-    let pipeline = registry.get_pipeline(DFLASH2_DYNAMIC_CONV_KERNEL, device.metal_device())?;
+    let kernel = match precision {
+        ActivationPrecision::F32 => DFLASH2_DYNAMIC_CONV_KERNEL,
+        ActivationPrecision::Bf16 => "dflash2_dynamic_conv_f32_bf16_boundary",
+    };
+    let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
     let elements = product(&activations)?;
     encode_with_args(
         encoder,

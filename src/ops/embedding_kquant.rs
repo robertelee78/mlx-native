@@ -10,6 +10,7 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::ActivationPrecision;
 use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 
 const QK_K: usize = 256;
@@ -225,6 +226,23 @@ pub fn embedding_gather_q5_k(
     output: &MlxBuffer,
     params: &EmbeddingQ5KParams,
 ) -> Result<()> {
+    embedding_gather_q5_k_with_precision(
+        encoder, registry, device, weight, token_ids, output, params, ActivationPrecision::F32,
+    )
+}
+
+/// Gather Q5_K rows with an optional RNE BF16 output boundary widened to F32.
+#[allow(clippy::too_many_arguments)]
+pub fn embedding_gather_q5_k_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    token_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &EmbeddingQ5KParams,
+    precision: ActivationPrecision,
+) -> Result<()> {
     embedding_gather_kquant(
         encoder,
         registry,
@@ -236,7 +254,10 @@ pub fn embedding_gather_q5_k(
         params.embed_dim,
         params.n_tokens,
         Q5_K_BLOCK_BYTES,
-        Q5_K_KERNEL,
+        match precision {
+            ActivationPrecision::F32 => Q5_K_KERNEL,
+            ActivationPrecision::Bf16 => "embedding_gather_q5_k_f32_bf16_boundary",
+        },
         "embedding_q5_k",
     )
 }
@@ -252,6 +273,23 @@ pub fn embedding_gather_q6_k(
     output: &MlxBuffer,
     params: &EmbeddingQ6KParams,
 ) -> Result<()> {
+    embedding_gather_q6_k_with_precision(
+        encoder, registry, device, weight, token_ids, output, params, ActivationPrecision::F32,
+    )
+}
+
+/// Gather Q6_K rows with an optional RNE BF16 output boundary widened to F32.
+#[allow(clippy::too_many_arguments)]
+pub fn embedding_gather_q6_k_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    token_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &EmbeddingQ6KParams,
+    precision: ActivationPrecision,
+) -> Result<()> {
     embedding_gather_kquant(
         encoder,
         registry,
@@ -263,7 +301,10 @@ pub fn embedding_gather_q6_k(
         params.embed_dim,
         params.n_tokens,
         Q6_K_BLOCK_BYTES,
-        Q6_K_KERNEL,
+        match precision {
+            ActivationPrecision::F32 => Q6_K_KERNEL,
+            ActivationPrecision::Bf16 => "embedding_gather_q6_k_f32_bf16_boundary",
+        },
         "embedding_q6_k",
     )
 }

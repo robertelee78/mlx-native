@@ -15,7 +15,8 @@ using namespace metal;
 /// Threadgroup: (threadgroup_size, 1, 1) — one threadgroup per row
 /// Grid threadgroups: (rows, 1, 1)
 
-kernel void rms_norm_f32(
+template <bool BF16_BOUNDARY>
+kernel void rms_norm_f32_impl(
     device const float *input     [[buffer(0)]],
     device const float *weight    [[buffer(1)]],
     device float       *output    [[buffer(2)]],
@@ -54,9 +55,19 @@ kernel void rms_norm_f32(
 
     // Phase 2: normalize and apply weight
     for (uint i = tid; i < dim; i += tg_size) {
-        output[base + i] = input[base + i] * rms_inv * weight[i];
+        const float value = input[base + i] * rms_inv * weight[i];
+        output[base + i] = BF16_BOUNDARY ? float(bfloat(value)) : value;
     }
 }
+
+template [[host_name("rms_norm_f32")]]
+kernel void rms_norm_f32_impl<false>(
+    device const float *, device const float *, device float *, device const float *,
+    uint, uint, uint, threadgroup float *);
+template [[host_name("rms_norm_f32_bf16_boundary")]]
+kernel void rms_norm_f32_impl<true>(
+    device const float *, device const float *, device float *, device const float *,
+    uint, uint, uint, threadgroup float *);
 
 // ---------------------------------------------------------------------------
 // rms_norm_f32_v2 (ADR-028 iter-310) — peer-pattern port.
@@ -78,7 +89,8 @@ kernel void rms_norm_f32(
 // `min(256, dim.next_power_of_two())` threads.  Shared memory now
 // only needs one float per simdgroup (32 floats max for 1024 threads),
 // vs `tg_size * 4` bytes in scalar.
-kernel void rms_norm_f32_v2(
+template <bool BF16_BOUNDARY>
+kernel void rms_norm_f32_v2_impl(
     device const float4 *input  [[buffer(0)]],
     device const float4 *weight [[buffer(1)]],
     device float4       *output [[buffer(2)]],
@@ -128,9 +140,22 @@ kernel void rms_norm_f32_v2(
 
     // Phase 2: normalize and apply weight, float4 vector store.
     for (uint i = tid; i < dim4; i += tg_size) {
-        output[base4 + i] = (input[base4 + i] * rms_inv) * weight[i];
+        const float4 value = (input[base4 + i] * rms_inv) * weight[i];
+        output[base4 + i] = BF16_BOUNDARY
+            ? float4(float(bfloat(value.x)), float(bfloat(value.y)),
+                     float(bfloat(value.z)), float(bfloat(value.w)))
+            : value;
     }
 }
+
+template [[host_name("rms_norm_f32_v2")]]
+kernel void rms_norm_f32_v2_impl<false>(
+    device const float4 *, device const float4 *, device float4 *, device const float *,
+    uint, uint, uint, ushort, ushort, threadgroup float *);
+template [[host_name("rms_norm_f32_v2_bf16_boundary")]]
+kernel void rms_norm_f32_v2_impl<true>(
+    device const float4 *, device const float4 *, device float4 *, device const float *,
+    uint, uint, uint, ushort, ushort, threadgroup float *);
 
 // ---------------------------------------------------------------------------
 // rms_norm_f32_v2_bf16_out: `rms_norm_f32_v2` whose result is stored as BF16.

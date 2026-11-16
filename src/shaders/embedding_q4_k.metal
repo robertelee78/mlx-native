@@ -30,7 +30,8 @@ static inline uchar2 q4_k_scale_min(
         (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4));
 }
 
-kernel void embedding_gather_q4_k_f32(
+template <bool BF16_BOUNDARY>
+kernel void embedding_gather_q4_k_impl(
     device const block_q4_K *weights [[buffer(0)]],
     device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]],
@@ -65,6 +66,16 @@ kernel void embedding_gather_q4_k_f32(
     for (uint lane = 0; lane < VALUES_PER_THREAD; ++lane) {
         const uchar packed_quant = block.qs[quant_base + lane];
         const uchar quant = group & 1 ? packed_quant >> 4 : packed_quant & 0x0f;
-        output[output_base + lane] = scale * float(quant) - minimum;
+        const float value = scale * float(quant) - minimum;
+        output[output_base + lane] = BF16_BOUNDARY ? float(bfloat(value)) : value;
     }
 }
+
+template [[host_name("embedding_gather_q4_k_f32")]]
+kernel void embedding_gather_q4_k_impl<false>(
+    device const block_q4_K *, device const uint *, device float *,
+    constant EmbeddingQ4KParams &, uint2);
+template [[host_name("embedding_gather_q4_k_f32_bf16_boundary")]]
+kernel void embedding_gather_q4_k_impl<true>(
+    device const block_q4_K *, device const uint *, device float *,
+    constant EmbeddingQ4KParams &, uint2);
