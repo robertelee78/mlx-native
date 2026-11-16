@@ -209,6 +209,14 @@ buffer-owned set retirement.
   a frozen pre-serve calibrated route plan (`dense_matmul_bf16_f32_auto`)
 - **Dense F16**: `dense_gemm_f16`, `dense_matvec_f16`
 
+For prepared Q4_K/Q6_K allocation budgets, call
+`mlx_native::ops::repacked_gguf_mm::repacked_gguf_weight_bytes(n, k, ggml_type)`.
+It shares the constructor's checked layout and includes repacked planes,
+metadata, and eagerly retained split-grid partials, even for serial dispatch.
+Charge the retained raw source backing, allocator rounding/caches, and command
+resources separately. Invalid or unrepresentable layouts return an error before
+allocation; this size is not a device-memory admission decision.
+
 Before an artifact producer or model graph claims a packed-affine route, query
 `packed_affine_capability(PackedAffineRequest)`. The versioned, serializable
 result distinguishes executable scalar fallbacks from routes specialized for
