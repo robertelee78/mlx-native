@@ -91,6 +91,19 @@ Unqualified experimental rewrites are not included in this release.
 
 ### Changelog — unreleased
 
+- **v0.23.1 / BF16 register inputs** — the prepared register projection's
+  `_with_precision` API accepts physical BF16 input with BF16 logical output.
+  It prepares the existing table and sums directly, without an intermediate
+  F32 activation buffer, and validates the BF16 handle's logical byte extent.
+  Existing F32 input arithmetic, preparation and scratch contracts are unchanged;
+  F32 output precision still requires F32 input.
+- **Reference decode plan** —
+  `dflash2_af4g64_decode_uses_register(rows, columns)` exposes the pinned
+  Apple10 narrow-grid arithmetic-family law on the same fixed 40-core reference
+  as the staged split law. Callers supply complete eight-row/64-column tiles.
+  Gate/up pairs retain their separate one-pass plan. This is not a measured
+  performance recommendation for arbitrary devices.
+
 - BF16 AF4G64 register projections preserve the pinned register kernel's packed
   accumulation association and split reduction order. Legacy F32 arithmetic is
   unchanged; requalify BF16 model outputs rather than preserving prior bits.
