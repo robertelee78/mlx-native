@@ -21,6 +21,7 @@ static CACHED_FUSED_POST_FF_NORM2_V2: AtomicI8 = AtomicI8::new(-1);
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::ActivationPrecision;
 use super::encode_helpers::{as_bytes, encode_threadgroups_with_args, KernelArg};
 
 /// MSL source for the RMS norm kernels (embedded at compile time).
@@ -213,6 +214,29 @@ pub fn dispatch_rms_norm(
     rows: u32,
     dim: u32,
 ) -> Result<()> {
+    dispatch_rms_norm_with_precision(
+        encoder, registry, device, input, weight, output, params_buf, rows, dim,
+        ActivationPrecision::F32,
+    )
+}
+
+/// Weighted RMS normalization with an explicit completed-producer boundary.
+/// BF16 mode requires F32 storage, preserves the existing F32 reduction and
+/// epsilon arithmetic, then rounds RNE to BF16 and widens at the output write.
+/// Inputs are consumed as supplied: this does not round inputs or weights.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rms_norm_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+    precision: ActivationPrecision,
+) -> Result<()> {
     if rows == 0 || dim == 0 {
         return Err(MlxError::InvalidArgument(
             "RMS norm rows and dim must be > 0".into(),
@@ -268,6 +292,11 @@ pub fn dispatch_rms_norm(
             input.dtype(), output.dtype(),
         )));
     }
+    if precision == ActivationPrecision::Bf16 && input.dtype() != DType::F32 {
+        return Err(MlxError::InvalidArgument(
+            "RMS norm BF16 boundary requires F32 input, weight, and output storage".into(),
+        ));
+    }
 
     // ADR-028 —float4 + simd_sum variant for F32 path.
     // Requires `dim % 4 == 0`; falls back to scalar when not.
@@ -279,10 +308,16 @@ pub fn dispatch_rms_norm(
         && cached_env_default_true(&CACHED_RMS_NORM_V2, "HF2Q_RMS_NORM_V2");
 
     let kernel_name = if use_v2 {
-        "rms_norm_f32_v2"
+        match precision {
+            ActivationPrecision::F32 => "rms_norm_f32_v2",
+            ActivationPrecision::Bf16 => "rms_norm_f32_v2_bf16_boundary",
+        }
     } else {
         match input.dtype() {
-            DType::F32 => "rms_norm_f32",
+            DType::F32 => match precision {
+                ActivationPrecision::F32 => "rms_norm_f32",
+                ActivationPrecision::Bf16 => "rms_norm_f32_bf16_boundary",
+            },
             DType::F16 => "rms_norm_f16",
             DType::BF16 => "rms_norm_bf16",
             _ => {
@@ -322,7 +357,11 @@ pub fn dispatch_rms_norm(
 
     // Tag for the fusion pass (Phase 4e.2): RMS norm can fuse with a
     // subsequent elementwise multiply.
-    encoder.set_op_kind(CapturedOpKind::RmsNorm);
+    // A following multiply must not fuse across the BF16 producer boundary.
+    encoder.set_op_kind(match precision {
+        ActivationPrecision::F32 => CapturedOpKind::RmsNorm,
+        ActivationPrecision::Bf16 => CapturedOpKind::Other,
+    });
 
     encoder.encode_threadgroups_with_shared(
         pipeline,

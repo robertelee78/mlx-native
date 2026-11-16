@@ -25,6 +25,7 @@ use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 use crate::ops::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
+use crate::ops::ActivationPrecision;
 
 pub const PROJECTION_KERNELS: [&str; 3] = [
     "dflash2_af4g64_staged_m8",
@@ -38,6 +39,18 @@ pub const GATE_UP_KERNELS: [&str; 3] = [
 ];
 pub const REDUCE_KERNEL: &str = "dflash2_af4g64_staged_reduce";
 pub const GATE_UP_REDUCE_KERNEL: &str = "dflash2_af4g64_staged_gate_up_reduce";
+const BF16_PROJECTION_KERNELS: [&str; 3] = [
+    "dflash2_af4g64_staged_m8_precision_bf16",
+    "dflash2_af4g64_staged_m16_precision_bf16",
+    "dflash2_af4g64_staged_m32_precision_bf16",
+];
+const BF16_GATE_UP_KERNELS: [&str; 3] = [
+    "dflash2_af4g64_staged_gate_up_m8_precision_bf16",
+    "dflash2_af4g64_staged_gate_up_m16_precision_bf16",
+    "dflash2_af4g64_staged_gate_up_m32_precision_bf16",
+];
+const BF16_REDUCE_KERNEL: &str = "dflash2_af4g64_staged_reduce_precision_bf16";
+const BF16_GATE_UP_REDUCE_KERNEL: &str = "dflash2_af4g64_staged_gate_up_reduce_precision_bf16";
 pub static SOURCE: &str = include_str!("../shaders/dflash2_af4g64_staged.metal");
 
 pub fn register(registry: &mut KernelRegistry) {
@@ -256,6 +269,32 @@ pub fn dispatch_dflash2_af4g64_staged(
     n: u32,
     k: u32,
 ) -> Result<()> {
+    dispatch_dflash2_af4g64_staged_with_precision(
+        encoder, registry, device, input, weights, metadata, partials, output, m, n, k,
+        ActivationPrecision::F32,
+    )
+}
+
+/// Staged projection with explicit logical output precision.
+///
+/// `Bf16` rounds only the complete F32 reduction to nearest-even BF16, then
+/// widens exactly into F32 output storage. Split partials remain F32.
+/// Geometry, scratch and barrier contracts match [`dispatch_dflash2_af4g64_staged`].
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_af4g64_staged_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MlxBuffer,
+    metadata: &MlxBuffer,
+    partials: &MlxBuffer,
+    output: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+) -> Result<()> {
     require_geometry(m, n, k)?;
     let splits = dflash2_af4g64_staged_splits(n, k);
     let (rows, columns, inputs) = (m as usize, n as usize, k as usize);
@@ -289,9 +328,17 @@ pub fn dispatch_dflash2_af4g64_staged(
         splits,
         spread: 1,
     };
+    let (kernels, reduce_kernel) = match precision {
+        ActivationPrecision::F32 => (&PROJECTION_KERNELS, REDUCE_KERNEL),
+        ActivationPrecision::Bf16 => (&BF16_PROJECTION_KERNELS, BF16_REDUCE_KERNEL),
+    };
+    if precision == ActivationPrecision::Bf16 {
+        // The captured pipeline retains the specialized rounding boundary.
+        encoder.set_op_kind(crate::encoder::CapturedOpKind::Other);
+    }
     for (first, kernel, _) in row_tiles(m) {
         let first = first as usize;
-        let pipeline = registry.get_pipeline(PROJECTION_KERNELS[kernel], device.metal_device())?;
+        let pipeline = registry.get_pipeline(kernels[kernel], device.metal_device())?;
         encoder.encode_threadgroups_with_args_and_shared(
             pipeline,
             &[
@@ -325,7 +372,7 @@ pub fn dispatch_dflash2_af4g64_staged(
     encoder.memory_barrier();
     for (first, _, tile_rows) in row_tiles(m) {
         let first = first as usize;
-        let reduce = registry.get_pipeline(REDUCE_KERNEL, device.metal_device())?;
+        let reduce = registry.get_pipeline(reduce_kernel, device.metal_device())?;
         let dims = ReduceParams {
             rows: tile_rows,
             n,
@@ -376,6 +423,35 @@ pub fn dispatch_dflash2_af4g64_staged_gate_up(
     n: u32,
     k: u32,
 ) -> Result<()> {
+    dispatch_dflash2_af4g64_staged_gate_up_with_precision(
+        encoder, registry, device, input, gate_weights, gate_metadata, up_weights, up_metadata,
+        partials, output, m, n, k, ActivationPrecision::F32,
+    )
+}
+
+/// Fused staged gate/up with explicit logical producer precision.
+///
+/// Both modes accumulate in F32 and round the activation at its BF16 store.
+/// `Bf16` additionally rounds each completed gate and up sum to nearest-even
+/// BF16 before SiLU(gate) * up, after all split partials have been reduced.
+/// `F32` preserves unrounded gate/up sums. Scratch and barriers match the F32 API.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_af4g64_staged_gate_up_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gate_weights: &MlxBuffer,
+    gate_metadata: &MlxBuffer,
+    up_weights: &MlxBuffer,
+    up_metadata: &MlxBuffer,
+    partials: &MlxBuffer,
+    output: &MlxBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    precision: ActivationPrecision,
+) -> Result<()> {
     require_geometry(m, n, k)?;
     let splits = dflash2_af4g64_staged_gate_up_splits(n, k);
     let (rows, columns, inputs) = (m as usize, n as usize, k as usize);
@@ -410,9 +486,17 @@ pub fn dispatch_dflash2_af4g64_staged_gate_up(
         splits,
         spread: 1,
     };
+    let (kernels, reduce_kernel) = match precision {
+        ActivationPrecision::F32 => (&GATE_UP_KERNELS, GATE_UP_REDUCE_KERNEL),
+        ActivationPrecision::Bf16 => (&BF16_GATE_UP_KERNELS, BF16_GATE_UP_REDUCE_KERNEL),
+    };
+    if precision == ActivationPrecision::Bf16 {
+        // Do not expose rounded producers as a generic F32 fusion candidate.
+        encoder.set_op_kind(crate::encoder::CapturedOpKind::Other);
+    }
     for (first, kernel, _) in row_tiles(m) {
         let first = first as usize;
-        let pipeline = registry.get_pipeline(GATE_UP_KERNELS[kernel], device.metal_device())?;
+        let pipeline = registry.get_pipeline(kernels[kernel], device.metal_device())?;
         encoder.encode_threadgroups_with_args_and_shared(
             pipeline,
             &[
@@ -448,7 +532,7 @@ pub fn dispatch_dflash2_af4g64_staged_gate_up(
     encoder.memory_barrier();
     for (first, _, tile_rows) in row_tiles(m) {
         let first = first as usize;
-        let reduce = registry.get_pipeline(GATE_UP_REDUCE_KERNEL, device.metal_device())?;
+        let reduce = registry.get_pipeline(reduce_kernel, device.metal_device())?;
         let dims = ReduceParams {
             rows: tile_rows,
             n,
@@ -1031,6 +1115,194 @@ mod tests {
                         .eq(actual[..m * n].iter().map(|v| v.to_bits())),
                     "{n}x{k} M={m} differs from the 32-row tile"
                 );
+            }
+        }
+    }
+
+    /// Unit weights at input 0; optional unit weights at input 1 and K/2.
+    /// These exact binary probes distinguish final rounding from rounding runs.
+    fn precision_weights(
+        device: &MlxDevice,
+        n: usize,
+        k: usize,
+        fractional: impl Fn(usize) -> bool,
+    ) -> (MlxBuffer, MlxBuffer) {
+        let mut planes = device
+            .alloc_buffer(n * k / 8 * 4, DType::U32, vec![n / 64, k / 32, 64, 4])
+            .unwrap();
+        let words = planes.as_mut_slice::<u32>().unwrap();
+        for column in 0..n {
+            let at = |step| ((column / 64 * (k / 32) + step) * 64 + column % 64) * 4;
+            words[at(0)] = 1 | if fractional(column) { 1 << 16 } else { 0 };
+            if fractional(column) {
+                words[at(k / 64)] = 1;
+            }
+        }
+        let mut metadata = device
+            .alloc_buffer(n * k / 64 * 4, DType::U32, vec![n / 64, k / 64, 64])
+            .unwrap();
+        metadata.as_mut_slice::<u32>().unwrap().fill(u32::from(bf16::ONE.to_bits()));
+        (planes, metadata)
+    }
+
+    fn precision_input(device: &MlxDevice, m: usize, k: usize, signed: bool) -> MlxBuffer {
+        let mut values = vec![bf16::ZERO; m * k];
+        for row in 0..m {
+            let sign = if signed && row % 2 == 1 { -1.0 } else { 1.0 };
+            values[row * k] = bf16::from_f32(sign);
+            values[row * k + 1] = bf16::from_f32(sign / 256.0);
+            values[row * k + k / 2] = bf16::from_f32(sign / 65_536.0);
+        }
+        upload(device, &values, vec![m, k])
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn staged_projection_precision_rounds_after_complete_split_reduction() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        for (n, k) in SHAPES {
+            let splits = dflash2_af4g64_staged_splits(n as u32, k as u32);
+            assert_eq!(splits == 1, k == 256);
+            let (weights, metadata) = precision_weights(&device, n, k, |_| true);
+            for m in [8_usize, 16, 24, 32] {
+                let input = precision_input(&device, m, k, true);
+                let elements = dflash2_af4g64_staged_partial_elements(m as u32, n as u32, k as u32);
+                let partials = scratch(&device, elements);
+                let output = scratch(&device, m * n);
+                let mut f32_partials = Vec::new();
+                for mode in [None, Some(ActivationPrecision::F32), Some(ActivationPrecision::Bf16)] {
+                    let mut encoder = device.command_encoder().unwrap();
+                    if mode == Some(ActivationPrecision::Bf16) {
+                        encoder.start_capture();
+                        encoder.set_op_kind(crate::encoder::CapturedOpKind::RmsNorm);
+                    }
+                    if let Some(precision) = mode {
+                        dispatch_dflash2_af4g64_staged_with_precision(
+                            &mut encoder, &mut registry, &device, &input, &weights, &metadata,
+                            &partials, &output, m as u32, n as u32, k as u32, precision,
+                        ).unwrap();
+                    } else {
+                        dispatch_dflash2_af4g64_staged(
+                            &mut encoder, &mut registry, &device, &input, &weights, &metadata,
+                            &partials, &output, m as u32, n as u32, k as u32,
+                        ).unwrap();
+                    }
+                    if mode == Some(ActivationPrecision::Bf16) {
+                        replay_precision_capture(&mut encoder);
+                    }
+                    encoder.commit_and_wait().unwrap();
+                    for row in 0..m {
+                        let sign = if row % 2 == 1 { -1.0 } else { 1.0 };
+                        let sum = sign * (1.0 + 1.0 / 256.0 + 1.0 / 65_536.0);
+                        let want = if mode == Some(ActivationPrecision::Bf16) {
+                            bf16::from_f32(sum).to_f32()
+                        } else {
+                            sum
+                        };
+                        for &actual in &output.as_slice::<f32>().unwrap()[row * n..(row + 1) * n] {
+                            assert_eq!(actual.to_bits(), want.to_bits(), "{n}x{k} M={m} row={row} {mode:?}");
+                        }
+                    }
+                    let bits: Vec<u32> = partials.as_slice::<f32>().unwrap()[..elements]
+                        .iter().map(|v| v.to_bits()).collect();
+                    if mode.is_none() {
+                        f32_partials = bits;
+                    } else {
+                        assert_eq!(bits, f32_partials, "precision must not change split partials");
+                    }
+                }
+            }
+        }
+        // Rounding the first run's tie before adding the small second run
+        // produces 1.0; rounding the complete sum produces 1.0078125.
+        let early = bf16::from_f32(1.0 + 1.0 / 256.0).to_f32() + 1.0 / 65_536.0;
+        assert_eq!(bf16::from_f32(early).to_f32(), 1.0);
+        assert_eq!(bf16::from_f32(1.0 + 1.0 / 256.0 + 1.0 / 65_536.0).to_f32(), 1.0078125);
+    }
+
+    #[cfg(mlx_native_has_metal_tensor_artifact)]
+    #[test]
+    fn staged_gate_up_precision_rounds_each_producer_before_silu() {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        for (n, k) in SHAPES {
+            let splits = dflash2_af4g64_staged_gate_up_splits(n as u32, k as u32);
+            assert_eq!(splits == 1, k == 256);
+            // Separate columns falsify omitting gate rounding, up rounding, or both.
+            let (gate_weights, gate_metadata) = precision_weights(&device, n, k, |c| c % 3 != 1);
+            let (up_weights, up_metadata) = precision_weights(&device, n, k, |c| c % 3 != 0);
+            for m in [8_usize, 16, 24, 32] {
+                let input = precision_input(&device, m, k, false);
+                let elements = dflash2_af4g64_staged_gate_up_partial_elements(m as u32, n as u32, k as u32);
+                let partials = scratch(&device, elements);
+                let output = device.alloc_buffer(m * n * 2, DType::BF16, vec![m, n]).unwrap();
+                let mut f32_partials = Vec::new();
+                for mode in [None, Some(ActivationPrecision::F32), Some(ActivationPrecision::Bf16)] {
+                    let mut encoder = device.command_encoder().unwrap();
+                    if mode == Some(ActivationPrecision::Bf16) {
+                        encoder.start_capture();
+                        encoder.set_op_kind(crate::encoder::CapturedOpKind::RmsNorm);
+                    }
+                    if let Some(precision) = mode {
+                        dispatch_dflash2_af4g64_staged_gate_up_with_precision(
+                            &mut encoder, &mut registry, &device, &input, &gate_weights, &gate_metadata,
+                            &up_weights, &up_metadata, &partials, &output, m as u32, n as u32, k as u32, precision,
+                        ).unwrap();
+                    } else {
+                        dispatch_dflash2_af4g64_staged_gate_up(
+                            &mut encoder, &mut registry, &device, &input, &gate_weights, &gate_metadata,
+                            &up_weights, &up_metadata, &partials, &output, m as u32, n as u32, k as u32,
+                        ).unwrap();
+                    }
+                    if mode == Some(ActivationPrecision::Bf16) {
+                        replay_precision_capture(&mut encoder);
+                    }
+                    encoder.commit_and_wait().unwrap();
+                    for column in 0..n {
+                        let sum = 1.0_f32 + 1.0 / 256.0 + 1.0 / 65_536.0;
+                        let gate = if column % 3 != 1 { sum } else { 1.0 };
+                        let up = if column % 3 != 0 { sum } else { 1.0 };
+                        let oracle = |g: f32, u: f32| {
+                            bf16::from_f64(silu(f64::from(g)) * f64::from(u))
+                        };
+                        let default = oracle(gate, up);
+                        let rounded = oracle(bf16::from_f32(gate).to_f32(), bf16::from_f32(up).to_f32());
+                        assert_ne!(default.to_bits(), rounded.to_bits(), "probe must expose each boundary");
+                        let want = if mode == Some(ActivationPrecision::Bf16) { rounded } else { default };
+                        for row in 0..m {
+                            assert_eq!(output.as_slice::<bf16>().unwrap()[row * n + column].to_bits(),
+                                want.to_bits(), "{n}x{k} M={m} column={column} {mode:?}");
+                        }
+                    }
+                    let bits: Vec<u32> = partials.as_slice::<f32>().unwrap()[..elements]
+                        .iter().map(|v| v.to_bits()).collect();
+                    if mode.is_none() {
+                        f32_partials = bits;
+                    } else {
+                        assert_eq!(bits, f32_partials, "gate/up partials must stay F32");
+                    }
+                }
+            }
+        }
+    }
+
+    fn replay_precision_capture(encoder: &mut CommandEncoder) {
+        use crate::encoder::{CapturedNode, CapturedOpKind};
+        for node in encoder.take_capture().unwrap() {
+            match node {
+                CapturedNode::Dispatch {
+                    pipeline, bindings, threads_per_grid, threads_per_threadgroup,
+                    threadgroup_memory, dispatch_kind, op_kind, ..
+                } => {
+                    assert_eq!(op_kind, CapturedOpKind::Other);
+                    encoder.set_op_kind(op_kind);
+                    encoder.replay_dispatch(
+                        &pipeline, &bindings, &threadgroup_memory,
+                        threads_per_grid, threads_per_threadgroup, dispatch_kind,
+                    );
+                }
+                CapturedNode::Barrier => encoder.memory_barrier(),
             }
         }
     }

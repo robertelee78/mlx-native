@@ -10,6 +10,7 @@ use crate::encoder::CommandEncoder;
 use crate::error::{MlxError, Result};
 use crate::kernel_registry::KernelRegistry;
 
+use super::ActivationPrecision;
 use super::encode_helpers::{as_bytes, encode_with_args, KernelArg};
 
 const QK5_0: usize = 32;
@@ -82,6 +83,24 @@ pub fn embedding_gather_q5_0(
     token_ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &EmbeddingQ5_0Params,
+) -> Result<()> {
+    embedding_gather_q5_0_with_precision(
+        encoder, registry, device, weight, token_ids, output, params, ActivationPrecision::F32,
+    )
+}
+
+/// Gather Q5_0 rows with an optional RNE BF16 completed-producer boundary
+/// widened into the existing F32 output.
+#[allow(clippy::too_many_arguments)]
+pub fn embedding_gather_q5_0_with_precision(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    token_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &EmbeddingQ5_0Params,
+    precision: ActivationPrecision,
 ) -> Result<()> {
     if params.vocab_size == 0 || params.embed_dim == 0 || params.n_tokens == 0 {
         return Err(MlxError::InvalidArgument(
@@ -198,7 +217,11 @@ pub fn embedding_gather_q5_0(
             MlxError::InvalidArgument("embedding_q5_0: n_tokens exceeds u32".into())
         })?,
     };
-    let pipeline = registry.get_pipeline(KERNEL, device.metal_device())?;
+    let kernel = match precision {
+        ActivationPrecision::F32 => KERNEL,
+        ActivationPrecision::Bf16 => "embedding_gather_q5_0_f32_bf16_boundary",
+    };
+    let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
     encode_with_args(
         encoder,
         pipeline,

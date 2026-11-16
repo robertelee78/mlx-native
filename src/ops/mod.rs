@@ -2,6 +2,9 @@
 //!
 //! Each submodule implements dispatch for a specific kernel family.
 
+pub(crate) mod activation_precision;
+pub use activation_precision::ActivationPrecision;
+
 pub mod argmax;
 pub mod argsort;
 pub mod compute_g_beta;

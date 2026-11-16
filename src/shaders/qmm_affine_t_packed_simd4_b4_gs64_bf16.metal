@@ -89,7 +89,8 @@ kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_prepare(
     }
 }
 
-kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16(
+template <bool Bf16Output>
+kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16_impl(
     device const bfloat *table     [[buffer(0)]],
     device const float *sums       [[buffer(1)]],
     device const uint *codes       [[buffer(2)]],
@@ -183,9 +184,22 @@ kernel void qmm_affine_t_packed_simd4_b4_gs64_bf16(
             output_origin + output_fragment * 8 + matrix.row;
         const uint row0 = row_origin + matrix.column;
         const uint row1 = row0 + 1;
-        if (output < N && row0 < M)
-            y[ulong(row0) * N + output] = accumulators[output_fragment].x;
-        if (output < N && row1 < M)
-            y[ulong(row1) * N + output] = accumulators[output_fragment].y;
+        if (output < N && row0 < M) {
+            const float value = accumulators[output_fragment].x;
+            y[ulong(row0) * N + output] = Bf16Output ? float(bfloat(value)) : value;
+        }
+        if (output < N && row1 < M) {
+            const float value = accumulators[output_fragment].y;
+            y[ulong(row1) * N + output] = Bf16Output ? float(bfloat(value)) : value;
+        }
     }
 }
+
+typedef decltype(qmm_affine_t_packed_simd4_b4_gs64_bf16_impl<false>)
+    qmm_affine_t_packed_simd4_b4_gs64_bf16_t;
+template [[host_name("qmm_affine_t_packed_simd4_b4_gs64_bf16")]]
+kernel qmm_affine_t_packed_simd4_b4_gs64_bf16_t
+    qmm_affine_t_packed_simd4_b4_gs64_bf16_impl<false>;
+template [[host_name("qmm_affine_t_packed_simd4_b4_gs64_bf16_precision_bf16")]]
+kernel qmm_affine_t_packed_simd4_b4_gs64_bf16_t
+    qmm_affine_t_packed_simd4_b4_gs64_bf16_impl<true>;
