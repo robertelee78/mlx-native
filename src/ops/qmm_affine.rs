@@ -727,6 +727,26 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4(
     Ok(())
 }
 
+// Reference register split tiers, evaluated against the same fixed reference
+// core count as the staged law. These select arithmetic association, not a
+// device-dependent dispatch geometry.
+fn register_reference_splits(n: u32, k: u32) -> u32 {
+    use super::dflash2_af4g64_staged::LAW_CORES;
+
+    const TIERS: [(u64, u32, u32); 3] = [(4, 256, 8), (32, 1024, 8), (3, 512, 16)];
+    let mut splits = 1;
+    while (k / 32) % (2 * splits) == 0
+        && TIERS.iter().any(|&(groups, inputs, maximum)| {
+            splits < maximum
+                && u64::from(n / 64) * u64::from(splits) < groups * LAW_CORES
+                && k / (2 * splits) >= inputs
+        })
+    {
+        splits *= 2;
+    }
+    splits
+}
+
 /// Dispatch a prepared AF4G64 register-tile projection.
 ///
 /// `weights` is `[N / 64][K / 32][64][4 u32]`; `metadata` is
@@ -758,9 +778,13 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
 
 /// Prepared register-tile projection with explicit logical output precision.
 ///
-/// Accumulation stays F32. `Bf16` rounds the completed reduction to nearest-even
-/// BF16 and widens it into the existing F32 output, without rounding group sums.
-/// Input preparation, scratch requirements and geometry match the F32 API.
+/// Accumulation stays F32. `Bf16` uses four-MMA 32-input chains, two ordered
+/// scale FMAs then one bias-correction FMA per 64 inputs, and shape-selected
+/// reference partitions added in ascending order. Only the completed reduction
+/// is rounded to nearest-even BF16 and widened into the existing F32 output.
+/// Reference partitions cover whole 256-input units; a final partial unit is
+/// clamped to K, preserving every accepted K divisible by 64. The F32 arithmetic,
+/// input preparation, scratch requirements and dispatch geometry are unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
     encoder: &mut CommandEncoder,
@@ -823,7 +847,14 @@ pub fn dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
         )));
     }
 
-    let params = [m, n, k, GROUP_SIZE];
+    // Both kernels read xyz only for geometry. Prepare ignores w; the legacy
+    // F32 projection also ignores it and retains its original value of 64.
+    // The BF16 projection uses w for sequential virtual reference partitions.
+    let reference_splits = match precision {
+        ActivationPrecision::F32 => GROUP_SIZE,
+        ActivationPrecision::Bf16 => register_reference_splits(n, k),
+    };
+    let params = [m, n, k, reference_splits];
     let m = m as usize;
     let n = n as usize;
     let k = k as usize;
@@ -2241,6 +2272,93 @@ mod tests {
             assert_eq!(bf16::from_f32(expected[1]).to_f32(), 1.0078125);
             assert_eq!(bf16::from_f32(expected[2]).to_f32(), -1.0078125);
             assert_eq!(bf16::from_f32(expected[3]).to_f32(), 1.015625);
+        }
+    }
+
+    #[test]
+    fn qmm_affine_register_preserves_generic_k_tails_for_consumers() {
+        use half::bf16;
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let (m, n) = (9_usize, 128_usize);
+        // Sub-unit K, partial units, uneven canonical partitions (5120), and
+        // the sixteen-partition tier all reach the actual output consumer.
+        for k in [
+            64_usize, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704,
+            768, 832, 960, 1024, 1280, 2048, 5120, 8192,
+        ] {
+            let tail_start = (k - 1) / 256 * 256;
+            let mut values = vec![0.0_f32; m * k];
+            for row in 0..m {
+                let sign = if row % 2 == 0 { 1.0 } else { -1.0 };
+                for inner in 0..k {
+                    let selected = match row % 3 {
+                        0 => inner == k - 1,       // Last input alone.
+                        1 => inner % 64 == 63,    // Every metadata group.
+                        _ => inner >= tail_start, // Entire final unit/tail.
+                    };
+                    if selected {
+                        values[row * k + inner] = sign;
+                    }
+                }
+            }
+            let codes: Vec<u8> = (0..n * k)
+                .map(|index| ((index / k * 3 + index % k * 5 + 1) % 16) as u8)
+                .collect();
+            // Nonzero scale exercises both half-dot scale FMAs. All decoded
+            // weights, inputs and F32 intermediate sums are exactly representable.
+            let scales = vec![bf16::from_f32(0.5).to_bits(); n * k / 64];
+            let biases = vec![bf16::from_f32(-2.0).to_bits(); n * k / 64];
+            let (packed, coefficients) = prepare_af4_g64(&codes, &scales, &biases, n, k);
+            let expected = qmm_affine_t_cpu(
+                &values, &codes, &vec![0.5; scales.len()], &vec![-2.0; biases.len()],
+                m, n, k, 64,
+            );
+            let mut input = alloc_f32(&device, m * k, vec![m, k]);
+            input.as_mut_slice::<f32>().unwrap().copy_from_slice(&values);
+            let mut weights = device
+                .alloc_buffer(packed.len() * 4, DType::U32, vec![n / 64, k / 32, 64, 4])
+                .unwrap();
+            weights.as_mut_slice::<u32>().unwrap().copy_from_slice(&packed);
+            let mut metadata = device
+                .alloc_buffer(coefficients.len() * 4, DType::U32, vec![n / 64, k / 64, 64])
+                .unwrap();
+            metadata.as_mut_slice::<u32>().unwrap().copy_from_slice(&coefficients);
+            let row_tiles = m.div_ceil(8);
+            let table = device
+                .alloc_buffer(row_tiles * 8 * k * 2, DType::BF16, vec![row_tiles, 8, k])
+                .unwrap();
+            let sums = alloc_f32(&device, row_tiles * (k / 64) * 8, vec![row_tiles, k / 64, 8]);
+            let mut output = alloc_f32(&device, m * n, vec![m, n]);
+            let mut consumed = alloc_f32(&device, m * n, vec![m, n]);
+            for precision in [ActivationPrecision::F32, ActivationPrecision::Bf16] {
+                output.as_mut_slice::<f32>().unwrap().fill(f32::NAN);
+                consumed.as_mut_slice::<f32>().unwrap().fill(f32::NAN);
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
+                    &mut encoder, &mut registry, device.metal_device(), &input, &table, &sums,
+                    &weights, &metadata, &output, m as u32, n as u32, k as u32, precision,
+                ).unwrap();
+                encoder.memory_barrier();
+                crate::ops::elementwise::scalar_mul_f32_with_precision(
+                    &mut encoder, &mut registry, device.metal_device(), &output, &consumed,
+                    m * n, 2.0, ActivationPrecision::F32,
+                ).unwrap();
+                encoder.commit_and_wait().unwrap();
+                for (index, (&actual, &sum)) in consumed.as_slice::<f32>().unwrap()
+                    .iter().zip(&expected).enumerate()
+                {
+                    let stored = if precision == ActivationPrecision::Bf16 {
+                        bf16::from_f32(sum).to_f32()
+                    } else {
+                        sum
+                    };
+                    assert_eq!(
+                        actual.to_bits(), (2.0 * stored).to_bits(),
+                        "K={k} row={} output={} {precision:?}", index / n, index % n,
+                    );
+                }
+            }
         }
     }
 

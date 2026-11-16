@@ -9,7 +9,8 @@
 // mlx-native's prepared AF4G64 planes and dispatch arguments; a split count
 // fixed per weight shape and a separate fixed-order reduce kernel instead of
 // the last-arriving partition's reduce; FP32 projection storage; selectable
-// logical BF16 producer boundaries and exp in the pair's SiLU.
+// logical BF16 producer boundaries, masked real-row prefill tails, and exp in
+// the pair's SiLU.
 //
 // Copyright the Splash authors. See LICENSE-APACHE-splash at the repository
 // root.
@@ -24,8 +25,8 @@
 // K. Lane l of a simdgroup dequantizes column l of one 32-input step into the
 // simdgroup's half stage, and the simdgroup multiplies the step's activation
 // slice by the stage with matmul2d. Runs are added in run order by the reduce
-// kernel, so an output's bits depend on its own activation row, its weight
-// row and the split count alone.
+// kernel, so for a fixed phase and precision an output's bits depend on its own
+// activation row, its weight row and the split count alone.
 #pragma clang fp reassociate(off)
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -44,6 +45,30 @@ struct Af4StagedParams {
     uint splits;
     uint spread;
 };
+
+// Separate prefill ABI; legacy kernels keep Af4StagedParams byte-for-byte.
+struct Af4PrefillParams {
+    uint k;
+    uint n;
+    uint splits;
+    uint spread;
+    uint rows;
+};
+
+inline uint projection_rows(constant Af4StagedParams &, uint rows) { return rows; }
+inline uint projection_rows(constant Af4PrefillParams &p, uint) { return p.rows; }
+
+template <ushort Rows, typename Tensor>
+inline auto activation_slice(Tensor x, uint step, constant Af4StagedParams &) {
+    return x.template slice<kStep, Rows>(step * kStep, 0);
+}
+
+template <ushort Rows, typename Tensor>
+inline auto activation_slice(Tensor x, uint step, constant Af4PrefillParams &) {
+    // Dynamic slices retain the real tensor extent. MPP edge checking supplies
+    // zero for absent rows, rather than reading padding or adjacent tensors.
+    return x.slice(step * kStep, 0);
+}
 
 struct Af4ReduceParams {
     uint rows;
@@ -108,9 +133,9 @@ struct Af4Column {
     }
 };
 
-template <ushort Rows, bool Bf16Output>
+template <ushort Rows, bool Bf16Output, typename Params = Af4StagedParams>
 kernel void dflash2_af4g64_staged_impl(
-    constant Af4StagedParams &p     [[buffer(0)]],
+    constant Params &p              [[buffer(0)]],
     device const uint *codes        [[buffer(1)]],
     device const uint *metadata     [[buffer(2)]],
     device bfloat *input            [[buffer(3)]],
@@ -125,16 +150,17 @@ kernel void dflash2_af4g64_staged_impl(
     const uint origin = group.y * 64 + simdgroup * kColumns;
     const uint per = p.k / kStep / p.splits;
     const uint begin = group.x * per, end = begin + per;
+    const uint rows = projection_rows(p, Rows);
 
     auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
-        input, dextents<int32_t, 2>{int(p.k), Rows}, array<int32_t, 2>{1, int(p.k)});
+        input, dextents<int32_t, 2>{int(p.k), int(rows)}, array<int32_t, 2>{1, int(p.k)});
     auto w0 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
         stage0, dextents<int32_t, 2>{kStep, kColumns}, array<int32_t, 2>{1, kStep});
     auto w1 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
         stage1, dextents<int32_t, 2>{kStep, kColumns}, array<int32_t, 2>{1, kStep});
     matmul2d<matmul2d_descriptor(Rows, kColumns, kStep, false, true, false,
         matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<1>> multiply;
-    auto left0 = x.template slice<kStep, Rows>(0, 0);
+    auto left0 = activation_slice<Rows>(x, 0, p);
     auto right0 = w0.template slice<kStep, kColumns>(0, 0);
     auto right1 = w1.template slice<kStep, kColumns>(0, 0);
     auto sum = multiply.template get_destination_cooperative_tensor<
@@ -151,7 +177,7 @@ kernel void dflash2_af4g64_staged_impl(
         simdgroup_barrier(mem_flags::mem_threadgroup);
         const uint next = step + 1 < end ? step + 1 : begin;
         if (walked + 1 < per) column.load(step, next);
-        auto left = x.template slice<kStep, Rows>(step * kStep, 0);
+        auto left = activation_slice<Rows>(x, step, p);
         if (odd) multiply.run(left, right1, sum);
         else multiply.run(left, right0, sum);
         step = next;
@@ -159,11 +185,12 @@ kernel void dflash2_af4g64_staged_impl(
 
     // Split partials stay F32: rounding belongs only to the completed sum.
     device float *destination =
-        (p.splits == 1 ? output : partials + ulong(group.x) * Rows * p.n) + origin;
+        (p.splits == 1 ? output : partials + ulong(group.x) * rows * p.n) + origin;
 #pragma unroll
     for (ushort i = 0; i < sum.get_capacity(); ++i) {
         if (!sum.is_valid_element(i)) continue;
         const auto index = sum.get_multidimensional_index(i);
+        if (index[1] >= rows) continue;
         const float value = Bf16Output && p.splits == 1 ? float(bfloat(sum[i])) : sum[i];
         destination[ulong(index[1]) * p.n + index[0]] = value;
     }
@@ -182,6 +209,20 @@ template [[host_name("dflash2_af4g64_staged_m16_precision_bf16")]]
 kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<16, true>;
 template [[host_name("dflash2_af4g64_staged_m32_precision_bf16")]]
 kernel dflash2_af4g64_staged_t dflash2_af4g64_staged_impl<32, true>;
+
+typedef decltype(dflash2_af4g64_staged_impl<32, false, Af4PrefillParams>) dflash2_af4g64_prefill_t;
+template [[host_name("dflash2_af4g64_prefill_m8")]]
+kernel dflash2_af4g64_prefill_t dflash2_af4g64_staged_impl<8, false, Af4PrefillParams>;
+template [[host_name("dflash2_af4g64_prefill_m16")]]
+kernel dflash2_af4g64_prefill_t dflash2_af4g64_staged_impl<16, false, Af4PrefillParams>;
+template [[host_name("dflash2_af4g64_prefill_m32")]]
+kernel dflash2_af4g64_prefill_t dflash2_af4g64_staged_impl<32, false, Af4PrefillParams>;
+template [[host_name("dflash2_af4g64_prefill_m8_precision_bf16")]]
+kernel dflash2_af4g64_prefill_t dflash2_af4g64_staged_impl<8, true, Af4PrefillParams>;
+template [[host_name("dflash2_af4g64_prefill_m16_precision_bf16")]]
+kernel dflash2_af4g64_prefill_t dflash2_af4g64_staged_impl<16, true, Af4PrefillParams>;
+template [[host_name("dflash2_af4g64_prefill_m32_precision_bf16")]]
+kernel dflash2_af4g64_prefill_t dflash2_af4g64_staged_impl<32, true, Af4PrefillParams>;
 
 // Adds the runs of one row tile in run order.
 template <bool Bf16Output>
