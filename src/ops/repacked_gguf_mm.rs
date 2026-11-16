@@ -4,6 +4,10 @@
 //! rows. Rows are processed in 32-row tiles; the last tile may be partial.
 //! The bits of an output row depend only on that row and the weight: not on
 //! the row count, and not on the row's position among the rows.
+//!
+//! [`repacked_gguf_weight_bytes`] reports the incremental prepared buffer
+//! footprint before device allocation, including eagerly retained split scratch.
+//! It does not count the raw source backing retained by the prepared handle.
 
 use metal::MTLSize;
 
@@ -242,6 +246,94 @@ fn split_grid_row_tiles(n: u32, k: u32, ggml_type: GgmlType, splits: u32) -> u32
     row_tiles
 }
 
+/// Checked allocation and shader-parameter layout shared by sizing and preparation.
+struct PreparedWeightLayout {
+    format: u8,
+    source_bytes: usize,
+    packed_bytes: usize,
+    partial_bytes: usize,
+    total_bytes: usize,
+    plane1_offset: u32,
+    meta_offset: u32,
+    src_row_bytes: u32,
+    threads: usize,
+    splits: u32,
+}
+
+impl PreparedWeightLayout {
+    fn new(n: u32, k: u32, ggml_type: GgmlType) -> Result<Self> {
+        let invalid = |message: &str| MlxError::InvalidArgument(message.into());
+        let format = match ggml_type {
+            GgmlType::Q4_K => 0,
+            GgmlType::Q6_K => 1,
+            other => {
+                return Err(MlxError::InvalidArgument(format!(
+                    "repacked GGUF MM does not support {other:?}"
+                )))
+            }
+        };
+        if n == 0 || k == 0 || n % 64 != 0 || k % 256 != 0 {
+            return Err(MlxError::InvalidArgument(format!(
+                "repacked GGUF MM requires positive N % 64 == 0 and K % 256 == 0, got N={n} K={k}"
+            )));
+        }
+        let rows = n as usize;
+        let groups = k as usize / 32;
+        let threads = rows.checked_mul(groups)
+            .ok_or_else(|| invalid("repacked GGUF thread count overflow"))?;
+        let plane0 = threads.checked_mul(16)
+            .ok_or_else(|| invalid("repacked GGUF plane size overflow"))?;
+        let plane1 = if format == 1 {
+            threads.checked_mul(8)
+                .ok_or_else(|| invalid("repacked GGUF high-bit plane size overflow"))?
+        } else {
+            0
+        };
+        let meta = rows.checked_mul(groups / 8)
+            .and_then(|v| v.checked_mul(if format == 1 { 20 } else { 16 }))
+            .ok_or_else(|| invalid("repacked GGUF metadata size overflow"))?;
+        let meta_start = plane0.checked_add(plane1)
+            .ok_or_else(|| invalid("repacked GGUF meta offset overflow"))?;
+        let plane1_offset = u32::try_from(plane0)
+            .map_err(|_| invalid("repacked GGUF plane offset exceeds u32"))?;
+        let meta_offset = u32::try_from(meta_start)
+            .map_err(|_| invalid("repacked GGUF meta offset exceeds u32"))?;
+        let packed_bytes = meta_start.checked_add(meta)
+            .ok_or_else(|| invalid("repacked GGUF size overflow"))?;
+        let src_row_bytes = (k / 256).checked_mul(ggml_type.block_bytes())
+            .ok_or_else(|| invalid("repacked GGUF source row size overflow"))?;
+        let source_bytes = rows.checked_mul(src_row_bytes as usize)
+            .ok_or_else(|| invalid("repacked GGUF source size overflow"))?;
+        // Offset bounds above also bound the cost-model arithmetic before it runs.
+        let splits = target_splits(n, k, ggml_type);
+        let partial_bytes = if splits > 1 {
+            rows.checked_mul(TILE_ROWS as usize)
+                .and_then(|v| v.checked_mul(splits as usize))
+                .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| invalid("repacked GGUF partial size overflow"))?
+        } else {
+            0
+        };
+        let total_bytes = packed_bytes.checked_add(partial_bytes)
+            .ok_or_else(|| invalid("repacked GGUF allocation size overflow"))?;
+        Ok(Self {
+            format, source_bytes, packed_bytes, partial_bytes, total_bytes,
+            plane1_offset, meta_offset, src_row_bytes, threads, splits,
+        })
+    }
+}
+
+/// Incremental buffer bytes allocated by preparing a Q4_K or Q6_K `[N, K]` weight.
+///
+/// Includes repacked planes, metadata, and eagerly retained F32 split-grid
+/// partials, even when subsequent dispatches use the serial schedule. Excludes
+/// the borrowed raw source backing (which preparation retains), allocator
+/// rounding/cache retention, and command/pipeline resources. No device is needed.
+/// Invalid, unsupported, or unrepresentable layouts return an error.
+pub fn repacked_gguf_weight_bytes(n: u32, k: u32, ggml_type: GgmlType) -> Result<usize> {
+    Ok(PreparedWeightLayout::new(n, k, ggml_type)?.total_bytes)
+}
+
 /// Repack a Q4_K or Q6_K weight `[N, K]` for the prepared MM.
 ///
 /// The result does not depend on a row count; `params.m` is ignored.
@@ -258,26 +350,8 @@ pub fn prepare_repacked_gguf_weight(
             weight.dtype()
         )));
     }
-    let format: u8 = match params.ggml_type {
-        GgmlType::Q4_K => 0,
-        GgmlType::Q6_K => 1,
-        other => {
-            return Err(MlxError::InvalidArgument(format!(
-                "repacked GGUF MM does not support {other:?}"
-            )))
-        }
-    };
-    if params.n % 64 != 0 || params.k % 256 != 0 {
-        return Err(MlxError::InvalidArgument(format!(
-            "repacked GGUF MM requires N % 64 == 0 and K % 256 == 0, got N={} K={}",
-            params.n, params.k
-        )));
-    }
-    let rows = params.n as usize;
-    let source_bytes = rows
-        .checked_mul(params.k as usize / 256)
-        .and_then(|value| value.checked_mul(params.ggml_type.block_bytes() as usize))
-        .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF source size overflow".into()))?;
+    let layout = PreparedWeightLayout::new(params.n, params.k, params.ggml_type)?;
+    let source_bytes = layout.source_bytes;
     if weight.data_byte_len() < source_bytes {
         return Err(MlxError::InvalidArgument(format!(
             "repacked GGUF source needs {source_bytes} bytes, got {}",
@@ -286,58 +360,29 @@ pub fn prepare_repacked_gguf_weight(
     }
     require_tensor_kernel_family(registry, device, TensorKernelFamily::RepackedGgufMm)?;
 
-    let groups = params.k as usize / 32;
-    let plane0 = rows
-        .checked_mul(groups)
-        .and_then(|v| v.checked_mul(16))
-        .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF plane size overflow".into()))?;
-    let plane1 = if format == 1 {
-        rows.checked_mul(groups)
-            .and_then(|v| v.checked_mul(8))
-            .ok_or_else(|| {
-                MlxError::InvalidArgument("repacked GGUF high-bit plane size overflow".into())
-            })?
-    } else {
-        0
-    };
-    let meta = rows
-        .checked_mul(groups / 8)
-        .and_then(|v| v.checked_mul(if format == 1 { 20 } else { 16 }))
-        .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF metadata size overflow".into()))?;
-    let total = plane0
-        .checked_add(plane1)
-        .and_then(|v| v.checked_add(meta))
-        .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF size overflow".into()))?;
-    let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
-    let splits = target_splits(params.n, params.k, params.ggml_type);
-    let partials = if splits > 1 {
-        let shape = vec![splits as usize, TILE_ROWS as usize, params.n as usize];
-        let bytes = shape
-            .iter()
-            .try_fold(std::mem::size_of::<f32>(), |bytes, &extent| {
-                bytes.checked_mul(extent)
-            })
-            .ok_or_else(|| {
-                MlxError::InvalidArgument("repacked GGUF partial size overflow".into())
-            })?;
-        Some(device.alloc_buffer(bytes, DType::F32, shape)?)
+    let bytes = device.alloc_buffer(
+        layout.packed_bytes, DType::U8, vec![layout.packed_bytes],
+    )?;
+    let splits = layout.splits;
+    let partials = if layout.partial_bytes > 0 {
+        Some(device.alloc_buffer(
+            layout.partial_bytes,
+            DType::F32,
+            vec![splits as usize, TILE_ROWS as usize, params.n as usize],
+        )?)
     } else {
         None
     };
     let p = RepackParams {
         rows: params.n,
         input_size: params.k,
-        format: u32::from(format),
-        plane1_offset: u32::try_from(plane0).map_err(|_| {
-            MlxError::InvalidArgument("repacked GGUF plane offset exceeds u32".into())
-        })?,
-        meta_offset: u32::try_from(plane0 + plane1).map_err(|_| {
-            MlxError::InvalidArgument("repacked GGUF meta offset exceeds u32".into())
-        })?,
-        src_row_bytes: (params.k / 256) * params.ggml_type.block_bytes(),
+        format: u32::from(layout.format),
+        plane1_offset: layout.plane1_offset,
+        meta_offset: layout.meta_offset,
+        src_row_bytes: layout.src_row_bytes,
     };
     let pipeline = registry.get_pipeline(REPACK_KERNEL, device.metal_device())?;
-    let threads = rows * groups;
+    let threads = layout.threads;
     encode_with_args(
         encoder,
         pipeline,
@@ -703,6 +748,38 @@ fn encode_mm_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_bytes_include_padding_and_eager_split_scratch() {
+        // Single-split Q4 has no scratch. Q6 metadata pads each source block
+        // from 210 to 212 bytes in the prepared representation.
+        assert_eq!(repacked_gguf_weight_bytes(192, 512, GgmlType::Q4_K).unwrap(), 55_296);
+        assert_eq!(repacked_gguf_weight_bytes(192, 512, GgmlType::Q6_K).unwrap(), 81_408);
+        // These shapes select eight splits, whose retained scratch is 64 KiB.
+        assert_eq!(repacked_gguf_weight_bytes(64, 4096, GgmlType::Q4_K).unwrap(), 212_992);
+        assert_eq!(repacked_gguf_weight_bytes(64, 4096, GgmlType::Q6_K).unwrap(), 282_624);
+    }
+
+    #[test]
+    fn prepared_bytes_reject_invalid_and_unrepresentable_layouts() {
+        for ty in [GgmlType::F32, GgmlType::Q8_0, GgmlType::Q5_K] {
+            assert!(repacked_gguf_weight_bytes(64, 256, ty).is_err());
+        }
+        for (n, k) in [
+            (0, 256),
+            (64, 0),
+            (63, 256),
+            (64, 255),
+            (64, 134_217_728),
+            (u32::MAX - 63, u32::MAX - 255),
+        ]
+        {
+            for ty in [GgmlType::Q4_K, GgmlType::Q6_K] {
+                assert!(repacked_gguf_weight_bytes(n, k, ty).is_err(), "{n} x {k} {ty:?}");
+            }
+        }
+    }
+
     #[cfg(mlx_native_has_metal_tensor_artifact)]
     use crate::ops::quantized_matmul_ggml::quantized_matmul_ggml;
 
@@ -821,6 +898,12 @@ mod tests {
                 &params,
             )
             .unwrap();
+            assert_eq!(
+                repacked_gguf_weight_bytes(params.n, params.k, ggml_type).unwrap(),
+                prepared.bytes.data_byte_len()
+                    + prepared.partials.as_ref().map_or(0, MlxBuffer::data_byte_len),
+                "prepared allocation footprint for {n} x {k} {ggml_type:?}",
+            );
             encoder.commit_and_wait().unwrap();
             Self {
                 device,
