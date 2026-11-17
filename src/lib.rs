@@ -228,12 +228,14 @@ pub use ops::quantized_matmul_id::{
     quantized_matmul_id, quantized_matmul_id_into, QuantizedMatmulIdParams,
 };
 pub use ops::quantized_matmul_id_ggml::{
-    dispatch_id_mm_for_test, grouped_m8_gathered_rows, moe_tiles_column_tile_exact,
+    dispatch_id_mm_for_test, grouped_m8_gathered_rows, grouped_m8_prepared_stack_bytes,
+    moe_tiles_column_tile_exact,
     moe_tiles_down, moe_tiles_gate_up,
     moe_tiles_fused, moe_tiles_fused_admits, moe_tiles_fused_grouped_rows,
     moe_tiles_fused_output_rows, moe_tiles_fused_schedule_words,
     moe_tiles_gather, moe_tiles_grouped_rows, moe_tiles_schedule,
     prepare_quantized_matmul_id_ggml_grouped_m8,
+    prepare_quantized_matmul_id_ggml_grouped_m8_live_into,
     quantized_matmul_id_ggml, quantized_matmul_id_ggml_grouped_m8_epilogue,
     quantized_matmul_id_ggml_grouped_m8_epilogue_masked,
     quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_pooled,

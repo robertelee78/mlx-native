@@ -664,6 +664,7 @@ impl KernelRegistry {
         let grouped_mv_src: &'static str =
             include_str!("shaders/quantized_matmul_id_grouped_mv.metal");
         sources.insert("grouped_m8_prepare_q4k_q6k".into(), grouped_mv_src);
+        sources.insert("grouped_m8_prepare_live_q4k_q6k".into(), grouped_mv_src);
         sources.insert("grouped_m8_gather_f32_bf16".into(), grouped_mv_src);
         sources.insert("grouped_m8_gather_bf16".into(), grouped_mv_src);
         for format in ["q4_K", "q6_K"] {

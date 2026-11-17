@@ -35,6 +35,12 @@ use crate::ops::dense_mm_capability::is_unavailable_tensor_api;
 use crate::ops::quantized_matmul_ggml::GgmlType;
 use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
+mod grouped_m8_prepare;
+pub use grouped_m8_prepare::{
+    grouped_m8_prepared_stack_bytes, prepare_quantized_matmul_id_ggml_grouped_m8,
+    prepare_quantized_matmul_id_ggml_grouped_m8_live_into,
+};
+
 mod moe_tiles;
 pub use moe_tiles::{
     moe_tiles_column_tile_exact, moe_tiles_down, moe_tiles_gate_up, moe_tiles_gather,
@@ -3043,20 +3049,6 @@ fn encode_legacy_map0(
 }
 
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GroupedM8PrepareGpuParams {
-    n_experts: u32,
-    n: u32,
-    k: u32,
-    format: u32,
-    source_expert_stride: u64,
-    prepared_expert_stride: u64,
-    plane1_offset: u32,
-    meta_offset: u32,
-    source_row_bytes: u32,
-    _pad: u32,
-}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -3072,9 +3064,10 @@ struct GroupedM8GpuParams {
     meta_offset: u32,
 }
 
-/// Model-owned Q4_K/Q6_K expert planes prepared for the eight-row Metal
-/// tensor tile. The source owner is retained so unloading either handle
-/// cannot invalidate a command encoded from this representation.
+/// Q4_K/Q6_K expert planes prepared for the eight-row Metal tensor tile.
+/// The source owner is retained so unloading either handle cannot invalidate
+/// a command encoded from this representation. Live preparation aliases
+/// caller-owned storage and initializes only the scheduled experts.
 #[derive(Clone)]
 pub struct PreparedGroupedM8Experts {
     _source: MlxBuffer,
@@ -3088,128 +3081,6 @@ pub struct PreparedGroupedM8Experts {
     meta_offset: u32,
 }
 
-/// Prepare one complete Q4_K or Q6_K expert stack once for the grouped
-/// eight-row Metal tensor tile.
-pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    weight: &MlxBuffer,
-    params: &GgmlQuantizedMatmulIdParams,
-) -> Result<PreparedGroupedM8Experts> {
-    if weight.dtype() != DType::U8 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires U8 expert weights, got {:?}",
-            weight.dtype()
-        )));
-    }
-    let format = match params.ggml_type {
-        GgmlType::Q4_K => 0,
-        GgmlType::Q6_K => 1,
-        other => {
-            return Err(MlxError::InvalidArgument(format!(
-                "grouped M8 preparation requires Q4_K or Q6_K, got {other:?}"
-            )))
-        }
-    };
-    if params.n_experts == 0
-        || params.n == 0
-        || params.n % 64 != 0
-        || params.k == 0
-        || params.k % 256 != 0
-    {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
-            params.n_experts, params.n, params.k
-        )));
-    }
-    let matrix_bytes = checked_byte_extent(
-        "grouped M8 source matrix",
-        &[
-            params.n as usize,
-            (params.k / params.ggml_type.block_values()) as usize,
-            params.ggml_type.block_bytes() as usize,
-        ],
-    )?;
-    if params.expert_stride < matrix_bytes as u64 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
-            params.expert_stride
-        )));
-    }
-    let source_bytes = u64::from(params.n_experts - 1)
-        .checked_mul(params.expert_stride)
-        .and_then(|offset| offset.checked_add(matrix_bytes as u64))
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
-    if weight.data_byte_len() < source_bytes as usize {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source needs {source_bytes} bytes, got {}",
-            weight.data_byte_len()
-        )));
-    }
-
-    let rows = params.n as usize;
-    let groups = (params.k / 32) as usize;
-    let plane0 = checked_byte_extent("grouped M8 low plane", &[rows, groups, 16])?;
-    let plane1 = if format == 1 {
-        checked_byte_extent("grouped M8 high plane", &[rows, groups, 8])?
-    } else {
-        0
-    };
-    let metadata = checked_byte_extent(
-        "grouped M8 metadata plane",
-        &[rows, groups / 8, if format == 1 { 20 } else { 16 }],
-    )?;
-    let prepared_expert_stride = plane0
-        .checked_add(plane1)
-        .and_then(|bytes| bytes.checked_add(metadata))
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared stride overflow".into()))?;
-    let total = prepared_expert_stride
-        .checked_mul(params.n_experts as usize)
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared size overflow".into()))?;
-    require_tensor_kernel_family(registry, device, TensorKernelFamily::GroupedM8Experts)?;
-    let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
-    let gpu = GroupedM8PrepareGpuParams {
-        n_experts: params.n_experts,
-        n: params.n,
-        k: params.k,
-        format,
-        source_expert_stride: params.expert_stride,
-        prepared_expert_stride: prepared_expert_stride as u64,
-        plane1_offset: u32::try_from(plane0)
-            .map_err(|_| MlxError::InvalidArgument("grouped M8 plane offset exceeds u32".into()))?,
-        meta_offset: u32::try_from(plane0 + plane1).map_err(|_| {
-            MlxError::InvalidArgument("grouped M8 metadata offset exceeds u32".into())
-        })?,
-        source_row_bytes: u32::try_from(matrix_bytes / rows)
-            .map_err(|_| MlxError::InvalidArgument("grouped M8 row bytes exceed u32".into()))?,
-        _pad: 0,
-    };
-    let pipeline = registry.get_pipeline("grouped_m8_prepare_q4k_q6k", device.metal_device())?;
-    let threads = u64::from(params.n_experts) * u64::from(params.n) * u64::from(params.k / 32);
-    encoder.encode_with_args(
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(weight)),
-            (1, KernelArg::Buffer(&bytes)),
-            (2, KernelArg::Bytes(as_bytes(&gpu))),
-        ],
-        metal::MTLSize::new(threads, 1, 1),
-        metal::MTLSize::new(256.min(threads), 1, 1),
-    );
-    encoder.memory_barrier();
-    Ok(PreparedGroupedM8Experts {
-        _source: weight.clone(),
-        bytes,
-        n_experts: params.n_experts,
-        n: params.n,
-        k: params.k,
-        ggml_type: params.ggml_type,
-        prepared_expert_stride: prepared_expert_stride as u64,
-        plane1_offset: gpu.plane1_offset,
-        meta_offset: gpu.meta_offset,
-    })
-}
 
 /// Source activation storage consumed by the grouped M8 gather.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3645,20 +3516,22 @@ struct GgmlIdMmMap0cGpuParams {
     _pad: u32,
 }
 
-/// Encode the compact `kernel_mul_mm_id_map0c_ne20_<top_k>` stage (ADR-063
-/// P2) plus the barrier that orders it before the consuming `mm_id` kernel.
-#[allow(clippy::too_many_arguments)]
-fn encode_compact_map0(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
+struct CompactMap0Launch<'a> {
+    pipeline: &'a metal::ComputePipelineState,
+    params: GgmlIdMmMap0cGpuParams,
+    shmem: u64,
+    threads: u64,
+}
+
+// Separate fallible launch planning from encoding so live preparation can
+// validate everything before its WAR barrier, including map0's launch limits.
+fn prepare_compact_map0<'a>(
+    registry: &'a mut KernelRegistry,
     device: &MlxDevice,
-    ids: &MlxBuffer,
-    htpe: &MlxBuffer,
-    hids: &MlxBuffer,
     params: &GgmlIdMmDispatchParams,
     max_tiles: u64,
     skip_masked: bool,
-) -> Result<()> {
+) -> Result<CompactMap0Launch<'a>> {
     let kernel_name = match params.top_k {
         1 => "kernel_mul_mm_id_map0c_ne20_1",
         6 => "kernel_mul_mm_id_map0c_ne20_6",
@@ -3706,8 +3579,21 @@ fn encode_compact_map0(
         skip_masked: u32::from(skip_masked),
         _pad: 0,
     };
-    let shmem = shmem_bytes(simdgroups);
+    Ok(CompactMap0Launch {
+        pipeline,
+        params: map0_params,
+        shmem: shmem_bytes(simdgroups),
+        threads: 32 * simdgroups,
+    })
+}
 
+fn encode_prepared_compact_map0(
+    encoder: &mut CommandEncoder,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    launch: &CompactMap0Launch<'_>,
+) {
     if encoder.is_capturing() {
         let range = |buffer: &MlxBuffer| {
             let start =
@@ -3717,19 +3603,37 @@ fn encode_compact_map0(
         encoder.set_pending_buffer_ranges(vec![range(ids)], vec![range(htpe), range(hids)]);
     }
     encoder.encode_threadgroups_with_args_and_shared(
-        pipeline,
+        launch.pipeline,
         &[
-            (0, KernelArg::Bytes(as_bytes(&map0_params))),
+            (0, KernelArg::Bytes(as_bytes(&launch.params))),
             (1, KernelArg::Buffer(ids)),
             (2, KernelArg::Buffer(htpe)),
             (3, KernelArg::Buffer(hids)),
         ],
-        &[(0, shmem)],
+        &[(0, launch.shmem)],
         metal::MTLSize::new(1, 1, 1),
-        metal::MTLSize::new(32 * simdgroups, 1, 1),
+        metal::MTLSize::new(launch.threads, 1, 1),
     );
     // The compact mm_id kernel reads the descriptors and list map0c wrote.
     encoder.memory_barrier();
+}
+
+/// Encode the compact `kernel_mul_mm_id_map0c_ne20_<top_k>` stage (ADR-063
+/// P2) plus the barrier that orders it before the consuming `mm_id` kernel.
+#[allow(clippy::too_many_arguments)]
+fn encode_compact_map0(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    ids: &MlxBuffer,
+    htpe: &MlxBuffer,
+    hids: &MlxBuffer,
+    params: &GgmlIdMmDispatchParams,
+    max_tiles: u64,
+    skip_masked: bool,
+) -> Result<()> {
+    let launch = prepare_compact_map0(registry, device, params, max_tiles, skip_masked)?;
+    encode_prepared_compact_map0(encoder, ids, htpe, hids, &launch);
     Ok(())
 }
 

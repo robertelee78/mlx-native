@@ -24,7 +24,7 @@ struct GroupedM8PrepareParams {
     uint plane1_offset;
     uint meta_offset;
     uint source_row_bytes;
-    uint _pad;
+    uint max_descriptors;
 };
 
 inline ulong grouped_m8_tiled_index(uint row, uint unit, uint units) {
@@ -50,17 +50,14 @@ inline uint grouped_m8_bit_word(thread const uchar *slots, uint bits, uint word_
     return word;
 }
 
-kernel void grouped_m8_prepare_q4k_q6k(
-    device const uchar *source [[buffer(0)]],
-    device uchar *prepared [[buffer(1)]],
-    constant GroupedM8PrepareParams &p [[buffer(2)]],
-    uint index [[thread_position_in_grid]]) {
+// Both entry points use the identical byte repack, without dequantization.
+inline void grouped_m8_prepare_unit(
+    device const uchar *source,
+    device uchar *prepared,
+    constant GroupedM8PrepareParams &p,
+    uint expert,
+    uint matrix_index) {
     const uint groups = p.k / 32;
-    const uint matrix_units = p.n * groups;
-    if (index >= p.n_experts * matrix_units)
-        return;
-    const uint expert = index / matrix_units;
-    const uint matrix_index = index % matrix_units;
     const uint row = matrix_index / groups;
     const uint group = matrix_index % groups;
     const uint block = group / 8;
@@ -109,6 +106,38 @@ kernel void grouped_m8_prepare_q4k_q6k(
             meta[19] = 0;
         }
     }
+}
+
+kernel void grouped_m8_prepare_q4k_q6k(
+    device const uchar *source [[buffer(0)]],
+    device uchar *prepared [[buffer(1)]],
+    constant GroupedM8PrepareParams &p [[buffer(2)]],
+    uint2 index [[thread_position_in_grid]]) {
+    if (index.y >= p.n_experts || index.x >= p.n * (p.k / 32))
+        return;
+    grouped_m8_prepare_unit(source, prepared, p, index.y, index.x);
+}
+
+kernel void grouped_m8_prepare_live_q4k_q6k(
+    device const uchar *source [[buffer(0)]],
+    device uchar *prepared [[buffer(1)]],
+    constant GroupedM8PrepareParams &p [[buffer(2)]],
+    device const uint *schedule [[buffer(3)]],
+    uint2 index [[thread_position_in_grid]]) {
+    const uint state = schedule[0];
+    const uint descriptor_index = index.y;
+    if ((state & 0x80000000u) != 0 || state > p.max_descriptors ||
+        descriptor_index >= state || index.x >= p.n * (p.k / 32))
+        return;
+    device const uint *descriptor = schedule + 1 + 3 * ulong(descriptor_index);
+    const uint expert = descriptor[0];
+    if (expert >= p.n_experts || descriptor[2] == 0)
+        return;
+    // map0c emits adjacent expert-sorted descriptors, splitting at 32 rows.
+    // Only the first may repack: later tiles would race on identical bytes.
+    if (descriptor_index != 0 && descriptor[-3] == expert)
+        return;
+    grouped_m8_prepare_unit(source, prepared, p, expert, index.x);
 }
 
 inline uint4 grouped_m8_nibble_pairs(uint word) {
