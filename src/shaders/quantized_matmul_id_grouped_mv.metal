@@ -239,8 +239,7 @@ inline void grouped_m8_decode_q6_thread(
 // expert strides may start at any byte. Only the metadata is assembled into
 // words; quant quads decode directly into the same BF16 linear-pair operation.
 inline uint grouped_m8_raw_word(device const uchar *p) {
-    return uint(p[0]) | (uint(p[1]) << 8) |
-        (uint(p[2]) << 16) | (uint(p[3]) << 24);
+    return as_type<uint>(uchar4(*reinterpret_cast<device const packed_uchar4 *>(p)));
 }
 
 inline device const uchar *grouped_m8_raw_q4_block(
@@ -257,7 +256,8 @@ inline float2 grouped_m8_raw_q4_coef(device const uchar *block, ushort group) {
 
 inline bfloat4 grouped_m8_raw_q4_quad(
     device const uchar *q, ushort shift, float2 coefficient) {
-    const uint4 code = (uint4(q[0], q[1], q[2], q[3]) >> shift) & 15u;
+    const uint4 code =
+        (uint4(uchar4(*reinterpret_cast<device const packed_uchar4 *>(q))) >> shift) & 15u;
     return bfloat4(
         grouped_m8_linear_pair(code.x | (code.y << 16), coefficient.x, coefficient.y, 0),
         grouped_m8_linear_pair(code.z | (code.w << 16), coefficient.x, coefficient.y, 0));

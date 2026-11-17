@@ -15,6 +15,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+#[path = "support/raw_m8_stride.rs"]
+mod raw_m8_stride;
+
 const EXPERTS: u32 = 256;
 const N: u32 = 512;
 const K: u32 = 2048;
@@ -384,7 +387,7 @@ fn parity(device: &MlxDevice, registry: &mut KernelRegistry, start: Instant) -> 
                     cases += 1;
                     compared_elements += elements;
                     mismatch_elements += mismatches;
-                    println!("{}", json!({"kind":"raw_m8_spike_parity_case", "case":cases,
+                    eprintln!("{}", json!({"kind":"raw_m8_spike_parity_case", "case":cases,
                         "rows":rows, "schedule":if repeated { "repeated_eight_experts" } else { "dispersed" },
                         "masked":masked, "operation":mode.name(), "compared_elements":elements,
                         "mismatch_elements":mismatches, "masked_writes":masked_writes,
@@ -401,6 +404,7 @@ fn parity(device: &MlxDevice, registry: &mut KernelRegistry, start: Instant) -> 
     assert_eq!(cases, 126);
     json!({"exact_case_count":cases, "compared_elements":compared_elements,
         "rejected_consumers":rejected_consumers,
+        "odd_stride_parity":raw_m8_stride::run(device, registry),
         "mismatch_elements":mismatch_elements, "masked_route_cases":56,
         "raw_alias_evidence":"bind before source-nibble mutation; prepare after mutation; bitwise parity after local source owner drops",
         "source_stacks":2, "source_bytes_per_stack":source_bytes(),
@@ -435,7 +439,7 @@ fn grouped_m8_raw_q4_production_gate_spike() {
     let device = MlxDevice::new().expect("Metal device with grouped-M8 tensor support");
     let mut registry = KernelRegistry::new();
     let parity = parity(&device, &mut registry, start);
-    println!("{}", json!({"kind":"raw_m8_spike_parity_summary", "parity":parity}));
+    eprintln!("{}", json!({"kind":"raw_m8_spike_parity_summary", "parity":parity}));
 
     // Parity's two stacks are dropped before allocating the timing banks.
     let mut banks = Vec::with_capacity(BANKS);
@@ -472,13 +476,13 @@ fn grouped_m8_raw_q4_production_gate_spike() {
             let observation = json!({"pair":observations.len(), "rotation":rotation, "layer":layer,
                 "first":if first == 0 { "prepared" } else { "raw" },
                 "prepared_gpu_ms":elapsed[0], "raw_gpu_ms":elapsed[1]});
-            println!("{}", json!({"kind":"raw_m8_spike_pair", "observation":observation}));
+            eprintln!("{}", json!({"kind":"raw_m8_spike_pair", "observation":observation}));
             observations.push(observation);
         }
     }
     budget(start);
     assert_eq!(observations.len(), 80);
-    println!("{}", json!({
+    eprintln!("{}", json!({
         "kind":"unpublished_raw_m8_spike", "release_qualification":false,
         "source":{"format":"Q4_K", "shape":[EXPERTS,N,K], "top_k":TOP_K,
             "expert_stride_bytes":params(TIMING_ROWS).expert_stride, "timed_rows":TIMING_ROWS},
