@@ -223,6 +223,11 @@ fn check_planes(
     n: u32,
     k: u32,
 ) -> Result<()> {
+    if routed.raw_q4 || shared.raw_q4 {
+        return Err(invalid(
+            "fused MoE tiles require prepared expert planes, not raw Q4_K storage".into(),
+        ));
+    }
     if routed.n_experts != n_experts
         || shared.n_experts != 1
         || [routed.n, shared.n] != [n, n]

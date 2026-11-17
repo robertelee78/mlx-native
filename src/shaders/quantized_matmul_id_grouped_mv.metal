@@ -1,4 +1,4 @@
-// Prepared Q4_K/Q6_K expert planes and grouped staged-M8 decode tiles.
+// Prepared Q4_K/Q6_K planes or raw Q4_K blocks with staged-M8 decode tiles.
 //
 // The compact expert schedule groups live routed rows by expert. Decode keeps
 // activations and expert intermediates in BF16, uses the one/two-row column
@@ -235,6 +235,55 @@ inline void grouped_m8_decode_q6_thread(
     }
 }
 
+// Raw blocks have no vector-alignment requirement: source views and padded
+// expert strides may start at any byte. Only the metadata is assembled into
+// words; quant quads decode directly into the same BF16 linear-pair operation.
+inline uint grouped_m8_raw_word(device const uchar *p) {
+    return uint(p[0]) | (uint(p[1]) << 8) |
+        (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+inline device const uchar *grouped_m8_raw_q4_block(
+    device const uchar *expert, uint row, uint group, uint groups) {
+    return expert + ulong(row) * (groups / 8) * 144 + ulong(group / 8) * 144;
+}
+
+inline float2 grouped_m8_raw_q4_coef(device const uchar *block, ushort group) {
+    const uint4 meta = uint4(
+        grouped_m8_raw_word(block), grouped_m8_raw_word(block + 4),
+        grouped_m8_raw_word(block + 8), grouped_m8_raw_word(block + 12));
+    return grouped_m8_q4_coef(meta, group);
+}
+
+inline bfloat4 grouped_m8_raw_q4_quad(
+    device const uchar *q, ushort shift, float2 coefficient) {
+    const uint4 code = (uint4(q[0], q[1], q[2], q[3]) >> shift) & 15u;
+    return bfloat4(
+        grouped_m8_linear_pair(code.x | (code.y << 16), coefficient.x, coefficient.y, 0),
+        grouped_m8_linear_pair(code.z | (code.w << 16), coefficient.x, coefficient.y, 0));
+}
+
+inline void grouped_m8_decode_q4_raw_thread(
+    device const uchar *expert, uint row, uint group, uint groups,
+    thread bfloat4 *out) {
+    device const uchar *block = grouped_m8_raw_q4_block(expert, row, group, groups);
+    const float2 coefficient = grouped_m8_raw_q4_coef(block, ushort(group % 8));
+    device const uchar *q = block + 16 + ((group % 8) / 2) * 32;
+    for (ushort chunk = 0; chunk < 8; ++chunk)
+        out[chunk] = grouped_m8_raw_q4_quad(q + 4 * chunk, 4 * (group % 2), coefficient);
+}
+
+inline void grouped_m8_decode_q4_raw(
+    device const uchar *expert, uint row, uint group, uint groups,
+    threadgroup bfloat *out) {
+    device const uchar *block = grouped_m8_raw_q4_block(expert, row, group, groups);
+    const float2 coefficient = grouped_m8_raw_q4_coef(block, ushort(group % 8));
+    device const uchar *q = block + 16 + ((group % 8) / 2) * 32;
+    for (ushort chunk = 0; chunk < 8; ++chunk)
+        *reinterpret_cast<threadgroup bfloat4 *>(out + 4 * chunk) =
+            grouped_m8_raw_q4_quad(q + 4 * chunk, 4 * (group % 2), coefficient);
+}
+
 struct GroupedM8Params {
     int32_t k;
     int32_t n;
@@ -300,7 +349,7 @@ constant constexpr ushort M8_EP_F32 = 0;
 constant constexpr ushort M8_EP_BF16 = 1;
 constant constexpr ushort M8_EP_SILU_MUL_BF16 = 2;
 
-template <bool Q6, ushort Ep>
+template <bool Q6, ushort Ep, bool Raw = false>
 kernel void grouped_m8_impl(
     device const uchar *weights [[buffer(0)]],
     device bfloat *input [[buffer(1)]],
@@ -336,28 +385,33 @@ kernel void grouped_m8_impl(
             packed[row] = routes[first_route + row];
         const uint weight_row = output_origin + lane;
         for (uint g = 0; g < groups; ++g) {
-            const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
-            const uint4 low = *reinterpret_cast<device const uint4 *>(
-                expert_weights + tiled * 16);
             bfloat4 decoded[8];
-            if constexpr (Q6) {
-                const uint2 high = *reinterpret_cast<device const uint2 *>(
-                    expert_weights + p.plane1_offset + tiled * 8);
-                device const uchar *meta = expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
-                const packed_uint4 scales =
-                    *reinterpret_cast<device const packed_uint4 *>(meta);
-                const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
-                grouped_m8_decode_q6_thread(
-                    low, high, scales, dh, ushort(g % 8),
-                    reinterpret_cast<thread bfloat *>(decoded));
+            if constexpr (Raw) {
+                grouped_m8_decode_q4_raw_thread(
+                    expert_weights, weight_row, g, groups, decoded);
             } else {
-                const uint4 meta = *reinterpret_cast<device const uint4 *>(
-                    expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
-                grouped_m8_decode_q4_thread(
-                    low, meta, ushort(g % 8),
-                    reinterpret_cast<thread bfloat *>(decoded));
+                const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
+                const uint4 low = *reinterpret_cast<device const uint4 *>(
+                    expert_weights + tiled * 16);
+                if constexpr (Q6) {
+                    const uint2 high = *reinterpret_cast<device const uint2 *>(
+                        expert_weights + p.plane1_offset + tiled * 8);
+                    device const uchar *meta = expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
+                    const packed_uint4 scales =
+                        *reinterpret_cast<device const packed_uint4 *>(meta);
+                    const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
+                    grouped_m8_decode_q6_thread(
+                        low, high, scales, dh, ushort(g % 8),
+                        reinterpret_cast<thread bfloat *>(decoded));
+                } else {
+                    const uint4 meta = *reinterpret_cast<device const uint4 *>(
+                        expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
+                    grouped_m8_decode_q4_thread(
+                        low, meta, ushort(g % 8),
+                        reinterpret_cast<thread bfloat *>(decoded));
+                }
             }
             for (uint row = 0; row < route_count; ++row) {
                 device const bfloat4 *x = reinterpret_cast<device const bfloat4 *>(
@@ -426,33 +480,38 @@ kernel void grouped_m8_impl(
         for (uint g = 0; g < groups; ++g) {
 
             const uint weight_row = output_origin + lane;
-            const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
-            const uint4 low = *reinterpret_cast<device const uint4 *>(
-                expert_weights + tiled * 16);
-            if constexpr (Q6) {
-                const uint2 high = *reinterpret_cast<device const uint2 *>(
-                    expert_weights + p.plane1_offset + tiled * 8);
-                device const uchar *meta = expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
-                const packed_uint4 scales =
-                    *reinterpret_cast<device const packed_uint4 *>(meta);
-                const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
-                grouped_m8_decode_q6(
-                    low, high, scales, dh, ushort(g % 8), 0,
-                    simd_weight + lane * STEP);
-                grouped_m8_decode_q6(
-                    low, high, scales, dh, ushort(g % 8), 1,
-                    simd_weight + lane * STEP + 16);
+            if constexpr (Raw) {
+                grouped_m8_decode_q4_raw(
+                    expert_weights, weight_row, g, groups, simd_weight + lane * STEP);
             } else {
-                const uint4 meta = *reinterpret_cast<device const uint4 *>(
-                    expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
-                grouped_m8_decode_q4(
-                    low, meta, ushort(g % 8), 0,
-                    simd_weight + lane * STEP);
-                grouped_m8_decode_q4(
-                    low, meta, ushort(g % 8), 1,
-                    simd_weight + lane * STEP + 16);
+                const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
+                const uint4 low = *reinterpret_cast<device const uint4 *>(
+                    expert_weights + tiled * 16);
+                if constexpr (Q6) {
+                    const uint2 high = *reinterpret_cast<device const uint2 *>(
+                        expert_weights + p.plane1_offset + tiled * 8);
+                    device const uchar *meta = expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
+                    const packed_uint4 scales =
+                        *reinterpret_cast<device const packed_uint4 *>(meta);
+                    const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
+                    grouped_m8_decode_q6(
+                        low, high, scales, dh, ushort(g % 8), 0,
+                        simd_weight + lane * STEP);
+                    grouped_m8_decode_q6(
+                        low, high, scales, dh, ushort(g % 8), 1,
+                        simd_weight + lane * STEP + 16);
+                } else {
+                    const uint4 meta = *reinterpret_cast<device const uint4 *>(
+                        expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
+                    grouped_m8_decode_q4(
+                        low, meta, ushort(g % 8), 0,
+                        simd_weight + lane * STEP);
+                    grouped_m8_decode_q4(
+                        low, meta, ushort(g % 8), 1,
+                        simd_weight + lane * STEP + 16);
+                }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
             auto left = all_left.template slice<STEP, ROWS>(g * STEP, 0);
@@ -489,7 +548,7 @@ kernel void grouped_m8_impl(
     }
 }
 
-template <bool Q6>
+template <bool Q6, bool Raw = false>
 kernel void grouped_m8_gate_up_impl(
     device const uchar *gate_weights [[buffer(0)]],
     device const uchar *up_weights [[buffer(1)]],
@@ -528,28 +587,33 @@ kernel void grouped_m8_gate_up_impl(
             packed[row] = routes[first_route + row];
         const uint weight_row = output_origin + lane;
         for (uint g = 0; g < groups; ++g) {
-            const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
-            const uint4 low = *reinterpret_cast<device const uint4 *>(
-                expert_weights + tiled * 16);
             bfloat4 decoded[8];
-            if constexpr (Q6) {
-                const uint2 high = *reinterpret_cast<device const uint2 *>(
-                    expert_weights + p.plane1_offset + tiled * 8);
-                device const uchar *meta = expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
-                const packed_uint4 scales =
-                    *reinterpret_cast<device const packed_uint4 *>(meta);
-                const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
-                grouped_m8_decode_q6_thread(
-                    low, high, scales, dh, ushort(g % 8),
-                    reinterpret_cast<thread bfloat *>(decoded));
+            if constexpr (Raw) {
+                grouped_m8_decode_q4_raw_thread(
+                    expert_weights, weight_row, g, groups, decoded);
             } else {
-                const uint4 meta = *reinterpret_cast<device const uint4 *>(
-                    expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
-                grouped_m8_decode_q4_thread(
-                    low, meta, ushort(g % 8),
-                    reinterpret_cast<thread bfloat *>(decoded));
+                const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
+                const uint4 low = *reinterpret_cast<device const uint4 *>(
+                    expert_weights + tiled * 16);
+                if constexpr (Q6) {
+                    const uint2 high = *reinterpret_cast<device const uint2 *>(
+                        expert_weights + p.plane1_offset + tiled * 8);
+                    device const uchar *meta = expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
+                    const packed_uint4 scales =
+                        *reinterpret_cast<device const packed_uint4 *>(meta);
+                    const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
+                    grouped_m8_decode_q6_thread(
+                        low, high, scales, dh, ushort(g % 8),
+                        reinterpret_cast<thread bfloat *>(decoded));
+                } else {
+                    const uint4 meta = *reinterpret_cast<device const uint4 *>(
+                        expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
+                    grouped_m8_decode_q4_thread(
+                        low, meta, ushort(g % 8),
+                        reinterpret_cast<thread bfloat *>(decoded));
+                }
             }
             for (uint row = 0; row < route_count; ++row) {
                 device const bfloat4 *x = reinterpret_cast<device const bfloat4 *>(
@@ -618,33 +682,38 @@ kernel void grouped_m8_gate_up_impl(
 
         for (uint g = 0; g < groups; ++g) {
             const uint weight_row = output_origin + lane;
-            const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
-            const uint4 low = *reinterpret_cast<device const uint4 *>(
-                expert_weights + tiled * 16);
-            if constexpr (Q6) {
-                const uint2 high = *reinterpret_cast<device const uint2 *>(
-                    expert_weights + p.plane1_offset + tiled * 8);
-                device const uchar *meta = expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
-                const packed_uint4 scales =
-                    *reinterpret_cast<device const packed_uint4 *>(meta);
-                const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
-                grouped_m8_decode_q6(
-                    low, high, scales, dh, ushort(g % 8), 0,
-                    simd_weight + lane * STEP);
-                grouped_m8_decode_q6(
-                    low, high, scales, dh, ushort(g % 8), 1,
-                    simd_weight + lane * STEP + 16);
+            if constexpr (Raw) {
+                grouped_m8_decode_q4_raw(
+                    expert_weights, weight_row, g, groups, simd_weight + lane * STEP);
             } else {
-                const uint4 meta = *reinterpret_cast<device const uint4 *>(
-                    expert_weights + p.meta_offset +
-                    grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
-                grouped_m8_decode_q4(
-                    low, meta, ushort(g % 8), 0,
-                    simd_weight + lane * STEP);
-                grouped_m8_decode_q4(
-                    low, meta, ushort(g % 8), 1,
-                    simd_weight + lane * STEP + 16);
+                const ulong tiled = grouped_m8_tiled_index(weight_row, g, groups);
+                const uint4 low = *reinterpret_cast<device const uint4 *>(
+                    expert_weights + tiled * 16);
+                if constexpr (Q6) {
+                    const uint2 high = *reinterpret_cast<device const uint2 *>(
+                        expert_weights + p.plane1_offset + tiled * 8);
+                    device const uchar *meta = expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 20;
+                    const packed_uint4 scales =
+                        *reinterpret_cast<device const packed_uint4 *>(meta);
+                    const uint dh = *reinterpret_cast<device const uint *>(meta + 16);
+                    grouped_m8_decode_q6(
+                        low, high, scales, dh, ushort(g % 8), 0,
+                        simd_weight + lane * STEP);
+                    grouped_m8_decode_q6(
+                        low, high, scales, dh, ushort(g % 8), 1,
+                        simd_weight + lane * STEP + 16);
+                } else {
+                    const uint4 meta = *reinterpret_cast<device const uint4 *>(
+                        expert_weights + p.meta_offset +
+                        grouped_m8_tiled_index(weight_row, g / 8, units) * 16);
+                    grouped_m8_decode_q4(
+                        low, meta, ushort(g % 8), 0,
+                        simd_weight + lane * STEP);
+                    grouped_m8_decode_q4(
+                        low, meta, ushort(g % 8), 1,
+                        simd_weight + lane * STEP + 16);
+                }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
             auto left = all_left.template slice<STEP, ROWS>(g * STEP, 0);
@@ -721,6 +790,30 @@ kernel void grouped_m8_gate_up_impl<false>(
 
 template [[host_name("grouped_m8_gate_up_q6_K_bf16")]]
 kernel void grouped_m8_gate_up_impl<true>(
+    device const uchar *, device const uchar *, device bfloat *, device bfloat *,
+    device const uint32_t *, device const int32_t *,
+    constant GroupedM8Params &, uint2, ushort, ushort, ushort);
+
+template [[host_name("grouped_m8_id_q4_K_raw_f32")]]
+kernel void grouped_m8_impl<false, M8_EP_F32, true>(
+    device const uchar *, device bfloat *, device uchar *,
+    device const uint32_t *, device const int32_t *,
+    constant GroupedM8Params &, device const bfloat *, uint2, ushort, ushort, ushort);
+
+template [[host_name("grouped_m8_id_q4_K_raw_bf16")]]
+kernel void grouped_m8_impl<false, M8_EP_BF16, true>(
+    device const uchar *, device bfloat *, device uchar *,
+    device const uint32_t *, device const int32_t *,
+    constant GroupedM8Params &, device const bfloat *, uint2, ushort, ushort, ushort);
+
+template [[host_name("grouped_m8_id_q4_K_raw_silu_mul_bf16")]]
+kernel void grouped_m8_impl<false, M8_EP_SILU_MUL_BF16, true>(
+    device const uchar *, device bfloat *, device uchar *,
+    device const uint32_t *, device const int32_t *,
+    constant GroupedM8Params &, device const bfloat *, uint2, ushort, ushort, ushort);
+
+template [[host_name("grouped_m8_gate_up_q4_K_raw_bf16")]]
+kernel void grouped_m8_gate_up_impl<false, true>(
     device const uchar *, device const uchar *, device bfloat *, device bfloat *,
     device const uint32_t *, device const int32_t *,
     constant GroupedM8Params &, uint2, ushort, ushort, ushort);

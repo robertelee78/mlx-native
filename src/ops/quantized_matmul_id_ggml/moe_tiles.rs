@@ -178,6 +178,11 @@ fn check_prepared(
     n: u32,
     k: u32,
 ) -> Result<()> {
+    if prepared.raw_q4 {
+        return Err(invalid(
+            "MoE tiles require prepared expert planes, not raw Q4_K storage".into(),
+        ));
+    }
     let n_experts = if params.shared_planes {
         1
     } else {

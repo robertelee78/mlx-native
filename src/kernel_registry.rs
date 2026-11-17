@@ -666,7 +666,7 @@ impl KernelRegistry {
         sources.insert("grouped_m8_prepare_q4k_q6k".into(), grouped_mv_src);
         sources.insert("grouped_m8_gather_f32_bf16".into(), grouped_mv_src);
         sources.insert("grouped_m8_gather_bf16".into(), grouped_mv_src);
-        for format in ["q4_K", "q6_K"] {
+        for format in ["q4_K", "q6_K", "q4_K_raw"] {
             for epilogue in ["f32", "bf16", "silu_mul_bf16"] {
                 sources.insert(format!("grouped_m8_id_{format}_{epilogue}"), grouped_mv_src);
             }

@@ -3072,12 +3072,12 @@ struct GroupedM8GpuParams {
     meta_offset: u32,
 }
 
-/// Model-owned Q4_K/Q6_K expert planes prepared for the eight-row Metal
-/// tensor tile. The source owner is retained so unloading either handle
-/// cannot invalidate a command encoded from this representation.
+/// Model-owned Q4_K/Q6_K expert storage for the eight-row Metal tensor tile.
+/// Prepared planes retain their source owner; the raw Q4_K spike aliases its
+/// source directly without allocating a second complete weight representation.
 #[derive(Clone)]
 pub struct PreparedGroupedM8Experts {
-    _source: MlxBuffer,
+    _source: Option<MlxBuffer>,
     bytes: MlxBuffer,
     n_experts: u32,
     n: u32,
@@ -3086,6 +3086,37 @@ pub struct PreparedGroupedM8Experts {
     prepared_expert_stride: u64,
     plane1_offset: u32,
     meta_offset: u32,
+    raw_q4: bool,
+}
+
+/// Bind raw Q4_K expert blocks to the staged M8 dispatch APIs without repacking.
+///
+/// This isolated spike retains the original U8 storage and preserves the
+/// prepared path's BF16 decode and projection arithmetic. Other formats are
+/// explicitly unsupported.
+pub fn bind_quantized_matmul_id_ggml_grouped_m8_raw(
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<PreparedGroupedM8Experts> {
+    if params.ggml_type != GgmlType::Q4_K {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 raw spike supports Q4_K only, got {:?}",
+            params.ggml_type
+        )));
+    }
+    validate_grouped_m8_source(weight, params)?;
+    Ok(PreparedGroupedM8Experts {
+        _source: None,
+        bytes: weight.clone(),
+        n_experts: params.n_experts,
+        n: params.n,
+        k: params.k,
+        ggml_type: params.ggml_type,
+        prepared_expert_stride: params.expert_stride,
+        plane1_offset: 0,
+        meta_offset: 0,
+        raw_q4: true,
+    })
 }
 
 /// Prepare one complete Q4_K or Q6_K expert stack once for the grouped
@@ -3097,56 +3128,8 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
     weight: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<PreparedGroupedM8Experts> {
-    if weight.dtype() != DType::U8 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires U8 expert weights, got {:?}",
-            weight.dtype()
-        )));
-    }
-    let format = match params.ggml_type {
-        GgmlType::Q4_K => 0,
-        GgmlType::Q6_K => 1,
-        other => {
-            return Err(MlxError::InvalidArgument(format!(
-                "grouped M8 preparation requires Q4_K or Q6_K, got {other:?}"
-            )))
-        }
-    };
-    if params.n_experts == 0
-        || params.n == 0
-        || params.n % 64 != 0
-        || params.k == 0
-        || params.k % 256 != 0
-    {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
-            params.n_experts, params.n, params.k
-        )));
-    }
-    let matrix_bytes = checked_byte_extent(
-        "grouped M8 source matrix",
-        &[
-            params.n as usize,
-            (params.k / params.ggml_type.block_values()) as usize,
-            params.ggml_type.block_bytes() as usize,
-        ],
-    )?;
-    if params.expert_stride < matrix_bytes as u64 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
-            params.expert_stride
-        )));
-    }
-    let source_bytes = u64::from(params.n_experts - 1)
-        .checked_mul(params.expert_stride)
-        .and_then(|offset| offset.checked_add(matrix_bytes as u64))
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
-    if weight.data_byte_len() < source_bytes as usize {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source needs {source_bytes} bytes, got {}",
-            weight.data_byte_len()
-        )));
-    }
+    let matrix_bytes = validate_grouped_m8_source(weight, params)?;
+    let format = u32::from(params.ggml_type == GgmlType::Q6_K);
 
     let rows = params.n as usize;
     let groups = (params.k / 32) as usize;
@@ -3199,7 +3182,7 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
     );
     encoder.memory_barrier();
     Ok(PreparedGroupedM8Experts {
-        _source: weight.clone(),
+        _source: Some(weight.clone()),
         bytes,
         n_experts: params.n_experts,
         n: params.n,
@@ -3208,7 +3191,62 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
         prepared_expert_stride: prepared_expert_stride as u64,
         plane1_offset: gpu.plane1_offset,
         meta_offset: gpu.meta_offset,
+        raw_q4: false,
     })
+}
+
+fn validate_grouped_m8_source(
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<usize> {
+    if weight.dtype() != DType::U8 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 requires U8 expert weights, got {:?}",
+            weight.dtype()
+        )));
+    }
+    if !matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K) {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 requires Q4_K or Q6_K, got {:?}",
+            params.ggml_type
+        )));
+    }
+    if params.n_experts == 0
+        || params.n == 0
+        || params.n % 64 != 0
+        || params.k == 0
+        || params.k % 256 != 0
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
+            params.n_experts, params.n, params.k
+        )));
+    }
+    let matrix_bytes = checked_byte_extent(
+        "grouped M8 source matrix",
+        &[
+            params.n as usize,
+            (params.k / params.ggml_type.block_values()) as usize,
+            params.ggml_type.block_bytes() as usize,
+        ],
+    )?;
+    if params.expert_stride < matrix_bytes as u64 {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
+            params.expert_stride
+        )));
+    }
+    let source_bytes = u64::from(params.n_experts - 1)
+        .checked_mul(params.expert_stride)
+        .and_then(|offset| offset.checked_add(matrix_bytes as u64))
+        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
+    if (weight.data_byte_len() as u64) < source_bytes {
+        return Err(MlxError::InvalidArgument(format!(
+            "grouped M8 source needs {source_bytes} bytes, got {}",
+            weight.data_byte_len()
+        )));
+    }
+    Ok(matrix_bytes)
 }
 
 /// Source activation storage consumed by the grouped M8 gather.
@@ -3384,10 +3422,12 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
             if up.n_experts == prepared.n_experts
                 && up.n == prepared.n
                 && up.k == prepared.k
-                && up.ggml_type == prepared.ggml_type => {}
+                && up.ggml_type == prepared.ggml_type
+                && up.raw_q4 == prepared.raw_q4
+                && up.prepared_expert_stride == prepared.prepared_expert_stride => {}
         (GroupedM8Epilogue::FusedGateUpBf16, _) => {
             return Err(MlxError::InvalidArgument(
-                "grouped M8 fused gate/up requires matching prepared up experts".into(),
+                "grouped M8 fused gate/up requires matching shape, type, storage layout and expert stride".into(),
             ))
         }
         (_, Some(_)) => {
@@ -3578,6 +3618,7 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
     }
 
     let format = match params.ggml_type {
+        GgmlType::Q4_K if prepared.raw_q4 => "q4_K_raw",
         GgmlType::Q4_K => "q4_K",
         GgmlType::Q6_K => "q6_K",
         _ => unreachable!("prepared grouped M8 type was validated"),
