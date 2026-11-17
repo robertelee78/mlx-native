@@ -41,6 +41,7 @@ pub mod dflash2_af4g64_staged;
 pub mod dflash2_attention_pack;
 pub mod dflash2_dynamic_conv;
 pub mod dflash2_ring_attention;
+pub mod dflash2_rms_norm;
 pub mod dflash2_selector;
 pub mod dequant_to_f16;
 pub mod elementwise;

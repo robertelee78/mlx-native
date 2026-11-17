@@ -91,6 +91,14 @@ Unqualified experimental rewrites are not included in this release.
 
 ### Changelog — unreleased
 
+- **v0.23.2 / source-ordered BF16 draft RMS** —
+  `ops::dflash2_rms_norm::dispatch_dflash2_rms_norm_bf16` uses scalar-column
+  accumulation, eight ordered SIMD partials, and one completed BF16 result
+  boundary in F32 storage. Input and weight values are unchanged; the dispatcher
+  allocates no conversion or scratch buffers. The checked width is bound
+  inline; only epsilon is read from the caller's parameter buffer. Generic RMS
+  arithmetic and existing dispatch APIs are unchanged. This additive operation
+  does not by itself qualify a downstream model or establish performance.
 - **v0.23.1 / BF16 register inputs** — the prepared register projection's
   `_with_precision` API accepts physical BF16 input with BF16 logical output.
   It prepares the existing table and sums directly, without an intermediate

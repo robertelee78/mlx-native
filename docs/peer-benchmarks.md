@@ -11,7 +11,8 @@ notice ships as `LICENSE-MIT-llamacpp` at the repo root. Some quantized
 kernels arrived via candle's vendored copies (`LICENSE-APACHE-candle`). The
 prepared GGUF projection (`gguf_repacked_mm.metal`), the staged AF4G64 draft
 projection (`dflash2_af4g64_staged.metal`), the ring draft attention
-(`dflash2_ring_attention.metal`), the MoE expert live tiles
+(`dflash2_ring_attention.metal`), the source-ordered BF16 draft RMS
+(`dflash2_rms_norm.metal`), the MoE expert live tiles
 (`moe_expert_tiles.metal`), the tiled verify attention
 (`tq_hb_verify_tile.metal`) and the fused DeltaNet window
 (`gdn_window_fused.metal`) are derived from
@@ -136,6 +137,19 @@ more exact than it. Gate: `tests/kquant_real_scale_f64_reference.rs`; cost:
   ranks) **9.9 → 19.9**, 14× under the reference at 1832 tokens, with an
   unchanged schedule. The schedule builder is no longer structurally aligned
   with the reference (structural diff table above).
+
+## DFlash2 BF16 RMS association
+
+The draft-specific RMS producer follows Splash `031a25a6`'s
+`common/rms_inverse.h` and `shared/normalization.metal`: 256 scalar-column
+threads, a SIMD sum, eight partials added in order, and `(x * inverse) * weight`
+rounded once to BF16. Reassociation is disabled. F32 storage carries inputs
+unchanged and the completed BF16 result widened back to F32; this is not an
+implicit BF16 input cast or a change to generic RMS.
+
+The regression compares synthetic BF16-exact operands against an independent
+BF16-storage GPU producer, including nonzero-offset views and output guards.
+Downstream conformance, model quality and performance remain separate gates.
 
 ## Measurements retained namelessly in code (2026-08-20 sweep)
 
