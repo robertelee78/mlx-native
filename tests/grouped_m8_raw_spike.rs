@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 #[path = "support/raw_m8_stride.rs"]
 mod raw_m8_stride;
 
+#[path = "support/raw_m8_recorded.rs"]
+mod raw_m8_recorded;
+
 const EXPERTS: u32 = 256;
 const N: u32 = 512;
 const K: u32 = 2048;
@@ -505,4 +508,10 @@ fn grouped_m8_raw_q4_production_gate_spike() {
             "observations":observations},
         "elapsed_wall_seconds":start.elapsed().as_secs_f64()
     }));
+}
+
+#[test]
+#[ignore = "unpublished frozen actual-routing, forty-layer paired GPU projection spike"]
+fn grouped_m8_raw_q4_recorded_routes_spike() {
+    raw_m8_recorded::run();
 }
