@@ -229,6 +229,7 @@ pub use ops::quantized_matmul_id::{
 };
 pub use ops::quantized_matmul_id_ggml::{
     dispatch_id_mm_for_test, grouped_m8_gathered_rows, moe_tiles_column_tile_exact,
+    dispatch_prepared_id_mm_pooled_with_options_for_test,
     moe_tiles_down, moe_tiles_gate_up,
     moe_tiles_fused, moe_tiles_fused_admits, moe_tiles_fused_grouped_rows,
     moe_tiles_fused_output_rows, moe_tiles_fused_schedule_words,

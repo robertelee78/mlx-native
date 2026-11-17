@@ -50,6 +50,8 @@ pub use moe_tiles_fused::{
 };
 mod prepared_f16_probe;
 pub use prepared_f16_probe::quantized_matmul_id_ggml_grouped_m8_f16_tiles_probe_into;
+mod prepared_mm;
+pub use prepared_mm::dispatch_prepared_id_mm_pooled_with_options_for_test;
 
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     factors.iter().try_fold(1usize, |total, factor| {

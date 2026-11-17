@@ -704,6 +704,14 @@ impl KernelRegistry {
         );
         sources.insert("grouped_m8_f16_tiles_reference".into(), ggml_id_mm_src);
         sources.insert("grouped_m8_f16_tiles_candidate".into(), ggml_id_mm_src);
+        for name in [
+            "kernel_mul_mm_id_prepared_q4_K_f32",
+            "kernel_mul_mm_id_prepared_q4_K_f32_c",
+            "kernel_mul_mm_id_prepared_q6_K_f32",
+            "kernel_mul_mm_id_prepared_q6_K_f32_c",
+        ] {
+            sources.insert(name.into(), ggml_id_mm_src);
+        }
         sources.insert("kernel_mul_mm_id_map0_ne20_1".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_6".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
@@ -771,6 +779,14 @@ impl KernelRegistry {
             "grouped_m8_f16_tiles_tensor_reference".into(),
             ggml_id_mm_tensor_src,
         );
+        for name in [
+            "kernel_mul_mm_id_prepared_q4_K_tensor_f32",
+            "kernel_mul_mm_id_prepared_q4_K_tensor_f32_c",
+            "kernel_mul_mm_id_prepared_q6_K_tensor_f32",
+            "kernel_mul_mm_id_prepared_q6_K_tensor_f32_c",
+        ] {
+            sources.insert(name.into(), ggml_id_mm_tensor_src);
+        }
         sources.insert(
             "kernel_mul_mm_id_q4_0_tensor_f32".into(),
             ggml_id_mm_tensor_src,

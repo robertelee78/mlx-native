@@ -949,3 +949,290 @@ kernel void grouped_m8_f16_tiles_tensor_reference(
     for (int i = 0; i < 16; ++i)
         output[offset + i] = reg[i / 4][i % 4];
 }
+
+
+// Unpublished full-MM candidate: duplicate the oracle reduction deliberately.
+// Only weight addressing changes; the original raw template above is untouched.
+template<bool Q6, short TM>
+inline void hf2q_mul_mm_id_prepared_tensor_tile(
+        constant GgmlMatmulIdMmTensor_MmParams & args,
+        constant PreparedF16TilesParams & p,
+        device const uchar *expert,
+        uint row,
+        device const float * y,
+        short il0,
+        threadgroup half  * sa,
+        threadgroup half  * sb,
+        threadgroup float * sc,
+        ushort tiitg) {
+    constexpr short nl = 16;
+    uint block = 0;
+    constexpr int NR0 = 64;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    short il = il0;
+
+    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
+    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NK, TM));
+
+    matmul2d<
+        matmul2d_descriptor(TM, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // Stage A.
+        //
+        // ADR-029 iter-55 H47 FALSIFIED 2026-05-11: tested adding
+        // `#pragma clang loop unroll(full)` here to mirror peer's
+        // FOR_UNROLL on this loop.
+        // Bench (post-H44+H46 baseline, 4K + 8K warmup-then-real):
+        //   4K MOE_GATE_UP: 10.61 → 10.65 ms/call (+0.4%, σ)
+        //   4K MOE_DOWN:    9.82  → 9.83  ms/call (+0.1%, σ)
+        //   8K MOE_GATE_UP: 20.58 → 20.56 ms/call (-0.1%, σ)
+        //   8K MOE_DOWN:    19.08 → 19.09 ms/call (+0.1%, σ)
+        //   4K wall:        1549  → 1551 ms (+0.1%, σ)
+        //   8K wall:        3307  → 3307 ms (0%, σ)
+        // ALL WITHIN σ on both regimes.  Deep-research hypothesis was
+        // that mm_id's extra pre-loop live registers (id, i11, i12,
+        // offset0, offset1, ids_i32) inhibit Metal's auto-unroll
+        // heuristic — measurement falsifies this.  Metal compiler
+        // already auto-unrolls regardless of register pressure here.
+        // The original P4.8-null-effect comment direction was correct
+        // even though the cited measurement was on the dense path;
+        // iter-55 confirms mm_id has the same null effect.
+        {
+            half4x4 temp_a;
+            if (Q6)
+                prepared_f16_q6_fragment(expert, p, row, block, il, temp_a);
+            else
+                prepared_f16_q4_fragment(expert, p, row, block, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = i%8;
+                const short ly = (tiitg/NL0)%8;
+                *(sa + NK*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        // Stage B (f32 → half, 8-wide vector store).  See the dense
+        // tensor kernel's equivalent staging for the rationale:
+        // K is always a multiple of NK=32 on our projections, so the
+        // per-element K-tail bounds check that the scalar path needs is
+        // never triggered — drop it and issue a single half2x4 store
+        // per thread.  Matches the FC_mul_mm_bc_inp=false fast path.
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+            *(threadgroup half2x4 *)(sb + NK*(8*sy + ly) + 8*sx) =
+                (half2x4)(*((device float2x4 *) y));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        block += (il < 2) ? 1 : 0;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto sA = tA.slice(0, 0);
+        auto sB = tB.slice(0, 0);
+        mm.run(sB, sA, cT);
+        // ADR-040 §0.19: post-mm.run barrier — without it the next K-iter
+        // overwrites sa/sb while this mm.run may still be reading them under
+        // GPU contention (intra-kernel race; deterministic single-tenant by
+        // timing-luck, flakes under multi-process scheduling). Mirrors the V2
+        // path + llama's kernel_mul_mm (ggml-metal.metal:9549).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write-back: always through shmem (scatter-by-hids) — same pattern as
+    // the simdgroup mm_id version, just cooperative_tensor::store instead
+    // of simdgroup_store for the shmem stage.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        auto tC_sm = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(NR0, TM));
+        cT.store(tC_sm);
+    }
+}
+
+template<bool Q6, bool COMPACT = false>
+kernel void hf2q_mul_mm_id_prepared_tensor_impl(
+        constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const char * htpe [[buffer(3)]],
+        device const char * hids [[buffer(4)]],
+        device       char * dst  [[buffer(5)]],
+        constant PreparedF16TilesParams & p [[buffer(6)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half  * sa = (threadgroup half  *)(shmem);
+    threadgroup half  * sb = (threadgroup half  *)(shmem + 4096);
+    threadgroup float * sc = (threadgroup float *)(shmem);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    int   im;
+    int   r0;
+    int   list_base;  // hids index of this tile's first routed row
+    short nr1;
+    if (COMPACT) {
+        const uint32_t schedule_state = tpe_u32[0];
+        const uint32_t tile  = tgpig.x;
+        const uint32_t ntile = tgpig.y;
+        if ((schedule_state & 0x80000000u) != 0u) {
+            if (tgpig.x == 0 && tgpig.y == 0) {
+                device float * out = (device float *) dst;
+                const uint64_t total =
+                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+                for (uint64_t index = tiitg; index < total; index += 128) {
+                    out[index] = NAN;
+                }
+            }
+            return;
+        }
+        if (tile >= schedule_state) return;
+        device const uint32_t * desc = tpe_u32 + 1 + 3*tile;
+        im        = (int)desc[0];
+        list_base = (int)desc[1];
+        nr1       = (short)desc[2];
+        r0        = ntile * NR0;
+    } else {
+        im = tgpig.z;
+        r0 = tgpig.y * NR0;
+        const int r1 = tgpig.x * NR1;
+
+        const uint32_t route_state = tpe_u32[im];
+        if ((route_state & 0x80000000u) != 0u) {
+            if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
+                device float * out = (device float *) dst;
+                const uint64_t total =
+                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
+                for (uint64_t index = tiitg; index < total; index += 128) {
+                    out[index] = NAN;
+                }
+            }
+            return;
+        }
+        const int32_t neh1 = (int32_t)route_state;
+        if (r1 >= neh1) return;
+
+        nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;
+        list_base = im * args.ne21 + r1;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    const int id = ids_i32[list_base + lr1];
+    const short i11 = (id % args.ne20) % args.ne11;
+    // §0.19 FIX (2026-06-30): token/row index must be `int` — flat
+    // [n_tokens, K] layout makes i12 reach n_tokens-1 (65535 at 8k); `short`
+    // overflows at 32768 → OOB gather. See quantized_matmul_id_mm.metal.
+    const int   i12 = (id / args.ne20);
+    const short i13 = 0;
+
+    // Prepared addresses are formed only after the original poison/idle exits.
+    device const uchar *expert = reinterpret_cast<device const uchar *>(src0)
+        + ulong(im) * p.prepared_expert_stride;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*(uint64_t)i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    if (COMPACT && (args.sched_flags & 1) != 0 && nr1 <= 16) {
+        hf2q_mul_mm_id_prepared_tensor_tile<Q6, 16>(
+            args, p, expert, r0 + lr0, y, il0, sa, sb, sc, tiitg);
+    } else {
+        hf2q_mul_mm_id_prepared_tensor_tile<Q6, NR1>(
+            args, p, expert, r0 + lr0, y, il0, sa, sb, sc, tiitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int id = ids_i32[list_base + j];
+        const short ide = id % args.ne20;
+        // §0.19 FIX (2026-06-30): output token/batch index must be `int` —
+        // `short` overflows at n_tokens>32768 → OOB write-back. See
+        // quantized_matmul_id_mm.metal.
+        const int   idt = id / args.ne20;
+
+        // §0.19 FIX (2026-06-30, codex SHIP-WITH-CHANGES): 64-bit output
+        // element offset (each factor promoted before multiply). See
+        // quantized_matmul_id_mm.metal. Byte-identical for in-range values.
+        const uint64_t dst_off =
+            (uint64_t) r0
+            + (uint64_t) ide * (uint64_t) args.ne0
+            + (uint64_t) idt * (uint64_t) args.ne1 * (uint64_t) args.ne0;
+        device float  * D  = (device float  *) dst + dst_off;
+        device float4 * D4 = (device float4 *) D;
+
+        threadgroup float  * C  = sc + j*NR0;
+        threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+        int i = tiisg;
+        for (; i < nr0/4; i += 32) {
+            *(D4 + i) = *(C4 + i);
+        }
+
+        i = (4*(nr0/4)) + tiisg;
+        for (; i < nr0; i += 32) {
+            *(D + i) = *(C + i);
+        }
+    }
+}
+
+template [[host_name("kernel_mul_mm_id_prepared_q4_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<false, false>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_prepared_q4_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<false, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_prepared_q6_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<true, false>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_prepared_q6_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<true, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
