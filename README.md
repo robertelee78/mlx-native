@@ -267,6 +267,21 @@ Charge the retained raw source backing, allocator rounding/caches, and command
 resources separately. Invalid or unrepresentable layouts return an error before
 allocation; this size is not a device-memory admission decision.
 
+To share execution scratch instead of retaining it per weight, prepare a
+`PreparedGgufWeightPlanes` with `prepare_repacked_gguf_weight_planes` and size
+its immutable storage with `repacked_gguf_weight_plane_bytes`. Query
+`repacked_gguf_mm_scratch_bytes` for the actual row count and
+`RepackedGgufMmExecution::{Auto, OnePass}`, then pass writable F32 scratch to
+`dispatch_repacked_gguf_mm_with_scratch`. Serial, one-pass and single-split
+executions require none. This API accepts F32 or BF16 inputs and preserves the
+corresponding established arithmetic and split policy. Scratch must not overlap
+accessed inputs, outputs or weights, and mapped read-only storage is rejected.
+End every scratch reader with a barrier before queued reuse; retain its owner
+through the checked success/error drain. Concurrent execution needs distinct
+scratch or an explicit ordering contract. Charge source backing and execution
+scratch separately; a smaller prepared-weight allocation is not an admission
+or performance verdict.
+
 Before an artifact producer or model graph claims a packed-affine route, query
 `packed_affine_capability(PackedAffineRequest)`. The versioned, serializable
 result distinguishes executable scalar fallbacks from routes specialized for

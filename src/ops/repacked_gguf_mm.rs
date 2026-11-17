@@ -5,9 +5,9 @@
 //! The bits of an output row depend only on that row and the weight: not on
 //! the row count, and not on the row's position among the rows.
 //!
-//! [`repacked_gguf_weight_bytes`] reports the incremental prepared buffer
-//! footprint before device allocation, including eagerly retained split scratch.
-//! It does not count the raw source backing retained by the prepared handle.
+//! [`repacked_gguf_weight_bytes`] includes the established API's owned scratch.
+//! [`repacked_gguf_weight_plane_bytes`] and [`repacked_gguf_mm_scratch_bytes`]
+//! charge immutable planes and caller-owned execution storage separately.
 
 use metal::MTLSize;
 
@@ -120,19 +120,33 @@ enum SplitSchedule {
     Serial,
 }
 
-/// A Q4_K or Q6_K weight repacked for the prepared MM. One prepared weight
-/// serves every row count.
+/// A prepared weight with eagerly owned split-grid execution scratch.
 ///
-/// The split-grid schedule passes through the weight's scratch, so two
-/// dispatches of one prepared weight need a memory barrier between them.
+/// Existing consumers retain this ownership model. Dispatches sharing this
+/// handle need a last-reader memory barrier before reusing its scratch.
 #[derive(Clone)]
 pub struct PreparedGgufWeight {
+    planes: PreparedGgufWeightPlanes,
+    partials: Option<MlxBuffer>,
+}
+
+impl PreparedGgufWeight {
+    /// K-split count, which fixes the output summation order.
+    pub fn splits(&self) -> u32 {
+        self.planes.splits()
+    }
+}
+
+/// Immutable repacked Q4_K/Q6_K planes, with no execution scratch or cache.
+///
+/// Retains the raw source backing, just like [`PreparedGgufWeight`]. Concurrent
+/// readers may use distinct scratch, or reuse scratch after its last reader
+/// completes (a memory barrier on one encoder, or a completed submission).
+#[derive(Clone)]
+pub struct PreparedGgufWeightPlanes {
     _source: MlxBuffer,
     bytes: MlxBuffer,
     plane1_offset: u32,
-    /// Split-grid scratch for one row tile, `[splits, TILE_ROWS, n]`; absent
-    /// for one split.
-    partials: Option<MlxBuffer>,
     meta_offset: u32,
     n: u32,
     k: u32,
@@ -144,10 +158,24 @@ pub struct PreparedGgufWeight {
     split_grid_row_tiles: u32,
 }
 
-impl PreparedGgufWeight {
-    /// K-split count of this weight (see [`PreparedGgufWeight`]).
+impl PreparedGgufWeightPlanes {
+    /// K-split count, which fixes the output summation order.
     pub fn splits(&self) -> u32 {
         self.splits
+    }
+
+    /// Bytes allocated for immutable planes and metadata, excluding source.
+    pub fn plane_bytes(&self) -> usize {
+        self.bytes.data_byte_len()
+    }
+
+    /// F32 scratch bytes needed by this execution; zero for serial/one-split.
+    pub fn execution_scratch_bytes(
+        &self,
+        rows: u32,
+        execution: RepackedGgufMmExecution,
+    ) -> Result<usize> {
+        execution_scratch_bytes(self.n, self.splits, rows, execution.schedule(self, rows))
     }
 
     fn split_schedule(&self, rows: u32) -> SplitSchedule {
@@ -334,6 +362,66 @@ pub fn repacked_gguf_weight_bytes(n: u32, k: u32, ggml_type: GgmlType) -> Result
     Ok(PreparedWeightLayout::new(n, k, ggml_type)?.total_bytes)
 }
 
+/// Scheduling policy for caller-owned execution storage. Neither choice changes
+/// K splits, reduction order, shaders, or output bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepackedGgufMmExecution {
+    /// The established row-count-dependent split-grid/serial schedule.
+    Auto,
+    /// Explicit serial splits, with no partial buffer or reduce pass.
+    OnePass,
+}
+
+impl RepackedGgufMmExecution {
+    fn schedule(self, prepared: &PreparedGgufWeightPlanes, rows: u32) -> SplitSchedule {
+        match self {
+            Self::Auto => prepared.split_schedule(rows),
+            Self::OnePass => SplitSchedule::Serial,
+        }
+    }
+}
+
+/// Checked immutable allocation bytes, excluding retained raw source backing,
+/// allocator rounding/cache retention, and execution/command/pipeline storage.
+pub fn repacked_gguf_weight_plane_bytes(n: u32, k: u32, ggml_type: GgmlType) -> Result<usize> {
+    Ok(PreparedWeightLayout::new(n, k, ggml_type)?.packed_bytes)
+}
+
+/// Checked caller-owned F32 execution bytes for `[M, K]` by `[N, K]`.
+/// Zero for one split, the automatic serial schedule, or explicit one-pass.
+/// A nonzero result covers one full `[splits, 32, N]` tile and is independent
+/// of activation dtype. No allocation or device is needed.
+pub fn repacked_gguf_mm_scratch_bytes(
+    n: u32,
+    k: u32,
+    ggml_type: GgmlType,
+    rows: u32,
+    execution: RepackedGgufMmExecution,
+) -> Result<usize> {
+    let layout = PreparedWeightLayout::new(n, k, ggml_type)?;
+    let schedule = if execution == RepackedGgufMmExecution::OnePass
+        || rows.div_ceil(TILE_ROWS) > split_grid_row_tiles(n, k, ggml_type, layout.splits)
+    {
+        SplitSchedule::Serial
+    } else {
+        SplitSchedule::Grid
+    };
+    execution_scratch_bytes(n, layout.splits, rows, schedule)
+}
+
+fn execution_scratch_bytes(n: u32, splits: u32, rows: u32, schedule: SplitSchedule) -> Result<usize> {
+    if rows == 0 {
+        return Err(MlxError::InvalidArgument("repacked GGUF MM requires M >= 1".into()));
+    }
+    if splits == 1 || schedule == SplitSchedule::Serial {
+        return Ok(0);
+    }
+    (n as usize).checked_mul(TILE_ROWS as usize)
+        .and_then(|v| v.checked_mul(splits as usize))
+        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF partial size overflow".into()))
+}
+
 /// Repack a Q4_K or Q6_K weight `[N, K]` for the prepared MM.
 ///
 /// The result does not depend on a row count; `params.m` is ignored.
@@ -344,6 +432,33 @@ pub fn prepare_repacked_gguf_weight(
     weight: &MlxBuffer,
     params: &GgmlQuantizedMatmulParams,
 ) -> Result<PreparedGgufWeight> {
+    prepare_repacked_gguf_weight_impl(encoder, registry, device, weight, params, true)
+        .map(|(planes, partials)| PreparedGgufWeight { planes, partials })
+}
+
+/// Prepare only immutable weight planes. No split scratch is allocated, even
+/// for a split weight. Use [`dispatch_repacked_gguf_mm_with_scratch`] to execute.
+/// `params.m` is ignored. Preparation errors leave earlier commands owned by
+/// the encoder; callers must drain those commands before reusing their inputs.
+pub fn prepare_repacked_gguf_weight_planes(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<PreparedGgufWeightPlanes> {
+    prepare_repacked_gguf_weight_impl(encoder, registry, device, weight, params, false)
+        .map(|(planes, _)| planes)
+}
+
+fn prepare_repacked_gguf_weight_impl(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+    owned_scratch: bool,
+) -> Result<(PreparedGgufWeightPlanes, Option<MlxBuffer>)> {
     if weight.dtype() != DType::U8 {
         return Err(MlxError::InvalidArgument(format!(
             "repacked GGUF preparation requires native U8 blocks, got {:?}",
@@ -358,13 +473,14 @@ pub fn prepare_repacked_gguf_weight(
             weight.data_byte_len()
         )));
     }
+    logical_range(weight, source_bytes)?;
     require_tensor_kernel_family(registry, device, TensorKernelFamily::RepackedGgufMm)?;
 
     let bytes = device.alloc_buffer(
         layout.packed_bytes, DType::U8, vec![layout.packed_bytes],
     )?;
     let splits = layout.splits;
-    let partials = if layout.partial_bytes > 0 {
+    let partials = if owned_scratch && layout.partial_bytes > 0 {
         Some(device.alloc_buffer(
             layout.partial_bytes,
             DType::F32,
@@ -395,10 +511,9 @@ pub fn prepare_repacked_gguf_weight(
         MTLSize::new(256, 1, 1),
     );
     encoder.memory_barrier();
-    Ok(PreparedGgufWeight {
+    Ok((PreparedGgufWeightPlanes {
         _source: weight.clone(),
         bytes,
-        partials,
         plane1_offset: p.plane1_offset,
         meta_offset: p.meta_offset,
         n: params.n,
@@ -406,7 +521,7 @@ pub fn prepare_repacked_gguf_weight(
         ggml_type: params.ggml_type,
         splits,
         split_grid_row_tiles: split_grid_row_tiles(params.n, params.k, params.ggml_type, splits),
-    })
+    }, partials))
 }
 
 /// Multiply `params.m >= 1` F32 activation rows `[M, K]` by a prepared weight,
@@ -509,6 +624,43 @@ pub fn dispatch_repacked_gguf_mm_bf16_input_one_pass(
     )
 }
 
+/// Execute immutable planes with caller-owned reusable F32 partial storage.
+///
+/// Accepts F32 or BF16 activations and writes F32 output, using the same kernels,
+/// splits and summation order as the established dtype-specific entries.
+/// `scratch` may be a flat arena view or any dense shape covering the checked
+/// requirement. It is not used or required when the requirement is zero.
+///
+/// No execution buffers, views, or per-weight caches are allocated here.
+/// Output and any used scratch require writable, non-file-backed storage.
+/// Known shared views are checked by virtual address range; callers must not
+/// supply distinct external/no-copy mappings with unknown physical aliasing.
+/// Validation and all fallible pipeline lookups finish before any command from
+/// this call is encoded. An error does not cancel earlier commands: the caller
+/// still owns their inputs/scratch and must drain the encoder before CPU reuse.
+///
+/// After a split-grid call, insert a last-reader `encoder.memory_barrier()`
+/// before any dispatch reuses its scratch, even for another weight. Separate
+/// encoders require completed submission or an equivalent dependency. This
+/// function inserts only the producer/reducer and between-tile barriers.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_repacked_gguf_mm_with_scratch(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    prepared: &PreparedGgufWeightPlanes,
+    output: &MlxBuffer,
+    scratch: Option<&MlxBuffer>,
+    params: &GgmlQuantizedMatmulParams,
+    execution: RepackedGgufMmExecution,
+) -> Result<()> {
+    dispatch_repacked_gguf_mm_planes(
+        encoder, registry, device, input, prepared, output, scratch, params,
+        input.dtype(), execution.schedule(prepared, params.m),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_repacked_gguf_mm_typed(
     encoder: &mut CommandEncoder,
@@ -521,9 +673,31 @@ fn dispatch_repacked_gguf_mm_typed(
     input_dtype: DType,
     schedule: Option<SplitSchedule>,
 ) -> Result<()> {
-    if params.m == 0 || input.dtype() != input_dtype || output.dtype() != DType::F32 {
+    dispatch_repacked_gguf_mm_planes(
+        encoder, registry, device, input, &prepared.planes, output,
+        prepared.partials.as_ref(), params, input_dtype,
+        schedule.unwrap_or_else(|| prepared.planes.split_schedule(params.m)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_repacked_gguf_mm_planes(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    prepared: &PreparedGgufWeightPlanes,
+    output: &MlxBuffer,
+    scratch: Option<&MlxBuffer>,
+    params: &GgmlQuantizedMatmulParams,
+    input_dtype: DType,
+    schedule: SplitSchedule,
+) -> Result<()> {
+    if params.m == 0 || !matches!(input_dtype, DType::F32 | DType::BF16)
+        || input.dtype() != input_dtype || output.dtype() != DType::F32
+    {
         return Err(MlxError::InvalidArgument(format!(
-            "repacked GGUF MM requires M >= 1, {input_dtype:?} input, and F32 output buffers"
+            "repacked GGUF MM requires M >= 1, {input_dtype:?} F32/BF16 input, and F32 output buffers"
         )));
     }
     if prepared.n != params.n || prepared.k != params.k || prepared.ggml_type != params.ggml_type {
@@ -532,18 +706,72 @@ fn dispatch_repacked_gguf_mm_typed(
             prepared.n, prepared.k, prepared.ggml_type, params.n, params.k, params.ggml_type
         )));
     }
-    require_tensor_kernel_family(registry, device, TensorKernelFamily::RepackedGgufMm)?;
     encode_repacked_gguf_mm(
-        encoder,
-        registry,
-        device,
-        input,
-        prepared,
-        output,
-        params.m,
-        input_dtype,
-        schedule.unwrap_or_else(|| prepared.split_schedule(params.m)),
+        encoder, registry, device, input, prepared, output, scratch,
+        params.m, input_dtype, schedule,
     )
+}
+
+/// Validate dense scalar buffers without trusting shape or backing padding.
+/// Flat arena views and multidimensional dense tensors are both supported.
+fn scalar_range(
+    label: &str,
+    buffer: &MlxBuffer,
+    dtype: DType,
+    required: usize,
+    alignment: u64,
+) -> Result<(usize, usize)> {
+    let shape_bytes = buffer.shape().iter().try_fold(dtype.size_of(), |size, &dim| {
+        size.checked_mul(dim)
+    });
+    if buffer.dtype() != dtype || buffer.byte_offset() % alignment != 0
+        || required > buffer.data_byte_len()
+        || !matches!(shape_bytes, Some(size) if size >= required && size <= buffer.data_byte_len())
+    {
+        return Err(MlxError::InvalidArgument(format!(
+            "repacked GGUF MM {label} requires aligned dense {dtype:?} shape covering {required} logical bytes"
+        )));
+    }
+    logical_range(buffer, required)
+}
+
+fn validate_writable(label: &str, buffer: &MlxBuffer) -> Result<()> {
+    if buffer.is_file_backed() || !buffer.is_cpu_writable() {
+        return Err(MlxError::InvalidArgument(format!(
+            "repacked GGUF MM {label} requires writable non-file-backed storage"
+        )));
+    }
+    Ok(())
+}
+
+fn logical_range(buffer: &MlxBuffer, bytes: usize) -> Result<(usize, usize)> {
+    let invalid = || MlxError::InvalidArgument("repacked GGUF MM buffer range overflow".into());
+    let offset = usize::try_from(buffer.byte_offset()).map_err(|_| invalid())?;
+    let end = offset.checked_add(bytes).ok_or_else(invalid)?;
+    if bytes > buffer.data_byte_len() || end > buffer.byte_len() {
+        return Err(MlxError::InvalidArgument("repacked GGUF MM buffer exceeds logical/backing extent".into()));
+    }
+    let start = (buffer.contents_ptr() as usize).checked_add(offset).ok_or_else(invalid)?;
+    Ok((start, start.checked_add(bytes).ok_or_else(invalid)?))
+}
+
+fn disjoint(label: &str, left: (usize, usize), right: (usize, usize)) -> Result<()> {
+    if left.0 < right.1 && right.0 < left.1 {
+        return Err(MlxError::InvalidArgument(format!(
+            "repacked GGUF MM {label} must not overlap"
+        )));
+    }
+    Ok(())
+}
+
+fn mm_kernels(ggml_type: GgmlType, input_dtype: DType) -> MmKernels {
+    match (ggml_type, input_dtype) {
+        (GgmlType::Q4_K, DType::F32) => Q4K_MM_KERNELS,
+        (GgmlType::Q6_K, DType::F32) => Q6K_MM_KERNELS,
+        (GgmlType::Q4_K, DType::BF16) => Q4K_MM_BF16_INPUT_KERNELS,
+        (GgmlType::Q6_K, DType::BF16) => Q6K_MM_BF16_INPUT_KERNELS,
+        _ => unreachable!(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,202 +780,155 @@ fn encode_repacked_gguf_mm(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    prepared: &PreparedGgufWeight,
+    prepared: &PreparedGgufWeightPlanes,
     output: &MlxBuffer,
+    scratch: Option<&MlxBuffer>,
     rows: u32,
     input_dtype: DType,
     schedule: SplitSchedule,
 ) -> Result<()> {
     let row_bytes = |width: u32, element: usize| {
-        (rows as usize)
-            .checked_mul(width as usize)
+        (rows as usize).checked_mul(width as usize)
             .and_then(|elements| elements.checked_mul(element))
             .ok_or_else(|| MlxError::InvalidArgument("repacked GGUF MM size overflow".into()))
     };
-    let input_bytes = row_bytes(prepared.k, input_dtype.size_of())?;
-    let output_bytes = row_bytes(prepared.n, std::mem::size_of::<f32>())?;
-    if input.data_byte_len() < input_bytes || output.data_byte_len() < output_bytes {
-        return Err(MlxError::InvalidArgument(format!(
-            "repacked GGUF MM buffer is too small: input {}/{input_bytes}, output {}/{output_bytes}",
-            input.data_byte_len(),
-            output.data_byte_len()
-        )));
-    }
-    match schedule {
-        SplitSchedule::Grid if rows <= TILE_ROWS => encode_split_grid_tile(
-            encoder,
-            registry,
-            device,
-            input,
-            prepared,
-            output,
-            rows,
-            input_dtype,
-        ),
-        SplitSchedule::Grid => {
-            let input_row = prepared.k as usize * input_dtype.size_of();
-            let output_row = prepared.n as usize * std::mem::size_of::<f32>();
-            for first_row in (0..rows).step_by(TILE_ROWS as usize) {
-                let tile_rows = (rows - first_row).min(TILE_ROWS);
-                if first_row > 0 && prepared.partials.is_some() {
-                    // The next tile reuses the partial-sum scratch.
-                    encoder.memory_barrier();
-                }
-                let tile_input = input.slice_view(
-                    (first_row as usize * input_row) as u64,
-                    tile_rows as usize * prepared.k as usize,
-                );
-                let tile_output = output.slice_view(
-                    (first_row as usize * output_row) as u64,
-                    tile_rows as usize * prepared.n as usize,
-                );
-                encode_split_grid_tile(
-                    encoder,
-                    registry,
-                    device,
-                    &tile_input,
-                    prepared,
-                    &tile_output,
-                    tile_rows,
-                    input_dtype,
-                )?;
-            }
-            Ok(())
+    let input_range = scalar_range("input", input, input_dtype,
+        row_bytes(prepared.k, input_dtype.size_of())?, input_dtype.size_of() as u64)?;
+    validate_writable("output", output)?;
+    // Serial folding binds packed_float4 output vectors.
+    let output_range = scalar_range("output", output, DType::F32,
+        row_bytes(prepared.n, 4)?, 16)?;
+    let plane_range = logical_range(&prepared.bytes, prepared.bytes.data_byte_len())?;
+    let source_range = logical_range(&prepared._source, prepared._source.data_byte_len())?;
+    disjoint("output/input", output_range, input_range)?;
+    disjoint("output/planes", output_range, plane_range)?;
+    disjoint("output/source", output_range, source_range)?;
+    let scratch_bytes = execution_scratch_bytes(prepared.n, prepared.splits, rows, schedule)?;
+    let partials = if scratch_bytes > 0 {
+        let scratch = scratch.ok_or_else(|| MlxError::InvalidArgument(
+            "repacked GGUF MM split grid requires caller-owned F32 scratch".into()
+        ))?;
+        validate_writable("scratch", scratch)?;
+        let range = scalar_range("scratch", scratch, DType::F32, scratch_bytes, 16)?;
+        for (label, other) in [
+            ("scratch/input", input_range), ("scratch/output", output_range),
+            ("scratch/planes", plane_range), ("scratch/source", source_range),
+        ] {
+            disjoint(label, range, other)?;
         }
-        SplitSchedule::Serial => {
-            let column_tiles = u64::from(prepared.n / 64);
-            let full_tiles = u64::from(rows / TILE_ROWS);
-            let edge_tiles = u64::from(rows % TILE_ROWS != 0);
-            for (edge, row_tiles) in [(false, full_tiles), (true, edge_tiles)] {
-                if row_tiles > 0 {
-                    encode_mm_pass(
-                        encoder,
-                        registry,
-                        device,
-                        input,
-                        prepared,
-                        output,
-                        output,
-                        rows,
-                        input_dtype,
-                        edge,
-                        true,
-                        MTLSize::new(row_tiles, column_tiles, 1),
-                    )?;
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Encode one row tile (`rows <= TILE_ROWS`) with one threadgroup per K
-/// split, then the reduce pass when the weight has several splits.
-#[allow(clippy::too_many_arguments)]
-fn encode_split_grid_tile(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    input: &MlxBuffer,
-    prepared: &PreparedGgufWeight,
-    output: &MlxBuffer,
-    rows: u32,
-    input_dtype: DType,
-) -> Result<()> {
-    let partials = prepared.partials.as_ref();
-    encode_mm_pass(
-        encoder,
-        registry,
-        device,
-        input,
-        prepared,
-        output,
-        partials.unwrap_or(output),
-        rows,
-        input_dtype,
-        rows < TILE_ROWS,
-        false,
-        MTLSize::new(u64::from(prepared.splits), u64::from(prepared.n / 64), 1),
-    )?;
-    if let Some(partials) = partials {
-        encoder.memory_barrier();
-        let reduce = registry.get_pipeline(REDUCE_KERNEL, device.metal_device())?;
-        let elements = rows.checked_mul(prepared.n).ok_or_else(|| {
+        // The reduce kernel's element count is a u32 shader parameter.
+        prepared.n.checked_mul(rows.min(TILE_ROWS)).ok_or_else(|| {
             MlxError::InvalidArgument("repacked GGUF MM tile exceeds u32 elements".into())
         })?;
-        let dims = [elements, prepared.splits];
-        encode_with_args(
-            encoder,
-            reduce,
-            &[
-                (0, KernelArg::Buffer(partials)),
-                (1, KernelArg::Buffer(output)),
-                (2, KernelArg::Bytes(as_bytes(&dims))),
-            ],
-            MTLSize::new(u64::from(elements), 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        Some(scratch)
+    } else {
+        None
+    };
+    require_tensor_kernel_family(registry, device, TensorKernelFamily::RepackedGgufMm)?;
+    let serial = schedule == SplitSchedule::Serial;
+    let kernels = mm_kernels(prepared.ggml_type, input_dtype);
+    // Resolve every pipeline before encoding: a lookup failure must not leave a
+    // partial product in the consumer's output or overwrite shared scratch.
+    let full = if rows >= TILE_ROWS {
+        Some(registry.get_pipeline(kernels[0][usize::from(serial)], device.metal_device())?.clone())
+    } else {
+        None
+    };
+    let edge = if rows % TILE_ROWS != 0 {
+        Some(registry.get_pipeline(kernels[1][usize::from(serial)], device.metal_device())?.clone())
+    } else {
+        None
+    };
+    let reduce = if partials.is_some() {
+        Some(registry.get_pipeline(REDUCE_KERNEL, device.metal_device())?.clone())
+    } else {
+        None
+    };
+    if !serial {
+        let input_row = prepared.k as usize * input_dtype.size_of();
+        let output_row = prepared.n as usize * 4;
+        for first_row in (0..rows).step_by(TILE_ROWS as usize) {
+            let tile_rows = (rows - first_row).min(TILE_ROWS);
+            if first_row > 0 && partials.is_some() {
+                // The prior reducer is the last reader of this scratch tile.
+                encoder.memory_barrier();
+            }
+            let input_offset = input.byte_offset() + (first_row as usize * input_row) as u64;
+            let output_offset = output.byte_offset() + (first_row as usize * output_row) as u64;
+            let pipeline = if tile_rows < TILE_ROWS { edge.as_ref() } else { full.as_ref() }.unwrap();
+            encode_mm_pass(
+                encoder, pipeline, input, prepared, output, partials.unwrap_or(output),
+                input_offset, output_offset, tile_rows, input_dtype,
+                MTLSize::new(u64::from(prepared.splits), u64::from(prepared.n / 64), 1),
+            );
+            if let (Some(partials), Some(reduce)) = (partials, reduce.as_ref()) {
+                encoder.memory_barrier();
+                let elements = tile_rows * prepared.n;
+                let dims = [elements, prepared.splits];
+                encode_with_args(
+                    encoder, reduce,
+                    &[
+                        (0, KernelArg::Buffer(partials)),
+                        (1, KernelArg::BufferWithOffset(output, output_offset)),
+                        (2, KernelArg::Bytes(as_bytes(&dims))),
+                    ],
+                    MTLSize::new(u64::from(elements), 1, 1), MTLSize::new(256, 1, 1),
+                );
+            }
+        }
+    } else {
+        for (pipeline, row_tiles) in [
+            (full.as_ref(), u64::from(rows / TILE_ROWS)),
+            (edge.as_ref(), u64::from(rows % TILE_ROWS != 0)),
+        ] {
+            if let Some(pipeline) = pipeline {
+                encode_mm_pass(
+                    encoder, pipeline, input, prepared, output, output,
+                    input.byte_offset(), output.byte_offset(), rows, input_dtype,
+                    MTLSize::new(row_tiles, u64::from(prepared.n / 64), 1),
+                );
+            }
+        }
     }
     Ok(())
 }
 
-/// Encode one MM kernel pass over the `rows` activation rows bound to it.
 #[allow(clippy::too_many_arguments)]
 fn encode_mm_pass(
     encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
+    pipeline: &metal::ComputePipelineStateRef,
     input: &MlxBuffer,
-    prepared: &PreparedGgufWeight,
+    prepared: &PreparedGgufWeightPlanes,
     output: &MlxBuffer,
     partials: &MlxBuffer,
+    input_offset: u64,
+    output_offset: u64,
     rows: u32,
     input_dtype: DType,
-    edge: bool,
-    serial: bool,
     threadgroups: MTLSize,
-) -> Result<()> {
-    let kernels = match (prepared.ggml_type, input_dtype) {
-        (GgmlType::Q4_K, DType::F32) => Q4K_MM_KERNELS,
-        (GgmlType::Q6_K, DType::F32) => Q6K_MM_KERNELS,
-        (GgmlType::Q4_K, DType::BF16) => Q4K_MM_BF16_INPUT_KERNELS,
-        (GgmlType::Q6_K, DType::BF16) => Q6K_MM_BF16_INPUT_KERNELS,
-        _ => unreachable!(),
-    };
-    let kernel = kernels[usize::from(edge)][usize::from(serial)];
-    let pipeline = registry.get_pipeline(kernel, device.metal_device())?;
-    let p = MmParams {
-        k: prepared.k,
-        n: prepared.n,
-        m: rows,
-        splits: prepared.splits,
-    };
+) {
+    let p = MmParams { k: prepared.k, n: prepared.n, m: rows, splits: prepared.splits };
     let offsets = [prepared.plane1_offset, prepared.meta_offset];
-    let shared_bytes = if input_dtype == DType::BF16 {
-        8_192
-    } else {
-        12_288
-    };
+    let shared_bytes = if input_dtype == DType::BF16 { 8_192 } else { 12_288 };
     encoder.encode_threadgroups_with_args_and_shared(
-        &pipeline,
+        pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&p))),
             (1, KernelArg::Buffer(&prepared.bytes)),
-            (2, KernelArg::Buffer(input)),
-            (3, KernelArg::Buffer(output)),
+            (2, KernelArg::BufferWithOffset(input, input_offset)),
+            (3, KernelArg::BufferWithOffset(output, output_offset)),
             (4, KernelArg::Bytes(as_bytes(&offsets))),
             (5, KernelArg::Buffer(partials)),
         ],
-        &[(0, shared_bytes)],
-        threadgroups,
-        MTLSize::new(64, 1, 1),
+        &[(0, shared_bytes)], threadgroups, MTLSize::new(64, 1, 1),
     );
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod caller_scratch;
 
     #[test]
     fn prepared_bytes_include_padding_and_eager_split_scratch() {
@@ -900,7 +1081,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 repacked_gguf_weight_bytes(params.n, params.k, ggml_type).unwrap(),
-                prepared.bytes.data_byte_len()
+                prepared.planes.bytes.data_byte_len()
                     + prepared.partials.as_ref().map_or(0, MlxBuffer::data_byte_len),
                 "prepared allocation footprint for {n} x {k} {ggml_type:?}",
             );
@@ -1050,8 +1231,9 @@ mod tests {
                 &mut self.registry,
                 &self.device,
                 input,
-                &self.prepared,
+                &self.prepared.planes,
                 &output,
+                self.prepared.partials.as_ref(),
                 rows as u32,
                 input.dtype(),
                 schedule,
@@ -1140,7 +1322,7 @@ mod tests {
             input: &MlxBuffer,
             output: &MlxBuffer,
         ) {
-            let prepared = &harness.prepared;
+            let prepared = &harness.prepared.planes;
             let element = input.dtype().size_of() as u64;
             let k = harness.k as u64;
             let p = Width32ReferenceParams {
@@ -1171,7 +1353,7 @@ mod tests {
             let device = harness.device.metal_device();
             let pipeline = self.registry.get_pipeline(kernel, device).unwrap();
             let offsets = [prepared.plane1_offset, prepared.meta_offset];
-            let partials = prepared.partials.as_ref().unwrap_or(output);
+            let partials = harness.prepared.partials.as_ref().unwrap_or(output);
             let shared_bytes = if input.dtype() == DType::BF16 {
                 8_192
             } else {
@@ -1774,7 +1956,7 @@ mod tests {
                 println!(
                     "| {name} | {n} x {k} | {ggml_type:?} | {m} | {stock:.3} | {prepared:.3} | {:.2} | {:?} |",
                     prepared / stock,
-                    harness.prepared.split_schedule(m as u32)
+                    harness.prepared.planes.split_schedule(m as u32)
                 );
             }
         }
