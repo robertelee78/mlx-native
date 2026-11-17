@@ -237,6 +237,7 @@ pub use ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml, quantized_matmul_id_ggml_grouped_m8_epilogue,
     quantized_matmul_id_ggml_grouped_m8_epilogue_masked,
     quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_pooled,
+    quantized_matmul_id_ggml_grouped_m8_f16_tiles_probe_into,
     quantized_matmul_id_ggml_pooled_pair, quantized_matmul_id_ggml_pooled_pair_with_policy,
     quantized_matmul_id_ggml_pooled_slotted,
     quantized_matmul_id_ggml_pooled_slotted_reusing_schedule,

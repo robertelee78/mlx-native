@@ -697,7 +697,13 @@ impl KernelRegistry {
         // per-expert routed-token lists, then mm_id stages a 64x32 expert
         // weight tile into threadgroup shmem and reuses it across a 32-row
         // block of that expert's routed tokens.
-        let ggml_id_mm_src: &'static str = include_str!("shaders/quantized_matmul_id_mm.metal");
+        let ggml_id_mm_src: &'static str = concat!(
+            include_str!("shaders/prepared_f16_tiles.h"),
+            "\n",
+            include_str!("shaders/quantized_matmul_id_mm.metal")
+        );
+        sources.insert("grouped_m8_f16_tiles_reference".into(), ggml_id_mm_src);
+        sources.insert("grouped_m8_f16_tiles_candidate".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_1".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_6".into(), ggml_id_mm_src);
         sources.insert("kernel_mul_mm_id_map0_ne20_8".into(), ggml_id_mm_src);
@@ -756,8 +762,15 @@ impl KernelRegistry {
         // matmul2d primitive for hardware-tensor-core MMA on M3+.  Only
         // the mm_id kernel is ported — map0 is a short pre-pass (not
         // matmul) and continues to use the simdgroup version.
-        let ggml_id_mm_tensor_src: &'static str =
-            include_str!("shaders/quantized_matmul_id_mm_tensor.metal");
+        let ggml_id_mm_tensor_src: &'static str = concat!(
+            include_str!("shaders/prepared_f16_tiles.h"),
+            "\n",
+            include_str!("shaders/quantized_matmul_id_mm_tensor.metal")
+        );
+        sources.insert(
+            "grouped_m8_f16_tiles_tensor_reference".into(),
+            ggml_id_mm_tensor_src,
+        );
         sources.insert(
             "kernel_mul_mm_id_q4_0_tensor_f32".into(),
             ggml_id_mm_tensor_src,

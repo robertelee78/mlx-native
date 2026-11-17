@@ -923,3 +923,29 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_iq2_xxs, QK_NL, dq_iq2_xxs_id, true
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// Private native-only probe of the actual tensor translation-unit decoders.
+#ifndef MLX_NATIVE_PREPARED_F16_TILES_H
+#include "prepared_f16_tiles.h"
+#endif
+
+kernel void grouped_m8_f16_tiles_tensor_reference(
+    device const uchar *raw [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant PreparedF16TilesParams &p [[buffer(2)]],
+    uint3 index [[thread_position_in_grid]]) {
+    if (index.x >= p.blocks * 16 || index.y >= p.n || index.z >= p.n_experts)
+        return;
+    const uint block = index.x / 16;
+    const short il = short(index.x % 16);
+    device const uchar *b = raw + ulong(index.z) * p.raw_expert_stride +
+        (ulong(index.y) * p.blocks + block) * (p.format == 0 ? 144 : 210);
+    half4x4 reg;
+    if (p.format == 0)
+        dq_q4_K_id(reinterpret_cast<device const block_q4_K *>(b), il, reg);
+    else
+        dq_q6_K_id(reinterpret_cast<device const block_q6_K *>(b), il, reg);
+    const ulong offset = prepared_f16_fragment_offset(p, index);
+    for (int i = 0; i < 16; ++i)
+        output[offset + i] = reg[i / 4][i % 4];
+}

@@ -48,6 +48,8 @@ pub use moe_tiles_fused::{
     MoeTilesFusedMask, MoeTilesFusedParams, MoeTilesFusedStage, MoeTilesFusedWeights,
     MOE_TILES_FUSED_GRID_WORDS, MOE_TILES_FUSED_MAX_EXPERTS, MOE_TILES_FUSED_MAX_ROUTES,
 };
+mod prepared_f16_probe;
+pub use prepared_f16_probe::quantized_matmul_id_ggml_grouped_m8_f16_tiles_probe_into;
 
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     factors.iter().try_fold(1usize, |total, factor| {

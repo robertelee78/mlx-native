@@ -1485,3 +1485,48 @@ kernel void hf2q_dequant_iq4_xs_dump(
         }
     }
 }
+
+// Private, native-only decoder-tile spike. Runtime registration bundles this
+// same header; the local include serves the precompiled translation unit.
+#ifndef MLX_NATIVE_PREPARED_F16_TILES_H
+#include "prepared_f16_tiles.h"
+#endif
+
+kernel void grouped_m8_f16_tiles_reference(
+    device const uchar *raw [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant PreparedF16TilesParams &p [[buffer(2)]],
+    uint3 index [[thread_position_in_grid]]) {
+    if (index.x >= p.blocks * 16 || index.y >= p.n || index.z >= p.n_experts)
+        return;
+    const uint block = index.x / 16;
+    const short il = short(index.x % 16);
+    device const uchar *b = raw + ulong(index.z) * p.raw_expert_stride +
+        (ulong(index.y) * p.blocks + block) * (p.format == 0 ? 144 : 210);
+    half4x4 reg;
+    if (p.format == 0)
+        dequantize_q4_K(reinterpret_cast<device const block_q4_K *>(b), il, reg);
+    else
+        dequantize_q6_K(reinterpret_cast<device const block_q6_K *>(b), il, reg);
+    const ulong offset = prepared_f16_fragment_offset(p, index);
+    for (int i = 0; i < 16; ++i)
+        output[offset + i] = reg[i / 4][i % 4];
+}
+
+kernel void grouped_m8_f16_tiles_candidate(
+    device const uchar *prepared [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant PreparedF16TilesParams &p [[buffer(2)]],
+    uint3 index [[thread_position_in_grid]]) {
+    if (index.x >= p.blocks * 16 || index.y >= p.n || index.z >= p.n_experts)
+        return;
+    device const uchar *expert = prepared + ulong(index.z) * p.prepared_expert_stride;
+    half4x4 reg;
+    if (p.format == 0)
+        prepared_f16_q4_fragment(expert, p, index.y, index.x / 16, short(index.x % 16), reg);
+    else
+        prepared_f16_q6_fragment(expert, p, index.y, index.x / 16, short(index.x % 16), reg);
+    const ulong offset = prepared_f16_fragment_offset(p, index);
+    for (int i = 0; i < 16; ++i)
+        output[offset + i] = reg[i / 4][i % 4];
+}
