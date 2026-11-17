@@ -10,6 +10,7 @@ use mlx_native::{
     MlxDevice, PreparedGroupedM8Experts,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{hash_map::DefaultHasher, BTreeMap};
 use std::hash::Hasher;
 
@@ -309,6 +310,8 @@ fn signatures(nodes: &[CapturedNode], projection: Projection, case: Case, prepar
 fn run(projection: Projection) {
     assert!(std::env::var_os("MTL_SHADER_VALIDATION").is_none());
     assert!(std::env::var_os("MTL_DEBUG_LAYER").is_none());
+    let golden_only = std::env::var("MLX_NATIVE_PREPARED_MM_GOLDEN_ONLY").as_deref() == Ok("1");
+    let mut golden_records = golden_only.then(|| Vec::with_capacity(16));
     let device = MlxDevice::new().expect("Metal device");
     let mut registry = KernelRegistry::new();
     let mut packet = Packet::new(&device, &mut registry, projection);
@@ -322,6 +325,19 @@ fn run(projection: Projection) {
                     let case = Case { tokens, concentrated, tensor, compact };
                     let views = packet.views(case);
                     compared += packet.parity(&device, &mut registry, case, &views, &mut routes);
+                    if let Some(records) = golden_records.as_mut() {
+                        let words = tokens * TOP_K * projection.n();
+                        let mut hashes = Vec::with_capacity(BANKS);
+                        for (layer, bank) in packet.banks.iter().enumerate() {
+                            let bytes = bank.reference.root.as_slice::<u8>().expect("settled raw output bytes");
+                            let digest = Sha256::digest(&bytes[GUARD * 4..(GUARD + words) * 4]);
+                            hashes.push(json!({"layer": layer,
+                                "format": format!("{:?}", projection.ty(layer)),
+                                "f32_words": words, "sha256": format!("{digest:x}")}));
+                        }
+                        records.push(json!({"case": case.metadata(), "raw_output_hashes": hashes}));
+                        continue;
+                    }
                     for _ in 0..2 {
                         packet.timed(&device, &mut registry, case, &views, false);
                         packet.timed(&device, &mut registry, case, &views, true);
@@ -357,6 +373,20 @@ fn run(projection: Projection) {
         }
     }
     packet.unchanged();
+    if let Some(records) = golden_records {
+        assert_eq!(records.len(), 16);
+        eprintln!("GROUPED_M8_LEGACY_MM_GOLDEN_SPIKE_JSON={}", json!({
+            "projection": projection.name(), "qualification": false,
+            "source_math": "unchanged published0.23.3 raw MM reductions",
+            "hash_encoding": "SHA256 of every logical output byte, native little-endian F32",
+            "experts": EXPERTS, "banks": BANKS, "top_k": TOP_K,
+            "n": projection.n(), "k": projection.k(), "slotted": projection.down,
+            "requested_fixture_bytes": packet.requested_bytes,
+            "compared_f32_words": compared, "bit_differences": 0,
+            "guard_or_source_failures": 0, "routes": routes, "records": records
+        }));
+        return;
+    }
     assert_eq!(scenarios.len(), 16);
     eprintln!("GROUPED_M8_PREPARED_MM_COST_SPIKE_JSON={}", json!({
         "projection": projection.name(), "qualification": false, "physical_savings_claimed": false,
