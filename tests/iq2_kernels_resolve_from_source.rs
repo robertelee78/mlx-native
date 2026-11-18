@@ -9,28 +9,21 @@
 use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice};
 use sha2::{Digest, Sha256};
 
+#[path = "support/expert_source_inputs.rs"]
+mod expert_source_inputs;
+
 const IQ2_XXS_KERNELS: [(&str, &str); 3] = [
     (
         "kernel_mul_mv_id_iq2_xxs_f32",
-        concat!(
-            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
-            include_str!("../src/shaders/prepared_legacy_readers.h"), "\n",
-            include_str!("../src/shaders/quantized_matmul_id_ggml.metal"),
-        ),
+        expert_source_inputs::EXPERT_MV_SOURCE,
     ),
     (
         "kernel_mul_mm_id_iq2_xxs_f32",
-        concat!(
-            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
-            include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
-        ),
+        expert_source_inputs::EXPERT_MM_SOURCE,
     ),
     (
         "kernel_mul_mm_id_iq2_xxs_tensor_f32",
-        concat!(
-            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
-            include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
-        ),
+        expert_source_inputs::EXPERT_TENSOR_MM_SOURCE,
     ),
 ];
 const TENSOR_REFERENCE: &str = "kernel_mul_mm_id_q4_0_tensor_f32";
