@@ -41,6 +41,28 @@ Reach for **[candle](https://github.com/huggingface/candle)** instead if you nee
 
 **Active development, pre-1.0.** API may change between minor versions (`0.x.0 → 0.(x+1).0` signals breaking changes). Public functions and structs evolve as new model families are added. Patch versions (`0.x.y → 0.x.(y+1)`) are non-breaking.
 
+### Migrating to 0.24
+
+Prepared Q4_K/Q6_K expert consumers now borrow opaque `GroupedM8ExpertPlanes`,
+not `PreparedGroupedM8Experts`. Update explicit function-pointer and wrapper
+signatures accordingly; both pending and completed owners dereference to the
+common planes. Direct storage fields are private: use `storage_bytes()` for
+immutable plane accounting.
+
+To retire raw expert storage, pass owned `GroupedM8Preparation` requests to
+`prepare_quantized_matmul_id_ggml_grouped_m8_batch`. It validates the whole batch
+before encoding, submits once, and returns `CompletedGroupedM8Experts` only
+after a checked wait. Completed handles retain no raw source. The asynchronous
+`PreparedGroupedM8Experts` contract remains source-retaining; dropping unrelated
+source aliases is not proof of completion. Drop caller-held aliases and drain
+originating residency removals before claiming physical reclamation.
+
+Integer preparation does not require the Metal tensor API. Established expert
+MM/MV, masked, slotted, paired and fused consumers read the same canonical
+planes with their own capability checks and caller-owned execution scratch.
+Charge preparation's simultaneous raw/prepared peak and execution scratch
+separately; this ownership API does not establish model admission or throughput.
+
 ### Migrating to 0.23
 
 BF16 AF4G64 staged decode projections use a precision-specific split profile.
@@ -90,6 +112,15 @@ fixed here, and their cause and relevance to ordinary execution remain open.
 Unqualified experimental rewrites are not included in this release.
 
 ### Changelog — unreleased
+
+- **v0.24.0 / canonical expert ownership** — a consuming, checked batch producer
+  returns source-free completed Q4_K/Q6_K expert planes. Shared legacy arithmetic
+  reads raw or canonical storage without reconstructing a raw bank. Q6 stock
+  and NR2 reductions explicitly retain their independently measured original
+  FMA associations. Independent original MV/MM goldens, masked and fused paths,
+  and source-lifetime tests pass on M5 with ordinary execution, Shader
+  Validation and combined Shader/Metal API Validation. Full-model memory,
+  quality and performance qualification remain downstream gates.
 
 - **v0.23.2 / source-ordered BF16 draft RMS** —
   `ops::dflash2_rms_norm::dispatch_dflash2_rms_norm_bf16` uses scalar-column

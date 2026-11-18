@@ -1457,15 +1457,21 @@ kernel void kernel_mul_mv_id_q5_K_f32(
 // Q6_K expert-indexed mat-vec kernel
 // ====================================================================
 
-kernel void kernel_mul_mv_id_q6_K_f32(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
+#ifndef MLX_NATIVE_PREPARED_LEGACY_READERS_H
+#include "prepared_legacy_readers.h"
+#endif
+
+template<bool PREPARED>
+inline void kernel_mul_mv_id_q6_K_f32_core(
+    device const  char  * src0,
+    device const float  * src1,
+    device       float  * dst,
+    device const  uint  * ids,
+    constant GgmlMatvecIdParams & p,
+    constant PreparedF16TilesParams * planes,
+    uint3 tgpig,
+    uint  tiisg,
+    uint  sgitg
 ) {
     const uint8_t kmask1 = 0x03;
     const uint8_t kmask2 = 0x0C;
@@ -1501,7 +1507,7 @@ kernel void kernel_mul_mv_id_q6_K_f32(
     if (poison_invalid_expert_id(
             dst, p, expert_id, output_row_base, row, 1, tiisg == 0)) return;
 
-    device const block_q6_K * x  = (device const block_q6_K *)((device const char *)src0 + expert_id * p.expert_stride) + row * nb;
+    const LegacyExpertRow<PREPARED, true> x = {src0, expert_id, uint(row), uint(nb), ulong(p.expert_stride), planes};
     device const float      * yy = src1 + token_idx * p.ne10;
 
     float sumf = 0;
@@ -1519,30 +1525,59 @@ kernel void kernel_mul_mv_id_q6_K_f32(
     const int q_offset_h = 32*ip + l0;
 
     for (int i = ix; i < nb; i += 2) {
-        device const uint8_t * q1 = x[i].ql + q_offset_l;
-        device const uint8_t * q2 = q1 + 32;
-        device const uint8_t * qh = x[i].qh + q_offset_h;
-        device const int8_t  * sc = x[i].scales + is;
+        device const int8_t  * sc = reinterpret_cast<device const int8_t *>(x.scales(i)) + is;
 
         device const float * y = yy + i * QK_K + y_offset;
 
-        const float dall = x[i].d;
+        const float dall = *x.dh(i);
 
         float4 sums = {0.f, 0.f, 0.f, 0.f};
         for (int l = 0; l < n; ++l) {
-            sums[0] += y[l+ 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-            sums[1] += y[l+32] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-            sums[2] += y[l+64] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-            sums[3] += y[l+96] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            sums[0] = fma(y[l+ 0], float((int8_t)((x.q6_low(i, q_offset_l + l) & 0xF) | ((x.q6_high(i, q_offset_h + l) & kmask1) << 4)) - 32), sums[0]);
+            sums[1] = fma(y[l+32], float((int8_t)((x.q6_low(i, q_offset_l + 32 + l) & 0xF) | ((x.q6_high(i, q_offset_h + l) & kmask2) << 2)) - 32), sums[1]);
+            sums[2] = fma(y[l+64], float((int8_t)((x.q6_low(i, q_offset_l + l)  >> 4) | ((x.q6_high(i, q_offset_h + l) & kmask3) << 0)) - 32), sums[2]);
+            sums[3] = fma(y[l+96], float((int8_t)((x.q6_low(i, q_offset_l + 32 + l)  >> 4) | ((x.q6_high(i, q_offset_h + l) & kmask4) >> 2)) - 32), sums[3]);
         }
 
-        sumf += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        // Preserve the independently captured stock-MV association.
+        const float scale0 = sums[0] * float(sc[0]);
+        const float scale2 = fma(sums[2], float(sc[4]), scale0);
+        const float scale1 = fma(sums[1], float(sc[2]), scale2);
+        const float scaled = fma(sums[3], float(sc[6]), scale1);
+        sumf = fma(dall, scaled, sumf);
     }
 
     const float tot = simd_sum(sumf);
     if (tiisg == 0 && row < (int)p.ne01) {
         dst[output_row_base * p.ne0 + row] = tot;
     }
+}
+
+kernel void kernel_mul_mv_id_q6_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q6_K_f32_core<false>(src0, src1, dst, ids, p, nullptr, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_id_prepared_q6_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    constant PreparedF16TilesParams & planes [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q6_K_f32_core<true>(src0, src1, dst, ids, p, &planes, tgpig, tiisg, sgitg);
 }
 
 // ====================================================================
@@ -1557,15 +1592,17 @@ kernel void kernel_mul_mv_id_q6_K_f32(
 //
 // Dispatch: threadgroups=(ceil(N/4), n_tokens*top_k, 1), threads=(2, 32, 1).
 // Env-gated via HF2Q_Q6K_ID_MV_NR2=1 in dispatch_id_mv.
-kernel void kernel_mul_mv_id_q6_K_f32_nr2(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
+template<bool PREPARED>
+inline void kernel_mul_mv_id_q6_K_f32_nr2_core(
+    device const  char  * src0,
+    device const float  * src1,
+    device       float  * dst,
+    device const  uint  * ids,
+    constant GgmlMatvecIdParams & p,
+    constant PreparedF16TilesParams * planes,
+    uint3 tgpig,
+    uint  tiisg,
+    uint  sgitg
 ) {
     constexpr int NSG = 2;
     constexpr int nr0 = 2;
@@ -1589,7 +1626,7 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
     if (poison_invalid_expert_id(
             dst, p, expert_id, output_row_base, first_row, nr0, tiisg == 0)) return;
 
-    device const block_q6_K * x_base = (device const block_q6_K *)((device const char *)src0 + expert_id * p.expert_stride) + first_row * nb;
+    const LegacyExpertRow<PREPARED, true> x_base = {src0, expert_id, uint(first_row), uint(nb), ulong(p.expert_stride), planes};
     device const float      * yy = src1 + token_idx * p.ne10;
 
     float sumf[nr0] = {0.f, 0.f};
@@ -1621,23 +1658,27 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
         }
 
         for (int row = 0; row < nr0; ++row) {
-            device const block_q6_K * xr = x_base + row * nb;
-            device const uint8_t * q1 = xr[i].ql + q_offset_l;
-            device const uint8_t * q2 = q1 + 32;
-            device const uint8_t * qh = xr[i].qh + q_offset_h;
-            device const int8_t  * sc = xr[i].scales + is;
+            const auto xr = x_base.with_row(min(uint(first_row + row), uint(p.ne01 - 1)));
+            device const int8_t  * sc = reinterpret_cast<device const int8_t *>(xr.scales(i)) + is;
 
-            const float dall = xr[i].d;
+            const float dall = *xr.dh(i);
 
             float4 sums = {0.f, 0.f, 0.f, 0.f};
             for (int l = 0; l < 4; ++l) {
-                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+                sums[0] = fma(yl[4*l + 0], float((int8_t)((xr.q6_low(i, q_offset_l + l) & 0xF) | ((xr.q6_high(i, q_offset_h + l) & kmask1) << 4)) - 32), sums[0]);
+                sums[1] = fma(yl[4*l + 1], float((int8_t)((xr.q6_low(i, q_offset_l + 32 + l) & 0xF) | ((xr.q6_high(i, q_offset_h + l) & kmask2) << 2)) - 32), sums[1]);
+                sums[2] = fma(yl[4*l + 2], float((int8_t)((xr.q6_low(i, q_offset_l + l)  >> 4) | ((xr.q6_high(i, q_offset_h + l) & kmask3) << 0)) - 32), sums[2]);
+                sums[3] = fma(yl[4*l + 3], float((int8_t)((xr.q6_low(i, q_offset_l + 32 + l)  >> 4) | ((xr.q6_high(i, q_offset_h + l) & kmask4) >> 2)) - 32), sums[3]);
             }
 
-            sumf[row] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            // Freeze the original NR2 reduction, not the stock-MV association.
+            // The independently captured dense golden distinguishes the rounded
+            // first product (group 2) from storage-dependent compiler choices.
+            const float scale2 = sums[2] * float(sc[4]);
+            const float scale0 = fma(sums[0], float(sc[0]), scale2);
+            const float scale1 = fma(sums[1], float(sc[2]), scale0);
+            const float scaled = fma(sums[3], float(sc[6]), scale1);
+            sumf[row] = fma(dall, scaled, sumf[row]);
         }
     }
 
@@ -1648,6 +1689,33 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
             dst[output_row_base * p.ne0 + out_row] = tot;
         }
     }
+}
+
+kernel void kernel_mul_mv_id_q6_K_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q6_K_f32_nr2_core<false>(src0, src1, dst, ids, p, nullptr, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_id_prepared_q6_K_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    constant PreparedF16TilesParams & planes [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q6_K_f32_nr2_core<true>(src0, src1, dst, ids, p, &planes, tgpig, tiisg, sgitg);
 }
 
 // ====================================================================
@@ -1675,15 +1743,17 @@ kernel void kernel_mul_mv_id_q6_K_f32_nr2(
 //
 // Routing index dim Y, NOT Z — see the Q5_K kernel's note at line 124.
 
-kernel void kernel_mul_mv_id_q4_K_f32(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
+template<bool PREPARED>
+inline void kernel_mul_mv_id_q4_K_f32_core(
+    device const  char  * src0,
+    device const float  * src1,
+    device       float  * dst,
+    device const  uint  * ids,
+    constant GgmlMatvecIdParams & p,
+    constant PreparedF16TilesParams * planes,
+    uint3 tgpig,
+    uint  tiisg,
+    uint  sgitg
 ) {
     const int nb = p.ne00 / QK_K;
 
@@ -1702,7 +1772,7 @@ kernel void kernel_mul_mv_id_q4_K_f32(
     if (poison_invalid_expert_id(
             dst, p, expert_id, output_row, row, 1, tiisg == 0)) return;
 
-    device const block_q4_K * x  = (device const block_q4_K *)((device const char *)src0 + expert_id * p.expert_stride) + row * nb;
+    const LegacyExpertRow<PREPARED, false> x = {src0, expert_id, uint(row), uint(nb), ulong(p.expert_stride), planes};
     device const float      * yy = src1 + token_idx * p.ne10;
 
     float sumf = 0.f;
@@ -1727,12 +1797,10 @@ kernel void kernel_mul_mv_id_q4_K_f32(
     device const float * y1 = yy + ix * QK_K + y_offset;
 
     for (int i = ix; i < nb; i += 4) {
-        device const uint8_t  * q1 = x[i].qs + q_offset;
-        device const uint8_t  * q2 = q1 + 64;
-        device const half     * dh = &x[i].d;
+        device const half     * dh = x.dh(i);
         // scales array is uint8_t[12]; cast to uint16_t[6] for the
         // sc16 decoding identical to the reference candle kernel.
-        device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
+        device const uint16_t * a  = (device const uint16_t *)x.scales(i) + iq;
 
         device const float * y2 = y1 + 128;
         float yl[16], yh[16];
@@ -1751,10 +1819,10 @@ kernel void kernel_mul_mv_id_q4_K_f32(
 
         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
         for (int l = 0; l < n; ++l) {
-            acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
-            acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
-            acc1[2] += yh[l+0] * (float)(q2[l] & 0x0F);
-            acc1[3] += yh[l+8] * (float)(q2[l] & 0xF0);
+            acc1[0] += yl[l+0] * (float)(x.q4_byte(i, q_offset + l) & 0x0F);
+            acc1[1] += yl[l+8] * (float)(x.q4_byte(i, q_offset + l) & 0xF0);
+            acc1[2] += yh[l+0] * (float)(x.q4_byte(i, q_offset + 64 + l) & 0x0F);
+            acc1[3] += yh[l+8] * (float)(x.q4_byte(i, q_offset + 64 + l) & 0xF0);
         }
 
         const float dall = (float)dh[0];
@@ -1773,6 +1841,33 @@ kernel void kernel_mul_mv_id_q4_K_f32(
     if (tiisg == 0 && row < (int)p.ne01) {
         dst[output_row * p.ne0 + row] = tot;
     }
+}
+
+kernel void kernel_mul_mv_id_q4_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q4_K_f32_core<false>(src0, src1, dst, ids, p, nullptr, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_id_prepared_q4_K_f32(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    constant PreparedF16TilesParams & planes [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q4_K_f32_core<true>(src0, src1, dst, ids, p, &planes, tgpig, tiisg, sgitg);
 }
 
 // ====================================================================
@@ -1810,15 +1905,17 @@ kernel void kernel_mul_mv_id_q4_K_f32(
 //
 // Dispatch: threadgroups (ceil(N / (4 * FOLD)), n_tokens * top_k, 1),
 // threads (32, 2, 1). Selected only by `quantized_matmul_id_ggml_mv_q4_k_nr2`.
-kernel void kernel_mul_mv_id_q4_K_f32_nr2(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3  tgpig [[threadgroup_position_in_grid]],
-    ushort tiisg [[thread_index_in_simdgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]]
+template<bool PREPARED>
+inline void kernel_mul_mv_id_q4_K_f32_nr2_core(
+    device const  char  * src0,
+    device const float  * src1,
+    device       float  * dst,
+    device const  uint  * ids,
+    constant GgmlMatvecIdParams & p,
+    constant PreparedF16TilesParams * planes,
+    uint3  tgpig,
+    ushort tiisg,
+    ushort sgitg
 ) {
     constexpr short NSG = 2;
     constexpr short NR0 = 2;
@@ -1864,10 +1961,8 @@ kernel void kernel_mul_mv_id_q4_K_f32_nr2(
     const int first_row = sg_first_row + rg * NR0;
     const int last_row = (int)p.ne01 - 1;
     const int row0 = min(first_row, last_row);
-    const int row_step = (first_row + 1 <= last_row)
-        ? nb * (int)(sizeof(block_q4_K) / sizeof(uint16_t)) : 0;
 
-    device const block_q4_K * x = (device const block_q4_K *)(src0 + expert_id * p.expert_stride) + row0 * nb;
+    const LegacyExpertRow<PREPARED, false> x = {src0, expert_id, uint(row0), uint(nb), ulong(p.expert_stride), planes};
     device const float      * y = src1 + token_idx * p.ne10;
 
     float yl[16];
@@ -1890,31 +1985,30 @@ kernel void kernel_mul_mv_id_q4_K_f32_nr2(
             yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
         }
 
-        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
-        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
-        device const half     * dh = &x[ib].d;
 
         for (short row = 0; row < NR0; row++) {
+            const auto xr = x.with_row(min(uint(row0 + row), uint(last_row)));
+            device const uint16_t * sc = reinterpret_cast<device const uint16_t *>(xr.scales(ib)) + iq;
+            device const half * dh = xr.dh(ib);
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
             sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
             sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
-            device const uint16_t * q2 = q1 + 32;
 
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
             _Pragma("clang loop unroll(full)")
             for (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+                acc1[0] += yl[2*i + 0] * (xr.q4_word(ib, 16 * iq + 4 * ir + i) & 0x000F);
+                acc1[1] += yl[2*i + 1] * (xr.q4_word(ib, 16 * iq + 4 * ir + i) & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (xr.q4_word(ib, 16 * iq + 4 * ir + i) & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (xr.q4_word(ib, 16 * iq + 4 * ir + i) & 0xF000);
+                acc2[0] += yh[2*i + 0] * (xr.q4_word(ib, 16 * iq + 4 * ir + 32 + i) & 0x000F);
+                acc2[1] += yh[2*i + 1] * (xr.q4_word(ib, 16 * iq + 4 * ir + 32 + i) & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (xr.q4_word(ib, 16 * iq + 4 * ir + 32 + i) & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (xr.q4_word(ib, 16 * iq + 4 * ir + 32 + i) & 0xF000);
             }
 
             sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
@@ -1923,9 +2017,6 @@ kernel void kernel_mul_mv_id_q4_K_f32_nr2(
                                   (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
                          dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-            q1 += row_step;
-            sc += row_step;
-            dh += row_step;
         }
 
         y4 += block_lanes * QK_K;
@@ -1942,6 +2033,33 @@ kernel void kernel_mul_mv_id_q4_K_f32_nr2(
             }
         }
     }
+}
+
+kernel void kernel_mul_mv_id_q4_K_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q4_K_f32_nr2_core<false>(src0, src1, dst, ids, p, nullptr, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_id_prepared_q4_K_f32_nr2(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    constant PreparedF16TilesParams & planes [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q4_K_f32_nr2_core<true>(src0, src1, dst, ids, p, &planes, tgpig, tiisg, sgitg);
 }
 
 // ====================================================================
@@ -2130,9 +2248,9 @@ inline int grouped_mv_id_next_members(
 
 // One weight row against up to 4 members: tot[c] is the stock per-pair
 // `simd_sum(sumf)` for member c.
-template <int NC>
+template <int NC, bool PREPARED>
 inline void q4_K_grouped_row_sums(
-    device const block_q4_K * x,
+    LegacyExpertRow<PREPARED, false> x,
     device const float      * src1,
     constant GgmlMatvecIdParams & p,
     thread const int * members,
@@ -2170,10 +2288,8 @@ inline void q4_K_grouped_row_sums(
     }
 
     for (int i = ix; i < nb; i += 4) {
-        device const uint8_t  * q1 = x[i].qs + q_offset;
-        device const uint8_t  * q2 = q1 + 64;
-        device const half     * dh = &x[i].d;
-        device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
+        device const half     * dh = x.dh(i);
+        device const uint16_t * a  = (device const uint16_t *)x.scales(i) + iq;
 
         for (int c = 0; c < NC; ++c) {
             device const float * y2 = y1[c] + 128;
@@ -2193,10 +2309,10 @@ inline void q4_K_grouped_row_sums(
 
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             for (int l = 0; l < n; ++l) {
-                acc1[0] += yl[l+0] * (float)(q1[l] & 0x0F);
-                acc1[1] += yl[l+8] * (float)(q1[l] & 0xF0);
-                acc1[2] += yh[l+0] * (float)(q2[l] & 0x0F);
-                acc1[3] += yh[l+8] * (float)(q2[l] & 0xF0);
+                acc1[0] += yl[l+0] * (float)(x.q4_byte(i, q_offset + l) & 0x0F);
+                acc1[1] += yl[l+8] * (float)(x.q4_byte(i, q_offset + l) & 0xF0);
+                acc1[2] += yh[l+0] * (float)(x.q4_byte(i, q_offset + 64 + l) & 0x0F);
+                acc1[3] += yh[l+8] * (float)(x.q4_byte(i, q_offset + 64 + l) & 0xF0);
             }
 
             const float dall = (float)dh[0];
@@ -2235,9 +2351,9 @@ inline float grouped_geglu_epilogue(float gate, float up) {
     return gelu * up;
 }
 
-template <int R0, int NC>
+template <int R0, int NC, bool PREPARED>
 inline void q4_K_geglu_chunk(
-    device const block_q4_K * xe,
+    LegacyExpertRow<PREPARED, false> xe,
     device const float      * src1,
     device       float      * dst,
     constant GgmlMatvecIdParams & p,
@@ -2245,7 +2361,6 @@ inline void q4_K_geglu_chunk(
     int first_row,
     uint tiisg
 ) {
-    const int nb = p.ne00 / QK_K;
     const int n_ff = (int)p.ne01 / 2;
     for (int r = 0; r < R0; ++r) {
         const int row = first_row + r;
@@ -2255,8 +2370,8 @@ inline void q4_K_geglu_chunk(
         }
         float gate[NC];
         float up[NC];
-        q4_K_grouped_row_sums<NC>(xe + row * nb, src1, p, members, tiisg, gate);
-        q4_K_grouped_row_sums<NC>(xe + (row + n_ff) * nb, src1, p, members, tiisg, up);
+        q4_K_grouped_row_sums<NC, PREPARED>(xe.with_row(row), src1, p, members, tiisg, gate);
+        q4_K_grouped_row_sums<NC, PREPARED>(xe.with_row(row + n_ff), src1, p, members, tiisg, up);
         if (tiisg == 0) {
             for (int c = 0; c < NC; ++c) {
                 dst[members[c] * p.ne0 + row] = grouped_geglu_epilogue(gate[c], up[c]);
@@ -2267,16 +2382,17 @@ inline void q4_K_geglu_chunk(
 
 // Geometry: threads (2, 32, 1) = 2 SIMD groups of R0 gate/up row pairs, so a
 // threadgroup covers 2 * R0 output columns. tgpig.y = flat pair.
-template <int R0>
-kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl(
-    device const  char  * src0   [[buffer(0)]],
-    device const float  * src1   [[buffer(1)]],
-    device       float  * dst    [[buffer(2)]],
-    device const  uint  * ids    [[buffer(3)]],
-    constant GgmlMatvecIdParams & p [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
+template <int R0, bool PREPARED>
+inline void kernel_mul_mv_id_q4_K_f32_grouped_geglu_core(
+    device const  char  * src0,
+    device const float  * src1,
+    device       float  * dst,
+    device const  uint  * ids,
+    constant GgmlMatvecIdParams & p,
+    constant PreparedF16TilesParams * planes,
+    uint3 tgpig,
+    uint  tiisg,
+    uint  sgitg
 ) {
     const int pair = tgpig.y;
     if (pair >= (int)p.ne1) return;
@@ -2303,26 +2419,63 @@ kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl(
     }
     if (grouped_mv_id_has_earlier_member(ids, pair, expert_id)) return;
 
-    device const block_q4_K * xe = (device const block_q4_K *)((device const char *)src0 + expert_id * p.expert_stride);
+    const LegacyExpertRow<PREPARED, false> xe = {src0, expert_id, 0, uint(p.ne00 / QK_K), ulong(p.expert_stride), planes};
 
     int cursor = pair;
     int members[4];
     for (;;) {
         const int count = grouped_mv_id_next_members(ids, p, expert_id, &cursor, members);
         if (count == 4) {
-            q4_K_geglu_chunk<R0, 4>(xe, src1, dst, p, members, first_row, tiisg);
+            q4_K_geglu_chunk<R0, 4, PREPARED>(xe, src1, dst, p, members, first_row, tiisg);
         } else if (count == 3) {
-            q4_K_geglu_chunk<R0, 3>(xe, src1, dst, p, members, first_row, tiisg);
+            q4_K_geglu_chunk<R0, 3, PREPARED>(xe, src1, dst, p, members, first_row, tiisg);
         } else if (count == 2) {
-            q4_K_geglu_chunk<R0, 2>(xe, src1, dst, p, members, first_row, tiisg);
+            q4_K_geglu_chunk<R0, 2, PREPARED>(xe, src1, dst, p, members, first_row, tiisg);
         } else if (count == 1) {
-            q4_K_geglu_chunk<R0, 1>(xe, src1, dst, p, members, first_row, tiisg);
+            q4_K_geglu_chunk<R0, 1, PREPARED>(xe, src1, dst, p, members, first_row, tiisg);
         }
         if (count < 4) break;
     }
+}
+
+template <int R0>
+kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q4_K_f32_grouped_geglu_core<R0, false>(
+        src0, src1, dst, ids, p, nullptr, tgpig, tiisg, sgitg);
+}
+
+template <int R0>
+kernel void kernel_mul_mv_id_prepared_q4_K_f32_grouped_geglu_impl(
+    device const  char  * src0   [[buffer(0)]],
+    device const float  * src1   [[buffer(1)]],
+    device       float  * dst    [[buffer(2)]],
+    device const  uint  * ids    [[buffer(3)]],
+    constant GgmlMatvecIdParams & p [[buffer(4)]],
+    constant PreparedF16TilesParams & planes [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    kernel_mul_mv_id_q4_K_f32_grouped_geglu_core<R0, true>(
+        src0, src1, dst, ids, p, &planes, tgpig, tiisg, sgitg);
 }
 
 template [[host_name("kernel_mul_mv_id_q4_K_f32_grouped_geglu_rt4")]]
 kernel void kernel_mul_mv_id_q4_K_f32_grouped_geglu_impl<4>(
     device const char *, device const float *, device float *, device const uint *,
     constant GgmlMatvecIdParams &, uint3, uint, uint);
+
+
+template [[host_name("kernel_mul_mv_id_prepared_q4_K_f32_grouped_geglu_rt4")]]
+kernel void kernel_mul_mv_id_prepared_q4_K_f32_grouped_geglu_impl<4>(
+    device const char *, device const float *, device float *, device const uint *,
+    constant GgmlMatvecIdParams &, constant PreparedF16TilesParams &, uint3, uint, uint);

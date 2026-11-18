@@ -35,9 +35,12 @@
 //   buffer(5): hids         device const char * per-expert routed-token list
 //   buffer(6): dst          device       char * output [n_tokens*top_k, N]
 //
-// Math contract: byte-identical (within F32 FMA tolerance) to the
-// unfused 3-dispatch sequence. Parity tested via
-// `adr_033_pi_task20_fused_mm_id_q6_K_parity` (TBD).
+// Raw and canonical storage use one fused reduction and epilogue body.
+// Full bitwise output gates live in prepared_expert_legacy_parity.rs.
+
+#ifndef MLX_NATIVE_PREPARED_F16_TILES_H
+#include "prepared_f16_tiles.h"
+#endif
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -56,43 +59,11 @@ static_assert(sizeof(block_q6_K) == sizeof(half) + QK_K/16 + 3*QK_K/4,
               "wrong q6_K block size");
 
 // Per-call dequantize: writes 16 elements of one Q6_K block to a 4x4 tile.
-// Verbatim port of `dequantize_q6_K` from quantized_matmul_id_mm.metal:213
-// (itself the shared upstream template). DO NOT modify — the
-// `il`/scales index arithmetic + kmask bit-packing is mm-template-specific.
+// Uses the same F16 fragment arithmetic as classic and tensor expert MM.
 template <typename type4x4>
 void dequantize_q6_K_fused(device const block_q6_K * xb, short il, thread type4x4 & reg) {
-    const half d_all = xb->d;
-    device const uint16_t * ql = (device const uint16_t *)xb->ql;
-    device const uint16_t * qh = (device const uint16_t *)xb->qh;
-    device const int8_t * scales = (device const int8_t *)xb->scales;
-
-    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
-    qh = qh + 16*(il/8) + 8*(il&1);
-    float sc = scales[(il%2) + 2 * ((il/2))];
-    il = (il/2) & 3;
-
-    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
-    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
-    const float ml = d_all * sc * 32.f;
-    const float dl0 = d_all * sc;
-    const float dl1 = dl0 / 256.f;
-    const float dl2 = dl0 / (256.f * 256.f);
-    const float dl3 = dl0 / (256.f * 256.f * 256.f);
-    const uint8_t shr_h = il>2 ? 2 : 0;
-    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
-    const uint8_t shr_l = il>1 ? 4 : 0;
-
-    float4x4 reg_f;
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
-        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
-        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
-        reg_f[i][0] = dl0 *  ((half)(q & 0xFF))      - ml;
-        reg_f[i][1] = dl1 * ((float)(q & 0xFF00))    - ml;
-        reg_f[i][2] = dl2 * ((float)(q & 0xFF0000))  - ml;
-        reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
-    }
-    reg = (type4x4) reg_f;
+    const RawF16Fragment<block_q6_K> reader = {xb};
+    legacy_f16_q6_fragment(xb->d, xb->scales, reader, il, reg);
 }
 
 // Args struct — same shape as GgmlMatmulIdMm_MmParams in the
@@ -113,37 +84,39 @@ struct GgmlMatmulIdMm_MmParams {
     int32_t  ne21;
     int32_t  ne0;
     int32_t  ne1;
-    uint     r2;
-    uint     r3;
-    uint     _pad1;
+    short    r2;
+    short    r3;
+    ushort   sched_flags;
+    ushort   _pad1;
 };
 
-// Iter 2: dual-A-tile staging + shared B-tile + dual MMA accumulation.
+// Dual-A-tile staging + shared B-tile + dual MMA accumulation.
 //
-// Shmem layout (12 KB used in K-loop, 4 KB used in writeback):
+// Shmem layout (12 KB used in K-loop, 16 KB used in writeback):
 //   offset    0 .. 4095   sa_gate (32 K-elem × 64 N-row × half = 4 KB)
 //   offset 4096 .. 8191   sa_up   (same shape)
 //   offset 8192 .. 12287  sb      (32 K-elem × 32 M-row × float = 4 KB)
 //
 //   Writeback overlays sa_gate region (offset 0); the A-tiles are no
 //   longer needed once we exit the K-loop.
-//
-// silu_mul fusion lands in iter 3 — for now writeback path is empty.
 #define Q6K_NL 16  // 256/16 = 16 dequant ops per block
 
-kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
-        constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
-        device const char * gate_w [[buffer(1)]],
-        device const char * up_w   [[buffer(2)]],
-        device const char * src1   [[buffer(3)]],
-        device const char * htpe   [[buffer(4)]],
-        device const char * hids   [[buffer(5)]],
-        device       char * dst    [[buffer(6)]],
-        threadgroup  char * shmem  [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+template<bool PREPARED>
+inline void fused_gate_up_silu_mm_id_q6_K_core(
+        constant GgmlMatmulIdMm_MmParams & args,
+        device const char * gate_w,
+        device const char * up_w,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        constant PreparedF16TilesParams * gate_planes,
+        constant PreparedF16TilesParams * up_planes,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg) {
 
     threadgroup half  * sa_gate = (threadgroup half  *)(shmem);
     threadgroup half  * sa_up   = (threadgroup half  *)(shmem + 4096);
@@ -197,10 +170,20 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/Q6K_NL;
 
-    device const block_q6_K * x_gate =
-        (device const block_q6_K *)(gate_w + args.nb01*(r0 + lr0) + offset0) + offset1;
-    device const block_q6_K * x_up =
-        (device const block_q6_K *)(up_w   + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q6_K * x_gate = nullptr;
+    device const block_q6_K * x_up = nullptr;
+    device const uchar * gate_expert = nullptr;
+    device const uchar * up_expert = nullptr;
+    uint block = 0;
+    if (PREPARED) {
+        gate_expert = reinterpret_cast<device const uchar *>(gate_w)
+            + ulong(im) * gate_planes->prepared_expert_stride;
+        up_expert = reinterpret_cast<device const uchar *>(up_w)
+            + ulong(im) * up_planes->prepared_expert_stride;
+    } else {
+        x_gate = (device const block_q6_K *)(gate_w + args.nb01*(r0 + lr0) + offset0) + offset1;
+        x_up = (device const block_q6_K *)(up_w + args.nb01*(r0 + lr0) + offset0) + offset1;
+    }
 
     const short iy = 8*(tiitg % NL1);
 
@@ -225,7 +208,9 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
         // ---- A-tile dequantize + stage for GATE ----
         {
             half4x4 temp_a;
-            dequantize_q6_K_fused(x_gate, il, temp_a);
+            if (PREPARED)
+                prepared_f16_q6_fragment(gate_expert, *gate_planes, r0 + lr0, block, il, temp_a);
+            else dequantize_q6_K_fused(x_gate, il, temp_a);
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -242,7 +227,9 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
         // ---- A-tile dequantize + stage for UP ----
         {
             half4x4 temp_a;
-            dequantize_q6_K_fused(x_up, il, temp_a);
+            if (PREPARED)
+                prepared_f16_q6_fragment(up_expert, *up_planes, r0 + lr0, block, il, temp_a);
+            else dequantize_q6_K_fused(x_up, il, temp_a);
 
             // No barrier between the two A-tile stages — they write to
             // disjoint shmem regions and the same thread owns the same
@@ -274,8 +261,11 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
         // the same dequant block layout so `il`/`x` arithmetic is identical.
         const short il_next = (il + 2 < Q6K_NL) ? il + 2 : il % 2;
         if (il_next < 2) {
-            x_gate += (2 + Q6K_NL - 1)/Q6K_NL;
-            x_up   += (2 + Q6K_NL - 1)/Q6K_NL;
+            if (PREPARED) ++block;
+            else {
+                x_gate += (2 + Q6K_NL - 1)/Q6K_NL;
+                x_up += (2 + Q6K_NL - 1)/Q6K_NL;
+            }
         }
         il = il_next;
 
@@ -338,9 +328,11 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
         const int id = ids_i32[im*args.ne21 + r1 + j];
 
         const short ide = id % args.ne20;  // slot index
-        const short idt = id / args.ne20;  // token index
+        const int idt = id / args.ne20;
 
-        device float  * D  = (device float  *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+        device float * D = (device float *)dst + uint64_t(r0)
+            + uint64_t(ide) * uint64_t(args.ne0)
+            + uint64_t(idt) * uint64_t(args.ne1) * uint64_t(args.ne0);
         device float4 * D4 = (device float4 *) D;
 
         threadgroup float  * Cg  = (threadgroup float *)  shmem          + j*NR0;
@@ -368,4 +360,40 @@ kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
             *(D + i) = (g / (1.0f + exp(-g))) * u;
         }
     }
+}
+
+kernel void kernel_fused_gate_up_silu_mm_id_q6_K_f32(
+        constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
+        device const char * gate_w [[buffer(1)]],
+        device const char * up_w   [[buffer(2)]],
+        device const char * src1   [[buffer(3)]],
+        device const char * htpe   [[buffer(4)]],
+        device const char * hids   [[buffer(5)]],
+        device       char * dst    [[buffer(6)]],
+        threadgroup  char * shmem  [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    fused_gate_up_silu_mm_id_q6_K_core<false>(args, gate_w, up_w, src1, htpe, hids,
+        dst, nullptr, nullptr, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
+kernel void kernel_fused_gate_up_silu_mm_id_prepared_q6_K_f32(
+        constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
+        device const char * gate_w [[buffer(1)]],
+        device const char * up_w   [[buffer(2)]],
+        device const char * src1   [[buffer(3)]],
+        device const char * htpe   [[buffer(4)]],
+        device const char * hids   [[buffer(5)]],
+        device       char * dst    [[buffer(6)]],
+        constant PreparedF16TilesParams & gate_planes [[buffer(7)]],
+        constant PreparedF16TilesParams & up_planes [[buffer(8)]],
+        threadgroup  char * shmem  [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    fused_gate_up_silu_mm_id_q6_K_core<true>(args, gate_w, up_w, src1, htpe, hids,
+        dst, &gate_planes, &up_planes, shmem, tgpig, tiitg, tiisg, sgitg);
 }

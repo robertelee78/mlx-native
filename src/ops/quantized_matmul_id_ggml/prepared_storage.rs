@@ -24,6 +24,13 @@ pub struct GroupedM8ExpertPlanes {
     pub(super) meta_offset: u32,
 }
 
+impl GroupedM8ExpertPlanes {
+    /// Encoded plane payload bytes; not a physical residency measurement.
+    pub fn storage_bytes(&self) -> usize {
+        self.bytes.data_byte_len()
+    }
+}
+
 struct PendingExpertPlanes {
     _source: MlxBuffer,
     planes: GroupedM8ExpertPlanes,
@@ -210,8 +217,9 @@ struct BatchFlight {
 /// Consume source owners and complete one batch of expert-plane preparations.
 ///
 /// All requests are validated and all destinations allocated before encoding.
-/// The batch has one preparation submission and checked wait; the existing
-/// capability probe may perform its own independent initialization work.
+/// The batch has one preparation submission and checked wait. Integer packing
+/// does not require the tensor API; each arithmetic consumer checks its own
+/// capabilities separately.
 /// No partially completed handles escape. A command-attached resource owner
 /// covers both retained and unretained command buffers, including an unexpected
 /// nonterminal wait result. No caller-provided completion assertion is accepted.
@@ -229,7 +237,6 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8_batch(
     let plans = requests.iter().map(|request| {
         PreparationPlan::new(device, &request.source, &request.params)
     }).collect::<Result<Vec<_>>>()?;
-    require_tensor_kernel_family(registry, device, TensorKernelFamily::GroupedM8Experts)?;
     let pipeline = registry.get_pipeline("grouped_m8_prepare_q4k_q6k", device.metal_device())?;
     let planes = plans.iter().map(|plan| {
         plan.allocate(device).map(Arc::new)
@@ -264,4 +271,105 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8_batch(
     drop(handler);
     result?;
     Ok(planes.into_iter().map(|planes| CompletedGroupedM8Experts { planes }).collect())
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Weak;
+
+    fn mapped_source(device: &MlxDevice, bytes: usize) -> (MlxBuffer, Weak<memmap2::Mmap>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mlx-completed-auto-source-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let file = OpenOptions::new().read(true).write(true).create_new(true)
+            .open(&path).unwrap();
+        file.set_len((bytes + 64).div_ceil(65536) as u64 * 65536).unwrap();
+        // SAFETY: this test exclusively owns the file and never writes it after
+        // mapping. The Metal deallocator and storage keep its mapping alive.
+        let backing = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file).unwrap() });
+        std::fs::remove_file(path).unwrap();
+        let weak = Arc::downgrade(&backing);
+        let buffer = device.map_file_buffer(backing, 64, bytes, DType::U8, vec![bytes]).unwrap();
+        (buffer, weak)
+    }
+
+    #[test]
+    #[ignore = "Apple GPU; auto-registered mapped source retirement with a live sibling"]
+    fn completed_batch_retires_auto_registered_sources_with_live_sibling() {
+        run_auto_registered_retirement(false);
+    }
+
+    #[test]
+    #[ignore = "Apple GPU; canonical storage and legacy MV without the Metal tensor header"]
+    fn completed_batch_and_legacy_mv_do_not_require_tensor_header() {
+        run_auto_registered_retirement(true);
+    }
+
+    fn run_auto_registered_retirement(missing_tensor_header: bool) {
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        if missing_tensor_header {
+            registry.simulate_missing_tensor_header().unwrap();
+        }
+        let mut pool = crate::MlxBufferPool::new();
+        let mut requests = Vec::new();
+        let mut witnesses = Vec::new();
+        for ggml_type in [GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q6_K] {
+            let params = GgmlQuantizedMatmulIdParams {
+                n_tokens: 1, top_k: 1, n: 64, k: 256, n_experts: 8,
+                expert_stride: 64 * u64::from(ggml_type.block_bytes()), ggml_type,
+            };
+            let (source, weak) = mapped_source(&device, params.expert_stride as usize * 8);
+            pool.register_existing(&device, &source).unwrap();
+            requests.push(GroupedM8Preparation { source, params });
+            witnesses.push((weak, params));
+        }
+        let (survivor, survivor_weak) = mapped_source(&device, 4096);
+        pool.register_existing(&device, &survivor).unwrap();
+        let completed = objc::rc::autoreleasepool(|| {
+            prepare_quantized_matmul_id_ggml_grouped_m8_batch(
+                &device, &mut registry, requests,
+            ).unwrap()
+        });
+        objc::rc::autoreleasepool(|| {
+            device.command_encoder().unwrap().commit_and_wait().unwrap();
+        });
+        for (weak, _) in &witnesses {
+            assert!(weak.upgrade().is_none(), "retired source mapping remains owned");
+        }
+        assert!(survivor_weak.upgrade().is_some());
+        assert!(survivor.as_slice::<u8>().unwrap().iter().all(|&byte| byte == 0));
+
+        let mut input = device.alloc_buffer(256 * 4, DType::F32, vec![256]).unwrap();
+        input.as_mut_slice::<f32>().unwrap().fill(3.0);
+        let mut ids = device.alloc_buffer(4, DType::U32, vec![1]).unwrap();
+        ids.as_mut_slice::<u32>().unwrap()[0] = 0;
+        let mut output = device.alloc_buffer(64 * 4, DType::F32, vec![64]).unwrap();
+        for (planes, (_, params)) in completed.iter().zip(&witnesses) {
+            output.as_mut_slice::<f32>().unwrap().fill(f32::NAN);
+            objc::rc::autoreleasepool(|| {
+                let mut encoder = device.command_encoder().unwrap();
+                crate::quantized_matmul_id_ggml_prepared_mv_with_policy(
+                    &mut encoder, &mut registry, &device, &input, planes, &ids, &output,
+                    params, &crate::GgmlRoutingPolicy::default(),
+                ).unwrap();
+                encoder.commit_and_wait().unwrap();
+            });
+            assert!(output.as_slice::<f32>().unwrap().iter().all(|&value| value == 0.0));
+        }
+        drop(completed);
+        drop(survivor);
+        objc::rc::autoreleasepool(|| {
+            device.command_encoder().unwrap().commit_and_wait().unwrap();
+        });
+        assert!(survivor_weak.upgrade().is_none(),
+            "source set keeps a dropped sibling while device and pool remain alive");
+        drop(pool);
+    }
 }

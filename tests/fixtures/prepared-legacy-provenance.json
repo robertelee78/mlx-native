@@ -1,0 +1,25 @@
+{
+  "schema": "mlx-native.prepared-legacy-independent-goldens.v1",
+  "proof_root": "/Volumes/Extreme Pro/hf2q-v0130/release-evidence-20261116/native0233-prepared-only-expert-spike-v1",
+  "source_grounding_sha256": "11554435a6664dbe3804bb3ed224c9a1580926649344906d8588fc4bc9db9036",
+  "frozen_generator_commit": "b168dcb2eb4c89b56eadf694117350a37fde723c",
+  "generator": "tests/grouped_m8_prepared_mm_cost_spike.rs",
+  "generator_change": "Optional SHA256 output capture only; original published 0.23.3 raw library/shader arithmetic and fixture RNG unchanged.",
+  "hash_encoding": "SHA256 of all logical output bytes, little-endian F32, without conversion",
+  "packets": [
+    {
+      "source": "legacy-mm-golden-v1/gate-raw-output-goldens.json",
+      "fixture": "prepared-legacy-gate-raw-output-goldens.json",
+      "bytes": 126564,
+      "sha256": "3964b02aaa3878a653b2526e4eb387374d77424ddb0cb804f29aa038e912f453"
+    },
+    {
+      "source": "legacy-mm-golden-v1/down-raw-output-goldens.json",
+      "fixture": "prepared-legacy-down-raw-output-goldens.json",
+      "bytes": 127241,
+      "sha256": "74e59fc3556a5764e2a0e04ab6311ccccf581fbbb604d6c429a080e92529b150"
+    }
+  ],
+  "coverage": "Two projections, 16 cases each, 40 banks per case; every one of 2516582400 F32 output words. Expected hashes are immutable and are never derived from the shared candidate core.",
+  "qualification": false
+}

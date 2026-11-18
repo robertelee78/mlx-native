@@ -1,4 +1,4 @@
-//! Unpublished full-MM experiment: prepared addresses, original F16 reductions.
+//! Source-free canonical readers with the original legacy MM arithmetic.
 
 use super::{
     as_bytes, checked_byte_extent, compact_max_tiles, encode_compact_map0,
@@ -14,24 +14,24 @@ use crate::device::metal_device_registry_id;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PreparedGpuParams {
-    n_experts: u32,
-    n: u32,
-    blocks: u32,
-    format: u32,
-    raw_expert_stride: u64,
-    prepared_expert_stride: u64,
-    plane1_offset: u32,
-    meta_offset: u32,
+pub(super) struct PreparedGpuParams {
+    pub(super) n_experts: u32,
+    pub(super) n: u32,
+    pub(super) blocks: u32,
+    pub(super) format: u32,
+    pub(super) raw_expert_stride: u64,
+    pub(super) prepared_expert_stride: u64,
+    pub(super) plane1_offset: u32,
+    pub(super) meta_offset: u32,
 }
 
 type Range = (usize, usize);
 
-fn invalid(message: &str) -> MlxError {
-    MlxError::InvalidArgument(format!("prepared mm_id experiment: {message}"))
+pub(super) fn invalid(message: &str) -> MlxError {
+    MlxError::InvalidArgument(format!("prepared legacy expert dispatch: {message}"))
 }
 
-fn buffer_range(
+pub(super) fn buffer_range(
     buffer: &MlxBuffer,
     dtype: DType,
     required: usize,
@@ -68,11 +68,11 @@ fn buffer_range(
     Ok((start, end))
 }
 
-fn overlaps(a: Range, b: Range) -> bool {
+pub(super) fn overlaps(a: Range, b: Range) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-/// Native-only candidate for complete classic/tensor Q4_K/Q6_K MM reductions.
+/// Explicit MM schedule/half-tile controls for numerical qualification.
 ///
 /// Output is F32 `[n_tokens, top_k, N]`. Input, schedule reuse and half-tile
 /// options have the raw test dispatch's semantics. Only naturally selected MM
@@ -98,9 +98,29 @@ pub fn dispatch_prepared_id_mm_pooled_with_options_for_test(
     routing: &GgmlRoutingPolicy,
     options: IdMmScheduleOptions,
 ) -> Result<()> {
+    dispatch_pooled(encoder, registry, device, input, prepared, ids, output,
+        scratch, params, slotted, reuse_schedule, routing, options)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_pooled(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    prepared: &GroupedM8ExpertPlanes,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+    slotted: bool,
+    reuse_schedule: bool,
+    routing: &GgmlRoutingPolicy,
+    options: IdMmScheduleOptions,
+) -> Result<()> {
     // Preserve the raw pooled helper's early-error schedule ownership rules.
     super::validate_native_expert_dtypes(
-        "dispatch_prepared_id_mm_pooled_with_options_for_test",
+        "quantized_matmul_id_ggml_prepared_pooled",
         input, &prepared.bytes, ids, output,
     )?;
     if plan_expert_auto_route(params.n_tokens, params.top_k, params.k, false, routing)
@@ -113,10 +133,10 @@ pub fn dispatch_prepared_id_mm_pooled_with_options_for_test(
             params.n_experts, options.schedule)?;
     }
     scratch.check_capacity(params.n_experts, params.n_tokens, params.top_k)?;
-    let result = dispatch(
+    let result = plan(
         encoder, registry, device, input, prepared, ids, output, scratch,
         params, slotted, reuse_schedule, routing, options,
-    );
+    ).and_then(|plan| plan.encode(encoder, registry, device, reuse_schedule));
     match &result {
         Ok(()) if !reuse_schedule => {
             scratch.encode_serial = scratch.encode_serial.wrapping_add(1);
@@ -132,21 +152,21 @@ pub fn dispatch_prepared_id_mm_pooled_with_options_for_test(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch(
+pub(super) fn plan<'a>(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
-    input: &MlxBuffer,
-    prepared: &GroupedM8ExpertPlanes,
-    ids: &MlxBuffer,
-    output: &MlxBuffer,
-    scratch: &IdMmScratch,
+    input: &'a MlxBuffer,
+    prepared: &'a GroupedM8ExpertPlanes,
+    ids: &'a MlxBuffer,
+    output: &'a MlxBuffer,
+    scratch: &'a IdMmScratch,
     params: &GgmlQuantizedMatmulIdParams,
     slotted: bool,
     reuse_schedule: bool,
     routing: &GgmlRoutingPolicy,
     options: IdMmScheduleOptions,
-) -> Result<()> {
+) -> Result<PreparedMmPlan<'a>> {
     let format = match params.ggml_type {
         GgmlType::Q4_K => 0,
         GgmlType::Q6_K => 1,
@@ -313,6 +333,53 @@ fn dispatch(
         metal::MTLSize::new(u64::from(params.n_tokens).div_ceil(32),
             u64::from(params.n / 64), u64::from(params.n_experts))
     };
+    Ok(PreparedMmPlan {
+        input, prepared, ids, output, scratch, pipeline, mm, planes, dispatch,
+        max_tiles, compact, grid, prepared_range, input_range, output_range,
+        htpe_range, hids_range,
+        input_bytes, output_bytes, htpe_bytes, hids_bytes, experts, n, blocks,
+        stride, meta_offset, metadata, format,
+    })
+}
+
+pub(super) struct PreparedMmPlan<'a> {
+    input: &'a MlxBuffer,
+    prepared: &'a GroupedM8ExpertPlanes,
+    ids: &'a MlxBuffer,
+    output: &'a MlxBuffer,
+    scratch: &'a IdMmScratch,
+    pipeline: metal::ComputePipelineState,
+    mm: GgmlIdMmMmGpuParams,
+    planes: PreparedGpuParams,
+    dispatch: GgmlIdMmDispatchParams,
+    max_tiles: u64,
+    compact: bool,
+    grid: metal::MTLSize,
+    prepared_range: Range,
+    input_range: Range,
+    output_range: Range,
+    htpe_range: Range,
+    hids_range: Range,
+    input_bytes: usize,
+    output_bytes: usize,
+    htpe_bytes: usize,
+    hids_bytes: usize,
+    experts: usize,
+    n: usize,
+    blocks: usize,
+    stride: usize,
+    meta_offset: usize,
+    metadata: usize,
+    format: u32,
+}
+
+impl PreparedMmPlan<'_> {
+    pub(super) fn encode(&self, encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry, device: &MlxDevice, reuse_schedule: bool) -> Result<()> {
+        let Self { input, prepared, ids, output, scratch, ref pipeline, mm, planes,
+            dispatch, max_tiles, compact, grid, prepared_range, input_range,
+            output_range, htpe_range, hids_range, input_bytes, output_bytes, htpe_bytes, hids_bytes,
+            experts, n, blocks, stride, meta_offset, metadata, format } = *self;
     // Last fallible operation: these unchanged helpers validate and look up
     // their pipeline before encoding their first command.
     if !reuse_schedule {
@@ -348,7 +415,7 @@ fn dispatch(
             vec![(output_range.0, output_range.0 + output_bytes)]);
     }
     encoder.encode_threadgroups_with_args_and_shared(
-        &pipeline,
+        pipeline,
         &[
             (0, KernelArg::Bytes(as_bytes(&mm))),
             (1, KernelArg::Buffer(&prepared.bytes)),
@@ -361,4 +428,6 @@ fn dispatch(
         &[(0, 8192)], grid, metal::MTLSize::new(128, 1, 1),
     );
     Ok(())
+}
+
 }

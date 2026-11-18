@@ -33,6 +33,10 @@
 // for detail).  Both kernels are bit-compatible with the reference source;
 // output tolerance-level matches with the existing mv_id kernel.
 
+#ifndef MLX_NATIVE_PREPARED_F16_TILES_H
+#include "prepared_f16_tiles.h"
+#endif
+
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
@@ -393,38 +397,8 @@ void dequantize_q3_K(device const block_q3_K * xb, short il, thread type4x4 & re
 
 template <typename type4x4>
 void dequantize_q6_K(device const block_q6_K * xb, short il, thread type4x4 & reg) {
-    const half d_all = xb->d;
-    device const uint16_t * ql = (device const uint16_t *)xb->ql;
-    device const uint16_t * qh = (device const uint16_t *)xb->qh;
-    device const int8_t * scales = (device const int8_t *)xb->scales;
-
-    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
-    qh = qh + 16*(il/8) + 8*(il&1);
-    float sc = scales[(il%2) + 2 * ((il/2))];
-    il = (il/2) & 3;
-
-    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
-    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
-    const float ml = d_all * sc * 32.f;
-    const float dl0 = d_all * sc;
-    const float dl1 = dl0 / 256.f;
-    const float dl2 = dl0 / (256.f * 256.f);
-    const float dl3 = dl0 / (256.f * 256.f * 256.f);
-    const uint8_t shr_h = il>2 ? 2 : 0;
-    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
-    const uint8_t shr_l = il>1 ? 4 : 0;
-
-    float4x4 reg_f;
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
-        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
-        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
-        reg_f[i][0] = dl0 *  ((half)(q & 0xFF))      - ml;
-        reg_f[i][1] = dl1 * ((float)(q & 0xFF00))    - ml;
-        reg_f[i][2] = dl2 * ((float)(q & 0xFF0000))  - ml;
-        reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
-    }
-    reg = (type4x4) reg_f;
+    const RawF16Fragment<block_q6_K> reader = {xb};
+    legacy_f16_q6_fragment(xb->d, xb->scales, reader, il, reg);
 }
 
 // ADR-022 Phase 1 — Q5_1 dequant for the mm_id MMA-tile path.
@@ -553,24 +527,8 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
 // already shipped at quantized_matmul_id_ggml.metal.
 template <typename type4x4>
 void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
-    device const uchar * q = xb->qs;
-
-    short is = (il/4) * 2;
-    q = q + (il/4) * 32 + 16 * (il&1);
-    il = il & 3;
-    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    // The scale is widened before the division: |d| / 16 is a subnormal half
-    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
-    // model files carry (nearly every Q4_K / Q5_K block).
-    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
-    const float min = xb->dmin;
-    const float dl  = d * sc[0];
-    const float ml  = min * sc[1];
-
-    const ushort mask = il < 2 ? 0x0F : 0xF0;
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
-    }
+    const RawF16Fragment<block_q4_K> reader = {xb};
+    legacy_f16_q4_fragment(xb->d, xb->dmin, xb->scales, reader, il, reg);
 }
 
 // ADR-022 Phase 2 — Q5_K dequant for mm_id MMA-tile path.
@@ -1019,19 +977,21 @@ kernel void hf2q_mul_mm_id_map0c_impl<8>(
 // their MMA and shared-memory store; all four simdgroups still stage the
 // tiles and copy rows out.
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
-kernel void hf2q_mul_mm_id_impl(
-        constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
-        device const char * src0 [[buffer(1)]],
-        device const char * src1 [[buffer(2)]],
-        device const char * htpe [[buffer(3)]],
-        device const char * hids [[buffer(4)]],
-        device       char * dst  [[buffer(5)]],
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false, bool PREPARED = false, bool Q6 = false>
+inline void hf2q_mul_mm_id_core(
+        constant GgmlMatmulIdMm_MmParams & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        constant PreparedF16TilesParams * planes,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg) {
 
     threadgroup half  * sa = (threadgroup half  *)(shmem);
     threadgroup float * sb = (threadgroup float *)(shmem + 4096);
@@ -1134,8 +1094,15 @@ kernel void hf2q_mul_mm_id_impl(
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
-    device const block_q * x =
-        (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * x = nullptr;
+    device const uchar * expert = nullptr;
+    uint block = 0;
+    if (PREPARED) {
+        expert = reinterpret_cast<device const uchar *>(src0)
+            + ulong(im) * planes->prepared_expert_stride;
+    } else {
+        x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    }
 
     const short iy = 8*(tiitg % NL1);
 
@@ -1157,7 +1124,12 @@ kernel void hf2q_mul_mm_id_impl(
         // ---- A tile dequantize + stage ----
         {
             half4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            if (PREPARED) {
+                if (Q6) prepared_f16_q6_fragment(expert, *planes, r0 + lr0, block, il, temp_a);
+                else prepared_f16_q4_fragment(expert, *planes, r0 + lr0, block, il, temp_a);
+            } else {
+                dequantize_func(x, il, temp_a);
+            }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1206,7 +1178,8 @@ kernel void hf2q_mul_mm_id_impl(
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        if (PREPARED) block += (il < 2) ? 1 : 0;
+        else x = (il < 2) ? x + (2 + nl - 1)/nl : x;
 
         y += NK;
 
@@ -1290,6 +1263,23 @@ kernel void hf2q_mul_mm_id_impl(
             *(D + i) = *(C + i);
         }
     }
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
+kernel void hf2q_mul_mm_id_impl(
+        constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const char * htpe [[buffer(3)]],
+        device const char * hids [[buffer(4)]],
+        device       char * dst  [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    hf2q_mul_mm_id_core<block_q, nl, dequantize_func, COMPACT>(
+        args, src0, src1, htpe, hids, dst, nullptr, shmem, tgpig, tiitg, tiisg, sgitg);
 }
 
 // Template instantiations for the three quant types our GGUF uses.
@@ -1488,9 +1478,6 @@ kernel void hf2q_dequant_iq4_xs_dump(
 
 // Private, native-only decoder-tile spike. Runtime registration bundles this
 // same header; the local include serves the precompiled translation unit.
-#ifndef MLX_NATIVE_PREPARED_F16_TILES_H
-#include "prepared_f16_tiles.h"
-#endif
 
 kernel void grouped_m8_f16_tiles_reference(
     device const uchar *raw [[buffer(0)]],
@@ -1532,8 +1519,6 @@ kernel void grouped_m8_f16_tiles_candidate(
 }
 
 
-// Unpublished full-MM candidate: duplicate the oracle reduction deliberately.
-// Only weight addressing changes; the original raw template above is untouched.
 template<bool Q6, bool COMPACT = false>
 kernel void hf2q_mul_mm_id_prepared_impl(
         constant GgmlMatmulIdMm_MmParams & args [[buffer(0)]],
@@ -1548,265 +1533,12 @@ kernel void hf2q_mul_mm_id_prepared_impl(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-
-    threadgroup half  * sa = (threadgroup half  *)(shmem);
-    threadgroup float * sb = (threadgroup float *)(shmem + 4096);
-
-    constexpr short nl = 16;
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
-    constexpr int NK  = 32;
-    constexpr int NL0 = NK/16;  // 2
-    constexpr int NL1 = NK/8;   // 4
-
-    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
-    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
-
-    int   im;
-    int   r0;
-    int   list_base;  // hids index of this tile's first routed row
-    short nr1;
-    if (COMPACT) {
-        const uint32_t schedule_state = tpe_u32[0];
-        const uint32_t tile  = tgpig.x;
-        const uint32_t ntile = tgpig.y;
-        if ((schedule_state & 0x80000000u) != 0u) {
-            // Same poison contract as the uniform grid: one threadgroup
-            // fills the logical output with NaN and nobody forms a weight
-            // or activation address.
-            if (tgpig.x == 0 && tgpig.y == 0) {
-                device float * out = (device float *) dst;
-                const uint64_t total =
-                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
-                for (uint64_t index = tiitg; index < total; index += 128) {
-                    out[index] = NAN;
-                }
-            }
-            return;
-        }
-        if (tile >= schedule_state) return;
-        device const uint32_t * desc = tpe_u32 + 1 + 3*tile;
-        im        = (int)desc[0];
-        list_base = (int)desc[1];
-        nr1       = (short)desc[2];
-        r0        = ntile * NR0;
+    if (Q6) {
+        hf2q_mul_mm_id_core<block_q6_K, 16, dequantize_q6_K, COMPACT, true, true>(
+            args, src0, src1, htpe, hids, dst, &p, shmem, tgpig, tiitg, tiisg, sgitg);
     } else {
-        im = tgpig.z;
-        r0 = tgpig.y * NR0;
-        const int r1 = tgpig.x * NR1;
-
-        const uint32_t route_state = tpe_u32[im];
-        if ((route_state & 0x80000000u) != 0u) {
-            // Invalid IDs poison the whole operation. Exactly one threadgroup
-            // fills the complete logical output with NaN; every threadgroup exits
-            // before constructing an expert weight or activation address. The
-            // consuming graph is responsible for rejecting this sentinel at an
-            // existing host-visible result readback.
-            if (im == 0 && tgpig.x == 0 && tgpig.y == 0) {
-                device float * out = (device float *) dst;
-                const uint64_t total =
-                    (uint64_t)args.ne21 * (uint64_t)args.ne1 * (uint64_t)args.ne0;
-                for (uint64_t index = tiitg; index < total; index += 128) {
-                    out[index] = NAN;
-                }
-            }
-            return;
-        }
-        const int32_t neh1 = (int32_t)route_state;
-
-        // Early exit: this expert has fewer routed tokens than our tile's
-        // M-base.  Whole threadgroup returns.
-        if (r1 >= neh1) return;
-
-        nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;
-        list_base = im * args.ne21 + r1;
-    }
-    // P2c: simdgroups 2-3 own tile rows 16-31, which hold no routed row.
-    const bool upper_half_idle =
-        COMPACT && (args.sched_flags & 1) != 0 && nr1 <= 16 && sgitg >= 2;
-
-    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
-
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
-    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
-
-    const short il0 = (tiitg % NL0);
-    short il = il0;
-
-    // (token_idx, slot_idx) of the row this thread owns.
-    const int id = ids_i32[list_base + lr1];
-    const short i11 = (id % args.ne20) % args.ne11;   // slot index
-    // §0.19 FIX (2026-06-30): token/row index must be `int`, not `short`.
-    // The flat [n_tokens, K] input layout makes i12 = id/ne20 range up to
-    // n_tokens-1 (65535 at 8k, 131071 at 16k for the MoE down call where
-    // n_tokens = seq_len*top_k). `short` overflows at 32768 → negative
-    // i12 → `args.nb12*i12` wraps to an OOB device address (read of
-    // run-varying memory). llama keeps this index small via its
-    // [K, n_expert_used, n_tokens] multi-dim layout; our flat port must
-    // widen it. Bit-identical for n_tokens<=32768 (parity gate).
-    const int   i12 = (id / args.ne20);               // token index
-    const short i13 = 0;
-
-    // Prepared addresses are formed only after the original poison/idle exits.
-    device const uchar *expert = reinterpret_cast<device const uchar *>(src0)
-        + ulong(im) * p.prepared_expert_stride;
-    uint block = 0;
-
-    const short iy = 8*(tiitg % NL1);
-
-    device const float * y = (device const float *)(src1
-        + args.nb13*i13
-        + args.nb12*(uint64_t)i12
-        + args.nb11*i11
-        + args.nb10*iy);
-
-    simdgroup_half8x8  ma[4];
-    simdgroup_float8x8 mb[2];
-    simdgroup_float8x8 mc[8];
-
-    for (short i = 0; i < 8; i++){
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
-    }
-
-    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        // ---- A tile dequantize + stage ----
-        {
-            half4x4 temp_a;
-            if (Q6)
-                prepared_f16_q6_fragment(expert, p, r0 + lr0, block, il, temp_a);
-            else
-                prepared_f16_q4_fragment(expert, p, r0 + lr0, block, il, temp_a);
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // ADR-033 §Pi Task #20 iter 8 — added #pragma unroll to match
-            // the peer's FOR_UNROLL for the 16-iter A-tile staging loop.
-            #pragma clang loop unroll(full)
-            for (short i = 0; i < 16; i++) {
-                const short sx = 2*il0 + i/8;
-                const short sy = (tiitg/NL0)/8;
-                const short lx = (tiitg/NL0)%8;
-                const short ly = i%8;
-                const short ib = 8*sx + sy;
-                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
-            }
-        }
-
-        // ---- B tile stage ----
-        //
-        // ADR-033 §Pi Task #20 iter 8 — vectorized B-tile store fast path
-        // matching the reference `*(threadgroup S1_2x4 *)(sb + ...) = (S1_2x4) *((device T1_2x4 *) y)`.
-        // Each thread does ONE 8-float store instead of 8 scalar stores
-        // when the K-loop iteration is fully in-bounds. For Q6_K with
-        // K%QK_K==0 and NK=32, K is always divisible by NK, so the fast
-        // path is taken every iteration (no tail). Kept the scalar
-        // bounds-checked fallback for non-Q6_K shapes.
-        {
-            const short sx = (tiitg%NL1);
-            const short sy = (tiitg/NL1)/8;
-            const short ly = (tiitg/NL1)%8;
-            const short ib = 4*sx + sy;
-            if (loop_k + NK <= args.ne00) {
-                // Fast path: vectorized 8-float store (= S1_2x4 / float8).
-                threadgroup float * dst_row = sb + 64*ib + 8*ly;
-                device const float * src_row = (device const float *) y;
-                ((threadgroup float4 *) dst_row)[0] = ((device const float4 *) src_row)[0];
-                ((threadgroup float4 *) dst_row)[1] = ((device const float4 *) src_row)[1];
-            } else {
-                // Tail: scalar with bounds check.
-                #pragma clang loop unroll(full)
-                for (short i = 0; i < 8; ++i) {
-                    const short lx = i;
-                    *(sb + 64*ib + 8*ly + lx) =
-                        (loop_k + iy + i < args.ne00) ? *((device float *) y + i) : 0.f;
-                }
-            }
-        }
-
-        il = (il + 2 < nl) ? il + 2 : il % 2;
-        block += (il < 2) ? 1 : 0;
-
-        y += NK;
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ---- MMA accumulate ----
-        threadgroup const half  * lsma = (sa + 4*64*(sgitg%2));
-        threadgroup const float * lsmb = (sb + 2*64*(sgitg/2));
-
-        if (!upper_half_idle) {
-            for (short ik = 0; ik < NK/8; ik++) {
-                simdgroup_barrier(mem_flags::mem_none);
-                for (short i = 0; i < 4; i++) {
-                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
-                }
-                simdgroup_barrier(mem_flags::mem_none);
-                for (short i = 0; i < 2; i++) {
-                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-                }
-                simdgroup_barrier(mem_flags::mem_none);
-                for (short i = 0; i < 8; i++) {
-                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
-                }
-                lsma += 8*64;
-                lsmb += 4*64;
-            }
-        }
-    }
-
-    // ---- Write-back (always through shmem staging: see header note) ----
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    threadgroup float * temp_str = ((threadgroup float *) shmem)
-        + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-
-    if (!upper_half_idle) {
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-        }
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Each simdgroup `sgitg` strides through the tile in steps of 4 rows.
-    // For each owned row j (within the tile), look up its (token, slot)
-    // via hids, compute the destination address in dst, and copy.
-    for (short j = sgitg; j < nr1; j += 4) {
-        const int id = ids_i32[list_base + j];
-
-        const short ide = id % args.ne20;  // slot index (output row-major)
-        // §0.19 FIX (2026-06-30): output token/batch index must be `int` —
-        // same overflow as i12 above. For the MoE down call idt = id ranges
-        // to n_tokens-1 (65535 at 8k); `short` overflows at 32768 → negative
-        // idt → the `dst + idt*ne1*ne0` write-back wraps to an OOB device
-        // address (corrupting/reading run-varying memory). Bit-identical for
-        // n_tokens<=32768.
-        const int   idt = id / args.ne20;  // token index (output batch)
-
-        // §0.19 FIX (2026-06-30, codex SHIP-WITH-CHANGES): force the output
-        // ELEMENT offset to 64-bit (promote each factor BEFORE multiply) so the
-        // dst address never overflows int32 at large ne0/ne1/token counts —
-        // mirrors the int32 dst-offset fix in dense_mm_bf16_tensor.metal.
-        // Byte-identical for in-range values.
-        const uint64_t dst_off =
-            (uint64_t) r0
-            + (uint64_t) ide * (uint64_t) args.ne0
-            + (uint64_t) idt * (uint64_t) args.ne1 * (uint64_t) args.ne0;
-        device float  * D  = (device float  *) dst + dst_off;
-        device float4 * D4 = (device float4 *) D;
-
-        threadgroup float  * C  = (threadgroup float *) shmem + j*NR0;
-        threadgroup float4 * C4 = (threadgroup float4 *) C;
-
-        int i = tiisg;
-        for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
-        }
-
-        i = (4*(nr0/4)) + tiisg;
-        for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
-        }
+        hf2q_mul_mm_id_core<block_q4_K, 16, dequantize_q4_K, COMPACT, true, false>(
+            args, src0, src1, htpe, hids, dst, &p, shmem, tgpig, tiitg, tiisg, sgitg);
     }
 }
 

@@ -52,6 +52,27 @@ mod prepared_f16_probe;
 pub use prepared_f16_probe::quantized_matmul_id_ggml_grouped_m8_f16_tiles_probe_into;
 mod prepared_mm;
 pub use prepared_mm::dispatch_prepared_id_mm_pooled_with_options_for_test;
+mod prepared_legacy;
+pub use prepared_legacy::{
+    quantized_matmul_id_ggml_prepared,
+    quantized_matmul_id_ggml_prepared_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled,
+    quantized_matmul_id_ggml_prepared_pooled_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled_pair,
+    quantized_matmul_id_ggml_prepared_pooled_pair_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled_slotted,
+    quantized_matmul_id_ggml_prepared_pooled_slotted_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled_slotted_reusing_schedule,
+    quantized_matmul_id_ggml_prepared_pooled_slotted_reusing_schedule_with_policy,
+    quantized_matmul_id_ggml_prepared_mv,
+    quantized_matmul_id_ggml_prepared_mv_with_policy,
+    quantized_matmul_id_ggml_prepared_mv_masked,
+    quantized_matmul_id_ggml_prepared_mv_masked_with_policy,
+    quantized_matmul_id_ggml_prepared_mv_q4_k_nr2,
+    quantized_matmul_id_ggml_prepared_mv_q4_k_nr2_masked,
+    quantized_matmul_id_ggml_prepared_mv_grouped_geglu,
+    quantized_matmul_id_ggml_prepared_fused_gate_up_silu_mm_q6_k,
+};
 mod prepared_storage;
 pub use prepared_storage::{
     prepare_quantized_matmul_id_ggml_grouped_m8_batch,
