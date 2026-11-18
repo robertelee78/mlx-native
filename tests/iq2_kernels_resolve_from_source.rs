@@ -1,7 +1,7 @@
 //! ADR-066 N-IQ2XXS: every IQ2_XXS kernel name builds from its registered
 //! source with the precompiled metallib disabled, so no name resolves only
 //! through the embedded library (the IQ4_XS gap, ADR-066 Context item 2).
-//! The pipeline identity must bind the sha256 of the exact shader file.
+//! The pipeline identity binds the complete compiler input, including headers.
 //!
 //! This binary holds one test: `MLX_PRECOMPILED_METALLIB` is read once per
 //! process, before the first pipeline lookup.
@@ -12,15 +12,25 @@ use sha2::{Digest, Sha256};
 const IQ2_XXS_KERNELS: [(&str, &str); 3] = [
     (
         "kernel_mul_mv_id_iq2_xxs_f32",
-        include_str!("../src/shaders/quantized_matmul_id_ggml.metal"),
+        concat!(
+            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
+            include_str!("../src/shaders/prepared_legacy_readers.h"), "\n",
+            include_str!("../src/shaders/quantized_matmul_id_ggml.metal"),
+        ),
     ),
     (
         "kernel_mul_mm_id_iq2_xxs_f32",
-        include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
+        concat!(
+            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
+            include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
+        ),
     ),
     (
         "kernel_mul_mm_id_iq2_xxs_tensor_f32",
-        include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
+        concat!(
+            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
+            include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
+        ),
     ),
 ];
 const TENSOR_REFERENCE: &str = "kernel_mul_mm_id_q4_0_tensor_f32";

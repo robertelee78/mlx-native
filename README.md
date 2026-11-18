@@ -121,6 +121,8 @@ Unqualified experimental rewrites are not included in this release.
   and source-lifetime tests pass on M5 with ordinary execution, Shader
   Validation and combined Shader/Metal API Validation. Full-model memory,
   quality and performance qualification remain downstream gates.
+  Runtime pipeline identities bind the complete registered compiler input,
+  including shared headers.
 
 - **v0.23.2 / source-ordered BF16 draft RMS** —
   `ops::dflash2_rms_norm::dispatch_dflash2_rms_norm_bf16` uses scalar-column
