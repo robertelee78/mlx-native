@@ -2,7 +2,7 @@
 
 use super::{
     as_bytes, checked_byte_extent, CommandEncoder, DType, GgmlQuantizedMatmulIdParams,
-    GgmlType, KernelArg, KernelRegistry, MlxBuffer, MlxError, PreparedGroupedM8Experts, Result,
+    GgmlType, KernelArg, KernelRegistry, MlxBuffer, MlxError, GroupedM8ExpertPlanes, Result,
 };
 use crate::device::metal_device_registry_id;
 
@@ -90,7 +90,7 @@ pub fn quantized_matmul_id_ggml_grouped_m8_f16_tiles_probe_into(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     raw: &MlxBuffer,
-    prepared: &PreparedGroupedM8Experts,
+    prepared: &GroupedM8ExpertPlanes,
     reference: &MlxBuffer,
     candidate: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,

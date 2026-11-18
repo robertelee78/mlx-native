@@ -7,7 +7,7 @@ use super::{
     tensor_mm_auto_selected, CommandEncoder, DType, ExpertAutoPlan, ExpertMmSchedule,
     GgmlIdMmDispatchParams, GgmlIdMmMmGpuParams, GgmlQuantizedMatmulIdParams,
     GgmlRoutingPolicy, GgmlType, HalfTileSkip, IdMmScheduleOptions, IdMmScratch,
-    KernelArg, KernelRegistry, MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts,
+    KernelArg, KernelRegistry, MlxBuffer, MlxDevice, MlxError, GroupedM8ExpertPlanes,
     Result, HALF_TILE_SKIP_SIMDGROUP, SCHED_FLAG_HALF_TILE_SKIP,
 };
 use crate::device::metal_device_registry_id;
@@ -88,7 +88,7 @@ pub fn dispatch_prepared_id_mm_pooled_with_options_for_test(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    prepared: &PreparedGroupedM8Experts,
+    prepared: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     scratch: &mut IdMmScratch,
@@ -137,7 +137,7 @@ fn dispatch(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    prepared: &PreparedGroupedM8Experts,
+    prepared: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     scratch: &IdMmScratch,

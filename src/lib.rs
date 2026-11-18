@@ -251,6 +251,8 @@ pub use ops::quantized_matmul_id_ggml::{
     GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GroupedM8Epilogue, GroupedM8Input,
     IdMmScratch, MoeTilesBuffers, MoeTilesFusedBuffers, MoeTilesFusedMask, MoeTilesFusedParams,
     MoeTilesFusedStage, MoeTilesFusedWeights, MoeTilesParams, PreparedGroupedM8Experts,
+    CompletedGroupedM8Experts, GroupedM8ExpertPlanes, GroupedM8Preparation,
+    prepare_quantized_matmul_id_ggml_grouped_m8_batch,
     MM_ID_ROUTING_THRESHOLD, MOE_TILES_FUSED_GRID_WORDS, MOE_TILES_FUSED_MAX_EXPERTS,
     MOE_TILES_FUSED_MAX_ROUTES, MOE_TILES_GRID_WORDS,
 };

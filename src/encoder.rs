@@ -3116,6 +3116,13 @@ impl CommandEncoder {
         }
     }
 
+    pub(crate) fn add_completed_handler(
+        &self,
+        handler: &block::Block<(&metal::CommandBufferRef,), ()>,
+    ) {
+        self.cmd_buf.add_completed_handler(handler);
+    }
+
     /// Commit + wait, accumulating GPU wall-clock time under `label` into
     /// the [`crate::kernel_profile`] global table when `MLX_PROFILE_CB=1`
     /// is set.  When the env var is unset, this is identical to
