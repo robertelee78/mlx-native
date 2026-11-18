@@ -40,7 +40,13 @@ fn checksum(bytes: &[u8]) -> u64 {
     h.finish()
 }
 fn buffer_checksum(buffer: &MlxBuffer) -> u64 {
-    checksum(buffer.as_slice::<u8>().expect("settled CPU bytes"))
+    let bytes = match buffer.dtype() {
+        DType::U8 => buffer.as_slice::<u8>().expect("settled U8 bytes"),
+        DType::U32 => bytemuck::cast_slice(buffer.as_slice::<u32>().expect("settled U32 words")),
+        DType::F32 => bytemuck::cast_slice(buffer.as_slice::<f32>().expect("settled F32 values")),
+        _ => unreachable!("fixture scalar type"),
+    };
+    checksum(bytes)
 }
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
@@ -99,9 +105,23 @@ impl Guarded {
         value.reset(capacity, GUARD_WORD);
         value
     }
+    fn words(&self) -> &[u32] {
+        match self.root.dtype() {
+            DType::F32 => bytemuck::cast_slice(self.root.as_slice::<f32>().expect("completed F32 values")),
+            DType::U32 => self.root.as_slice::<u32>().expect("completed U32 words"),
+            _ => unreachable!("guarded fixture scalar type"),
+        }
+    }
+    fn words_mut(&mut self) -> &mut [u32] {
+        match self.root.dtype() {
+            DType::F32 => bytemuck::cast_slice_mut(self.root.as_mut_slice::<f32>().expect("completed mutable F32 values")),
+            DType::U32 => self.root.as_mut_slice::<u32>().expect("completed mutable U32 words"),
+            _ => unreachable!("guarded fixture scalar type"),
+        }
+    }
     fn reset(&mut self, words: usize, sentinel: u32) {
         assert!(words <= self.capacity);
-        let all = self.root.as_mut_slice::<u32>().expect("settled mutable words");
+        let all = self.words_mut();
         all.fill(GUARD_WORD);
         all[GUARD..GUARD + words].fill(sentinel);
     }
@@ -110,13 +130,13 @@ impl Guarded {
         self.root.slice_view((GUARD * 4) as u64, words)
     }
     fn payload(&self, words: usize) -> &[u32] {
-        &self.root.as_slice::<u32>().expect("completed words")[GUARD..GUARD + words]
+        &self.words()[GUARD..GUARD + words]
     }
     fn payload_mut(&mut self, words: usize) -> &mut [u32] {
-        &mut self.root.as_mut_slice::<u32>().expect("completed mutable words")[GUARD..GUARD + words]
+        &mut self.words_mut()[GUARD..GUARD + words]
     }
     fn check_guards(&self, words: usize) {
-        let all = self.root.as_slice::<u32>().expect("completed guards");
+        let all = self.words();
         assert!(all[..GUARD].iter().chain(&all[GUARD + words..]).all(|v| *v == GUARD_WORD));
     }
 }
@@ -329,8 +349,8 @@ fn run(projection: Projection) {
                         let words = tokens * TOP_K * projection.n();
                         let mut hashes = Vec::with_capacity(BANKS);
                         for (layer, bank) in packet.banks.iter().enumerate() {
-                            let bytes = bank.reference.root.as_slice::<u8>().expect("settled raw output bytes");
-                            let digest = Sha256::digest(&bytes[GUARD * 4..(GUARD + words) * 4]);
+                            let bytes = bytemuck::cast_slice::<u32, u8>(bank.reference.payload(words));
+                            let digest = Sha256::digest(bytes);
                             hashes.push(json!({"layer": layer,
                                 "format": format!("{:?}", projection.ty(layer)),
                                 "f32_words": words, "sha256": format!("{digest:x}")}));
