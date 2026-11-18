@@ -1,0 +1,3650 @@
+{
+  "schema": "mlx-native-canonical-legacy-mv-goldens-v1",
+  "provenance": {
+    "original_crate": "mlx-native0.23.3",
+    "original_commit": "14cbfd4f1acc89ff38826953750b472a0b7428f4",
+    "original_shader_sha256": "749c8a432147b97631260499b5db86f77d0db92ab1c3fae308cf7dcb4be9784f",
+    "original_capture_proof_sha256": "c228295d24d5695e665cc01a2f0fd4e119126dedfc1ad57f9f0f3304707a7373",
+    "original_full_packet_sha256": "af4863447c474769ecfd46701262d64d946e0cce1ddbb4e459df776d244acac2",
+    "device": "Apple M5 Max",
+    "artifact_and_runtime_source_agree": true
+  },
+  "records": [
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": null,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "966d32e3e06d7319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "4d5027726b9953e278207c371fc6a2653e990d7e42b463ae6c8552f468950a4d",
+          "raw_sha256": "a0bbf8b4ca4ce92843f6a7863afc2ec7b72781511d1d7dd97a7d5d2aa61fc859"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "ecf08716ffd571898718a3b97ca97f1d175382a5091e0b02a72ee02986268f25",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "677825744399f5da7bfd9025cc9bd8d7c8d936fef6b72b9324e89ce96868615f",
+          "raw_sha256": "8b1b7bf0907a5d63013884768c5690fd1318081f2674e75d1c06f04a0d01440a"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Auto",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 589824,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "e240c8f972c33f3199c3e3e3e2b7b82a41b3033225c4eeb5b4c7226305ffdedc",
+      "ids_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "output_words": 512,
+      "output_sha256": "1dbe91433642601d72c2b1813fa0a40a90e08089cc2fb7b92d1a2abc25b7d0d2"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": 64,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "966d32e3e06d7319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "4d5027726b9953e278207c371fc6a2653e990d7e42b463ae6c8552f468950a4d",
+          "raw_sha256": "a0bbf8b4ca4ce92843f6a7863afc2ec7b72781511d1d7dd97a7d5d2aa61fc859"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "ecf08716ffd571898718a3b97ca97f1d175382a5091e0b02a72ee02986268f25",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "677825744399f5da7bfd9025cc9bd8d7c8d936fef6b72b9324e89ce96868615f",
+          "raw_sha256": "8b1b7bf0907a5d63013884768c5690fd1318081f2674e75d1c06f04a0d01440a"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Auto",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 589824,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "e240c8f972c33f3199c3e3e3e2b7b82a41b3033225c4eeb5b4c7226305ffdedc",
+      "ids_sha256": "c31425b44a7ed682a3356bf6820141e1584a15c43b6d6793f552e5d4621586f7",
+      "output_words": 512,
+      "output_sha256": "34f4b3efd43fd77d16449c5a4fbf63efdf2ed14022e3f5619f8f3ced7a50e104"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": 4294967295,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "966d32e3e06d7319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "4d5027726b9953e278207c371fc6a2653e990d7e42b463ae6c8552f468950a4d",
+          "raw_sha256": "a0bbf8b4ca4ce92843f6a7863afc2ec7b72781511d1d7dd97a7d5d2aa61fc859"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "ecf08716ffd571898718a3b97ca97f1d175382a5091e0b02a72ee02986268f25",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "677825744399f5da7bfd9025cc9bd8d7c8d936fef6b72b9324e89ce96868615f",
+          "raw_sha256": "8b1b7bf0907a5d63013884768c5690fd1318081f2674e75d1c06f04a0d01440a"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Auto",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 589824,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "e240c8f972c33f3199c3e3e3e2b7b82a41b3033225c4eeb5b4c7226305ffdedc",
+      "ids_sha256": "ad95131bc0b799c0b1af477fb14fcf26a6a9f76079e48bf090acb7e8367bfd0e",
+      "output_words": 512,
+      "output_sha256": "34f4b3efd43fd77d16449c5a4fbf63efdf2ed14022e3f5619f8f3ced7a50e104"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": null,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "37010b2f05057319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "53a79a27df07e20c416e156e827423b4693a89a9dac320cfbe8dfefdcc6185d0",
+          "raw_sha256": "8799fa2dd82a612d84274fa66579342a1ba260bec41d47f0f85846b43e7fe4b5"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "4bb7f3c32a63c15e1a13d7fa4bccfebd3fcf3536d20c948526a3ea11deef9e87",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "10014d7ee658749d208ed418518f7d43b0c9e8375350a3e18bc94c2b1df69798",
+          "raw_sha256": "522df398bc1cd93ac5c9db6dfc4351c7e200d0f7090459769e1339fe7d4d97ba"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Auto",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 860160,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "729bf2a0e15bd3622d841c0acd73ee9b15a03586b05ac6648ea810412b568899",
+      "ids_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "output_words": 512,
+      "output_sha256": "057acfe74a910c8ef860bc663c60a27b14d6f48ab96f4d1692cf2387bb443430"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": 64,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "37010b2f05057319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "53a79a27df07e20c416e156e827423b4693a89a9dac320cfbe8dfefdcc6185d0",
+          "raw_sha256": "8799fa2dd82a612d84274fa66579342a1ba260bec41d47f0f85846b43e7fe4b5"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "4bb7f3c32a63c15e1a13d7fa4bccfebd3fcf3536d20c948526a3ea11deef9e87",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "10014d7ee658749d208ed418518f7d43b0c9e8375350a3e18bc94c2b1df69798",
+          "raw_sha256": "522df398bc1cd93ac5c9db6dfc4351c7e200d0f7090459769e1339fe7d4d97ba"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Auto",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 860160,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "729bf2a0e15bd3622d841c0acd73ee9b15a03586b05ac6648ea810412b568899",
+      "ids_sha256": "c31425b44a7ed682a3356bf6820141e1584a15c43b6d6793f552e5d4621586f7",
+      "output_words": 512,
+      "output_sha256": "34f4b3efd43fd77d16449c5a4fbf63efdf2ed14022e3f5619f8f3ced7a50e104"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": 4294967295,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "37010b2f05057319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "53a79a27df07e20c416e156e827423b4693a89a9dac320cfbe8dfefdcc6185d0",
+          "raw_sha256": "8799fa2dd82a612d84274fa66579342a1ba260bec41d47f0f85846b43e7fe4b5"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "4bb7f3c32a63c15e1a13d7fa4bccfebd3fcf3536d20c948526a3ea11deef9e87",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "10014d7ee658749d208ed418518f7d43b0c9e8375350a3e18bc94c2b1df69798",
+          "raw_sha256": "522df398bc1cd93ac5c9db6dfc4351c7e200d0f7090459769e1339fe7d4d97ba"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Auto",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 860160,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "729bf2a0e15bd3622d841c0acd73ee9b15a03586b05ac6648ea810412b568899",
+      "ids_sha256": "ad95131bc0b799c0b1af477fb14fcf26a6a9f76079e48bf090acb7e8367bfd0e",
+      "output_words": 512,
+      "output_sha256": "34f4b3efd43fd77d16449c5a4fbf63efdf2ed14022e3f5619f8f3ced7a50e104"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": null,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "37010b2f05057319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "53a79a27df07e20c416e156e827423b4693a89a9dac320cfbe8dfefdcc6185d0",
+          "raw_sha256": "8799fa2dd82a612d84274fa66579342a1ba260bec41d47f0f85846b43e7fe4b5"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "4bb7f3c32a63c15e1a13d7fa4bccfebd3fcf3536d20c948526a3ea11deef9e87",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "10014d7ee658749d208ed418518f7d43b0c9e8375350a3e18bc94c2b1df69798",
+          "raw_sha256": "522df398bc1cd93ac5c9db6dfc4351c7e200d0f7090459769e1339fe7d4d97ba"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 860160,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "729bf2a0e15bd3622d841c0acd73ee9b15a03586b05ac6648ea810412b568899",
+      "ids_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "output_words": 512,
+      "output_sha256": "e6ec4e15eaef2399263e45b2086a47dcc82e015aa0b444fd6726915f9d5bfed7"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": 64,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "37010b2f05057319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "53a79a27df07e20c416e156e827423b4693a89a9dac320cfbe8dfefdcc6185d0",
+          "raw_sha256": "8799fa2dd82a612d84274fa66579342a1ba260bec41d47f0f85846b43e7fe4b5"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "4bb7f3c32a63c15e1a13d7fa4bccfebd3fcf3536d20c948526a3ea11deef9e87",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "10014d7ee658749d208ed418518f7d43b0c9e8375350a3e18bc94c2b1df69798",
+          "raw_sha256": "522df398bc1cd93ac5c9db6dfc4351c7e200d0f7090459769e1339fe7d4d97ba"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 860160,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "729bf2a0e15bd3622d841c0acd73ee9b15a03586b05ac6648ea810412b568899",
+      "ids_sha256": "c31425b44a7ed682a3356bf6820141e1584a15c43b6d6793f552e5d4621586f7",
+      "output_words": 512,
+      "output_sha256": "34f4b3efd43fd77d16449c5a4fbf63efdf2ed14022e3f5619f8f3ced7a50e104"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_auto_first",
+        "generation_order": [
+          "first_raw_source",
+          "second_raw_source",
+          "shared_input",
+          "slotted_input"
+        ],
+        "invalid_id": 4294967295,
+        "output": "first_ordinary_raw",
+        "rng_state_after_inputs_u64_hex": "37010b2f05057319",
+        "second_source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "53a79a27df07e20c416e156e827423b4693a89a9dac320cfbe8dfefdcc6185d0",
+          "raw_sha256": "8799fa2dd82a612d84274fa66579342a1ba260bec41d47f0f85846b43e7fe4b5"
+        },
+        "seed_u64_hex": "a17e1d6609942319",
+        "slotted_input_sha256_le_bits": "4bb7f3c32a63c15e1a13d7fa4bccfebd3fcf3536d20c948526a3ea11deef9e87",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "10014d7ee658749d208ed418518f7d43b0c9e8375350a3e18bc94c2b1df69798",
+          "raw_sha256": "522df398bc1cd93ac5c9db6dfc4351c7e200d0f7090459769e1339fe7d4d97ba"
+        },
+        "source_exact": false,
+        "source_generation_tokens": 256
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 2048,
+      "tokens": 1,
+      "top_k": 1,
+      "output_cols": 512,
+      "expert_stride": 860160,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "729bf2a0e15bd3622d841c0acd73ee9b15a03586b05ac6648ea810412b568899",
+      "ids_sha256": "ad95131bc0b799c0b1af477fb14fcf26a6a9f76079e48bf090acb7e8367bfd0e",
+      "output_words": 512,
+      "output_sha256": "34f4b3efd43fd77d16449c5a4fbf63efdf2ed14022e3f5619f8f3ced7a50e104"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ff08d787b24b65cfc9744b941e812c3991fb5eda0fa3e9fbafed4455beb701ec"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ff08d787b24b65cfc9744b941e812c3991fb5eda0fa3e9fbafed4455beb701ec"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "302fc4a5fbcead7bf0dc88e8a9e8b70abe31831ac2ecedc4fad922ec6e852cb3"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "36f0fc3595ad6198000cb86ef78990be2c07eab6b3701ca7f9067ea68cd35ae8"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "3466ca42b5d71afc64c9c60884bb7c54b3e931885124fe3b838ea98696dd3cb6"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "8525319b7172d97eba5f5b9469da43cb4067a1daf1046955f88a46ed5be41717"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "8525319b7172d97eba5f5b9469da43cb4067a1daf1046955f88a46ed5be41717"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "83aa0c490bd715e3258f1a8761f95026dbedc5ccf23092b80e034a03998e7530"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "bc8aea2f7cb5215261953ee881606cac9e999fcf58f4580333b1c73ca349ad0d"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "bd14d447569b1e5d79f7091d9039d7485b7e652436f6c904d2057a88fd772804"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "bd14d447569b1e5d79f7091d9039d7485b7e652436f6c904d2057a88fd772804"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "275bf7d3f452e8777e7213d6dca64bcc93056a6ad82601cd230e839604ecf098"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "02037bd6a6eb702b4defdbe5dac39327e1582dd52885e7d7c133a7c02908c410"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "3466ca42b5d71afc64c9c60884bb7c54b3e931885124fe3b838ea98696dd3cb6"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "8525319b7172d97eba5f5b9469da43cb4067a1daf1046955f88a46ed5be41717"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "8525319b7172d97eba5f5b9469da43cb4067a1daf1046955f88a46ed5be41717"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "83aa0c490bd715e3258f1a8761f95026dbedc5ccf23092b80e034a03998e7530"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 73728,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "bc8aea2f7cb5215261953ee881606cac9e999fcf58f4580333b1c73ca349ad0d"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 2048,
+      "output_sha256": "d8c279726f4f4dfc44457377eef0219c8692e0be8e2790e46395de662ee91bef"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0cdcf712f257a098be77c77240e7dfb423be5fcea9b4ad2bd7ef46a6e1bbe007",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 2048,
+      "output_sha256": "14e26704e4824eb5c7c1578bee1dba0233ba48b268d8a0c4b7262892e93b8bc1"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 2048,
+      "output_sha256": "0c1325d137cccc23b27ee89e049fdc12105f99461573d1cd205519d0faeed256"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "0fca54b9988189be69c0cb137bf7e9f4bf24d2692bc1775392b64b7dc89464cd",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 2048,
+      "output_sha256": "0c1325d137cccc23b27ee89e049fdc12105f99461573d1cd205519d0faeed256"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 2048,
+      "output_sha256": "0c1325d137cccc23b27ee89e049fdc12105f99461573d1cd205519d0faeed256"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "1fb32b7f3f93cfcb78d401d7b955ab49d9dbad74f0fd8b26b7004c71ab2e16d8",
+          "raw_sha256": "f945f4541192d5ca0576410dc96d3992f1e576806aa805208ce2003f97d61aaf"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 73728,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f662b896bf730d01add5545995608447bb0f7e9c6d35f6c7345dde237e5674b7",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 2048,
+      "output_sha256": "0c1325d137cccc23b27ee89e049fdc12105f99461573d1cd205519d0faeed256"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "c814e5e0efe322bf08df3494e5dce5859d6b708d65e6ff5cfd944d34f1835c5d"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "c814e5e0efe322bf08df3494e5dce5859d6b708d65e6ff5cfd944d34f1835c5d"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "8cbdc62731126c5b68c22a8fbe138cdb93a64746a35c1e436185c327333eb04a"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "0524ebed60214b24246f357e38886f0a7b0f19ac93ea6a3f741d3bf5e71cda56"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "88a2bae9f64e5587caa60cfc13ccad15b31896e3ee23645a9e7eff93565e8d05"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "88a2bae9f64e5587caa60cfc13ccad15b31896e3ee23645a9e7eff93565e8d05"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "6c3903c7aa960def48fa8a95ca5d955a8d485b2f5a3e8f7bc52870ed9ca3af14"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "60088eba121e193597d80f2995587da14e6642f240cb84850f5989fa0ff45202"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "fd8172e2d0027814e96ef9c37b0dcd04ed0f770c50c3cf0796837765875d6e66"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "fd8172e2d0027814e96ef9c37b0dcd04ed0f770c50c3cf0796837765875d6e66"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "ff6c22ca93bbbc3ecd670c1aad17fb1638c9d1406bda8c125a1449f0debb7676"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "c21506dd8b62b47dcba00a92925d02a988191bb1862357608957c1c08872c580"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "067422ddbf313f1739bf2eb4f5255524e6957845324349c31f85c3d4e4ff05cd"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "067422ddbf313f1739bf2eb4f5255524e6957845324349c31f85c3d4e4ff05cd"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "1adededbf6a45cae6293bdc3e1e855bef6c7c4c7ccd4ba15e4d7331edadafa50"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "d22deb7051879a2a6509b8f4db5ce5aa2458e7002c61471d1d2f0b4ff273a33c"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "af111abf99297cdaa36c5f80bcee3befc0bfc9e715dd3f562a57afd4357f5038"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "af111abf99297cdaa36c5f80bcee3befc0bfc9e715dd3f562a57afd4357f5038"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "6613a46438b322d49ac3fa5967eecda15013c15473fedaebe635c5c80d6c0434"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "96042b817caf67ab3f5ba5c49726f9a7dcae8d9c9905eff852e1f67eba91bbab"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "e0a255c0b09b69fb20af8a931e5161a42711565c1e3a269968960607da74e41f"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "e0a255c0b09b69fb20af8a931e5161a42711565c1e3a269968960607da74e41f"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "a6251f22c43ae6fb47ab43b0ac2df280564aa7d64d51180ef06dbca1366437b6"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 221184,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "e1b054f7ef7e6c3bea7273164eb115bfa8657eb20acb02383f75dfe450b1a7e1"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 8192,
+      "output_sha256": "ea3d26a47e6c4e4318a6b2eb6d562e1644a7315bcdce1da0230178b42f398736"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "9a97149510ecf6d0140ba6e990192cb8fbdae1040937ff49e0ee64816d3c1da0",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 8192,
+      "output_sha256": "33ddf257ae997e66e5721b2c798a447b65137c29d7b628b6ea83cdb8826e7d29"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 8192,
+      "output_sha256": "74074693db18c7645800bedd08aaee2568d9d52b0221c4a5adb47b830049665c"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "94462eb4d126b2a08abfd185d56f054f3cec7579191b325dc0a29e2d468320ea",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 8192,
+      "output_sha256": "96082089ce87ed17ab6b9b1b450ad16c42813947166b5011dc6bff1f888347b3"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 8192,
+      "output_sha256": "326da583b1b92aeab7d6e30e803b377b7bdb3ab7c10af173742c95513e07ac2a"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "2fb749063261815ecf0048fb1bc61a0d4933f78e7e271896c0fe1cd6300dea6b",
+          "raw_sha256": "ffd1f1fa115c1bc9e8dd5e5c8603a05d062d416ca61a529b4ffa576a73d5e1b0"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q4_K",
+      "kind": "Geglu",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 256,
+      "expert_stride": 221184,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "f6496961ba4bf2e0e8d8cd3f18b2cf603c18fc1acf69fa5aedc29bdf579cb889",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 8192,
+      "output_sha256": "9ca095446db498c1de4899d462b4446f2d7f0c855ca97d425745fc8069ee3260"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "1dc70d6cc02b465ca60e5a0895475b5d83039bcd645d13219de5407794189cd7"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "1dc70d6cc02b465ca60e5a0895475b5d83039bcd645d13219de5407794189cd7"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "07dd9b979304d128af7eac8bcec30472f1d5ac55b76be467143c3730d684ca26"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "aa018ae9c4b0d17236bb25cfb228f9922a9ce94e62440388a4922fd3df654c74"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "3466ca42b5d71afc64c9c60884bb7c54b3e931885124fe3b838ea98696dd3cb6"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "a707309dd262dd6769de3e4d2e3c0c2240cc08645d50483f7ee075d88b65fe8d"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "a707309dd262dd6769de3e4d2e3c0c2240cc08645d50483f7ee075d88b65fe8d"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "c724e50986ee5170a58c99937609dab000286dcd31e7807a5887ffdb04504c74"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "f5a1d630e7f7dda4229d617763178b69d504804ec9d30e81ad265a906f026b3a"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "24fe271b067faf31e8d7ee58f120424033f7ae78b1a49481e7cd0dfe76bee9bd"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "24fe271b067faf31e8d7ee58f120424033f7ae78b1a49481e7cd0dfe76bee9bd"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "df5a7f1af65b1175bac3146976d56fdf6f24fc5df7f4ed28bc42ca242dcbf052"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "4b73eadb47083c4d263340304f47bf4b8c78fc807bdd710698105ec176c42f65",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "0db63d1401c99d8c73e6b2b89a7447d44af86b3f41a6f5c87ec27aac70e7ca39"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "ad6b6454c90d30e77f354fd0e93c4482b2242d2fa8035a93d626c9f109456125"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "86d44b5459b9e6398628361dd8be40b08bd8d9d3bd0a34a4a3eb478a57c9dd67",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "3466ca42b5d71afc64c9c60884bb7c54b3e931885124fe3b838ea98696dd3cb6"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "a707309dd262dd6769de3e4d2e3c0c2240cc08645d50483f7ee075d88b65fe8d"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "f8f7e62cf4e5123805fe79c3d26bbefc36e15d5525b56386fa4e29fa6c788e2a",
+      "output_words": 4096,
+      "output_sha256": "a707309dd262dd6769de3e4d2e3c0c2240cc08645d50483f7ee075d88b65fe8d"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "c724e50986ee5170a58c99937609dab000286dcd31e7807a5887ffdb04504c74"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28b91",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "c950fe284a3184fc8337a65bae5532dea8fb6cc9e21a95adcc602e4af71ae183",
+          "raw_sha256": "b42dfc081410667f513c55311997c21f69b38dab82148d14eaf7c740a1d9d70a"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 256,
+      "tokens": 1,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 107520,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "91cf08896a2a02a321cbfdc45b4418c8c50001c8d714f8dd4be2e8ac6606fc70",
+      "ids_sha256": "e4c1d6ef09ef36b414a444d51a29701ab23a7408fca81befe697d9fd6154ca89",
+      "output_words": 4096,
+      "output_sha256": "f5a1d630e7f7dda4229d617763178b69d504804ec9d30e81ad265a906f026b3a"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "bd714f7c882fa37e04e29fb71a8d53d8e701abb26e706b06892868e76dfec273"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "bd714f7c882fa37e04e29fb71a8d53d8e701abb26e706b06892868e76dfec273"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "691d7b65ae2838d8cba6d190dd622f1d4cd26a9cc8202a48bd9f27f95de6c8cf"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "cadc8f02ddc574b4c55e0cc06eba945ad5e4acd109531b5cb9b879987760f3da"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "61dfd8d17d44a7643a2658a90e432dc14cd41c2f875f98ede54c2cd97c1a410a"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "61dfd8d17d44a7643a2658a90e432dc14cd41c2f875f98ede54c2cd97c1a410a"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "cd849d585f47447d206ab0a9d39ccbb46fff2a79942e9992ea78167d68444daa"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "6288a0699582b19400b5a7de50f17abf9c7c61c69d5168329fbe48a68ec78bf1"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "7e58d5f2f05b9a9e846dcb6a6343d6b61f367bfe3258520eaefc5f718df9193e"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "7e58d5f2f05b9a9e846dcb6a6343d6b61f367bfe3258520eaefc5f718df9193e"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": false,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "0d9e0113dd53cc229bc27bf128f076ab7e03f55ac66d77fdb5fc4ec34adde714"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Stock",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": false,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "22d401b2493d6297c718995bed26c76e80732b179e08622adb656a85241d9e3f"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "58214220eb9d802e0dec01374e6a94360ff9d175ee5ffbc36bbee3d34102c5cf"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "58214220eb9d802e0dec01374e6a94360ff9d175ee5ffbc36bbee3d34102c5cf"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "7364b8b33d315160a2b41a3f108e88433d5ef04b2c7b63ce36d8d2c806eae541"
+    },
+    {
+      "case": {
+        "activation": "dense_finite",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "7490bfa28dec2123723c2b7c2b31d23aa0defe525708176af790580d22ea7add",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "f1cda6eabcd8b3fe45aacc199328501804aae83d707ffef3a7f3e9e8da52508f"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "e84acef2673f48beab19cfa3c07c3e10d28b85ecb1463856371fc2324e81ce97"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "e84acef2673f48beab19cfa3c07c3e10d28b85ecb1463856371fc2324e81ce97"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "4b1eeb4fda68427b862f98dad449845b5f2a9eaf5e00ae2b85f49d4cdd6b7f3d"
+    },
+    {
+      "case": {
+        "activation": "dense_nan_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "ae706dddab717b6173f43df72e491de1de6cc60a1891b1af4f3c6f60bfb2c0c2",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "6c98ed8feb86892d392d458c2272d010d924477af1e0ffa21ba046994776635c"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "16b7f7f6bc55bf7b1d9b20d9bf5a1eff537bfc14ff12da4efe653110901747e8"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": false,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "f297183724cd8c169906b9efe879708d182fcf1b380eba2388b5e9553dc79df6",
+      "output_words": 16384,
+      "output_sha256": "16b7f7f6bc55bf7b1d9b20d9bf5a1eff537bfc14ff12da4efe653110901747e8"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": false,
+      "q6_nr2": true,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "ca0f13556246d784d14f042ee2018dba3edd47b04f13d4e755488aa148cd3973"
+    },
+    {
+      "case": {
+        "activation": "dense_inf_last_token",
+        "corpus": "current_mv_derived_dense",
+        "exceptional_ids": true,
+        "input_generation": "three consecutive dense draws after one raw source; poison at last_token*K+7",
+        "seed_u64_hex": "619a56ce33a28991",
+        "source": {
+          "byte_offset": 64,
+          "guarded_root_sha256": "ba51dc033296e45113f1e327e11bf84e511f2a6917a2e269f0b279451445e978",
+          "raw_sha256": "00a0bc8559fd3ea1829e27ecb668d27164d1710582d4af93f2161a8ca8729b81"
+        },
+        "source_exact": true
+      },
+      "ggml_type": "Q6_K",
+      "kind": "Nr2",
+      "n_experts": 64,
+      "n": 512,
+      "k": 768,
+      "tokens": 4,
+      "top_k": 8,
+      "output_cols": 512,
+      "expert_stride": 322560,
+      "masked": true,
+      "q6_nr2": true,
+      "input_sha256": "58995d3b9b0e81fb965f4ebd37fa3ceef8690f9673514811cd1fe1eede7ae375",
+      "ids_sha256": "fb3c318884e624a6195b1870d60aa33298feadf5812d012fd70e4e22262cce50",
+      "output_words": 16384,
+      "output_sha256": "cc49535b61e7e35d11261b9bfa45a50a23e49646d430011ca209f12dfd76c9eb"
+    }
+  ]
+}

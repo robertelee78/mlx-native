@@ -26,7 +26,7 @@
 
 use super::{
     as_bytes, checked_byte_extent, CommandEncoder, DType, GgmlType, KernelArg, KernelRegistry,
-    MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts, Result,
+    MlxBuffer, MlxDevice, MlxError, GroupedM8ExpertPlanes, Result,
 };
 use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
@@ -75,12 +75,12 @@ pub struct MoeTilesFusedMask<'a> {
 /// shared expert's (prepared with `n_experts = 1`).
 #[derive(Clone, Copy)]
 pub struct MoeTilesFusedWeights<'a> {
-    pub gate: &'a PreparedGroupedM8Experts,
-    pub up: &'a PreparedGroupedM8Experts,
-    pub down: &'a PreparedGroupedM8Experts,
-    pub shared_gate: &'a PreparedGroupedM8Experts,
-    pub shared_up: &'a PreparedGroupedM8Experts,
-    pub shared_down: &'a PreparedGroupedM8Experts,
+    pub gate: &'a GroupedM8ExpertPlanes,
+    pub up: &'a GroupedM8ExpertPlanes,
+    pub down: &'a GroupedM8ExpertPlanes,
+    pub shared_gate: &'a GroupedM8ExpertPlanes,
+    pub shared_up: &'a GroupedM8ExpertPlanes,
+    pub shared_down: &'a GroupedM8ExpertPlanes,
 }
 
 /// Caller-owned scratch of one step; the contents need no initialization.
@@ -217,8 +217,8 @@ fn format_name(ggml_type: GgmlType) -> &'static str {
 /// format, hence one plane layout.
 fn check_planes(
     label: &str,
-    routed: &PreparedGroupedM8Experts,
-    shared: &PreparedGroupedM8Experts,
+    routed: &GroupedM8ExpertPlanes,
+    shared: &GroupedM8ExpertPlanes,
     n_experts: u32,
     n: u32,
     k: u32,
@@ -465,7 +465,7 @@ pub fn moe_tiles_fused(
     encoder.memory_barrier();
 
     // ---- 3: gate and up ----
-    let pass = |planes: &PreparedGroupedM8Experts| PassGpuParams {
+    let pass = |planes: &GroupedM8ExpertPlanes| PassGpuParams {
         k: planes.k,
         n: planes.n,
         column_rows: 0,

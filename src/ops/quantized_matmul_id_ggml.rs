@@ -48,6 +48,37 @@ pub use moe_tiles_fused::{
     MoeTilesFusedMask, MoeTilesFusedParams, MoeTilesFusedStage, MoeTilesFusedWeights,
     MOE_TILES_FUSED_GRID_WORDS, MOE_TILES_FUSED_MAX_EXPERTS, MOE_TILES_FUSED_MAX_ROUTES,
 };
+mod prepared_f16_probe;
+pub use prepared_f16_probe::quantized_matmul_id_ggml_grouped_m8_f16_tiles_probe_into;
+mod prepared_mm;
+pub use prepared_mm::dispatch_prepared_id_mm_pooled_with_options_for_test;
+mod prepared_legacy;
+pub use prepared_legacy::{
+    quantized_matmul_id_ggml_prepared,
+    quantized_matmul_id_ggml_prepared_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled,
+    quantized_matmul_id_ggml_prepared_pooled_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled_pair,
+    quantized_matmul_id_ggml_prepared_pooled_pair_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled_slotted,
+    quantized_matmul_id_ggml_prepared_pooled_slotted_with_policy,
+    quantized_matmul_id_ggml_prepared_pooled_slotted_reusing_schedule,
+    quantized_matmul_id_ggml_prepared_pooled_slotted_reusing_schedule_with_policy,
+    quantized_matmul_id_ggml_prepared_mv,
+    quantized_matmul_id_ggml_prepared_mv_with_policy,
+    quantized_matmul_id_ggml_prepared_mv_masked,
+    quantized_matmul_id_ggml_prepared_mv_masked_with_policy,
+    quantized_matmul_id_ggml_prepared_mv_q4_k_nr2,
+    quantized_matmul_id_ggml_prepared_mv_q4_k_nr2_masked,
+    quantized_matmul_id_ggml_prepared_mv_grouped_geglu,
+    quantized_matmul_id_ggml_prepared_fused_gate_up_silu_mm_q6_k,
+};
+mod prepared_storage;
+pub use prepared_storage::{
+    prepare_quantized_matmul_id_ggml_grouped_m8_batch,
+    CompletedGroupedM8Experts, GroupedM8ExpertPlanes, GroupedM8Preparation,
+    PreparedGroupedM8Experts,
+};
 
 fn checked_byte_extent(label: &str, factors: &[usize]) -> Result<usize> {
     factors.iter().try_fold(1usize, |total, factor| {
@@ -3072,21 +3103,6 @@ struct GroupedM8GpuParams {
     meta_offset: u32,
 }
 
-/// Model-owned Q4_K/Q6_K expert planes prepared for the eight-row Metal
-/// tensor tile. The source owner is retained so unloading either handle
-/// cannot invalidate a command encoded from this representation.
-#[derive(Clone)]
-pub struct PreparedGroupedM8Experts {
-    _source: MlxBuffer,
-    bytes: MlxBuffer,
-    n_experts: u32,
-    n: u32,
-    k: u32,
-    ggml_type: GgmlType,
-    prepared_expert_stride: u64,
-    plane1_offset: u32,
-    meta_offset: u32,
-}
 
 /// Prepare one complete Q4_K or Q6_K expert stack once for the grouped
 /// eight-row Metal tensor tile.
@@ -3097,119 +3113,10 @@ pub fn prepare_quantized_matmul_id_ggml_grouped_m8(
     weight: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<PreparedGroupedM8Experts> {
-    if weight.dtype() != DType::U8 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires U8 expert weights, got {:?}",
-            weight.dtype()
-        )));
-    }
-    let format = match params.ggml_type {
-        GgmlType::Q4_K => 0,
-        GgmlType::Q6_K => 1,
-        other => {
-            return Err(MlxError::InvalidArgument(format!(
-                "grouped M8 preparation requires Q4_K or Q6_K, got {other:?}"
-            )))
-        }
-    };
-    if params.n_experts == 0
-        || params.n == 0
-        || params.n % 64 != 0
-        || params.k == 0
-        || params.k % 256 != 0
-    {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 preparation requires experts > 0, N % 64 == 0 and K % 256 == 0; got experts={} N={} K={}",
-            params.n_experts, params.n, params.k
-        )));
-    }
-    let matrix_bytes = checked_byte_extent(
-        "grouped M8 source matrix",
-        &[
-            params.n as usize,
-            (params.k / params.ggml_type.block_values()) as usize,
-            params.ggml_type.block_bytes() as usize,
-        ],
-    )?;
-    if params.expert_stride < matrix_bytes as u64 {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source expert stride {} is smaller than matrix bytes {matrix_bytes}",
-            params.expert_stride
-        )));
-    }
-    let source_bytes = u64::from(params.n_experts - 1)
-        .checked_mul(params.expert_stride)
-        .and_then(|offset| offset.checked_add(matrix_bytes as u64))
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 source size overflow".into()))?;
-    if weight.data_byte_len() < source_bytes as usize {
-        return Err(MlxError::InvalidArgument(format!(
-            "grouped M8 source needs {source_bytes} bytes, got {}",
-            weight.data_byte_len()
-        )));
-    }
-
-    let rows = params.n as usize;
-    let groups = (params.k / 32) as usize;
-    let plane0 = checked_byte_extent("grouped M8 low plane", &[rows, groups, 16])?;
-    let plane1 = if format == 1 {
-        checked_byte_extent("grouped M8 high plane", &[rows, groups, 8])?
-    } else {
-        0
-    };
-    let metadata = checked_byte_extent(
-        "grouped M8 metadata plane",
-        &[rows, groups / 8, if format == 1 { 20 } else { 16 }],
-    )?;
-    let prepared_expert_stride = plane0
-        .checked_add(plane1)
-        .and_then(|bytes| bytes.checked_add(metadata))
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared stride overflow".into()))?;
-    let total = prepared_expert_stride
-        .checked_mul(params.n_experts as usize)
-        .ok_or_else(|| MlxError::InvalidArgument("grouped M8 prepared size overflow".into()))?;
-    require_tensor_kernel_family(registry, device, TensorKernelFamily::GroupedM8Experts)?;
-    let bytes = device.alloc_buffer(total, DType::U8, vec![total])?;
-    let gpu = GroupedM8PrepareGpuParams {
-        n_experts: params.n_experts,
-        n: params.n,
-        k: params.k,
-        format,
-        source_expert_stride: params.expert_stride,
-        prepared_expert_stride: prepared_expert_stride as u64,
-        plane1_offset: u32::try_from(plane0)
-            .map_err(|_| MlxError::InvalidArgument("grouped M8 plane offset exceeds u32".into()))?,
-        meta_offset: u32::try_from(plane0 + plane1).map_err(|_| {
-            MlxError::InvalidArgument("grouped M8 metadata offset exceeds u32".into())
-        })?,
-        source_row_bytes: u32::try_from(matrix_bytes / rows)
-            .map_err(|_| MlxError::InvalidArgument("grouped M8 row bytes exceed u32".into()))?,
-        _pad: 0,
-    };
-    let pipeline = registry.get_pipeline("grouped_m8_prepare_q4k_q6k", device.metal_device())?;
-    let threads = u64::from(params.n_experts) * u64::from(params.n) * u64::from(params.k / 32);
-    encoder.encode_with_args(
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(weight)),
-            (1, KernelArg::Buffer(&bytes)),
-            (2, KernelArg::Bytes(as_bytes(&gpu))),
-        ],
-        metal::MTLSize::new(threads, 1, 1),
-        metal::MTLSize::new(256.min(threads), 1, 1),
-    );
-    encoder.memory_barrier();
-    Ok(PreparedGroupedM8Experts {
-        _source: weight.clone(),
-        bytes,
-        n_experts: params.n_experts,
-        n: params.n,
-        k: params.k,
-        ggml_type: params.ggml_type,
-        prepared_expert_stride: prepared_expert_stride as u64,
-        plane1_offset: gpu.plane1_offset,
-        meta_offset: gpu.meta_offset,
-    })
+    let planes = prepared_storage::prepare_expert_planes(encoder, registry, device, weight, params)?;
+    Ok(PreparedGroupedM8Experts::pending(weight.clone(), planes))
 }
+
 
 /// Source activation storage consumed by the grouped M8 gather.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3254,7 +3161,7 @@ pub fn quantized_matmul_id_ggml_grouped_m8_epilogue(
     device: &MlxDevice,
     input: &MlxBuffer,
     gathered_input: &MlxBuffer,
-    prepared: &PreparedGroupedM8Experts,
+    prepared: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     aux: Option<&MlxBuffer>,
@@ -3286,7 +3193,7 @@ pub fn quantized_matmul_id_ggml_grouped_m8_epilogue_masked(
     device: &MlxDevice,
     input: &MlxBuffer,
     gathered_input: &MlxBuffer,
-    prepared: &PreparedGroupedM8Experts,
+    prepared: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     aux: Option<&MlxBuffer>,
@@ -3316,8 +3223,8 @@ pub fn quantized_matmul_id_ggml_grouped_m8_gate_up(
     device: &MlxDevice,
     input: &MlxBuffer,
     gathered_input: &MlxBuffer,
-    gate: &PreparedGroupedM8Experts,
-    up: &PreparedGroupedM8Experts,
+    gate: &GroupedM8ExpertPlanes,
+    up: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     scratch: &mut IdMmScratch,
@@ -3354,8 +3261,8 @@ fn quantized_matmul_id_ggml_grouped_m8_impl(
     device: &MlxDevice,
     input: &MlxBuffer,
     gathered_input: &MlxBuffer,
-    prepared: &PreparedGroupedM8Experts,
-    paired: Option<&PreparedGroupedM8Experts>,
+    prepared: &GroupedM8ExpertPlanes,
+    paired: Option<&GroupedM8ExpertPlanes>,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     aux: Option<&MlxBuffer>,

@@ -40,7 +40,7 @@ const FILLER: usize = 6;
 const WARMUP: usize = 3;
 const VARIANTS: [&str; 3] = ["half", "f32", "f32b"];
 
-/// Affected shader files and the number of scale sites in each.
+/// Complete compiler inputs and the number of scale sites in each.
 const SHADERS: [(&str, usize); 7] = [
     (include_str!("../src/shaders/quantized_matmul_mm.metal"), 3),
     (
@@ -48,11 +48,17 @@ const SHADERS: [(&str, usize); 7] = [
         3,
     ),
     (
-        include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
+        concat!(
+            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
+            include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
+        ),
         3,
     ),
     (
-        include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
+        concat!(
+            include_str!("../src/shaders/prepared_f16_tiles.h"), "\n",
+            include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
+        ),
         3,
     ),
     (include_str!("../src/shaders/mul_mv_ext.metal"), 3),
@@ -60,8 +66,8 @@ const SHADERS: [(&str, usize); 7] = [
     (include_str!("../src/shaders/dequant_to_f16.metal"), 1),
 ];
 
-/// (fixed text, shipped-before text) of the two forms of the expression.
-const SITES: [(&str, &str); 2] = [
+/// (fixed text, shipped-before text) for every controlled scale expression.
+const SITES: [(&str, &str); 3] = [
     (
         "il < 2 ? float(xb->d) : float(xb->d) / 16.f;",
         "il < 2 ? xb->d : xb->d / 16.h;",
@@ -69,6 +75,10 @@ const SITES: [(&str, &str); 2] = [
     (
         "? (float(xb->d) / 16.f) : float(xb->d);",
         "? (xb->d / 16.h) : xb->d;",
+    ),
+    (
+        "sub < 2 ? float(d_all) : float(d_all) / 16.f;",
+        "sub < 2 ? d_all : d_all / 16.h;",
     ),
 ];
 
@@ -103,7 +113,7 @@ static SOURCES: LazyLock<Vec<Vec<String>>> = LazyLock::new(|| {
                         .iter()
                         .map(|(fixed, _)| text.matches(fixed).count())
                         .sum();
-                    assert_eq!(found, sites, "scale sites in a shader file changed");
+                    assert_eq!(found, sites, "scale sites in a compiler input changed");
                     if *variant == "half" {
                         for (fixed, before) in SITES {
                             text = text.replace(fixed, before);

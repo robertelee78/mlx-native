@@ -21,6 +21,9 @@ use mlx_native::ops::{
 use mlx_native::{KernelPipelineOrigin, KernelRegistry, MlxDevice, MlxError};
 use sha2::{Digest, Sha256};
 
+#[path = "support/expert_source_inputs.rs"]
+mod expert_source_inputs;
+
 const NO_BOOLS: &[(usize, bool)] = &[];
 const NO_INTS: &[(usize, i32)] = &[];
 /// `flash_attn_prefill.metal`: align_Q, align_K, has_mask, do_causal, has_blk.
@@ -306,19 +309,19 @@ fn cases() -> Vec<Case> {
         ),
         (
             "kernel_mul_mv_id_iq4_xs_f32",
-            include_str!("../src/shaders/quantized_matmul_id_ggml.metal"),
+            expert_source_inputs::EXPERT_MV_SOURCE,
             NO_BOOLS,
             NO_INTS,
         ),
         (
             "kernel_mul_mm_id_iq4_xs_f32",
-            include_str!("../src/shaders/quantized_matmul_id_mm.metal"),
+            expert_source_inputs::EXPERT_MM_SOURCE,
             NO_BOOLS,
             NO_INTS,
         ),
         (
             "kernel_mul_mm_id_iq4_xs_tensor_f32",
-            include_str!("../src/shaders/quantized_matmul_id_mm_tensor.metal"),
+            expert_source_inputs::EXPERT_TENSOR_MM_SOURCE,
             NO_BOOLS,
             NO_INTS,
         ),

@@ -11,6 +11,10 @@
 // memory staging is the tensor-path row-major layout identical to the
 // dense tensor mm kernel.
 
+#ifndef MLX_NATIVE_PREPARED_F16_TILES_H
+#include "prepared_f16_tiles.h"
+#endif
+
 #include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -328,38 +332,8 @@ void dq_q3_K_id(device const block_q3_K * xb, short il, thread type4x4 & reg) {
 
 template <typename type4x4>
 void dq_q6_K_id(device const block_q6_K * xb, short il, thread type4x4 & reg) {
-    const half d_all = xb->d;
-    device const uint16_t * ql = (device const uint16_t *)xb->ql;
-    device const uint16_t * qh = (device const uint16_t *)xb->qh;
-    device const int8_t * scales = (device const int8_t *)xb->scales;
-
-    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
-    qh = qh + 16*(il/8) + 8*(il&1);
-    float sc = scales[(il%2) + 2 * ((il/2))];
-    il = (il/2) & 3;
-
-    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
-    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
-    const float ml = d_all * sc * 32.f;
-    const float dl0 = d_all * sc;
-    const float dl1 = dl0 / 256.f;
-    const float dl2 = dl0 / (256.f * 256.f);
-    const float dl3 = dl0 / (256.f * 256.f * 256.f);
-    const uint8_t shr_h = il>2 ? 2 : 0;
-    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
-    const uint8_t shr_l = il>1 ? 4 : 0;
-
-    float4x4 reg_f;
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
-        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
-        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
-        reg_f[i][0] = dl0 *  ((half)(q & 0xFF))      - ml;
-        reg_f[i][1] = dl1 * ((float)(q & 0xFF00))    - ml;
-        reg_f[i][2] = dl2 * ((float)(q & 0xFF0000))  - ml;
-        reg_f[i][3] = dl3 * ((float)(q & 0xFF000000))- ml;
-    }
-    reg = (type4x4) reg_f;
+    const RawF16Fragment<block_q6_K> reader = {xb};
+    legacy_f16_q6_fragment(xb->d, xb->scales, reader, il, reg);
 }
 
 // ADR-022 Phase 1 — Q5_1 / IQ4_NL dequant for tensor-API MMA-tile path.
@@ -456,24 +430,8 @@ void dq_iq2_xxs_id(device const block_iq2_xxs * xb, short il, thread type4x4 & r
 // Spec source: reference `dequantize_q4_K`.
 template <typename type4x4>
 void dq_q4_K_id(device const block_q4_K * xb, short il, thread type4x4 & reg) {
-    device const uchar * q = xb->qs;
-
-    short is = (il/4) * 2;
-    q = q + (il/4) * 32 + 16 * (il&1);
-    il = il & 3;
-    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    // The scale is widened before the division: |d| / 16 is a subnormal half
-    // (absolute step 2^-24, percent-level error) for |d| < 2^-10, which real
-    // model files carry (nearly every Q4_K / Q5_K block).
-    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
-    const float min = xb->dmin;
-    const float dl  = d * sc[0];
-    const float ml  = min * sc[1];
-
-    const ushort mask = il < 2 ? 0x0F : 0xF0;
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
-    }
+    const RawF16Fragment<block_q4_K> reader = {xb};
+    legacy_f16_q4_fragment(xb->d, xb->dmin, xb->scales, reader, il, reg);
 }
 
 // ADR-022 Phase 2 — Q5_K dequant for tensor-API mm_id MMA-tile path.
@@ -512,10 +470,14 @@ void dq_q5_K_id(device const block_q5_K * xb, short il, thread type4x4 & reg) {
 // tiles with at most 16 rows at TM = 16 over the lower half of the staged
 // B tile; staging is unchanged, so rows 16-31 are loaded but not multiplied
 // and the destination rows 16-31 of `sc` are not written.
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), short TM>
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), short TM, bool PREPARED = false, bool Q6 = false>
 inline void hf2q_mul_mm_id_tensor_tile(
         constant GgmlMatmulIdMmTensor_MmParams & args,
         device const block_q * x,
+        constant PreparedF16TilesParams * planes,
+        device const uchar * expert,
+        uint row,
         device const float * y,
         short il0,
         threadgroup half  * sa,
@@ -528,6 +490,7 @@ inline void hf2q_mul_mm_id_tensor_tile(
     constexpr int NL1 = NK/8;
 
     short il = il0;
+    uint block = 0;
 
     auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
     auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NK, TM));
@@ -562,7 +525,12 @@ inline void hf2q_mul_mm_id_tensor_tile(
         // iter-55 confirms mm_id has the same null effect.
         {
             half4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            if (PREPARED) {
+                if (Q6) prepared_f16_q6_fragment(expert, *planes, row, block, il, temp_a);
+                else prepared_f16_q4_fragment(expert, *planes, row, block, il, temp_a);
+            } else {
+                dequantize_func(x, il, temp_a);
+            }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -590,7 +558,8 @@ inline void hf2q_mul_mm_id_tensor_tile(
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        if (PREPARED) block += (il < 2) ? 1 : 0;
+        else x = (il < 2) ? x + (2 + nl - 1)/nl : x;
 
         y += NK;
 
@@ -622,19 +591,20 @@ inline void hf2q_mul_mm_id_tensor_tile(
 // (grid x, fastest) × ⌈N/64⌉ N tiles (grid y) over the map0c schedule; see
 // quantized_matmul_id_mm.metal for the descriptor layout. Bit 0 enables the
 // half-tile skip (P2c) for tiles of <= 16 rows.
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
-kernel void hf2q_mul_mm_id_tensor_impl(
-        constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
-        device const char * src0 [[buffer(1)]],
-        device const char * src1 [[buffer(2)]],
-        device const char * htpe [[buffer(3)]],
-        device const char * hids [[buffer(4)]],
-        device       char * dst  [[buffer(5)]],
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false, bool PREPARED = false, bool Q6 = false>
+inline void hf2q_mul_mm_id_tensor_core(
+        constant GgmlMatmulIdMmTensor_MmParams & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        constant PreparedF16TilesParams * planes,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg) {
 
     threadgroup half  * sa = (threadgroup half  *)(shmem);
     threadgroup half  * sb = (threadgroup half  *)(shmem + 4096);
@@ -716,8 +686,14 @@ kernel void hf2q_mul_mm_id_tensor_impl(
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
-    device const block_q * x =
-        (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * x = nullptr;
+    device const uchar * expert = nullptr;
+    if (PREPARED) {
+        expert = reinterpret_cast<device const uchar *>(src0)
+            + ulong(im) * planes->prepared_expert_stride;
+    } else {
+        x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    }
 
     const short iy = 8*(tiitg % NL1);
 
@@ -728,11 +704,11 @@ kernel void hf2q_mul_mm_id_tensor_impl(
         + args.nb10*iy);
 
     if (COMPACT && (args.sched_flags & 1) != 0 && nr1 <= 16) {
-        hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, 16>(
-            args, x, y, il0, sa, sb, sc, tiitg);
+        hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, 16, PREPARED, Q6>(
+            args, x, planes, expert, r0 + lr0, y, il0, sa, sb, sc, tiitg);
     } else {
-        hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, NR1>(
-            args, x, y, il0, sa, sb, sc, tiitg);
+        hf2q_mul_mm_id_tensor_tile<block_q, nl, dequantize_func, NR1, PREPARED, Q6>(
+            args, x, planes, expert, r0 + lr0, y, il0, sa, sb, sc, tiitg);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -768,6 +744,23 @@ kernel void hf2q_mul_mm_id_tensor_impl(
             *(D + i) = *(C + i);
         }
     }
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool COMPACT = false>
+kernel void hf2q_mul_mm_id_tensor_impl(
+        constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const char * htpe [[buffer(3)]],
+        device const char * hids [[buffer(4)]],
+        device       char * dst  [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    hf2q_mul_mm_id_tensor_core<block_q, nl, dequantize_func, COMPACT>(
+        args, src0, src1, htpe, hids, dst, nullptr, shmem, tgpig, tiitg, tiisg, sgitg);
 }
 
 template [[host_name("kernel_mul_mm_id_q4_0_tensor_f32")]]
@@ -923,3 +916,76 @@ kernel void hf2q_mul_mm_id_tensor_impl<block_iq2_xxs, QK_NL, dq_iq2_xxs_id, true
     constant GgmlMatmulIdMmTensor_MmParams &,
     device const char *, device const char *, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort, ushort, ushort);
+
+// Private native-only probe of the actual tensor translation-unit decoders.
+
+kernel void grouped_m8_f16_tiles_tensor_reference(
+    device const uchar *raw [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant PreparedF16TilesParams &p [[buffer(2)]],
+    uint3 index [[thread_position_in_grid]]) {
+    if (index.x >= p.blocks * 16 || index.y >= p.n || index.z >= p.n_experts)
+        return;
+    const uint block = index.x / 16;
+    const short il = short(index.x % 16);
+    device const uchar *b = raw + ulong(index.z) * p.raw_expert_stride +
+        (ulong(index.y) * p.blocks + block) * (p.format == 0 ? 144 : 210);
+    half4x4 reg;
+    if (p.format == 0)
+        dq_q4_K_id(reinterpret_cast<device const block_q4_K *>(b), il, reg);
+    else
+        dq_q6_K_id(reinterpret_cast<device const block_q6_K *>(b), il, reg);
+    const ulong offset = prepared_f16_fragment_offset(p, index);
+    for (int i = 0; i < 16; ++i)
+        output[offset + i] = reg[i / 4][i % 4];
+}
+
+
+
+
+template<bool Q6, bool COMPACT = false>
+kernel void hf2q_mul_mm_id_prepared_tensor_impl(
+        constant GgmlMatmulIdMmTensor_MmParams & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device const char * htpe [[buffer(3)]],
+        device const char * hids [[buffer(4)]],
+        device       char * dst  [[buffer(5)]],
+        constant PreparedF16TilesParams & p [[buffer(6)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (Q6) {
+        hf2q_mul_mm_id_tensor_core<block_q6_K, 16, dq_q6_K_id, COMPACT, true, true>(
+            args, src0, src1, htpe, hids, dst, &p, shmem, tgpig, tiitg, tiisg, sgitg);
+    } else {
+        hf2q_mul_mm_id_tensor_core<block_q4_K, 16, dq_q4_K_id, COMPACT, true, false>(
+            args, src0, src1, htpe, hids, dst, &p, shmem, tgpig, tiitg, tiisg, sgitg);
+    }
+}
+
+template [[host_name("kernel_mul_mm_id_prepared_q4_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<false, false>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_prepared_q4_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<false, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_prepared_q6_K_tensor_f32")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<true, false>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_id_prepared_q6_K_tensor_f32_c")]]
+kernel void hf2q_mul_mm_id_prepared_tensor_impl<true, true>(
+    constant GgmlMatmulIdMmTensor_MmParams &,
+    device const char *, device const char *, device const char *, device const char *,
+    device char *, constant PreparedF16TilesParams &, threadgroup char *, uint3, ushort, ushort, ushort);

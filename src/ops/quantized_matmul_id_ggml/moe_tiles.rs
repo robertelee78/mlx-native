@@ -33,7 +33,7 @@ use super::{
     as_bytes, checked_byte_extent, compact_max_tiles, encode_compact_map0,
     grouped_m8_gathered_rows, prepare_quantized_matmul_id_ggml_grouped_m8, CommandEncoder, DType,
     ExpertMmSchedule, GgmlIdMmDispatchParams, GgmlQuantizedMatmulIdParams, GgmlType, IdMmScratch,
-    KernelArg, KernelRegistry, MlxBuffer, MlxDevice, MlxError, PreparedGroupedM8Experts, Result,
+    KernelArg, KernelRegistry, MlxBuffer, MlxDevice, MlxError, GroupedM8ExpertPlanes, Result,
 };
 use crate::ops::tensor_kernels::{require_tensor_kernel_family, TensorKernelFamily};
 
@@ -173,7 +173,7 @@ fn check_buffers(buffers: &MoeTilesBuffers<'_>, params: &MoeTilesParams) -> Resu
 
 fn check_prepared(
     label: &str,
-    prepared: &PreparedGroupedM8Experts,
+    prepared: &GroupedM8ExpertPlanes,
     params: &MoeTilesParams,
     n: u32,
     k: u32,
@@ -207,7 +207,7 @@ fn format_name(ggml_type: GgmlType) -> &'static str {
     }
 }
 
-fn pass_params(prepared: &PreparedGroupedM8Experts, params: &MoeTilesParams) -> PassGpuParams {
+fn pass_params(prepared: &GroupedM8ExpertPlanes, params: &MoeTilesParams) -> PassGpuParams {
     PassGpuParams {
         k: prepared.k,
         n: prepared.n,
@@ -351,8 +351,8 @@ pub fn moe_tiles_gate_up(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
-    gate: &PreparedGroupedM8Experts,
-    up: &PreparedGroupedM8Experts,
+    gate: &GroupedM8ExpertPlanes,
+    up: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     buffers: &MoeTilesBuffers<'_>,
     scratch: &IdMmScratch,
@@ -409,7 +409,7 @@ pub fn moe_tiles_down(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
-    down: &PreparedGroupedM8Experts,
+    down: &GroupedM8ExpertPlanes,
     ids: &MlxBuffer,
     buffers: &MoeTilesBuffers<'_>,
     scratch: &IdMmScratch,
